@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import datetime
+import email.utils
 import hashlib
 import inspect
 import json
@@ -88,6 +90,443 @@ REPOSITORY_POLICY_SCOPE_BY_PROFILE = {
     "canonical": pathlib.Path("."),
     "private": pathlib.Path("personal_codex"),
 }
+
+
+def _canonical_positive_decimal(value: object) -> str | None:
+    if type(value) is int:
+        return str(value) if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) is not None:
+        return value
+    return None
+
+
+_GITHUB_CODEX_DISCLOSURE = "\n".join(
+    (
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+        "<br/>",
+        "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+        "- Open a pull request for review",
+        "- Mark a draft as ready",
+        '- Comment "@codex review".',
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+        'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
+        "</details>",
+    )
+)
+_GITHUB_CODEX_CLEAN_TAGLINES = {
+    "",
+    " :rocket:",
+    " :tada:",
+    " :+1:",
+    " 🚀",
+    " 🎉",
+    " 👍",
+    " ✨",
+    " ✅",
+} | {
+    f" {stem}{punctuation}"
+    for stem in (
+        "Nice work",
+        "Chef's kiss",
+        "What shall we delve into next",
+        "Already looking forward to the next diff",
+        "Keep them coming",
+        "Swish",
+        "Another round soon, please",
+        "Breezy",
+        "Can't wait for the next one",
+        "More of your lovely PRs please",
+        "Bravo",
+        "Keep it up",
+        "Delightful",
+        "Hooray",
+        "You're on a roll",
+    )
+    for punctuation in (".", "!", "?")
+}
+
+
+def _normalize_github_codex_body(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = (
+        value.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\v", "\n")
+        .replace("\f", "\n")
+        .replace("\u0085", "\n")
+        .replace("\u2028", "\n")
+        .replace("\u2029", "\n")
+    )
+    if any(
+        codepoint == 0
+        or (
+            (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F)
+            and codepoint not in (0x09, 0x0A)
+        )
+        for codepoint in map(ord, normalized)
+    ):
+        return None
+    return normalized.strip("\t\n ")
+
+
+def _github_codex_issue_terminal_looking(normalized_body: object) -> bool:
+    if not isinstance(normalized_body, str):
+        return False
+    first_line = normalized_body.split("\n", 1)[0]
+    marker_index = first_line.find("Codex Review")
+    return 0 <= marker_index < 64 and all(
+        not char.isascii() or not char.isalnum() for char in first_line[:marker_index]
+    )
+
+
+def _github_codex_issue_body_semantic(
+    raw_body: object,
+    *,
+    repository: str,
+    head: str,
+) -> tuple[str, str | None]:
+    body = _normalize_github_codex_body(raw_body)
+    if body is None or not _github_codex_issue_terminal_looking(body):
+        return ("nonterminal", None)
+    first_line, *later_lines = body.split("\n")
+    marker_index = first_line.find("Codex Review")
+    provider_first_line = first_line[marker_index:]
+    progress_stems = {
+        "Codex Review in progress",
+        "Codex Review still in progress",
+    }
+    progress_only = provider_first_line in progress_stems or provider_first_line in {
+        f"{stem}." for stem in progress_stems
+    }
+    if not progress_only:
+        for stem in progress_stems:
+            prefix = f"{stem}: "
+            detail = (
+                provider_first_line[len(prefix) :]
+                if provider_first_line.startswith(prefix)
+                else ""
+            )
+            if (
+                detail
+                and len(detail) <= 160
+                and all(
+                    not unicodedata.category(char).startswith("C") for char in detail
+                )
+            ):
+                progress_only = True
+                break
+    if progress_only and not any(line for line in later_lines):
+        return ("nonterminal", None)
+
+    clean_lead = "Codex Review: Didn't find any major issues."
+    commit_marker = f"**Reviewed commit:** `{head}`"
+    for tagline in _GITHUB_CODEX_CLEAN_TAGLINES:
+        clean_core = f"{clean_lead}{tagline}\n\n{commit_marker}"
+        if body in {
+            clean_core,
+            f"{clean_core}\n\n{_GITHUB_CODEX_DISCLOSURE}",
+        }:
+            return ("clean", head)
+
+    lines = body.split("\n")
+    if len(lines) >= 2 and lines[0] == "### 💡 Codex Review":
+        finding_pattern = re.compile(
+            r"^- \[P[0-3]\] (?P<title>.{1,240}) — "
+            + rf"https://github\.com/{re.escape(repository)}/blob/"
+            + r"(?P<sha>[0-9a-f]{40})/"
+            + r"(?P<path>(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2})+)"
+            + r"#L[1-9][0-9]*(?:-L[1-9][0-9]*)?$"
+        )
+        shas: set[str] = set()
+        for line in lines[1:]:
+            match = finding_pattern.fullmatch(line)
+            if match is None:
+                return ("malformed", None)
+            title = match.group("title")
+            try:
+                decoded_path = urllib.parse.unquote_to_bytes(
+                    match.group("path")
+                ).decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return ("malformed", None)
+            if (
+                title != title.strip("\t ")
+                or " — " in title
+                or any(unicodedata.category(char) == "Cc" for char in title)
+                or any(
+                    segment in {"", ".", ".."} for segment in decoded_path.split("/")
+                )
+            ):
+                return ("malformed", None)
+            shas.add(match.group("sha"))
+        if shas == {head}:
+            return ("findings", head)
+    return ("malformed", None)
+
+
+def _format_github_rfc3339_seconds(value: object) -> object:
+    if type(value) is not int or value <= 0:
+        return value
+    try:
+        instant = datetime.datetime.fromtimestamp(value, datetime.UTC)
+    except (OSError, OverflowError, ValueError):
+        return value
+    return instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_github_rfc3339_seconds(value: object) -> int | None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+            value,
+        )
+        is None
+    ):
+        return None
+    try:
+        instant = datetime.datetime.strptime(
+            value,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=datetime.UTC)
+    except ValueError:
+        return None
+    if instant.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        return None
+    timestamp = instant.timestamp()
+    return int(timestamp) if timestamp.is_integer() and timestamp > 0 else None
+
+
+def _review_thread_pages(
+    children: list[dict[str, object]],
+    *,
+    parent_review_id: int,
+    resolved: bool = False,
+) -> dict[str, object]:
+    nodes: list[dict[str, object]] = []
+    for child in children:
+        child_id = child["id"]
+        child_url = child["url"]
+        assert type(child_id) is int
+        assert isinstance(child_url, str)
+        nodes.append(
+            {
+                "id": f"PRRT_{child_id}",
+                "isResolved": resolved,
+                "isOutdated": False,
+                "comments": {
+                    "pagination_complete": True,
+                    "pages": [
+                        {
+                            "after": None,
+                            "nodes": [
+                                {
+                                    "id": f"PRRC_{child_id}",
+                                    "fullDatabaseId": str(child_id),
+                                    "url": child_url,
+                                    "pullRequestReview": {
+                                        "id": f"PRR_{parent_review_id}",
+                                        "fullDatabaseId": str(parent_review_id),
+                                    },
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+    return {
+        "endpoint": "https://api.github.com/graphql",
+        "pagination_complete": True,
+        "pages": [
+            {
+                "after": None,
+                "nodes": nodes,
+                "pageInfo": {
+                    "hasNextPage": False,
+                    "endCursor": None,
+                },
+            }
+        ],
+    }
+
+
+def _review_thread_findings_from_raw(
+    children: object,
+    thread_pages: object,
+    *,
+    repository: str,
+    pull_request: int,
+    parent_review_id: int,
+) -> list[dict[str, object]] | None:
+    if not isinstance(children, list) or not isinstance(thread_pages, dict):
+        return None
+    if (
+        set(thread_pages) != {"endpoint", "pagination_complete", "pages"}
+        or thread_pages.get("endpoint") != "https://api.github.com/graphql"
+        or thread_pages.get("pagination_complete") is not True
+        or not isinstance(thread_pages.get("pages"), list)
+        or not thread_pages["pages"]
+    ):
+        return None
+
+    rest_children: dict[str, dict[str, object]] = {}
+    for child in children:
+        if not isinstance(child, dict):
+            return None
+        raw_child_id = child.get("id")
+        raw_parent_review_id = child.get("pull_request_review_id")
+        child_id = (
+            str(raw_child_id)
+            if type(raw_child_id) is int and raw_child_id > 0
+            else None
+        )
+        if (
+            child_id is None
+            or child_id in rest_children
+            or child.get("url")
+            != (
+                f"https://github.com/{repository}/pull/{pull_request}"
+                f"#discussion_r{child_id}"
+            )
+            or type(raw_parent_review_id) is not int
+            or raw_parent_review_id != parent_review_id
+        ):
+            return None
+        rest_children[child_id] = child
+
+    def connection_nodes(
+        connection: object,
+        *,
+        node_keys: set[str],
+    ) -> list[dict[str, object]] | None:
+        if (
+            not isinstance(connection, dict)
+            or set(connection) != {"pagination_complete", "pages"}
+            or connection.get("pagination_complete") is not True
+            or not isinstance(connection.get("pages"), list)
+            or not connection["pages"]
+        ):
+            return None
+        pages = connection["pages"]
+        expected_after: str | None = None
+        nodes: list[dict[str, object]] = []
+        for index, page in enumerate(pages):
+            if (
+                not isinstance(page, dict)
+                or set(page) != {"after", "nodes", "pageInfo"}
+                or page.get("after") != expected_after
+                or not isinstance(page.get("nodes"), list)
+            ):
+                return None
+            page_info = page.get("pageInfo")
+            if (
+                not isinstance(page_info, dict)
+                or set(page_info) != {"hasNextPage", "endCursor"}
+                or type(page_info.get("hasNextPage")) is not bool
+            ):
+                return None
+            has_next = page_info["hasNextPage"]
+            end_cursor = page_info.get("endCursor")
+            if has_next:
+                if (
+                    index == len(pages) - 1
+                    or not isinstance(end_cursor, str)
+                    or not end_cursor
+                ):
+                    return None
+                expected_after = end_cursor
+            else:
+                if index != len(pages) - 1 or end_cursor is not None:
+                    return None
+                expected_after = None
+            for node in page["nodes"]:
+                if not isinstance(node, dict) or set(node) != node_keys:
+                    return None
+                nodes.append(node)
+        return nodes
+
+    thread_connection = {
+        "pagination_complete": thread_pages["pagination_complete"],
+        "pages": thread_pages["pages"],
+    }
+    thread_nodes = connection_nodes(
+        thread_connection,
+        node_keys={"id", "isResolved", "isOutdated", "comments"},
+    )
+    if thread_nodes is None:
+        return None
+
+    mapped_children: dict[str, dict[str, object]] = {}
+    thread_ids: set[str] = set()
+    graphql_comment_ids: set[str] = set()
+    graphql_review_ids: set[str] = set()
+    for thread in thread_nodes:
+        thread_id = thread.get("id")
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id
+            or thread_id in thread_ids
+            or type(thread.get("isResolved")) is not bool
+            or type(thread.get("isOutdated")) is not bool
+        ):
+            return None
+        thread_ids.add(thread_id)
+        comment_nodes = connection_nodes(
+            thread.get("comments"),
+            node_keys={"id", "fullDatabaseId", "url", "pullRequestReview"},
+        )
+        if not comment_nodes:
+            return None
+        for comment in comment_nodes:
+            graphql_comment_id = comment.get("id")
+            graphql_child_id = comment.get("fullDatabaseId")
+            child_id = (
+                _canonical_positive_decimal(graphql_child_id)
+                if isinstance(graphql_child_id, str)
+                else None
+            )
+            parent = comment.get("pullRequestReview")
+            if (
+                not isinstance(graphql_comment_id, str)
+                or not graphql_comment_id
+                or graphql_comment_id in graphql_comment_ids
+                or child_id is None
+                or child_id in mapped_children
+                or child_id not in rest_children
+                or comment.get("url") != rest_children[child_id].get("url")
+                or not isinstance(parent, dict)
+                or set(parent) != {"id", "fullDatabaseId"}
+                or not isinstance(parent.get("id"), str)
+                or not parent["id"]
+                or not isinstance(parent.get("fullDatabaseId"), str)
+                or (
+                    _canonical_positive_decimal(parent.get("fullDatabaseId"))
+                    != str(parent_review_id)
+                )
+            ):
+                return None
+            graphql_comment_ids.add(graphql_comment_id)
+            graphql_review_ids.add(parent["id"])
+            mapped_children[child_id] = {
+                "child_id": int(child_id),
+                "graphql_comment_id": graphql_comment_id,
+                "thread_id": thread_id,
+                "is_resolved": thread["isResolved"],
+                "is_outdated": thread["isOutdated"],
+                "pull_request_review_id": parent_review_id,
+            }
+    if set(mapped_children) != set(rest_children):
+        return None
+    if mapped_children and len(graphql_review_ids) != 1:
+        return None
+    return [mapped_children[child_id] for child_id in rest_children]
 
 
 def _has_python_shebang(path: pathlib.Path) -> bool:
@@ -2281,7 +2720,7 @@ class RepositoryContractTest(unittest.TestCase):
             "stable numeric artifact id",
             "any trustworthy finding in the set takes precedence over every clean",
             "incompatible artifacts without another provider-stable ordering signal are ambiguous",
-            "any malformed or scope-conflicting member of that equal-time set",
+            "within one source channel, any malformed or scope-conflicting member blocks",
             "scope",
             "final re-read",
             "same or successor head",
@@ -2378,7 +2817,9 @@ class RepositoryContractTest(unittest.TestCase):
             "generic `issuer`/`source` strings",
             "a local paraphrase with a self-consistent hash",
             "caller-supplied fields alone never authenticate it",
-            "trusted github rest response `date` header",
+            "exact response receipt from the first direct authenticated rest get",
+            "`initial_fetch_receipt`",
+            "`as_of_receipt`",
             "`window_seconds: 2592000`",
             "`window_start_exclusive = as_of_server_time - 2592000",
             "a candidate basis at the lower boundary is outside the window",
@@ -2411,6 +2852,17 @@ class RepositoryContractTest(unittest.TestCase):
             (
                 "the only clean-completion path that deliberately has no terminal "
                 "review/comment payload"
+            ),
+            "`schema_version: 2`",
+            "`merge_base_commit.sha`",
+            "`source_evidence`",
+            "raw github rest timestamps remain canonical whole-second rfc3339",
+            "`comments { nodes pageinfo }`",
+            "`hasnextpage == false`",
+            "a confirmed different actor is not provider behaviour",
+            (
+                "a provider terminal artifact may form a candidate even when no "
+                "controlled request was observed"
             ),
         ):
             self.assertIn(
@@ -2529,6 +2981,36 @@ class RepositoryContractTest(unittest.TestCase):
                     authority,
                 )
 
+        anti_drift_documents = {
+            "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "pr-readiness": (SKILL_ROOT / "references/pr-readiness.md").read_text(
+                encoding="utf-8"
+            ),
+            "project-journal": (
+                SKILL_SCOPE_ROOT / "docs/project_journal/2026/07/"
+                "2026-07-30-github-codex-evidence-authority-gea001.md"
+            ).read_text(encoding="utf-8"),
+        }
+        baseline_ids = (
+            "16366aa81270ad2c875d2ceb8ce194f5b2308af6",
+            "2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6",
+            "d03de9035d20f285e6a93986d436403b4a30e9bc",
+        )
+        for document_name, document in anti_drift_documents.items():
+            for baseline_id in baseline_ids:
+                with self.subTest(
+                    anti_drift_document=document_name,
+                    baseline_id=baseline_id,
+                ):
+                    self.assertIn(baseline_id, document)
+        journal = anti_drift_documents["project-journal"]
+        for relative_path, blob_id in baseline_manifest.items():
+            with self.subTest(journal_action_baseline_path=relative_path):
+                self.assertIn(
+                    f"| `{relative_path}` | `{blob_id}` |",
+                    journal,
+                )
+
         for rationale in (
             "a provider-authored terminal payload carries the actual "
             "finding/no-findings decision and commit scope",
@@ -2538,6 +3020,10 @@ class RepositoryContractTest(unittest.TestCase):
             "defects, but they do not contradict what the provider reported",
         ):
             self.assertIn(rationale, normalized)
+            self.assertIn(
+                rationale,
+                " ".join(journal.split()).lower(),
+            )
         for upstream_regression in (
             "valid current-head clean passes without creating a review marker",
             "current-head clean passes regardless of marker timing or deadline",
@@ -2589,19 +3075,7 @@ class RepositoryContractTest(unittest.TestCase):
         current_sha = "0123456789abcdef0123456789abcdef01234567"
         other_sha = "fedcba9876543210fedcba9876543210fedcba98"
         review_id = 123456789
-        disclosure = "\n".join(
-            (
-                "<details> <summary>ℹ️ About Codex in GitHub</summary>",
-                "<br/>",
-                "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
-                "- Open a pull request for review",
-                "- Mark a draft as ready",
-                '- Comment "@codex review".',
-                "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
-                'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
-                "</details>",
-            )
-        )
+        disclosure = _GITHUB_CODEX_DISCLOSURE
         eligible_finding_commits = {current_sha, other_sha}
 
         def inline_container(commit_id: str) -> str:
@@ -2619,27 +3093,7 @@ class RepositoryContractTest(unittest.TestCase):
             return json.loads(json.dumps(value))
 
         def normalize_body(value: object) -> str | None:
-            if not isinstance(value, str):
-                return None
-            normalized = (
-                value.replace("\r\n", "\n")
-                .replace("\r", "\n")
-                .replace("\v", "\n")
-                .replace("\f", "\n")
-                .replace("\u0085", "\n")
-                .replace("\u2028", "\n")
-                .replace("\u2029", "\n")
-            )
-            if any(
-                codepoint == 0
-                or (
-                    (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F)
-                    and codepoint not in (0x09, 0x0A)
-                )
-                for codepoint in map(ord, normalized)
-            ):
-                return None
-            return normalized.strip("\t\n ")
+            return _normalize_github_codex_body(value)
 
         finding_line = re.compile(
             r"^- \[P[0-3]\] (?P<title>.{1,240}) — "
@@ -2705,8 +3159,6 @@ class RepositoryContractTest(unittest.TestCase):
                 "original_commit_id",
                 "body",
                 "normalized_body",
-                "thread_id",
-                "thread_resolved",
             }
             return (
                 set(record) == expected_keys
@@ -2721,8 +3173,6 @@ class RepositoryContractTest(unittest.TestCase):
                 and record.get("original_commit_id") == commit_id
                 and bool(body)
                 and record.get("normalized_body") == body
-                and record.get("thread_id") == f"PRRT_{child_id}"
-                and type(record.get("thread_resolved")) is bool
             )
 
         def classify(record: dict[str, object]) -> str:
@@ -2736,50 +3186,14 @@ class RepositoryContractTest(unittest.TestCase):
             if body is None:
                 return "malformed"
             if channel == "issue-comment":
-                if (
-                    record.get("app_slug") == "chatgpt-codex-connector"
-                    and body.count("**Reviewed commit:**") == 1
-                ):
-                    short_taglines = {
-                        "",
-                        " :rocket:",
-                        " :tada:",
-                        " :+1:",
-                        " 🚀",
-                        " 🎉",
-                        " 👍",
-                        " ✨",
-                        " ✅",
-                    }
-                    stems = {
-                        "Nice work",
-                        "Chef's kiss",
-                        "What shall we delve into next",
-                        "Already looking forward to the next diff",
-                        "Keep them coming",
-                        "Swish",
-                        "Another round soon, please",
-                        "Breezy",
-                        "Can't wait for the next one",
-                        "More of your lovely PRs please",
-                        "Bravo",
-                        "Keep it up",
-                        "Delightful",
-                        "Hooray",
-                        "You're on a roll",
-                    }
-                    taglines = short_taglines | {
-                        f" {stem}{punctuation}"
-                        for stem in stems
-                        for punctuation in (".", "!", "?")
-                    }
-                    clean_lead = "Codex Review: Didn't find any major issues."
-                    marker = f"**Reviewed commit:** `{current_sha}`"
-                    for tagline in taglines:
-                        core = f"{clean_lead}{tagline}\n\n{marker}"
-                        if body in (core, f"{core}\n\n{disclosure}"):
-                            return "clean"
-                return "findings" if finding_sha(body) is not None else "malformed"
+                if record.get("app_slug") != "chatgpt-codex-connector":
+                    return "malformed"
+                semantic, _ = _github_codex_issue_body_semantic(
+                    body,
+                    repository="OWNER/REPO",
+                    head=current_sha,
+                )
+                return semantic
             if channel != "review":
                 return "malformed"
             children = record.get("children")
@@ -2793,14 +3207,24 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             commit_id = record.get("commit_id")
             parent_id = record.get("id")
-            if type(parent_id) is not int or parent_id <= 0:
+            children = record.get("children")
+            if (
+                type(parent_id) is not int
+                or parent_id <= 0
+                or not isinstance(children, list)
+            ):
+                return "malformed"
+            thread_findings = _review_thread_findings_from_raw(
+                children,
+                record.get("review_thread_pages"),
+                repository="OWNER/REPO",
+                pull_request=1,
+                parent_review_id=parent_id,
+            )
+            if thread_findings is None:
                 return "malformed"
             if state == "APPROVED":
-                if (
-                    commit_id != current_sha
-                    or body != "No findings."
-                    or not isinstance(children, list)
-                ):
+                if commit_id != current_sha or body != "No findings.":
                     return "malformed"
                 child_ids: set[int] = set()
                 for child_record in children:
@@ -2827,7 +3251,6 @@ class RepositoryContractTest(unittest.TestCase):
                 state != "COMMENTED"
                 or commit_id not in eligible_finding_commits
                 or body not in ("", inline_container(str(commit_id)))
-                or not isinstance(children, list)
                 or not children
             ):
                 return "malformed"
@@ -2864,6 +3287,10 @@ class RepositoryContractTest(unittest.TestCase):
             "commit_id": current_sha,
             "body": "No findings.",
             "children": [],
+            "review_thread_pages": _review_thread_pages(
+                [],
+                parent_review_id=review_id,
+            ),
         }
         finding = {
             "channel": "issue-comment",
@@ -2887,8 +3314,6 @@ class RepositoryContractTest(unittest.TestCase):
             "original_commit_id": current_sha,
             "body": "[P1] Example inline finding",
             "normalized_body": "[P1] Example inline finding",
-            "thread_id": "PRRT_987654321",
-            "thread_resolved": False,
         }
         inline_parent = {
             "channel": "review",
@@ -2899,6 +3324,10 @@ class RepositoryContractTest(unittest.TestCase):
             "commit_id": current_sha,
             "body": "",
             "children": [child],
+            "review_thread_pages": _review_thread_pages(
+                [child],
+                parent_review_id=review_id,
+            ),
         }
 
         fixtures: list[tuple[str, str, str, str, dict[str, object]]] = []
@@ -2922,6 +3351,10 @@ class RepositoryContractTest(unittest.TestCase):
         )
         approved_with_inline_finding = clone(clean_review)
         approved_with_inline_finding["children"] = [child]
+        approved_with_inline_finding["review_thread_pages"] = _review_thread_pages(
+            [child],
+            parent_review_id=review_id,
+        )
         add(
             "clean-review-with-inline-finding",
             "clean pull-request review",
@@ -3238,7 +3671,7 @@ class RepositoryContractTest(unittest.TestCase):
         boolean_child_parent["children"][0]["pull_request_review_id"] = True
         self.assertEqual(classify(boolean_child_parent), "malformed")
 
-        for child_field in ("normalized_body", "thread_id", "thread_resolved"):
+        for child_field in ("normalized_body",):
             incomplete_child = clone(inline_parent)
             incomplete_child["children"][0].pop(child_field)
             with self.subTest(inline_child_missing_closed_field=child_field):
@@ -3256,7 +3689,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(classify(empty_child_body), "malformed")
 
         resolved_child = clone(inline_parent)
-        resolved_child["children"][0]["thread_resolved"] = True
+        resolved_child["review_thread_pages"]["pages"][0]["nodes"][0]["isResolved"] = (
+            True
+        )
         self.assertEqual(classify(resolved_child), "findings")
 
         def invalid_state_terminal_signal(record: dict[str, object]) -> bool:
@@ -3368,49 +3803,25 @@ class RepositoryContractTest(unittest.TestCase):
             body = normalize_body(snapshot.get("body"))
             assert body is not None
             snapshot["normalized_body"] = body
-            if snapshot.get("channel") == "review":
-                artifact_id = snapshot.get("id")
-                children = snapshot.get("children")
-                assert type(artifact_id) is int
-                assert isinstance(children, list)
-                snapshot["url"] = (
-                    "https://github.com/OWNER/REPO/pull/1"
-                    f"#pullrequestreview-{artifact_id}"
+            if snapshot.get("channel") != "review":
+                raise AssertionError(
+                    "issue-comment report coverage belongs to the unified "
+                    "candidate-artifact evaluator"
                 )
-                snapshot["submitted_at"] = 100
-                snapshot["server_time"] = 100
-                snapshot["server_time_field"] = "submitted_at"
-                snapshot["associated_inline_comments"] = {
-                    "pagination_complete": True,
-                    "records": clone(children),
-                }
-                snapshot["review_thread_join"] = {
-                    "pagination_complete": True,
-                    "records": [
-                        {
-                            "child_id": child_record["id"],
-                            "thread_id": child_record["thread_id"],
-                            "is_resolved": child_record["thread_resolved"],
-                            "pull_request_review_id": artifact_id,
-                        }
-                        for child_record in children
-                    ],
-                }
-            else:
-                artifact_id = 234567890
-                snapshot["id"] = artifact_id
-                snapshot["api_url"] = (
-                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
-                    f"{artifact_id}"
-                )
-                snapshot["url"] = (
-                    f"https://github.com/OWNER/REPO/pull/1#issuecomment-{artifact_id}"
-                )
-                snapshot["created_at"] = 100
-                snapshot["updated_at"] = 100
-                snapshot["server_time"] = 100
-                snapshot["server_time_field"] = "created_at"
-                snapshot["parsed_commit"] = current_sha
+            artifact_id = snapshot.get("id")
+            children = snapshot.get("children")
+            assert type(artifact_id) is int
+            assert isinstance(children, list)
+            snapshot["url"] = (
+                f"https://github.com/OWNER/REPO/pull/1#pullrequestreview-{artifact_id}"
+            )
+            snapshot["submitted_at"] = 100
+            snapshot["server_time"] = 100
+            snapshot["server_time_field"] = "submitted_at"
+            snapshot["associated_inline_comments"] = {
+                "pagination_complete": True,
+                "records": clone(children),
+            }
             return snapshot
 
         def selection_snapshot_for(
@@ -3419,6 +3830,18 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> dict[str, object]:
             children = artifact.get("children")
             child_records = children if isinstance(children, list) else []
+            thread_findings = (
+                _review_thread_findings_from_raw(
+                    child_records,
+                    artifact.get("review_thread_pages"),
+                    repository="OWNER/REPO",
+                    pull_request=1,
+                    parent_review_id=int(artifact["id"]),
+                )
+                if artifact.get("channel") == "review"
+                else []
+            )
+            assert thread_findings is not None
             return {
                 "complete": True,
                 "lifecycle": {
@@ -3435,34 +3858,16 @@ class RepositoryContractTest(unittest.TestCase):
                 "pagination": clone(selection_pagination),
                 "terminal_candidates": [
                     {
-                        "kind": (
-                            "pull-request-review"
-                            if artifact.get("channel") == "review"
-                            else "issue-comment"
-                        ),
+                        "kind": "pull-request-review",
                         "id": artifact.get("id"),
                         "url": artifact.get("url"),
                         "server_time": artifact.get("server_time"),
                         "outcome": outcome,
-                        "commit": (
-                            artifact.get("commit_id")
-                            if artifact.get("channel") == "review"
-                            else artifact.get("parsed_commit")
-                        ),
+                        "commit": artifact.get("commit_id"),
                     }
                 ],
                 "malformed_blockers": [],
-                "thread_findings": [
-                    {
-                        "child_id": child_record["id"],
-                        "thread_id": child_record["thread_id"],
-                        "is_resolved": child_record["thread_resolved"],
-                        "pull_request_review_id": child_record[
-                            "pull_request_review_id"
-                        ],
-                    }
-                    for child_record in child_records
-                ],
+                "thread_findings": clone(thread_findings),
             }
 
         def terminal_report(
@@ -3472,11 +3877,7 @@ class RepositoryContractTest(unittest.TestCase):
             artifact = complete_terminal_artifact(record)
             selection = selection_snapshot_for(artifact, claimed_outcome)
             return {
-                "kind": (
-                    "pull-request-review"
-                    if artifact.get("channel") == "review"
-                    else "issue-comment"
-                ),
+                "kind": "pull-request-review",
                 "selection_snapshots": {
                     "initial": clone(selection),
                     "final": clone(selection),
@@ -3562,7 +3963,7 @@ class RepositoryContractTest(unittest.TestCase):
                 artifact_id = artifact["id"]
                 children = artifact.get("children")
                 associated = artifact.get("associated_inline_comments")
-                thread_join = artifact.get("review_thread_join")
+                thread_pages = artifact.get("review_thread_pages")
                 if (
                     set(artifact)
                     != {
@@ -3580,7 +3981,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "server_time",
                         "server_time_field",
                         "associated_inline_comments",
-                        "review_thread_join",
+                        "review_thread_pages",
                     }
                     or artifact.get("url")
                     != (
@@ -3597,13 +3998,8 @@ class RepositoryContractTest(unittest.TestCase):
                     or set(associated) != {"pagination_complete", "records"}
                     or associated.get("pagination_complete") is not True
                     or not report_typed_equal(associated.get("records"), children)
-                    or not isinstance(thread_join, dict)
-                    or set(thread_join) != {"pagination_complete", "records"}
-                    or thread_join.get("pagination_complete") is not True
-                    or not isinstance(thread_join.get("records"), list)
                 ):
                     return "inconclusive"
-                expected_thread_records: list[dict[str, object]] = []
                 child_ids: set[int] = set()
                 for child_record in children:
                     if (
@@ -3616,70 +4012,25 @@ class RepositoryContractTest(unittest.TestCase):
                     ):
                         return "inconclusive"
                     child_ids.add(child_record["id"])
-                    expected_thread_records.append(
-                        {
-                            "child_id": child_record["id"],
-                            "thread_id": child_record["thread_id"],
-                            "is_resolved": child_record["thread_resolved"],
-                            "pull_request_review_id": artifact_id,
-                        }
-                    )
-                if not report_typed_equal(
-                    thread_join.get("records"), expected_thread_records
-                ):
-                    return "inconclusive"
-            elif channel == "issue-comment":
-                artifact_id = artifact["id"]
                 if (
-                    set(artifact)
-                    != {
-                        "channel",
-                        "user_login",
-                        "user_type",
-                        "app_slug",
-                        "body",
-                        "normalized_body",
-                        "id",
-                        "api_url",
-                        "url",
-                        "created_at",
-                        "updated_at",
-                        "server_time",
-                        "server_time_field",
-                        "parsed_commit",
-                    }
-                    or artifact.get("api_url")
-                    != (
-                        "https://api.github.com/repos/OWNER/REPO/issues/comments/"
-                        f"{artifact_id}"
+                    _review_thread_findings_from_raw(
+                        children,
+                        thread_pages,
+                        repository="OWNER/REPO",
+                        pull_request=1,
+                        parent_review_id=artifact_id,
                     )
-                    or artifact.get("url")
-                    != (
-                        "https://github.com/OWNER/REPO/pull/1"
-                        f"#issuecomment-{artifact_id}"
-                    )
-                    or artifact.get("app_slug") != "chatgpt-codex-connector"
-                    or type(artifact.get("created_at")) is not int
-                    or artifact.get("created_at") != 100
-                    or type(artifact.get("updated_at")) is not int
-                    or artifact.get("updated_at") != 100
-                    or type(artifact.get("server_time")) is not int
-                    or artifact.get("server_time") != 100
-                    or artifact.get("server_time_field") != "created_at"
-                    or artifact.get("parsed_commit") != current_sha
+                    is None
                 ):
                     return "inconclusive"
             else:
                 return "inconclusive"
 
             classified = classify(artifact)
-            expected_kind = (
-                "pull-request-review" if channel == "review" else "issue-comment"
-            )
             expected_selection = selection_snapshot_for(artifact, classified)
             if (
                 classified not in ("clean", "findings")
-                or report.get("kind") != expected_kind
+                or report.get("kind") != "pull-request-review"
                 or report.get("claimed_outcome") != classified
                 or not report_typed_equal(selection, expected_selection)
             ):
@@ -3691,10 +4042,6 @@ class RepositoryContractTest(unittest.TestCase):
             classify_terminal_report(clean_review_report),
             "clean",
         )
-        self.assertEqual(
-            classify_terminal_report(terminal_report(clean_issue, "clean")),
-            "clean",
-        )
         inline_finding_report = terminal_report(
             approved_with_inline_finding,
             "findings",
@@ -3704,19 +4051,19 @@ class RepositoryContractTest(unittest.TestCase):
             "findings",
         )
 
-        boolean_child_parent_report_record = clone(inline_parent)
-        boolean_child_parent_report_record["id"] = 1
-        boolean_child_parent_report_record["children"][0]["pull_request_review_id"] = (
-            True
-        )
+        boolean_child_parent_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_snapshot = boolean_child_parent_report["artifact"][snapshot_name]
+            artifact_snapshot["children"][0]["pull_request_review_id"] = True
+            artifact_snapshot["associated_inline_comments"]["records"][0][
+                "pull_request_review_id"
+            ] = True
         self.assertEqual(
-            classify_terminal_report(
-                terminal_report(boolean_child_parent_report_record, "findings")
-            ),
+            classify_terminal_report(boolean_child_parent_report),
             "inconclusive",
         )
 
-        for child_field in ("normalized_body", "thread_id", "thread_resolved"):
+        for child_field in ("normalized_body",):
             incomplete_child_report = clone(inline_finding_report)
             for snapshot_name in ("initial_snapshot", "final_snapshot"):
                 artifact_snapshot = incomplete_child_report["artifact"][snapshot_name]
@@ -3730,31 +4077,110 @@ class RepositoryContractTest(unittest.TestCase):
                     "inconclusive",
                 )
 
-        mismatched_child_thread_report = clone(inline_finding_report)
+        orphan_thread_report = clone(inline_finding_report)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
-            report_child = mismatched_child_thread_report["artifact"][snapshot_name][
-                "children"
-            ][0]
-            report_child["thread_id"] = "PRRT_different"
-            associated_child = mismatched_child_thread_report["artifact"][
-                snapshot_name
-            ]["associated_inline_comments"]["records"][0]
-            associated_child["thread_id"] = "PRRT_different"
+            raw_comment = orphan_thread_report["artifact"][snapshot_name][
+                "review_thread_pages"
+            ]["pages"][0]["nodes"][0]["comments"]["pages"][0]["nodes"][0]
+            raw_comment["fullDatabaseId"] = "999999999"
         self.assertEqual(
-            classify_terminal_report(mismatched_child_thread_report),
+            classify_terminal_report(orphan_thread_report),
             "inconclusive",
         )
+
+        raw_join_near_misses: dict[str, dict[str, object]] = {}
+        raw_url_conflict = clone(inline_finding_report)
+        raw_parent_conflict = clone(inline_finding_report)
+        raw_duplicate_mapping = clone(inline_finding_report)
+        raw_cursor_conflict = clone(inline_finding_report)
+        raw_incomplete_pagination = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            raw_url_conflict["artifact"][snapshot_name]["review_thread_pages"]["pages"][
+                0
+            ]["nodes"][0]["comments"]["pages"][0]["nodes"][0][
+                "url"
+            ] = "https://github.com/OWNER/REPO/pull/1#discussion_r999999999"
+            raw_parent_conflict["artifact"][snapshot_name]["review_thread_pages"][
+                "pages"
+            ][0]["nodes"][0]["comments"]["pages"][0]["nodes"][0]["pullRequestReview"][
+                "fullDatabaseId"
+            ] = str(review_id + 1)
+            duplicate_node = clone(
+                raw_duplicate_mapping["artifact"][snapshot_name]["review_thread_pages"][
+                    "pages"
+                ][0]["nodes"][0]
+            )
+            duplicate_node["id"] = "PRRT_duplicate"
+            raw_duplicate_mapping["artifact"][snapshot_name]["review_thread_pages"][
+                "pages"
+            ][0]["nodes"].append(duplicate_node)
+            raw_cursor_conflict["artifact"][snapshot_name]["review_thread_pages"][
+                "pages"
+            ][0]["after"] = "unexpected"
+            raw_incomplete_pagination["artifact"][snapshot_name]["review_thread_pages"][
+                "pagination_complete"
+            ] = False
+        raw_join_near_misses.update(
+            {
+                "url-conflict": raw_url_conflict,
+                "parent-review-conflict": raw_parent_conflict,
+                "duplicate-mapping": raw_duplicate_mapping,
+                "cursor-conflict": raw_cursor_conflict,
+                "pagination-incomplete": raw_incomplete_pagination,
+            }
+        )
+        for name, raw_join_near_miss in raw_join_near_misses.items():
+            with self.subTest(raw_review_thread_join_near_miss=name):
+                self.assertEqual(
+                    classify_terminal_report(raw_join_near_miss),
+                    "inconclusive",
+                )
+
+        empty_thread_comments = _review_thread_pages(
+            [child],
+            parent_review_id=review_id,
+        )
+        empty_thread_comments["pages"][0]["nodes"][0]["comments"]["pages"][0][
+            "nodes"
+        ] = []
+        string_rest_child_id = clone(child)
+        string_rest_child_id["id"] = str(child["id"])
+        string_rest_parent_id = clone(child)
+        string_rest_parent_id["pull_request_review_id"] = str(review_id)
+        raw_join_direct_near_misses = {
+            "thread-without-attributable-comment": (
+                [child],
+                empty_thread_comments,
+            ),
+            "rest-child-id-as-string": (
+                [string_rest_child_id],
+                _review_thread_pages([child], parent_review_id=review_id),
+            ),
+            "rest-parent-review-id-as-string": (
+                [string_rest_parent_id],
+                _review_thread_pages([child], parent_review_id=review_id),
+            ),
+        }
+        for name, (raw_children, raw_threads) in raw_join_direct_near_misses.items():
+            with self.subTest(raw_review_thread_direct_near_miss=name):
+                self.assertIsNone(
+                    _review_thread_findings_from_raw(
+                        raw_children,
+                        raw_threads,
+                        repository="OWNER/REPO",
+                        pull_request=1,
+                        parent_review_id=review_id,
+                    )
+                )
 
         numeric_child_resolution_report = clone(inline_finding_report)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
             artifact_snapshot = numeric_child_resolution_report["artifact"][
                 snapshot_name
             ]
-            artifact_snapshot["children"][0]["thread_resolved"] = 0
-            artifact_snapshot["associated_inline_comments"]["records"][0][
-                "thread_resolved"
+            artifact_snapshot["review_thread_pages"]["pages"][0]["nodes"][0][
+                "isResolved"
             ] = 0
-            artifact_snapshot["review_thread_join"]["records"][0]["is_resolved"] = 0
         for snapshot_name in ("initial", "final"):
             numeric_child_resolution_report["selection_snapshots"][snapshot_name][
                 "thread_findings"
@@ -3790,7 +4216,7 @@ class RepositoryContractTest(unittest.TestCase):
             "inconclusive",
         )
 
-        for page_field in ("associated_inline_comments", "review_thread_join"):
+        for page_field in ("associated_inline_comments", "review_thread_pages"):
             extended_page_report = clone(inline_finding_report)
             for snapshot_name in ("initial_snapshot", "final_snapshot"):
                 extended_page_report["artifact"][snapshot_name][page_field][
@@ -3805,8 +4231,8 @@ class RepositoryContractTest(unittest.TestCase):
         extended_thread_record_report = clone(inline_finding_report)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
             extended_thread_record_report["artifact"][snapshot_name][
-                "review_thread_join"
-            ]["records"][0]["authority_override"] = True
+                "review_thread_pages"
+            ]["pages"][0]["nodes"][0]["authority_override"] = True
         self.assertEqual(
             classify_terminal_report(extended_thread_record_report),
             "inconclusive",
@@ -3894,14 +4320,6 @@ class RepositoryContractTest(unittest.TestCase):
             "inconclusive",
         )
 
-        issue_missing_app = terminal_report(clean_issue, "clean")
-        for snapshot_name in ("initial_snapshot", "final_snapshot"):
-            issue_missing_app["artifact"][snapshot_name].pop("app_slug")
-        self.assertEqual(
-            classify_terminal_report(issue_missing_app),
-            "inconclusive",
-        )
-
         terminal_report_final_drift = clone(clean_review_report)
         terminal_report_final_drift["artifact"]["final_snapshot"]["body"] = (
             "Changed body."
@@ -3969,7 +4387,7 @@ class RepositoryContractTest(unittest.TestCase):
             "selection_snapshots.initial",
             "artifact.initial_snapshot",
             "associated inline-comment page/join",
-            "every child record includes its stable id/url",
+            "every raw rest child record includes its stable id/url",
             "closed object schemas and json type identity",
             "numeric `0` / `1` are never boolean pagination or resolution values",
             "an `approved` / `no findings.` review with zero children",
@@ -4032,9 +4450,58 @@ class RepositoryContractTest(unittest.TestCase):
                 declaration_text.encode("utf-8")
             ).hexdigest(),
         }
+        declaration_api_url = str(declaration_record["api_url"])
+        declaration_raw_record = {
+            "id": declaration_artifact_id,
+            "node_id": "IC_declaration",
+            "url": declaration_api_url,
+            "html_url": declaration_record["html_url"],
+            "user": {
+                "login": exact_login,
+                "type": "Bot",
+                "node_id": "BOT_codex",
+            },
+            "performed_via_github_app": {
+                "slug": "chatgpt-codex-connector",
+                "id": 1,
+            },
+            "body": declaration_text,
+            "created_at": _format_github_rfc3339_seconds(100),
+            "updated_at": _format_github_rfc3339_seconds(100),
+            "author_association": "NONE",
+        }
+
+        def declaration_fetch_receipt(
+            server_time: int,
+        ) -> dict[str, object]:
+            date_header = email.utils.format_datetime(
+                datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                usegmt=True,
+            )
+            body_utf8 = json.dumps(
+                declaration_raw_record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return {
+                "method": "GET",
+                "request_url": declaration_api_url,
+                "status": 200,
+                "date_header": date_header,
+                "body_utf8": body_utf8,
+                "body_sha256": hashlib.sha256(body_utf8.encode("utf-8")).hexdigest(),
+            }
+
         declaration = {
             "initial_snapshot": declaration_record,
             "final_snapshot": json.loads(json.dumps(declaration_record)),
+            "initial_fetch_receipt": declaration_fetch_receipt(
+                history_as_of_server_time
+            ),
+            "final_fetch_receipt": declaration_fetch_receipt(
+                history_as_of_server_time + 60
+            ),
         }
         required_pagination = {
             "request_comments": True,
@@ -4046,6 +4513,7 @@ class RepositoryContractTest(unittest.TestCase):
         }
         required_universe_pagination = {
             "pull_requests": True,
+            "compare": True,
             "issue_comments": True,
             "reviews": True,
             "inline_comments": True,
@@ -4085,19 +4553,154 @@ class RepositoryContractTest(unittest.TestCase):
                 and all(value[key] is True for key in expected)
             )
 
-        def declaration_is_authoritative(value: object) -> bool:
+        def parse_http_date(value: object) -> int | None:
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = email.utils.parsedate_to_datetime(value)
+            except (TypeError, ValueError):
+                return None
+            if parsed is None or parsed.tzinfo is None or parsed.microsecond != 0:
+                return None
+            utc_value = parsed.astimezone(datetime.UTC)
+            if email.utils.format_datetime(utc_value, usegmt=True) != value:
+                return None
+            timestamp = utc_value.timestamp()
+            return int(timestamp) if timestamp.is_integer() and timestamp > 0 else None
+
+        def parse_declaration_fetch_receipt(
+            value: object,
+        ) -> tuple[dict[str, object], str, int] | None:
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {
+                    "method",
+                    "request_url",
+                    "status",
+                    "date_header",
+                    "body_utf8",
+                    "body_sha256",
+                }
+                or value.get("method") != "GET"
+                or value.get("request_url") != declaration_api_url
+                or type(value.get("status")) is not int
+                or value.get("status") != 200
+                or not isinstance(value.get("body_utf8"), str)
+                or value.get("body_sha256")
+                != hashlib.sha256(value["body_utf8"].encode("utf-8")).hexdigest()
+            ):
+                return None
+            response_server_time = parse_http_date(value.get("date_header"))
+            if response_server_time is None:
+                return None
+            try:
+                raw_record = json.loads(value["body_utf8"])
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(raw_record, dict):
+                return None
+            artifact_id = raw_record.get("id")
+            user = raw_record.get("user")
+            app = raw_record.get("performed_via_github_app")
+            body = raw_record.get("body")
+            created_at = _parse_github_rfc3339_seconds(raw_record.get("created_at"))
+            updated_at = _parse_github_rfc3339_seconds(raw_record.get("updated_at"))
+            if (
+                type(artifact_id) is not int
+                or artifact_id <= 0
+                or raw_record.get("url")
+                != (
+                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                    f"{artifact_id}"
+                )
+                or raw_record.get("html_url")
+                != (
+                    f"https://github.com/{current_repository}/pull/{declaration_pr}"
+                    f"#issuecomment-{artifact_id}"
+                )
+                or not isinstance(user, dict)
+                or user.get("login") != exact_login
+                or user.get("type") != "Bot"
+                or not isinstance(app, dict)
+                or app.get("slug") != "chatgpt-codex-connector"
+                or not isinstance(body, str)
+                or created_at is None
+                or updated_at is None
+                or updated_at != created_at
+            ):
+                return None
+            normalized_body = body.replace("\r\n", "\n").replace("\r", "\n")
+            try:
+                normalized_body.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return None
+            projected = {
+                "authority_kind": "exact-provider-github-artifact",
+                "repository": current_repository,
+                "pull_request": declaration_pr,
+                "artifact_id": artifact_id,
+                "api_url": raw_record["url"],
+                "html_url": raw_record["html_url"],
+                "channel": "issue-comment",
+                "user_login": user["login"],
+                "user_type": user["type"],
+                "app_slug": app["slug"],
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "server_time": created_at,
+                "server_time_field": "created_at",
+                "body": body,
+                "asserted_text": declaration_text,
+                "github_reaction_content": "+1",
+                "github_reaction_glyph": "👍",
+                "normalization": "crlf-and-cr-to-lf+utf8",
+                "normalized_sha256": hashlib.sha256(
+                    declaration_text.encode("utf-8")
+                ).hexdigest(),
+            }
+            if normalized_body.split("\n").count(declaration_text) != 1:
+                return None
+            return (projected, str(value["request_url"]), response_server_time)
+
+        def declaration_authority(
+            value: object,
+        ) -> tuple[str, int] | None:
             if not isinstance(value, dict) or set(value) != {
                 "initial_snapshot",
                 "final_snapshot",
+                "initial_fetch_receipt",
+                "final_fetch_receipt",
             }:
-                return False
+                return None
             initial = value.get("initial_snapshot")
             final = value.get("final_snapshot")
+            initial_fetch = parse_declaration_fetch_receipt(
+                value.get("initial_fetch_receipt")
+            )
+            final_fetch = parse_declaration_fetch_receipt(
+                value.get("final_fetch_receipt")
+            )
             if (
                 not isinstance(initial, dict)
                 or not isinstance(final, dict)
                 or not typed_json_equal(initial, final)
+                or initial_fetch is None
+                or final_fetch is None
+                or not typed_json_equal(initial, initial_fetch[0])
+                or not typed_json_equal(final, final_fetch[0])
+                or final_fetch[1] != initial_fetch[1]
+                or final_fetch[2] < initial_fetch[2]
             ):
+                return None
+            return (initial_fetch[1], initial_fetch[2])
+
+        def declaration_is_authoritative(value: object) -> bool:
+            if declaration_authority(value) is None:
+                return False
+            assert isinstance(value, dict)
+            final = value.get("final_snapshot")
+            if not isinstance(final, dict):
                 return False
             expected_snapshot_keys = {
                 "authority_kind",
@@ -4422,7 +5025,6 @@ class RepositoryContractTest(unittest.TestCase):
                 raise AssertionError(f"unsupported fixture outcome: {outcome}")
             if artifact_kind == "unresolved-thread-finding":
                 child_id = (artifact_id * 10) + 1
-                thread_id = f"PRRT_{artifact_id}"
                 associated_inline_comments = {
                     "pagination_complete": True,
                     "records": [
@@ -4439,29 +5041,22 @@ class RepositoryContractTest(unittest.TestCase):
                             "original_commit_id": head,
                             "body": "[P1] Fixture inline finding",
                             "normalized_body": "[P1] Fixture inline finding",
-                            "thread_id": thread_id,
                         }
                     ],
                 }
-                review_thread_join = {
-                    "pagination_complete": True,
-                    "records": [
-                        {
-                            "thread_id": thread_id,
-                            "is_resolved": False,
-                            "comment_ids": [child_id],
-                        }
-                    ],
-                }
+                review_thread_pages = _review_thread_pages(
+                    associated_inline_comments["records"],
+                    parent_review_id=artifact_id,
+                )
             else:
                 associated_inline_comments = {
                     "pagination_complete": True,
                     "records": [],
                 }
-                review_thread_join = {
-                    "pagination_complete": True,
-                    "records": [],
-                }
+                review_thread_pages = _review_thread_pages(
+                    [],
+                    parent_review_id=artifact_id,
+                )
             snapshot: dict[str, object] = {
                 "complete": True,
                 "artifact_kind": artifact_kind,
@@ -4486,11 +5081,78 @@ class RepositoryContractTest(unittest.TestCase):
                 "commit_id": head,
                 "scope": scope,
                 "associated_inline_comments": associated_inline_comments,
-                "review_thread_join": review_thread_join,
+                "review_thread_pages": review_thread_pages,
             }
-            if artifact_kind == "unresolved-thread-finding":
-                snapshot["thread_id"] = thread_id
-                snapshot["thread_resolved"] = False
+            return {
+                "initial_snapshot": clone(snapshot),
+                "final_snapshot": clone(snapshot),
+            }
+
+        def complete_issue_comment_artifact(
+            record: dict[str, object],
+            artifact_id: int,
+            server_time: int,
+            *,
+            artifact_kind: str = "terminal-payload",
+            outcome: str = "clean",
+            edited: bool = False,
+            user_login: str = exact_login,
+            user_type: str = "Bot",
+            app_slug: str = "chatgpt-codex-connector",
+        ) -> dict[str, object]:
+            scope = clone(record.get("scope"))
+            assert isinstance(scope, dict)
+            pr = scope["pr"]
+            head = scope["head"]
+            if outcome == "clean":
+                body = (
+                    "Codex Review: Didn't find any major issues.\n\n"
+                    f"**Reviewed commit:** `{head}`"
+                )
+                grammar_status = "accepted"
+            elif outcome == "findings":
+                body = (
+                    "### 💡 Codex Review\n"
+                    "- [P1] Fixture finding — "
+                    f"https://github.com/{current_repository}/blob/{head}/"
+                    "src/example.py#L1"
+                )
+                grammar_status = "accepted"
+            elif outcome == "malformed":
+                body = f"Codex Review: Finished.\n\n**Reviewed commit:** `{head}`"
+                grammar_status = "malformed"
+            else:
+                raise AssertionError(f"unsupported fixture outcome: {outcome}")
+            created_at = server_time - 1 if edited else server_time
+            snapshot = {
+                "complete": True,
+                "artifact_kind": artifact_kind,
+                "outcome": outcome,
+                "channel": "issue-comment",
+                "id": artifact_id,
+                "stable_artifact_id": artifact_id,
+                "api_url": (
+                    f"https://api.github.com/repos/{current_repository}/"
+                    f"issues/comments/{artifact_id}"
+                ),
+                "url": (
+                    f"https://github.com/{current_repository}/pull/{pr}"
+                    f"#issuecomment-{artifact_id}"
+                ),
+                "user_login": user_login,
+                "user_type": user_type,
+                "app_slug": app_slug,
+                "body": body,
+                "normalized_body": body,
+                "grammar_status": grammar_status,
+                "terminal_looking": True,
+                "created_at": created_at,
+                "updated_at": server_time,
+                "server_time": server_time,
+                "server_time_field": "updated_at" if edited else "created_at",
+                "parsed_commit": head,
+                "scope": scope,
+            }
             return {
                 "initial_snapshot": clone(snapshot),
                 "final_snapshot": clone(snapshot),
@@ -4517,9 +5179,10 @@ class RepositoryContractTest(unittest.TestCase):
             artifact_id = final.get("id")
             server_time = final.get("server_time")
             body = final.get("body")
+            normalized_body = _normalize_github_codex_body(body)
             outcome = final.get("outcome")
             channel = final.get("channel")
-            expected_snapshot_keys = {
+            common_snapshot_keys = {
                 "complete",
                 "artifact_kind",
                 "outcome",
@@ -4529,44 +5192,40 @@ class RepositoryContractTest(unittest.TestCase):
                 "url",
                 "user_login",
                 "user_type",
-                "state",
                 "body",
                 "normalized_body",
                 "grammar_status",
                 "terminal_looking",
-                "submitted_at",
                 "server_time",
                 "server_time_field",
-                "commit_id",
                 "scope",
-                "associated_inline_comments",
-                "review_thread_join",
             }
-            if expected_kind == "unresolved-thread-finding":
-                expected_snapshot_keys.update({"thread_id", "thread_resolved"})
+            review_snapshot_keys = common_snapshot_keys | {
+                "state",
+                "submitted_at",
+                "commit_id",
+                "associated_inline_comments",
+                "review_thread_pages",
+            }
+            issue_comment_snapshot_keys = common_snapshot_keys | {
+                "api_url",
+                "app_slug",
+                "created_at",
+                "updated_at",
+                "parsed_commit",
+            }
             if (
-                set(final) != expected_snapshot_keys
-                or final.get("complete") is not True
+                final.get("complete") is not True
                 or final.get("artifact_kind") != expected_kind
-                or channel != "pull-request-review"
                 or type(artifact_id) is not int
                 or artifact_id <= 0
                 or type(final.get("stable_artifact_id")) is not int
                 or final.get("stable_artifact_id") != artifact_id
-                or final.get("url")
-                != (
-                    f"https://github.com/{repository}/pull/{pr}"
-                    f"#pullrequestreview-{artifact_id}"
-                )
                 or final.get("user_login") != exact_login
                 or final.get("user_type") != "Bot"
                 or type(server_time) is not int
                 or server_time <= 0
                 or server_time > history_as_of_server_time
-                or type(final.get("submitted_at")) is not int
-                or final.get("submitted_at") != server_time
-                or final.get("server_time_field") != "submitted_at"
-                or final.get("commit_id") != head
                 or not typed_json_equal(
                     final.get("scope"),
                     {
@@ -4577,9 +5236,56 @@ class RepositoryContractTest(unittest.TestCase):
                     },
                 )
                 or not isinstance(body, str)
-                or final.get("normalized_body") != body
+                or normalized_body is None
+                or final.get("normalized_body") != normalized_body
                 or final.get("terminal_looking") is not True
             ):
+                return None
+            if channel == "pull-request-review":
+                if (
+                    set(final) != review_snapshot_keys
+                    or final.get("url")
+                    != (
+                        f"https://github.com/{repository}/pull/{pr}"
+                        f"#pullrequestreview-{artifact_id}"
+                    )
+                    or type(final.get("submitted_at")) is not int
+                    or final.get("submitted_at") != server_time
+                    or final.get("server_time_field") != "submitted_at"
+                    or final.get("commit_id") != head
+                ):
+                    return None
+            elif channel == "issue-comment":
+                created_at = final.get("created_at")
+                updated_at = final.get("updated_at")
+                expected_time = created_at if updated_at == created_at else updated_at
+                expected_time_field = (
+                    "created_at" if updated_at == created_at else "updated_at"
+                )
+                if (
+                    set(final) != issue_comment_snapshot_keys
+                    or final.get("api_url")
+                    != (
+                        f"https://api.github.com/repos/{repository}/"
+                        f"issues/comments/{artifact_id}"
+                    )
+                    or final.get("url")
+                    != (
+                        f"https://github.com/{repository}/pull/{pr}"
+                        f"#issuecomment-{artifact_id}"
+                    )
+                    or final.get("app_slug") != "chatgpt-codex-connector"
+                    or type(created_at) is not int
+                    or type(updated_at) is not int
+                    or created_at <= 0
+                    or updated_at < created_at
+                    or expected_time != server_time
+                    or final.get("server_time_field") != expected_time_field
+                    or final.get("parsed_commit") != head
+                    or not _github_codex_issue_terminal_looking(normalized_body)
+                ):
+                    return None
+            else:
                 return None
 
             expected_finding = (
@@ -4588,28 +5294,70 @@ class RepositoryContractTest(unittest.TestCase):
                 f"https://github.com/{repository}/blob/{head}/"
                 "src/example.py#L1"
             )
-            clean_grammar = (
-                outcome == "clean"
-                and final.get("state") == "APPROVED"
-                and body == "No findings."
-                and final.get("grammar_status") == "accepted"
+            issue_semantic, issue_commit = (
+                _github_codex_issue_body_semantic(
+                    body,
+                    repository=str(repository),
+                    head=str(head),
+                )
+                if channel == "issue-comment"
+                else ("nonterminal", None)
+            )
+            clean_grammar = outcome == "clean" and (
+                (
+                    channel == "pull-request-review"
+                    and final.get("state") == "APPROVED"
+                    and body == "No findings."
+                    and final.get("grammar_status") == "accepted"
+                )
+                or (
+                    channel == "issue-comment"
+                    and issue_semantic == "clean"
+                    and issue_commit == head
+                    and final.get("grammar_status") == "accepted"
+                )
             )
             finding_grammar = (
                 outcome == "findings"
-                and final.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
-                and body == expected_finding
+                and (
+                    (
+                        channel == "pull-request-review"
+                        and final.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
+                    )
+                    or (
+                        channel == "issue-comment"
+                        and issue_semantic == "findings"
+                        and issue_commit == head
+                    )
+                )
+                and (
+                    body == expected_finding
+                    if channel == "pull-request-review"
+                    else True
+                )
                 and final.get("grammar_status") == "accepted"
             )
             inline_finding_grammar = (
-                outcome == "findings"
+                channel == "pull-request-review"
+                and outcome == "findings"
                 and final.get("state") == "COMMENTED"
                 and body == ""
                 and final.get("grammar_status") == "accepted"
             )
             malformed_grammar = (
                 outcome == "malformed"
-                and final.get("state") == "APPROVED"
-                and body == "Looks good."
+                and (
+                    (
+                        channel == "pull-request-review"
+                        and final.get("state") == "APPROVED"
+                        and body == "Looks good."
+                    )
+                    or (
+                        channel == "issue-comment"
+                        and issue_semantic == "malformed"
+                        and issue_commit is None
+                    )
+                )
                 and final.get("grammar_status") == "malformed"
             )
             if expected_kind == "terminal-payload":
@@ -4619,17 +5367,27 @@ class RepositoryContractTest(unittest.TestCase):
                 if not malformed_grammar:
                     return None
             elif expected_kind == "active-top-level-finding":
-                if not finding_grammar:
+                if channel != "issue-comment" or not finding_grammar:
                     return None
             elif expected_kind == "unresolved-thread-finding":
+                if channel != "pull-request-review":
+                    return None
                 child_id = (artifact_id * 10) + 1
-                thread_id = f"PRRT_{artifact_id}"
+                associated = final.get("associated_inline_comments")
+                children = (
+                    associated.get("records") if isinstance(associated, dict) else None
+                )
+                thread_findings = _review_thread_findings_from_raw(
+                    children,
+                    final.get("review_thread_pages"),
+                    repository=str(repository),
+                    pull_request=int(pr),
+                    parent_review_id=artifact_id,
+                )
                 if (
                     not inline_finding_grammar
-                    or final.get("thread_id") != thread_id
-                    or final.get("thread_resolved") is not False
                     or not typed_json_equal(
-                        final.get("associated_inline_comments"),
+                        associated,
                         {
                             "pagination_complete": True,
                             "records": [
@@ -4646,36 +5404,35 @@ class RepositoryContractTest(unittest.TestCase):
                                     "original_commit_id": head,
                                     "body": "[P1] Fixture inline finding",
                                     "normalized_body": "[P1] Fixture inline finding",
-                                    "thread_id": thread_id,
                                 }
                             ],
                         },
                     )
-                    or not typed_json_equal(
-                        final.get("review_thread_join"),
-                        {
-                            "pagination_complete": True,
-                            "records": [
-                                {
-                                    "thread_id": thread_id,
-                                    "is_resolved": False,
-                                    "comment_ids": [child_id],
-                                }
-                            ],
-                        },
-                    )
+                    or not isinstance(thread_findings, list)
+                    or len(thread_findings) != 1
+                    or thread_findings[0]["is_resolved"] is not False
                 ):
                     return None
             else:
                 return None
-            if expected_kind != "unresolved-thread-finding" and (
-                not typed_json_equal(
-                    final.get("associated_inline_comments"),
-                    {"pagination_complete": True, "records": []},
-                )
-                or not typed_json_equal(
-                    final.get("review_thread_join"),
-                    {"pagination_complete": True, "records": []},
+            if (
+                channel == "pull-request-review"
+                and expected_kind != "unresolved-thread-finding"
+                and (
+                    not typed_json_equal(
+                        final.get("associated_inline_comments"),
+                        {"pagination_complete": True, "records": []},
+                    )
+                    or not typed_json_equal(
+                        _review_thread_findings_from_raw(
+                            [],
+                            final.get("review_thread_pages"),
+                            repository=str(repository),
+                            pull_request=int(pr),
+                            parent_review_id=artifact_id,
+                        ),
+                        [],
+                    )
                 )
             ):
                 return None
@@ -4888,7 +5645,7 @@ class RepositoryContractTest(unittest.TestCase):
             artifact_bases: list[tuple[int, int, str, str, str]] = []
             artifacts_by_native_id: dict[tuple[str, int], dict[str, object]] = {}
             artifact_semantics_by_time_id: dict[
-                tuple[int, int], tuple[str, str, str]
+                tuple[str, int, int], tuple[str, str]
             ] = {}
             for field, kind in artifact_fields.items():
                 artifacts = evidence_state.get(field)
@@ -4917,8 +5674,8 @@ class RepositoryContractTest(unittest.TestCase):
                         previous_artifact, final_artifact_snapshot
                     ):
                         return None
-                    semantics_key = (server_time, stable_artifact_id)
-                    semantics = (validated_kind, outcome, channel)
+                    semantics_key = (channel, server_time, stable_artifact_id)
+                    semantics = (validated_kind, outcome)
                     previous_semantics = artifact_semantics_by_time_id.get(
                         semantics_key
                     )
@@ -5075,18 +5832,27 @@ class RepositoryContractTest(unittest.TestCase):
                 latest_artifacts = [
                     item for item in artifact_bases if item[0] == latest_artifact_time
                 ]
+                if len({item[4] for item in latest_artifacts}) != 1:
+                    return None
 
                 def artifact_precedence(
                     item: tuple[int, int, str, str, str],
-                ) -> tuple[int, int]:
-                    _, artifact_id, artifact_kind, outcome, _ = item
+                ) -> int:
+                    _, _, artifact_kind, outcome, _ = item
                     if artifact_kind == "malformed-terminal-artifact":
-                        priority = 3
+                        return 3
                     elif outcome == "findings":
-                        priority = 2
-                    else:
-                        priority = 1
-                    return (priority, artifact_id)
+                        return 2
+                    return 1
+
+                highest_priority = max(
+                    artifact_precedence(item) for item in latest_artifacts
+                )
+                priority_artifacts = [
+                    item
+                    for item in latest_artifacts
+                    if artifact_precedence(item) == highest_priority
+                ]
 
                 (
                     server_time,
@@ -5094,7 +5860,7 @@ class RepositoryContractTest(unittest.TestCase):
                     kind,
                     _,
                     _,
-                ) = max(latest_artifacts, key=artifact_precedence)
+                ) = max(priority_artifacts, key=lambda item: item[1])
             else:
                 if not request_times or not exact_provider_reactions:
                     return None
@@ -5143,9 +5909,167 @@ class RepositoryContractTest(unittest.TestCase):
         def current_lifecycle_is_eligible(record: dict[str, object]) -> bool:
             return lifecycle_is_typed(record, require_open=True)
 
-        def universe_inventory(
+        def artifact_source_bundle(
+            snapshot: dict[str, object],
+        ) -> object:
+            channel = snapshot.get("channel")
+            if channel == "issue-comment":
+                projected_issue = project_raw_issue_record(
+                    raw_issue_artifact_record(snapshot)
+                )
+                return (
+                    projected_issue
+                    if projected_issue is not None
+                    else {"invalid_issue_projection": clone(snapshot)}
+                )
+            if channel != "pull-request-review":
+                return {"invalid_channel": clone(channel)}
+            projected_review = project_raw_review_record(raw_review_record(snapshot))
+            associated = snapshot.get("associated_inline_comments")
+            inline_comments = (
+                associated.get("records") if isinstance(associated, dict) else None
+            )
+            projected_inline_comments = (
+                [
+                    project_raw_inline_record(raw_inline_record(item))
+                    for item in inline_comments
+                ]
+                if isinstance(inline_comments, list)
+                else None
+            )
+            thread_pages = snapshot.get("review_thread_pages")
+            pages = (
+                thread_pages.get("pages") if isinstance(thread_pages, dict) else None
+            )
+            thread_nodes: list[object] = []
+            if isinstance(pages, list):
+                for page in pages:
+                    nodes = page.get("nodes") if isinstance(page, dict) else None
+                    if isinstance(nodes, list):
+                        thread_nodes.extend(clone(nodes))
+                    else:
+                        thread_nodes.append({"invalid_nodes": clone(nodes)})
+            return {
+                "artifact": (
+                    projected_review
+                    if projected_review is not None
+                    else {"invalid_review_projection": clone(snapshot)}
+                ),
+                "inline_comments": clone(projected_inline_comments),
+                "review_threads": thread_nodes,
+            }
+
+        def candidate_source_evidence(
+            candidate: dict[str, object],
+            ordering_key: tuple[int, int] | None,
+        ) -> dict[str, object] | None:
+            basis = candidate.get("candidate_basis")
+            if ordering_key is None or not isinstance(basis, dict):
+                return None
+            basis_kind = basis.get("kind")
+            server_time, stable_artifact_id = ordering_key
+            if basis_kind == "reaction":
+                reactions = candidate.get("reactions")
+                if not isinstance(reactions, list):
+                    return None
+                descriptors: list[dict[str, object]] = []
+                for raw_reaction in reactions:
+                    if (
+                        not isinstance(raw_reaction, dict)
+                        or raw_reaction.get("id") != stable_artifact_id
+                        or raw_reaction.get("created_at") != server_time
+                    ):
+                        continue
+                    parent_comment_id = raw_reaction.get("parent_request_id")
+                    parent_api_url = raw_reaction.get("parent_reactions_api_url")
+                    if type(parent_comment_id) is not int or not isinstance(
+                        parent_api_url, str
+                    ):
+                        return None
+                    projected_reaction = project_raw_reaction_record(
+                        raw_reaction_record(raw_reaction)
+                    )
+                    if projected_reaction is None:
+                        return None
+                    source_bundle = {
+                        "parent_comment_id": parent_comment_id,
+                        "reaction": projected_reaction,
+                    }
+                    descriptors.append(
+                        {
+                            "carrier": "reaction",
+                            "channel": "request-reaction",
+                            "semantic": clone(raw_reaction.get("content")),
+                            "native_identity": [
+                                parent_api_url,
+                                stable_artifact_id,
+                            ],
+                            "source_record_sha256": hashlib.sha256(
+                                canonical_raw_body(source_bundle).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                    )
+                if not descriptors or any(
+                    not typed_json_equal(descriptors[0], item)
+                    for item in descriptors[1:]
+                ):
+                    return None
+                return descriptors[0]
+
+            artifact_field_by_kind = {
+                "terminal-payload": "terminal_payloads",
+                "malformed-terminal-artifact": "malformed_terminal_artifacts",
+                "active-top-level-finding": "active_top_level_findings",
+                "unresolved-thread-finding": "unresolved_thread_findings",
+            }
+            artifact_field = artifact_field_by_kind.get(basis_kind)
+            evidence_state = candidate.get("evidence_state")
+            candidate_scope_key = scope_key(candidate)
+            if (
+                artifact_field is None
+                or not isinstance(evidence_state, dict)
+                or candidate_scope_key is None
+                or not isinstance(evidence_state.get(artifact_field), list)
+            ):
+                return None
+            descriptors = []
+            for artifact in evidence_state[artifact_field]:
+                validated = validate_candidate_artifact(
+                    artifact,
+                    expected_kind=str(basis_kind),
+                    expected_scope=candidate_scope_key,
+                )
+                if (
+                    validated is None
+                    or validated[0] != server_time
+                    or validated[1] != stable_artifact_id
+                    or not isinstance(artifact, dict)
+                    or not isinstance(artifact.get("final_snapshot"), dict)
+                ):
+                    continue
+                final = artifact["final_snapshot"]
+                channel = validated[4]
+                source_bundle = artifact_source_bundle(final)
+                descriptors.append(
+                    {
+                        "carrier": "terminal-artifact",
+                        "channel": channel,
+                        "semantic": validated[3],
+                        "native_identity": [channel, stable_artifact_id],
+                        "source_record_sha256": hashlib.sha256(
+                            canonical_raw_body(source_bundle).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
+            if not descriptors or any(
+                not typed_json_equal(descriptors[0], item) for item in descriptors[1:]
+            ):
+                return None
+            return descriptors[0]
+
+        def derived_inventory_entries(
             candidates: list[dict[str, object]],
-        ) -> dict[str, object]:
+        ) -> list[dict[str, object]]:
             entries: list[dict[str, object]] = []
             for candidate in candidates:
                 candidate_scope_key = scope_key(candidate)
@@ -5157,18 +6081,1500 @@ class RepositoryContractTest(unittest.TestCase):
                             if candidate_scope_key is not None
                             else None
                         ),
-                        "candidate_basis": clone(candidate.get("candidate_basis")),
-                        "validated_ordering_key": (
+                        "source_ordering_key": (
                             list(ordering_key) if ordering_key is not None else None
+                        ),
+                        "source_evidence": candidate_source_evidence(
+                            candidate,
+                            ordering_key,
                         ),
                     }
                 )
+            return entries
+
+        def canonical_raw_body(value: object) -> str:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+
+        def raw_page(
+            *,
+            request_url: str,
+            body: object,
+            link_header: str | None = None,
+            request_after: str | None = None,
+        ) -> dict[str, object]:
+            body_utf8 = canonical_raw_body(body)
+            return {
+                "request_url": request_url,
+                "status": 200,
+                "link_header": link_header,
+                "request_after": request_after,
+                "body_utf8": body_utf8,
+                "body_sha256": hashlib.sha256(body_utf8.encode("utf-8")).hexdigest(),
+            }
+
+        def rest_fetch(
+            kind: str,
+            request_url: str,
+            records: list[object],
+            *,
+            parent_comment_id: int | None = None,
+            direct_object: bool = False,
+        ) -> dict[str, object]:
+            if direct_object:
+                chunks = [records[0] if records else {}]
+            else:
+                chunks = [
+                    records[index : index + 1] for index in range(0, len(records), 1)
+                ] or [[]]
+            pages: list[dict[str, object]] = []
+            for index, chunk in enumerate(chunks):
+                page_number = index + 1
+                page_url = (
+                    request_url
+                    if page_number == 1
+                    else f"{request_url}&page={page_number}"
+                )
+                next_url = (
+                    f"{request_url}&page={page_number + 1}"
+                    if page_number < len(chunks)
+                    else None
+                )
+                pages.append(
+                    raw_page(
+                        request_url=page_url,
+                        body=chunk,
+                        link_header=(
+                            f'<{next_url}>; rel="next"'
+                            if next_url is not None
+                            else None
+                        ),
+                    )
+                )
+            return {
+                "kind": kind,
+                "transport": "rest",
+                "parent_comment_id": parent_comment_id,
+                "pages": pages,
+            }
+
+        def raw_graphql_thread_node_from_internal(
+            node: object,
+        ) -> dict[str, object]:
+            if not isinstance(node, dict):
+                return {"invalid_internal_thread": clone(node)}
+            comments = node.get("comments")
+            pages = comments.get("pages") if isinstance(comments, dict) else None
+            if (
+                set(node) != {"id", "isResolved", "isOutdated", "comments"}
+                or not isinstance(comments, dict)
+                or set(comments) != {"pagination_complete", "pages"}
+                or comments.get("pagination_complete") is not True
+                or not isinstance(pages, list)
+                or len(pages) != 1
+                or not isinstance(pages[0], dict)
+                or set(pages[0]) != {"after", "nodes", "pageInfo"}
+                or pages[0].get("after") is not None
+                or not isinstance(pages[0].get("nodes"), list)
+                or not isinstance(pages[0].get("pageInfo"), dict)
+                or set(pages[0]["pageInfo"]) != {"hasNextPage", "endCursor"}
+                or pages[0]["pageInfo"].get("hasNextPage") is not False
+                or pages[0]["pageInfo"].get("endCursor") is not None
+            ):
+                return {"invalid_internal_thread": clone(node)}
+            return {
+                "id": clone(node.get("id")),
+                "isResolved": clone(node.get("isResolved")),
+                "isOutdated": clone(node.get("isOutdated")),
+                "comments": {
+                    "nodes": clone(pages[0]["nodes"]),
+                    "pageInfo": clone(pages[0]["pageInfo"]),
+                },
+            }
+
+        def graphql_thread_fetch(
+            nodes: list[dict[str, object]],
+        ) -> dict[str, object]:
+            raw_nodes = [raw_graphql_thread_node_from_internal(node) for node in nodes]
+            chunks = [
+                raw_nodes[index : index + 1] for index in range(0, len(raw_nodes), 1)
+            ] or [[]]
+            pages: list[dict[str, object]] = []
+            request_after: str | None = None
+            for index, chunk in enumerate(chunks):
+                has_next = index < len(chunks) - 1
+                end_cursor = f"THREAD_CURSOR_{index + 1}" if has_next else None
+                body = {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewThreads": {
+                                    "nodes": chunk,
+                                    "pageInfo": {
+                                        "hasNextPage": has_next,
+                                        "endCursor": end_cursor,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+                pages.append(
+                    raw_page(
+                        request_url="https://api.github.com/graphql",
+                        body=body,
+                        request_after=request_after,
+                    )
+                )
+                request_after = end_cursor
+            return {
+                "kind": "review_threads",
+                "transport": "graphql",
+                "parent_comment_id": None,
+                "pages": pages,
+            }
+
+        def raw_review_record(snapshot: object) -> dict[str, object]:
+            if not isinstance(snapshot, dict):
+                return {"invalid_snapshot": clone(snapshot)}
+            return {
+                "id": clone(snapshot.get("id")),
+                "node_id": f"PRR_{snapshot.get('id')}",
+                "html_url": clone(snapshot.get("url")),
+                "user": {
+                    "login": clone(snapshot.get("user_login")),
+                    "type": clone(snapshot.get("user_type")),
+                    "node_id": "BOT_codex",
+                },
+                "state": clone(snapshot.get("state")),
+                "body": clone(snapshot.get("body")),
+                "submitted_at": _format_github_rfc3339_seconds(
+                    snapshot.get("submitted_at")
+                ),
+                "commit_id": clone(snapshot.get("commit_id")),
+                "author_association": "NONE",
+            }
+
+        def project_raw_review_record(
+            value: object,
+        ) -> dict[str, object] | None:
+            if not isinstance(value, dict):
+                return None
+            review_id = value.get("id")
+            user = value.get("user")
+            submitted_at = _parse_github_rfc3339_seconds(value.get("submitted_at"))
+            if (
+                type(review_id) is not int
+                or review_id <= 0
+                or not isinstance(value.get("html_url"), str)
+                or not isinstance(user, dict)
+                or not isinstance(user.get("login"), str)
+                or not isinstance(user.get("type"), str)
+                or not isinstance(value.get("state"), str)
+                or not isinstance(value.get("body"), str)
+                or submitted_at is None
+                or not isinstance(value.get("commit_id"), str)
+            ):
+                return None
+            return {
+                "id": review_id,
+                "html_url": value["html_url"],
+                "user": {
+                    "login": user["login"],
+                    "type": user["type"],
+                },
+                "state": value["state"],
+                "body": value["body"],
+                "submitted_at": submitted_at,
+                "commit_id": value["commit_id"],
+            }
+
+        def raw_issue_artifact_record(snapshot: object) -> dict[str, object]:
+            if not isinstance(snapshot, dict):
+                return {"invalid_snapshot": clone(snapshot)}
+            return {
+                "id": clone(snapshot.get("id")),
+                "node_id": f"IC_{snapshot.get('id')}",
+                "url": clone(snapshot.get("api_url")),
+                "html_url": clone(snapshot.get("url")),
+                "user": {
+                    "login": clone(snapshot.get("user_login")),
+                    "type": clone(snapshot.get("user_type")),
+                    "node_id": "BOT_codex",
+                },
+                "performed_via_github_app": {
+                    "slug": clone(snapshot.get("app_slug")),
+                    "id": 1,
+                },
+                "body": clone(snapshot.get("body")),
+                "created_at": _format_github_rfc3339_seconds(
+                    snapshot.get("created_at")
+                ),
+                "updated_at": _format_github_rfc3339_seconds(
+                    snapshot.get("updated_at")
+                ),
+                "author_association": "NONE",
+            }
+
+        def raw_request_record(value: object) -> dict[str, object]:
+            if not isinstance(value, dict):
+                return {"invalid_request": clone(value)}
+            return {
+                "id": clone(value.get("id")),
+                "node_id": f"IC_{value.get('id')}",
+                "url": (
+                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                    f"{value.get('id')}"
+                ),
+                "html_url": clone(value.get("url")),
+                "body": clone(value.get("normalized_body")),
+                "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
+                "updated_at": _format_github_rfc3339_seconds(value.get("updated_at")),
+                "user": {
+                    "login": "fixture-requester",
+                    "type": "User",
+                    "node_id": "U_requester",
+                },
+                "performed_via_github_app": None,
+                "author_association": "CONTRIBUTOR",
+            }
+
+        def project_raw_issue_record(
+            value: object,
+        ) -> dict[str, object] | None:
+            if not isinstance(value, dict):
+                return None
+            issue_id = value.get("id")
+            user = value.get("user")
+            app = value.get("performed_via_github_app")
+            created_at = _parse_github_rfc3339_seconds(value.get("created_at"))
+            updated_at = _parse_github_rfc3339_seconds(value.get("updated_at"))
+            if (
+                type(issue_id) is not int
+                or issue_id <= 0
+                or not isinstance(value.get("url"), str)
+                or not isinstance(value.get("html_url"), str)
+                or not isinstance(user, dict)
+                or not isinstance(user.get("login"), str)
+                or not isinstance(user.get("type"), str)
+                or not isinstance(value.get("body"), str)
+                or created_at is None
+                or updated_at is None
+                or updated_at < created_at
+                or (
+                    app is not None
+                    and (
+                        not isinstance(app, dict)
+                        or not isinstance(app.get("slug"), str)
+                    )
+                )
+            ):
+                return None
+            return {
+                "id": issue_id,
+                "url": value["url"],
+                "html_url": value["html_url"],
+                "user": {
+                    "login": user["login"],
+                    "type": user["type"],
+                },
+                "app_slug": app["slug"] if isinstance(app, dict) else None,
+                "body": value["body"],
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+
+        def raw_reaction_record(value: object) -> dict[str, object]:
+            if not isinstance(value, dict):
+                return {"invalid_reaction": clone(value)}
+            return {
+                "id": clone(value.get("id")),
+                "node_id": f"REACTION_{value.get('id')}",
+                "content": clone(value.get("content")),
+                "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
+                "user": {
+                    "login": clone(value.get("user_login")),
+                    "type": clone(value.get("user_type")),
+                    "node_id": "BOT_codex",
+                },
+            }
+
+        def project_raw_reaction_record(
+            value: object,
+        ) -> dict[str, object] | None:
+            if not isinstance(value, dict):
+                return None
+            reaction_id = value.get("id")
+            user = value.get("user")
+            created_at = _parse_github_rfc3339_seconds(value.get("created_at"))
+            if (
+                type(reaction_id) is not int
+                or reaction_id <= 0
+                or not isinstance(value.get("content"), str)
+                or created_at is None
+                or not isinstance(user, dict)
+                or not isinstance(user.get("login"), str)
+                or not isinstance(user.get("type"), str)
+            ):
+                return None
+            return {
+                "id": reaction_id,
+                "content": value["content"],
+                "created_at": created_at,
+                "user": {
+                    "login": user["login"],
+                    "type": user["type"],
+                },
+            }
+
+        def raw_inline_record(value: object) -> dict[str, object]:
+            if not isinstance(value, dict):
+                return {"invalid_inline": clone(value)}
+            return {
+                "id": clone(value.get("id")),
+                "node_id": f"PRRC_{value.get('id')}",
+                "html_url": clone(value.get("url")),
+                "pull_request_review_id": clone(value.get("pull_request_review_id")),
+                "commit_id": clone(value.get("commit_id")),
+                "original_commit_id": clone(value.get("original_commit_id")),
+                "body": clone(value.get("body")),
+                "user": {
+                    "login": clone(value.get("user_login")),
+                    "type": clone(value.get("user_type")),
+                    "node_id": "BOT_codex",
+                },
+                "author_association": "NONE",
+            }
+
+        def project_raw_inline_record(
+            value: object,
+        ) -> dict[str, object] | None:
+            if not isinstance(value, dict):
+                return None
+            inline_id = value.get("id")
+            parent_review_id = value.get("pull_request_review_id")
+            user = value.get("user")
+            body = value.get("body")
+            normalized_body = _normalize_github_codex_body(body)
+            if (
+                type(inline_id) is not int
+                or inline_id <= 0
+                or type(parent_review_id) is not int
+                or parent_review_id <= 0
+                or not isinstance(value.get("html_url"), str)
+                or not isinstance(user, dict)
+                or not isinstance(user.get("login"), str)
+                or not isinstance(user.get("type"), str)
+                or not isinstance(value.get("commit_id"), str)
+                or not isinstance(value.get("original_commit_id"), str)
+                or not isinstance(body, str)
+                or normalized_body is None
+            ):
+                return None
+            return {
+                "id": inline_id,
+                "url": value["html_url"],
+                "user_login": user["login"],
+                "user_type": user["type"],
+                "pull_request_review_id": parent_review_id,
+                "commit_id": value["commit_id"],
+                "original_commit_id": value["original_commit_id"],
+                "body": body,
+                "normalized_body": normalized_body,
+            }
+
+        def build_discovery_endpoint_transcript(
+            candidates: list[dict[str, object]],
+        ) -> dict[str, object]:
+            scope_transcripts: list[dict[str, object]] = []
+            for candidate in candidates:
+                raw_scope = candidate.get("scope")
+                raw_lifecycle = candidate.get("lifecycle")
+                scope = raw_scope if isinstance(raw_scope, dict) else {}
+                lifecycle = raw_lifecycle if isinstance(raw_lifecycle, dict) else {}
+                repository = scope.get("repository")
+                pr = scope.get("pr")
+                merge_base = scope.get("pr_merge_base")
+                head = scope.get("head")
+                base_oid = (
+                    f"{pr + 100_000:040x}" if type(pr) is int and pr > 0 else "0" * 40
+                )
+                pull_record = {
+                    "number": clone(pr),
+                    "base": {
+                        "sha": base_oid,
+                        "ref": "master",
+                    },
+                    "head": {
+                        "sha": clone(head),
+                        "ref": f"fixture-{pr}",
+                    },
+                    "state": clone(lifecycle.get("state")),
+                    "merged": clone(lifecycle.get("merged")),
+                    "merged_at": clone(lifecycle.get("merged_at")),
+                    "merge_commit_sha": "f" * 40,
+                    "node_id": f"PR_{pr}",
+                }
+                compare_record = {
+                    "base_commit": {"sha": base_oid},
+                    "merge_base_commit": {"sha": clone(merge_base)},
+                    "status": "ahead",
+                    "ahead_by": 1,
+                }
+                if isinstance(repository, str) and type(pr) is int:
+                    api_root = f"https://api.github.com/repos/{repository}"
+                else:
+                    api_root = "https://api.github.com/repos/INVALID/INVALID"
+                requests = candidate.get("requests")
+                raw_requests = requests if isinstance(requests, list) else []
+                reactions = candidate.get("reactions")
+                raw_reactions = reactions if isinstance(reactions, list) else []
+                issue_records = [raw_request_record(item) for item in raw_requests]
+                review_records: list[dict[str, object]] = []
+                inline_records: list[object] = []
+                thread_nodes: list[dict[str, object]] = []
+                evidence_state = candidate.get("evidence_state")
+                if isinstance(evidence_state, dict):
+                    for field in (
+                        "terminal_payloads",
+                        "malformed_terminal_artifacts",
+                        "active_top_level_findings",
+                        "unresolved_thread_findings",
+                    ):
+                        artifacts = evidence_state.get(field)
+                        if not isinstance(artifacts, list):
+                            continue
+                        for artifact in artifacts:
+                            final = (
+                                artifact.get("final_snapshot")
+                                if isinstance(artifact, dict)
+                                else None
+                            )
+                            channel = (
+                                final.get("channel")
+                                if isinstance(final, dict)
+                                else None
+                            )
+                            if channel == "issue-comment":
+                                issue_records.append(raw_issue_artifact_record(final))
+                            elif channel == "pull-request-review":
+                                review_records.append(raw_review_record(final))
+                                associated = (
+                                    final.get("associated_inline_comments")
+                                    if isinstance(final, dict)
+                                    else None
+                                )
+                                child_records = (
+                                    associated.get("records")
+                                    if isinstance(associated, dict)
+                                    else None
+                                )
+                                if isinstance(child_records, list):
+                                    inline_records.extend(
+                                        raw_inline_record(item)
+                                        for item in child_records
+                                    )
+                                thread_pages = (
+                                    final.get("review_thread_pages")
+                                    if isinstance(final, dict)
+                                    else None
+                                )
+                                pages = (
+                                    thread_pages.get("pages")
+                                    if isinstance(thread_pages, dict)
+                                    else None
+                                )
+                                if isinstance(pages, list):
+                                    for page in pages:
+                                        nodes = (
+                                            page.get("nodes")
+                                            if isinstance(page, dict)
+                                            else None
+                                        )
+                                        if isinstance(nodes, list):
+                                            thread_nodes.extend(clone(nodes))
+
+                pull_url = f"{api_root}/pulls/{pr}?per_page=100"
+                compare_url = f"{api_root}/compare/{base_oid}...{head}"
+                issue_url = f"{api_root}/issues/{pr}/comments?per_page=100"
+                reviews_url = f"{api_root}/pulls/{pr}/reviews?per_page=100"
+                inline_url = f"{api_root}/pulls/{pr}/comments?per_page=100"
+                fetches = [
+                    rest_fetch(
+                        "pull_requests",
+                        pull_url,
+                        [pull_record],
+                        direct_object=True,
+                    ),
+                    rest_fetch(
+                        "compare",
+                        compare_url,
+                        [compare_record],
+                        direct_object=True,
+                    ),
+                    rest_fetch("issue_comments", issue_url, issue_records),
+                    rest_fetch("reviews", reviews_url, review_records),
+                    rest_fetch("inline_comments", inline_url, inline_records),
+                    graphql_thread_fetch(thread_nodes),
+                ]
+                request_ids: list[int | None] = []
+                for raw_request in raw_requests:
+                    request_id = (
+                        raw_request.get("id") if isinstance(raw_request, dict) else None
+                    )
+                    request_ids.append(request_id if type(request_id) is int else None)
+                for request_id in request_ids:
+                    matching_reactions = [
+                        raw_reaction_record(item)
+                        for item in raw_reactions
+                        if isinstance(item, dict)
+                        and item.get("parent_request_id") == request_id
+                    ]
+                    fetches.append(
+                        rest_fetch(
+                            "request_reactions",
+                            (
+                                f"{api_root}/issues/comments/{request_id}/"
+                                "reactions?per_page=100"
+                            ),
+                            matching_reactions,
+                            parent_comment_id=request_id,
+                        )
+                    )
+                scope_transcripts.append({"fetches": fetches})
+            return {
+                "schema_version": 2,
+                "repository": current_repository,
+                "scopes": scope_transcripts,
+            }
+
+        def parse_rest_pages(
+            fetch: object,
+            *,
+            expected_kind: str,
+            expected_url: str,
+        ) -> list[object] | None:
+            if (
+                not isinstance(fetch, dict)
+                or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
+                or fetch.get("kind") != expected_kind
+                or fetch.get("transport") != "rest"
+                or not isinstance(fetch.get("pages"), list)
+                or not fetch["pages"]
+            ):
+                return None
+
+            def next_link(value: object) -> str | None | bool:
+                if value is None:
+                    return None
+                if not isinstance(value, str) or not value:
+                    return False
+                links: dict[str, str] = {}
+                for raw_part in value.split(","):
+                    match = re.fullmatch(
+                        r'\s*<([^<>]+)>\s*;\s*rel="([^"]+)"\s*',
+                        raw_part,
+                    )
+                    if match is None:
+                        return False
+                    link_url, relation = match.groups()
+                    if relation in links or not link_url:
+                        return False
+                    links[relation] = link_url
+                return links.get("next")
+
+            records: list[object] = []
+            pages = fetch["pages"]
+            page_url = expected_url
+            seen_page_urls: set[str] = set()
+            for index, page in enumerate(pages):
+                if (
+                    not isinstance(page, dict)
+                    or set(page)
+                    != {
+                        "request_url",
+                        "status",
+                        "link_header",
+                        "request_after",
+                        "body_utf8",
+                        "body_sha256",
+                    }
+                    or page.get("request_url") != page_url
+                    or page_url in seen_page_urls
+                    or type(page.get("status")) is not int
+                    or page.get("status") != 200
+                    or page.get("request_after") is not None
+                    or not isinstance(page.get("body_utf8"), str)
+                    or page.get("body_sha256")
+                    != hashlib.sha256(page["body_utf8"].encode("utf-8")).hexdigest()
+                ):
+                    return None
+                seen_page_urls.add(page_url)
+                next_url = next_link(page.get("link_header"))
+                if (
+                    next_url is False
+                    or (index < len(pages) - 1 and not isinstance(next_url, str))
+                    or (index == len(pages) - 1 and next_url is not None)
+                ):
+                    return None
+                try:
+                    body = json.loads(page["body_utf8"])
+                except (TypeError, ValueError):
+                    return None
+                if isinstance(body, list):
+                    records.extend(body)
+                elif len(pages) == 1:
+                    records.append(body)
+                else:
+                    return None
+                if isinstance(next_url, str):
+                    page_url = next_url
+            return records
+
+        def parse_graphql_thread_pages(
+            fetch: object,
+        ) -> list[dict[str, object]] | None:
+            if (
+                not isinstance(fetch, dict)
+                or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
+                or fetch.get("kind") != "review_threads"
+                or fetch.get("transport") != "graphql"
+                or fetch.get("parent_comment_id") is not None
+                or not isinstance(fetch.get("pages"), list)
+                or not fetch["pages"]
+            ):
+                return None
+            expected_after: str | None = None
+            nodes: list[dict[str, object]] = []
+            pages = fetch["pages"]
+            for index, page in enumerate(pages):
+                if (
+                    not isinstance(page, dict)
+                    or set(page)
+                    != {
+                        "request_url",
+                        "status",
+                        "link_header",
+                        "request_after",
+                        "body_utf8",
+                        "body_sha256",
+                    }
+                    or page.get("request_url") != "https://api.github.com/graphql"
+                    or type(page.get("status")) is not int
+                    or page.get("status") != 200
+                    or page.get("link_header") is not None
+                    or page.get("request_after") != expected_after
+                    or not isinstance(page.get("body_utf8"), str)
+                    or page.get("body_sha256")
+                    != hashlib.sha256(page["body_utf8"].encode("utf-8")).hexdigest()
+                ):
+                    return None
+                try:
+                    body = json.loads(page["body_utf8"])
+                    connection = body["data"]["repository"]["pullRequest"][
+                        "reviewThreads"
+                    ]
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if (
+                    not isinstance(connection, dict)
+                    or set(connection) != {"nodes", "pageInfo"}
+                    or not isinstance(connection.get("nodes"), list)
+                    or not isinstance(connection.get("pageInfo"), dict)
+                    or set(connection["pageInfo"]) != {"hasNextPage", "endCursor"}
+                    or type(connection["pageInfo"].get("hasNextPage")) is not bool
+                ):
+                    return None
+                has_next = connection["pageInfo"]["hasNextPage"]
+                end_cursor = connection["pageInfo"].get("endCursor")
+                if has_next:
+                    if (
+                        index == len(pages) - 1
+                        or not isinstance(end_cursor, str)
+                        or not end_cursor
+                    ):
+                        return None
+                    expected_after = end_cursor
+                elif index != len(pages) - 1 or end_cursor is not None:
+                    return None
+                else:
+                    expected_after = None
+                for raw_node in connection["nodes"]:
+                    if (
+                        not isinstance(raw_node, dict)
+                        or set(raw_node)
+                        != {"id", "isResolved", "isOutdated", "comments"}
+                        or type(raw_node.get("isResolved")) is not bool
+                        or type(raw_node.get("isOutdated")) is not bool
+                    ):
+                        return None
+                    raw_comments = raw_node.get("comments")
+                    if (
+                        not isinstance(raw_comments, dict)
+                        or set(raw_comments) != {"nodes", "pageInfo"}
+                        or not isinstance(raw_comments.get("nodes"), list)
+                        or not isinstance(raw_comments.get("pageInfo"), dict)
+                        or set(raw_comments["pageInfo"]) != {"hasNextPage", "endCursor"}
+                        or raw_comments["pageInfo"].get("hasNextPage") is not False
+                        or raw_comments["pageInfo"].get("endCursor") is not None
+                    ):
+                        return None
+                    nodes.append(
+                        {
+                            "id": clone(raw_node.get("id")),
+                            "isResolved": raw_node["isResolved"],
+                            "isOutdated": raw_node["isOutdated"],
+                            "comments": {
+                                "pagination_complete": True,
+                                "pages": [
+                                    {
+                                        "after": None,
+                                        "nodes": clone(raw_comments["nodes"]),
+                                        "pageInfo": clone(raw_comments["pageInfo"]),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+            return nodes
+
+        graphql_shape_child = {
+            "id": 990_001,
+            "url": (
+                f"https://github.com/{current_repository}/pull/{current_pr}"
+                "#discussion_r990001"
+            ),
+        }
+        graphql_shape_internal = _review_thread_pages(
+            [graphql_shape_child],
+            parent_review_id=990_002,
+        )["pages"][0]["nodes"][0]
+        assert isinstance(graphql_shape_internal, dict)
+        graphql_shape_fetch = graphql_thread_fetch([graphql_shape_internal])
+        graphql_shape_body = json.loads(graphql_shape_fetch["pages"][0]["body_utf8"])
+        graphql_shape_raw_node = graphql_shape_body["data"]["repository"][
+            "pullRequest"
+        ]["reviewThreads"]["nodes"][0]
+        self.assertEqual(
+            set(graphql_shape_raw_node["comments"]),
+            {"nodes", "pageInfo"},
+        )
+        self.assertNotIn("pagination_complete", graphql_shape_raw_node["comments"])
+        self.assertNotIn("pages", graphql_shape_raw_node["comments"])
+        parsed_graphql_shape = parse_graphql_thread_pages(graphql_shape_fetch)
+        self.assertIsNotNone(parsed_graphql_shape)
+        assert parsed_graphql_shape is not None
+        self.assertTrue(
+            typed_json_equal(parsed_graphql_shape, [graphql_shape_internal])
+        )
+
+        legacy_graphql_shape = clone(graphql_shape_fetch)
+        assert isinstance(legacy_graphql_shape, dict)
+        legacy_page = legacy_graphql_shape["pages"][0]
+        legacy_body = json.loads(legacy_page["body_utf8"])
+        legacy_node = legacy_body["data"]["repository"]["pullRequest"]["reviewThreads"][
+            "nodes"
+        ][0]
+        legacy_node["comments"] = clone(graphql_shape_internal["comments"])
+        legacy_page["body_utf8"] = canonical_raw_body(legacy_body)
+        legacy_page["body_sha256"] = hashlib.sha256(
+            legacy_page["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        self.assertIsNone(parse_graphql_thread_pages(legacy_graphql_shape))
+
+        incomplete_nested_graphql = clone(graphql_shape_fetch)
+        assert isinstance(incomplete_nested_graphql, dict)
+        incomplete_page = incomplete_nested_graphql["pages"][0]
+        incomplete_body = json.loads(incomplete_page["body_utf8"])
+        incomplete_comments = incomplete_body["data"]["repository"]["pullRequest"][
+            "reviewThreads"
+        ]["nodes"][0]["comments"]
+        incomplete_comments["pageInfo"] = {
+            "hasNextPage": True,
+            "endCursor": "COMMENT_CURSOR_1",
+        }
+        incomplete_page["body_utf8"] = canonical_raw_body(incomplete_body)
+        incomplete_page["body_sha256"] = hashlib.sha256(
+            incomplete_page["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        self.assertIsNone(parse_graphql_thread_pages(incomplete_nested_graphql))
+
+        def parse_discovery_endpoint_transcript(
+            value: object,
+        ) -> list[dict[str, object]] | None:
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"schema_version", "repository", "scopes"}
+                or type(value.get("schema_version")) is not int
+                or value.get("schema_version") != 2
+                or value.get("repository") != current_repository
+                or not isinstance(value.get("scopes"), list)
+            ):
+                return None
+            entries: list[dict[str, object]] = []
+            seen_scopes: set[tuple[object, ...]] = set()
+            for scope_transcript in value["scopes"]:
+                if (
+                    not isinstance(scope_transcript, dict)
+                    or set(scope_transcript) != {"fetches"}
+                    or not isinstance(scope_transcript.get("fetches"), list)
+                ):
+                    return None
+                fetches = scope_transcript["fetches"]
+                by_kind: dict[str, list[dict[str, object]]] = {}
+                for fetch in fetches:
+                    if not isinstance(fetch, dict):
+                        return None
+                    kind = fetch.get("kind")
+                    if not isinstance(kind, str):
+                        return None
+                    by_kind.setdefault(kind, []).append(fetch)
+                singleton_kinds = set(required_universe_pagination) - {
+                    "request_reactions"
+                }
+                if not singleton_kinds.issubset(by_kind) or set(by_kind) - set(
+                    required_universe_pagination
+                ):
+                    return None
+                if any(len(by_kind[kind]) != 1 for kind in singleton_kinds):
+                    return None
+                pull_fetch = by_kind["pull_requests"][0]
+                pull_pages = pull_fetch.get("pages")
+                if not isinstance(pull_pages, list) or not pull_pages:
+                    return None
+                first_pull_page = pull_pages[0]
+                first_pull_url = (
+                    first_pull_page.get("request_url")
+                    if isinstance(first_pull_page, dict)
+                    else None
+                )
+                if (
+                    not isinstance(first_pull_url, str)
+                    or re.fullmatch(
+                        (
+                            r"https://api\.github\.com/repos/"
+                            r"([^/]+/[^/]+)/pulls/([1-9][0-9]*)"
+                            r"\?per_page=100"
+                        ),
+                        first_pull_url,
+                    )
+                    is None
+                ):
+                    return None
+                pull_match = re.fullmatch(
+                    (
+                        r"https://api\.github\.com/repos/"
+                        r"([^/]+/[^/]+)/pulls/([1-9][0-9]*)"
+                        r"\?per_page=100"
+                    ),
+                    first_pull_url,
+                )
+                assert pull_match is not None
+                repository = pull_match.group(1)
+                pr = int(pull_match.group(2))
+                if repository != current_repository:
+                    return None
+                api_root = f"https://api.github.com/repos/{repository}"
+                pull_records = parse_rest_pages(
+                    pull_fetch,
+                    expected_kind="pull_requests",
+                    expected_url=f"{api_root}/pulls/{pr}?per_page=100",
+                )
+                if (
+                    not isinstance(pull_records, list)
+                    or len(pull_records) != 1
+                    or not isinstance(pull_records[0], dict)
+                ):
+                    return None
+                pull_record = pull_records[0]
+                base = pull_record.get("base")
+                pull_head = pull_record.get("head")
+                base_oid = base.get("sha") if isinstance(base, dict) else None
+                head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                if (
+                    type(pull_record.get("number")) is not int
+                    or pull_record.get("number") != pr
+                    or not isinstance(base_oid, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                    or not isinstance(head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                    or pull_record.get("state") not in {"open", "closed"}
+                    or type(pull_record.get("merged")) is not bool
+                    or (
+                        pull_record.get("state") == "open"
+                        and (
+                            pull_record.get("merged") is not False
+                            or pull_record.get("merged_at") is not None
+                        )
+                    )
+                ):
+                    return None
+                compare_records = parse_rest_pages(
+                    by_kind["compare"][0],
+                    expected_kind="compare",
+                    expected_url=f"{api_root}/compare/{base_oid}...{head}",
+                )
+                if (
+                    not isinstance(compare_records, list)
+                    or len(compare_records) != 1
+                    or not isinstance(compare_records[0], dict)
+                ):
+                    return None
+                compare_record = compare_records[0]
+                base_commit = compare_record.get("base_commit")
+                merge_base_commit = compare_record.get("merge_base_commit")
+                merge_base = (
+                    merge_base_commit.get("sha")
+                    if isinstance(merge_base_commit, dict)
+                    else None
+                )
+                if (
+                    not isinstance(base_commit, dict)
+                    or base_commit.get("sha") != base_oid
+                    or not isinstance(merge_base, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
+                ):
+                    return None
+                parsed_scope = (repository, pr, merge_base, head)
+                if parsed_scope in seen_scopes:
+                    return None
+                seen_scopes.add(parsed_scope)
+
+                issue_records = parse_rest_pages(
+                    by_kind["issue_comments"][0],
+                    expected_kind="issue_comments",
+                    expected_url=(f"{api_root}/issues/{pr}/comments?per_page=100"),
+                )
+                review_records = parse_rest_pages(
+                    by_kind["reviews"][0],
+                    expected_kind="reviews",
+                    expected_url=f"{api_root}/pulls/{pr}/reviews?per_page=100",
+                )
+                inline_records = parse_rest_pages(
+                    by_kind["inline_comments"][0],
+                    expected_kind="inline_comments",
+                    expected_url=f"{api_root}/pulls/{pr}/comments?per_page=100",
+                )
+                thread_nodes = parse_graphql_thread_pages(by_kind["review_threads"][0])
+                if not all(
+                    isinstance(records, list)
+                    for records in (
+                        issue_records,
+                        review_records,
+                        inline_records,
+                        thread_nodes,
+                    )
+                ):
+                    return None
+                assert issue_records is not None
+                assert review_records is not None
+                assert inline_records is not None
+                assert thread_nodes is not None
+
+                def raw_actor(value: object) -> str:
+                    if not isinstance(value, dict):
+                        return "ambiguous"
+                    login = value.get("login")
+                    user_type = value.get("type")
+                    if login == exact_login and user_type == "Bot":
+                        return "exact"
+                    if (
+                        isinstance(login, str)
+                        and login
+                        and login != exact_login
+                        and user_type == "User"
+                    ):
+                        return "different"
+                    if (
+                        isinstance(login, str)
+                        and login
+                        and login != exact_login
+                        and user_type == "Bot"
+                        and "codex" not in login.casefold()
+                    ):
+                        return "different"
+                    return "ambiguous"
+
+                request_times: dict[int, int] = {}
+                issue_artifacts: list[dict[str, object]] = []
+                seen_issue_ids: set[int] = set()
+                for raw_issue in issue_records:
+                    projected_issue = project_raw_issue_record(raw_issue)
+                    if projected_issue is None:
+                        return None
+                    issue_id = projected_issue.get("id")
+                    if type(issue_id) is not int or issue_id <= 0:
+                        return None
+                    if issue_id in seen_issue_ids:
+                        return None
+                    seen_issue_ids.add(issue_id)
+                    body = projected_issue.get("body")
+                    created_at = projected_issue.get("created_at")
+                    updated_at = projected_issue.get("updated_at")
+                    if (
+                        not isinstance(body, str)
+                        or type(created_at) is not int
+                        or type(updated_at) is not int
+                        or created_at <= 0
+                        or updated_at < created_at
+                        or updated_at > history_as_of_server_time
+                    ):
+                        return None
+                    if body == "@codex review":
+                        if (
+                            projected_issue.get("url")
+                            != f"{api_root}/issues/comments/{issue_id}"
+                            or projected_issue.get("html_url")
+                            != (
+                                f"https://github.com/{repository}/pull/{pr}"
+                                f"#issuecomment-{issue_id}"
+                            )
+                        ):
+                            return None
+                        request_times[issue_id] = (
+                            created_at if updated_at == created_at else updated_at
+                        )
+                    else:
+                        normalized_issue = _normalize_github_codex_body(body)
+                        if normalized_issue is None:
+                            return None
+                        terminal_looking = _github_codex_issue_terminal_looking(
+                            normalized_issue
+                        )
+                        actor = raw_actor(projected_issue.get("user"))
+                        if not terminal_looking:
+                            continue
+                        if actor == "different":
+                            continue
+                        if actor != "exact":
+                            return None
+                        if (
+                            projected_issue.get("app_slug") != "chatgpt-codex-connector"
+                            or projected_issue.get("url")
+                            != f"{api_root}/issues/comments/{issue_id}"
+                            or projected_issue.get("html_url")
+                            != (
+                                f"https://github.com/{repository}/pull/{pr}"
+                                f"#issuecomment-{issue_id}"
+                            )
+                        ):
+                            return None
+                        issue_artifacts.append(projected_issue)
+
+                reaction_records: list[dict[str, object]] = []
+                reaction_fetches = by_kind.get("request_reactions", [])
+                if len(reaction_fetches) != len(request_times):
+                    return None
+                seen_reaction_parents: set[int] = set()
+                for reaction_fetch in reaction_fetches:
+                    parent_comment_id = reaction_fetch.get("parent_comment_id")
+                    if (
+                        type(parent_comment_id) is not int
+                        or parent_comment_id not in request_times
+                        or parent_comment_id in seen_reaction_parents
+                    ):
+                        return None
+                    seen_reaction_parents.add(parent_comment_id)
+                    reactions_for_parent = parse_rest_pages(
+                        reaction_fetch,
+                        expected_kind="request_reactions",
+                        expected_url=(
+                            f"{api_root}/issues/comments/{parent_comment_id}/"
+                            "reactions?per_page=100"
+                        ),
+                    )
+                    if reactions_for_parent is None:
+                        return None
+                    for raw_reaction in reactions_for_parent:
+                        projected_reaction = project_raw_reaction_record(raw_reaction)
+                        if projected_reaction is None:
+                            return None
+                        projected_reaction["parent_comment_id"] = parent_comment_id
+                        reaction_records.append(projected_reaction)
+
+                review_by_id: dict[int, dict[str, object]] = {}
+                other_review_ids: set[int] = set()
+                seen_review_ids: set[int] = set()
+                for raw_review in review_records:
+                    projected_review = project_raw_review_record(raw_review)
+                    if projected_review is None:
+                        return None
+                    review_id = projected_review.get("id")
+                    if (
+                        type(review_id) is not int
+                        or review_id <= 0
+                        or review_id in seen_review_ids
+                        or type(projected_review.get("submitted_at")) is not int
+                        or projected_review["submitted_at"] <= 0
+                        or projected_review["submitted_at"] > history_as_of_server_time
+                    ):
+                        return None
+                    seen_review_ids.add(review_id)
+                    actor = raw_actor(projected_review.get("user"))
+                    if actor == "different":
+                        other_review_ids.add(review_id)
+                        continue
+                    if actor != "exact":
+                        return None
+                    if projected_review.get("state") == "PENDING":
+                        other_review_ids.add(review_id)
+                        continue
+                    review_by_id[review_id] = projected_review
+                thread_nodes_by_review: dict[int, list[dict[str, object]]] = {
+                    review_id: [] for review_id in review_by_id
+                }
+                for thread in thread_nodes:
+                    if not isinstance(thread, dict):
+                        return None
+                    comments = thread.get("comments")
+                    pages = (
+                        comments.get("pages") if isinstance(comments, dict) else None
+                    )
+                    parent_ids: set[str] = set()
+                    if not isinstance(pages, list):
+                        return None
+                    for page in pages:
+                        nodes = page.get("nodes") if isinstance(page, dict) else None
+                        if not isinstance(nodes, list):
+                            return None
+                        for comment in nodes:
+                            parent = (
+                                comment.get("pullRequestReview")
+                                if isinstance(comment, dict)
+                                else None
+                            )
+                            parent_id = (
+                                parent.get("fullDatabaseId")
+                                if isinstance(parent, dict)
+                                else None
+                            )
+                            canonical_parent = _canonical_positive_decimal(parent_id)
+                            if canonical_parent is None:
+                                return None
+                            parent_ids.add(canonical_parent)
+                    if len(parent_ids) != 1:
+                        return None
+                    review_id = int(next(iter(parent_ids)))
+                    if review_id in other_review_ids:
+                        continue
+                    if review_id not in thread_nodes_by_review:
+                        return None
+                    thread_nodes_by_review[review_id].append(thread)
+
+                inline_by_review: dict[int, list[dict[str, object]]] = {
+                    review_id: [] for review_id in review_by_id
+                }
+                for raw_inline in inline_records:
+                    if not isinstance(raw_inline, dict):
+                        return None
+                    parent_id = raw_inline.get("pull_request_review_id")
+                    if type(parent_id) is not int:
+                        return None
+                    if parent_id in other_review_ids:
+                        continue
+                    if parent_id not in inline_by_review:
+                        return None
+                    projected_inline = project_raw_inline_record(raw_inline)
+                    if projected_inline is None:
+                        return None
+                    inline_by_review[parent_id].append(projected_inline)
+
+                artifact_bases: list[tuple[int, int, str, str, str]] = []
+                for review_id, raw_review in review_by_id.items():
+                    user = raw_review.get("user")
+                    submitted_at = raw_review.get("submitted_at")
+                    if (
+                        raw_actor(user) != "exact"
+                        or type(submitted_at) is not int
+                        or submitted_at <= 0
+                        or submitted_at > history_as_of_server_time
+                        or raw_review.get("html_url")
+                        != (
+                            f"https://github.com/{repository}/pull/{pr}"
+                            f"#pullrequestreview-{review_id}"
+                        )
+                        or raw_review.get("commit_id") != head
+                    ):
+                        return None
+                    per_review_threads = {
+                        "endpoint": "https://api.github.com/graphql",
+                        "pagination_complete": True,
+                        "pages": [
+                            {
+                                "after": None,
+                                "nodes": thread_nodes_by_review[review_id],
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                            }
+                        ],
+                    }
+                    joined = _review_thread_findings_from_raw(
+                        inline_by_review[review_id],
+                        per_review_threads,
+                        repository=repository,
+                        pull_request=pr,
+                        parent_review_id=review_id,
+                    )
+                    if joined is None:
+                        return None
+                    body = raw_review.get("body")
+                    state = raw_review.get("state")
+                    if any(finding.get("is_resolved") is False for finding in joined):
+                        semantic = "findings"
+                    elif body == "No findings." and state == "APPROVED":
+                        semantic = "clean"
+                    elif (
+                        isinstance(body, str)
+                        and body.startswith("### 💡 Codex Review\n")
+                        and state in {"COMMENTED", "CHANGES_REQUESTED"}
+                    ):
+                        semantic = "findings"
+                    else:
+                        semantic = "malformed"
+                    source_bundle = {
+                        "artifact": clone(raw_review),
+                        "inline_comments": clone(inline_by_review[review_id]),
+                        "review_threads": clone(thread_nodes_by_review[review_id]),
+                    }
+                    artifact_bases.append(
+                        (
+                            submitted_at,
+                            review_id,
+                            "pull-request-review",
+                            semantic,
+                            hashlib.sha256(
+                                canonical_raw_body(source_bundle).encode("utf-8")
+                            ).hexdigest(),
+                        )
+                    )
+
+                for raw_issue in issue_artifacts:
+                    issue_id = raw_issue["id"]
+                    user = raw_issue.get("user")
+                    created_at = raw_issue.get("created_at")
+                    updated_at = raw_issue.get("updated_at")
+                    if (
+                        type(issue_id) is not int
+                        or raw_actor(user) != "exact"
+                        or raw_issue.get("app_slug") != "chatgpt-codex-connector"
+                        or type(created_at) is not int
+                        or type(updated_at) is not int
+                        or created_at <= 0
+                        or updated_at < created_at
+                        or raw_issue.get("url")
+                        != (f"{api_root}/issues/comments/{issue_id}")
+                        or raw_issue.get("html_url")
+                        != (
+                            f"https://github.com/{repository}/pull/{pr}"
+                            f"#issuecomment-{issue_id}"
+                        )
+                    ):
+                        return None
+                    server_time = created_at if updated_at == created_at else updated_at
+                    body = raw_issue.get("body")
+                    semantic, _ = _github_codex_issue_body_semantic(
+                        body,
+                        repository=repository,
+                        head=head,
+                    )
+                    if semantic == "nonterminal":
+                        return None
+                    artifact_bases.append(
+                        (
+                            server_time,
+                            issue_id,
+                            "issue-comment",
+                            semantic,
+                            hashlib.sha256(
+                                canonical_raw_body(raw_issue).encode("utf-8")
+                            ).hexdigest(),
+                        )
+                    )
+
+                provider_reactions: list[tuple[int, int, int]] = []
+                seen_reaction_ids: set[int] = set()
+                for raw_reaction in reaction_records:
+                    reaction_id = raw_reaction.get("id")
+                    created_at = raw_reaction.get("created_at")
+                    parent_comment_id = raw_reaction.get("parent_comment_id")
+                    actor = raw_actor(raw_reaction.get("user"))
+                    if (
+                        type(reaction_id) is not int
+                        or reaction_id <= 0
+                        or reaction_id in seen_reaction_ids
+                        or type(created_at) is not int
+                        or created_at <= 0
+                        or created_at > history_as_of_server_time
+                        or type(parent_comment_id) is not int
+                        or parent_comment_id not in request_times
+                    ):
+                        return None
+                    seen_reaction_ids.add(reaction_id)
+                    if actor == "different":
+                        continue
+                    if (
+                        actor != "exact"
+                        or created_at <= request_times[parent_comment_id]
+                        or raw_reaction.get("content") not in {"+1", "eyes"}
+                    ):
+                        return None
+                    provider_reactions.append(
+                        (created_at, reaction_id, parent_comment_id)
+                    )
+
+                if artifact_bases:
+                    latest_time = max(item[0] for item in artifact_bases)
+                    latest = [item for item in artifact_bases if item[0] == latest_time]
+                    if len({item[2] for item in latest}) != 1:
+                        return None
+                    priority = {"clean": 1, "findings": 2, "malformed": 3}
+                    highest = max(priority[item[3]] for item in latest)
+                    selected = max(
+                        (item for item in latest if priority[item[3]] == highest),
+                        key=lambda item: item[1],
+                    )
+                    source_ordering_key = [selected[0], selected[1]]
+                    source_evidence = {
+                        "carrier": "terminal-artifact",
+                        "channel": selected[2],
+                        "semantic": selected[3],
+                        "native_identity": [selected[2], selected[1]],
+                        "source_record_sha256": selected[4],
+                    }
+                else:
+                    if not provider_reactions or not request_times:
+                        return None
+                    selected_reaction = max(provider_reactions)
+                    latest_request_time = max(request_times.values())
+                    latest_request_ids = [
+                        request_id
+                        for request_id, server_time in request_times.items()
+                        if server_time == latest_request_time
+                    ]
+                    if (
+                        len(latest_request_ids) != 1
+                        or selected_reaction[2] != latest_request_ids[0]
+                    ):
+                        return None
+                    source_ordering_key = [
+                        selected_reaction[0],
+                        selected_reaction[1],
+                    ]
+                    parent_comment_id = selected_reaction[2]
+                    selected_raw_reaction = next(
+                        (
+                            item
+                            for item in reaction_records
+                            if item.get("id") == selected_reaction[1]
+                            and item.get("created_at") == selected_reaction[0]
+                            and item.get("parent_comment_id") == parent_comment_id
+                        ),
+                        None,
+                    )
+                    if not isinstance(selected_raw_reaction, dict):
+                        return None
+                    raw_reaction_without_parent = clone(selected_raw_reaction)
+                    assert isinstance(raw_reaction_without_parent, dict)
+                    del raw_reaction_without_parent["parent_comment_id"]
+                    source_bundle = {
+                        "parent_comment_id": parent_comment_id,
+                        "reaction": raw_reaction_without_parent,
+                    }
+                    parent_api_url = (
+                        f"{api_root}/issues/comments/{parent_comment_id}/"
+                        "reactions?per_page=100"
+                    )
+                    source_evidence = {
+                        "carrier": "reaction",
+                        "channel": "request-reaction",
+                        "semantic": selected_raw_reaction["content"],
+                        "native_identity": [
+                            parent_api_url,
+                            selected_reaction[1],
+                        ],
+                        "source_record_sha256": hashlib.sha256(
+                            canonical_raw_body(source_bundle).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                entries.append(
+                    {
+                        "scope_key": list(parsed_scope),
+                        "source_ordering_key": source_ordering_key,
+                        "source_evidence": source_evidence,
+                    }
+                )
+            return entries
+
+        def universe_inventory(
+            candidates: list[dict[str, object]],
+        ) -> dict[str, object]:
             return {
                 "complete": True,
                 "repository": current_repository,
                 "pagination": clone(required_universe_pagination),
-                "entries": entries,
+                "discovery_endpoint_transcript": (
+                    build_discovery_endpoint_transcript(candidates)
+                ),
+                "entries": derived_inventory_entries(candidates),
             }
+
+        def validate_history_universe(
+            candidate_history: dict[str, object],
+        ) -> list[dict[str, object]] | None:
+            initial_candidates = candidate_history.get("initial_candidates")
+            final_candidates = candidate_history.get("final_candidates")
+            initial_inventory = candidate_history.get("initial_inventory")
+            final_inventory = candidate_history.get("final_inventory")
+            if (
+                not isinstance(initial_candidates, list)
+                or not isinstance(final_candidates, list)
+                or not typed_json_equal(initial_candidates, final_candidates)
+                or not isinstance(initial_inventory, dict)
+                or not isinstance(final_inventory, dict)
+                or not typed_json_equal(initial_inventory, final_inventory)
+            ):
+                return None
+            expected_inventory_fields = {
+                "complete",
+                "repository",
+                "pagination",
+                "discovery_endpoint_transcript",
+                "entries",
+            }
+            if (
+                set(initial_inventory) != expected_inventory_fields
+                or initial_inventory.get("complete") is not True
+                or initial_inventory.get("repository") != current_repository
+                or not exact_true_flags(
+                    initial_inventory.get("pagination"),
+                    required_universe_pagination,
+                )
+            ):
+                return None
+            transcript_entries = parse_discovery_endpoint_transcript(
+                initial_inventory.get("discovery_endpoint_transcript")
+            )
+            candidate_entries = derived_inventory_entries(final_candidates)
+            if (
+                transcript_entries is None
+                or not typed_json_equal(
+                    initial_inventory.get("entries"),
+                    transcript_entries,
+                )
+                or not typed_json_equal(transcript_entries, candidate_entries)
+                or type(candidate_history.get("candidate_universe_count")) is not int
+                or candidate_history.get("candidate_universe_count")
+                != len(transcript_entries)
+                or len(final_candidates) != len(transcript_entries)
+            ):
+                return None
+            return final_candidates
 
         def history(
             candidates: list[dict[str, object]],
@@ -5180,11 +7586,9 @@ class RepositoryContractTest(unittest.TestCase):
                 "complete": complete,
                 "repository": current_repository,
                 "as_of_source": "github-response-date-header",
-                "as_of_api_url": (
-                    f"https://api.github.com/repos/{current_repository}/pulls/"
-                    f"{current_pr}"
-                ),
+                "as_of_api_url": declaration_api_url,
                 "as_of_server_time": history_as_of_server_time,
+                "as_of_receipt": clone(declaration["initial_fetch_receipt"]),
                 "window_seconds": history_window_seconds,
                 "window_start_exclusive": history_start_exclusive,
                 "window_end_inclusive": history_as_of_server_time,
@@ -5194,6 +7598,38 @@ class RepositoryContractTest(unittest.TestCase):
                 "initial_candidates": clone(candidates),
                 "final_candidates": clone(candidates),
             }
+
+        def history_window_is_authoritative(
+            provider_declaration: object,
+            candidate_history: object,
+        ) -> int | None:
+            authority = declaration_authority(provider_declaration)
+            if (
+                authority is None
+                or not isinstance(provider_declaration, dict)
+                or not isinstance(candidate_history, dict)
+                or not typed_json_equal(
+                    candidate_history.get("as_of_receipt"),
+                    provider_declaration.get("initial_fetch_receipt"),
+                )
+            ):
+                return None
+            as_of_url, as_of_server_time = authority
+            if (
+                candidate_history.get("as_of_source") != "github-response-date-header"
+                or candidate_history.get("as_of_api_url") != as_of_url
+                or type(candidate_history.get("as_of_server_time")) is not int
+                or candidate_history.get("as_of_server_time") != as_of_server_time
+                or type(candidate_history.get("window_seconds")) is not int
+                or candidate_history.get("window_seconds") != history_window_seconds
+                or type(candidate_history.get("window_start_exclusive")) is not int
+                or candidate_history.get("window_start_exclusive")
+                != as_of_server_time - history_window_seconds
+                or type(candidate_history.get("window_end_inclusive")) is not int
+                or candidate_history.get("window_end_inclusive") != as_of_server_time
+            ):
+                return None
+            return as_of_server_time
 
         def compute_provider_profile(
             provider_declaration: dict[str, object] | None,
@@ -5206,6 +7642,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "as_of_source",
                 "as_of_api_url",
                 "as_of_server_time",
+                "as_of_receipt",
                 "window_seconds",
                 "window_start_exclusive",
                 "window_end_inclusive",
@@ -5215,50 +7652,21 @@ class RepositoryContractTest(unittest.TestCase):
                 "initial_candidates",
                 "final_candidates",
             }
+            profile_as_of = history_window_is_authoritative(
+                provider_declaration,
+                candidate_history,
+            )
             if (
                 not isinstance(candidate_history, dict)
                 or set(candidate_history) != expected_history_fields
                 or candidate_history.get("complete") is not True
                 or candidate_history.get("repository") != current_repository
-                or candidate_history.get("as_of_source")
-                != "github-response-date-header"
-                or candidate_history.get("as_of_api_url")
-                != (
-                    f"https://api.github.com/repos/{current_repository}/pulls/"
-                    f"{current_pr}"
-                )
-                or type(candidate_history.get("as_of_server_time")) is not int
-                or candidate_history.get("as_of_server_time")
-                != history_as_of_server_time
-                or type(candidate_history.get("window_seconds")) is not int
-                or candidate_history.get("window_seconds") != history_window_seconds
-                or type(candidate_history.get("window_start_exclusive")) is not int
-                or candidate_history.get("window_start_exclusive")
-                != history_start_exclusive
-                or type(candidate_history.get("window_end_inclusive")) is not int
-                or candidate_history.get("window_end_inclusive")
-                != history_as_of_server_time
+                or profile_as_of is None
             ):
                 return "unknown"
-            initial_candidates = candidate_history.get("initial_candidates")
-            final_candidates = candidate_history.get("final_candidates")
-            initial_inventory = candidate_history.get("initial_inventory")
-            final_inventory = candidate_history.get("final_inventory")
-            if (
-                not isinstance(initial_candidates, list)
-                or not isinstance(final_candidates, list)
-                or not typed_json_equal(initial_candidates, final_candidates)
-                or type(candidate_history.get("candidate_universe_count")) is not int
-                or candidate_history.get("candidate_universe_count")
-                != len(final_candidates)
-                or not isinstance(initial_inventory, dict)
-                or not isinstance(final_inventory, dict)
-                or not typed_json_equal(initial_inventory, final_inventory)
-                or not typed_json_equal(
-                    final_inventory,
-                    universe_inventory(final_candidates),
-                )
-            ):
+            profile_start = profile_as_of - history_window_seconds
+            final_candidates = validate_history_universe(candidate_history)
+            if final_candidates is None:
                 return "unknown"
 
             ordering_keys: set[tuple[int, int]] = set()
@@ -5291,11 +7699,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or candidate_scope_key in scope_keys
                     or ordering_key is None
                     or ordering_key in ordering_keys
-                    or not (
-                        history_start_exclusive
-                        < ordering_key[0]
-                        <= history_as_of_server_time
-                    )
+                    or not (profile_start < ordering_key[0] <= profile_as_of)
                     or not isinstance(basis, dict)
                     or candidate_carrier is None
                 ):
@@ -5315,7 +7719,7 @@ class RepositoryContractTest(unittest.TestCase):
                 not current_lifecycle_is_eligible(current)
                 or scope_key(current) != current_scope_key
                 or current_ordering_key is None
-                or current_ordering_key[0] > history_as_of_server_time
+                or current_ordering_key[0] > profile_as_of
                 or not isinstance(current_basis, dict)
                 or current_carrier is None
             ):
@@ -5361,6 +7765,10 @@ class RepositoryContractTest(unittest.TestCase):
                 return "unknown"
             if not declaration_is_authoritative(provider_declaration):
                 return "unknown"
+            fallback_as_of = history_window_is_authoritative(
+                provider_declaration,
+                candidate_history,
+            )
             if (
                 set(candidate_history)
                 != {
@@ -5369,6 +7777,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "as_of_source",
                     "as_of_api_url",
                     "as_of_server_time",
+                    "as_of_receipt",
                     "window_seconds",
                     "window_start_exclusive",
                     "window_end_inclusive",
@@ -5380,41 +7789,12 @@ class RepositoryContractTest(unittest.TestCase):
                 }
                 or candidate_history.get("complete") is not True
                 or candidate_history.get("repository") != current_repository
-                or candidate_history.get("as_of_source")
-                != "github-response-date-header"
-                or candidate_history.get("as_of_api_url")
-                != (
-                    f"https://api.github.com/repos/{current_repository}/pulls/"
-                    f"{current_pr}"
-                )
-                or type(candidate_history.get("as_of_server_time")) is not int
-                or candidate_history.get("as_of_server_time")
-                != history_as_of_server_time
-                or type(candidate_history.get("window_seconds")) is not int
-                or candidate_history.get("window_seconds") != history_window_seconds
-                or type(candidate_history.get("window_start_exclusive")) is not int
-                or candidate_history.get("window_start_exclusive")
-                != history_start_exclusive
-                or type(candidate_history.get("window_end_inclusive")) is not int
-                or candidate_history.get("window_end_inclusive")
-                != history_as_of_server_time
+                or fallback_as_of is None
             ):
                 return "unknown"
-            initial_candidates = candidate_history.get("initial_candidates")
-            candidates = candidate_history.get("final_candidates")
-            initial_inventory = candidate_history.get("initial_inventory")
-            final_inventory = candidate_history.get("final_inventory")
-            if (
-                not isinstance(initial_candidates, list)
-                or not isinstance(candidates, list)
-                or not typed_json_equal(initial_candidates, candidates)
-                or type(candidate_history.get("candidate_universe_count")) is not int
-                or candidate_history.get("candidate_universe_count") != len(candidates)
-                or not isinstance(initial_inventory, dict)
-                or not isinstance(final_inventory, dict)
-                or not typed_json_equal(initial_inventory, final_inventory)
-                or not typed_json_equal(final_inventory, universe_inventory(candidates))
-            ):
+            fallback_start = fallback_as_of - history_window_seconds
+            candidates = validate_history_universe(candidate_history)
+            if candidates is None:
                 return "unknown"
 
             ordering_keys: set[tuple[int, int]] = set()
@@ -5492,6 +7872,29 @@ class RepositoryContractTest(unittest.TestCase):
                         ):
                             return False
                         global_artifact_records[artifact_key] = final
+                        if final["channel"] == "issue-comment":
+                            issue_comment_native_record = {
+                                "kind": "provider-terminal-artifact",
+                                "repository": candidate_scope_key[0],
+                                "pull_request": candidate_scope_key[1],
+                                "api_url": final["api_url"],
+                                "html_url": final["url"],
+                                "body": final["body"],
+                            }
+                            previous_issue_comment = global_issue_comment_records.get(
+                                final["id"]
+                            )
+                            if (
+                                previous_issue_comment is not None
+                                and not typed_json_equal(
+                                    previous_issue_comment,
+                                    issue_comment_native_record,
+                                )
+                            ):
+                                return False
+                            global_issue_comment_records[final["id"]] = (
+                                issue_comment_native_record
+                            )
                 return True
 
             for candidate in candidates:
@@ -5504,11 +7907,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or candidate_scope_key == current_scope_key
                     or candidate_scope_key in historical_scope_keys
                     or ordering_key is None
-                    or not (
-                        history_start_exclusive
-                        < ordering_key[0]
-                        <= history_as_of_server_time
-                    )
+                    or not (fallback_start < ordering_key[0] <= fallback_as_of)
                 ):
                     return "unknown"
                 historical_scope_keys.add(candidate_scope_key)
@@ -5539,7 +7938,7 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 != "clean"
                 or current_ordering_key is None
-                or current_ordering_key[0] > history_as_of_server_time
+                or current_ordering_key[0] > fallback_as_of
                 or not register_global_native_records(current, current_scope_key)
             ):
                 return "unknown"
@@ -5712,6 +8111,8 @@ class RepositoryContractTest(unittest.TestCase):
             )
             if (
                 not isinstance(declaration_final, dict)
+                or candidate_history.get("as_of_api_url")
+                != declaration_final.get("api_url")
                 or selected_history is None
                 or current_provenance is None
                 or current_audit is None
@@ -5727,12 +8128,19 @@ class RepositoryContractTest(unittest.TestCase):
             provider_declaration_basis = {
                 "initial_snapshot": clone(provider_declaration["initial_snapshot"]),
                 "final_snapshot": clone(provider_declaration["final_snapshot"]),
+                "initial_fetch_receipt": clone(
+                    provider_declaration["initial_fetch_receipt"]
+                ),
+                "final_fetch_receipt": clone(
+                    provider_declaration["final_fetch_receipt"]
+                ),
                 **clone(declaration_final),
             }
             history_window = {
                 "as_of_source": candidate_history["as_of_source"],
                 "as_of_api_url": candidate_history["as_of_api_url"],
                 "as_of_server_time": candidate_history["as_of_server_time"],
+                "as_of_receipt": clone(candidate_history["as_of_receipt"]),
                 "window_seconds": candidate_history["window_seconds"],
                 "window_start_exclusive": candidate_history["window_start_exclusive"],
                 "window_end_inclusive": candidate_history["window_end_inclusive"],
@@ -6088,6 +8496,19 @@ class RepositoryContractTest(unittest.TestCase):
                 expected_scope=thread_scope,
             )
         )
+        outdated_thread_artifact = clone(valid_thread_artifact)
+        assert isinstance(outdated_thread_artifact, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            outdated_thread_artifact[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ][0]["isOutdated"] = True
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                outdated_thread_artifact,
+                expected_kind="unresolved-thread-finding",
+                expected_scope=thread_scope,
+            )
+        )
 
         thread_artifact_near_misses: dict[str, dict[str, object]] = {}
         wrong_thread_parent = clone(valid_thread_artifact)
@@ -6109,27 +8530,69 @@ class RepositoryContractTest(unittest.TestCase):
         resolved_thread_artifact = clone(valid_thread_artifact)
         assert isinstance(resolved_thread_artifact, dict)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
-            resolved_thread_artifact[snapshot_name]["thread_resolved"] = True
-            resolved_thread_artifact[snapshot_name]["review_thread_join"]["records"][0][
-                "is_resolved"
-            ] = True
+            resolved_thread_artifact[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ][0]["isResolved"] = True
         thread_artifact_near_misses["resolved-thread"] = resolved_thread_artifact
 
         orphan_thread_join = clone(valid_thread_artifact)
         assert isinstance(orphan_thread_join, dict)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
-            orphan_thread_join[snapshot_name]["review_thread_join"]["records"][0][
-                "comment_ids"
-            ] = [999_999]
+            orphan_thread_join[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ][0]["comments"]["pages"][0]["nodes"][0]["fullDatabaseId"] = "999999"
         thread_artifact_near_misses["orphan-thread-join"] = orphan_thread_join
 
         numeric_thread_pagination = clone(valid_thread_artifact)
         assert isinstance(numeric_thread_pagination, dict)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
-            numeric_thread_pagination[snapshot_name]["review_thread_join"][
+            numeric_thread_pagination[snapshot_name]["review_thread_pages"][
                 "pagination_complete"
             ] = 1
         thread_artifact_near_misses["numeric-pagination"] = numeric_thread_pagination
+
+        noncanonical_graphql_id = clone(valid_thread_artifact)
+        assert isinstance(noncanonical_graphql_id, dict)
+        raw_thread_url_conflict = clone(valid_thread_artifact)
+        assert isinstance(raw_thread_url_conflict, dict)
+        raw_thread_parent_conflict = clone(valid_thread_artifact)
+        assert isinstance(raw_thread_parent_conflict, dict)
+        duplicate_raw_mapping = clone(valid_thread_artifact)
+        assert isinstance(duplicate_raw_mapping, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            noncanonical_graphql_id[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ][0]["comments"]["pages"][0]["nodes"][0][
+                "fullDatabaseId"
+            ] = f"0{77_001 * 10 + 1}"
+            raw_thread_url_conflict[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ][0]["comments"]["pages"][0]["nodes"][0]["url"] = (
+                f"https://github.com/{current_repository}/pull/{thread_scope[1]}"
+                "#discussion_r999999"
+            )
+            raw_thread_parent_conflict[snapshot_name]["review_thread_pages"]["pages"][
+                0
+            ]["nodes"][0]["comments"]["pages"][0]["nodes"][0]["pullRequestReview"][
+                "fullDatabaseId"
+            ] = str(77_002)
+            duplicate_node = clone(
+                duplicate_raw_mapping[snapshot_name]["review_thread_pages"]["pages"][0][
+                    "nodes"
+                ][0]
+            )
+            duplicate_node["id"] = "PRRT_duplicate"
+            duplicate_raw_mapping[snapshot_name]["review_thread_pages"]["pages"][0][
+                "nodes"
+            ].append(duplicate_node)
+        thread_artifact_near_misses.update(
+            {
+                "noncanonical-graphql-id": noncanonical_graphql_id,
+                "raw-url-conflict": raw_thread_url_conflict,
+                "raw-parent-conflict": raw_thread_parent_conflict,
+                "duplicate-raw-mapping": duplicate_raw_mapping,
+            }
+        )
 
         for name, artifact in thread_artifact_near_misses.items():
             with self.subTest(unresolved_thread_artifact_near_miss=name):
@@ -6141,16 +8604,84 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 )
 
+        baseline_history = history(samples)
+        baseline_transcript = baseline_history["initial_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        baseline_fetches = baseline_transcript["scopes"][0]["fetches"]
+        baseline_issue_fetch = next(
+            fetch for fetch in baseline_fetches if fetch.get("kind") == "issue_comments"
+        )
+        baseline_reaction_fetch = next(
+            fetch
+            for fetch in baseline_fetches
+            if fetch.get("kind") == "request_reactions"
+        )
+        baseline_raw_request = json.loads(
+            baseline_issue_fetch["pages"][0]["body_utf8"]
+        )[0]
+        baseline_raw_reaction = json.loads(
+            baseline_reaction_fetch["pages"][0]["body_utf8"]
+        )[0]
+        for raw_time in (
+            baseline_raw_request["created_at"],
+            baseline_raw_request["updated_at"],
+            baseline_raw_reaction["created_at"],
+            declaration_raw_record["created_at"],
+            declaration_raw_record["updated_at"],
+        ):
+            self.assertIsInstance(raw_time, str)
+            self.assertIsNotNone(_parse_github_rfc3339_seconds(raw_time))
+        for invalid_raw_time in (
+            100,
+            True,
+            100.0,
+            "1970-01-01T00:01:40+00:00",
+            "1970-01-01T00:01:40.000Z",
+            "1970-13-01T00:01:40Z",
+        ):
+            self.assertIsNone(_parse_github_rfc3339_seconds(invalid_raw_time))
+
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(samples),
+                baseline_history,
                 current,
             ),
             "clean",
         )
         self.assertEqual(
-            compute_provider_profile(declaration, history(samples), current),
+            compute_provider_profile(declaration, baseline_history, current),
+            "thumbs-up-clean",
+        )
+        unrelated_raw_fields = history(samples)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            transcript = unrelated_raw_fields[inventory_name][
+                "discovery_endpoint_transcript"
+            ]
+            reaction_fetch = next(
+                fetch
+                for fetch in transcript["scopes"][0]["fetches"]
+                if fetch.get("kind") == "request_reactions"
+            )
+            reaction_page = reaction_fetch["pages"][0]
+            reaction_body = json.loads(reaction_page["body_utf8"])
+            reaction_body[0]["url"] = (
+                "https://api.github.com/repos/OWNER/REPO/reactions/transport-only"
+            )
+            reaction_body[0]["user"]["avatar_url"] = (
+                "https://avatars.githubusercontent.com/u/1?v=4"
+            )
+            reaction_page["body_utf8"] = canonical_raw_body(reaction_body)
+            reaction_page["body_sha256"] = hashlib.sha256(
+                reaction_page["body_utf8"].encode("utf-8")
+            ).hexdigest()
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                unrelated_raw_fields,
+                current,
+            ),
             "thumbs-up-clean",
         )
 
@@ -6159,6 +8690,8 @@ class RepositoryContractTest(unittest.TestCase):
             artifact_id: int,
             *,
             artifact_outcome: str = "clean",
+            channel: str = "pull-request-review",
+            edited: bool = False,
         ) -> dict[str, object]:
             reaction_times = [
                 item["created_at"]
@@ -6166,12 +8699,19 @@ class RepositoryContractTest(unittest.TestCase):
                 if isinstance(item, dict) and type(item.get("created_at")) is int
             ]
             terminal_time = max(reaction_times) + 1
+            artifact_builder = (
+                complete_review_artifact
+                if channel == "pull-request-review"
+                else complete_issue_comment_artifact
+            )
+            artifact_kwargs = {"edited": edited} if channel == "issue-comment" else {}
             record["evidence_state"]["terminal_payloads"] = [
-                complete_review_artifact(
+                artifact_builder(
                     record,
                     artifact_id,
                     terminal_time,
                     outcome=artifact_outcome,
+                    **artifact_kwargs,
                 )
             ]
             record["candidate_basis"] = {
@@ -6188,6 +8728,38 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_current = clone(current)
         assert isinstance(terminal_current, dict)
         with_terminal_payload(terminal_current, 80_100)
+        issue_terminal_history = clone(samples)
+        assert isinstance(issue_terminal_history, list)
+        for index, historical_record in enumerate(issue_terminal_history, start=1):
+            with_terminal_payload(
+                historical_record,
+                81_000 + index,
+                channel="issue-comment",
+                edited=index == 1,
+            )
+        requestless_terminal_history = clone(issue_terminal_history)
+        assert isinstance(requestless_terminal_history, list)
+        for historical_record in requestless_terminal_history:
+            historical_record["requests"] = []
+            historical_record["reactions"] = []
+            historical_record["selected_request_id"] = None
+            historical_record["selected_reaction_id"] = None
+            restamp(historical_record)
+        issue_terminal_current = clone(current)
+        assert isinstance(issue_terminal_current, dict)
+        with_terminal_payload(
+            issue_terminal_current,
+            81_100,
+            channel="issue-comment",
+            edited=True,
+        )
+        mixed_terminal_history = clone(terminal_history)
+        assert isinstance(mixed_terminal_history, list)
+        with_terminal_payload(
+            mixed_terminal_history[0],
+            81_200,
+            channel="issue-comment",
+        )
         profile_matrix = {
             "terminal-payload": (
                 history(terminal_history),
@@ -6219,6 +8791,30 @@ class RepositoryContractTest(unittest.TestCase):
                     ),
                     expected_profile,
                 )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                history(issue_terminal_history),
+                issue_terminal_current,
+            ),
+            "terminal-payload",
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                history(requestless_terminal_history),
+                issue_terminal_current,
+            ),
+            "terminal-payload",
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                history(mixed_terminal_history),
+                issue_terminal_current,
+            ),
+            "terminal-payload",
+        )
         self.assertEqual(
             classify_fallback(
                 declaration,
@@ -6303,16 +8899,25 @@ class RepositoryContractTest(unittest.TestCase):
                 history(terminal_history),
                 terminal_current,
                 "terminal-payload",
+                "pull-request-review",
+            ),
+            "terminal-issue-comment": (
+                history(issue_terminal_history),
+                issue_terminal_current,
+                "terminal-payload",
+                "issue-comment",
             ),
             "mixed-later-eyes": (
                 history(samples),
                 terminal_current_with_later_reactions["eyes"],
                 "mixed",
+                "pull-request-review",
             ),
             "mixed-later-plus-one": (
                 history(samples),
                 terminal_current_with_later_reactions["+1"],
                 "mixed",
+                "pull-request-review",
             ),
         }
         for (
@@ -6321,6 +8926,7 @@ class RepositoryContractTest(unittest.TestCase):
                 terminal_report_history,
                 terminal_report_current,
                 expected_terminal_profile,
+                expected_terminal_kind,
             ),
         ) in terminal_report_cases.items():
             with self.subTest(accepted_terminal_report=case_name):
@@ -6345,7 +8951,7 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     terminal_report_basis["kind"],
-                    "pull-request-review",
+                    expected_terminal_kind,
                 )
                 self.assertTrue(
                     typed_json_equal(
@@ -6428,6 +9034,125 @@ class RepositoryContractTest(unittest.TestCase):
                 declaration,
                 history(samples),
                 terminal_current,
+                normal_lane_timing,
+            )
+        )
+        issue_findings_current = clone(current)
+        assert isinstance(issue_findings_current, dict)
+        with_terminal_payload(
+            issue_findings_current,
+            81_300,
+            artifact_outcome="findings",
+            channel="issue-comment",
+        )
+        issue_findings_report = expected_report_from_inputs(
+            "accepted-terminal-findings",
+            declaration,
+            history(samples),
+            issue_findings_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(issue_findings_report)
+        assert isinstance(issue_findings_report, dict)
+        self.assertEqual(
+            issue_findings_report["evidence_basis"]["kind"],
+            "issue-comment",
+        )
+        self.assertTrue(
+            validate_complete_report(
+                issue_findings_report,
+                lane_state="accepted-terminal-findings",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=issue_findings_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+        issue_comment_near_misses: dict[str, dict[str, object]] = {}
+        wrong_issue_time_field = clone(issue_terminal_current)
+        assert isinstance(wrong_issue_time_field, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            wrong_issue_time_field["evidence_state"]["terminal_payloads"][0][
+                snapshot_name
+            ]["server_time_field"] = "created_at"
+        restamp(wrong_issue_time_field)
+        issue_comment_near_misses["edited-uses-created-at"] = wrong_issue_time_field
+
+        missing_issue_app = clone(issue_terminal_current)
+        assert isinstance(missing_issue_app, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            missing_issue_app["evidence_state"]["terminal_payloads"][0][
+                snapshot_name
+            ].pop("app_slug")
+        restamp(missing_issue_app)
+        issue_comment_near_misses["missing-app"] = missing_issue_app
+
+        wrong_issue_commit = clone(issue_terminal_current)
+        assert isinstance(wrong_issue_commit, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            wrong_issue_commit["evidence_state"]["terminal_payloads"][0][snapshot_name][
+                "parsed_commit"
+            ] = "f" * 40
+        restamp(wrong_issue_commit)
+        issue_comment_near_misses["wrong-parsed-commit"] = wrong_issue_commit
+
+        issue_final_drift = clone(issue_terminal_current)
+        assert isinstance(issue_final_drift, dict)
+        issue_final_drift["evidence_state"]["terminal_payloads"][0]["final_snapshot"][
+            "updated_at"
+        ] += 1
+        restamp(issue_final_drift)
+        issue_comment_near_misses["artifact-final-reread-drift"] = issue_final_drift
+
+        for name, issue_comment_near_miss in issue_comment_near_misses.items():
+            with self.subTest(issue_comment_terminal_near_miss=name):
+                self.assertIsNone(candidate_order_basis(issue_comment_near_miss))
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        history(samples),
+                        issue_comment_near_miss,
+                    ),
+                    "unknown",
+                )
+
+        cross_channel_clean = clone(terminal_current)
+        assert isinstance(cross_channel_clean, dict)
+        cross_channel_time = cross_channel_clean["candidate_basis"]["server_time"]
+        assert isinstance(cross_channel_time, int)
+        cross_channel_clean["evidence_state"]["terminal_payloads"].append(
+            complete_issue_comment_artifact(
+                cross_channel_clean,
+                81_400,
+                cross_channel_time,
+            )
+        )
+        restamp(cross_channel_clean)
+        self.assertIsNone(candidate_order_basis(cross_channel_clean))
+
+        cross_channel_finding = clone(terminal_current)
+        assert isinstance(cross_channel_finding, dict)
+        cross_channel_finding["evidence_state"]["terminal_payloads"].append(
+            complete_issue_comment_artifact(
+                cross_channel_finding,
+                81_401,
+                cross_channel_time,
+                outcome="findings",
+            )
+        )
+        cross_channel_finding["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": cross_channel_time,
+            "stable_artifact_id": 81_401,
+        }
+        restamp(cross_channel_finding)
+        self.assertIsNone(candidate_order_basis(cross_channel_finding))
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-findings",
+                declaration,
+                history(samples),
+                cross_channel_finding,
                 normal_lane_timing,
             )
         )
@@ -6652,8 +9377,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
         report_current = complete_basis["current"]
         report_samples = complete_basis["samples"]
+        report_declaration = complete_basis["provider_declaration"]
+        report_history_window = complete_basis["history_window"]
         assert isinstance(report_current, dict)
         assert isinstance(report_samples, list)
+        assert isinstance(report_declaration, dict)
+        assert isinstance(report_history_window, dict)
+        self.assertEqual(
+            report_history_window["as_of_api_url"],
+            report_declaration["api_url"],
+        )
+        self.assertTrue(
+            typed_json_equal(
+                report_history_window["as_of_receipt"],
+                report_declaration["initial_fetch_receipt"],
+            )
+        )
         self.assertEqual(len(report_samples), 3)
         self.assertIn("same_scope_request_audit", report_current)
         self.assertTrue(
@@ -6784,6 +9523,22 @@ class RepositoryContractTest(unittest.TestCase):
         ][0]["same_scope_request_audit"]
         report_near_misses["universe-missing-same-scope-request-audit"] = (
             missing_universe_audit
+        )
+        missing_raw_discovery_transcript = clone(complete_report)
+        assert isinstance(missing_raw_discovery_transcript, dict)
+        del missing_raw_discovery_transcript["evidence_basis"]["historical_universe"][
+            "final_inventory"
+        ]["discovery_endpoint_transcript"]
+        report_near_misses["universe-missing-raw-discovery-transcript"] = (
+            missing_raw_discovery_transcript
+        )
+        wrong_report_as_of_url = clone(complete_report)
+        assert isinstance(wrong_report_as_of_url, dict)
+        wrong_report_as_of_url["evidence_basis"]["history_window"]["as_of_api_url"] = (
+            f"https://api.github.com/repos/{current_repository}/pulls/{current_pr}"
+        )
+        report_near_misses["history-window-as-of-not-declaration-url"] = (
+            wrong_report_as_of_url
         )
         empty_samples_report = clone(complete_report)
         assert isinstance(empty_samples_report, dict)
@@ -7124,6 +9879,47 @@ class RepositoryContractTest(unittest.TestCase):
                 current,
             ),
         }
+        numeric_raw_reaction_time = history(samples)
+        shifted_raw_reaction_time = history(samples)
+        for case_history, replacement_time in (
+            (
+                numeric_raw_reaction_time,
+                samples[0]["reactions"][0]["created_at"],
+            ),
+            (
+                shifted_raw_reaction_time,
+                _format_github_rfc3339_seconds(
+                    samples[0]["reactions"][0]["created_at"] + 1
+                ),
+            ),
+        ):
+            for inventory_name in ("initial_inventory", "final_inventory"):
+                transcript = case_history[inventory_name][
+                    "discovery_endpoint_transcript"
+                ]
+                reaction_fetch = next(
+                    fetch
+                    for fetch in transcript["scopes"][0]["fetches"]
+                    if fetch.get("kind") == "request_reactions"
+                )
+                reaction_page = reaction_fetch["pages"][0]
+                reaction_body = json.loads(reaction_page["body_utf8"])
+                reaction_body[0]["created_at"] = replacement_time
+                reaction_page["body_utf8"] = canonical_raw_body(reaction_body)
+                reaction_page["body_sha256"] = hashlib.sha256(
+                    reaction_page["body_utf8"].encode("utf-8")
+                ).hexdigest()
+        invalid_cases["history-raw-numeric-reaction-time"] = (
+            declaration,
+            numeric_raw_reaction_time,
+            current,
+        )
+        invalid_cases["history-raw-time-projection-drift"] = (
+            declaration,
+            shifted_raw_reaction_time,
+            current,
+        )
+
         declaration_drift = clone(declaration)
         assert isinstance(declaration_drift, dict)
         declaration_drift["final_snapshot"]["asserted_text"] = "A changed meaning."
@@ -7206,11 +10002,108 @@ class RepositoryContractTest(unittest.TestCase):
             current,
         )
 
+        receipt_near_misses: dict[str, dict[str, object]] = {}
+        missing_initial_receipt = clone(declaration)
+        assert isinstance(missing_initial_receipt, dict)
+        missing_initial_receipt.pop("initial_fetch_receipt")
+        receipt_near_misses["missing-initial-receipt"] = missing_initial_receipt
+
+        extended_receipt = clone(declaration)
+        assert isinstance(extended_receipt, dict)
+        extended_receipt["initial_fetch_receipt"]["tls_attested"] = True
+        receipt_near_misses["unknown-receipt-field"] = extended_receipt
+
+        boolean_receipt_status = clone(declaration)
+        assert isinstance(boolean_receipt_status, dict)
+        boolean_receipt_status["initial_fetch_receipt"]["status"] = True
+        receipt_near_misses["boolean-receipt-status"] = boolean_receipt_status
+
+        numeric_declaration_raw_time = clone(declaration)
+        assert isinstance(numeric_declaration_raw_time, dict)
+        for receipt_name in ("initial_fetch_receipt", "final_fetch_receipt"):
+            receipt = numeric_declaration_raw_time[receipt_name]
+            raw_body = json.loads(receipt["body_utf8"])
+            raw_body["created_at"] = 100
+            raw_body["updated_at"] = 100
+            receipt["body_utf8"] = canonical_raw_body(raw_body)
+            receipt["body_sha256"] = hashlib.sha256(
+                receipt["body_utf8"].encode("utf-8")
+            ).hexdigest()
+        receipt_near_misses["numeric-declaration-raw-time"] = (
+            numeric_declaration_raw_time
+        )
+
+        wrong_receipt_method = clone(declaration)
+        assert isinstance(wrong_receipt_method, dict)
+        wrong_receipt_method["initial_fetch_receipt"]["method"] = "POST"
+        receipt_near_misses["wrong-receipt-method"] = wrong_receipt_method
+
+        noncanonical_receipt_date = clone(declaration)
+        assert isinstance(noncanonical_receipt_date, dict)
+        noncanonical_receipt_date["initial_fetch_receipt"]["date_header"] = (
+            "1970-02-04T17:20:00Z"
+        )
+        receipt_near_misses["noncanonical-receipt-date"] = noncanonical_receipt_date
+
+        receipt_body_hash_drift = clone(declaration)
+        assert isinstance(receipt_body_hash_drift, dict)
+        receipt_body_hash_drift["initial_fetch_receipt"]["body_sha256"] = "0" * 64
+        receipt_near_misses["receipt-body-hash-drift"] = receipt_body_hash_drift
+
+        final_receipt_time_regression = clone(declaration)
+        assert isinstance(final_receipt_time_regression, dict)
+        final_receipt_time_regression["final_fetch_receipt"]["date_header"] = (
+            email.utils.format_datetime(
+                datetime.datetime.fromtimestamp(
+                    history_as_of_server_time - 1,
+                    datetime.UTC,
+                ),
+                usegmt=True,
+            )
+        )
+        receipt_near_misses["final-receipt-time-regression"] = (
+            final_receipt_time_regression
+        )
+
+        for name, receipt_near_miss in receipt_near_misses.items():
+            invalid_cases[f"provider-declaration-{name}"] = (
+                receipt_near_miss,
+                history(samples),
+                current,
+            )
+
         wrong_history_source = history(samples)
         wrong_history_source["as_of_source"] = "local-clock"
         invalid_cases["history-untrusted-as-of-source"] = (
             declaration,
             wrong_history_source,
+            current,
+        )
+
+        final_receipt_as_of = history(samples)
+        final_receipt_server_time = parse_http_date(
+            declaration["final_fetch_receipt"]["date_header"]
+        )
+        assert isinstance(final_receipt_server_time, int)
+        final_receipt_as_of["as_of_receipt"] = clone(declaration["final_fetch_receipt"])
+        final_receipt_as_of["as_of_server_time"] = final_receipt_server_time
+        final_receipt_as_of["window_start_exclusive"] = (
+            final_receipt_server_time - history_window_seconds
+        )
+        final_receipt_as_of["window_end_inclusive"] = final_receipt_server_time
+        invalid_cases["history-window-moved-to-final-reread-date"] = (
+            declaration,
+            final_receipt_as_of,
+            current,
+        )
+
+        invented_history_as_of = history(samples)
+        invented_history_as_of["as_of_server_time"] += 30
+        invented_history_as_of["window_start_exclusive"] += 30
+        invented_history_as_of["window_end_inclusive"] += 30
+        invalid_cases["history-invented-time-with-correct-url-and-label"] = (
+            declaration,
+            invented_history_as_of,
             current,
         )
 
@@ -7258,6 +10151,309 @@ class RepositoryContractTest(unittest.TestCase):
         invalid_cases["history-truncated-with-synchronized-count"] = (
             declaration,
             truncated_candidate_universe,
+            current,
+        )
+
+        self_proving_candidate_universe = history([sample(pr) for pr in (2, 3, 4, 5)])
+        self_proving_candidate_universe["initial_candidates"].pop()
+        self_proving_candidate_universe["final_candidates"].pop()
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            self_proving_candidate_universe[snapshot_name]["entries"].pop()
+        self_proving_candidate_universe["candidate_universe_count"] = 3
+        invalid_cases["history-truncated-with-synchronized-count-and-inventory"] = (
+            declaration,
+            self_proving_candidate_universe,
+            current,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                self_proving_candidate_universe,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                self_proving_candidate_universe,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        raw_carrier_substitution = history(samples)
+        substituted_reaction_id = samples[0]["reactions"][0]["id"]
+        substituted_reaction_time = samples[0]["reactions"][0]["created_at"]
+        substituted_pr = samples[0]["scope"]["pr"]
+        assert isinstance(substituted_reaction_id, int)
+        assert isinstance(substituted_reaction_time, int)
+        assert isinstance(substituted_pr, int)
+        forged_issue_snapshot = complete_issue_comment_artifact(
+            samples[0],
+            substituted_reaction_id,
+            substituted_reaction_time,
+        )["final_snapshot"]
+        forged_issue_record = raw_issue_artifact_record(forged_issue_snapshot)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            transcript = raw_carrier_substitution[snapshot_name][
+                "discovery_endpoint_transcript"
+            ]
+            issue_fetch = transcript["scopes"][0]["fetches"][2]
+            request_record = json.loads(issue_fetch["pages"][0]["body_utf8"])[0]
+            transcript["scopes"][0]["fetches"][2] = rest_fetch(
+                "issue_comments",
+                (
+                    f"https://api.github.com/repos/{current_repository}/issues/"
+                    f"{substituted_pr}/comments?per_page=100"
+                ),
+                [request_record, forged_issue_record],
+            )
+        invalid_cases["history-raw-carrier-substitution"] = (
+            declaration,
+            raw_carrier_substitution,
+            current,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                raw_carrier_substitution,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                raw_carrier_substitution,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        background_noise_history = history(samples)
+        background_pr = samples[0]["scope"]["pr"]
+        background_head = samples[0]["scope"]["head"]
+        background_request_id = samples[0]["requests"][0]["id"]
+        assert isinstance(background_pr, int)
+        assert isinstance(background_head, str)
+        assert isinstance(background_request_id, int)
+        background_review_id = 910_001
+        background_inline_id = 910_002
+        background_issue = {
+            "id": 910_003,
+            "url": (
+                f"https://api.github.com/repos/{current_repository}/issues/"
+                "comments/910003"
+            ),
+            "html_url": (
+                f"https://github.com/{current_repository}/pull/{background_pr}"
+                "#issuecomment-910003"
+            ),
+            "body": "Human discussion.",
+            "created_at": _format_github_rfc3339_seconds(2_500_000),
+            "updated_at": _format_github_rfc3339_seconds(2_500_000),
+            "user": {"login": "octocat", "type": "User"},
+            "performed_via_github_app": None,
+        }
+        background_review = {
+            "id": background_review_id,
+            "html_url": (
+                f"https://github.com/{current_repository}/pull/{background_pr}"
+                f"#pullrequestreview-{background_review_id}"
+            ),
+            "user": {"login": "octocat", "type": "User"},
+            "state": "APPROVED",
+            "body": "Human review.",
+            "submitted_at": _format_github_rfc3339_seconds(2_500_001),
+            "commit_id": background_head,
+        }
+        background_inline = {
+            "id": background_inline_id,
+            "html_url": (
+                f"https://github.com/{current_repository}/pull/{background_pr}"
+                f"#discussion_r{background_inline_id}"
+            ),
+            "user": {"login": "octocat", "type": "User"},
+            "pull_request_review_id": background_review_id,
+            "commit_id": background_head,
+            "original_commit_id": background_head,
+            "body": "Human inline discussion.",
+        }
+        background_thread = _review_thread_pages(
+            [
+                {
+                    "id": background_inline_id,
+                    "url": background_inline["html_url"],
+                }
+            ],
+            parent_review_id=background_review_id,
+        )["pages"][0]["nodes"][0]
+        background_reaction = {
+            "id": 910_004,
+            "content": "+1",
+            "created_at": _format_github_rfc3339_seconds(2_500_002),
+            "user": {"login": "octocat", "type": "User"},
+        }
+
+        def fetch_index(fetches: list[dict[str, object]], kind: str) -> int:
+            matches = [
+                index
+                for index, fetch in enumerate(fetches)
+                if fetch.get("kind") == kind
+            ]
+            assert len(matches) == 1
+            return matches[0]
+
+        def raw_rest_records(fetch: dict[str, object]) -> list[object]:
+            records: list[object] = []
+            for page in fetch["pages"]:
+                body = json.loads(page["body_utf8"])
+                if isinstance(body, list):
+                    records.extend(body)
+                else:
+                    records.append(body)
+            return records
+
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            transcript = background_noise_history[inventory_name][
+                "discovery_endpoint_transcript"
+            ]
+            fetches = transcript["scopes"][0]["fetches"]
+            issue_index = fetch_index(fetches, "issue_comments")
+            review_index = fetch_index(fetches, "reviews")
+            inline_index = fetch_index(fetches, "inline_comments")
+            thread_index = fetch_index(fetches, "review_threads")
+            reaction_matches = [
+                index
+                for index, fetch in enumerate(fetches)
+                if fetch.get("kind") == "request_reactions"
+                and fetch.get("parent_comment_id") == background_request_id
+            ]
+            assert len(reaction_matches) == 1
+            reaction_index = reaction_matches[0]
+            api_root = f"https://api.github.com/repos/{current_repository}"
+            fetches[issue_index] = rest_fetch(
+                "issue_comments",
+                f"{api_root}/issues/{background_pr}/comments?per_page=100",
+                [*raw_rest_records(fetches[issue_index]), background_issue],
+            )
+            fetches[review_index] = rest_fetch(
+                "reviews",
+                f"{api_root}/pulls/{background_pr}/reviews?per_page=100",
+                [*raw_rest_records(fetches[review_index]), background_review],
+            )
+            fetches[inline_index] = rest_fetch(
+                "inline_comments",
+                f"{api_root}/pulls/{background_pr}/comments?per_page=100",
+                [*raw_rest_records(fetches[inline_index]), background_inline],
+            )
+            existing_thread_nodes = parse_graphql_thread_pages(fetches[thread_index])
+            assert isinstance(existing_thread_nodes, list)
+            fetches[thread_index] = graphql_thread_fetch(
+                [*existing_thread_nodes, background_thread]
+            )
+            fetches[reaction_index] = rest_fetch(
+                "request_reactions",
+                (
+                    f"{api_root}/issues/comments/{background_request_id}/"
+                    "reactions?per_page=100"
+                ),
+                [
+                    *raw_rest_records(fetches[reaction_index]),
+                    background_reaction,
+                ],
+                parent_comment_id=background_request_id,
+            )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                background_noise_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
+        ambiguous_background_noise = clone(background_noise_history)
+        assert isinstance(ambiguous_background_noise, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            transcript = ambiguous_background_noise[inventory_name][
+                "discovery_endpoint_transcript"
+            ]
+            fetches = transcript["scopes"][0]["fetches"]
+            review_index = fetch_index(fetches, "reviews")
+            raw_reviews = raw_rest_records(fetches[review_index])
+            for raw_review in raw_reviews:
+                if (
+                    isinstance(raw_review, dict)
+                    and raw_review.get("id") == background_review_id
+                ):
+                    raw_review["user"] = {
+                        "login": "other-codex[bot]",
+                        "type": "Bot",
+                    }
+            fetches[review_index] = rest_fetch(
+                "reviews",
+                (
+                    f"https://api.github.com/repos/{current_repository}/pulls/"
+                    f"{background_pr}/reviews?per_page=100"
+                ),
+                raw_reviews,
+            )
+        invalid_cases["history-provider-like-ambiguous-background"] = (
+            declaration,
+            ambiguous_background_noise,
+            current,
+        )
+
+        missing_raw_discovery_page = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            transcript = missing_raw_discovery_page[snapshot_name][
+                "discovery_endpoint_transcript"
+            ]
+            transcript["scopes"][0]["fetches"][2]["pages"].clear()
+        invalid_cases["history-raw-discovery-page-missing"] = (
+            declaration,
+            missing_raw_discovery_page,
+            current,
+        )
+
+        broken_raw_rest_link = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            transcript = broken_raw_rest_link[snapshot_name][
+                "discovery_endpoint_transcript"
+            ]
+            transcript["scopes"][0]["fetches"][2]["pages"][0]["link_header"] = (
+                '<https://api.github.com/unbound?page=2>; rel="next"'
+            )
+        invalid_cases["history-raw-rest-link-conflict"] = (
+            declaration,
+            broken_raw_rest_link,
+            current,
+        )
+
+        broken_raw_graphql_cursor = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            transcript = broken_raw_graphql_cursor[snapshot_name][
+                "discovery_endpoint_transcript"
+            ]
+            transcript["scopes"][0]["fetches"][5]["pages"][0]["request_after"] = (
+                "UNBOUND_CURSOR"
+            )
+        invalid_cases["history-raw-graphql-cursor-conflict"] = (
+            declaration,
+            broken_raw_graphql_cursor,
+            current,
+        )
+
+        wrong_history_api_url = history(samples)
+        wrong_history_api_url["as_of_api_url"] = (
+            f"https://api.github.com/repos/{current_repository}/pulls/{current_pr}"
+        )
+        invalid_cases["history-as-of-not-provider-declaration-url"] = (
+            declaration,
+            wrong_history_api_url,
             current,
         )
 
@@ -7816,7 +11012,7 @@ class RepositoryContractTest(unittest.TestCase):
         selected_history_blocker = clone(samples)
         assert isinstance(selected_history_blocker, list)
         selected_history_blocker[0]["evidence_state"]["terminal_payloads"] = [
-            complete_review_artifact(
+            complete_issue_comment_artifact(
                 selected_history_blocker[0],
                 80_000,
                 2_800_000,
@@ -8176,7 +11372,7 @@ class RepositoryContractTest(unittest.TestCase):
         negative_time_candidate["reactions"][0]["created_at"] = -1
         low_terminal_time = history_start_exclusive + 1
         negative_time_candidate["evidence_state"]["terminal_payloads"] = [
-            complete_review_artifact(
+            complete_issue_comment_artifact(
                 negative_time_candidate,
                 74_001,
                 low_terminal_time,
@@ -8202,7 +11398,7 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_payload_changes_candidate_order[0]["evidence_state"][
             "terminal_payloads"
         ] = [
-            complete_review_artifact(
+            complete_issue_comment_artifact(
                 terminal_payload_changes_candidate_order[0],
                 99_999,
                 2_900_000,
@@ -8303,7 +11499,7 @@ class RepositoryContractTest(unittest.TestCase):
         boundary_time = eleven_candidates[1]["candidate_basis"]["server_time"]
         assert isinstance(boundary_time, int)
         oldest["evidence_state"]["active_top_level_findings"] = [
-            complete_review_artifact(
+            complete_issue_comment_artifact(
                 oldest,
                 90_000,
                 boundary_time,
@@ -8424,7 +11620,7 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_time = oldest["candidate_basis"]["server_time"]
         assert isinstance(terminal_time, int)
         oldest["evidence_state"]["active_top_level_findings"] = [
-            complete_review_artifact(
+            complete_issue_comment_artifact(
                 oldest,
                 90_000,
                 terminal_time,
@@ -8728,9 +11924,10 @@ class RepositoryContractTest(unittest.TestCase):
             "confirmed different actor",
             "`codex`-containing bot login",
             "provider-like identity ambiguity",
-            "identical initial/final discovery inventories",
-            "a bare `complete: true` and a caller-adjustable count",
-            "removing a candidate while decrementing the count",
+            "raw `discovery_endpoint_transcript`, not the candidate array",
+            "each scope is exactly `{fetches}`",
+            "deleting a candidate, deleting its inventory entry, and decrementing the count",
+            "do not themselves provide a cryptographic proof of github tls origin",
             "including confirmed-different-actor reactions",
             "its payload kind does not itself select the provider profile",
             "unknown fields and json type aliases are not forward-compatible",
@@ -9120,13 +12317,16 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "'repos/<owner>/<repo>/issues/comments/<declaration_comment_id>'",
             "--method GET --include",
-            "response's `Date` header",
+            "initial receipt",
             "`as_of_server_time`",
             "`as_of_api_url`",
             "fixed 2,592,000-second interval",
-            "a caller-supplied declaration object",
         ):
             self.assertIn(anchor, probes)
+        self.assertIn(
+            "a current-pr endpoint, local clock, caller-supplied declaration object",
+            " ".join(probes.split()).lower(),
+        )
         for anchor in (
             "reviewThreads",
             "isResolved",

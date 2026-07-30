@@ -60,6 +60,20 @@ The inherited authority rule is:
 - Fail closed when identity, schema, pagination, ordering, scope, or final
   stability is incomplete.
 
+This is an anti-drift baseline, not a floating reference to either repository's
+default branch. Future changes must compare against both immutable commits, the
+common tree ID, and all 15 path/blob pairs above, then explicitly record whether
+the baseline is retained or replaced. A branch name, tag name, partial runtime
+diff, or a later release with similar prose is not a substitute.
+
+Only the provider-result authority is inherited: trustworthy provider results
+decide the outcome, while requests and run markers remain producer/audit
+evidence. The playbook's raw REST/GraphQL review-thread proof, exact whole-PR
+scope and lifecycle gates, closed terminal issue-comment carrier and edit-time
+rules, and conditional `+1` fallback are local extensions. They must not be
+removed merely because the fixed Action uses a different evidence envelope,
+and they must not be attributed to that Action without a new pinned comparison.
+
 ### Why Result-Present Acceptance Is Deliberate
 
 “Result-present acceptance” means that a complete, trustworthy current-scope
@@ -184,15 +198,19 @@ Evaluate provider artifacts independently of request count:
    `updated_at` because that is when the currently observed body became
    authoritative. A missing or contradictory edit time is inconclusive.
    Reactions use `created_at`. First take every terminal-looking artifact at
-   the greatest semantic server time. Any malformed or scope-conflicting
-   member of that equal-time set makes the result inconclusive. Otherwise any
-   trustworthy finding in the set takes precedence over every clean,
-   regardless of source channel or numeric ID. Only after semantic outcome and
-   commit scope agree may the greatest positive stable numeric artifact ID
-   break a tie within one source channel to choose the reported basis.
-   Compatible equal-time artifacts across channels may corroborate one
-   outcome; incompatible artifacts without another provider-stable ordering
-   signal are ambiguous.
+   the greatest semantic server time. If that equal-time set contains more
+   than one source channel, fail closed before outcome or ID tie-breaking:
+   numeric IDs from issue comments and reviews are different native namespaces,
+   and the report contract has no predeclared cross-channel selector or
+   multi-artifact basis. This applies even when the channels report the same
+   outcome or one reports findings while another reports clean. Within one
+   source channel, any malformed or scope-conflicting member blocks; otherwise
+   any trustworthy finding in the set takes precedence over every clean. Only
+   after semantic outcome and commit scope agree may the greatest positive
+   stable numeric artifact ID in that same channel choose the reported basis.
+   Incompatible artifacts without another provider-stable ordering signal are
+   ambiguous; this baseline conservatively treats every equal-time
+   cross-channel set as that case.
 7. Select the latest trustworthy terminal artifact. A newer or equal-time
    malformed or scope-conflicting terminal-looking artifact blocks an older
    clean result.
@@ -381,6 +399,49 @@ Only the following terminal payloads are accepted:
    join, missing/mismatched child SHA, incomplete page, or any other parent
    body is inconclusive or malformed, never clean.
 
+Every terminal issue-comment candidate uses this closed snapshot schema before
+its body enters any clean, finding, malformed, current, historical, or report
+path:
+
+```yaml
+complete: true
+artifact_kind: terminal-payload | active-top-level-finding | malformed-terminal-artifact
+outcome: clean | findings | malformed
+channel: issue-comment
+id: "<canonical positive issue-comment ID>"
+stable_artifact_id: "<same canonical positive issue-comment ID>"
+api_url: https://api.github.com/repos/OWNER/REPO/issues/comments/<id>
+url: https://github.com/OWNER/REPO/pull/<pr>#issuecomment-<id>
+user_login: chatgpt-codex-connector[bot]
+user_type: Bot
+app_slug: chatgpt-codex-connector
+body: <raw REST body>
+normalized_body: <body after the fixed normalization above>
+grammar_status: accepted | malformed
+terminal_looking: true
+created_at: <trusted REST server time>
+updated_at: <trusted REST server time>
+server_time: <created_at when unedited, otherwise updated_at>
+server_time_field: created_at | updated_at
+parsed_commit: <lowercase full SHA parsed from the accepted body>
+scope:
+  repository: OWNER/REPO
+  pr: <positive PR number>
+  pr_merge_base: <lowercase full SHA>
+  head: <lowercase full SHA>
+```
+
+The object rejects unknown fields and review-only fields such as `state`,
+`submitted_at`, `commit_id`, and inline-thread joins. Require
+`updated_at >= created_at`. When the two times are equal, require
+`server_time == created_at` and `server_time_field == created_at`; when they
+differ, require `server_time == updated_at` and
+`server_time_field == updated_at`. `api_url`, `url`, actor, App, body,
+normalization, grammar result, parsed commit, and scope all participate in the
+type-preserving initial/final equality check. The issue-comment ID shares its
+native namespace with request and provider-declaration comments, so one ID
+cannot describe conflicting records in those roles.
+
 All other terminal-looking exact-provider comments or reviews are malformed.
 In particular, these near misses never complete clean: a missing or duplicate
 reviewed-commit marker, a 10-character SHA, a mixed-case or mismatched SHA,
@@ -497,10 +558,37 @@ define how to consume provider evidence after a duplicate already exists.
 
 ### Thread-Backed Findings
 
-An inline finding backed by a GitHub review thread uses the thread's
-`isResolved` value. `isOutdated` is not a substitute. Enumeration must join the
-fully paginated REST review comment to its parent review and to the fully
-paginated GraphQL thread without an orphan or conflicting identity.
+An inline finding backed by a GitHub review thread uses only the raw GraphQL
+thread node's `isResolved` value. `isOutdated` is retained as audit context but
+is not a substitute for resolution.
+
+The evidence basis stores the fully paginated raw REST inline-comment records
+and the fully paginated raw GraphQL `reviewThreads` pages, including each
+thread's stable `id`, typed `isResolved`, typed `isOutdated`, outer
+`pageInfo`, every nested thread-comment page and its `pageInfo`, and each
+comment's GraphQL `id`, `fullDatabaseId`, `url`, and
+`pullRequestReview { id fullDatabaseId }`. Both connections start at a null
+cursor, follow each opaque returned `endCursor` exactly, and terminate only at
+typed `hasNextPage == false`.
+
+Normalize each non-null GraphQL `BigInt` to canonical positive decimal text.
+Normalize a REST JSON numeric ID only when it is a positive integer; booleans,
+floats, zero, negatives, signs, leading zeros, and other text forms are
+invalid. Join each raw REST inline comment to exactly one raw GraphQL comment
+by normalized REST `id == fullDatabaseId`, then require the normalized REST
+`pull_request_review_id` to equal
+`pullRequestReview.fullDatabaseId` and require the canonical URLs to agree.
+Every applicable raw REST child and GraphQL comment must participate in one and
+only one join. An orphan, duplicate, parent-review conflict, URL conflict,
+missing page, broken cursor chain, or wrong JSON type makes the snapshot
+incomplete.
+
+Fields such as `thread_id`, `thread_resolved`, or `is_resolved` attached to a
+REST inline record are synthesized assertions, not raw GitHub authority. Do
+not accept them in place of the raw pages and canonical one-to-one join, and do
+not copy them into the raw record schema. A derived reader-facing
+`thread_findings` summary is allowed only after the raw join succeeds and must
+be recomputable field for field from those pages.
 
 An unresolved thread finding is not superseded. A later clean terminal
 artifact can establish the provider's latest terminal outcome, but the lane
@@ -545,22 +633,106 @@ Duplicate requests, duplicate reactions, and multiple artifacts for one scope
 never increase the sample size.
 
 Enumerate the complete same-repository historical candidate universe for the
-last 30 days before deciding eligibility. Anchor the interval to one trusted
-GitHub REST response `Date` header obtained over authenticated TLS from the
-recorded exact repository/PR API URL; a local clock or the literal label
-`window_days: 30` is not evidence. Convert that header to
-`as_of_server_time`, set `window_seconds: 2592000`, and derive the exact
-half-open interval
+last 30 days before deciding eligibility. The one canonical as-of receipt is
+the exact response receipt from the first direct authenticated REST GET of the
+provider-declaration issue comment:
+`https://api.github.com/repos/<owner>/<repo>/issues/comments/<declaration_id>`.
+The closed receipt is exactly
+`{method, request_url, status, date_header, body_utf8, body_sha256}`. Require
+`GET`, the canonical declaration URL, exact integer `200`, canonical
+IMF-fixdate, strict UTF-8 JSON, and a recomputed digest. Project the declaration
+snapshot independently from the raw body and require type-preserving equality
+with the recorded initial snapshot. Repeat the same receipt validation for the
+final GET, require its projected snapshot to be identical and its Date not
+earlier, but use only the initial receipt as the window anchor. Require
+`as_of_receipt` to equal that initial receipt, `as_of_api_url` to equal its
+`request_url`, and `as_of_server_time` to equal the parsed initial `Date`.
+Freeze those values before discovery starts. A current-PR endpoint, local
+clock, final-read response time, caller timestamp, or literal
+`window_days: 30` label is not evidence. Set
+`window_seconds: 2592000` and derive the exact half-open interval
 `(window_start_exclusive = as_of_server_time - 2592000,
 window_end_inclusive = as_of_server_time]`. Record the source URL, all four
-values, and `candidate_universe_count`. Also record identical initial/final
-discovery inventories: direct-API completion for pull requests, issue comments,
-reviews, associated inline comments, review threads, and controlled-request
-reactions, plus every distinct candidate scope key and its recomputed
-scope-final basis. A bare `complete: true` and a caller-adjustable count cannot
-prove discovery completeness. Removing a candidate while decrementing the
-count, changing a discovery page, or changing an inventory entry must be
-detectable in the final record.
+values, and the initial receipt. Self-reported `authenticated` or
+`tls_attested` booleans are not receipt fields and add no authority.
+
+The raw `discovery_endpoint_transcript`, not the candidate array, inventory
+entries, or count, is the historical-universe authority. Store it in both the
+initial and final inventory. Its closed top-level shape is exactly
+`{schema_version: 2, repository, scopes}`, and each scope is exactly
+`{fetches}`. Each fetch is exactly
+`{kind, transport, parent_comment_id, pages}`. The only fetch kinds are
+`pull_requests`, `compare`, `issue_comments`, `reviews`, `inline_comments`,
+`review_threads`, and `request_reactions`. The fixed parser takes `base.sha`
+and `head.sha` from the raw pull record, binds those exact values into the
+canonical compare request, and takes `pr_merge_base` only from
+`compare.merge_base_commit.sha`; neither `base.sha` nor
+`merge_commit_sha` substitutes for the merge base. A version-2
+`review_threads` response stores the real GraphQL
+`comments { nodes pageInfo }` connection inside each raw thread node; it never
+stores the report's normalized `comments.pagination_complete/pages` shape in
+the response body. Version 2 accepts that nested connection only when its
+first response is already complete (`hasNextPage == false` and
+`endCursor == null`). A nested `hasNextPage == true` requires a separately
+bound child-cursor fetch shape that this schema does not define, so the profile
+is `unknown`; an implementation must introduce a new transcript schema version
+rather than folding multiple normalized pages into a fabricated raw response.
+`parent_comment_id` is non-null only for the corresponding controlled-request
+reaction fetch. A scope with no controlled request has no reaction fetch; a
+scope with requests has exactly one complete reaction traversal per request.
+
+Every page is exactly
+`{request_url, status, link_header, request_after, body_utf8, body_sha256}`.
+A REST page records the exact request URL, integer status, raw `Link` header or
+null, `request_after: null`, bounded raw body, and recomputed lowercase body
+SHA-256. Raw GitHub REST timestamps remain canonical whole-second RFC3339
+`YYYY-MM-DDTHH:MM:SSZ` text. Before ordering, window checks, or policy-projection
+hashing, the fixed projector converts them to positive integer Unix seconds by
+strict round trip; JSON numbers, booleans, offsets, fractional seconds, and
+noncanonical or invalid dates are rejected. A GraphQL page records exact request URL
+`https://api.github.com/graphql`, integer status, `link_header: null`, the
+exact requested `request_after` cursor or null, and the same bounded raw
+body/digest; the fixed parser reads raw `pageInfo.hasNextPage` and
+`pageInfo.endCursor` from that body. REST traversal follows raw
+`Link rel=next` until none remains.
+GraphQL traversal starts at null, requires each next `request_after` to equal
+the prior raw `endCursor`, and terminates only at typed
+`hasNextPage == false`.
+
+The transcript envelope is closed, but endpoint JSON objects are forward
+compatible: the versioned fixed projector reads and type-checks every field
+used by policy while ignoring unrelated GitHub response additions. The raw page
+digest still binds all response bytes. A versioned fixed parser independently
+derives the complete set of candidate scope keys and scope-final bases from the
+projected records, then derives `entries` in the closed shape
+`{scope_key, source_ordering_key, source_evidence}` and
+`candidate_universe_count`. `source_evidence` is exactly
+`{carrier, channel, semantic, native_identity, source_record_sha256}`. It binds
+reaction versus terminal-artifact carrier, request-reaction versus review or
+issue-comment channel, `+1` / `eyes` / clean / findings / malformed semantics,
+the native parent-and-ID or channel-and-ID identity, and the digest of the
+canonical policy projection. Review projection digests include the review,
+associated inline records, and joined thread nodes; issue-comment digests bind
+the projected comment; reaction digests bind the parent ID and projected
+reaction. Same time and numeric ID alone therefore cannot substitute one
+carrier, channel, or semantic result for another.
+
+The closed candidate evaluator independently validates each complete candidate
+array element and requires its full authority projection to equal the
+raw-derived entry. Initial/final candidate arrays must also be type-preserving
+identical. Audit-only normalized fields that do not originate in one endpoint
+are not falsely described as raw-derived. These checks never prove the
+transcript complete merely by agreeing with one another. In particular,
+deleting a candidate, deleting its inventory entry, and decrementing the count
+while leaving its raw fetch record present must fail closed. Missing required
+child fetches, an unreadable or over-budget page, a broken Link/cursor chain, a
+body-digest mismatch, initial/final semantic drift, or any projection mismatch
+selects `unknown`; no completeness flag can override it.
+
+The parent GitHub fetch path that captured each response is a trusted workflow
+boundary. The stored offline transcript and hashes preserve the bytes supplied
+to the decision, but do not themselves provide a cryptographic proof of GitHub
+TLS origin. Do not describe the record as a TLS attestation.
 
 A candidate basis at the lower boundary is outside the window; one at the upper
 boundary is inside. Every trusted server time in every historical/current raw
@@ -574,12 +746,20 @@ validated separately and never counts toward the three-outcome history
 minimum. A historical scope is a candidate when it contains a terminal-looking
 provider record, an exact-bot reaction on a controlled request, or a
 provider-like record whose identity is missing or ambiguous. A confirmed
-different actor is not provider behaviour and does not enter the universe.
+different actor is not provider behaviour and does not enter the universe; its
+bounded record remains audit evidence and cannot cause ordinary human
+comments, reviews, inline threads, or reactions to masquerade as provider
+behaviour. A provider terminal artifact may form a candidate even when no
+controlled request was observed. Reaction-only evidence still requires the
+exact controlled parent and can never arise without a request.
 Complete pagination and scope inventory must prove that universe and its
-recorded count. The initial and final enumerations must be identical for the
-same frozen interval. The current outcome's selected basis must not be later
-than the same `as_of_server_time`; its complete raw evidence snapshot is subject
-to that bound as well.
+recorded count by derivation from the raw transcript. The initial and final
+enumerations must be semantically identical for the same frozen interval.
+Opaque GraphQL cursor bytes need only form a valid chain within each traversal;
+stable node content and derived universe, rather than cursor-byte equality,
+establish final equivalence. The current outcome's selected basis must not be
+later than the same `as_of_server_time`; its complete raw evidence snapshot is
+subject to that bound as well.
 
 After applying terminal precedence inside each scope, record that final
 candidate outcome's ordering basis as `candidate_basis.kind`,
@@ -875,9 +1055,8 @@ evidence_basis:
     associated_inline_comments:
       pagination_complete: true
       records: []
-    review_thread_join:
-      pagination_complete: true
-      records: []
+    review_thread_pages: <complete raw GraphQL pages and nested comment pages>
+    thread_findings: []
 ```
 
 | Lane state | `provider_profile` | `evidence_basis` |
@@ -914,12 +1093,17 @@ value equality.
 For a pull-request review, each artifact snapshot contains exact REST
 `id`/URL, `user.login`, `user.type`, `state`, raw body, normalized body,
 `submitted_at`, native `commit_id`, and the complete associated inline-comment
-page/join. Every child record includes its stable ID/URL, exact actor,
+pages. Every raw REST child record includes its stable ID/URL, exact actor,
 `pull_request_review_id`, `commit_id`, `original_commit_id`, raw/normalized
-body, and joined thread ID/resolution. The pagination and join records must
+body, but no synthesized thread or resolution field. The snapshot separately
+stores the complete raw GraphQL thread/comment pages. The canonical BigInt
+one-to-one join derives `thread_findings`; only the raw GraphQL `isResolved`
+value supplies resolution authority. The pagination and raw join inputs must
 prove the complete child set even when it is empty. Thus an `APPROVED` /
 `No findings.` review with zero children, one with a valid finding child, and
 one whose child page is unread produce distinguishable reports.
+This raw page set plus its canonical derivation is the associated inline-comment
+page/join evidence; the legacy phrase does not authorize synthesized fields.
 
 For a terminal issue comment, each artifact snapshot contains exact REST
 `id`/API URL/HTML URL, `user.login`, `user.type`,
@@ -927,7 +1111,10 @@ For a terminal issue comment, each artifact snapshot contains exact REST
 `updated_at`, selected semantic server time/field, and the parsed exact
 full-head marker or finding SHA. The initial/final records must be identical
 after re-fetch. Missing actor/App/body/time/commit fields, a changed body, or a
-sparse summary cannot prove the closed grammar.
+sparse summary cannot prove the closed grammar. Use the complete closed
+issue-comment schema defined above in current, historical, selected-artifact,
+and blocking-artifact records; no review-only evaluator may silently drop this
+carrier.
 
 For reaction fallback, `evidence_basis` uses this field-level shape. The
 `samples` array has 3 to 10 entries in the deterministic selected order and
@@ -939,6 +1126,20 @@ evidence_basis:
   provider_declaration:
     initial_snapshot: <complete authenticated declaration record using the fields below>
     final_snapshot: <repeat the complete identical declaration record>
+    initial_fetch_receipt:
+      method: GET
+      request_url: https://api.github.com/repos/OWNER/REPO/issues/comments/<artifact_id>
+      status: 200
+      date_header: <canonical IMF-fixdate from the first GET>
+      body_utf8: <bounded raw declaration JSON response>
+      body_sha256: <recomputed lowercase SHA-256>
+    final_fetch_receipt:
+      method: GET
+      request_url: <same canonical declaration URL>
+      status: 200
+      date_header: <canonical IMF-fixdate not earlier than the initial Date>
+      body_utf8: <bounded raw declaration JSON response projecting to the same snapshot>
+      body_sha256: <recomputed lowercase SHA-256>
     authority_kind: exact-provider-github-artifact
     repository: OWNER/REPO
     pull_request: <positive PR number>
@@ -961,27 +1162,41 @@ evidence_basis:
     normalized_sha256: <64 lowercase hex>
   history_window:
     as_of_source: github-response-date-header
-    as_of_api_url: https://api.github.com/repos/OWNER/REPO/pulls/<current_pr>
-    as_of_server_time: <trusted parsed Date header>
+    as_of_api_url: https://api.github.com/repos/OWNER/REPO/issues/comments/<artifact_id>
+    as_of_server_time: <Date from the first direct provider-declaration REST GET>
+    as_of_receipt: <exact initial_fetch_receipt above>
     window_seconds: 2592000
     window_start_exclusive: <as_of_server_time minus 2592000>
     window_end_inclusive: <same as as_of_server_time>
-    candidate_universe_count: <complete distinct-scope count>
+    candidate_universe_count: <distinct-scope count derived from the raw transcript>
   historical_universe:
     initial_inventory:
       complete: true
       repository: OWNER/REPO
-      pagination:
-        pull_requests: true
-        issue_comments: true
-        reviews: true
-        inline_comments: true
-        review_threads: true
-        request_reactions: true
+      discovery_endpoint_transcript:
+        schema_version: 2
+        repository: OWNER/REPO
+        scopes:
+          - fetches:
+              - kind: pull_requests | compare | issue_comments | reviews | inline_comments | review_threads | request_reactions
+                transport: rest | graphql
+                parent_comment_id: <positive request-comment ID or null>
+                pages:
+                  - request_url: <exact REST URL or https://api.github.com/graphql>
+                    status: 200
+                    link_header: <raw REST Link header or null for GraphQL>
+                    request_after: <null for REST/first GraphQL page or prior raw endCursor>
+                    body_utf8: <bounded raw JSON response body>
+                    body_sha256: <recomputed lowercase SHA-256>
       entries:
         - scope_key: [OWNER/REPO, <pr>, <pr_merge_base>, <head>]
-          candidate_basis: <same three basis fields used below>
-          validated_ordering_key: [<server_time>, <stable_artifact_id>]
+          source_ordering_key: [<server_time>, <stable_artifact_id>]
+          source_evidence:
+            carrier: reaction | terminal-artifact
+            channel: request-reaction | issue-comment | pull-request-review
+            semantic: "+1" | eyes | clean | findings | malformed
+            native_identity: [<parent reactions URL or channel>, <positive native ID>]
+            source_record_sha256: <canonical policy-projection SHA-256>
     final_inventory: <repeat the complete identical initial_inventory record>
     initial_candidates:
       - <complete candidate snapshot defined below>
@@ -1052,9 +1267,10 @@ evidence_basis:
             - <same seven reaction fields>
 ```
 
-The report embeds both historical-universe inventories and both complete
-candidate arrays, including candidates outside `samples`; a count or external
-ledger reference is insufficient. Each complete candidate snapshot repeats
+The report embeds both raw historical discovery endpoint transcripts, both
+raw-derived source-authority inventories, and both independently validated
+complete candidate arrays, including candidates outside `samples`; a count or
+external ledger reference is insufficient. Each complete candidate snapshot repeats
 these fields: `complete`, all six pagination results, the four
 `evidence_state` artifact arrays with stable IDs/times, lifecycle, immutable
 scope, every controlled request, every individual reaction (including
@@ -1075,9 +1291,12 @@ confirmed-human reaction.
 
 `provider_declaration.asserted_text` stores the exact authenticated line, not a
 summary. `normalized_sha256` is recomputed with the recorded normalization
-algorithm after re-fetching the canonical REST artifact. The history window is
-derived arithmetically from the trusted GitHub response time; its label cannot
-substitute for those values. Every candidate basis must satisfy
+algorithm after projecting each canonical REST receipt body. The history
+window is derived arithmetically from the initial receipt's canonical `Date`;
+its label, URL alone, or arbitrary integer cannot substitute for that receipt.
+The final declaration receipt proves a stable re-read but does not move
+`as_of_server_time`, replace `as_of_receipt`, or replace `as_of_api_url`. Every candidate
+basis must satisfy
 `window_start_exclusive < candidate_basis.server_time <=
 window_end_inclusive`, and the current basis cannot be later than the same
 as-of time.
@@ -1098,17 +1317,19 @@ remains the basis when a later `+1` or `eyes` exists; those reactions remain
 visible in the complete audit and may prevent only reaction-only fallback.
 References to an external ledger do not replace these fields.
 Immediately before success, re-fetch and revalidate the authenticated
-declaration artifact, window/count, every universe candidate before sorting,
-every ordered `samples[]`, and every `current` field, including every
-cross-parent audit. When a terminal artifact is selected, record it even when
-its outcome is findings. Do not reduce the basis to prose such as “Codex
-completed”.
+declaration artifact without moving the frozen window, re-read every raw
+discovery endpoint transcript, independently rederive the inventory/count and
+every universe candidate before sorting, and revalidate every ordered
+`samples[]` and every `current` field, including every cross-parent audit.
+When a terminal artifact is selected, record it even when its outcome is
+findings. Do not reduce the basis to prose such as “Codex completed”.
 
 ## Alignment And Intentional Differences From The Fixed Action Baseline
 
-The result-evidence authority is inherited from the fixed Action baseline.
-The stricter scope gates and playbook extensions below are deliberate and must
-not be “corrected” by copying the Action implementation mechanically:
+Only the provider-result authority is inherited from the fixed Action
+baseline. The stricter evidence carriers and scope gates below are deliberate
+playbook extensions and must not be “corrected” by copying the Action
+implementation mechanically:
 
 1. **Whole-PR scope and lifecycle are stricter.** The Action baseline binds a
    clean artifact to the current head and validates a complete evidence
@@ -1116,26 +1337,36 @@ not be “corrected” by copying the Action implementation mechanically:
    base OID, head OID, one local merge base, and equality with the frozen
    whole-PR range. A base-only retarget on the same head remains
    `base-changed-same-head`.
-2. **An empty `APPROVED` review is not clean.** The Action baseline accepts an
+2. **Raw thread resolution is a playbook extension.** This playbook requires
+   complete raw REST inline-comment records, complete raw GraphQL thread and
+   nested-comment pages, canonical BigInt normalization, and a one-to-one join.
+   It never treats synthesized REST `thread_id` / `thread_resolved` fields or
+   `isOutdated` as resolution authority.
+3. **The closed terminal issue-comment carrier is a playbook extension.** The
+   inheritance does not make the fixed Action's internal carrier schema this
+   playbook's schema. The exact Bot/App/API/HTML/body/scope record, parsed
+   commit, edited-comment `updated_at` ordering, final reread, and
+   cross-channel equal-time fail-closed rule remain locally normative.
+4. **An empty `APPROVED` review is not clean.** The Action baseline accepts an
    empty or exact `Looks good.` approved-review body under its closed grammar.
    This playbook requires an explicit clean comment/review payload with commit
    binding for `terminal-payload`; an empty state-only approval is
    insufficient.
-3. **The `+1` fallback is new playbook policy.** The fixed Action collects
+5. **The `+1` fallback is new playbook policy.** The fixed Action collects
    `plusOne` in its reaction baseline but does not use it as provider-result
    authority; its result selector consumes terminal issue comments and
    reviews. This playbook permits `+1` only under the dynamic-profile and
    thirteen-condition fallback above.
-4. **`eyes` remains orchestration-only.** The fixed Action uses a new `eyes`
+6. **`eyes` remains orchestration-only.** The fixed Action uses a new `eyes`
    transition as acknowledgement/liveness. This playbook preserves that
    boundary and additionally rejects `+1` fallback when a newer `eyes`
    indicates later activity.
-5. **Duplicate result consumption aligns with the Action; warning codes are a
+7. **Duplicate result consumption aligns with the Action; warning codes are a
    playbook extension.** Stable current-head result evidence is not rejected by
    marker or audit history in the fixed baseline. This playbook inherits that
    consumer rule, while adding `duplicate-observed` and the producer rule that
    the orchestrator must never create another same-scope request.
-6. **Early-result consumption aligns with the Action; local-lane sequencing is
+8. **Early-result consumption aligns with the Action; local-lane sequencing is
    a playbook extension.** The fixed baseline accepts stable clean evidence
    regardless of marker timing. This playbook additionally requires local
    terminal artifacts before it sends a new GitHub request and reports
