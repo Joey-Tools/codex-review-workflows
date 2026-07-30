@@ -1753,7 +1753,7 @@ class RepositoryContractTest(unittest.TestCase):
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
-            "ordinary deterministic suite passed 618/618",
+            "ordinary deterministic suite passed 619/619",
             '"release_tree_immutable":true',
             '"runtime_residue":[]',
         ):
@@ -1794,7 +1794,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 618", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 619", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)

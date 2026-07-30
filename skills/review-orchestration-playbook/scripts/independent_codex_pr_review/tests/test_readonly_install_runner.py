@@ -361,6 +361,50 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             process_group = int(group_file.read_text(encoding="ascii"))
             self._require_process_group_absent(process_group)
 
+    def test_bounded_child_does_not_claim_closure_before_process_supervision(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-child-pre-supervision-") as root:
+            signal_guard = runner.ChildSignalGuard(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                interrupt=mock.sentinel.interrupt,
+            )
+            closure_proof = runner.ChildProcessClosureProof()
+            with (
+                mock.patch.object(
+                    runner,
+                    "_install_child_signal_guard",
+                    return_value=signal_guard,
+                ),
+                mock.patch.object(
+                    runner,
+                    "activate_deferred_signal_interrupt",
+                    side_effect=TimeoutError("synthetic activation failure"),
+                ),
+                mock.patch.object(runner, "_restore_child_signal_guard"),
+                mock.patch.object(runner, "run_bounded") as run_bounded,
+                self.assertRaisesRegex(TimeoutError, "activation failure"),
+            ):
+                runner._run_bounded_child(
+                    (sys.executable, "-B", "-c", "raise SystemExit(0)"),
+                    cwd=root,
+                    environment={
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=closure_proof,
+                )
+
+            self.assertFalse(closure_proof.proven)
+            run_bounded.assert_not_called()
+
     def test_bounded_child_sigterm_settles_group_before_interrupt_returns(
         self,
     ) -> None:
@@ -435,7 +479,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     os.killpg(worker.pid, signal.SIGKILL)
                     worker.wait(timeout=5)
 
-    def test_main_retains_trees_when_child_process_closure_is_unproven(
+    def test_main_preserves_closure_failure_across_signal_teardown(
         self,
     ) -> None:
         with owned_temporary_directory("readonly-main-closure-gap-") as root:
@@ -461,6 +505,19 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 None,
                 None,
                 RuntimeError("synthetic closure failure"),
+            )
+            signal_guard = runner.ChildSignalGuard(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                interrupt=mock.sentinel.interrupt,
+            )
+            deactivate_error = RuntimeError(
+                "synthetic deferred-signal teardown failure"
+            )
+            restore_error = OSError(
+                errno.EIO,
+                "synthetic signal-guard restore failure",
             )
             stdout = io.StringIO()
             stderr = io.StringIO()
@@ -490,7 +547,27 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(runner, "_tree_snapshot", return_value={}),
                 mock.patch.object(
                     runner,
-                    "_run_bounded_child",
+                    "_install_child_signal_guard",
+                    return_value=signal_guard,
+                ),
+                mock.patch.object(
+                    runner,
+                    "activate_deferred_signal_interrupt",
+                    return_value=mock.sentinel.binding,
+                ),
+                mock.patch.object(
+                    runner,
+                    "deactivate_deferred_signal_interrupt",
+                    side_effect=deactivate_error,
+                ) as deactivate,
+                mock.patch.object(
+                    runner,
+                    "_restore_child_signal_guard",
+                    side_effect=restore_error,
+                ) as restore,
+                mock.patch.object(
+                    runner,
+                    "run_bounded",
                     side_effect=closure_error,
                 ),
                 mock.patch.object(runner, "_cleanup_tree") as cleanup_tree,
@@ -503,6 +580,21 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(returncode, 1)
             self.assertEqual(summary["primary_status"], "closure-unproven")
             self.assertEqual(summary["child_process_closure"], "unproven")
+            self.assertEqual(
+                summary["primary_failure"]["error_kind"],
+                "GitProcessClosureUnproven",
+            )
+            self.assertEqual(
+                [failure["operation"] for failure in summary["secondary_failures"]],
+                [
+                    "deactivate-deferred-signal-interrupt",
+                    "restore-child-signal-guard",
+                ],
+            )
+            self.assertEqual(
+                [failure["error_kind"] for failure in summary["secondary_failures"]],
+                ["RuntimeError", "OSError"],
+            )
             self.assertEqual(summary["cleanup_status"], "incomplete")
             self.assertEqual(
                 summary["retained_paths"],
@@ -511,7 +603,18 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(install_container.is_dir())
             self.assertTrue(runtime_parent.is_dir())
             cleanup_tree.assert_not_called()
-            self.assertIn("GitProcessClosureUnproven", stderr.getvalue())
+            deactivate.assert_called_once_with(mock.sentinel.binding)
+            restore.assert_called_once_with(signal_guard)
+            error_text = stderr.getvalue()
+            self.assertIn("GitProcessClosureUnproven", error_text)
+            self.assertLess(
+                error_text.index("primary failure"),
+                error_text.index("secondary failures"),
+            )
+            self.assertLess(
+                error_text.index("secondary failures"),
+                error_text.index("cleanup incomplete"),
+            )
 
     def test_main_reports_primary_and_cleanup_failures_in_order(self) -> None:
         with owned_temporary_directory("readonly-main-failures-") as root:

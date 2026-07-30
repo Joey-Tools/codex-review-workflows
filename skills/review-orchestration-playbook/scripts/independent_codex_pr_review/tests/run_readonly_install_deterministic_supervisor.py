@@ -91,10 +91,25 @@ class PrimaryFailure:
     message: str
 
 
+@dataclass(frozen=True)
+class SecondaryFailure:
+    operation: str
+    error_kind: str
+    error_errno: int | None
+    message: str
+
+
 class ChildRunInterrupted(RuntimeError):
     def __init__(self, signal_number: int) -> None:
         self.signal_number = signal_number
         super().__init__(f"child run interrupted by signal {signal_number}")
+
+
+class ChildSignalTeardownError(RuntimeError):
+    def __init__(self, failures: tuple[SecondaryFailure, ...]) -> None:
+        self.failures = failures
+        operations = ",".join(failure.operation for failure in failures)
+        super().__init__(f"child signal teardown failed: {operations}")
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,11 @@ class ChildSignalGuard:
     previous_handlers: tuple[Any, ...]
     previous_mask: set[signal.Signals]
     interrupt: DeferredSignalInterrupt
+
+
+@dataclass
+class ChildProcessClosureProof:
+    proven: bool = False
 
 
 def _install_child_signal_guard() -> ChildSignalGuard:
@@ -152,20 +172,82 @@ def _restore_child_signal_guard(guard: ChildSignalGuard) -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, guard.previous_mask)
 
 
+def _secondary_failure(
+    operation: str,
+    error: BaseException,
+) -> SecondaryFailure:
+    try:
+        error_errno = getattr(error, "errno", None)
+    except BaseException:
+        error_errno = None
+    try:
+        message = str(error)
+    except BaseException as formatting_error:
+        message = (
+            "<secondary failure message unavailable: "
+            f"{type(formatting_error).__name__}>"
+        )
+    if len(message) > 2_048:
+        message = message[-2_048:]
+    return SecondaryFailure(
+        operation=operation,
+        error_kind=type(error).__name__,
+        error_errno=error_errno if isinstance(error_errno, int) else None,
+        message=message,
+    )
+
+
 @contextmanager
-def _bound_child_signals() -> Iterator[None]:
+def _bound_child_signals(
+    secondary_failures: list[SecondaryFailure],
+) -> Iterator[None]:
     guard = _install_child_signal_guard()
     binding: Any | None = None
+    primary_error: BaseException | None = None
     try:
         binding = activate_deferred_signal_interrupt(guard.interrupt)
         yield
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        signal.pthread_sigmask(signal.SIG_BLOCK, guard.signals)
+        teardown_errors: list[BaseException] = []
         try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, guard.signals)
+        except BaseException as error:
+            secondary_failures.append(_secondary_failure("block-child-signals", error))
+            teardown_errors.append(error)
+        else:
             if binding is not None:
-                deactivate_deferred_signal_interrupt(binding)
-        finally:
-            _restore_child_signal_guard(guard)
+                try:
+                    deactivate_deferred_signal_interrupt(binding)
+                except BaseException as error:
+                    secondary_failures.append(
+                        _secondary_failure(
+                            "deactivate-deferred-signal-interrupt",
+                            error,
+                        )
+                    )
+                    teardown_errors.append(error)
+            try:
+                _restore_child_signal_guard(guard)
+            except BaseException as error:
+                secondary_failures.append(
+                    _secondary_failure("restore-child-signal-guard", error)
+                )
+                teardown_errors.append(error)
+        if teardown_errors and primary_error is None:
+            control_flow = next(
+                (
+                    error
+                    for error in teardown_errors
+                    if not isinstance(error, Exception)
+                ),
+                None,
+            )
+            if control_flow is not None:
+                raise control_flow
+            raise ChildSignalTeardownError(tuple(secondary_failures))
 
 
 def _run_bounded_child(
@@ -176,8 +258,12 @@ def _run_bounded_child(
     timeout: float = CHILD_TIMEOUT_SECONDS,
     stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
+    secondary_failures: list[SecondaryFailure] | None = None,
+    closure_proof: ChildProcessClosureProof | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    with _bound_child_signals():
+    diagnostics = secondary_failures if secondary_failures is not None else []
+    proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    with _bound_child_signals(diagnostics):
         try:
             returncode, stdout, stderr = run_bounded(
                 argv,
@@ -188,8 +274,20 @@ def _run_bounded_child(
                 stderr_limit=stderr_limit,
             )
         except GitProcessClosureUnproven as error:
-            error.finish_signal_deferral(deliver=False)
+            try:
+                error.finish_signal_deferral(deliver=False)
+            except BaseException as teardown_error:
+                diagnostics.append(
+                    _secondary_failure(
+                        "finish-closure-signal-deferral",
+                        teardown_error,
+                    )
+                )
             raise
+        except BaseException:
+            proof.proven = True
+            raise
+        proof.proven = True
     return subprocess.CompletedProcess(
         args=argv,
         returncode=returncode,
@@ -506,6 +604,8 @@ def main() -> int:
     closure_error: GitProcessClosureUnproven | None = None
     child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
+    secondary_failures: list[SecondaryFailure] = []
+    closure_proof = ChildProcessClosureProof()
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     stage = "install-container"
     try:
@@ -555,6 +655,8 @@ def main() -> int:
             ),
             cwd=installed_root,
             environment=environment,
+            secondary_failures=secondary_failures,
+            closure_proof=closure_proof,
         )
         child_process_closure = "proven"
         stage = "snapshot-after"
@@ -568,22 +670,24 @@ def main() -> int:
         primary_failure = _primary_failure(stage, error)
     except TimeoutError as error:
         timeout_error = error
-        child_process_closure = "proven"
+        child_process_closure = "proven" if closure_proof.proven else "unproven"
         primary_failure = _primary_failure(stage, error)
     except OverflowError as error:
         output_limit_error = error
-        child_process_closure = "proven"
+        child_process_closure = "proven" if closure_proof.proven else "unproven"
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
-        child_process_closure = "proven"
+        child_process_closure = "proven" if closure_proof.proven else "unproven"
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
         if child_process_closure == "pending":
-            child_process_closure = "proven"
+            child_process_closure = "proven" if closure_proof.proven else "unproven"
         primary_failure = _primary_failure(stage, error)
     finally:
-        if closure_error is not None:
+        if child_process_closure == "pending" and closure_proof.proven:
+            child_process_closure = "proven"
+        if child_process_closure in {"pending", "unproven"}:
             cleanup_failures = tuple(
                 failure
                 for failure in (
@@ -615,7 +719,7 @@ def main() -> int:
             primary_status = "output-limit"
         elif signal_error is not None:
             primary_status = "interrupted"
-        elif closure_error is not None:
+        elif closure_error is not None or child_process_closure == "unproven":
             primary_status = "closure-unproven"
         else:
             primary_status = "failed"
@@ -643,6 +747,7 @@ def main() -> int:
         "retained_paths": retained_paths,
         "returncode": completed.returncode if completed is not None else None,
         "runtime_residue": list(runtime_residue),
+        "secondary_failures": [asdict(failure) for failure in secondary_failures],
         "signal_number": (
             signal_error.signal_number if signal_error is not None else None
         ),
@@ -656,6 +761,16 @@ def main() -> int:
             "read-only installed supervisor primary failure: "
             + json.dumps(
                 asdict(primary_failure),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+    if secondary_failures:
+        print(
+            "read-only installed supervisor secondary failures: "
+            + json.dumps(
+                [asdict(failure) for failure in secondary_failures],
                 sort_keys=True,
                 separators=(",", ":"),
             ),

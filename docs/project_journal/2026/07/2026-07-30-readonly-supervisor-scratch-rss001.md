@@ -51,6 +51,11 @@ superseded_by:
   stderr. Normal leader exit, output overflow, timeout, and SIGTERM settle the
   leader and same-group descendants before cleanup. Unproven process closure
   retains both exact trees and reports `closure-unproven`.
+- Signal-guard teardown cannot replace an already raised
+  `GitProcessClosureUnproven`. Deactivation and handler-restoration failures are
+  retained as ordered secondary diagnostics, while cleanup is authorized only
+  by an explicit process-closure proof; a still-pending or unproven child keeps
+  both the installed and runtime trees.
 - CI runs the ordinary deterministic suite and the read-only installed
   regression in separate macOS Python 3.13 jobs. The read-only job has a
   20-minute emergency outer budget around the runner's 10-minute child timeout.
@@ -72,9 +77,9 @@ superseded_by:
   scratch allocation as incompatible with read-only installed releases and
   untrusted `01777` ancestors.
 - Focused no-child regressions passed 6/6.
-- The ordinary deterministic suite passed 618/618 in 246.656 seconds with
+- The ordinary deterministic suite passed 619/619 in 278.468 seconds with
   selected-identity SHA-256
-  `72a2f40d533257fa90d72fb96cb08e4c2833e65379b05908b7c5ddf54dd88b37`.
+  `346a50ba8b68780fb7afee2e71c9c2caa9f1805d6bb7d4da96ed71cbc1401787`.
 - A replacement-head Fresh Codex review found that the prior runtime-parent
   selector ignored macOS ACL inheritance and that the read-only tree snapshot
   did not reject a regular file with an external hardlink alias. New regressions
@@ -85,6 +90,20 @@ superseded_by:
   path did not prove descendant closure before deleting the trees. The bounded
   replacement has live regressions for a lingering same-group descendant,
   output overflow, SIGTERM, and closure-unproven retention.
+- A later fresh-context Codex reviewer found that signal teardown in
+  `_bound_child_signals()` could overwrite `GitProcessClosureUnproven`, causing
+  the pending fallback to claim closure and delete both recovery trees. The
+  focused runner suite now passes 14/14, including compound closure plus
+  deactivation/restoration failures and a pre-supervision proof-negative case.
+- The updated ordinary deterministic gate passes 619/619 with selected-identity
+  SHA-256
+  `346a50ba8b68780fb7afee2e71c9c2caa9f1805d6bb7d4da96ed71cbc1401787`.
+  The real read-only installed runner also completed with explicit proven child
+  closure, complete cleanup, an immutable release tree, no retained paths, no
+  runtime residue, and no secondary failure. All 102 repository contract tests
+  passed, and an independent state-machine audit returned `No findings.`.
+  Ruff lint/format, source compilation, actionlint, skill validation, project
+  journal validation, and `git diff --check` passed on the final files.
 - GitHub Ubuntu image `20260726.254.1` exposed `/usr` as non-root-owned and
   correctly triggered the production trust policy. The host-independent
   fixture preserves that policy instead of weakening it.
