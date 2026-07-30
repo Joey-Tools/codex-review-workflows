@@ -124,7 +124,7 @@ superseded_by:
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
   in 2.062 seconds. The required live no-child/Seatbelt suite passed 9/9
-  outside the parent sandbox in 7.504 seconds.
+  outside the parent sandbox in 7.866 seconds.
 - The complete 100-test contract module passed in 8.043 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
