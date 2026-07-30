@@ -558,6 +558,26 @@ class DirectoryPathEquivalenceBinding:
     def matches_selected_walk_path(self, walk_path: pathlib.Path) -> bool:
         return walk_path == self.selected_walk_path
 
+    def duplicate_selected_prefix(
+        self,
+    ) -> tuple[int, pathlib.Path, tuple[bytes, ...]]:
+        """Keep selected-root traversal under the originally held prefix object."""
+
+        remaining_count = len(self.left.remaining)
+        remaining_parts = (
+            self.left.walk_path.parts[-remaining_count:] if remaining_count else ()
+        )
+        prefix = self.left.walk_path
+        for _ in remaining_parts:
+            prefix = prefix.parent
+        if prefix != self.left.prefix:
+            raise OSError(
+                errno.ESTALE,
+                "selected retention root prefix binding is inconsistent",
+            )
+        raw_parts = tuple(os.fsencode(part) for part in remaining_parts)
+        return os.dup(self.left.fd), prefix, raw_parts
+
     @staticmethod
     def _revalidate_held_prefix(
         snapshot: _DirectoryPathEquivalenceSnapshot,
@@ -801,8 +821,11 @@ def open_absolute_directory_chain(
     if selected_path:
         active_binding.validate_before_selected_open()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    fd = os.open(b"/", flags)
-    current = pathlib.Path("/")
+    if selected_path:
+        fd, current, raw_parts = active_binding.duplicate_selected_prefix()
+    else:
+        fd = os.open(b"/", flags)
+        current = pathlib.Path("/")
     try:
         identity, _ = _validate_directory_fd_with_policy(
             fd,

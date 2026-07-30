@@ -34,9 +34,12 @@ superseded_by:
   completion. Every exact selected-root open binds the object identity and
   private access policy to that classification before a retention lock or
   durable state can be written, and finalization revalidates both paths plus
-  their equivalence. Expected missing-leaf materialization and directory
-  child-entry churn are accepted; selected/default object replacement or an
-  equivalence transition fails closed.
+  their equivalence. A missing selected root is opened and materialized
+  relative to the originally held deepest-prefix descriptor, so a concurrent
+  pathname replacement cannot redirect state into a different parent object.
+  Expected missing-leaf materialization, restoration of the same bound parent,
+  and directory child-entry churn are accepted; persistent selected/default
+  object replacement or an equivalence transition fails closed.
 - Installed overlays fail closed when any sibling release still has a
   release-local retained attempt. Operators must explicitly select that old
   retention root and drain it before using the account-local default.
@@ -117,12 +120,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 939.260 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 1049.456 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.314 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 2.062 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.504 seconds.
-- The complete 100-test contract module passed in 7.158 seconds.
+- The complete 100-test contract module passed in 8.043 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -201,10 +204,18 @@ superseded_by:
   skipped by hosted Python 3.13 CI. Command-lifetime catalog probes now retain
   component policies and held descriptors, public defaults share one state-root
   snapshot, and both canonical/private Python 3.13 jobs run the regression.
-- The deterministic independent-supervisor gate passed 597/597 in 195.354
-  seconds with the reviewed 597-test selected identity and SHA-256
-  `cd810f99ad39dd711597594d5de9035a41d4604c9c44f577019b438619996763`.
-- The focused post-fix CLI and secure-I/O modules passed 76/76 tests in 44.260
+- The next exact-head Fresh Codex review found that an initially missing
+  retention root could be opened through a replacement pathname after the
+  binding's pre-open check, so the final root no longer had to descend from the
+  originally held parent object. Selected-root traversal now starts from a
+  duplicate of that held descriptor and processes only the missing suffix.
+  Persistent parent replacement fails closed before lock or durable-state
+  creation, while replacement followed by restoration of the same bound parent
+  remains safe and supported.
+- The deterministic independent-supervisor gate passed 599/599 in 211.618
+  seconds with the reviewed 599-test selected identity and SHA-256
+  `aab4d688c8e024101b341c2a71125ddfd788c1fe2f634781f773c5c45b8c78ac`.
+- The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 44.260
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

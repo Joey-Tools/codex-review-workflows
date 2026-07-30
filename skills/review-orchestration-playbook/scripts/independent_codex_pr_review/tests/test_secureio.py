@@ -298,6 +298,117 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             finally:
                 os.close(parent_fd)
 
+    def test_selected_missing_root_rejects_bound_prefix_replacement(self) -> None:
+        with owned_temporary_directory("secureio-selected-prefix-replace-") as root:
+            selected_parent = root / "selected-parent"
+            selected_parent.mkdir(mode=0o700)
+            selected = selected_parent / "retention"
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            replacement_parent = root / "replacement-parent"
+            replacement_parent.mkdir(mode=0o700)
+            displaced_parent = root / "displaced-parent"
+            original_validate = secureio_module.DirectoryPathEquivalenceBinding.validate_before_selected_open
+            replaced = False
+
+            def replace_after_validation(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+            ) -> None:
+                nonlocal replaced
+                original_validate(binding)
+                if not replaced:
+                    selected_parent.rename(displaced_parent)
+                    replacement_parent.rename(selected_parent)
+                    replaced = True
+
+            with (
+                secureio_module.bind_directory_path_equivalence(
+                    selected,
+                    account_default,
+                ),
+                mock.patch.object(
+                    secureio_module.DirectoryPathEquivalenceBinding,
+                    "validate_before_selected_open",
+                    new=replace_after_validation,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                open_absolute_directory_chain(
+                    selected,
+                    create=True,
+                    private_leaf=True,
+                )
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertTrue((displaced_parent / "retention").is_dir())
+            self.assertFalse(selected.exists())
+            self.assertFalse((selected / "retention.lock").exists())
+            self.assertFalse(
+                (displaced_parent / "retention" / "retention.lock").exists()
+            )
+
+    def test_selected_missing_root_allows_bound_prefix_restore(self) -> None:
+        with owned_temporary_directory("secureio-selected-prefix-restore-") as root:
+            selected_parent = root / "selected-parent"
+            selected_parent.mkdir(mode=0o700)
+            selected = selected_parent / "retention"
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            replacement_parent = root / "replacement-parent"
+            replacement_parent.mkdir(mode=0o700)
+            displaced_parent = root / "displaced-parent"
+            retired_replacement = root / "retired-replacement"
+            binding_type = secureio_module.DirectoryPathEquivalenceBinding
+            original_validate = binding_type.validate_before_selected_open
+            original_bind = binding_type.bind_selected_open
+            replaced = False
+
+            def replace_after_validation(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+            ) -> None:
+                nonlocal replaced
+                original_validate(binding)
+                if not replaced:
+                    selected_parent.rename(displaced_parent)
+                    replacement_parent.rename(selected_parent)
+                    replaced = True
+
+            def restore_before_binding(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+                fd: int,
+                identity: Identity,
+            ) -> None:
+                selected_parent.rename(retired_replacement)
+                displaced_parent.rename(selected_parent)
+                original_bind(binding, fd, identity)
+
+            with (
+                secureio_module.bind_directory_path_equivalence(
+                    selected,
+                    account_default,
+                ),
+                mock.patch.object(
+                    binding_type,
+                    "validate_before_selected_open",
+                    new=replace_after_validation,
+                ),
+                mock.patch.object(
+                    binding_type,
+                    "bind_selected_open",
+                    new=restore_before_binding,
+                ),
+            ):
+                selected_fd, _ = open_absolute_directory_chain(
+                    selected,
+                    create=True,
+                    private_leaf=True,
+                )
+                os.close(selected_fd)
+
+            self.assertTrue(replaced)
+            self.assertTrue(selected.is_dir())
+            self.assertFalse((retired_replacement / "retention").exists())
+
     def test_directory_equivalence_rejects_missing_leaf_creation(self) -> None:
         with owned_temporary_directory("secureio-equivalence-create-") as root:
             target = root / "retention"
