@@ -2152,8 +2152,9 @@ class RepositoryContractTest(unittest.TestCase):
             "No comparison exists for explicit-range-only standalone single/double with no selected PR",
             "Only authenticated actual PR absence takes the no-PR path",
             "existing PR on an unsupported host or identity remains on the existing-PR path",
-            "an authenticated provider rejection may prove no-start integration/service unavailability",
-            "acknowledgement or run/review activity proves start",
+            "The fixed authority baseline has no accepted no-start body grammar",
+            "Posting the request is not service start",
+            "nonterminal/check-only",
         ):
             self.assertIn(scenario, readiness)
         self.assertNotIn(
@@ -2186,96 +2187,255 @@ class RepositoryContractTest(unittest.TestCase):
             "No PR or proved integration/host/identity/service unavailability means effective double",
             interface,
         )
-        self.assertIn("after service start means triple-inconclusive", interface)
-
-    def test_github_codex_issue_comments_require_request_correlation(self) -> None:
-        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
-            encoding="utf-8"
+        self.assertIn(
+            "A missing response, otherwise valid nonterminal/check-only evidence, "
+            "or a retryable transport/read failure remains pending while bounded "
+            "waiting is meaningful",
+            interface,
         )
-        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
-            encoding="utf-8"
+        self.assertIn(
+            "Unknown provider identity, malformed/stale evidence, a non-retryable "
+            "failure, or an unstable final read is immediately triple-inconclusive",
+            interface,
+        )
+
+    def test_github_codex_provider_evidence_authority_converges_duplicates(
+        self,
+    ) -> None:
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        normalized = " ".join(authority.split()).lower()
+
+        scenario_outcomes = {
+            "R1-clean1-R2-pending": "clean",
+            "R1-clean1-R2-clean2": "clean",
+            "R1-R2-clean1-clean2": "clean",
+            "R1-clean1-R2-findings2": "findings",
+        }
+        for scenario, expected_outcome in scenario_outcomes.items():
+            matching_lines = [
+                line.lower()
+                for line in authority.splitlines()
+                if scenario.lower() in line.lower()
+            ]
+            with self.subTest(scenario=scenario):
+                self.assertTrue(matching_lines, f"missing scenario {scenario}")
+                self.assertTrue(
+                    any(
+                        expected_outcome
+                        in {cell.strip().strip("`") for cell in line.split("|")}
+                        for line in matching_lines
+                    ),
+                    f"{scenario} must have an exact {expected_outcome} outcome cell",
+                )
+
+        unquoted = normalized.replace("`", "")
+        for anchor in (
+            "duplicate-observed is warning-only",
+            "does not require request/run attribution",
+            "latest trustworthy terminal artifact",
+            "if an accepted request already exists, it does not post another one",
+            "a lone request that was posted under producer policy and is still pending",
+            "compliant, not a warning",
+            "does not independently invalidate complete provider-result evidence",
+            "base-changed-same-head",
+        ):
+            self.assertIn(anchor.lower(), unquoted)
+        self.assertIn("request_policy.status: warning", skill)
+        self.assertIn("request_policy.warnings", skill)
+        self.assertNotIn("request_policy: duplicate-observed", skill)
+
+    def test_github_codex_provider_evidence_authority_is_fail_closed(
+        self,
+    ) -> None:
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(authority.split()).lower()
+
+        for anchor in (
+            "unresolved thread finding",
+            (
+                "a newer malformed or scope-conflicting terminal-looking artifact "
+                "blocks an older clean result"
+            ),
+            "pagination",
+            "aggregate issue-comment reaction counts do not identify the actor",
+            "fully paginated individual reaction records",
+            "closed grammar and an exact commit binding",
+            "an empty `approved` review is not clean",
+            "stable numeric artifact id",
+            "a trustworthy finding takes precedence over clean",
+            (
+                "other incompatible issue-comment/review cross-channel artifacts "
+                "are ambiguous"
+            ),
+            "scope",
+            "final re-read",
+            "same or successor head",
+            (
+                "a top-level finding may be superseded by a later clean artifact "
+                "on the same or successor head"
+            ),
+            "an unresolved thread finding is not superseded",
+        ):
+            self.assertIn(anchor, normalized)
+
+        for profile in (
+            "terminal-payload",
+            "mixed",
+            "thumbs-up-clean",
+            "unknown",
+        ):
+            self.assertIn(f"`{profile}`", authority)
+
+        profile_expectations = {
+            "terminal-payload": ("reactions are not clean evidence",),
+            "thumbs-up-clean": (
+                "explicitly defined `+1` as completed-clean",
+                "reaction-only operation",
+            ),
+            "unknown": ("reaction-only outcome remains pending or inconclusive",),
+        }
+        for profile, expected_phrases in profile_expectations.items():
+            profile_lines = [
+                line.lower()
+                for line in authority.splitlines()
+                if line.lower().startswith(f"| `{profile}` |")
+            ]
+            with self.subTest(provider_profile=profile):
+                self.assertEqual(len(profile_lines), 1)
+                for phrase in expected_phrases:
+                    self.assertIn(phrase, profile_lines[0])
+
+        for anchor in (
+            "+1 fallback requires all of the following",
+            "provider_profile is thumbs-up-clean",
+            "an exact +1",
+            "exact accepted request comment",
+            "exact provider identity",
+            "created after the request",
+            "complete pagination",
+            "stable current scope",
+            (
+                "enumerate every distinct eligible same-repository outcome from the "
+                "last 30 days"
+            ),
+            "select exactly the first 10 when 10 or more exist",
+            "never cherry-pick a favourable subset",
+            "fewer than 3 distinct reaction-only outcomes yields unknown",
+            "the three-outcome minimum applies only to selecting reaction-only",
+            "it never downgrades observed terminal-payload behaviour",
+            "at most one final eligible outcome per distinct immutable scope key",
+            "frozen whole-pr base_sha equal to pr_merge_base",
+            "never use the moving baserefoid as this key",
+            (
+                "base-branch advancement that leaves pr_merge_base and head unchanged "
+                "is still one outcome"
+            ),
+            (
+                "duplicate requests, duplicate reactions, and multiple artifacts for "
+                "one scope never increase the sample size"
+            ),
+            "eligible same-repository outcome",
+            "stable recorded scope",
+            "provider-explicit `+1` semantics",
+            "no trustworthy current-scope terminal artifact",
+            "no current-scope terminal-looking malformed artifact",
+            (
+                "no active top-level finding on the current head or a proved ancestor "
+                "head"
+            ),
+            "reaction-only clean never supersedes a finding",
+            "no unresolved thread finding",
+            "no newer exact-provider `eyes` reaction",
+            ("every one reaction-only and none containing a clean terminal payload"),
+            "final re-read is unchanged",
+            "`eyes` is liveness-only",
+            "if any condition is absent",
+            (
+                "the only clean-completion path that deliberately has no terminal "
+                "review/comment payload"
+            ),
+        ):
+            self.assertIn(
+                anchor.lower().replace("`", ""),
+                normalized.replace("`", ""),
+            )
+        self.assertIn(
+            "`eyes` is liveness-only: it can show that work started or "
+            "restarted, but it never proves clean",
+            normalized,
+        )
+
+        mixed_profile_lines = [
+            line.lower()
+            for line in authority.splitlines()
+            if line.lower().startswith("| `mixed` |")
+        ]
+        self.assertEqual(len(mixed_profile_lines), 1)
+        self.assertIn(
+            "terminal payload remains the only clean authority",
+            mixed_profile_lines[0],
+        )
+        self.assertIn(
+            "reaction-only evidence cannot independently pass",
+            mixed_profile_lines[0],
         )
 
         for anchor in (
-            "Keep a request ledger across the PR's issue-comment history",
-            "does **not** resolve the older request",
-            "the full exact current `headRefOid`",
-            "the current request is the sole still-unresolved `@codex review` request",
-            "A head marker does not relax either condition",
-            "no other `@codex review` request intervened",
-            "pair a response to the nearest request by timestamp alone",
-            "an older-head request remains unresolved",
-            "a full SHA proves only which head the response concerns, not which request caused it",
-            "exact request comment ID/URL",
-            "provider request/dispatch identity",
-            "SHA-only delayed result while any older request remains unresolved",
-            "even when the candidate names the full exact current `headRefOid`",
-            "`triple-inconclusive`",
-            "`commit_id == headRefOid`",
+            "`provider_profile` is recomputed from the final complete snapshot",
+            "not a sticky provider preference",
+            "`+1` cannot independently establish clean in this profile",
         ):
-            self.assertIn(anchor, probes)
+            self.assertIn(anchor.lower(), normalized)
+
+        for field in (
+            "request_policy",
+            "provider_profile",
+            "evidence_basis",
+        ):
+            self.assertIn(field, authority)
 
         self.assertIn(
-            "the request-ledger and correlation rule",
-            readiness,
+            "16366aa81270ad2c875d2ceb8ce194f5b2308af6",
+            authority,
         )
         self.assertIn(
-            "An older request remains unresolved across a head change",
-            readiness,
-        )
-        self.assertIn(
-            "without the required correlation, that ambiguity is `triple-inconclusive`",
-            readiness,
-        )
-        self.assertIn(
-            "A terminal completion must bind through the exact request/run or the sole-unresolved/no-intervening fallback",
-            readiness,
-        )
-        self.assertIn(
-            "The full exact current SHA may corroborate artifact scope, but it does not identify which request caused the response",
-            readiness,
-        )
-        self.assertIn(
-            "Exact current-head SHA binding alone is not request binding for completion or no-start evidence",
-            readiness,
-        )
-        self.assertIn(
-            "A current-SHA marker cannot disambiguate which request caused a result",
-            readiness,
-        )
-        self.assertNotIn(
-            "the full exact current SHA, or the sole-unresolved-request fallback",
-            readiness,
+            "2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6",
+            authority,
         )
 
-    def test_current_sha_does_not_resolve_an_older_request(self) -> None:
-        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
-            encoding="utf-8"
-        )
-        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
-            encoding="utf-8"
-        )
+        for anchor in (
+            "complete 15-file release tree",
+            "complete `packages/action/` tree",
+            "`src/core.mjs`",
+            "`src/evidence-budget.mjs`",
+            "alignment and intentional differences from the fixed action baseline",
+            "duplicate result consumption aligns with the action",
+            "early-result consumption aligns with the action",
+            "warning codes are a playbook extension",
+            "local-lane sequencing is a playbook extension",
+        ):
+            self.assertIn(anchor, normalized)
 
-        self.assertIn(
-            "SHA-only delayed terminal completion or no-start rejection while any older request remains unresolved",
-            probes,
-        )
-        self.assertIn(
-            "even when the terminal response names the current SHA",
-            readiness,
-        )
-        self.assertIn(
-            "an older request may execute after the push and review that same current head",
-            readiness,
-        )
-        self.assertNotIn(
-            "the SHA disambiguates any unresolved different-head request",
-            probes,
-        )
-        self.assertNotIn(
-            "full-current-SHA binding that disambiguates the head epoch",
-            readiness,
-        )
+        for anchor in (
+            "fixed authority baseline intentionally defines no accepted provider body grammar",
+            "free-form prose that appears to say",
+            "provider-backed declaration",
+            "evidence_basis.kind: no-start-rejection",
+            "actually recomputed `provider_profile`",
+            "server_time_field: submitted_at",
+            "server_time_field: created_at",
+            "server_time_field: updated_at",
+            "proved pre-provider ineligibility or blocker",
+            "eligible and waiting with no selected provider artifact",
+            "accepted weak reaction clean",
+            "future accepted authenticated no-start rejection",
+        ):
+            self.assertIn(anchor, normalized)
 
     def test_named_lanes_materialize_before_the_first_status_query(self) -> None:
         policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
@@ -2493,6 +2653,10 @@ class RepositoryContractTest(unittest.TestCase):
             _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
             / "skills/change-delivery-workflow/SKILL.md"
         ).read_text(encoding="utf-8")
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        normalized_authority = " ".join(authority.split()).lower()
 
         for content in (skill, readiness, probes, contracts, agents_policy, interface):
             self.assertIn("blocked-input", content)
@@ -2553,45 +2717,31 @@ class RepositoryContractTest(unittest.TestCase):
             agents_policy,
             interface,
             delivery,
+            authority,
         )
         for content in identity_documents:
             self.assertIn("github.com", content)
             self.assertIn("chatgpt-codex-connector[bot]", content)
             self.assertIn("chatgpt-codex-connector", content)
-        for content in (skill, readiness, probes, contracts, templates, egress):
+        for content in (
+            skill,
+            readiness,
+            probes,
+            contracts,
+            templates,
+            egress,
+            authority,
+        ):
             self.assertIn("Bot", content)
         self.assertIn('user.login == "chatgpt-codex-connector[bot]"', probes)
         self.assertIn('user.type == "Bot"', probes)
         self.assertIn('app.slug == "chatgpt-codex-connector"', probes)
-        self.assertIn(
-            "Accept a review artifact only when request isolation is proved, its `commit_id` equals `headRefOid`",
-            probes,
-        )
         for anchor in (
-            "server `created_at`",
-            "strictly later",
-            "Evidence from an earlier request on the same unchanged head is stale",
+            "latest trustworthy terminal artifact",
+            "fully paginate issue comments, reviews, every associated inline review comment",
+            "terminal issue comments or pull-request reviews",
         ):
-            self.assertIn(anchor, probes)
-        for anchor in (
-            "complete terminal provider-authored",
-            "findings payload",
-            "fully paginated associated inline review comment",
-            "terminal",
-            "issue-comment body",
-        ):
-            for content in (
-                skill,
-                readiness,
-                contracts,
-                templates,
-                egress,
-                agents_policy,
-                interface,
-                delivery,
-            ):
-                with self.subTest(payload_anchor=anchor):
-                    self.assertIn(anchor, content)
+            self.assertIn(anchor, normalized_authority)
         for content in (
             skill,
             readiness,
@@ -2607,30 +2757,13 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("missing", lowered)
                 self.assertIn("ambiguous", lowered)
                 self.assertIn("triple-inconclusive", lowered)
-        if CI_PROFILE == "canonical":
-            for content in (
-                (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
-                (
-                    REPO_ROOT
-                    / "docs/project_journal/2026/07/"
-                    / "2026-07-20-review-policy-migration-7f2001.md"
-                ).read_text(encoding="utf-8"),
-            ):
-                self.assertIn("complete terminal provider-authored", content)
-                self.assertIn("fully paginated associated inline", content)
-                self.assertRegex(
-                    content,
-                    r"terminal(?: exact-bot)? issue-comment body",
+        for content in (readiness, probes, contracts, authority):
+            with self.subTest(liveness_document=content[:40]):
+                normalized = " ".join(content.split()).lower().replace("-", " ")
+                self.assertTrue(
+                    "`eyes` is liveness only" in normalized
+                    or "`eyes` proves liveness only" in normalized
                 )
-
-        for content in (readiness, probes, contracts):
-            with self.subTest(check_only_document=content[:40]):
-                self.assertIn("service-start evidence only", content)
-                self.assertIn("never completes triple", content)
-                self.assertIn('status == "completed"', content)
-                self.assertIn('conclusion == "success"', content)
-                self.assertIn("same-App check may be unrelated", content)
-                self.assertIn("check success can coexist", content)
         self.assertNotIn("Accept a check/run only when", probes)
 
         for anchor in (
@@ -2639,13 +2772,49 @@ class RepositoryContractTest(unittest.TestCase):
             "'repos/<owner>/<repo>/pulls/<number>/reviews/<review_id>/comments?per_page=100'",
             "pull_request_review_id",
             "'repos/<owner>/<repo>/issues/<number>/comments?per_page=100'",
+            "'repos/<owner>/<repo>/issues/comments/<request_comment_id>/reactions?per_page=100'",
             "COMMENTED",
             "APPROVED",
             "CHANGES_REQUESTED",
-            "never `PENDING`",
+            "`PENDING` is nonterminal",
         ):
             self.assertIn(anchor, probes)
-        self.assertGreaterEqual(probes.count("--method GET --paginate --slurp"), 4)
+        self.assertGreaterEqual(probes.count("--method GET --paginate --slurp"), 5)
+        reaction_probe = probes.split(
+            "'repos/<owner>/<repo>/issues/comments/"
+            "<request_comment_id>/reactions?per_page=100'",
+            1,
+        )[1].split("```", 1)[0]
+        for anchor in (
+            "--method GET --paginate --slurp",
+            ".user.login",
+            ".user.type",
+            "content",
+            "created_at",
+        ):
+            self.assertIn(anchor, reaction_probe)
+        for anchor in (
+            "reviewThreads",
+            "isResolved",
+            "hasNextPage",
+            "endCursor",
+            "REST-compatible `fullDatabaseId: BigInt`",
+            "pullRequestReview { id fullDatabaseId }",
+            "canonical positive decimal text",
+            "REST `pull_request_review_id`",
+            "orphan",
+            "duplicate mapping",
+            "parent-review conflict",
+        ):
+            self.assertIn(anchor, probes)
+        self.assertNotIn("REST-compatible `databaseId`", probes)
+        for anchor in (
+            "An untrusted-identity or stale-scope artifact cannot win selection",
+            "retain every terminal-looking instance as fail-closed evidence",
+            "Never drop one and expose an older clean as the apparent winner",
+            "an issue comment whose current body was edited uses `updated_at`",
+        ):
+            self.assertIn(anchor, probes)
         self.assertIn(
             "Do not use `gh pr view --repo` for this host-sensitive preflight",
             probes,
@@ -2656,7 +2825,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertGreaterEqual(probes.count(host_bound_metadata_probe), 2)
         self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
-        request_isolation_documents = {
+        producer_policy_documents = {
             "skill": skill,
             "PR readiness": readiness,
             "GitHub probes": probes,
@@ -2665,7 +2834,7 @@ class RepositoryContractTest(unittest.TestCase):
             "repository policy": agents_policy,
             "skill interface": interface,
         }
-        full_history_documents = {
+        authority_consumer_documents = {
             "PR readiness": readiness,
             "GitHub probes": probes,
             "lane contracts": contracts,
@@ -2679,55 +2848,131 @@ class RepositoryContractTest(unittest.TestCase):
                 / "docs/project_journal/2026/07/"
                 / "2026-07-20-review-policy-migration-7f2001.md"
             ).read_text(encoding="utf-8")
-            request_isolation_documents.update(
+            producer_policy_documents.update(
                 {
                     "README": readme,
                     "migration journal": migration_journal,
                 }
             )
-            full_history_documents.update(
-                {
-                    "README": readme,
-                    "migration journal": migration_journal,
-                }
-            )
-        for name, content in request_isolation_documents.items():
+        for name, content in producer_policy_documents.items():
             normalized = content.lower()
-            with self.subTest(request_isolation_document=name):
-                self.assertIn("at most one", normalized)
-                self.assertIn("never post a second", normalized)
+            with self.subTest(producer_policy_document=name):
+                self.assertTrue(
+                    "at most one" in normalized
+                    or "one-request producer rule" in normalized
+                    or "permits one exact" in normalized,
+                    f"{name} must preserve the one-request producer rule",
+                )
+                self.assertTrue(
+                    "never post a second" in normalized
+                    or "never permits a second" in normalized
+                    or "never a second or third" in normalized,
+                    f"{name} must forbid another same-scope request",
+                )
                 self.assertIn("base-changed-same-head", normalized)
                 self.assertIn("empty or anchor commit", normalized)
-                self.assertIn(
-                    "timestamps prove ordering, not request/run lineage",
+
+        for name, content in authority_consumer_documents.items():
+            with self.subTest(authority_consumer=name):
+                self.assertIn("github-codex-evidence-authority.md", content)
+                normalized = content.lower().replace("`", "")
+                self.assertNotIn(
+                    "predeclared provider_profile",
                     normalized,
                 )
-        for name, content in full_history_documents.items():
-            with self.subTest(full_history_document=name):
-                self.assertIn("older request", content)
-                self.assertIn("might overlap", content)
-                self.assertIn("triple-inconclusive", content)
-                self.assertIn("check/run", content)
-                self.assertIn("started_at", content)
+                self.assertNotIn(
+                    "selected provider_profile was predeclared",
+                    normalized,
+                )
+                for field in (
+                    "request_policy",
+                    "provider_profile",
+                    "evidence_basis",
+                ):
+                    self.assertIn(field, content)
                 self.assertIn(
-                    "re-read complete authenticated request history immediately before",
+                    "pending while bounded waiting is meaningful",
                     content.lower(),
                 )
+        self.assertNotIn(
+            "predeclared provider_profile",
+            skill.lower().replace("`", ""),
+        )
+
+        for content in (readiness, probes, contracts, authority):
+            normalized = " ".join(content.split()).lower()
+            self.assertIn("duplicate-observed", normalized)
+            self.assertTrue(
+                "final re-read" in normalized
+                or "final reread" in normalized
+                or (
+                    "immediately before success" in normalized
+                    and "re-read" in normalized
+                )
+            )
+        self.assertIn("never post a second", templates.lower())
+        self.assertIn(
+            "does not require request/run attribution",
+            authority.lower(),
+        )
+        self.assertIn(
+            "This blocker does not reject a complete `thumbs-up-clean` result",
+            skill,
+        )
+        for content in (skill, interface, templates):
+            normalized = content.lower().replace("`", "")
+            self.assertIn("provider_profile: null", normalized)
+            self.assertIn("evidence_basis: null", normalized)
+        self.assertIn(
+            "fixed authority baseline has no accepted no-start body grammar",
+            skill.lower(),
+        )
+        normalized_authority = " ".join(authority.split()).lower()
+        for anchor in (
+            "only authenticated structured capability or installation metadata",
+            "explicitly encode the unavailable or not-installed state",
+            "provider-authored free-form prose do not satisfy this path",
+        ):
+            self.assertIn(anchor, normalized_authority)
+        normalized_contracts = " ".join(contracts.split()).lower()
+        normalized_delivery = " ".join(delivery.split()).lower()
+        for normalized in (normalized_contracts, normalized_delivery):
+            self.assertIn(
+                "authenticated structured capability or installation metadata",
+                normalized,
+            )
+            self.assertIn("selected repository/integration", normalized)
+            self.assertTrue(
+                "unavailable or not installed" in normalized
+                or "unavailable 或 not-installed" in normalized
+            )
+            self.assertNotIn(
+                "directly known or proved by authenticated structured "
+                "capability or installation metadata",
+                normalized,
+            )
         for content in (readiness, probes, contracts):
-            self.assertIn("race", content)
+            normalized = content.lower()
+            self.assertIn(
+                "fixed authority baseline has no accepted no-start body grammar",
+                normalized,
+            )
+            self.assertNotIn(
+                "proved by an authenticated exact-provider response",
+                normalized,
+            )
         self.assertIn(
-            "post the exact comment below only when complete authenticated history proves that no accepted exact request exists for the unchanged head",
-            templates,
+            "A changed `baseRefOid` does not create another outcome when "
+            "`pr_merge_base` and head are unchanged",
+            probes,
         )
-        self.assertIn(
-            "Otherwise reuse the one recorded request and do not post another",
-            templates,
-        )
-        self.assertIn("non-null `started_at` strictly later than the request", probes)
-        self.assertIn(
-            "review/comment APIs expose no request/run identifier",
-            readiness,
-        )
+        for content in (probes, contracts, interface, templates, delivery):
+            normalized = content.lower().replace("`", "")
+            self.assertIn("nonterminal/check-only", normalized)
+            self.assertIn("pending while bounded waiting is meaningful", normalized)
+            self.assertIn("malformed", normalized)
+            self.assertIn("ambiguous", normalized)
+            self.assertTrue("immediate" in normalized or "立即" in normalized)
         self.assertNotIn("expected Codex integration identity", probes)
 
         for anchor in (
@@ -4413,6 +4658,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
             "skills/review-orchestration-playbook/references/claude-stream-schema.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-codex-evidence-authority.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
@@ -4451,6 +4697,7 @@ class RepositoryContractTest(unittest.TestCase):
         outcome_policy_paths = (
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-codex-evidence-authority.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
@@ -4491,6 +4738,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/claude-stream-schema.json",
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-codex-evidence-authority.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
@@ -5723,6 +5971,7 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
             SKILL_ROOT / "references/egress-consent.md",
+            SKILL_ROOT / "references/github-codex-evidence-authority.md",
             SKILL_ROOT / "references/github-pr-probes.md",
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
@@ -5758,6 +6007,7 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
             SKILL_ROOT / "references/egress-consent.md",
+            SKILL_ROOT / "references/github-codex-evidence-authority.md",
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
             SKILL_ROOT / "references/review-prompt-templates.md",
@@ -6368,7 +6618,10 @@ class RepositoryContractTest(unittest.TestCase):
         preflight_anchor = "independently query and record lifecycle"
         run_lanes_anchor = "Run the requested local lanes"
         read_state_anchor = "Read required CI/check state"
-        post_request_anchor = "Otherwise post the one exact `@codex review` comment"
+        post_request_anchor = (
+            "If no same-scope request exists, producer policy permits the parent "
+            "to post one exact `@codex review` comment"
+        )
         for later_anchor in (run_lanes_anchor, read_state_anchor, post_request_anchor):
             self.assertLess(
                 readiness.index(preflight_anchor), readiness.index(later_anchor)
@@ -6380,39 +6633,42 @@ class RepositoryContractTest(unittest.TestCase):
                 content.lower(),
             )
 
-    def test_github_request_requires_terminal_local_lanes(self) -> None:
+    def test_early_github_request_does_not_poison_provider_evidence(self) -> None:
         documents = {
             "skill": SKILL_ROOT / "SKILL.md",
             "PR readiness": SKILL_ROOT / "references/pr-readiness.md",
             "lane contracts": SKILL_ROOT / "references/review-lane-contracts.md",
             "GitHub probes": SKILL_ROOT / "references/github-pr-probes.md",
             "prompt templates": SKILL_ROOT / "references/review-prompt-templates.md",
+            "skill interface": SKILL_ROOT / "agents/openai.yaml",
         }
         if CI_PROFILE == "canonical":
             documents["README"] = REPO_ROOT / "README.md"
         for name, path in documents.items():
             content = " ".join(path.read_text(encoding="utf-8").split()).lower()
             with self.subTest(policy_document=name):
-                self.assertIn("github-request-before-local-terminal", content)
-                self.assertIn("later local-lane completion does not cure", content)
-                self.assertIn("terminal payload cannot count", content)
-                self.assertIn("empty or anchor commit", content)
+                self.assertIn("github-codex-evidence-authority.md", content)
+                self.assertNotIn("later local-lane completion does not cure", content)
+                self.assertNotIn("terminal payload cannot count", content)
 
-        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
-        self.assertIn("github-request-before-local-terminal", interface)
-        self.assertIn("both local terminals preceded", interface)
-        self.assertIn("cannot be cured by later local completion", interface)
-        self.assertIn("cannot be repeated on the unchanged head", interface)
-
-        readiness = documents["PR readiness"].read_text(encoding="utf-8")
-        self.assertLess(
-            readiness.index("Run the requested local lanes"),
-            readiness.index("Otherwise post the one exact `@codex review` comment"),
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(authority.split()).lower()
+        self.assertIn("early-request-observed", normalized)
+        self.assertIn("warning-only", normalized)
+        self.assertIn("outcome-neutral", normalized)
+        self.assertIn(
+            "a producer-side request policy violation does not erase otherwise "
+            "complete provider-authored result evidence",
+            normalized,
         )
         self.assertIn(
-            "only after both local lanes are terminal",
-            readiness,
+            "do not discard a later independently trustworthy provider result "
+            "solely because of that producer-side sequencing defect",
+            normalized,
         )
+        self.assertIn("latest trustworthy terminal artifact", normalized)
 
 
 if __name__ == "__main__":
