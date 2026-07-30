@@ -7,11 +7,14 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
+import urllib.parse
 
 try:
     import tomllib
@@ -2080,7 +2083,7 @@ class RepositoryContractTest(unittest.TestCase):
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
-            "missing PR, unsupported host or integration, unavailable GitHub Codex service, or unsupported operating identity",
+            "only a proven missing PR, unsupported host, or unsupported operating identity establishes third-lane unavailability",
             "sqbu-github.cisco.com",
             "operating identity is in `{hoteng, hoteng_cisco}`",
             "Report `requested: triple`, `effective: double`, and the concrete reason",
@@ -2184,7 +2187,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("on Cisco GitHub Enterprise Cloud", readiness)
         self.assertNotIn("on Cisco GitHub Enterprise Cloud", probes)
         self.assertIn(
-            "No PR or proved integration/host/identity/service unavailability means effective double",
+            "Proved no PR or directly unsupported host/identity means effective double",
             interface,
         )
         self.assertIn(
@@ -2258,20 +2261,27 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "unresolved thread finding",
             (
-                "a newer malformed or scope-conflicting terminal-looking artifact "
-                "blocks an older clean result"
+                "a newer or equal-time malformed or scope-conflicting "
+                "terminal-looking artifact blocks an older clean result"
             ),
             "pagination",
             "aggregate issue-comment reaction counts do not identify the actor",
             "fully paginated individual reaction records",
-            "closed grammar and an exact commit binding",
+            "fixed grammar below and an exact commit binding",
+            "state admissibility and terminal-looking detection are separate",
+            "`dismissed` is terminal-looking but inadmissible",
+            (
+                "a missing or unknown state is terminal-looking when the "
+                "normalized review body is nonempty"
+            ),
+            "whole-snapshot inconclusive blocker",
+            "original `submitted_at` cannot make it older than",
+            "do not let a later-looking clean supersede them",
             "an empty `approved` review is not clean",
             "stable numeric artifact id",
-            "a trustworthy finding takes precedence over clean",
-            (
-                "other incompatible issue-comment/review cross-channel artifacts "
-                "are ambiguous"
-            ),
+            "any trustworthy finding in the set takes precedence over every clean",
+            "incompatible artifacts without another provider-stable ordering signal are ambiguous",
+            "any malformed or scope-conflicting member of that equal-time set",
             "scope",
             "final re-read",
             "same or successor head",
@@ -2316,19 +2326,23 @@ class RepositoryContractTest(unittest.TestCase):
             "an exact +1",
             "exact accepted request comment",
             "exact provider identity",
-            "created after the request",
+            "created strictly after the request's semantic server time",
             "complete pagination",
             "stable current scope",
             (
-                "enumerate every distinct eligible same-repository outcome from the "
+                "complete same-repository historical candidate universe for the "
                 "last 30 days"
             ),
-            "select exactly the first 10 when 10 or more exist",
-            "never cherry-pick a favourable subset",
-            "fewer than 3 distinct reaction-only outcomes yields unknown",
+            "historical candidates exclude the exact current scope",
+            "current outcome is validated separately",
+            "never counts toward the three-outcome history minimum",
+            "select exactly the first 10 candidates when 10 or more exist",
+            "never skip an incomplete, conflicting, or unfavourable candidate",
+            "fewer than 3 distinct selected reaction-only outcomes yields unknown",
             "the three-outcome minimum applies only to selecting reaction-only",
-            "it never downgrades observed terminal-payload behaviour",
-            "at most one final eligible outcome per distinct immutable scope key",
+            "observed behaviour” means behaviour in the deterministic selected outcome window",
+            "its payload kind does not itself select the provider profile",
+            "at most one final candidate outcome per distinct immutable scope key",
             "frozen whole-pr base_sha equal to pr_merge_base",
             "never use the moving baserefoid as this key",
             (
@@ -2339,9 +2353,41 @@ class RepositoryContractTest(unittest.TestCase):
                 "duplicate requests, duplicate reactions, and multiple artifacts for "
                 "one scope never increase the sample size"
             ),
-            "eligible same-repository outcome",
+            "every selected candidate must have exact provider identity",
             "stable recorded scope",
+            "normalized body is exactly `@codex review`",
+            "record each request's id, url, `created_at`, `updated_at`, normalized body, and scope",
+            "record every reaction's id, canonical reaction-resource api url",
+            "`parent_request_id`",
+            "`issues/comments/<parent_request_id>/reactions?per_page=100` fetch url",
+            "`created_at`, content, login, and type",
+            "`reaction.created_at > request.request_server_time`",
+            "a reaction that predates an edit into `@codex review`",
+            "`request_server_time_field: created_at | updated_at`",
+            "de-duplicate only repeated api records with the same positive reaction id",
+            "any exact-provider reaction on any same-scope parent with other content",
+            "an `eyes` at or after the selected `+1`",
+            "aggregate reaction counts and a single selected parent's reaction page "
+            "cannot prove the absence of a cross-parent conflict",
             "provider-explicit `+1` semantics",
+            "only active declaration authority is an exact provider-authored "
+            "github issue-comment artifact",
+            "fetched directly from its canonical rest resource",
+            "generic `issuer`/`source` strings",
+            "a local paraphrase with a self-consistent hash",
+            "caller-supplied fields alone never authenticate it",
+            "trusted github rest response `date` header",
+            "`window_seconds: 2592000`",
+            "`window_start_exclusive = as_of_server_time - 2592000",
+            "a candidate basis at the lower boundary is outside the window",
+            "candidate_universe_count",
+            "including candidates that will fall outside the selected 10-outcome "
+            "window",
+            "a later `eyes`",
+            "sha-256 of its normalized content",
+            "`normalization: crlf-and-cr-to-lf+utf8`",
+            "every selected history entry records its immutable scope",
+            "strict request-semantic-time-before-reaction ordering",
             "no trustworthy current-scope terminal artifact",
             "no current-scope terminal-looking malformed artifact",
             (
@@ -2350,7 +2396,12 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "reaction-only clean never supersedes a finding",
             "no unresolved thread finding",
-            "no newer exact-provider `eyes` reaction",
+            "no cross-parent conflict under the rule above",
+            "every accepted current-scope controlled request",
+            "no cross-parent conflict",
+            "selected +1 is later than every such request",
+            "single selected parent's reaction page cannot prove",
+            "same_scope_request_audit",
             ("every one reaction-only and none containing a clean terminal payload"),
             "final re-read is unchanged",
             "`eyes` is liveness-only",
@@ -2367,6 +2418,45 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "`eyes` is liveness-only: it can show that work started or "
             "restarted, but it never proves clean",
+            normalized,
+        )
+        for anchor in (
+            "fixed terminal-payload grammar",
+            'performed_via_github_app.slug == "chatgpt-codex-connector"',
+            "codex review: didn't find any major issues.[ optional_tagline]",
+            "**reviewed commit:** `<full_40_hex_sha>`",
+            'rest `state == "approved"`',
+            "normalized body exactly equal to `no findings.`",
+            "ascii rfc 3986 absolute uri",
+            "https://github.com/<exact_owner>/<exact_repo>/blob/"
+            "<full_40_hex_sha>/<path>#l<positive_line>",
+            "native full-sha `commit_id` to equal that sha",
+            "inline-parent review container",
+            "no reviewed-commit marker is present or required",
+            "`pull_request_review_id` equal to the parent review id",
+            "`original_commit_id == p`",
+            "all other terminal-looking exact-provider comments or reviews "
+            "are malformed",
+            "a 10-character sha",
+            "`no findings!`",
+            "an empty `approved` review",
+            "`looks good.`",
+            "a short-sha or cross-repository finding url",
+            "positive example for each active grammar branch",
+            "**reviewed commit:** `0123456789abcdef0123456789abcdef01234567`",
+            "commit_id: 0123456789abcdef0123456789abcdef01234567",
+            "body: no findings.",
+            "pull_request_review_id: 123456789",
+            "original_commit_id: 0123456789abcdef0123456789abcdef01234567",
+            "https://github.com/owner/repo/blob/"
+            "0123456789abcdef0123456789abcdef01234567/"
+            "path/to/file.py#l10",
+            "the contract fixture matrix is normative",
+            "exercise every row against a closed reference classifier",
+        ):
+            self.assertIn(anchor, normalized)
+        self.assertIn(
+            "every ordered historical request/reaction sample",
             normalized,
         )
 
@@ -2408,6 +2498,53 @@ class RepositoryContractTest(unittest.TestCase):
             authority,
         )
 
+        baseline_manifest = {
+            "COOKBOOK.md": "70784aed0869504d85cd9b95710b2dea427841e5",
+            "COOKBOOK.zh-CN.md": "f7dc955b8ebd1673883d38352f37b58099b1227d",
+            "DESIGN.md": "8de87334a37bd85a6b3f3d1a4362933eeacbab25",
+            "DESIGN.zh-CN.md": "45026f208847f1385780ffe9904b58b98903fb44",
+            "EULA.md": "eeaeb240bb31e35e2d7c574c044d3ddcbb64ea30",
+            "LICENSE": "d9a10c0d8e868ebf8da0b3dc95bb0be634c34bfe",
+            "README.md": "c43aeded90def8d5876dec6d67e07a7cdcfac038",
+            "README.zh-CN.md": "c66a93b90a3354269f2f91135103490cc949a81e",
+            "SECURITY.md": "ae8b45461e2f41350b1e6fc7343504fc4c9dcd8b",
+            "SUPPORT.md": "4378a1e3377ee0fb58fcaa7a2ad715a4d53e814f",
+            "action.yml": "2169ca33d1cb8c698805513768e6a5c34887fe35",
+            "package.json": "b554018df447543590a0f732968892ccc22050f3",
+            "src/core.mjs": "7270586bced68f0faca15ebe844f0517dc7b1ec3",
+            "src/evidence-budget.mjs": "b2a07e9a4dd33dc60d138d97a59444b3fc537677",
+            "src/gate.mjs": "e0b974b27ebd64e412eaef1d069789b5f6bd76ba",
+        }
+        self.assertEqual(len(baseline_manifest), 15)
+        self.assertIn(
+            "d03de9035d20f285e6a93986d436403b4a30e9bc",
+            authority,
+        )
+        for relative_path, blob_id in baseline_manifest.items():
+            with self.subTest(action_baseline_path=relative_path):
+                self.assertIn(
+                    f"| `{relative_path}` | `{blob_id}` |",
+                    authority,
+                )
+
+        for rationale in (
+            "a provider-authored terminal payload carries the actual "
+            "finding/no-findings decision and commit scope",
+            "github review and issue-comment apis do not expose a general "
+            "request/run lineage",
+            "duplicate or mistimed requests are still actionable orchestration "
+            "defects, but they do not contradict what the provider reported",
+        ):
+            self.assertIn(rationale, normalized)
+        for upstream_regression in (
+            "valid current-head clean passes without creating a review marker",
+            "current-head clean passes regardless of marker timing or deadline",
+            "clean predates active marker",
+            "marker and audit history cannot reject stable current-head clean",
+            "conflicting trusted markers",
+        ):
+            self.assertIn(upstream_regression, normalized)
+
         for anchor in (
             "complete 15-file release tree",
             "complete `packages/action/` tree",
@@ -2418,11 +2555,17 @@ class RepositoryContractTest(unittest.TestCase):
             "early-result consumption aligns with the action",
             "warning codes are a playbook extension",
             "local-lane sequencing is a playbook extension",
+            "whole-pr scope and lifecycle are stricter",
+            "an empty `approved` review is not clean",
+            "the `+1` fallback is new playbook policy",
+            "`eyes` remains orchestration-only",
+            "duplicate result consumption aligns with the action",
+            "early-result consumption aligns with the action",
         ):
             self.assertIn(anchor, normalized)
 
         for anchor in (
-            "fixed authority baseline intentionally defines no accepted provider body grammar",
+            "fixed authority baseline intentionally defines no accepted no-start body grammar",
             "free-form prose that appears to say",
             "provider-backed declaration",
             "evidence_basis.kind: no-start-rejection",
@@ -2436,6 +2579,4624 @@ class RepositoryContractTest(unittest.TestCase):
             "future accepted authenticated no-start rejection",
         ):
             self.assertIn(anchor, normalized)
+
+    def test_github_codex_terminal_grammar_fixture_matrix(self) -> None:
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        current_sha = "0123456789abcdef0123456789abcdef01234567"
+        other_sha = "fedcba9876543210fedcba9876543210fedcba98"
+        review_id = 123456789
+        disclosure = "\n".join(
+            (
+                "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+                "<br/>",
+                "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+                "- Open a pull request for review",
+                "- Mark a draft as ready",
+                '- Comment "@codex review".',
+                "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+                'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
+                "</details>",
+            )
+        )
+        eligible_finding_commits = {current_sha, other_sha}
+
+        def inline_container(commit_id: str) -> str:
+            return "\n".join(
+                (
+                    "### 💡 Codex Review",
+                    "Here are some automated review suggestions for this pull request.",
+                    f"**Reviewed commit:** `{commit_id}`",
+                    "",
+                    disclosure,
+                )
+            )
+
+        def clone(value: dict[str, object]) -> dict[str, object]:
+            return json.loads(json.dumps(value))
+
+        def normalize_body(value: object) -> str | None:
+            if not isinstance(value, str):
+                return None
+            normalized = (
+                value.replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .replace("\v", "\n")
+                .replace("\f", "\n")
+                .replace("\u0085", "\n")
+                .replace("\u2028", "\n")
+                .replace("\u2029", "\n")
+            )
+            if any(
+                codepoint == 0
+                or (
+                    (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F)
+                    and codepoint not in (0x09, 0x0A)
+                )
+                for codepoint in map(ord, normalized)
+            ):
+                return None
+            return normalized.strip("\t\n ")
+
+        finding_line = re.compile(
+            r"^- \[P[0-3]\] (?P<title>.{1,240}) — "
+            r"https://github\.com/OWNER/REPO/blob/"
+            r"(?P<sha>[0-9a-f]{40})/"
+            r"(?P<path>(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2})+)"
+            r"#L[1-9][0-9]*(?:-L[1-9][0-9]*)?$"
+        )
+
+        def finding_sha(body: str) -> str | None:
+            lines = body.split("\n")
+            if len(lines) < 2 or lines[0] != "### 💡 Codex Review":
+                return None
+            shas: set[str] = set()
+            for line in lines[1:]:
+                match = finding_line.fullmatch(line)
+                if match is None:
+                    return None
+                title = match.group("title")
+                path = match.group("path")
+                try:
+                    decoded_path = urllib.parse.unquote_to_bytes(path).decode(
+                        "utf-8", errors="strict"
+                    )
+                except UnicodeDecodeError:
+                    return None
+                if (
+                    title != title.strip("\t ")
+                    or " — " in title
+                    or any(unicodedata.category(char) == "Cc" for char in title)
+                    or any(
+                        segment in ("", ".", "..")
+                        for segment in decoded_path.split("/")
+                    )
+                ):
+                    return None
+                shas.add(match.group("sha"))
+            return next(iter(shas)) if len(shas) == 1 else None
+
+        def exact_provider(record: dict[str, object]) -> bool:
+            return (
+                record.get("user_login") == "chatgpt-codex-connector[bot]"
+                and record.get("user_type") == "Bot"
+            )
+
+        def exact_inline_child(
+            record: object,
+            *,
+            parent_id: int,
+            commit_id: str,
+        ) -> bool:
+            if not isinstance(record, dict):
+                return False
+            child_id = record.get("id")
+            body = normalize_body(record.get("body"))
+            expected_keys = {
+                "id",
+                "url",
+                "user_login",
+                "user_type",
+                "pull_request_review_id",
+                "commit_id",
+                "original_commit_id",
+                "body",
+                "normalized_body",
+                "thread_id",
+                "thread_resolved",
+            }
+            return (
+                set(record) == expected_keys
+                and type(child_id) is int
+                and child_id > 0
+                and record.get("url")
+                == (f"https://github.com/OWNER/REPO/pull/1#discussion_r{child_id}")
+                and exact_provider(record)
+                and type(record.get("pull_request_review_id")) is int
+                and record.get("pull_request_review_id") == parent_id
+                and record.get("commit_id") == commit_id
+                and record.get("original_commit_id") == commit_id
+                and bool(body)
+                and record.get("normalized_body") == body
+                and record.get("thread_id") == f"PRRT_{child_id}"
+                and type(record.get("thread_resolved")) is bool
+            )
+
+        def classify(record: dict[str, object]) -> str:
+            if not exact_provider(record):
+                return "malformed"
+            channel = record.get("channel")
+            state = record.get("state")
+            if channel == "review" and state == "PENDING":
+                return "nonterminal"
+            body = normalize_body(record.get("body"))
+            if body is None:
+                return "malformed"
+            if channel == "issue-comment":
+                if (
+                    record.get("app_slug") == "chatgpt-codex-connector"
+                    and body.count("**Reviewed commit:**") == 1
+                ):
+                    short_taglines = {
+                        "",
+                        " :rocket:",
+                        " :tada:",
+                        " :+1:",
+                        " 🚀",
+                        " 🎉",
+                        " 👍",
+                        " ✨",
+                        " ✅",
+                    }
+                    stems = {
+                        "Nice work",
+                        "Chef's kiss",
+                        "What shall we delve into next",
+                        "Already looking forward to the next diff",
+                        "Keep them coming",
+                        "Swish",
+                        "Another round soon, please",
+                        "Breezy",
+                        "Can't wait for the next one",
+                        "More of your lovely PRs please",
+                        "Bravo",
+                        "Keep it up",
+                        "Delightful",
+                        "Hooray",
+                        "You're on a roll",
+                    }
+                    taglines = short_taglines | {
+                        f" {stem}{punctuation}"
+                        for stem in stems
+                        for punctuation in (".", "!", "?")
+                    }
+                    clean_lead = "Codex Review: Didn't find any major issues."
+                    marker = f"**Reviewed commit:** `{current_sha}`"
+                    for tagline in taglines:
+                        core = f"{clean_lead}{tagline}\n\n{marker}"
+                        if body in (core, f"{core}\n\n{disclosure}"):
+                            return "clean"
+                return "findings" if finding_sha(body) is not None else "malformed"
+            if channel != "review":
+                return "malformed"
+            children = record.get("children")
+            if state == "DISMISSED":
+                return "malformed"
+            if state not in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED"):
+                return (
+                    "malformed"
+                    if body or (isinstance(children, list) and bool(children))
+                    else "nonterminal"
+                )
+            commit_id = record.get("commit_id")
+            parent_id = record.get("id")
+            if type(parent_id) is not int or parent_id <= 0:
+                return "malformed"
+            if state == "APPROVED":
+                if (
+                    commit_id != current_sha
+                    or body != "No findings."
+                    or not isinstance(children, list)
+                ):
+                    return "malformed"
+                child_ids: set[int] = set()
+                for child_record in children:
+                    if (
+                        not exact_inline_child(
+                            child_record,
+                            parent_id=parent_id,
+                            commit_id=commit_id,
+                        )
+                        or child_record["id"] in child_ids
+                    ):
+                        return "malformed"
+                    child_ids.add(child_record["id"])
+                return "findings" if children else "clean"
+            found_sha = finding_sha(body)
+            if found_sha is not None:
+                return (
+                    "findings"
+                    if state in ("COMMENTED", "CHANGES_REQUESTED")
+                    and commit_id == found_sha
+                    else "malformed"
+                )
+            if (
+                state != "COMMENTED"
+                or commit_id not in eligible_finding_commits
+                or body not in ("", inline_container(str(commit_id)))
+                or not isinstance(children, list)
+                or not children
+            ):
+                return "malformed"
+            child_ids = set()
+            for child in children:
+                if (
+                    not exact_inline_child(
+                        child,
+                        parent_id=parent_id,
+                        commit_id=commit_id,
+                    )
+                    or child["id"] in child_ids
+                ):
+                    return "malformed"
+                child_ids.add(child["id"])
+            return "findings"
+
+        clean_issue = {
+            "channel": "issue-comment",
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "app_slug": "chatgpt-codex-connector",
+            "body": (
+                "Codex Review: Didn't find any major issues.\n\n"
+                f"**Reviewed commit:** `{current_sha}`"
+            ),
+        }
+        clean_review = {
+            "channel": "review",
+            "id": review_id,
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "state": "APPROVED",
+            "commit_id": current_sha,
+            "body": "No findings.",
+            "children": [],
+        }
+        finding = {
+            "channel": "issue-comment",
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "app_slug": "chatgpt-codex-connector",
+            "body": (
+                "### 💡 Codex Review\n"
+                "- [P1] Example finding — "
+                "https://github.com/OWNER/REPO/blob/"
+                f"{current_sha}/path/to/file.py#L10"
+            ),
+        }
+        child = {
+            "id": 987654321,
+            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r987654321",
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "pull_request_review_id": review_id,
+            "commit_id": current_sha,
+            "original_commit_id": current_sha,
+            "body": "[P1] Example inline finding",
+            "normalized_body": "[P1] Example inline finding",
+            "thread_id": "PRRT_987654321",
+            "thread_resolved": False,
+        }
+        inline_parent = {
+            "channel": "review",
+            "id": review_id,
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "state": "COMMENTED",
+            "commit_id": current_sha,
+            "body": "",
+            "children": [child],
+        }
+
+        fixtures: list[tuple[str, str, str, str, dict[str, object]]] = []
+
+        def add(
+            name: str,
+            branch: str,
+            mutation: str,
+            expected: str,
+            record: dict[str, object],
+        ) -> None:
+            fixtures.append((name, branch, mutation, expected, record))
+
+        add("clean-issue-positive", "clean issue comment", "none", "clean", clean_issue)
+        add(
+            "clean-review-positive",
+            "clean pull-request review",
+            "none",
+            "clean",
+            clean_review,
+        )
+        approved_with_inline_finding = clone(clean_review)
+        approved_with_inline_finding["children"] = [child]
+        add(
+            "clean-review-with-inline-finding",
+            "clean pull-request review",
+            "associated inline finding",
+            "findings",
+            approved_with_inline_finding,
+        )
+        clean_review_without_children = clone(clean_review)
+        clean_review_without_children.pop("children")
+        add(
+            "clean-review-unread-children",
+            "clean pull-request review",
+            "associated inline set unavailable",
+            "malformed",
+            clean_review_without_children,
+        )
+        add("finding-positive", "top-level finding", "none", "findings", finding)
+        add(
+            "inline-parent-positive",
+            "inline-parent review",
+            "none",
+            "findings",
+            inline_parent,
+        )
+        nonempty_parent = clone(inline_parent)
+        nonempty_parent["body"] = inline_container(current_sha)
+        add(
+            "inline-parent-nonempty-positive",
+            "inline-parent review",
+            "exact container body and disclosure",
+            "findings",
+            nonempty_parent,
+        )
+        short_sha = clone(clean_issue)
+        short_sha["body"] = str(short_sha["body"]).replace(
+            current_sha, current_sha[:10]
+        )
+        add(
+            "clean-issue-short-sha",
+            "clean issue comment",
+            "10-character marker",
+            "malformed",
+            short_sha,
+        )
+        missing_marker = clone(clean_issue)
+        missing_marker["body"] = "Codex Review: Didn't find any major issues."
+        add(
+            "clean-issue-missing-marker",
+            "clean issue comment",
+            "missing marker",
+            "malformed",
+            missing_marker,
+        )
+        duplicate_marker = clone(clean_issue)
+        duplicate_marker["body"] = (
+            f"{duplicate_marker['body']}\n\n**Reviewed commit:** `{current_sha}`"
+        )
+        add(
+            "clean-issue-duplicate-marker",
+            "clean issue comment",
+            "duplicate marker",
+            "malformed",
+            duplicate_marker,
+        )
+        mixed_case_sha = clone(clean_issue)
+        mixed_case_sha["body"] = str(mixed_case_sha["body"]).replace(
+            current_sha, current_sha.upper()
+        )
+        add(
+            "clean-issue-mixed-case-sha",
+            "clean issue comment",
+            "uppercase SHA text",
+            "malformed",
+            mixed_case_sha,
+        )
+        mismatched_sha = clone(clean_issue)
+        mismatched_sha["body"] = str(mismatched_sha["body"]).replace(
+            current_sha, other_sha
+        )
+        add(
+            "clean-issue-mismatched-sha",
+            "clean issue comment",
+            "different full SHA",
+            "malformed",
+            mismatched_sha,
+        )
+        unlisted_tagline = clone(clean_issue)
+        unlisted_tagline["body"] = str(unlisted_tagline["body"]).replace(
+            "issues.", "issues. Nice."
+        )
+        add(
+            "clean-issue-unlisted-tagline",
+            "clean issue comment",
+            "unlisted tagline",
+            "malformed",
+            unlisted_tagline,
+        )
+        extra_footer = clone(clean_issue)
+        extra_footer["body"] = f"{extra_footer['body']}\n\nUnexpected footer"
+        add(
+            "clean-issue-extra-footer",
+            "clean issue comment",
+            "unlisted footer",
+            "malformed",
+            extra_footer,
+        )
+        containing_finding = clone(clean_issue)
+        containing_finding["body"] = (
+            f"{containing_finding['body']}\n"
+            "- [P1] Example finding — "
+            "https://github.com/OWNER/REPO/blob/"
+            f"{current_sha}/path/to/file.py#L10"
+        )
+        add(
+            "clean-issue-containing-finding",
+            "clean issue comment",
+            "appended finding line",
+            "malformed",
+            containing_finding,
+        )
+        empty_review = clone(clean_review)
+        empty_review["body"] = ""
+        add(
+            "clean-review-empty",
+            "clean pull-request review",
+            "empty body",
+            "malformed",
+            empty_review,
+        )
+        punctuated_review = clone(clean_review)
+        punctuated_review["body"] = "No findings!"
+        add(
+            "clean-review-punctuation",
+            "clean pull-request review",
+            "`No findings!`",
+            "malformed",
+            punctuated_review,
+        )
+        looks_good_review = clone(clean_review)
+        looks_good_review["body"] = "Looks good."
+        add(
+            "clean-review-looks-good",
+            "clean pull-request review",
+            "`Looks good.`",
+            "malformed",
+            looks_good_review,
+        )
+        pending_review = clone(clean_review)
+        pending_review["state"] = "PENDING"
+        add(
+            "review-pending-terminal-body",
+            "pull-request review state",
+            "`PENDING` with clean-shaped body",
+            "nonterminal",
+            pending_review,
+        )
+        dismissed_review = clone(clean_review)
+        dismissed_review["state"] = "DISMISSED"
+        add(
+            "review-dismissed-terminal-body",
+            "pull-request review state",
+            "`DISMISSED` with clean-shaped body",
+            "malformed",
+            dismissed_review,
+        )
+        missing_state_review = clone(clean_review)
+        missing_state_review.pop("state")
+        add(
+            "review-missing-state-terminal-body",
+            "pull-request review state",
+            "missing state with clean-shaped body",
+            "malformed",
+            missing_state_review,
+        )
+        unknown_state_review = clone(clean_review)
+        unknown_state_review["state"] = "QUEUED"
+        add(
+            "review-unknown-state-terminal-body",
+            "pull-request review state",
+            "unknown state with clean-shaped body",
+            "malformed",
+            unknown_state_review,
+        )
+        missing_state_inline_parent = clone(inline_parent)
+        missing_state_inline_parent.pop("state")
+        add(
+            "inline-parent-missing-state",
+            "pull-request review state",
+            "missing state with associated inline child",
+            "malformed",
+            missing_state_inline_parent,
+        )
+        cross_repository = clone(finding)
+        cross_repository["body"] = str(cross_repository["body"]).replace(
+            "/OWNER/REPO/", "/OTHER/REPO/"
+        )
+        add(
+            "finding-cross-repository",
+            "top-level finding",
+            "different repository",
+            "malformed",
+            cross_repository,
+        )
+        short_finding_sha = clone(finding)
+        short_finding_sha["body"] = str(short_finding_sha["body"]).replace(
+            current_sha, current_sha[:10]
+        )
+        add(
+            "finding-short-sha",
+            "top-level finding",
+            "10-character URL SHA",
+            "malformed",
+            short_finding_sha,
+        )
+        mixed_sha = clone(finding)
+        mixed_sha["body"] = (
+            f"{mixed_sha['body']}\n"
+            "- [P2] Another finding — "
+            "https://github.com/OWNER/REPO/blob/"
+            f"{other_sha}/path/to/other.py#L20"
+        )
+        add(
+            "finding-mixed-sha",
+            "top-level finding",
+            "two finding lines with different SHAs",
+            "malformed",
+            mixed_sha,
+        )
+        bad_percent = clone(finding)
+        bad_percent["body"] = str(bad_percent["body"]).replace(
+            "path/to/file.py", "path%2fto/file.py"
+        )
+        add(
+            "finding-bad-percent-escape",
+            "top-level finding",
+            "`%2f` in path",
+            "malformed",
+            bad_percent,
+        )
+        bad_line_anchor = clone(finding)
+        bad_line_anchor["body"] = str(bad_line_anchor["body"]).replace("#L10", "#L0")
+        add(
+            "finding-bad-line-anchor",
+            "top-level finding",
+            "zero line anchor",
+            "malformed",
+            bad_line_anchor,
+        )
+        no_children = clone(inline_parent)
+        no_children["children"] = []
+        add(
+            "inline-parent-empty-children",
+            "inline-parent review",
+            "no child",
+            "malformed",
+            no_children,
+        )
+        wrong_parent = clone(inline_parent)
+        wrong_parent["children"][0]["pull_request_review_id"] = review_id + 1
+        add(
+            "inline-parent-wrong-parent",
+            "inline-parent review",
+            "different `pull_request_review_id`",
+            "malformed",
+            wrong_parent,
+        )
+        wrong_child_commit = clone(inline_parent)
+        wrong_child_commit["children"][0]["commit_id"] = other_sha
+        add(
+            "inline-parent-wrong-child-commit",
+            "inline-parent review",
+            "mismatched child `commit_id`",
+            "malformed",
+            wrong_child_commit,
+        )
+        wrong_child_sha = clone(inline_parent)
+        wrong_child_sha["children"][0]["original_commit_id"] = other_sha
+        add(
+            "inline-parent-wrong-original-commit",
+            "inline-parent review",
+            "mismatched child `original_commit_id`",
+            "malformed",
+            wrong_child_sha,
+        )
+
+        positive_branches = {
+            branch
+            for _, branch, _, expected, _ in fixtures
+            if expected in ("clean", "findings")
+        }
+        self.assertEqual(
+            positive_branches,
+            {
+                "clean issue comment",
+                "clean pull-request review",
+                "top-level finding",
+                "inline-parent review",
+            },
+        )
+        for name, branch, mutation, expected, record in fixtures:
+            with self.subTest(terminal_grammar_fixture=name):
+                self.assertIn(
+                    f"| `{name}` | {branch} | {mutation} | `{expected}` |",
+                    authority,
+                )
+                self.assertEqual(classify(record), expected)
+
+        boolean_clean_review_id = clone(clean_review)
+        boolean_clean_review_id["id"] = True
+        self.assertEqual(classify(boolean_clean_review_id), "malformed")
+
+        boolean_child_parent = clone(inline_parent)
+        boolean_child_parent["id"] = 1
+        boolean_child_parent["children"][0]["pull_request_review_id"] = True
+        self.assertEqual(classify(boolean_child_parent), "malformed")
+
+        for child_field in ("normalized_body", "thread_id", "thread_resolved"):
+            incomplete_child = clone(inline_parent)
+            incomplete_child["children"][0].pop(child_field)
+            with self.subTest(inline_child_missing_closed_field=child_field):
+                self.assertEqual(classify(incomplete_child), "malformed")
+
+        mismatched_child_normalization = clone(inline_parent)
+        mismatched_child_normalization["children"][0]["normalized_body"] = (
+            "Different normalized body"
+        )
+        self.assertEqual(classify(mismatched_child_normalization), "malformed")
+
+        empty_child_body = clone(inline_parent)
+        empty_child_body["children"][0]["body"] = ""
+        empty_child_body["children"][0]["normalized_body"] = ""
+        self.assertEqual(classify(empty_child_body), "malformed")
+
+        resolved_child = clone(inline_parent)
+        resolved_child["children"][0]["thread_resolved"] = True
+        self.assertEqual(classify(resolved_child), "findings")
+
+        def invalid_state_terminal_signal(record: dict[str, object]) -> bool:
+            if record.get("channel") != "review" or not exact_provider(record):
+                return False
+            state = record.get("state")
+            if state == "PENDING" or state in (
+                "APPROVED",
+                "COMMENTED",
+                "CHANGES_REQUESTED",
+            ):
+                return False
+            body = normalize_body(record.get("body"))
+            children = record.get("children")
+            return (
+                state == "DISMISSED"
+                or bool(body)
+                or (isinstance(children, list) and bool(children))
+            )
+
+        def select_terminal(records: list[dict[str, object]]) -> str:
+            if any(invalid_state_terminal_signal(record) for record in records):
+                return "inconclusive"
+            terminal = [
+                (record["submitted_at"], classify(record))
+                for record in records
+                if classify(record) != "nonterminal"
+            ]
+            if not terminal or any(outcome == "malformed" for _, outcome in terminal):
+                return "inconclusive"
+            return max(terminal)[1]
+
+        newer_clean_review = clone(clean_review)
+        newer_clean_review["submitted_at"] = 20
+        for invalid_state in ("DISMISSED", None, "UNKNOWN"):
+            invalid_state_review = clone(clean_review)
+            invalid_state_review["submitted_at"] = 10
+            if invalid_state is None:
+                invalid_state_review.pop("state")
+            else:
+                invalid_state_review["state"] = invalid_state
+            with self.subTest(invalid_state_global_blocker=invalid_state):
+                self.assertEqual(
+                    select_terminal([invalid_state_review, newer_clean_review]),
+                    "inconclusive",
+                )
+
+        pending_review_with_newer_clean = clone(clean_review)
+        pending_review_with_newer_clean["state"] = "PENDING"
+        pending_review_with_newer_clean["submitted_at"] = 10
+        self.assertEqual(
+            select_terminal([pending_review_with_newer_clean, newer_clean_review]),
+            "clean",
+        )
+
+        clean_lead = "Codex Review: Didn't find any major issues."
+        marker = f"**Reviewed commit:** `{current_sha}`"
+        for accepted_tagline in (
+            " :rocket:",
+            " 🚀",
+            " Nice work!",
+            " You're on a roll?",
+        ):
+            tagged = clone(clean_issue)
+            tagged["body"] = f"{clean_lead}{accepted_tagline}\n\n{marker}"
+            with self.subTest(accepted_clean_tagline=accepted_tagline):
+                self.assertEqual(classify(tagged), "clean")
+        disclosed = clone(clean_issue)
+        disclosed["body"] = f"{clean_issue['body']}\n\n{disclosure}"
+        self.assertEqual(classify(disclosed), "clean")
+
+        selection_pagination = {
+            "issue_comments": True,
+            "reviews": True,
+            "inline_comments": True,
+            "review_threads": True,
+        }
+
+        def report_typed_equal(left: object, right: object) -> bool:
+            if type(left) is not type(right):
+                return False
+            if isinstance(left, dict):
+                assert isinstance(right, dict)
+                return set(left) == set(right) and all(
+                    report_typed_equal(left[key], right[key]) for key in left
+                )
+            if isinstance(left, list):
+                assert isinstance(right, list)
+                return len(left) == len(right) and all(
+                    report_typed_equal(left_item, right_item)
+                    for left_item, right_item in zip(left, right, strict=True)
+                )
+            return left == right
+
+        def report_exact_true_flags(
+            value: object,
+            expected: dict[str, bool],
+        ) -> bool:
+            return (
+                isinstance(value, dict)
+                and set(value) == set(expected)
+                and all(value[key] is True for key in expected)
+            )
+
+        def complete_terminal_artifact(
+            record: dict[str, object],
+        ) -> dict[str, object]:
+            snapshot = clone(record)
+            body = normalize_body(snapshot.get("body"))
+            assert body is not None
+            snapshot["normalized_body"] = body
+            if snapshot.get("channel") == "review":
+                artifact_id = snapshot.get("id")
+                children = snapshot.get("children")
+                assert type(artifact_id) is int
+                assert isinstance(children, list)
+                snapshot["url"] = (
+                    "https://github.com/OWNER/REPO/pull/1"
+                    f"#pullrequestreview-{artifact_id}"
+                )
+                snapshot["submitted_at"] = 100
+                snapshot["server_time"] = 100
+                snapshot["server_time_field"] = "submitted_at"
+                snapshot["associated_inline_comments"] = {
+                    "pagination_complete": True,
+                    "records": clone(children),
+                }
+                snapshot["review_thread_join"] = {
+                    "pagination_complete": True,
+                    "records": [
+                        {
+                            "child_id": child_record["id"],
+                            "thread_id": child_record["thread_id"],
+                            "is_resolved": child_record["thread_resolved"],
+                            "pull_request_review_id": artifact_id,
+                        }
+                        for child_record in children
+                    ],
+                }
+            else:
+                artifact_id = 234567890
+                snapshot["id"] = artifact_id
+                snapshot["api_url"] = (
+                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                    f"{artifact_id}"
+                )
+                snapshot["url"] = (
+                    f"https://github.com/OWNER/REPO/pull/1#issuecomment-{artifact_id}"
+                )
+                snapshot["created_at"] = 100
+                snapshot["updated_at"] = 100
+                snapshot["server_time"] = 100
+                snapshot["server_time_field"] = "created_at"
+                snapshot["parsed_commit"] = current_sha
+            return snapshot
+
+        def selection_snapshot_for(
+            artifact: dict[str, object],
+            outcome: str,
+        ) -> dict[str, object]:
+            children = artifact.get("children")
+            child_records = children if isinstance(children, list) else []
+            return {
+                "complete": True,
+                "lifecycle": {
+                    "state": "open",
+                    "merged": False,
+                    "merged_at": None,
+                },
+                "scope": {
+                    "repository": "OWNER/REPO",
+                    "pr": 1,
+                    "pr_merge_base": "1" * 40,
+                    "head": current_sha,
+                },
+                "pagination": clone(selection_pagination),
+                "terminal_candidates": [
+                    {
+                        "kind": (
+                            "pull-request-review"
+                            if artifact.get("channel") == "review"
+                            else "issue-comment"
+                        ),
+                        "id": artifact.get("id"),
+                        "url": artifact.get("url"),
+                        "server_time": artifact.get("server_time"),
+                        "outcome": outcome,
+                        "commit": (
+                            artifact.get("commit_id")
+                            if artifact.get("channel") == "review"
+                            else artifact.get("parsed_commit")
+                        ),
+                    }
+                ],
+                "malformed_blockers": [],
+                "thread_findings": [
+                    {
+                        "child_id": child_record["id"],
+                        "thread_id": child_record["thread_id"],
+                        "is_resolved": child_record["thread_resolved"],
+                        "pull_request_review_id": child_record[
+                            "pull_request_review_id"
+                        ],
+                    }
+                    for child_record in child_records
+                ],
+            }
+
+        def terminal_report(
+            record: dict[str, object],
+            claimed_outcome: str,
+        ) -> dict[str, object]:
+            artifact = complete_terminal_artifact(record)
+            selection = selection_snapshot_for(artifact, claimed_outcome)
+            return {
+                "kind": (
+                    "pull-request-review"
+                    if artifact.get("channel") == "review"
+                    else "issue-comment"
+                ),
+                "selection_snapshots": {
+                    "initial": clone(selection),
+                    "final": clone(selection),
+                },
+                "artifact": {
+                    "initial_snapshot": clone(artifact),
+                    "final_snapshot": clone(artifact),
+                },
+                "claimed_outcome": claimed_outcome,
+            }
+
+        def classify_terminal_report(report: object) -> str:
+            if not isinstance(report, dict) or set(report) != {
+                "kind",
+                "selection_snapshots",
+                "artifact",
+                "claimed_outcome",
+            }:
+                return "inconclusive"
+            selection_snapshots = report.get("selection_snapshots")
+            artifact_snapshots = report.get("artifact")
+            if (
+                not isinstance(selection_snapshots, dict)
+                or set(selection_snapshots) != {"initial", "final"}
+                or not isinstance(artifact_snapshots, dict)
+                or set(artifact_snapshots) != {"initial_snapshot", "final_snapshot"}
+                or not report_typed_equal(
+                    selection_snapshots.get("initial"),
+                    selection_snapshots.get("final"),
+                )
+                or not report_typed_equal(
+                    artifact_snapshots.get("initial_snapshot"),
+                    artifact_snapshots.get("final_snapshot"),
+                )
+            ):
+                return "inconclusive"
+            selection = selection_snapshots.get("final")
+            artifact = artifact_snapshots.get("final_snapshot")
+            if not isinstance(selection, dict) or not isinstance(artifact, dict):
+                return "inconclusive"
+            if (
+                set(selection)
+                != {
+                    "complete",
+                    "lifecycle",
+                    "scope",
+                    "pagination",
+                    "terminal_candidates",
+                    "malformed_blockers",
+                    "thread_findings",
+                }
+                or selection.get("complete") is not True
+                or not report_typed_equal(
+                    selection.get("lifecycle"),
+                    {"state": "open", "merged": False, "merged_at": None},
+                )
+                or not report_typed_equal(
+                    selection.get("scope"),
+                    {
+                        "repository": "OWNER/REPO",
+                        "pr": 1,
+                        "pr_merge_base": "1" * 40,
+                        "head": current_sha,
+                    },
+                )
+                or not report_exact_true_flags(
+                    selection.get("pagination"), selection_pagination
+                )
+                or selection.get("malformed_blockers") != []
+            ):
+                return "inconclusive"
+
+            body = normalize_body(artifact.get("body"))
+            if (
+                body is None
+                or artifact.get("normalized_body") != body
+                or type(artifact.get("id")) is not int
+                or artifact["id"] <= 0
+            ):
+                return "inconclusive"
+            channel = artifact.get("channel")
+            if channel == "review":
+                artifact_id = artifact["id"]
+                children = artifact.get("children")
+                associated = artifact.get("associated_inline_comments")
+                thread_join = artifact.get("review_thread_join")
+                if (
+                    set(artifact)
+                    != {
+                        "channel",
+                        "id",
+                        "user_login",
+                        "user_type",
+                        "state",
+                        "commit_id",
+                        "body",
+                        "children",
+                        "normalized_body",
+                        "url",
+                        "submitted_at",
+                        "server_time",
+                        "server_time_field",
+                        "associated_inline_comments",
+                        "review_thread_join",
+                    }
+                    or artifact.get("url")
+                    != (
+                        "https://github.com/OWNER/REPO/pull/1"
+                        f"#pullrequestreview-{artifact_id}"
+                    )
+                    or type(artifact.get("submitted_at")) is not int
+                    or artifact.get("submitted_at") != 100
+                    or type(artifact.get("server_time")) is not int
+                    or artifact.get("server_time") != 100
+                    or artifact.get("server_time_field") != "submitted_at"
+                    or not isinstance(children, list)
+                    or not isinstance(associated, dict)
+                    or set(associated) != {"pagination_complete", "records"}
+                    or associated.get("pagination_complete") is not True
+                    or not report_typed_equal(associated.get("records"), children)
+                    or not isinstance(thread_join, dict)
+                    or set(thread_join) != {"pagination_complete", "records"}
+                    or thread_join.get("pagination_complete") is not True
+                    or not isinstance(thread_join.get("records"), list)
+                ):
+                    return "inconclusive"
+                expected_thread_records: list[dict[str, object]] = []
+                child_ids: set[int] = set()
+                for child_record in children:
+                    if (
+                        not exact_inline_child(
+                            child_record,
+                            parent_id=artifact_id,
+                            commit_id=str(artifact.get("commit_id")),
+                        )
+                        or child_record["id"] in child_ids
+                    ):
+                        return "inconclusive"
+                    child_ids.add(child_record["id"])
+                    expected_thread_records.append(
+                        {
+                            "child_id": child_record["id"],
+                            "thread_id": child_record["thread_id"],
+                            "is_resolved": child_record["thread_resolved"],
+                            "pull_request_review_id": artifact_id,
+                        }
+                    )
+                if not report_typed_equal(
+                    thread_join.get("records"), expected_thread_records
+                ):
+                    return "inconclusive"
+            elif channel == "issue-comment":
+                artifact_id = artifact["id"]
+                if (
+                    set(artifact)
+                    != {
+                        "channel",
+                        "user_login",
+                        "user_type",
+                        "app_slug",
+                        "body",
+                        "normalized_body",
+                        "id",
+                        "api_url",
+                        "url",
+                        "created_at",
+                        "updated_at",
+                        "server_time",
+                        "server_time_field",
+                        "parsed_commit",
+                    }
+                    or artifact.get("api_url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                        f"{artifact_id}"
+                    )
+                    or artifact.get("url")
+                    != (
+                        "https://github.com/OWNER/REPO/pull/1"
+                        f"#issuecomment-{artifact_id}"
+                    )
+                    or artifact.get("app_slug") != "chatgpt-codex-connector"
+                    or type(artifact.get("created_at")) is not int
+                    or artifact.get("created_at") != 100
+                    or type(artifact.get("updated_at")) is not int
+                    or artifact.get("updated_at") != 100
+                    or type(artifact.get("server_time")) is not int
+                    or artifact.get("server_time") != 100
+                    or artifact.get("server_time_field") != "created_at"
+                    or artifact.get("parsed_commit") != current_sha
+                ):
+                    return "inconclusive"
+            else:
+                return "inconclusive"
+
+            classified = classify(artifact)
+            expected_kind = (
+                "pull-request-review" if channel == "review" else "issue-comment"
+            )
+            expected_selection = selection_snapshot_for(artifact, classified)
+            if (
+                classified not in ("clean", "findings")
+                or report.get("kind") != expected_kind
+                or report.get("claimed_outcome") != classified
+                or not report_typed_equal(selection, expected_selection)
+            ):
+                return "inconclusive"
+            return classified
+
+        clean_review_report = terminal_report(clean_review, "clean")
+        self.assertEqual(
+            classify_terminal_report(clean_review_report),
+            "clean",
+        )
+        self.assertEqual(
+            classify_terminal_report(terminal_report(clean_issue, "clean")),
+            "clean",
+        )
+        inline_finding_report = terminal_report(
+            approved_with_inline_finding,
+            "findings",
+        )
+        self.assertEqual(
+            classify_terminal_report(inline_finding_report),
+            "findings",
+        )
+
+        boolean_child_parent_report_record = clone(inline_parent)
+        boolean_child_parent_report_record["id"] = 1
+        boolean_child_parent_report_record["children"][0]["pull_request_review_id"] = (
+            True
+        )
+        self.assertEqual(
+            classify_terminal_report(
+                terminal_report(boolean_child_parent_report_record, "findings")
+            ),
+            "inconclusive",
+        )
+
+        for child_field in ("normalized_body", "thread_id", "thread_resolved"):
+            incomplete_child_report = clone(inline_finding_report)
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                artifact_snapshot = incomplete_child_report["artifact"][snapshot_name]
+                artifact_snapshot["children"][0].pop(child_field)
+                artifact_snapshot["associated_inline_comments"]["records"][0].pop(
+                    child_field
+                )
+            with self.subTest(terminal_report_child_missing_field=child_field):
+                self.assertEqual(
+                    classify_terminal_report(incomplete_child_report),
+                    "inconclusive",
+                )
+
+        mismatched_child_thread_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            report_child = mismatched_child_thread_report["artifact"][snapshot_name][
+                "children"
+            ][0]
+            report_child["thread_id"] = "PRRT_different"
+            associated_child = mismatched_child_thread_report["artifact"][
+                snapshot_name
+            ]["associated_inline_comments"]["records"][0]
+            associated_child["thread_id"] = "PRRT_different"
+        self.assertEqual(
+            classify_terminal_report(mismatched_child_thread_report),
+            "inconclusive",
+        )
+
+        numeric_child_resolution_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_snapshot = numeric_child_resolution_report["artifact"][
+                snapshot_name
+            ]
+            artifact_snapshot["children"][0]["thread_resolved"] = 0
+            artifact_snapshot["associated_inline_comments"]["records"][0][
+                "thread_resolved"
+            ] = 0
+            artifact_snapshot["review_thread_join"]["records"][0]["is_resolved"] = 0
+        for snapshot_name in ("initial", "final"):
+            numeric_child_resolution_report["selection_snapshots"][snapshot_name][
+                "thread_findings"
+            ][0]["is_resolved"] = 0
+        self.assertEqual(
+            classify_terminal_report(numeric_child_resolution_report),
+            "inconclusive",
+        )
+
+        empty_child_body_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_snapshot = empty_child_body_report["artifact"][snapshot_name]
+            for child_record in (
+                artifact_snapshot["children"][0],
+                artifact_snapshot["associated_inline_comments"]["records"][0],
+            ):
+                child_record["body"] = ""
+                child_record["normalized_body"] = ""
+        self.assertEqual(
+            classify_terminal_report(empty_child_body_report),
+            "inconclusive",
+        )
+
+        child_schema_extension_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_snapshot = child_schema_extension_report["artifact"][snapshot_name]
+            artifact_snapshot["children"][0]["authority_override"] = True
+            artifact_snapshot["associated_inline_comments"]["records"][0][
+                "authority_override"
+            ] = True
+        self.assertEqual(
+            classify_terminal_report(child_schema_extension_report),
+            "inconclusive",
+        )
+
+        for page_field in ("associated_inline_comments", "review_thread_join"):
+            extended_page_report = clone(inline_finding_report)
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                extended_page_report["artifact"][snapshot_name][page_field][
+                    "authority_override"
+                ] = True
+            with self.subTest(terminal_report_page_unknown_key=page_field):
+                self.assertEqual(
+                    classify_terminal_report(extended_page_report),
+                    "inconclusive",
+                )
+
+        extended_thread_record_report = clone(inline_finding_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            extended_thread_record_report["artifact"][snapshot_name][
+                "review_thread_join"
+            ]["records"][0]["authority_override"] = True
+        self.assertEqual(
+            classify_terminal_report(extended_thread_record_report),
+            "inconclusive",
+        )
+
+        sparse_terminal_report = {
+            "kind": "pull-request-review",
+            "id": review_id,
+            "commit_id": current_sha,
+            "claimed_outcome": "clean",
+        }
+        self.assertEqual(
+            classify_terminal_report(sparse_terminal_report),
+            "inconclusive",
+        )
+
+        report_schema_extension = clone(clean_review_report)
+        report_schema_extension["authority_override"] = True
+        self.assertEqual(
+            classify_terminal_report(report_schema_extension),
+            "inconclusive",
+        )
+
+        selection_wrapper_extension = clone(clean_review_report)
+        selection_wrapper_extension["selection_snapshots"]["authority_override"] = True
+        self.assertEqual(
+            classify_terminal_report(selection_wrapper_extension),
+            "inconclusive",
+        )
+
+        artifact_wrapper_extension = clone(clean_review_report)
+        artifact_wrapper_extension["artifact"]["authority_override"] = True
+        self.assertEqual(
+            classify_terminal_report(artifact_wrapper_extension),
+            "inconclusive",
+        )
+
+        selection_schema_extension = clone(clean_review_report)
+        for snapshot_name in ("initial", "final"):
+            selection_schema_extension["selection_snapshots"][snapshot_name][
+                "authority_override"
+            ] = True
+        self.assertEqual(
+            classify_terminal_report(selection_schema_extension),
+            "inconclusive",
+        )
+
+        artifact_schema_extension = clone(clean_review_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_schema_extension["artifact"][snapshot_name][
+                "authority_override"
+            ] = True
+        self.assertEqual(
+            classify_terminal_report(artifact_schema_extension),
+            "inconclusive",
+        )
+
+        missing_children_page = clone(clean_review_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            missing_children_page["artifact"][snapshot_name].pop(
+                "associated_inline_comments"
+            )
+        self.assertEqual(
+            classify_terminal_report(missing_children_page),
+            "inconclusive",
+        )
+
+        lookalike_report = clone(clean_review_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            lookalike_report["artifact"][snapshot_name]["user_login"] = (
+                "ChatGPT-Codex-Connector[bot]"
+            )
+        self.assertEqual(
+            classify_terminal_report(lookalike_report),
+            "inconclusive",
+        )
+
+        empty_candidate_selection = clone(clean_review_report)
+        for snapshot_name in ("initial", "final"):
+            empty_candidate_selection["selection_snapshots"][snapshot_name][
+                "terminal_candidates"
+            ] = []
+        self.assertEqual(
+            classify_terminal_report(empty_candidate_selection),
+            "inconclusive",
+        )
+
+        issue_missing_app = terminal_report(clean_issue, "clean")
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            issue_missing_app["artifact"][snapshot_name].pop("app_slug")
+        self.assertEqual(
+            classify_terminal_report(issue_missing_app),
+            "inconclusive",
+        )
+
+        terminal_report_final_drift = clone(clean_review_report)
+        terminal_report_final_drift["artifact"]["final_snapshot"]["body"] = (
+            "Changed body."
+        )
+        self.assertEqual(
+            classify_terminal_report(terminal_report_final_drift),
+            "inconclusive",
+        )
+
+        boolean_artifact_id = clone(clean_review_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            boolean_artifact_id["artifact"][snapshot_name]["id"] = True
+            boolean_artifact_id["artifact"][snapshot_name]["url"] = (
+                "https://github.com/OWNER/REPO/pull/1#pullrequestreview-True"
+            )
+        for snapshot_name in ("initial", "final"):
+            candidate = boolean_artifact_id["selection_snapshots"][snapshot_name][
+                "terminal_candidates"
+            ][0]
+            candidate["id"] = True
+            candidate["url"] = (
+                "https://github.com/OWNER/REPO/pull/1#pullrequestreview-True"
+            )
+        self.assertEqual(
+            classify_terminal_report(boolean_artifact_id),
+            "inconclusive",
+        )
+
+        initial_only_boolean_alias = clone(clean_review_report)
+        initial_only_boolean_alias["selection_snapshots"]["initial"]["pagination"][
+            "reviews"
+        ] = 1
+        self.assertEqual(
+            classify_terminal_report(initial_only_boolean_alias),
+            "inconclusive",
+        )
+
+        numeric_false_lifecycle = clone(clean_review_report)
+        for snapshot_name in ("initial", "final"):
+            numeric_false_lifecycle["selection_snapshots"][snapshot_name]["lifecycle"][
+                "merged"
+            ] = 0
+        self.assertEqual(
+            classify_terminal_report(numeric_false_lifecycle),
+            "inconclusive",
+        )
+
+        floating_submitted_at = clone(clean_review_report)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            floating_submitted_at["artifact"][snapshot_name]["submitted_at"] = 100.0
+        self.assertEqual(
+            classify_terminal_report(floating_submitted_at),
+            "inconclusive",
+        )
+
+        wrong_claim = clone(inline_finding_report)
+        wrong_claim["claimed_outcome"] = "clean"
+        self.assertEqual(
+            classify_terminal_report(wrong_claim),
+            "inconclusive",
+        )
+
+        normalized_authority = " ".join(authority.split()).lower()
+        for report_anchor in (
+            "selection_snapshots.initial",
+            "artifact.initial_snapshot",
+            "associated inline-comment page/join",
+            "every child record includes its stable id/url",
+            "closed object schemas and json type identity",
+            "numeric `0` / `1` are never boolean pagination or resolution values",
+            "an `approved` / `no findings.` review with zero children",
+            "performed_via_github_app.slug",
+            "a sparse summary cannot prove the closed grammar",
+        ):
+            self.assertIn(report_anchor, normalized_authority)
+
+    def test_thumbs_up_clean_reference_matrix(self) -> None:
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
+        exact_login = "chatgpt-codex-connector[bot]"
+        current_repository = "OWNER/REPO"
+        current_pr = 1
+        current_head = "0123456789abcdef0123456789abcdef01234567"
+        current_merge_base = "1111111111111111111111111111111111111111"
+        current_scope_key = (
+            current_repository,
+            current_pr,
+            current_merge_base,
+            current_head,
+        )
+        history_window_seconds = 30 * 24 * 60 * 60
+        history_as_of_server_time = 3_000_000
+        history_start_exclusive = history_as_of_server_time - history_window_seconds
+        declaration_pr = 99
+        declaration_artifact_id = 9_001
+        declaration_text = (
+            "If Codex has suggestions, it will comment; otherwise it will react "
+            "with 👍."
+        )
+        declaration_record = {
+            "authority_kind": "exact-provider-github-artifact",
+            "repository": current_repository,
+            "pull_request": declaration_pr,
+            "artifact_id": declaration_artifact_id,
+            "api_url": (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                f"{declaration_artifact_id}"
+            ),
+            "html_url": (
+                f"https://github.com/{current_repository}/pull/{declaration_pr}"
+                f"#issuecomment-{declaration_artifact_id}"
+            ),
+            "channel": "issue-comment",
+            "user_login": exact_login,
+            "user_type": "Bot",
+            "app_slug": "chatgpt-codex-connector",
+            "created_at": 100,
+            "updated_at": 100,
+            "server_time": 100,
+            "server_time_field": "created_at",
+            "body": declaration_text,
+            "asserted_text": declaration_text,
+            "github_reaction_content": "+1",
+            "github_reaction_glyph": "👍",
+            "normalization": "crlf-and-cr-to-lf+utf8",
+            "normalized_sha256": hashlib.sha256(
+                declaration_text.encode("utf-8")
+            ).hexdigest(),
+        }
+        declaration = {
+            "initial_snapshot": declaration_record,
+            "final_snapshot": json.loads(json.dumps(declaration_record)),
+        }
+        required_pagination = {
+            "request_comments": True,
+            "request_reactions": True,
+            "issue_comments": True,
+            "reviews": True,
+            "inline_comments": True,
+            "review_threads": True,
+        }
+        required_universe_pagination = {
+            "pull_requests": True,
+            "issue_comments": True,
+            "reviews": True,
+            "inline_comments": True,
+            "review_threads": True,
+            "request_reactions": True,
+        }
+        empty_evidence_state = {
+            "terminal_payloads": [],
+            "malformed_terminal_artifacts": [],
+            "active_top_level_findings": [],
+            "unresolved_thread_findings": [],
+        }
+
+        def clone(value: object) -> object:
+            return json.loads(json.dumps(value))
+
+        def typed_json_equal(left: object, right: object) -> bool:
+            if type(left) is not type(right):
+                return False
+            if isinstance(left, dict):
+                assert isinstance(right, dict)
+                return set(left) == set(right) and all(
+                    typed_json_equal(left[key], right[key]) for key in left
+                )
+            if isinstance(left, list):
+                assert isinstance(right, list)
+                return len(left) == len(right) and all(
+                    typed_json_equal(left_item, right_item)
+                    for left_item, right_item in zip(left, right, strict=True)
+                )
+            return left == right
+
+        def exact_true_flags(value: object, expected: dict[str, bool]) -> bool:
+            return (
+                isinstance(value, dict)
+                and set(value) == set(expected)
+                and all(value[key] is True for key in expected)
+            )
+
+        def declaration_is_authoritative(value: object) -> bool:
+            if not isinstance(value, dict) or set(value) != {
+                "initial_snapshot",
+                "final_snapshot",
+            }:
+                return False
+            initial = value.get("initial_snapshot")
+            final = value.get("final_snapshot")
+            if (
+                not isinstance(initial, dict)
+                or not isinstance(final, dict)
+                or not typed_json_equal(initial, final)
+            ):
+                return False
+            expected_snapshot_keys = {
+                "authority_kind",
+                "repository",
+                "pull_request",
+                "artifact_id",
+                "api_url",
+                "html_url",
+                "channel",
+                "user_login",
+                "user_type",
+                "app_slug",
+                "created_at",
+                "updated_at",
+                "server_time",
+                "server_time_field",
+                "body",
+                "asserted_text",
+                "github_reaction_content",
+                "github_reaction_glyph",
+                "normalization",
+                "normalized_sha256",
+            }
+            artifact_id = final.get("artifact_id")
+            pull_request = final.get("pull_request")
+            created_at = final.get("created_at")
+            updated_at = final.get("updated_at")
+            body = final.get("body")
+            asserted_text = final.get("asserted_text")
+            if (
+                set(final) != expected_snapshot_keys
+                or final.get("authority_kind") != "exact-provider-github-artifact"
+                or final.get("repository") != current_repository
+                or type(pull_request) is not int
+                or pull_request <= 0
+                or type(artifact_id) is not int
+                or artifact_id <= 0
+                or final.get("api_url")
+                != (
+                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                    f"{artifact_id}"
+                )
+                or final.get("html_url")
+                != (
+                    f"https://github.com/{current_repository}/pull/{pull_request}"
+                    f"#issuecomment-{artifact_id}"
+                )
+                or final.get("channel") != "issue-comment"
+                or final.get("user_login") != exact_login
+                or final.get("user_type") != "Bot"
+                or final.get("app_slug") != "chatgpt-codex-connector"
+                or type(created_at) is not int
+                or type(updated_at) is not int
+                or created_at <= 0
+                or updated_at != created_at
+                or type(final.get("server_time")) is not int
+                or final.get("server_time") != created_at
+                or final.get("server_time_field") != "created_at"
+                or not isinstance(body, str)
+                or asserted_text != declaration_text
+                or final.get("github_reaction_content") != "+1"
+                or final.get("github_reaction_glyph") != "👍"
+                or final.get("normalization") != "crlf-and-cr-to-lf+utf8"
+            ):
+                return False
+            try:
+                normalized_body = body.replace("\r\n", "\n").replace("\r", "\n")
+                normalized_body.encode("utf-8", errors="strict")
+                normalized_bytes = (
+                    asserted_text.replace("\r\n", "\n")
+                    .replace("\r", "\n")
+                    .encode("utf-8", errors="strict")
+                )
+            except (AttributeError, UnicodeEncodeError):
+                return False
+            return (
+                normalized_body.split("\n").count(declaration_text) == 1
+                and final.get("normalized_sha256")
+                == hashlib.sha256(normalized_bytes).hexdigest()
+            )
+
+        def request(
+            request_id: int,
+            created_at: int,
+            *,
+            pr: int,
+            updated_at: int | None = None,
+        ) -> dict[str, object]:
+            request_server_time = created_at if updated_at is None else updated_at
+            return {
+                "id": request_id,
+                "url": (
+                    f"https://github.com/{current_repository}/pull/{pr}"
+                    f"#issuecomment-{request_id}"
+                ),
+                "created_at": created_at,
+                "updated_at": created_at if updated_at is None else updated_at,
+                "request_server_time": request_server_time,
+                "request_server_time_field": (
+                    "created_at"
+                    if updated_at is None or updated_at == created_at
+                    else "updated_at"
+                ),
+                "normalized_body": "@codex review",
+            }
+
+        def reaction(
+            reaction_id: int | None,
+            request_id: int,
+            created_at: int,
+            *,
+            content: str = "+1",
+            user_login: str | None = exact_login,
+            user_type: str | None = "Bot",
+        ) -> dict[str, object]:
+            return {
+                "id": reaction_id,
+                "api_url": (
+                    f"https://api.github.com/repos/OWNER/REPO/reactions/{reaction_id}"
+                ),
+                "parent_request_id": request_id,
+                "parent_reactions_api_url": (
+                    "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                    f"{request_id}/reactions?per_page=100"
+                ),
+                "created_at": created_at,
+                "content": content,
+                "user_login": user_login,
+                "user_type": user_type,
+            }
+
+        snapshot_fields = (
+            "complete",
+            "pagination",
+            "evidence_state",
+            "lifecycle",
+            "scope",
+            "requests",
+            "reactions",
+            "selected_request_id",
+            "selected_reaction_id",
+            "candidate_basis",
+        )
+        record_fields = set(snapshot_fields) | {
+            "initial_snapshot",
+            "final_snapshot",
+        }
+        request_fields = {
+            "id",
+            "url",
+            "created_at",
+            "updated_at",
+            "request_server_time",
+            "request_server_time_field",
+            "normalized_body",
+        }
+        reaction_fields = {
+            "id",
+            "api_url",
+            "parent_request_id",
+            "parent_reactions_api_url",
+            "created_at",
+            "content",
+            "user_login",
+            "user_type",
+        }
+
+        def record_snapshot(record: dict[str, object]) -> dict[str, object]:
+            return {field: clone(record.get(field)) for field in snapshot_fields}
+
+        def restamp(record: dict[str, object]) -> dict[str, object]:
+            snapshot = record_snapshot(record)
+            record["initial_snapshot"] = clone(snapshot)
+            record["final_snapshot"] = clone(snapshot)
+            return record
+
+        def outcome(
+            pr: int,
+            head: str,
+            requests: list[dict[str, object]],
+            reactions: list[dict[str, object]],
+            *,
+            selected_request_id: int,
+            selected_reaction_id: int,
+            merge_base: str | None = None,
+            candidate_server_time: int | None = None,
+            stable_artifact_id: int | None = None,
+        ) -> dict[str, object]:
+            selected_reaction = next(
+                (item for item in reactions if item.get("id") == selected_reaction_id),
+                None,
+            )
+            resolved_merge_base = merge_base or f"{pr + 1000:040x}"
+            record = {
+                "complete": True,
+                "pagination": clone(required_pagination),
+                "evidence_state": clone(empty_evidence_state),
+                "lifecycle": {
+                    "state": "open",
+                    "merged": False,
+                    "merged_at": None,
+                },
+                "scope": {
+                    "repository": current_repository,
+                    "pr": pr,
+                    "pr_merge_base": resolved_merge_base,
+                    "head": head,
+                },
+                "requests": requests,
+                "reactions": reactions,
+                "selected_request_id": selected_request_id,
+                "selected_reaction_id": selected_reaction_id,
+                "candidate_basis": {
+                    "kind": "reaction",
+                    "server_time": (
+                        selected_reaction.get("created_at")
+                        if candidate_server_time is None
+                        and isinstance(selected_reaction, dict)
+                        else candidate_server_time
+                    ),
+                    "stable_artifact_id": (
+                        selected_reaction_id
+                        if stable_artifact_id is None
+                        else stable_artifact_id
+                    ),
+                },
+            }
+            return restamp(record)
+
+        def scope_key(record: dict[str, object]) -> tuple[object, ...] | None:
+            scope = record.get("scope")
+            if not isinstance(scope, dict) or set(scope) != {
+                "repository",
+                "pr",
+                "pr_merge_base",
+                "head",
+            }:
+                return None
+            repository = scope.get("repository")
+            pr = scope.get("pr")
+            merge_base = scope.get("pr_merge_base")
+            head = scope.get("head")
+            if (
+                repository != current_repository
+                or type(pr) is not int
+                or pr <= 0
+                or not isinstance(merge_base, str)
+                or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
+                or not isinstance(head, str)
+                or re.fullmatch(r"[0-9a-f]{40}", head) is None
+            ):
+                return None
+            return (repository, pr, merge_base, head)
+
+        def lifecycle_is_typed(
+            record: dict[str, object],
+            *,
+            require_open: bool,
+        ) -> bool:
+            lifecycle = record.get("lifecycle")
+            if not isinstance(lifecycle, dict) or set(lifecycle) != {
+                "state",
+                "merged",
+                "merged_at",
+            }:
+                return False
+            state = lifecycle.get("state")
+            merged = lifecycle.get("merged")
+            merged_at = lifecycle.get("merged_at")
+            if state not in {"open", "closed"} or type(merged) is not bool:
+                return False
+            if require_open:
+                return state == "open" and merged is False and merged_at is None
+            if state == "open":
+                return merged is False and merged_at is None
+            if merged is False:
+                return merged_at is None
+            return (
+                type(merged_at) is int
+                and merged_at > 0
+                and merged_at <= history_as_of_server_time
+            )
+
+        def complete_review_artifact(
+            record: dict[str, object],
+            artifact_id: int,
+            server_time: int,
+            *,
+            artifact_kind: str = "terminal-payload",
+            outcome: str = "clean",
+            user_login: str = exact_login,
+            user_type: str = "Bot",
+        ) -> dict[str, object]:
+            scope = clone(record.get("scope"))
+            assert isinstance(scope, dict)
+            pr = scope["pr"]
+            head = scope["head"]
+            if artifact_kind == "unresolved-thread-finding":
+                if outcome != "findings":
+                    raise AssertionError("unresolved thread fixture must be findings")
+                state = "COMMENTED"
+                body = ""
+                grammar_status = "accepted"
+                terminal_looking = True
+            elif outcome == "clean":
+                state = "APPROVED"
+                body = "No findings."
+                grammar_status = "accepted"
+                terminal_looking = True
+            elif outcome == "findings":
+                state = "COMMENTED"
+                body = (
+                    "### 💡 Codex Review\n"
+                    "- [P1] Fixture finding — "
+                    f"https://github.com/{current_repository}/blob/{head}/"
+                    "src/example.py#L1"
+                )
+                grammar_status = "accepted"
+                terminal_looking = True
+            elif outcome == "malformed":
+                state = "APPROVED"
+                body = "Looks good."
+                grammar_status = "malformed"
+                terminal_looking = True
+            else:
+                raise AssertionError(f"unsupported fixture outcome: {outcome}")
+            if artifact_kind == "unresolved-thread-finding":
+                child_id = (artifact_id * 10) + 1
+                thread_id = f"PRRT_{artifact_id}"
+                associated_inline_comments = {
+                    "pagination_complete": True,
+                    "records": [
+                        {
+                            "id": child_id,
+                            "url": (
+                                f"https://github.com/{current_repository}/pull/{pr}"
+                                f"#discussion_r{child_id}"
+                            ),
+                            "user_login": exact_login,
+                            "user_type": "Bot",
+                            "pull_request_review_id": artifact_id,
+                            "commit_id": head,
+                            "original_commit_id": head,
+                            "body": "[P1] Fixture inline finding",
+                            "normalized_body": "[P1] Fixture inline finding",
+                            "thread_id": thread_id,
+                        }
+                    ],
+                }
+                review_thread_join = {
+                    "pagination_complete": True,
+                    "records": [
+                        {
+                            "thread_id": thread_id,
+                            "is_resolved": False,
+                            "comment_ids": [child_id],
+                        }
+                    ],
+                }
+            else:
+                associated_inline_comments = {
+                    "pagination_complete": True,
+                    "records": [],
+                }
+                review_thread_join = {
+                    "pagination_complete": True,
+                    "records": [],
+                }
+            snapshot: dict[str, object] = {
+                "complete": True,
+                "artifact_kind": artifact_kind,
+                "outcome": outcome,
+                "channel": "pull-request-review",
+                "id": artifact_id,
+                "stable_artifact_id": artifact_id,
+                "url": (
+                    f"https://github.com/{current_repository}/pull/{pr}"
+                    f"#pullrequestreview-{artifact_id}"
+                ),
+                "user_login": user_login,
+                "user_type": user_type,
+                "state": state,
+                "body": body,
+                "normalized_body": body,
+                "grammar_status": grammar_status,
+                "terminal_looking": terminal_looking,
+                "submitted_at": server_time,
+                "server_time": server_time,
+                "server_time_field": "submitted_at",
+                "commit_id": head,
+                "scope": scope,
+                "associated_inline_comments": associated_inline_comments,
+                "review_thread_join": review_thread_join,
+            }
+            if artifact_kind == "unresolved-thread-finding":
+                snapshot["thread_id"] = thread_id
+                snapshot["thread_resolved"] = False
+            return {
+                "initial_snapshot": clone(snapshot),
+                "final_snapshot": clone(snapshot),
+            }
+
+        def validate_candidate_artifact(
+            value: object,
+            *,
+            expected_kind: str,
+            expected_scope: tuple[object, ...],
+        ) -> tuple[int, int, str, str, str] | None:
+            if not isinstance(value, dict):
+                return None
+            initial = value.get("initial_snapshot")
+            final = value.get("final_snapshot")
+            if (
+                set(value) != {"initial_snapshot", "final_snapshot"}
+                or not isinstance(initial, dict)
+                or not isinstance(final, dict)
+                or not typed_json_equal(initial, final)
+            ):
+                return None
+            repository, pr, merge_base, head = expected_scope
+            artifact_id = final.get("id")
+            server_time = final.get("server_time")
+            body = final.get("body")
+            outcome = final.get("outcome")
+            channel = final.get("channel")
+            expected_snapshot_keys = {
+                "complete",
+                "artifact_kind",
+                "outcome",
+                "channel",
+                "id",
+                "stable_artifact_id",
+                "url",
+                "user_login",
+                "user_type",
+                "state",
+                "body",
+                "normalized_body",
+                "grammar_status",
+                "terminal_looking",
+                "submitted_at",
+                "server_time",
+                "server_time_field",
+                "commit_id",
+                "scope",
+                "associated_inline_comments",
+                "review_thread_join",
+            }
+            if expected_kind == "unresolved-thread-finding":
+                expected_snapshot_keys.update({"thread_id", "thread_resolved"})
+            if (
+                set(final) != expected_snapshot_keys
+                or final.get("complete") is not True
+                or final.get("artifact_kind") != expected_kind
+                or channel != "pull-request-review"
+                or type(artifact_id) is not int
+                or artifact_id <= 0
+                or type(final.get("stable_artifact_id")) is not int
+                or final.get("stable_artifact_id") != artifact_id
+                or final.get("url")
+                != (
+                    f"https://github.com/{repository}/pull/{pr}"
+                    f"#pullrequestreview-{artifact_id}"
+                )
+                or final.get("user_login") != exact_login
+                or final.get("user_type") != "Bot"
+                or type(server_time) is not int
+                or server_time <= 0
+                or server_time > history_as_of_server_time
+                or type(final.get("submitted_at")) is not int
+                or final.get("submitted_at") != server_time
+                or final.get("server_time_field") != "submitted_at"
+                or final.get("commit_id") != head
+                or not typed_json_equal(
+                    final.get("scope"),
+                    {
+                        "repository": repository,
+                        "pr": pr,
+                        "pr_merge_base": merge_base,
+                        "head": head,
+                    },
+                )
+                or not isinstance(body, str)
+                or final.get("normalized_body") != body
+                or final.get("terminal_looking") is not True
+            ):
+                return None
+
+            expected_finding = (
+                "### 💡 Codex Review\n"
+                "- [P1] Fixture finding — "
+                f"https://github.com/{repository}/blob/{head}/"
+                "src/example.py#L1"
+            )
+            clean_grammar = (
+                outcome == "clean"
+                and final.get("state") == "APPROVED"
+                and body == "No findings."
+                and final.get("grammar_status") == "accepted"
+            )
+            finding_grammar = (
+                outcome == "findings"
+                and final.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
+                and body == expected_finding
+                and final.get("grammar_status") == "accepted"
+            )
+            inline_finding_grammar = (
+                outcome == "findings"
+                and final.get("state") == "COMMENTED"
+                and body == ""
+                and final.get("grammar_status") == "accepted"
+            )
+            malformed_grammar = (
+                outcome == "malformed"
+                and final.get("state") == "APPROVED"
+                and body == "Looks good."
+                and final.get("grammar_status") == "malformed"
+            )
+            if expected_kind == "terminal-payload":
+                if not (clean_grammar or finding_grammar):
+                    return None
+            elif expected_kind == "malformed-terminal-artifact":
+                if not malformed_grammar:
+                    return None
+            elif expected_kind == "active-top-level-finding":
+                if not finding_grammar:
+                    return None
+            elif expected_kind == "unresolved-thread-finding":
+                child_id = (artifact_id * 10) + 1
+                thread_id = f"PRRT_{artifact_id}"
+                if (
+                    not inline_finding_grammar
+                    or final.get("thread_id") != thread_id
+                    or final.get("thread_resolved") is not False
+                    or not typed_json_equal(
+                        final.get("associated_inline_comments"),
+                        {
+                            "pagination_complete": True,
+                            "records": [
+                                {
+                                    "id": child_id,
+                                    "url": (
+                                        f"https://github.com/{repository}/pull/{pr}"
+                                        f"#discussion_r{child_id}"
+                                    ),
+                                    "user_login": exact_login,
+                                    "user_type": "Bot",
+                                    "pull_request_review_id": artifact_id,
+                                    "commit_id": head,
+                                    "original_commit_id": head,
+                                    "body": "[P1] Fixture inline finding",
+                                    "normalized_body": "[P1] Fixture inline finding",
+                                    "thread_id": thread_id,
+                                }
+                            ],
+                        },
+                    )
+                    or not typed_json_equal(
+                        final.get("review_thread_join"),
+                        {
+                            "pagination_complete": True,
+                            "records": [
+                                {
+                                    "thread_id": thread_id,
+                                    "is_resolved": False,
+                                    "comment_ids": [child_id],
+                                }
+                            ],
+                        },
+                    )
+                ):
+                    return None
+            else:
+                return None
+            if expected_kind != "unresolved-thread-finding" and (
+                not typed_json_equal(
+                    final.get("associated_inline_comments"),
+                    {"pagination_complete": True, "records": []},
+                )
+                or not typed_json_equal(
+                    final.get("review_thread_join"),
+                    {"pagination_complete": True, "records": []},
+                )
+            ):
+                return None
+            return (server_time, artifact_id, expected_kind, outcome, channel)
+
+        def classify_reaction_scope(
+            record: dict[str, object],
+            *,
+            expected_scope: tuple[object, ...] | None = None,
+        ) -> str:
+            initial_snapshot = record.get("initial_snapshot")
+            final_snapshot = record.get("final_snapshot")
+            if (
+                set(record) != record_fields
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or not typed_json_equal(initial_snapshot, final_snapshot)
+                or not typed_json_equal(final_snapshot, record_snapshot(record))
+            ):
+                return "unknown"
+            if record.get("complete") is not True:
+                return "unknown"
+            if not exact_true_flags(record.get("pagination"), required_pagination):
+                return "unknown"
+            if not typed_json_equal(record.get("evidence_state"), empty_evidence_state):
+                return "unknown"
+            record_scope_key = scope_key(record)
+            if record_scope_key is None or (
+                expected_scope is not None and record_scope_key != expected_scope
+            ):
+                return "unknown"
+            pr = record_scope_key[1]
+            raw_requests = record.get("requests")
+            raw_reactions = record.get("reactions")
+            if (
+                not isinstance(raw_requests, list)
+                or not raw_requests
+                or not isinstance(raw_reactions, list)
+            ):
+                return "unknown"
+
+            requests_by_id: dict[int, dict[str, object]] = {}
+            request_times: dict[int, int] = {}
+            for raw_request in raw_requests:
+                if (
+                    not isinstance(raw_request, dict)
+                    or set(raw_request) != request_fields
+                ):
+                    return "unknown"
+                request_id = raw_request.get("id")
+                created_at = raw_request.get("created_at")
+                updated_at = raw_request.get("updated_at")
+                expected_request_time = (
+                    created_at if updated_at == created_at else updated_at
+                )
+                expected_request_time_field = (
+                    "created_at" if updated_at == created_at else "updated_at"
+                )
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in requests_by_id
+                    or type(created_at) is not int
+                    or type(updated_at) is not int
+                    or created_at <= 0
+                    or updated_at < created_at
+                    or raw_request.get("normalized_body") != "@codex review"
+                    or type(raw_request.get("request_server_time")) is not int
+                    or raw_request.get("request_server_time") != expected_request_time
+                    or raw_request.get("request_server_time_field")
+                    != expected_request_time_field
+                    or raw_request.get("url")
+                    != (
+                        f"https://github.com/{current_repository}/pull/{pr}"
+                        f"#issuecomment-{request_id}"
+                    )
+                ):
+                    return "unknown"
+                requests_by_id[request_id] = raw_request
+                request_times[request_id] = expected_request_time
+
+            reactions_by_id: dict[int, dict[str, object]] = {}
+            for raw_reaction in raw_reactions:
+                if (
+                    not isinstance(raw_reaction, dict)
+                    or set(raw_reaction) != reaction_fields
+                ):
+                    return "unknown"
+                reaction_id = raw_reaction.get("id")
+                if type(reaction_id) is not int or reaction_id <= 0:
+                    return "unknown"
+                if reaction_id in reactions_by_id:
+                    if not typed_json_equal(reactions_by_id[reaction_id], raw_reaction):
+                        return "unknown"
+                    continue
+                reactions_by_id[reaction_id] = raw_reaction
+
+            reactions = list(reactions_by_id.values())
+            provider_reactions: list[dict[str, object]] = []
+            for item in reactions:
+                request_id = item.get("parent_request_id")
+                created_at = item.get("created_at")
+                reaction_id = item["id"]
+                user_login = item.get("user_login")
+                user_type = item.get("user_type")
+                if (
+                    type(request_id) is not int
+                    or request_id not in requests_by_id
+                    or type(created_at) is not int
+                    or created_at <= 0
+                    or created_at <= request_times[request_id]
+                    or not isinstance(item.get("content"), str)
+                    or not item["content"]
+                    or not isinstance(user_login, str)
+                    or not user_login
+                    or not isinstance(user_type, str)
+                    or not user_type
+                    or item.get("api_url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/reactions/"
+                        f"{reaction_id}"
+                    )
+                    or item.get("parent_reactions_api_url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                        f"{request_id}/reactions?per_page=100"
+                    )
+                ):
+                    return "unknown"
+                if user_login != exact_login:
+                    if user_type == "User" or (
+                        user_type == "Bot" and "codex" not in user_login.casefold()
+                    ):
+                        continue
+                    return "unknown"
+                if user_type != "Bot" or item["content"] not in ("+1", "eyes"):
+                    return "unknown"
+                provider_reactions.append(item)
+
+            plus_ones = [item for item in provider_reactions if item["content"] == "+1"]
+            if not plus_ones:
+                return "unknown"
+            selected_plus = max(
+                plus_ones,
+                key=lambda item: (int(item["created_at"]), int(item["id"])),
+            )
+            selected_request_id = record.get("selected_request_id")
+            selected_reaction_id = record.get("selected_reaction_id")
+            if (
+                type(selected_request_id) is not int
+                or selected_request_id <= 0
+                or type(selected_reaction_id) is not int
+                or selected_reaction_id <= 0
+                or selected_plus["id"] != selected_reaction_id
+                or selected_plus["parent_request_id"] != selected_request_id
+            ):
+                return "unknown"
+
+            latest_request_time = max(request_times.values())
+            latest_request_ids = [
+                request_id
+                for request_id, server_time in request_times.items()
+                if server_time == latest_request_time
+            ]
+            if (
+                latest_request_ids != [selected_request_id]
+                or int(selected_plus["created_at"]) <= latest_request_time
+            ):
+                return "unknown"
+
+            selected_order = (
+                int(selected_plus["created_at"]),
+                int(selected_plus["id"]),
+            )
+            if any(
+                item["content"] == "eyes"
+                and (int(item["created_at"]), int(item["id"])) >= selected_order
+                for item in provider_reactions
+            ):
+                return "unknown"
+            return "clean"
+
+        def candidate_order_basis(
+            record: dict[str, object],
+        ) -> tuple[int, int] | None:
+            initial_snapshot = record.get("initial_snapshot")
+            final_snapshot = record.get("final_snapshot")
+            if (
+                set(record) != record_fields
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or not typed_json_equal(initial_snapshot, final_snapshot)
+                or not typed_json_equal(final_snapshot, record_snapshot(record))
+            ):
+                return None
+            record_scope_key = scope_key(record)
+            if (
+                record.get("complete") is not True
+                or not exact_true_flags(record.get("pagination"), required_pagination)
+                or record_scope_key is None
+                or not lifecycle_is_typed(record, require_open=False)
+            ):
+                return None
+            evidence_state = record.get("evidence_state")
+            if not isinstance(evidence_state, dict):
+                return None
+            artifact_fields = {
+                "terminal_payloads": "terminal-payload",
+                "malformed_terminal_artifacts": "malformed-terminal-artifact",
+                "active_top_level_findings": "active-top-level-finding",
+                "unresolved_thread_findings": "unresolved-thread-finding",
+            }
+            if set(evidence_state) != set(artifact_fields):
+                return None
+            artifact_bases: list[tuple[int, int, str, str, str]] = []
+            artifacts_by_native_id: dict[tuple[str, int], dict[str, object]] = {}
+            artifact_semantics_by_time_id: dict[
+                tuple[int, int], tuple[str, str, str]
+            ] = {}
+            for field, kind in artifact_fields.items():
+                artifacts = evidence_state.get(field)
+                if not isinstance(artifacts, list):
+                    return None
+                for artifact in artifacts:
+                    validated_artifact = validate_candidate_artifact(
+                        artifact,
+                        expected_kind=kind,
+                        expected_scope=record_scope_key,
+                    )
+                    if validated_artifact is None:
+                        return None
+                    (
+                        server_time,
+                        stable_artifact_id,
+                        validated_kind,
+                        outcome,
+                        channel,
+                    ) = validated_artifact
+                    native_key = (channel, stable_artifact_id)
+                    final_artifact_snapshot = artifact["final_snapshot"]
+                    assert isinstance(final_artifact_snapshot, dict)
+                    previous_artifact = artifacts_by_native_id.get(native_key)
+                    if previous_artifact is not None and not typed_json_equal(
+                        previous_artifact, final_artifact_snapshot
+                    ):
+                        return None
+                    semantics_key = (server_time, stable_artifact_id)
+                    semantics = (validated_kind, outcome, channel)
+                    previous_semantics = artifact_semantics_by_time_id.get(
+                        semantics_key
+                    )
+                    if (
+                        previous_semantics is not None
+                        and previous_semantics != semantics
+                    ):
+                        return None
+                    if previous_artifact is None:
+                        artifacts_by_native_id[native_key] = final_artifact_snapshot
+                        artifact_semantics_by_time_id[semantics_key] = semantics
+                        artifact_bases.append(validated_artifact)
+
+            pr = record_scope_key[1]
+            raw_requests = record.get("requests")
+            reactions = record.get("reactions")
+            if not isinstance(raw_requests, list) or not isinstance(reactions, list):
+                return None
+
+            request_times: dict[int, int] = {}
+            for raw_request in raw_requests:
+                if (
+                    not isinstance(raw_request, dict)
+                    or set(raw_request) != request_fields
+                ):
+                    return None
+                request_id = raw_request.get("id")
+                created_at = raw_request.get("created_at")
+                updated_at = raw_request.get("updated_at")
+                expected_request_time = (
+                    created_at if updated_at == created_at else updated_at
+                )
+                expected_request_time_field = (
+                    "created_at" if updated_at == created_at else "updated_at"
+                )
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in request_times
+                    or type(created_at) is not int
+                    or type(updated_at) is not int
+                    or created_at <= 0
+                    or updated_at < created_at
+                    or created_at > history_as_of_server_time
+                    or updated_at > history_as_of_server_time
+                    or raw_request.get("normalized_body") != "@codex review"
+                    or type(raw_request.get("request_server_time")) is not int
+                    or raw_request.get("request_server_time") != expected_request_time
+                    or raw_request.get("request_server_time_field")
+                    != expected_request_time_field
+                    or raw_request.get("url")
+                    != (
+                        f"https://github.com/{current_repository}/pull/{pr}"
+                        f"#issuecomment-{request_id}"
+                    )
+                ):
+                    return None
+                request_times[request_id] = expected_request_time
+
+            reactions_by_id: dict[int, dict[str, object]] = {}
+            for raw_reaction in reactions:
+                if (
+                    not isinstance(raw_reaction, dict)
+                    or set(raw_reaction) != reaction_fields
+                ):
+                    return None
+                reaction_id = raw_reaction.get("id")
+                if type(reaction_id) is not int or reaction_id <= 0:
+                    return None
+                if reaction_id in reactions_by_id:
+                    if not typed_json_equal(reactions_by_id[reaction_id], raw_reaction):
+                        return None
+                    continue
+                reactions_by_id[reaction_id] = raw_reaction
+
+            exact_provider_reactions: list[dict[str, object]] = []
+            for item in reactions_by_id.values():
+                request_id = item.get("parent_request_id")
+                created_at = item.get("created_at")
+                reaction_id = item["id"]
+                content = item.get("content")
+                user_login = item.get("user_login")
+                user_type = item.get("user_type")
+                if (
+                    type(request_id) is not int
+                    or request_id not in request_times
+                    or type(created_at) is not int
+                    or created_at <= 0
+                    or created_at <= request_times[request_id]
+                    or created_at > history_as_of_server_time
+                    or not isinstance(content, str)
+                    or not content
+                    or item.get("api_url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/reactions/"
+                        f"{reaction_id}"
+                    )
+                    or item.get("parent_reactions_api_url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                        f"{request_id}/reactions?per_page=100"
+                    )
+                ):
+                    return None
+                confirmed_different_actor = (
+                    isinstance(user_login, str)
+                    and bool(user_login)
+                    and user_login != exact_login
+                    and (
+                        user_type == "User"
+                        or (user_type == "Bot" and "codex" not in user_login.casefold())
+                    )
+                )
+                if confirmed_different_actor:
+                    continue
+                if (
+                    user_login != exact_login
+                    or user_type != "Bot"
+                    or content not in ("+1", "eyes")
+                ):
+                    return None
+                exact_provider_reactions.append(item)
+
+            plus_ones = [
+                item for item in exact_provider_reactions if item["content"] == "+1"
+            ]
+            selected_request_id = record.get("selected_request_id")
+            selected_reaction_id = record.get("selected_reaction_id")
+            if plus_ones:
+                selected_plus = max(
+                    plus_ones,
+                    key=lambda item: (int(item["created_at"]), int(item["id"])),
+                )
+                if (
+                    type(selected_request_id) is not int
+                    or selected_request_id <= 0
+                    or type(selected_reaction_id) is not int
+                    or selected_reaction_id <= 0
+                    or selected_plus["id"] != selected_reaction_id
+                    or selected_plus.get("parent_request_id") != selected_request_id
+                ):
+                    return None
+            elif selected_request_id is not None or selected_reaction_id is not None:
+                return None
+
+            if artifact_bases:
+                latest_artifact_time = max(item[0] for item in artifact_bases)
+                latest_artifacts = [
+                    item for item in artifact_bases if item[0] == latest_artifact_time
+                ]
+
+                def artifact_precedence(
+                    item: tuple[int, int, str, str, str],
+                ) -> tuple[int, int]:
+                    _, artifact_id, artifact_kind, outcome, _ = item
+                    if artifact_kind == "malformed-terminal-artifact":
+                        priority = 3
+                    elif outcome == "findings":
+                        priority = 2
+                    else:
+                        priority = 1
+                    return (priority, artifact_id)
+
+                (
+                    server_time,
+                    stable_artifact_id,
+                    kind,
+                    _,
+                    _,
+                ) = max(latest_artifacts, key=artifact_precedence)
+                if any(
+                    int(item["created_at"]) >= server_time
+                    for item in exact_provider_reactions
+                ):
+                    return None
+            else:
+                if not request_times or not exact_provider_reactions:
+                    return None
+                scope_final_reaction = max(
+                    exact_provider_reactions,
+                    key=lambda item: (int(item["created_at"]), int(item["id"])),
+                )
+                latest_request_time = max(request_times.values())
+                latest_request_ids = [
+                    request_id
+                    for request_id, request_time in request_times.items()
+                    if request_time == latest_request_time
+                ]
+                if (
+                    len(latest_request_ids) != 1
+                    or scope_final_reaction.get("parent_request_id")
+                    != latest_request_ids[0]
+                    or int(scope_final_reaction["created_at"]) <= latest_request_time
+                ):
+                    return None
+                server_time = scope_final_reaction.get("created_at")
+                stable_artifact_id = scope_final_reaction.get("id")
+                kind = "reaction"
+                if type(server_time) is not int or type(stable_artifact_id) is not int:
+                    return None
+
+            expected_basis = {
+                "kind": kind,
+                "server_time": server_time,
+                "stable_artifact_id": stable_artifact_id,
+            }
+            actual_basis = record.get("candidate_basis")
+            if (
+                not isinstance(actual_basis, dict)
+                or set(actual_basis) != set(expected_basis)
+                or not isinstance(actual_basis.get("kind"), str)
+                or type(actual_basis.get("server_time")) is not int
+                or actual_basis["server_time"] <= 0
+                or type(actual_basis.get("stable_artifact_id")) is not int
+                or actual_basis["stable_artifact_id"] <= 0
+                or not typed_json_equal(actual_basis, expected_basis)
+            ):
+                return None
+            return (server_time, stable_artifact_id)
+
+        def current_lifecycle_is_eligible(record: dict[str, object]) -> bool:
+            return lifecycle_is_typed(record, require_open=True)
+
+        def universe_inventory(
+            candidates: list[dict[str, object]],
+        ) -> dict[str, object]:
+            entries: list[dict[str, object]] = []
+            for candidate in candidates:
+                candidate_scope_key = scope_key(candidate)
+                ordering_key = candidate_order_basis(candidate)
+                entries.append(
+                    {
+                        "scope_key": (
+                            list(candidate_scope_key)
+                            if candidate_scope_key is not None
+                            else None
+                        ),
+                        "candidate_basis": clone(candidate.get("candidate_basis")),
+                        "validated_ordering_key": (
+                            list(ordering_key) if ordering_key is not None else None
+                        ),
+                    }
+                )
+            return {
+                "complete": True,
+                "repository": current_repository,
+                "pagination": clone(required_universe_pagination),
+                "entries": entries,
+            }
+
+        def history(
+            candidates: list[dict[str, object]],
+            *,
+            complete: bool = True,
+        ) -> dict[str, object]:
+            inventory = universe_inventory(candidates)
+            return {
+                "complete": complete,
+                "repository": current_repository,
+                "as_of_source": "github-response-date-header",
+                "as_of_api_url": (
+                    f"https://api.github.com/repos/{current_repository}/pulls/"
+                    f"{current_pr}"
+                ),
+                "as_of_server_time": history_as_of_server_time,
+                "window_seconds": history_window_seconds,
+                "window_start_exclusive": history_start_exclusive,
+                "window_end_inclusive": history_as_of_server_time,
+                "candidate_universe_count": len(candidates),
+                "initial_inventory": clone(inventory),
+                "final_inventory": clone(inventory),
+                "initial_candidates": clone(candidates),
+                "final_candidates": clone(candidates),
+            }
+
+        def classify_fallback(
+            profile: str,
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current: dict[str, object],
+        ) -> str:
+            if profile != "thumbs-up-clean":
+                return "not-clean"
+            if not declaration_is_authoritative(provider_declaration):
+                return "unknown"
+            if (
+                set(candidate_history)
+                != {
+                    "complete",
+                    "repository",
+                    "as_of_source",
+                    "as_of_api_url",
+                    "as_of_server_time",
+                    "window_seconds",
+                    "window_start_exclusive",
+                    "window_end_inclusive",
+                    "candidate_universe_count",
+                    "initial_inventory",
+                    "final_inventory",
+                    "initial_candidates",
+                    "final_candidates",
+                }
+                or candidate_history.get("complete") is not True
+                or candidate_history.get("repository") != current_repository
+                or candidate_history.get("as_of_source")
+                != "github-response-date-header"
+                or candidate_history.get("as_of_api_url")
+                != (
+                    f"https://api.github.com/repos/{current_repository}/pulls/"
+                    f"{current_pr}"
+                )
+                or type(candidate_history.get("as_of_server_time")) is not int
+                or candidate_history.get("as_of_server_time")
+                != history_as_of_server_time
+                or type(candidate_history.get("window_seconds")) is not int
+                or candidate_history.get("window_seconds") != history_window_seconds
+                or type(candidate_history.get("window_start_exclusive")) is not int
+                or candidate_history.get("window_start_exclusive")
+                != history_start_exclusive
+                or type(candidate_history.get("window_end_inclusive")) is not int
+                or candidate_history.get("window_end_inclusive")
+                != history_as_of_server_time
+            ):
+                return "unknown"
+            initial_candidates = candidate_history.get("initial_candidates")
+            candidates = candidate_history.get("final_candidates")
+            initial_inventory = candidate_history.get("initial_inventory")
+            final_inventory = candidate_history.get("final_inventory")
+            if (
+                not isinstance(initial_candidates, list)
+                or not isinstance(candidates, list)
+                or not typed_json_equal(initial_candidates, candidates)
+                or type(candidate_history.get("candidate_universe_count")) is not int
+                or candidate_history.get("candidate_universe_count") != len(candidates)
+                or not isinstance(initial_inventory, dict)
+                or not isinstance(final_inventory, dict)
+                or not typed_json_equal(initial_inventory, final_inventory)
+                or not typed_json_equal(final_inventory, universe_inventory(candidates))
+            ):
+                return "unknown"
+
+            ordering_keys: set[tuple[int, int]] = set()
+            historical_scope_keys: set[tuple[object, ...]] = set()
+            ordered_candidates: list[tuple[tuple[int, int], dict[str, object]]] = []
+            global_request_records: dict[int, dict[str, object]] = {}
+            global_reaction_records: dict[int, dict[str, object]] = {}
+            global_artifact_records: dict[tuple[str, int], dict[str, object]] = {}
+            declaration_final = provider_declaration["final_snapshot"]
+            assert isinstance(declaration_final, dict)
+            declaration_native_id = declaration_final["artifact_id"]
+            assert isinstance(declaration_native_id, int)
+            global_issue_comment_records: dict[int, dict[str, object]] = {
+                declaration_native_id: {
+                    "kind": "provider-declaration",
+                    "repository": declaration_final["repository"],
+                    "pull_request": declaration_final["pull_request"],
+                    "api_url": declaration_final["api_url"],
+                    "html_url": declaration_final["html_url"],
+                    "body": declaration_final["body"],
+                }
+            }
+
+            def register_global_native_records(
+                candidate: dict[str, object],
+                candidate_scope_key: tuple[object, ...],
+            ) -> bool:
+                for raw_request in candidate["requests"]:
+                    request_id = raw_request["id"]
+                    request_native_record = {
+                        "kind": "controlled-request",
+                        "repository": candidate_scope_key[0],
+                        "pull_request": candidate_scope_key[1],
+                        "api_url": (
+                            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                            f"{request_id}"
+                        ),
+                        "html_url": raw_request["url"],
+                        "body": raw_request["normalized_body"],
+                    }
+                    previous_issue_comment = global_issue_comment_records.get(
+                        request_id
+                    )
+                    if previous_issue_comment is not None and not typed_json_equal(
+                        previous_issue_comment, request_native_record
+                    ):
+                        return False
+                    global_issue_comment_records[request_id] = request_native_record
+                    record = {
+                        "scope_key": list(candidate_scope_key),
+                        "record": raw_request,
+                    }
+                    previous = global_request_records.get(request_id)
+                    if previous is not None and not typed_json_equal(previous, record):
+                        return False
+                    global_request_records[request_id] = record
+                for raw_reaction in candidate["reactions"]:
+                    reaction_id = raw_reaction["id"]
+                    record = {
+                        "scope_key": list(candidate_scope_key),
+                        "record": raw_reaction,
+                    }
+                    previous = global_reaction_records.get(reaction_id)
+                    if previous is not None and not typed_json_equal(previous, record):
+                        return False
+                    global_reaction_records[reaction_id] = record
+                evidence_state = candidate["evidence_state"]
+                for artifacts in evidence_state.values():
+                    for artifact in artifacts:
+                        final = artifact["final_snapshot"]
+                        artifact_key = (final["channel"], final["id"])
+                        previous = global_artifact_records.get(artifact_key)
+                        if previous is not None and not typed_json_equal(
+                            previous, final
+                        ):
+                            return False
+                        global_artifact_records[artifact_key] = final
+                return True
+
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    return "unknown"
+                candidate_scope_key = scope_key(candidate)
+                ordering_key = candidate_order_basis(candidate)
+                if (
+                    candidate_scope_key is None
+                    or candidate_scope_key == current_scope_key
+                    or candidate_scope_key in historical_scope_keys
+                    or ordering_key is None
+                    or not (
+                        history_start_exclusive
+                        < ordering_key[0]
+                        <= history_as_of_server_time
+                    )
+                ):
+                    return "unknown"
+                historical_scope_keys.add(candidate_scope_key)
+                if not register_global_native_records(candidate, candidate_scope_key):
+                    return "unknown"
+                if ordering_key in ordering_keys:
+                    return "unknown"
+                ordering_keys.add(ordering_key)
+                ordered_candidates.append((ordering_key, candidate))
+
+            ordered_candidates.sort(key=lambda item: item[0], reverse=True)
+            selected = (
+                ordered_candidates[:10]
+                if len(ordered_candidates) >= 10
+                else ordered_candidates
+            )
+            if len(selected) < 3:
+                return "unknown"
+            for _, sample in selected:
+                if classify_reaction_scope(sample) != "clean":
+                    return "unknown"
+            current_ordering_key = candidate_order_basis(current)
+            if (
+                not current_lifecycle_is_eligible(current)
+                or classify_reaction_scope(
+                    current,
+                    expected_scope=current_scope_key,
+                )
+                != "clean"
+                or current_ordering_key is None
+                or current_ordering_key[0] > history_as_of_server_time
+                or not register_global_native_records(current, current_scope_key)
+            ):
+                return "unknown"
+            return "clean"
+
+        def sample(pr: int) -> dict[str, object]:
+            request_id = 10_000 + pr
+            reaction_id = 20_000 + pr
+            request_time = 2_000_000 + (pr * 10)
+            reaction_time = request_time + 1
+            return outcome(
+                pr,
+                f"{pr:040x}",
+                [request(request_id, request_time, pr=pr)],
+                [reaction(reaction_id, request_id, reaction_time)],
+                selected_request_id=request_id,
+                selected_reaction_id=reaction_id,
+            )
+
+        def retime_sample(
+            record: dict[str, object],
+            *,
+            request_time: int,
+            reaction_time: int,
+        ) -> dict[str, object]:
+            record["requests"][0]["created_at"] = request_time
+            record["requests"][0]["updated_at"] = request_time
+            record["requests"][0]["request_server_time"] = request_time
+            record["requests"][0]["request_server_time_field"] = "created_at"
+            record["reactions"][0]["created_at"] = reaction_time
+            record["candidate_basis"]["server_time"] = reaction_time
+            return restamp(record)
+
+        samples = [sample(pr) for pr in (2, 3, 4)]
+        current = outcome(
+            current_pr,
+            current_head,
+            [request(10, 10, pr=current_pr)],
+            [reaction(100, 10, 20)],
+            selected_request_id=10,
+            selected_reaction_id=100,
+            merge_base=current_merge_base,
+        )
+
+        thread_scope = scope_key(samples[0])
+        assert thread_scope is not None
+        valid_thread_artifact = complete_review_artifact(
+            samples[0],
+            77_001,
+            2_700_001,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+        )
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                valid_thread_artifact,
+                expected_kind="unresolved-thread-finding",
+                expected_scope=thread_scope,
+            )
+        )
+
+        thread_artifact_near_misses: dict[str, dict[str, object]] = {}
+        wrong_thread_parent = clone(valid_thread_artifact)
+        assert isinstance(wrong_thread_parent, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            wrong_thread_parent[snapshot_name]["associated_inline_comments"]["records"][
+                0
+            ]["pull_request_review_id"] = 77_002
+        thread_artifact_near_misses["wrong-parent-review-id"] = wrong_thread_parent
+
+        wrong_thread_commit = clone(valid_thread_artifact)
+        assert isinstance(wrong_thread_commit, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            wrong_thread_commit[snapshot_name]["associated_inline_comments"]["records"][
+                0
+            ]["commit_id"] = current_head
+        thread_artifact_near_misses["wrong-child-commit"] = wrong_thread_commit
+
+        resolved_thread_artifact = clone(valid_thread_artifact)
+        assert isinstance(resolved_thread_artifact, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            resolved_thread_artifact[snapshot_name]["thread_resolved"] = True
+            resolved_thread_artifact[snapshot_name]["review_thread_join"]["records"][0][
+                "is_resolved"
+            ] = True
+        thread_artifact_near_misses["resolved-thread"] = resolved_thread_artifact
+
+        orphan_thread_join = clone(valid_thread_artifact)
+        assert isinstance(orphan_thread_join, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            orphan_thread_join[snapshot_name]["review_thread_join"]["records"][0][
+                "comment_ids"
+            ] = [999_999]
+        thread_artifact_near_misses["orphan-thread-join"] = orphan_thread_join
+
+        numeric_thread_pagination = clone(valid_thread_artifact)
+        assert isinstance(numeric_thread_pagination, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            numeric_thread_pagination[snapshot_name]["review_thread_join"][
+                "pagination_complete"
+            ] = 1
+        thread_artifact_near_misses["numeric-pagination"] = numeric_thread_pagination
+
+        for name, artifact in thread_artifact_near_misses.items():
+            with self.subTest(unresolved_thread_artifact_near_miss=name):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        artifact,
+                        expected_kind="unresolved-thread-finding",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(samples),
+                current,
+            ),
+            "clean",
+        )
+        for profile in ("terminal-payload", "mixed", "unknown"):
+            with self.subTest(non_reaction_profile=profile):
+                self.assertEqual(
+                    classify_fallback(
+                        profile,
+                        declaration,
+                        history(samples),
+                        current,
+                    ),
+                    "not-clean",
+                )
+
+        invalid_cases: dict[str, tuple[object, object, object]] = {
+            "missing-provider-declaration": (
+                None,
+                history(samples),
+                current,
+            ),
+            "insufficient-samples": (
+                declaration,
+                history(samples[:2]),
+                current,
+            ),
+            "incomplete-candidate-universe": (
+                declaration,
+                history(samples, complete=False),
+                current,
+            ),
+        }
+        declaration_drift = clone(declaration)
+        assert isinstance(declaration_drift, dict)
+        declaration_drift["final_snapshot"]["asserted_text"] = "A changed meaning."
+        invalid_cases["provider-declaration-final-reread-drift"] = (
+            declaration_drift,
+            history(samples),
+            current,
+        )
+
+        declaration_outer_extension = clone(declaration)
+        assert isinstance(declaration_outer_extension, dict)
+        declaration_outer_extension["authority_override"] = True
+        invalid_cases["provider-declaration-unknown-outer-key"] = (
+            declaration_outer_extension,
+            history(samples),
+            current,
+        )
+
+        declaration_snapshot_extension = clone(declaration)
+        assert isinstance(declaration_snapshot_extension, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            declaration_snapshot_extension[snapshot_name]["authority_override"] = True
+        invalid_cases["provider-declaration-unknown-snapshot-key"] = (
+            declaration_snapshot_extension,
+            history(samples),
+            current,
+        )
+
+        declaration_boolean_artifact_id = clone(declaration)
+        assert isinstance(declaration_boolean_artifact_id, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            declaration_snapshot = declaration_boolean_artifact_id[snapshot_name]
+            declaration_snapshot["artifact_id"] = True
+            declaration_snapshot["api_url"] = (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments/True"
+            )
+            declaration_snapshot["html_url"] = (
+                "https://github.com/OWNER/REPO/pull/99#issuecomment-True"
+            )
+        invalid_cases["provider-declaration-boolean-artifact-id"] = (
+            declaration_boolean_artifact_id,
+            history(samples),
+            current,
+        )
+
+        untrusted_declaration_url = clone(declaration)
+        assert isinstance(untrusted_declaration_url, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            untrusted_declaration_url[snapshot_name]["api_url"] = (
+                "https://example.invalid/provider-declaration"
+            )
+        invalid_cases["provider-declaration-untrusted-url"] = (
+            untrusted_declaration_url,
+            history(samples),
+            current,
+        )
+
+        wrong_declaration_actor = clone(declaration)
+        assert isinstance(wrong_declaration_actor, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            wrong_declaration_actor[snapshot_name]["user_login"] = "octocat"
+        invalid_cases["provider-declaration-wrong-actor"] = (
+            wrong_declaration_actor,
+            history(samples),
+            current,
+        )
+
+        local_paraphrase = "A +1 reaction means no findings."
+        paraphrased_declaration = clone(declaration)
+        assert isinstance(paraphrased_declaration, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            paraphrased_declaration[snapshot_name]["body"] = local_paraphrase
+            paraphrased_declaration[snapshot_name]["asserted_text"] = local_paraphrase
+            paraphrased_declaration[snapshot_name]["normalized_sha256"] = (
+                hashlib.sha256(local_paraphrase.encode("utf-8")).hexdigest()
+            )
+        invalid_cases["provider-declaration-self-hashed-paraphrase"] = (
+            paraphrased_declaration,
+            history(samples),
+            current,
+        )
+
+        wrong_history_source = history(samples)
+        wrong_history_source["as_of_source"] = "local-clock"
+        invalid_cases["history-untrusted-as-of-source"] = (
+            declaration,
+            wrong_history_source,
+            current,
+        )
+
+        extended_history_schema = history(samples)
+        extended_history_schema["authority_override"] = True
+        invalid_cases["history-unknown-key"] = (
+            declaration,
+            extended_history_schema,
+            current,
+        )
+
+        wrong_history_count = history(samples)
+        wrong_history_count["candidate_universe_count"] = len(samples) - 1
+        invalid_cases["history-universe-count-mismatch"] = (
+            declaration,
+            wrong_history_count,
+            current,
+        )
+
+        incomplete_discovery_pagination = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            incomplete_discovery_pagination[snapshot_name]["pagination"][
+                "pull_requests"
+            ] = False
+        invalid_cases["history-discovery-pagination-incomplete"] = (
+            declaration,
+            incomplete_discovery_pagination,
+            current,
+        )
+
+        discovery_final_reread_drift = history(samples)
+        discovery_final_reread_drift["final_inventory"]["pagination"][
+            "pull_requests"
+        ] = False
+        invalid_cases["history-discovery-final-reread-drift"] = (
+            declaration,
+            discovery_final_reread_drift,
+            current,
+        )
+
+        truncated_candidate_universe = history([sample(pr) for pr in (2, 3, 4, 5)])
+        truncated_candidate_universe["initial_candidates"].pop()
+        truncated_candidate_universe["final_candidates"].pop()
+        truncated_candidate_universe["candidate_universe_count"] = 3
+        invalid_cases["history-truncated-with-synchronized-count"] = (
+            declaration,
+            truncated_candidate_universe,
+            current,
+        )
+
+        stale_history_samples = clone(samples)
+        assert isinstance(stale_history_samples, list)
+        retime_sample(
+            stale_history_samples[0],
+            request_time=history_start_exclusive - 2,
+            reaction_time=history_start_exclusive - 1,
+        )
+        invalid_cases["history-candidate-before-window"] = (
+            declaration,
+            history(stale_history_samples),
+            current,
+        )
+
+        boundary_history_samples = clone(samples)
+        assert isinstance(boundary_history_samples, list)
+        retime_sample(
+            boundary_history_samples[0],
+            request_time=history_start_exclusive - 1,
+            reaction_time=history_start_exclusive,
+        )
+        invalid_cases["history-candidate-on-exclusive-boundary"] = (
+            declaration,
+            history(boundary_history_samples),
+            current,
+        )
+
+        future_history_samples = clone(samples)
+        assert isinstance(future_history_samples, list)
+        retime_sample(
+            future_history_samples[0],
+            request_time=history_as_of_server_time,
+            reaction_time=history_as_of_server_time + 1,
+        )
+        invalid_cases["history-candidate-after-as-of"] = (
+            declaration,
+            history(future_history_samples),
+            current,
+        )
+
+        extended_historical_scope = clone(samples)
+        assert isinstance(extended_historical_scope, list)
+        extended_historical_scope[0]["scope"]["authority_override"] = True
+        restamp(extended_historical_scope[0])
+        invalid_cases["historical-scope-unknown-key"] = (
+            declaration,
+            history(extended_historical_scope),
+            current,
+        )
+
+        future_unrelated_history = clone(samples)
+        assert isinstance(future_unrelated_history, list)
+        future_history_request_id = future_unrelated_history[0]["selected_request_id"]
+        assert isinstance(future_history_request_id, int)
+        future_unrelated_history[0]["reactions"].append(
+            reaction(
+                88_001,
+                future_history_request_id,
+                history_as_of_server_time + 1,
+                content="confused",
+                user_login="octocat",
+                user_type="User",
+            )
+        )
+        restamp(future_unrelated_history[0])
+        invalid_cases["history-unrelated-reaction-after-as-of"] = (
+            declaration,
+            history(future_unrelated_history),
+            current,
+        )
+
+        future_current = clone(current)
+        assert isinstance(future_current, dict)
+        retime_sample(
+            future_current,
+            request_time=history_as_of_server_time,
+            reaction_time=history_as_of_server_time + 1,
+        )
+        invalid_cases["current-reaction-after-as-of"] = (
+            declaration,
+            history(samples),
+            future_current,
+        )
+
+        future_unrelated_current = clone(current)
+        assert isinstance(future_unrelated_current, dict)
+        future_unrelated_current["reactions"].append(
+            reaction(
+                88_002,
+                10,
+                history_as_of_server_time + 1,
+                content="confused",
+                user_login="octocat",
+                user_type="User",
+            )
+        )
+        restamp(future_unrelated_current)
+        invalid_cases["current-unrelated-reaction-after-as-of"] = (
+            declaration,
+            history(samples),
+            future_unrelated_current,
+        )
+
+        wrong_head = clone(current)
+        assert isinstance(wrong_head, dict)
+        wrong_head["scope"]["head"] = "f" * 40
+        restamp(wrong_head)
+        invalid_cases["wrong-current-head"] = (
+            declaration,
+            history(samples),
+            wrong_head,
+        )
+
+        wrong_merge_base = clone(current)
+        assert isinstance(wrong_merge_base, dict)
+        wrong_merge_base["scope"]["pr_merge_base"] = "2" * 40
+        restamp(wrong_merge_base)
+        invalid_cases["wrong-current-merge-base"] = (
+            declaration,
+            history(samples),
+            wrong_merge_base,
+        )
+
+        wrong_repository = clone(current)
+        assert isinstance(wrong_repository, dict)
+        wrong_repository["scope"]["repository"] = "OWNER/OTHER"
+        restamp(wrong_repository)
+        invalid_cases["wrong-current-repository"] = (
+            declaration,
+            history(samples),
+            wrong_repository,
+        )
+
+        wrong_pr = clone(current)
+        assert isinstance(wrong_pr, dict)
+        wrong_pr["scope"]["pr"] = 2
+        restamp(wrong_pr)
+        invalid_cases["wrong-current-pr"] = (
+            declaration,
+            history(samples),
+            wrong_pr,
+        )
+
+        extended_current_scope = clone(current)
+        assert isinstance(extended_current_scope, dict)
+        extended_current_scope["scope"]["authority_override"] = True
+        restamp(extended_current_scope)
+        invalid_cases["current-scope-unknown-key"] = (
+            declaration,
+            history(samples),
+            extended_current_scope,
+        )
+
+        extended_current_schema = clone(current)
+        assert isinstance(extended_current_schema, dict)
+        extended_current_schema["authority_override"] = True
+        invalid_cases["current-unknown-key"] = (
+            declaration,
+            history(samples),
+            extended_current_schema,
+        )
+
+        missing_lifecycle = clone(current)
+        assert isinstance(missing_lifecycle, dict)
+        missing_lifecycle.pop("lifecycle")
+        restamp(missing_lifecycle)
+        invalid_cases["missing-current-lifecycle"] = (
+            declaration,
+            history(samples),
+            missing_lifecycle,
+        )
+
+        closed_lifecycle = clone(current)
+        assert isinstance(closed_lifecycle, dict)
+        closed_lifecycle["lifecycle"]["state"] = "closed"
+        restamp(closed_lifecycle)
+        invalid_cases["closed-current-lifecycle"] = (
+            declaration,
+            history(samples),
+            closed_lifecycle,
+        )
+
+        merged_lifecycle = clone(current)
+        assert isinstance(merged_lifecycle, dict)
+        merged_lifecycle["lifecycle"] = {
+            "state": "closed",
+            "merged": True,
+            "merged_at": 40,
+        }
+        restamp(merged_lifecycle)
+        invalid_cases["merged-current-lifecycle"] = (
+            declaration,
+            history(samples),
+            merged_lifecycle,
+        )
+
+        lifecycle_final_reread_drift = clone(current)
+        assert isinstance(lifecycle_final_reread_drift, dict)
+        lifecycle_final_reread_drift["final_snapshot"]["lifecycle"]["state"] = "closed"
+        invalid_cases["current-lifecycle-final-reread-drift"] = (
+            declaration,
+            history(samples),
+            lifecycle_final_reread_drift,
+        )
+
+        malformed_head = clone(current)
+        assert isinstance(malformed_head, dict)
+        malformed_head["scope"]["head"] = current_head.upper()
+        restamp(malformed_head)
+        invalid_cases["non-lowercase-head"] = (
+            declaration,
+            history(samples),
+            malformed_head,
+        )
+
+        wrong_request_url = clone(current)
+        assert isinstance(wrong_request_url, dict)
+        wrong_request_url["requests"][0]["url"] = (
+            "https://github.com/OWNER/REPO/pull/2#issuecomment-10"
+        )
+        restamp(wrong_request_url)
+        invalid_cases["wrong-request-url-binding"] = (
+            declaration,
+            history(samples),
+            wrong_request_url,
+        )
+
+        extended_request_schema = clone(current)
+        assert isinstance(extended_request_schema, dict)
+        extended_request_schema["requests"][0]["authority_override"] = True
+        restamp(extended_request_schema)
+        invalid_cases["request-unknown-key"] = (
+            declaration,
+            history(samples),
+            extended_request_schema,
+        )
+
+        missing_request_server_time = clone(current)
+        assert isinstance(missing_request_server_time, dict)
+        missing_request_server_time["requests"][0].pop("request_server_time")
+        restamp(missing_request_server_time)
+        invalid_cases["missing-request-server-time"] = (
+            declaration,
+            history(samples),
+            missing_request_server_time,
+        )
+
+        wrong_request_server_time_field = clone(current)
+        assert isinstance(wrong_request_server_time_field, dict)
+        wrong_request_server_time_field["requests"][0]["request_server_time_field"] = (
+            "updated_at"
+        )
+        restamp(wrong_request_server_time_field)
+        invalid_cases["wrong-request-server-time-field"] = (
+            declaration,
+            history(samples),
+            wrong_request_server_time_field,
+        )
+
+        edited_before_reaction = clone(current)
+        assert isinstance(edited_before_reaction, dict)
+        edited_before_reaction["requests"][0]["updated_at"] = 30
+        edited_before_reaction["requests"][0]["request_server_time"] = 30
+        edited_before_reaction["requests"][0]["request_server_time_field"] = (
+            "updated_at"
+        )
+        restamp(edited_before_reaction)
+        invalid_cases["reaction-predates-request-edit"] = (
+            declaration,
+            history(samples),
+            edited_before_reaction,
+        )
+
+        later_duplicate = clone(current)
+        assert isinstance(later_duplicate, dict)
+        later_duplicate["requests"].append(request(11, 15, pr=current_pr))
+        restamp(later_duplicate)
+        invalid_cases["later-duplicate-request"] = (
+            declaration,
+            history(samples),
+            later_duplicate,
+        )
+
+        newer_eyes = clone(current)
+        assert isinstance(newer_eyes, dict)
+        newer_eyes["requests"].append(request(9, 5, pr=current_pr))
+        newer_eyes["reactions"].append(reaction(101, 9, 21, content="eyes"))
+        restamp(newer_eyes)
+        invalid_cases["cross-parent-newer-eyes"] = (
+            declaration,
+            history(samples),
+            newer_eyes,
+        )
+
+        conflicting_reaction = clone(current)
+        assert isinstance(conflicting_reaction, dict)
+        conflicting_reaction["reactions"].append(
+            reaction(101, 10, 21, content="confused")
+        )
+        restamp(conflicting_reaction)
+        invalid_cases["conflicting-reaction"] = (
+            declaration,
+            history(samples),
+            conflicting_reaction,
+        )
+
+        missing_reaction_id = clone(current)
+        assert isinstance(missing_reaction_id, dict)
+        missing_reaction_id["reactions"][0]["id"] = None
+        restamp(missing_reaction_id)
+        invalid_cases["missing-reaction-id"] = (
+            declaration,
+            history(samples),
+            missing_reaction_id,
+        )
+
+        wrong_reaction_api_url = clone(current)
+        assert isinstance(wrong_reaction_api_url, dict)
+        wrong_reaction_api_url["reactions"][0]["api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/reactions/101"
+        )
+        restamp(wrong_reaction_api_url)
+        invalid_cases["wrong-reaction-api-url"] = (
+            declaration,
+            history(samples),
+            wrong_reaction_api_url,
+        )
+
+        extended_reaction_schema = clone(current)
+        assert isinstance(extended_reaction_schema, dict)
+        extended_reaction_schema["reactions"][0]["authority_override"] = True
+        restamp(extended_reaction_schema)
+        invalid_cases["reaction-unknown-key"] = (
+            declaration,
+            history(samples),
+            extended_reaction_schema,
+        )
+
+        wrong_parent_reactions_api_url = clone(current)
+        assert isinstance(wrong_parent_reactions_api_url, dict)
+        wrong_parent_reactions_api_url["reactions"][0]["parent_reactions_api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+            "11/reactions?per_page=100"
+        )
+        restamp(wrong_parent_reactions_api_url)
+        invalid_cases["wrong-parent-reactions-api-url"] = (
+            declaration,
+            history(samples),
+            wrong_parent_reactions_api_url,
+        )
+
+        relocated_reaction = clone(current)
+        assert isinstance(relocated_reaction, dict)
+        relocated_reaction["requests"].append(request(11, 15, pr=current_pr))
+        relocated_reaction["selected_request_id"] = 11
+        relocated_reaction["reactions"][0]["parent_request_id"] = 11
+        restamp(relocated_reaction)
+        invalid_cases["reaction-relocated-with-stale-parent-endpoint"] = (
+            declaration,
+            history(samples),
+            relocated_reaction,
+        )
+
+        ambiguous_actor = clone(current)
+        assert isinstance(ambiguous_actor, dict)
+        ambiguous_actor["reactions"][0]["user_login"] = None
+        restamp(ambiguous_actor)
+        invalid_cases["ambiguous-reaction-actor"] = (
+            declaration,
+            history(samples),
+            ambiguous_actor,
+        )
+
+        exact_login_wrong_type = clone(current)
+        assert isinstance(exact_login_wrong_type, dict)
+        exact_login_wrong_type["reactions"][0]["user_type"] = "User"
+        restamp(exact_login_wrong_type)
+        invalid_cases["exact-login-wrong-type"] = (
+            declaration,
+            history(samples),
+            exact_login_wrong_type,
+        )
+
+        lookalike_bot = clone(current)
+        assert isinstance(lookalike_bot, dict)
+        lookalike_bot["reactions"].append(
+            reaction(
+                101,
+                10,
+                21,
+                content="confused",
+                user_login="ChatGPT-Codex-Connector[bot]",
+                user_type="Bot",
+            )
+        )
+        restamp(lookalike_bot)
+        invalid_cases["lookalike-bot-reaction"] = (
+            declaration,
+            history(samples),
+            lookalike_bot,
+        )
+
+        incomplete_current_pagination = clone(current)
+        assert isinstance(incomplete_current_pagination, dict)
+        incomplete_current_pagination["pagination"]["review_threads"] = False
+        restamp(incomplete_current_pagination)
+        invalid_cases["incomplete-current-pagination"] = (
+            declaration,
+            history(samples),
+            incomplete_current_pagination,
+        )
+
+        numeric_current_pagination = clone(current)
+        assert isinstance(numeric_current_pagination, dict)
+        numeric_current_pagination["pagination"]["review_threads"] = 1
+        restamp(numeric_current_pagination)
+        invalid_cases["numeric-current-pagination"] = (
+            declaration,
+            history(samples),
+            numeric_current_pagination,
+        )
+
+        numeric_current_lifecycle = clone(current)
+        assert isinstance(numeric_current_lifecycle, dict)
+        numeric_current_lifecycle["lifecycle"]["merged"] = 0
+        restamp(numeric_current_lifecycle)
+        invalid_cases["numeric-current-lifecycle"] = (
+            declaration,
+            history(samples),
+            numeric_current_lifecycle,
+        )
+
+        boolean_request_id = clone(current)
+        assert isinstance(boolean_request_id, dict)
+        boolean_request_id["requests"][0]["id"] = True
+        boolean_request_id["requests"][0]["url"] = (
+            f"https://github.com/{current_repository}/pull/{current_pr}"
+            "#issuecomment-True"
+        )
+        boolean_request_id["reactions"][0]["parent_request_id"] = True
+        boolean_request_id["reactions"][0]["parent_reactions_api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+            "True/reactions?per_page=100"
+        )
+        boolean_request_id["selected_request_id"] = True
+        restamp(boolean_request_id)
+        invalid_cases["boolean-request-id"] = (
+            declaration,
+            history(samples),
+            boolean_request_id,
+        )
+
+        boolean_reaction_id = clone(current)
+        assert isinstance(boolean_reaction_id, dict)
+        boolean_reaction_id["reactions"][0]["id"] = True
+        boolean_reaction_id["reactions"][0]["api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/reactions/True"
+        )
+        boolean_reaction_id["selected_reaction_id"] = True
+        boolean_reaction_id["candidate_basis"]["stable_artifact_id"] = True
+        restamp(boolean_reaction_id)
+        invalid_cases["boolean-reaction-id"] = (
+            declaration,
+            history(samples),
+            boolean_reaction_id,
+        )
+
+        floating_request_time = clone(current)
+        assert isinstance(floating_request_time, dict)
+        floating_request_time["requests"][0]["created_at"] = 10.0
+        floating_request_time["requests"][0]["updated_at"] = 10.0
+        floating_request_time["requests"][0]["request_server_time"] = 10.0
+        restamp(floating_request_time)
+        invalid_cases["floating-request-time"] = (
+            declaration,
+            history(samples),
+            floating_request_time,
+        )
+
+        floating_reaction_time = clone(current)
+        assert isinstance(floating_reaction_time, dict)
+        floating_reaction_time["reactions"][0]["created_at"] = 20.0
+        floating_reaction_time["candidate_basis"]["server_time"] = 20.0
+        restamp(floating_reaction_time)
+        invalid_cases["floating-reaction-time"] = (
+            declaration,
+            history(samples),
+            floating_reaction_time,
+        )
+
+        initial_only_numeric_pagination = clone(current)
+        assert isinstance(initial_only_numeric_pagination, dict)
+        initial_only_numeric_pagination["initial_snapshot"]["pagination"][
+            "review_threads"
+        ] = 1
+        invalid_cases["initial-only-numeric-pagination"] = (
+            declaration,
+            history(samples),
+            initial_only_numeric_pagination,
+        )
+
+        for blocker_field in empty_evidence_state:
+            blocked_current = clone(current)
+            assert isinstance(blocked_current, dict)
+            blocked_current["evidence_state"][blocker_field] = ["artifact-1"]
+            restamp(blocked_current)
+            invalid_cases[f"current-{blocker_field}"] = (
+                declaration,
+                history(samples),
+                blocked_current,
+            )
+
+        dismissed_review_blocks_fallback = clone(current)
+        assert isinstance(dismissed_review_blocks_fallback, dict)
+        dismissed_review_blocks_fallback["evidence_state"][
+            "malformed_terminal_artifacts"
+        ] = [
+            {
+                "channel": "review",
+                "state": "DISMISSED",
+                "body": "No findings.",
+            }
+        ]
+        restamp(dismissed_review_blocks_fallback)
+        invalid_cases["dismissed-review-blocks-reaction-fallback"] = (
+            declaration,
+            history(samples),
+            dismissed_review_blocks_fallback,
+        )
+
+        current_final_reread_drift = clone(current)
+        assert isinstance(current_final_reread_drift, dict)
+        current_final_reread_drift["final_snapshot"]["reactions"][0]["content"] = "eyes"
+        invalid_cases["current-final-reread-drift"] = (
+            declaration,
+            history(samples),
+            current_final_reread_drift,
+        )
+
+        current_in_history = [clone(current), sample(3), sample(4)]
+        invalid_cases["current-scope-counted-as-history"] = (
+            declaration,
+            history(current_in_history),
+            current,
+        )
+
+        missing_ordering_key = clone(samples)
+        assert isinstance(missing_ordering_key, list)
+        missing_ordering_key[0]["candidate_basis"]["server_time"] = None
+        restamp(missing_ordering_key[0])
+        invalid_cases["missing-candidate-ordering-key"] = (
+            declaration,
+            history(missing_ordering_key),
+            current,
+        )
+
+        selected_history_blocker = clone(samples)
+        assert isinstance(selected_history_blocker, list)
+        selected_history_blocker[0]["evidence_state"]["terminal_payloads"] = [
+            complete_review_artifact(
+                selected_history_blocker[0],
+                80_000,
+                2_800_000,
+            )
+        ]
+        restamp(selected_history_blocker[0])
+        invalid_cases["selected-history-terminal-payload"] = (
+            declaration,
+            history(selected_history_blocker),
+            current,
+        )
+
+        history_final_reread_drift = history(samples)
+        history_final_reread_drift["final_candidates"][0]["reactions"][0]["content"] = (
+            "eyes"
+        )
+        invalid_cases["history-final-reread-drift"] = (
+            declaration,
+            history_final_reread_drift,
+            current,
+        )
+
+        for name, (
+            case_declaration,
+            case_history,
+            case_current,
+        ) in invalid_cases.items():
+            with self.subTest(reaction_fallback_near_miss=name):
+                self.assertEqual(
+                    classify_fallback(
+                        "thumbs-up-clean",
+                        case_declaration,
+                        case_history,
+                        case_current,
+                    ),
+                    "unknown",
+                )
+
+        first_in_window_samples = clone(samples)
+        assert isinstance(first_in_window_samples, list)
+        retime_sample(
+            first_in_window_samples[0],
+            request_time=history_start_exclusive,
+            reaction_time=history_start_exclusive + 1,
+        )
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(first_in_window_samples),
+                current,
+            ),
+            "clean",
+        )
+
+        as_of_boundary_samples = clone(samples)
+        assert isinstance(as_of_boundary_samples, list)
+        retime_sample(
+            as_of_boundary_samples[0],
+            request_time=history_as_of_server_time - 1,
+            reaction_time=history_as_of_server_time,
+        )
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(as_of_boundary_samples),
+                current,
+            ),
+            "clean",
+        )
+
+        compatible_earlier_eyes = clone(current)
+        assert isinstance(compatible_earlier_eyes, dict)
+        compatible_earlier_eyes["requests"].append(request(9, 5, pr=current_pr))
+        compatible_earlier_eyes["reactions"].append(reaction(99, 9, 8, content="eyes"))
+        restamp(compatible_earlier_eyes)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(samples),
+                compatible_earlier_eyes,
+            ),
+            "clean",
+        )
+
+        confirmed_human_reaction = clone(current)
+        assert isinstance(confirmed_human_reaction, dict)
+        confirmed_human_reaction["reactions"].append(
+            reaction(
+                101,
+                10,
+                21,
+                content="confused",
+                user_login="octocat",
+                user_type="User",
+            )
+        )
+        restamp(confirmed_human_reaction)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(samples),
+                confirmed_human_reaction,
+            ),
+            "clean",
+        )
+
+        confirmed_unrelated_bot_reaction = clone(current)
+        assert isinstance(confirmed_unrelated_bot_reaction, dict)
+        confirmed_unrelated_bot_reaction["reactions"].append(
+            reaction(
+                101,
+                10,
+                21,
+                content="confused",
+                user_login="dependabot[bot]",
+                user_type="Bot",
+            )
+        )
+        restamp(confirmed_unrelated_bot_reaction)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(samples),
+                confirmed_unrelated_bot_reaction,
+            ),
+            "clean",
+        )
+
+        same_pr_different_scope = outcome(
+            current_pr,
+            "2" * 40,
+            [request(12, 2_100_000, pr=current_pr)],
+            [reaction(102, 12, 2_100_001)],
+            selected_request_id=12,
+            selected_reaction_id=102,
+            merge_base="3" * 40,
+        )
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history([same_pr_different_scope, sample(2), sample(3)]),
+                current,
+            ),
+            "clean",
+        )
+
+        for candidate_count in (9, 10, 11):
+            with self.subTest(candidate_universe_size=candidate_count):
+                candidate_universe = [
+                    sample(pr) for pr in range(2, candidate_count + 2)
+                ]
+                self.assertEqual(
+                    classify_fallback(
+                        "thumbs-up-clean",
+                        declaration,
+                        history(candidate_universe),
+                        current,
+                    ),
+                    "clean",
+                )
+
+        eleven_candidates = [sample(pr) for pr in range(2, 13)]
+
+        declaration_id_reused_as_request = clone(eleven_candidates)
+        assert isinstance(declaration_id_reused_as_request, list)
+        declaration_collision_candidate = declaration_id_reused_as_request[0]
+        declaration_collision_pr = declaration_collision_candidate["scope"]["pr"]
+        declaration_collision_reaction = declaration_collision_candidate["reactions"][0]
+        declaration_collision_candidate["requests"][0]["id"] = declaration_artifact_id
+        declaration_collision_candidate["requests"][0]["url"] = (
+            f"https://github.com/{current_repository}/pull/"
+            f"{declaration_collision_pr}#issuecomment-{declaration_artifact_id}"
+        )
+        declaration_collision_reaction["parent_request_id"] = declaration_artifact_id
+        declaration_collision_reaction["parent_reactions_api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+            f"{declaration_artifact_id}/reactions?per_page=100"
+        )
+        declaration_collision_candidate["selected_request_id"] = declaration_artifact_id
+        restamp(declaration_collision_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(declaration_id_reused_as_request),
+                current,
+            ),
+            "unknown",
+        )
+
+        cross_scope_request_id_reuse = clone(eleven_candidates)
+        assert isinstance(cross_scope_request_id_reuse, list)
+        first_request_id = cross_scope_request_id_reuse[0]["requests"][0]["id"]
+        request_collision_candidate = cross_scope_request_id_reuse[1]
+        request_collision_pr = request_collision_candidate["scope"]["pr"]
+        request_collision_candidate["requests"][0]["id"] = first_request_id
+        request_collision_candidate["requests"][0]["url"] = (
+            f"https://github.com/{current_repository}/pull/"
+            f"{request_collision_pr}#issuecomment-{first_request_id}"
+        )
+        request_collision_candidate["reactions"][0]["parent_request_id"] = (
+            first_request_id
+        )
+        request_collision_candidate["reactions"][0]["parent_reactions_api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+            f"{first_request_id}/reactions?per_page=100"
+        )
+        request_collision_candidate["selected_request_id"] = first_request_id
+        restamp(request_collision_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(cross_scope_request_id_reuse),
+                current,
+            ),
+            "unknown",
+        )
+
+        cross_scope_reaction_id_reuse = clone(eleven_candidates)
+        assert isinstance(cross_scope_reaction_id_reuse, list)
+        first_reaction_id = cross_scope_reaction_id_reuse[0]["reactions"][0]["id"]
+        reaction_collision_candidate = cross_scope_reaction_id_reuse[1]
+        reaction_collision_candidate["reactions"][0]["id"] = first_reaction_id
+        reaction_collision_candidate["reactions"][0]["api_url"] = (
+            f"https://api.github.com/repos/OWNER/REPO/reactions/{first_reaction_id}"
+        )
+        reaction_collision_candidate["selected_reaction_id"] = first_reaction_id
+        reaction_collision_candidate["candidate_basis"]["stable_artifact_id"] = (
+            first_reaction_id
+        )
+        restamp(reaction_collision_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(cross_scope_reaction_id_reuse),
+                current,
+            ),
+            "unknown",
+        )
+
+        current_history_request_id_reuse = clone(current)
+        assert isinstance(current_history_request_id_reuse, dict)
+        historical_request_id = eleven_candidates[0]["requests"][0]["id"]
+        current_history_request_id_reuse["requests"][0]["id"] = historical_request_id
+        current_history_request_id_reuse["requests"][0]["url"] = (
+            f"https://github.com/{current_repository}/pull/{current_pr}"
+            f"#issuecomment-{historical_request_id}"
+        )
+        current_history_request_id_reuse["reactions"][0]["parent_request_id"] = (
+            historical_request_id
+        )
+        current_history_request_id_reuse["reactions"][0]["parent_reactions_api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+            f"{historical_request_id}/reactions?per_page=100"
+        )
+        current_history_request_id_reuse["selected_request_id"] = historical_request_id
+        restamp(current_history_request_id_reuse)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(eleven_candidates),
+                current_history_request_id_reuse,
+            ),
+            "unknown",
+        )
+
+        current_history_reaction_id_reuse = clone(current)
+        assert isinstance(current_history_reaction_id_reuse, dict)
+        historical_reaction_id = eleven_candidates[0]["reactions"][0]["id"]
+        current_history_reaction_id_reuse["reactions"][0]["id"] = historical_reaction_id
+        current_history_reaction_id_reuse["reactions"][0]["api_url"] = (
+            "https://api.github.com/repos/OWNER/REPO/reactions/"
+            f"{historical_reaction_id}"
+        )
+        current_history_reaction_id_reuse["selected_reaction_id"] = (
+            historical_reaction_id
+        )
+        current_history_reaction_id_reuse["candidate_basis"]["stable_artifact_id"] = (
+            historical_reaction_id
+        )
+        restamp(current_history_reaction_id_reuse)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(eleven_candidates),
+                current_history_reaction_id_reuse,
+            ),
+            "unknown",
+        )
+
+        unselected_stale_selected_provenance = clone(eleven_candidates)
+        assert isinstance(unselected_stale_selected_provenance, list)
+        oldest_provenance_candidate = unselected_stale_selected_provenance[0]
+        oldest_provenance_pr = oldest_provenance_candidate["scope"]["pr"]
+        earlier_request_id = 71_001
+        earlier_reaction_id = 72_001
+        earlier_request_time = (
+            oldest_provenance_candidate["requests"][0]["created_at"] - 2
+        )
+        earlier_reaction_time = earlier_request_time + 1
+        oldest_provenance_candidate["requests"].append(
+            request(
+                earlier_request_id,
+                earlier_request_time,
+                pr=oldest_provenance_pr,
+            )
+        )
+        oldest_provenance_candidate["reactions"].append(
+            reaction(
+                earlier_reaction_id,
+                earlier_request_id,
+                earlier_reaction_time,
+            )
+        )
+        oldest_provenance_candidate["selected_request_id"] = earlier_request_id
+        oldest_provenance_candidate["selected_reaction_id"] = earlier_reaction_id
+        oldest_provenance_candidate["candidate_basis"] = {
+            "kind": "reaction",
+            "server_time": earlier_reaction_time,
+            "stable_artifact_id": earlier_reaction_id,
+        }
+        restamp(oldest_provenance_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_stale_selected_provenance),
+                current,
+            ),
+            "unknown",
+        )
+
+        cross_scope_artifact_id_reuse = [sample(pr) for pr in range(2, 14)]
+        assert isinstance(cross_scope_artifact_id_reuse, list)
+        for index in (0, 1):
+            artifact_collision_candidate = cross_scope_artifact_id_reuse[index]
+            terminal_time = (
+                artifact_collision_candidate["reactions"][0]["created_at"] + 1
+            )
+            artifact_collision_candidate["evidence_state"]["terminal_payloads"] = [
+                complete_review_artifact(
+                    artifact_collision_candidate,
+                    73_001,
+                    terminal_time,
+                )
+            ]
+            artifact_collision_candidate["candidate_basis"] = {
+                "kind": "terminal-payload",
+                "server_time": terminal_time,
+                "stable_artifact_id": 73_001,
+            }
+            restamp(artifact_collision_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(cross_scope_artifact_id_reuse),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_negative_request_reaction_times = clone(eleven_candidates)
+        assert isinstance(unselected_negative_request_reaction_times, list)
+        negative_time_candidate = unselected_negative_request_reaction_times[0]
+        negative_time_candidate["requests"][0]["created_at"] = -2
+        negative_time_candidate["requests"][0]["updated_at"] = -2
+        negative_time_candidate["requests"][0]["request_server_time"] = -2
+        negative_time_candidate["reactions"][0]["created_at"] = -1
+        low_terminal_time = history_start_exclusive + 1
+        negative_time_candidate["evidence_state"]["terminal_payloads"] = [
+            complete_review_artifact(
+                negative_time_candidate,
+                74_001,
+                low_terminal_time,
+            )
+        ]
+        negative_time_candidate["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": low_terminal_time,
+            "stable_artifact_id": 74_001,
+        }
+        restamp(negative_time_candidate)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_negative_request_reaction_times),
+                current,
+            ),
+            "unknown",
+        )
+
+        terminal_payload_changes_candidate_order = clone(eleven_candidates)
+        assert isinstance(terminal_payload_changes_candidate_order, list)
+        terminal_payload_changes_candidate_order[0]["evidence_state"][
+            "terminal_payloads"
+        ] = [
+            complete_review_artifact(
+                terminal_payload_changes_candidate_order[0],
+                99_999,
+                2_900_000,
+            )
+        ]
+        terminal_payload_changes_candidate_order[0]["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": 2_900_000,
+            "stable_artifact_id": 99_999,
+        }
+        restamp(terminal_payload_changes_candidate_order[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(terminal_payload_changes_candidate_order),
+                current,
+            ),
+            "unknown",
+        )
+
+        def history_with_unselected_terminal_basis() -> list[dict[str, object]]:
+            candidates = clone(eleven_candidates)
+            assert isinstance(candidates, list)
+            oldest = candidates[0]
+            terminal_time = int(oldest["reactions"][0]["created_at"]) + 1
+            oldest["evidence_state"]["terminal_payloads"] = [
+                complete_review_artifact(oldest, 90_000, terminal_time)
+            ]
+            oldest["candidate_basis"] = {
+                "kind": "terminal-payload",
+                "server_time": terminal_time,
+                "stable_artifact_id": 90_000,
+            }
+            restamp(oldest)
+            return candidates
+
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(history_with_unselected_terminal_basis()),
+                current,
+            ),
+            "clean",
+        )
+
+        def assert_unselected_artifact_history_rejected(
+            candidates: list[dict[str, object]],
+        ) -> None:
+            self.assertEqual(
+                classify_fallback(
+                    "thumbs-up-clean",
+                    declaration,
+                    history(candidates),
+                    current,
+                ),
+                "unknown",
+            )
+
+        history_with_unknown_evidence_channel = clone(eleven_candidates)
+        assert isinstance(history_with_unknown_evidence_channel, list)
+        oldest = history_with_unknown_evidence_channel[0]
+        oldest["evidence_state"]["unknown_terminal_artifacts"] = []
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            history_with_unknown_evidence_channel
+        )
+
+        history_with_conflicting_native_artifact = clone(eleven_candidates)
+        assert isinstance(history_with_conflicting_native_artifact, list)
+        oldest = history_with_conflicting_native_artifact[0]
+        terminal_time = int(oldest["reactions"][0]["created_at"]) + 1
+        commented_finding = complete_review_artifact(
+            oldest,
+            90_010,
+            terminal_time,
+            outcome="findings",
+        )
+        changes_requested_finding = clone(commented_finding)
+        assert isinstance(changes_requested_finding, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            changes_requested_finding[snapshot_name]["state"] = "CHANGES_REQUESTED"
+        oldest["evidence_state"]["terminal_payloads"] = [
+            commented_finding,
+            changes_requested_finding,
+        ]
+        oldest["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": terminal_time,
+            "stable_artifact_id": 90_010,
+        }
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            history_with_conflicting_native_artifact
+        )
+
+        history_with_wrong_finding_subtype_precedence = clone(eleven_candidates)
+        assert isinstance(history_with_wrong_finding_subtype_precedence, list)
+        oldest = history_with_wrong_finding_subtype_precedence[0]
+        boundary_time = eleven_candidates[1]["candidate_basis"]["server_time"]
+        assert isinstance(boundary_time, int)
+        oldest["evidence_state"]["active_top_level_findings"] = [
+            complete_review_artifact(
+                oldest,
+                90_000,
+                boundary_time,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+            )
+        ]
+        oldest["evidence_state"]["unresolved_thread_findings"] = [
+            complete_review_artifact(
+                oldest,
+                10_000,
+                boundary_time,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+        ]
+        oldest["candidate_basis"] = {
+            "kind": "unresolved-thread-finding",
+            "server_time": boundary_time,
+            "stable_artifact_id": 10_000,
+        }
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            history_with_wrong_finding_subtype_precedence
+        )
+
+        terminal_basis_with_sparse_artifact = history_with_unselected_terminal_basis()
+        oldest = terminal_basis_with_sparse_artifact[0]
+        terminal_time = oldest["candidate_basis"]["server_time"]
+        oldest["evidence_state"]["terminal_payloads"] = [
+            {
+                "server_time": terminal_time,
+                "stable_artifact_id": 90_000,
+            }
+        ]
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(terminal_basis_with_sparse_artifact)
+
+        terminal_basis_with_lookalike_artifact = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_lookalike_artifact[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact[snapshot_name]["user_login"] = "codex-review-helper[bot]"
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_lookalike_artifact
+        )
+
+        terminal_basis_without_submitted_at = history_with_unselected_terminal_basis()
+        oldest = terminal_basis_without_submitted_at[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            del artifact[snapshot_name]["submitted_at"]
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(terminal_basis_without_submitted_at)
+
+        terminal_basis_with_mismatched_submitted_at = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_mismatched_submitted_at[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact[snapshot_name]["submitted_at"] += 1
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_mismatched_submitted_at
+        )
+
+        terminal_basis_with_future_submitted_at = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_future_submitted_at[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact[snapshot_name]["submitted_at"] = history_as_of_server_time + 1
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_future_submitted_at
+        )
+
+        terminal_basis_with_incomplete_artifact_page = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_incomplete_artifact_page[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact[snapshot_name]["associated_inline_comments"][
+                "pagination_complete"
+            ] = False
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_incomplete_artifact_page
+        )
+
+        terminal_basis_with_scope_conflict = history_with_unselected_terminal_basis()
+        oldest = terminal_basis_with_scope_conflict[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact[snapshot_name]["scope"]["head"] = "f" * 40
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(terminal_basis_with_scope_conflict)
+
+        terminal_basis_with_artifact_reread_drift = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_artifact_reread_drift[0]
+        artifact = oldest["evidence_state"]["terminal_payloads"][0]
+        artifact["final_snapshot"]["body"] = "No findings. "
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_artifact_reread_drift
+        )
+
+        terminal_basis_with_same_id_conflict = history_with_unselected_terminal_basis()
+        oldest = terminal_basis_with_same_id_conflict[0]
+        terminal_time = oldest["candidate_basis"]["server_time"]
+        assert isinstance(terminal_time, int)
+        oldest["evidence_state"]["active_top_level_findings"] = [
+            complete_review_artifact(
+                oldest,
+                90_000,
+                terminal_time,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+            )
+        ]
+        oldest["candidate_basis"]["kind"] = "active-top-level-finding"
+        restamp(oldest)
+        assert_unselected_artifact_history_rejected(
+            terminal_basis_with_same_id_conflict
+        )
+
+        for later_content in ("eyes", "+1"):
+            with self.subTest(
+                unselected_artifact_basis_with_later_reaction=later_content
+            ):
+                artifact_basis_with_later_reaction = (
+                    history_with_unselected_terminal_basis()
+                )
+                oldest = artifact_basis_with_later_reaction[0]
+                request_id = oldest["selected_request_id"]
+                assert isinstance(request_id, int)
+                oldest["reactions"].append(
+                    reaction(
+                        90_003,
+                        request_id,
+                        2_900_000,
+                        content=later_content,
+                    )
+                )
+                restamp(oldest)
+                assert_unselected_artifact_history_rejected(
+                    artifact_basis_with_later_reaction
+                )
+
+        terminal_basis_with_future_human = history_with_unselected_terminal_basis()
+        oldest = terminal_basis_with_future_human[0]
+        request_id = oldest["selected_request_id"]
+        assert isinstance(request_id, int)
+        oldest["reactions"].append(
+            reaction(
+                90_001,
+                request_id,
+                history_as_of_server_time + 1,
+                content="confused",
+                user_login="human-reviewer",
+                user_type="User",
+            )
+        )
+        restamp(oldest)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(terminal_basis_with_future_human),
+                current,
+            ),
+            "unknown",
+        )
+
+        terminal_basis_with_relocated_reaction = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_relocated_reaction[0]
+        original_request = oldest["requests"][0]
+        original_request_time = original_request["request_server_time"]
+        assert isinstance(original_request_time, int)
+        oldest["requests"].append(request(90_002, original_request_time - 1, pr=2))
+        oldest["reactions"][0]["parent_request_id"] = 90_002
+        restamp(oldest)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(terminal_basis_with_relocated_reaction),
+                current,
+            ),
+            "unknown",
+        )
+
+        terminal_basis_with_ambiguous_reaction = (
+            history_with_unselected_terminal_basis()
+        )
+        oldest = terminal_basis_with_ambiguous_reaction[0]
+        oldest["reactions"][0]["user_type"] = None
+        restamp(oldest)
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(terminal_basis_with_ambiguous_reaction),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_final_reread_drift = clone(eleven_candidates)
+        assert isinstance(unselected_final_reread_drift, list)
+        unselected_final_reread_drift[0]["final_snapshot"]["reactions"][0][
+            "created_at"
+        ] = 2_900_000
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_final_reread_drift),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_incomplete_pagination = clone(eleven_candidates)
+        assert isinstance(unselected_incomplete_pagination, list)
+        unselected_incomplete_pagination[0]["pagination"]["reviews"] = False
+        restamp(unselected_incomplete_pagination[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_incomplete_pagination),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_newer_eyes = clone(eleven_candidates)
+        assert isinstance(unselected_newer_eyes, list)
+        unselected_request_id = unselected_newer_eyes[0]["selected_request_id"]
+        assert isinstance(unselected_request_id, int)
+        unselected_newer_eyes[0]["reactions"].append(
+            reaction(
+                99_999,
+                unselected_request_id,
+                2_900_000,
+                content="eyes",
+            )
+        )
+        restamp(unselected_newer_eyes[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_newer_eyes),
+                current,
+            ),
+            "unknown",
+        )
+
+        invalid_oldest_unselected = clone(eleven_candidates)
+        assert isinstance(invalid_oldest_unselected, list)
+        invalid_oldest_unselected[0]["reactions"][0]["user_type"] = "User"
+        restamp(invalid_oldest_unselected[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(invalid_oldest_unselected),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_lookalike_bot = clone(eleven_candidates)
+        assert isinstance(unselected_lookalike_bot, list)
+        unselected_lookalike_bot[0]["reactions"][0]["user_login"] = (
+            "codex-review-helper[bot]"
+        )
+        restamp(unselected_lookalike_bot[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_lookalike_bot),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_missing_type = clone(eleven_candidates)
+        assert isinstance(unselected_missing_type, list)
+        unselected_missing_type[0]["reactions"][0]["user_type"] = None
+        restamp(unselected_missing_type[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_missing_type),
+                current,
+            ),
+            "unknown",
+        )
+
+        unselected_conflicting_content = clone(eleven_candidates)
+        assert isinstance(unselected_conflicting_content, list)
+        unselected_conflicting_content[0]["reactions"][0]["content"] = "confused"
+        restamp(unselected_conflicting_content[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(unselected_conflicting_content),
+                current,
+            ),
+            "unknown",
+        )
+
+        invalid_newest_selected = clone(eleven_candidates)
+        assert isinstance(invalid_newest_selected, list)
+        invalid_newest_selected[-1]["reactions"][0]["user_type"] = "User"
+        restamp(invalid_newest_selected[-1])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(invalid_newest_selected),
+                current,
+            ),
+            "unknown",
+        )
+
+        invalid_tenth_newest_selected = clone(eleven_candidates)
+        assert isinstance(invalid_tenth_newest_selected, list)
+        invalid_tenth_newest_selected[1]["reactions"][0]["user_type"] = "User"
+        restamp(invalid_tenth_newest_selected[1])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(invalid_tenth_newest_selected),
+                current,
+            ),
+            "unknown",
+        )
+
+        ten_candidates = [sample(pr) for pr in range(2, 12)]
+        invalid_oldest_of_exact_ten = clone(ten_candidates)
+        assert isinstance(invalid_oldest_of_exact_ten, list)
+        invalid_oldest_of_exact_ten[0]["reactions"][0]["user_type"] = "User"
+        restamp(invalid_oldest_of_exact_ten[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(invalid_oldest_of_exact_ten),
+                current,
+            ),
+            "unknown",
+        )
+
+        nine_candidates = [sample(pr) for pr in range(2, 11)]
+        invalid_oldest_selected = clone(nine_candidates)
+        assert isinstance(invalid_oldest_selected, list)
+        invalid_oldest_selected[0]["reactions"][0]["user_type"] = "User"
+        restamp(invalid_oldest_selected[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(invalid_oldest_selected),
+                current,
+            ),
+            "unknown",
+        )
+
+        missing_unselected_order_key = clone(eleven_candidates)
+        assert isinstance(missing_unselected_order_key, list)
+        missing_unselected_order_key[0]["candidate_basis"]["stable_artifact_id"] = None
+        restamp(missing_unselected_order_key[0])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(missing_unselected_order_key),
+                current,
+            ),
+            "unknown",
+        )
+
+        forged_unselected_order_key = clone(eleven_candidates)
+        assert isinstance(forged_unselected_order_key, list)
+        forged_unselected_order_key[-1]["candidate_basis"]["server_time"] = 1
+        restamp(forged_unselected_order_key[-1])
+        self.assertEqual(
+            classify_fallback(
+                "thumbs-up-clean",
+                declaration,
+                history(forged_unselected_order_key),
+                current,
+            ),
+            "unknown",
+        )
+
+        normalized_authority = " ".join(authority.split()).lower()
+        for anchor in (
+            "belong to the unique accepted request with the greatest request "
+            "semantic time",
+            "equal-time latest requests are ambiguous",
+            "every accepted same-scope controlled request parent",
+            "single selected parent's reaction page cannot prove",
+            "historical candidates exclude the exact current scope",
+            "`candidate_basis.server_time`",
+            "a reaction supplies this basis only when",
+            "validate the basis against the complete scope evidence for every candidate",
+            "confirmed different actor",
+            "`codex`-containing bot login",
+            "provider-like identity ambiguity",
+            "identical initial/final discovery inventories",
+            "a bare `complete: true` and a caller-adjustable count",
+            "removing a candidate while decrementing the count",
+            "including confirmed-different-actor reactions",
+            "its payload kind does not itself select the provider profile",
+            "unknown fields and json type aliases are not forward-compatible",
+            "historical_universe",
+            "initial_candidates",
+            "final_candidates",
+            "current.initial_snapshot",
+            "state: open",
+            "merged: false",
+            "merged_at: null",
+            "same_scope_request_audit",
+            "`parent_request_id`",
+            "`parent_reactions_api_url`",
+            "relocating an r1 reaction under r2",
+        ):
+            self.assertIn(anchor, normalized_authority)
 
     def test_named_lanes_materialize_before_the_first_status_query(self) -> None:
         policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
@@ -2787,12 +7548,32 @@ class RepositoryContractTest(unittest.TestCase):
         )[1].split("```", 1)[0]
         for anchor in (
             "--method GET --paginate --slurp",
+            "api_url",
+            "https://api.github.com/repos/<owner>/<repo>/reactions/",
+            ".id",
             ".user.login",
             ".user.type",
             "content",
             "created_at",
         ):
             self.assertIn(anchor, reaction_probe)
+        for anchor in (
+            "reactions list does not supply a stable reaction-resource url",
+            "canonical positive numeric `id`",
+            "do not accept a caller-supplied url",
+            "reconstruct and compare the same url during the final re-read",
+        ):
+            self.assertIn(anchor, " ".join(probes.split()).lower())
+        for anchor in (
+            "'repos/<owner>/<repo>/issues/comments/<declaration_comment_id>'",
+            "--method GET --include",
+            "response's `Date` header",
+            "`as_of_server_time`",
+            "`as_of_api_url`",
+            "fixed 2,592,000-second interval",
+            "a caller-supplied declaration object",
+        ):
+            self.assertIn(anchor, probes)
         for anchor in (
             "reviewThreads",
             "isResolved",
@@ -2841,6 +7622,14 @@ class RepositoryContractTest(unittest.TestCase):
             "prompt templates": templates,
             "skill interface": interface,
         }
+        reaction_profile_entry_documents = {
+            "skill": skill,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+            "egress consent": egress,
+            "repository policy": agents_policy,
+            "skill interface": interface,
+        }
         if CI_PROFILE == "canonical":
             readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
             migration_journal = (
@@ -2854,6 +7643,34 @@ class RepositoryContractTest(unittest.TestCase):
                     "migration journal": migration_journal,
                 }
             )
+            reaction_profile_entry_documents["README"] = readme
+        for name, content in reaction_profile_entry_documents.items():
+            normalized = " ".join(content.split()).lower().replace("`", "")
+            with self.subTest(reaction_profile_entry_document=name):
+                self.assertTrue("3–10" in normalized or "3-10" in normalized)
+                self.assertTrue(
+                    "never count" in normalized or "never counts" in normalized
+                )
+                self.assertTrue(
+                    "canonical github rest issue comment" in normalized
+                    or "canonical github rest issue-comment" in normalized
+                )
+                self.assertIn(
+                    "if codex has suggestions, it will comment; otherwise it will "
+                    "react with 👍.",
+                    normalized,
+                )
+                for status in (
+                    "compliant",
+                    "warning",
+                    "unknown",
+                    "not-applicable",
+                ):
+                    self.assertIn(status, normalized)
+                self.assertIn("eligible wait", normalized)
+                self.assertIn("accepted", normalized)
+                self.assertIn("selected", normalized)
+                self.assertIn("basis", normalized)
         for name, content in producer_policy_documents.items():
             normalized = content.lower()
             with self.subTest(producer_policy_document=name):
@@ -2900,7 +7717,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for content in (readiness, probes, contracts, authority):
-            normalized = " ".join(content.split()).lower()
+            normalized = " ".join(content.split()).lower().replace("`", "")
             self.assertIn("duplicate-observed", normalized)
             self.assertTrue(
                 "final re-read" in normalized
@@ -2929,22 +7746,28 @@ class RepositoryContractTest(unittest.TestCase):
         )
         normalized_authority = " ".join(authority.split()).lower()
         for anchor in (
-            "only authenticated structured capability or installation metadata",
-            "explicitly encode the unavailable or not-installed state",
-            "provider-authored free-form prose do not satisfy this path",
+            "accepted structured capability/installation schema set is empty",
+            "no current metadata document may prove",
+            "authoritative api/issuer",
+            "schema identifier and version",
+            "repository/installation binding",
+            "integration/service state is unknown rather than unavailable",
         ):
             self.assertIn(anchor, normalized_authority)
-        normalized_contracts = " ".join(contracts.split()).lower()
-        normalized_delivery = " ".join(delivery.split()).lower()
-        for normalized in (normalized_contracts, normalized_delivery):
-            self.assertIn(
-                "authenticated structured capability or installation metadata",
-                normalized,
-            )
-            self.assertIn("selected repository/integration", normalized)
+        for content in (
+            readiness,
+            probes,
+            contracts,
+            delivery,
+            interface,
+            templates,
+        ):
+            normalized = " ".join(content.split()).lower()
             self.assertTrue(
-                "unavailable or not installed" in normalized
-                or "unavailable 或 not-installed" in normalized
+                "empty accepted structured capability/installation schema set"
+                in normalized
+                or "accepted structured capability/installation schema set 为空"
+                in normalized
             )
             self.assertNotIn(
                 "directly known or proved by authenticated structured "
@@ -2973,6 +7796,62 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("malformed", normalized)
             self.assertIn("ambiguous", normalized)
             self.assertTrue("immediate" in normalized or "立即" in normalized)
+        for content in (
+            skill,
+            readiness,
+            probes,
+            contracts,
+            templates,
+            interface,
+            delivery,
+            egress,
+            agents_policy,
+        ):
+            normalized = " ".join(content.split()).lower()
+            self.assertTrue(
+                "fixed terminal-payload grammar" in normalized
+                or "fixed clean/finding/inline-parent grammar" in normalized
+                or "fixed terminal grammar" in normalized
+            )
+            self.assertIn("terminal-looking", normalized)
+            self.assertIn("malformed", normalized)
+        for content in (
+            skill,
+            readiness,
+            probes,
+            contracts,
+            templates,
+            interface,
+            delivery,
+            agents_policy,
+        ):
+            normalized = " ".join(content.split()).lower().replace("`", "")
+            self.assertTrue(
+                "historical/current" in normalized
+                or "historical and current" in normalized
+                or "every sampled outcome" in normalized
+                or ("historical" in normalized and "current outcome" in normalized)
+            )
+            self.assertIn("parent", normalized)
+            self.assertIn("child", normalized)
+            self.assertIn("+1", normalized)
+            self.assertIn("declaration", normalized)
+            self.assertIn("digest", normalized)
+            self.assertTrue(
+                "strict ordering" in normalized
+                or "strict server ordering" in normalized
+                or "严格顺序" in normalized
+                or (
+                    "strict reaction.created_at"
+                    " > request.request_server_time" in normalized
+                )
+            )
+            self.assertIn("same-scope request", normalized)
+            self.assertTrue(
+                "cross-parent" in normalized
+                or "later duplicate request" in normalized
+                or "later request" in normalized
+            )
         self.assertNotIn("expected Codex integration identity", probes)
 
         for anchor in (
