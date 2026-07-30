@@ -59,13 +59,15 @@ superseded_by:
   run, rather than treating one absent-path observation as proof that an old
   version cannot start later.
 - Shared descriptor-relative and absolute regular-file openers request
-  nonblocking, no-follow descriptors before regular-file validation. FIFO or
-  device substitutions therefore fail closed without hanging capability,
-  marker, lock, or other control-file reads.
+  nonblocking, no-follow descriptors before regular-file validation. This
+  prevents FIFO peer-rendezvous blocking. Device nodes are rejected after
+  `open()` returns, but the openers do not bound arbitrary device-driver open
+  latency.
 - The legacy scan walks from an ACL/xattr-validated releases-root descriptor
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
-  policy with device, inode, type, owner, and mode while deliberately ignoring
-  timestamps, directory size, and link count.
+  policy with device, inode, type, generation, owner, group, mode, flags, and
+  normalized ACL/xattr evidence while deliberately ignoring timestamps,
+  directory size, and link count.
 - The scanner acquires every existing legacy `retention.lock` with a
   nonblocking exclusive flock, enumerates attempts while holding that fence,
   and retains it through the default-root command plus final path/catalog
@@ -107,12 +109,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 926.636 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 920.687 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.113 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 2.327 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.504 seconds.
-- The complete 100-test contract module passed in 6.862 seconds.
+- The complete 100-test contract module passed in 7.292 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -161,9 +163,11 @@ superseded_by:
   root bindings now guard every exact selected-root open and finalization, while
   each legacy fence records and enforces its initial attempt state.
 - The following exact-head Fresh Codex review found that regular-file opens
-  could block on a FIFO or device before validating the file type. The shared
-  openers now add `O_NONBLOCK`, and a bounded descriptor-relative plus absolute
-  FIFO regression proves immediate rejection.
+  could block on a FIFO and that device nodes reach driver-specific `open()`
+  paths before file-type validation. The shared openers now add `O_NONBLOCK`;
+  bounded descriptor-relative and absolute FIFO regressions verify rejection
+  without waiting for a FIFO peer. The `/dev/null` smoke check does not bound
+  arbitrary device-driver open latency.
 - The next exact-head Fresh Codex review found that differently cased aliases
   of the same installed helper could bypass the sibling-release catalog and
   that the journal's deterministic count was not bound to the runner. Catalog
@@ -175,10 +179,17 @@ superseded_by:
   pointer. Non-catalog helpers without an existing legacy root now block before
   the public command, and the contract-bound recovery pointer names this
   workstream journal.
-- The deterministic independent-supervisor gate passed 591/591 in 190.480
-  seconds with the reviewed 591-test selected identity and SHA-256
-  `766f68ff0c2ad1f5bad894ff45dfe33c00dd493c2847e3e0c7526b9a21a9f543`.
-- The focused post-fix CLI and secure-I/O modules passed 70/70 tests in 35.093
+- The next exact-head Fresh Codex review found that directory policy bindings
+  discarded group and normalized ACL/xattr evidence, and that the documentation
+  overclaimed device-node open latency. Account-local root equivalence and
+  legacy release custody now retain complete in-process directory policy
+  bindings across held descriptors and path reopens; allowed-to-allowed ACL
+  drift and group drift fail closed. FIFO coverage and device-driver limits are
+  now stated separately.
+- The deterministic independent-supervisor gate passed 593/593 in 202.870
+  seconds with the reviewed 593-test selected identity and SHA-256
+  `300a1b68a151a47d4f292648c3c31d3ef85e9eae5e5c8038de5b2d0ccc3e1a6f`.
+- The focused post-fix CLI and secure-I/O modules passed 72/72 tests in 47.822
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

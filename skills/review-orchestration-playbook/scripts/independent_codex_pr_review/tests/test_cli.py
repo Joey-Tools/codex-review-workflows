@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import errno
 import fcntl
 import io
@@ -28,6 +29,8 @@ from review_supervisor.constants import (
 )
 from review_supervisor.errors import SupervisorError
 from review_supervisor.secureio import (
+    DirectoryPolicyBinding,
+    MacOSDirectoryMetadataBinding,
     allocated_bytes,
     boot_identifier,
     canonical_json,
@@ -712,11 +715,15 @@ class CliLifecycleTests(unittest.TestCase):
             def replace_after_catalog(
                 directory_fd: int,
                 *,
+                path_hint: pathlib.Path,
+                private: bool,
                 label: str,
             ) -> tuple[tuple[bytes, os.stat_result], ...]:
                 nonlocal replacement_done
                 entries = original_scan(
                     directory_fd,
+                    path_hint=path_hint,
+                    private=private,
                     label=label,
                 )
                 if label == "installed release directory" and not replacement_done:
@@ -748,6 +755,59 @@ class CliLifecycleTests(unittest.TestCase):
                 "installed release changed while being inspected",
                 payload["message"],
             )
+
+    def test_installed_release_gid_drift_fails_catalog_revalidation(self) -> None:
+        with owned_temporary_directory("cli-release-gid-drift-") as root:
+            releases, _, _, _ = _installed_upgrade_layout(root)
+            releases_fd, _ = legacy_retention_module.open_absolute_directory_chain(
+                releases
+            )
+            try:
+                releases_policy = legacy_retention_module.validate_directory_policy_fd(
+                    releases_fd,
+                    releases,
+                    private=False,
+                )
+                releases_entries = legacy_retention_module._stable_directory_entries_fd(
+                    releases_fd,
+                    path_hint=releases,
+                    private=False,
+                    label="installed release directory",
+                )
+            finally:
+                os.close(releases_fd)
+
+            changed_policy = dataclasses.replace(
+                releases_policy,
+                gid=releases_policy.gid + 1,
+            )
+            original_validate = legacy_retention_module.validate_directory_policy_fd
+
+            def change_gid(
+                fd: int,
+                path: pathlib.Path,
+                *,
+                private: bool,
+            ) -> DirectoryPolicyBinding:
+                policy = original_validate(fd, path, private=private)
+                return changed_policy if path == releases else policy
+
+            with (
+                mock.patch.object(
+                    legacy_retention_module,
+                    "validate_directory_policy_fd",
+                    side_effect=change_gid,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "installed release directory changed",
+                ),
+            ):
+                legacy_retention_module._revalidate_releases_root(
+                    releases,
+                    releases_policy,
+                    releases_entries,
+                )
 
     def test_explicit_account_local_default_still_runs_legacy_gate(self) -> None:
         with owned_temporary_directory("cli-explicit-default-") as root:
@@ -1815,20 +1875,67 @@ class CliLifecycleTests(unittest.TestCase):
                 "\n".join(payload["secondary_errors"]),
             )
 
-    def test_legacy_retention_acl_revalidation_fails_closed(self) -> None:
+    def test_legacy_retention_permitted_metadata_drift_fails_closed(self) -> None:
         with owned_temporary_directory("cli-legacy-acl-drift-") as root:
             _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
             _write_retention_lock(legacy_retention)
+            account_default = root / "account-default"
             output = io.StringIO()
+            original_validate = legacy_retention_module.validate_directory_policy_fd
+            original_status = cli_module.status
+            command_completed = False
+
+            def change_permitted_metadata_after_command(
+                fd: int,
+                path: pathlib.Path,
+                *,
+                private: bool,
+            ) -> DirectoryPolicyBinding:
+                policy = original_validate(fd, path, private=private)
+                if command_completed and path == legacy_retention:
+                    current = policy.macos_metadata
+                    provenance_present = (
+                        current is not None and "com.apple.provenance" in current.xattrs
+                    )
+                    changed = MacOSDirectoryMetadataBinding(
+                        acl_entry_count=0,
+                        acl_entries=(),
+                        xattrs=() if provenance_present else ("com.apple.provenance",),
+                        quarantine_present=False,
+                    )
+                    return dataclasses.replace(
+                        policy,
+                        macos_metadata=changed,
+                    )
+                return policy
+
+            def complete_command_then_drift(
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal command_completed
+                result = original_status(**kwargs)
+                command_completed = True
+                return result
+
             with (
                 mock.patch(
                     "review_supervisor.legacy_retention.tool_root",
                     return_value=current_tool,
                 ),
                 mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch.object(
                     legacy_retention_module,
-                    "validate_private_directory_fd",
-                    side_effect=ValueError("synthetic ACL drift"),
+                    "validate_directory_policy_fd",
+                    side_effect=change_permitted_metadata_after_command,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=complete_command_then_drift,
                 ),
                 contextlib.redirect_stdout(output),
             ):
@@ -1837,8 +1944,9 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             payload = json.loads(output.getvalue())
             self.assertIn(
-                "cannot revalidate legacy retention path safely",
+                "legacy retention path changed while being inspected",
                 payload["message"],
+                payload,
             )
 
     def test_emit_overrides_conflicting_contract_metadata(self) -> None:

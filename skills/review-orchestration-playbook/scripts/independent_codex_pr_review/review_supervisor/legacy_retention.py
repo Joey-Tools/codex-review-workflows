@@ -14,14 +14,15 @@ from .constants import tool_root
 from .errors import record_secondary_error
 from .models import Identity
 from .secureio import (
+    DirectoryPolicyBinding,
     directory_paths_equivalent,
-    directory_identities_match,
+    directory_stat_binding,
     identity_from_stat,
     open_absolute_directory_chain,
     open_directory_at,
     open_regular_at,
     read_fd_exact,
-    validate_private_directory_fd,
+    validate_directory_policy_fd,
     validate_private_regular_fd,
 )
 
@@ -43,39 +44,27 @@ _MAX_REPORTED_UNFENCED_RELEASES = 8
 _RELEASE_NAME_LENGTH = 40
 _LOWER_HEX = frozenset(b"0123456789abcdef")
 _ATTEMPT_NAME = re.compile(rb"attempt-[0-9]+-[0-9a-f]{32}\Z")
-_DirectoryBinding = tuple[int, int, int, int, int]
+_DirectoryStatBinding = tuple[int, int, int, int, int, int, int, int]
 
 
-def _binding(metadata: os.stat_result) -> _DirectoryBinding:
+def _binding(metadata: os.stat_result) -> _DirectoryStatBinding:
     """Bind object identity and access policy while ignoring child-entry churn."""
 
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        stat.S_IFMT(metadata.st_mode),
-        metadata.st_uid,
-        stat.S_IMODE(metadata.st_mode),
-    )
-
-
-def _identity_binding(identity: Identity) -> _DirectoryBinding:
-    return (
-        identity.device,
-        identity.inode,
-        stat.S_IFMT(identity.mode),
-        identity.uid,
-        stat.S_IMODE(identity.mode),
-    )
+    return directory_stat_binding(metadata)
 
 
 def _stable_directory_entries_fd(
     directory_fd: int,
     *,
+    path_hint: pathlib.Path,
+    private: bool,
     label: str,
 ) -> tuple[tuple[bytes, os.stat_result], ...]:
-    root_before = identity_from_stat(os.fstat(directory_fd))
-    if not stat.S_ISDIR(root_before.mode):
-        raise RuntimeError(f"{label} is not a directory")
+    root_before = validate_directory_policy_fd(
+        directory_fd,
+        path_hint,
+        private=private,
+    )
 
     def scan() -> tuple[tuple[bytes, os.stat_result], ...]:
         scan_fd = os.open(
@@ -112,8 +101,12 @@ def _stable_directory_entries_fd(
 
     before = scan()
     after = scan()
-    root_after = identity_from_stat(os.fstat(directory_fd))
-    if not directory_identities_match(root_before, root_after) or tuple(
+    root_after = validate_directory_policy_fd(
+        directory_fd,
+        path_hint,
+        private=private,
+    )
+    if root_before != root_after or tuple(
         (name, _binding(metadata)) for name, metadata in before
     ) != tuple((name, _binding(metadata)) for name, metadata in after):
         raise RuntimeError(f"{label} changed while being inspected")
@@ -138,11 +131,23 @@ def _installed_release_catalog(
         if not directory_paths_equivalent(root, expected_tool_root):
             return None
 
-        releases_fd, releases_identity = open_absolute_directory_chain(releases_root)
-        release_fd, release_identity = open_absolute_directory_chain(release_root)
-        release_binding = _identity_binding(release_identity)
+        releases_fd, _ = open_absolute_directory_chain(releases_root)
+        releases_policy = validate_directory_policy_fd(
+            releases_fd,
+            releases_root,
+            private=False,
+        )
+        release_fd, _ = open_absolute_directory_chain(release_root)
+        release_policy = validate_directory_policy_fd(
+            release_fd,
+            release_root,
+            private=False,
+        )
+        release_binding = release_policy.stat_binding
         releases_entries = _stable_directory_entries_fd(
             releases_fd,
+            path_hint=releases_root,
+            private=False,
             label="installed release directory",
         )
         matching_names = tuple(
@@ -155,20 +160,25 @@ def _installed_release_catalog(
                 "current installed release has no unique catalog identity"
             )
 
-        held_release_identity = identity_from_stat(os.fstat(release_fd))
-        refreshed_release_fd, refreshed_release_identity = (
-            open_absolute_directory_chain(release_root)
+        held_release_policy = validate_directory_policy_fd(
+            release_fd,
+            release_root,
+            private=False,
         )
-        if not directory_identities_match(
-            release_identity, held_release_identity
-        ) or not directory_identities_match(
-            release_identity,
-            refreshed_release_identity,
+        refreshed_release_fd, _ = open_absolute_directory_chain(release_root)
+        refreshed_release_policy = validate_directory_policy_fd(
+            refreshed_release_fd,
+            release_root,
+            private=False,
+        )
+        if (
+            release_policy != held_release_policy
+            or release_policy != refreshed_release_policy
         ):
             raise RuntimeError("installed release changed while being inspected")
         _revalidate_installed_release_catalog(
             releases_root,
-            releases_identity,
+            releases_policy,
             releases_entries,
         )
     except (OSError, ValueError) as error:
@@ -203,9 +213,9 @@ def _installed_release_catalog(
 @dataclass(slots=True)
 class _LegacyRetentionRoot:
     path: pathlib.Path
-    components: tuple[tuple[bytes, _DirectoryBinding, bool], ...]
+    components: tuple[tuple[bytes, DirectoryPolicyBinding, bool], ...]
     retention_fd: int
-    retention_binding: _DirectoryBinding
+    retention_binding: DirectoryPolicyBinding
     lock_fd: int = -1
     lock_identity: Identity | None = None
     initial_attempt_present: bool | None = None
@@ -225,7 +235,7 @@ class _LegacyRetentionRoot:
 class _LegacyRetentionProbe:
     root: _LegacyRetentionRoot | None
     tool_path: pathlib.Path | None
-    tool_binding: _DirectoryBinding | None
+    tool_binding: DirectoryPolicyBinding | None
     uses_account_local_retention: bool
 
 
@@ -258,16 +268,23 @@ def _close_inspection_fd(fd: int, *, label: str) -> None:
 
 def _revalidate_installed_release_catalog(
     releases_root: pathlib.Path,
-    releases_identity: Identity,
+    releases_policy: DirectoryPolicyBinding,
     releases_entries: tuple[tuple[bytes, os.stat_result], ...],
 ) -> None:
     refreshed_fd = -1
     try:
-        refreshed_fd, refreshed_identity = open_absolute_directory_chain(releases_root)
-        if not directory_identities_match(releases_identity, refreshed_identity):
+        refreshed_fd, _ = open_absolute_directory_chain(releases_root)
+        refreshed_policy = validate_directory_policy_fd(
+            refreshed_fd,
+            releases_root,
+            private=False,
+        )
+        if releases_policy != refreshed_policy:
             raise RuntimeError("installed release changed while being inspected")
         refreshed_entries = _stable_directory_entries_fd(
             refreshed_fd,
+            path_hint=releases_root,
+            private=False,
             label="installed release directory",
         )
         if tuple(
@@ -368,21 +385,21 @@ def _open_legacy_retention_root(
     releases_fd: int,
     releases_root: pathlib.Path,
     release_name: bytes,
-    expected_release_binding: _DirectoryBinding,
+    expected_release_binding: _DirectoryStatBinding,
 ) -> _LegacyRetentionProbe:
     current_fd = releases_fd
     current_path = releases_root
-    components: list[tuple[bytes, _DirectoryBinding, bool]] = []
+    components: list[tuple[bytes, DirectoryPolicyBinding, bool]] = []
     opened_fd = -1
     tool_path: pathlib.Path | None = None
-    tool_binding: _DirectoryBinding | None = None
+    tool_binding: DirectoryPolicyBinding | None = None
     uses_account_local_retention = False
     try:
         for index, part in enumerate((release_name, *_LEGACY_RETENTION_SUFFIX)):
             current_path /= os.fsdecode(part)
             private = index == len(_LEGACY_RETENTION_SUFFIX)
             try:
-                next_fd, identity = open_directory_at(
+                next_fd, _ = open_directory_at(
                     current_fd,
                     part,
                     path_hint=current_path,
@@ -395,17 +412,40 @@ def _open_legacy_retention_root(
                     tool_binding=tool_binding,
                     uses_account_local_retention=uses_account_local_retention,
                 )
-            if index == 0 and _identity_binding(identity) != expected_release_binding:
-                os.close(next_fd)
-                raise RuntimeError("installed release changed while being inspected")
+            try:
+                policy = validate_directory_policy_fd(
+                    next_fd,
+                    current_path,
+                    private=private,
+                )
+            except BaseException:
+                _close_inspection_fd(
+                    next_fd,
+                    label="legacy retention path component",
+                )
+                raise
+            if index == 0 and policy.stat_binding != expected_release_binding:
+                error = RuntimeError("installed release changed while being inspected")
+                try:
+                    _close_inspection_fd(
+                        next_fd,
+                        label="installed release path component",
+                    )
+                except BaseException as cleanup_error:
+                    _record_secondary_error(
+                        error,
+                        label="installed release path component cleanup failed",
+                        secondary_error=cleanup_error,
+                    )
+                raise error
             if opened_fd >= 0:
                 os.close(opened_fd)
             opened_fd = next_fd
             current_fd = opened_fd
-            components.append((part, _identity_binding(identity), private))
+            components.append((part, policy, private))
             if index == len(_INSTALLED_TOOL_SUFFIX):
                 tool_path = current_path
-                tool_binding = _identity_binding(identity)
+                tool_binding = policy
                 uses_account_local_retention = _release_uses_account_local_retention(
                     current_fd, current_path
                 )
@@ -433,14 +473,25 @@ def _open_current_tool_legacy_retention_root(
     current_tool_path: pathlib.Path,
 ) -> _LegacyRetentionRoot | None:
     retention_path = current_tool_path / "runtime" / "retention"
+    retention_fd = -1
     try:
-        retention_fd, identity = open_absolute_directory_chain(
+        retention_fd, _ = open_absolute_directory_chain(
             retention_path,
             private_leaf=True,
+        )
+        retention_policy = validate_directory_policy_fd(
+            retention_fd,
+            retention_path,
+            private=True,
         )
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as error:
+        if retention_fd >= 0:
+            _close_inspection_fd(
+                retention_fd,
+                label="current helper legacy retention path",
+            )
         raise RuntimeError(
             "cannot inspect current helper legacy retention path safely"
         ) from error
@@ -448,7 +499,7 @@ def _open_current_tool_legacy_retention_root(
         path=retention_path,
         components=(),
         retention_fd=retention_fd,
-        retention_binding=_identity_binding(identity),
+        retention_binding=retention_policy,
     )
 
 
@@ -464,11 +515,13 @@ def _validate_current_release_probe(
                 "current installed helper is missing from its release catalog"
             )
         try:
-            current_tool_fd, current_tool_identity = open_absolute_directory_chain(
-                current_tool_path
-            )
+            current_tool_fd, _ = open_absolute_directory_chain(current_tool_path)
             try:
-                held_tool_identity = identity_from_stat(os.fstat(current_tool_fd))
+                current_tool_policy = validate_directory_policy_fd(
+                    current_tool_fd,
+                    current_tool_path,
+                    private=False,
+                )
             finally:
                 _close_inspection_fd(
                     current_tool_fd,
@@ -478,10 +531,7 @@ def _validate_current_release_probe(
             raise RuntimeError(
                 "cannot revalidate current installed helper safely"
             ) from error
-        if (
-            _identity_binding(current_tool_identity) != probe.tool_binding
-            or _identity_binding(held_tool_identity) != probe.tool_binding
-        ):
+        if current_tool_policy != probe.tool_binding:
             raise RuntimeError(
                 "current installed helper path changed while being inspected"
             )
@@ -521,14 +571,23 @@ def _revalidate_current_tool_legacy_retention_root(
 ) -> None:
     refreshed_fd = -1
     try:
-        refreshed_fd, refreshed_identity = open_absolute_directory_chain(
+        refreshed_fd, _ = open_absolute_directory_chain(
             root.path,
             private_leaf=True,
         )
-        held_identity = validate_private_directory_fd(root.retention_fd, root.path)
+        refreshed_policy = validate_directory_policy_fd(
+            refreshed_fd,
+            root.path,
+            private=True,
+        )
+        held_policy = validate_directory_policy_fd(
+            root.retention_fd,
+            root.path,
+            private=True,
+        )
         if (
-            _identity_binding(refreshed_identity) != root.retention_binding
-            or _identity_binding(held_identity) != root.retention_binding
+            refreshed_policy != root.retention_binding
+            or held_policy != root.retention_binding
         ):
             raise RuntimeError(
                 "current helper legacy retention path changed while being inspected"
@@ -553,26 +612,57 @@ def _revalidate_legacy_retention_root(
     try:
         for part, expected_binding, private in root.components:
             current_path /= os.fsdecode(part)
-            next_fd, identity = open_directory_at(
+            next_fd, _ = open_directory_at(
                 current_fd,
                 part,
                 path_hint=current_path,
                 private=private,
             )
-            if _identity_binding(identity) != expected_binding:
-                os.close(next_fd)
-                raise RuntimeError(
+            try:
+                policy = validate_directory_policy_fd(
+                    next_fd,
+                    current_path,
+                    private=private,
+                )
+            except BaseException:
+                _close_inspection_fd(
+                    next_fd,
+                    label="revalidated legacy retention path component",
+                )
+                raise
+            if policy != expected_binding:
+                error = RuntimeError(
                     "legacy retention path changed while being inspected"
                 )
+                try:
+                    _close_inspection_fd(
+                        next_fd,
+                        label="revalidated legacy retention path component",
+                    )
+                except BaseException as cleanup_error:
+                    _record_secondary_error(
+                        error,
+                        label="legacy retention path component cleanup failed",
+                        secondary_error=cleanup_error,
+                    )
+                raise error
             if opened_fd >= 0:
                 os.close(opened_fd)
             opened_fd = next_fd
             current_fd = opened_fd
-        held_identity = validate_private_directory_fd(root.retention_fd, root.path)
+        held_policy = validate_directory_policy_fd(
+            root.retention_fd,
+            root.path,
+            private=True,
+        )
+        opened_policy = validate_directory_policy_fd(
+            opened_fd,
+            root.path,
+            private=True,
+        )
         if (
-            _identity_binding(held_identity) != root.retention_binding
-            or _identity_binding(identity_from_stat(os.fstat(opened_fd)))
-            != root.retention_binding
+            held_policy != root.retention_binding
+            or opened_policy != root.retention_binding
         ):
             raise RuntimeError("legacy retention path changed while being inspected")
     except (OSError, ValueError) as error:
@@ -655,6 +745,8 @@ def _revalidate_legacy_retention_lock(root: _LegacyRetentionRoot) -> None:
 def _retention_root_has_attempt(root: _LegacyRetentionRoot) -> bool:
     entries = _stable_directory_entries_fd(
         root.retention_fd,
+        path_hint=root.path,
+        private=True,
         label="legacy retention root",
     )
     retained_attempt = False
@@ -665,7 +757,7 @@ def _retention_root_has_attempt(root: _LegacyRetentionRoot) -> bool:
                 raise RuntimeError(
                     "legacy retention lock appeared while acquiring migration fence"
                 )
-            if _binding(metadata) != _identity_binding(root.lock_identity):
+            if identity_from_stat(metadata) != root.lock_identity:
                 raise RuntimeError(
                     "legacy retention lock changed while being inspected"
                 )
@@ -680,13 +772,18 @@ def _retention_root_has_attempt(root: _LegacyRetentionRoot) -> bool:
             raise RuntimeError("legacy retention root has an unsafe entry")
         attempt_fd = -1
         try:
-            attempt_fd, identity = open_directory_at(
+            attempt_fd, _ = open_directory_at(
                 root.retention_fd,
                 entry_name,
                 path_hint=root.path / os.fsdecode(entry_name),
                 private=True,
             )
-            if _identity_binding(identity) != _binding(metadata):
+            attempt_policy = validate_directory_policy_fd(
+                attempt_fd,
+                root.path / os.fsdecode(entry_name),
+                private=True,
+            )
+            if attempt_policy.stat_binding != _binding(metadata):
                 raise RuntimeError(
                     "legacy retention attempt changed while being inspected"
                 )
@@ -725,17 +822,24 @@ def _reject_new_attempt(root: _LegacyRetentionRoot) -> None:
 
 def _revalidate_releases_root(
     releases_root: pathlib.Path,
-    releases_identity: Identity,
+    releases_policy: DirectoryPolicyBinding,
     releases_entries: tuple[tuple[bytes, os.stat_result], ...],
 ) -> None:
-    refreshed_fd, refreshed_identity = open_absolute_directory_chain(releases_root)
+    refreshed_fd, _ = open_absolute_directory_chain(releases_root)
     try:
-        if not directory_identities_match(releases_identity, refreshed_identity):
+        refreshed_policy = validate_directory_policy_fd(
+            refreshed_fd,
+            releases_root,
+            private=False,
+        )
+        if releases_policy != refreshed_policy:
             raise RuntimeError(
                 "installed release directory changed while being inspected"
             )
         refreshed_entries = _stable_directory_entries_fd(
             refreshed_fd,
+            path_hint=releases_root,
+            private=False,
             label="installed release directory",
         )
         if tuple(
@@ -757,12 +861,12 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
     catalog = _installed_release_catalog(current_tool_path)
     releases_root: pathlib.Path | None = None
     current_release_name: bytes | None = None
-    current_release_binding: _DirectoryBinding | None = None
+    current_release_binding: _DirectoryStatBinding | None = None
     releases_fd = -1
-    releases_identity: Identity | None = None
+    releases_policy: DirectoryPolicyBinding | None = None
     releases_entries: tuple[tuple[bytes, os.stat_result], ...] = ()
     roots: list[_LegacyRetentionRoot] = []
-    absent_roots: list[tuple[bytes, _DirectoryBinding]] = []
+    absent_roots: list[tuple[bytes, _DirectoryStatBinding]] = []
     try:
         try:
             unresolved: list[pathlib.Path] = []
@@ -787,12 +891,17 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
 
             if catalog is not None:
                 releases_root, current_release_name = catalog
-                releases_fd, releases_identity = open_absolute_directory_chain(
-                    releases_root
+                releases_fd, _ = open_absolute_directory_chain(releases_root)
+                releases_policy = validate_directory_policy_fd(
+                    releases_fd,
+                    releases_root,
+                    private=False,
                 )
                 cleanup.callback(os.close, releases_fd)
                 releases_entries = _stable_directory_entries_fd(
                     releases_fd,
+                    path_hint=releases_root,
+                    private=False,
                     label="installed release directory",
                 )
                 for name, release_metadata in releases_entries:
@@ -856,7 +965,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     )
                 _revalidate_releases_root(
                     releases_root,
-                    releases_identity,
+                    releases_policy,
                     releases_entries,
                 )
             if unfenced_tools:
@@ -925,7 +1034,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     )
                 if (
                     releases_root is not None
-                    and releases_identity is not None
+                    and releases_policy is not None
                     and releases_fd >= 0
                 ):
                     for name, release_binding in absent_roots:
@@ -951,7 +1060,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                             )
                     _revalidate_releases_root(
                         releases_root,
-                        releases_identity,
+                        releases_policy,
                         releases_entries,
                     )
             except (OSError, ValueError) as error:

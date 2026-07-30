@@ -82,7 +82,9 @@ class StrictJsonTests(unittest.TestCase):
 
 
 class PrivateDirectoryAnchorTests(unittest.TestCase):
-    def test_regular_openers_reject_fifo_without_blocking(self) -> None:
+    def test_regular_openers_avoid_fifo_rendezvous_and_reject_dev_null(
+        self,
+    ) -> None:
         if not hasattr(signal, "setitimer"):
             self.skipTest("requires POSIX interval timers")
 
@@ -90,7 +92,7 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             pass
 
         def reject_blocking_open(_signum: int, _frame: object) -> None:
-            raise BlockingOpenTimeout("regular-file opener blocked on a FIFO")
+            raise BlockingOpenTimeout("regular-file opener exceeded the test deadline")
 
         previous_handler = signal.signal(signal.SIGALRM, reject_blocking_open)
         try:
@@ -134,7 +136,8 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
 
             device = pathlib.Path("/dev/null")
             if device.exists():
-                with self.subTest(opener="character-device"):
+                # This is a smoke case, not a bound on arbitrary driver latency.
+                with self.subTest(opener="dev-null-smoke"):
                     signal.setitimer(signal.ITIMER_REAL, 1.0)
                     try:
                         with self.assertRaises(OSError) as caught:
@@ -261,7 +264,7 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             replacement = root / "replacement"
             replacement.mkdir(mode=0o700)
             parent_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
-            original_validate = secureio_module._validate_directory_fd
+            original_validate = secureio_module._validate_directory_fd_with_policy
             replaced = False
 
             def replace_path(
@@ -269,7 +272,7 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
                 path: pathlib.Path,
                 *,
                 private: bool,
-            ) -> Identity:
+            ) -> tuple[Identity, secureio_module.DirectoryPolicyBinding]:
                 nonlocal replaced
                 identity = original_validate(fd, path, private=private)
                 if not replaced:
@@ -281,7 +284,7 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             try:
                 with (
                     mock.patch(
-                        "review_supervisor.secureio._validate_directory_fd",
+                        "review_supervisor.secureio._validate_directory_fd_with_policy",
                         side_effect=replace_path,
                     ),
                     self.assertRaisesRegex(OSError, "path identity changed"),
@@ -352,6 +355,53 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
                 self.assertRaises(OSError) as caught,
             ):
                 directory_paths_equivalent(target, target)
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+
+    def test_directory_equivalence_rejects_allowed_acl_policy_drift(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-acl-") as root:
+            target = root / "retention"
+            target.mkdir(mode=0o700)
+            target_identity = os.stat(target)
+            clear = ExtendedMetadataEvidence(0, (), False)
+            restrictive_acl = ExtendedMetadataEvidence(
+                1,
+                (),
+                False,
+                ("group:fixture:deny:write",),
+            )
+            current_evidence = clear
+
+            def metadata_for_descriptor(
+                fd: int,
+                _path: pathlib.Path,
+                _kind: str,
+                *,
+                private: bool,
+            ) -> ExtendedMetadataEvidence:
+                del private
+                if os.fstat(fd).st_ino == target_identity.st_ino:
+                    return current_evidence
+                return clear
+
+            with mock.patch(
+                "review_supervisor.secureio._verify_macos_metadata",
+                side_effect=metadata_for_descriptor,
+            ):
+                snapshot = secureio_module._open_directory_path_equivalence_snapshot(
+                    target
+                )
+                try:
+                    current_evidence = restrictive_acl
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "directory path changed",
+                    ) as caught:
+                        secureio_module._revalidate_directory_path_equivalence_snapshot(
+                            snapshot
+                        )
+                finally:
+                    snapshot.close()
 
             self.assertEqual(caught.exception.errno, errno.ESTALE)
 

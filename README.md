@@ -6,9 +6,11 @@ Independent-review mutable state lives below the current account's home-derived
 review-runtime root rather than an immutable installed release. The shared
 regular-file openers request nonblocking, no-follow descriptors before
 validating file type, ownership, mode, link count, and identity;
-content-sensitive callers then reread bounded bytes from those descriptors. A
-FIFO or device substitution therefore fails closed without hanging migration
-or command entry.
+content-sensitive callers then reread bounded bytes from those descriptors.
+`O_NONBLOCK` avoids FIFO peer-rendezvous blocking, so FIFO substitutions fail
+closed without waiting for a peer. Device nodes fail regular-file validation
+only after `open()` returns; arbitrary device-driver open latency remains
+unbounded.
 
 `review-orchestration-playbook` is the single entrypoint for named single, double, and triple review plus PR readiness. The canonical Claude Code lane admits stable publisher-verified releases in `>=2.1.211,<3.0.0`; that compatibility range is defined once in [claude_version_policy.py](skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py). Claude Code `2.1.212` remains the audited per-version stream-schema baseline, not a global eligibility pin. A selected release must still pass its exact signed per-version manifest, digest, and executable-identity checks, the advertised-capability contract, and strict fail-closed stream validation before it can supply findings.
 

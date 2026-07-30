@@ -63,11 +63,12 @@ def identities_match(left: Identity, right: Identity) -> bool:
 
 
 def directory_identities_match(left: Identity, right: Identity) -> bool:
-    """Compare directory object identity and access policy.
+    """Compare the stable directory fields carried by persisted Identity values.
 
-    Device/inode bind the object while type, owner, and mode bind access policy.
-    Directory size, link count, and timestamps are deliberately excluded because
-    ordinary child-entry churn can change them without changing either property.
+    This compatibility shape cannot carry gid, flags, or extended metadata. Use
+    DirectoryPolicyBinding for security-sensitive in-process revalidation.
+    Directory size, link count, and timestamps remain deliberately excluded
+    because ordinary child-entry churn can change them.
     """
     return (
         stat.S_ISDIR(left.mode)
@@ -76,6 +77,99 @@ def directory_identities_match(left: Identity, right: Identity) -> bool:
         and left.inode == right.inode
         and left.uid == right.uid
         and left.mode == right.mode
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MacOSDirectoryMetadataBinding:
+    acl_entry_count: int
+    acl_entries: tuple[str, ...]
+    xattrs: tuple[str, ...]
+    quarantine_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryPolicyBinding:
+    """Bind directory object identity and the access policy used by this run."""
+
+    device: int
+    inode: int
+    file_type: int
+    generation: int
+    uid: int
+    gid: int
+    mode: int
+    flags: int
+    macos_metadata: MacOSDirectoryMetadataBinding | None
+
+    @property
+    def stat_binding(self) -> tuple[int, int, int, int, int, int, int, int]:
+        return (
+            self.device,
+            self.inode,
+            self.file_type,
+            self.generation,
+            self.uid,
+            self.gid,
+            self.mode,
+            self.flags,
+        )
+
+
+def directory_stat_binding(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    """Return directory identity/access fields unaffected by child-entry churn."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+    )
+
+
+def _macos_directory_metadata_binding(
+    evidence: Any | None,
+) -> MacOSDirectoryMetadataBinding | None:
+    if evidence is None:
+        return None
+    return MacOSDirectoryMetadataBinding(
+        acl_entry_count=evidence.acl_entry_count,
+        acl_entries=tuple(evidence.acl_entries),
+        xattrs=tuple(evidence.xattrs),
+        quarantine_present=evidence.quarantine_present,
+    )
+
+
+def _directory_policy_binding(
+    metadata: os.stat_result,
+    macos_metadata: Any | None,
+) -> DirectoryPolicyBinding:
+    (
+        device,
+        inode,
+        file_type,
+        generation,
+        uid,
+        gid,
+        mode,
+        flags,
+    ) = directory_stat_binding(metadata)
+    return DirectoryPolicyBinding(
+        device=device,
+        inode=inode,
+        file_type=file_type,
+        generation=generation,
+        uid=uid,
+        gid=gid,
+        mode=mode,
+        flags=flags,
+        macos_metadata=_macos_directory_metadata_binding(macos_metadata),
     )
 
 
@@ -141,26 +235,79 @@ def _directory_is_trusted_ancestor(metadata: os.stat_result) -> bool:
     return not writable_by_others or bool(metadata.st_mode & stat.S_ISVTX)
 
 
+def _validate_directory_fd_with_policy(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    private: bool,
+) -> tuple[Identity, DirectoryPolicyBinding]:
+    metadata_before = os.fstat(fd)
+    if private:
+        valid = (
+            stat.S_ISDIR(metadata_before.st_mode)
+            and metadata_before.st_uid == os.getuid()
+            and stat.S_IMODE(metadata_before.st_mode) == 0o700
+        )
+    else:
+        valid = _directory_is_trusted_ancestor(metadata_before)
+    if not valid:
+        raise OSError(errno.EPERM, f"directory metadata is unsafe: {path}")
+    macos_metadata = _verify_macos_metadata(
+        fd,
+        path,
+        "directory",
+        private=private,
+    )
+    metadata_after = os.fstat(fd)
+    if private:
+        still_valid = (
+            stat.S_ISDIR(metadata_after.st_mode)
+            and metadata_after.st_uid == os.getuid()
+            and stat.S_IMODE(metadata_after.st_mode) == 0o700
+        )
+    else:
+        still_valid = _directory_is_trusted_ancestor(metadata_after)
+    if not still_valid:
+        raise OSError(errno.EPERM, f"directory metadata is unsafe: {path}")
+    if directory_stat_binding(metadata_before) != directory_stat_binding(
+        metadata_after
+    ):
+        raise OSError(
+            errno.ESTALE,
+            f"directory identity or access policy changed: {path}",
+        )
+    return (
+        identity_from_stat(metadata_after),
+        _directory_policy_binding(metadata_after, macos_metadata),
+    )
+
+
 def _validate_directory_fd(
     fd: int,
     path: pathlib.Path,
     *,
     private: bool,
 ) -> Identity:
-    metadata = os.fstat(fd)
-    identity = identity_from_stat(metadata)
-    if private:
-        valid = (
-            stat.S_ISDIR(metadata.st_mode)
-            and metadata.st_uid == os.getuid()
-            and stat.S_IMODE(metadata.st_mode) == 0o700
-        )
-    else:
-        valid = _directory_is_trusted_ancestor(metadata)
-    if not valid:
-        raise OSError(errno.EPERM, f"directory metadata is unsafe: {path}")
-    _verify_macos_metadata(fd, path, "directory", private=private)
+    identity, _ = _validate_directory_fd_with_policy(
+        fd,
+        path,
+        private=private,
+    )
     return identity
+
+
+def validate_directory_policy_fd(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    private: bool,
+) -> DirectoryPolicyBinding:
+    _, policy = _validate_directory_fd_with_policy(
+        fd,
+        path,
+        private=private,
+    )
+    return policy
 
 
 def _validate_regular_fd(
@@ -245,20 +392,29 @@ def open_directory_at(
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     fd = os.open(name, flags, dir_fd=parent_fd)
     try:
-        path_identity_before = identity_from_stat(
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        path_metadata_before = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
         )
-        descriptor_identity = _validate_directory_fd(
+        path_identity_before = identity_from_stat(path_metadata_before)
+        descriptor_identity, descriptor_policy = _validate_directory_fd_with_policy(
             fd,
             path_hint,
             private=private,
         )
-        path_identity_after = identity_from_stat(
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        path_metadata_after = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
         )
+        path_identity_after = identity_from_stat(path_metadata_after)
         if not (
             directory_identities_match(descriptor_identity, path_identity_before)
             and directory_identities_match(descriptor_identity, path_identity_after)
+            and descriptor_policy.stat_binding
+            == directory_stat_binding(path_metadata_before)
+            == directory_stat_binding(path_metadata_after)
         ):
             raise OSError(errno.ESTALE, "directory path identity changed while opening")
         return fd, descriptor_identity
@@ -292,6 +448,7 @@ class _DirectoryPathEquivalenceSnapshot:
     prefix: pathlib.Path
     fd: int
     identity: Identity
+    policy: DirectoryPolicyBinding
     remaining: tuple[str, ...]
 
     @property
@@ -317,7 +474,11 @@ def _open_directory_path_equivalence_snapshot(
     fd = os.open(b"/", flags)
     current = pathlib.Path("/")
     try:
-        identity = _validate_directory_fd(fd, current, private=False)
+        identity, policy = _validate_directory_fd_with_policy(
+            fd,
+            current,
+            private=False,
+        )
         for index, part in enumerate(raw_parts):
             current /= os.fsdecode(part)
             try:
@@ -336,17 +497,24 @@ def _open_directory_path_equivalence_snapshot(
                     prefix=current.parent,
                     fd=fd,
                     identity=identity,
+                    policy=policy,
                     remaining=remaining,
                 )
             os.close(fd)
             fd = next_fd
             identity = next_identity
+            policy = validate_directory_policy_fd(
+                fd,
+                current,
+                private=False,
+            )
         return _DirectoryPathEquivalenceSnapshot(
             path=path,
             walk_path=walk_path,
             prefix=current,
             fd=fd,
             identity=identity,
+            policy=policy,
             remaining=(),
         )
     except BaseException:
@@ -359,7 +527,7 @@ def _revalidate_directory_path_equivalence_snapshot(
 ) -> None:
     refreshed = _open_directory_path_equivalence_snapshot(snapshot.path)
     try:
-        held_identity = _validate_directory_fd(
+        held_identity, held_policy = _validate_directory_fd_with_policy(
             snapshot.fd,
             snapshot.prefix,
             private=False,
@@ -367,6 +535,8 @@ def _revalidate_directory_path_equivalence_snapshot(
         if (
             not directory_identities_match(snapshot.identity, held_identity)
             or not directory_identities_match(snapshot.identity, refreshed.identity)
+            or snapshot.policy != held_policy
+            or snapshot.policy != refreshed.policy
             or snapshot.remaining != refreshed.remaining
         ):
             raise OSError(
@@ -383,7 +553,7 @@ class DirectoryPathEquivalenceBinding:
     right: _DirectoryPathEquivalenceSnapshot
     equivalent: bool
     selected_walk_path: pathlib.Path
-    selected_identity: Identity | None = None
+    selected_policy: DirectoryPolicyBinding | None = None
 
     def matches_selected_walk_path(self, walk_path: pathlib.Path) -> bool:
         return walk_path == self.selected_walk_path
@@ -392,12 +562,15 @@ class DirectoryPathEquivalenceBinding:
     def _revalidate_held_prefix(
         snapshot: _DirectoryPathEquivalenceSnapshot,
     ) -> None:
-        held_identity = _validate_directory_fd(
+        held_identity, held_policy = _validate_directory_fd_with_policy(
             snapshot.fd,
             snapshot.prefix,
             private=False,
         )
-        if not directory_identities_match(snapshot.identity, held_identity):
+        if (
+            not directory_identities_match(snapshot.identity, held_identity)
+            or snapshot.policy != held_policy
+        ):
             raise OSError(
                 errno.ESTALE,
                 "directory path prefix changed while comparing account-local roots",
@@ -410,16 +583,23 @@ class DirectoryPathEquivalenceBinding:
     ) -> None:
         if original.remaining:
             return
-        if current.remaining or not directory_identities_match(
-            original.identity,
-            current.identity,
+        if (
+            current.remaining
+            or not directory_identities_match(
+                original.identity,
+                current.identity,
+            )
+            or original.policy != current.policy
         ):
             raise OSError(
                 errno.ESTALE,
                 "directory path changed while comparing account-local roots",
             )
 
-    def _revalidate_selected_identity(self, expected: Identity) -> None:
+    def _revalidate_selected_policy(
+        self,
+        expected: DirectoryPolicyBinding,
+    ) -> None:
         self._revalidate_held_prefix(self.left)
         self._revalidate_held_prefix(self.right)
         current_left = _open_directory_path_equivalence_snapshot(self.left.path)
@@ -433,14 +613,15 @@ class DirectoryPathEquivalenceBinding:
                         errno.ESTALE,
                         "selected retention root is unavailable after path binding",
                     )
-                strict_left_identity = validate_private_directory_fd(
+                strict_left_policy = validate_directory_policy_fd(
                     current_left.fd,
                     self.left.path,
+                    private=True,
                 )
-                if not directory_identities_match(
-                    current_left.identity,
-                    strict_left_identity,
-                ) or not directory_identities_match(expected, strict_left_identity):
+                if (
+                    current_left.policy != strict_left_policy
+                    or expected != strict_left_policy
+                ):
                     raise OSError(
                         errno.ESTALE,
                         "selected retention root changed after path binding",
@@ -456,36 +637,43 @@ class DirectoryPathEquivalenceBinding:
             current_left.close()
 
     def validate_before_selected_open(self) -> None:
-        if self.selected_identity is None:
+        if self.selected_policy is None:
             _revalidate_directory_path_equivalence_snapshot(self.left)
             _revalidate_directory_path_equivalence_snapshot(self.right)
             return
-        self._revalidate_selected_identity(self.selected_identity)
+        self._revalidate_selected_policy(self.selected_policy)
 
     def bind_selected_open(self, fd: int, identity: Identity) -> None:
-        strict_identity = validate_private_directory_fd(fd, self.left.path)
-        if not directory_identities_match(identity, strict_identity):
+        strict_policy = validate_directory_policy_fd(
+            fd,
+            self.left.path,
+            private=True,
+        )
+        if (
+            identity.device != strict_policy.device
+            or identity.inode != strict_policy.inode
+            or stat.S_IFMT(identity.mode) != strict_policy.file_type
+            or identity.uid != strict_policy.uid
+            or stat.S_IMODE(identity.mode) != strict_policy.mode
+        ):
             raise OSError(
                 errno.ESTALE,
                 "selected retention root changed while being opened",
             )
-        if self.selected_identity is not None and not directory_identities_match(
-            self.selected_identity,
-            strict_identity,
-        ):
+        if self.selected_policy is not None and self.selected_policy != strict_policy:
             raise OSError(
                 errno.ESTALE,
                 "selected retention root changed after path binding",
             )
-        self._revalidate_selected_identity(strict_identity)
-        self.selected_identity = strict_identity
+        self._revalidate_selected_policy(strict_policy)
+        self.selected_policy = strict_policy
 
     def revalidate(self) -> None:
-        if self.selected_identity is None:
+        if self.selected_policy is None:
             _revalidate_directory_path_equivalence_snapshot(self.left)
             _revalidate_directory_path_equivalence_snapshot(self.right)
             return
-        self._revalidate_selected_identity(self.selected_identity)
+        self._revalidate_selected_policy(self.selected_policy)
 
     def close(self) -> None:
         cleanup_errors: list[OSError] = []
@@ -616,7 +804,7 @@ def open_absolute_directory_chain(
     fd = os.open(b"/", flags)
     current = pathlib.Path("/")
     try:
-        identity = _validate_directory_fd(
+        identity, _ = _validate_directory_fd_with_policy(
             fd,
             current,
             private=private_leaf and not raw_parts,
@@ -634,15 +822,26 @@ def open_absolute_directory_chain(
                 created = True
                 next_fd = os.open(part, flags, dir_fd=fd)
             try:
-                descriptor_identity = _validate_directory_fd(
-                    next_fd,
-                    current,
-                    private=created or (private_leaf and index == len(raw_parts) - 1),
+                descriptor_identity, descriptor_policy = (
+                    _validate_directory_fd_with_policy(
+                        next_fd,
+                        current,
+                        private=created
+                        or (private_leaf and index == len(raw_parts) - 1),
+                    )
                 )
-                path_identity = identity_from_stat(
-                    os.stat(part, dir_fd=fd, follow_symlinks=False)
+                path_metadata = os.stat(
+                    part,
+                    dir_fd=fd,
+                    follow_symlinks=False,
                 )
-                if not directory_identities_match(descriptor_identity, path_identity):
+                path_identity = identity_from_stat(path_metadata)
+                if not directory_identities_match(
+                    descriptor_identity,
+                    path_identity,
+                ) or descriptor_policy.stat_binding != directory_stat_binding(
+                    path_metadata
+                ):
                     raise OSError(errno.ESTALE, "directory path identity changed")
             except BaseException:
                 os.close(next_fd)
