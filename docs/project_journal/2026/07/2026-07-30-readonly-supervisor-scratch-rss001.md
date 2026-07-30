@@ -3,7 +3,7 @@ id: 20260730-rss001
 title: Read-Only Supervisor Scratch
 status: completed
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-07-31
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -19,6 +19,9 @@ superseded_by:
 - Add a fail-closed explicit runtime-parent binding for isolated test runners.
 - Bind every runtime-parent component through no-follow descriptors, reject
   unsafe ACL/xattr policy, and revalidate each newly created private directory.
+- Reject group- or world-writable components anywhere in an explicit
+  owner-private runtime-parent chain, including sticky ancestors, while keeping
+  the sticky `/private/tmp` exception scoped to the read-only install container.
 - Exercise the complete deterministic supervisor suite from a read-only copy
   below `/private/tmp`, while keeping scratch under an independently validated
   owner-private root.
@@ -41,8 +44,11 @@ superseded_by:
   mutation findings.
 - Runtime-parent selection and child creation use the existing secure-I/O
   descriptor chain. The held parent and its path must retain object identity,
-  owner/mode, flags, ACL, and xattr policy; every new `0700` child is opened
-  no-follow and compared with a fresh path-bound descriptor before use.
+  owner/mode, flags, ACL, and xattr policy. Initial open, path reopen, and child
+  path reopen walk the complete owner-private chain and reject every group- or
+  world-writable ancestor, including sticky directories; every new `0700` child
+  is opened no-follow and compared with a fresh path-bound descriptor before
+  use. The install container remains a separate explicit sticky-parent case.
 - Cleanup completes before success output. Every ordinary primary exception is
   reported in the structured summary; a concurrent cleanup error returns
   nonzero, preserves the primary failure and child return code, and reports the
@@ -95,9 +101,18 @@ superseded_by:
   the pending fallback to claim closure and delete both recovery trees. The
   focused runner suite now passes 14/14, including compound closure plus
   deactivation/restoration failures and a pre-supervision proof-negative case.
-- The updated ordinary deterministic gate passes 619/619 with selected-identity
+- GitHub Codex review on head `705fefb7d4df3bb687f911a59f101fbdeeade6b6`
+  found that an explicit
+  `CODEX_REVIEW_TEST_RUNTIME_PARENT` could be an owner-private leaf below a
+  sticky world-writable ancestor, unintentionally inheriting the
+  `/private/tmp` install-container exception. The strict runtime-parent opener
+  now performs a complete descriptor walk on initial validation and every path
+  revalidation. Focused secure-I/O and read-only-runner regressions pass 46/46,
+  including safe-chain acceptance, sticky-ancestor rejection, and rejection
+  after ancestor access-policy drift.
+- The updated ordinary deterministic gate passes 621/621 with selected-identity
   SHA-256
-  `346a50ba8b68780fb7afee2e71c9c2caa9f1805d6bb7d4da96ed71cbc1401787`.
+  `0203bf84f76bfe4fcb49362ac3137474753af30c4aea0a0a31c47774a6929f4d`.
   The real read-only installed runner also completed with explicit proven child
   closure, complete cleanup, an immutable release tree, no retained paths, no
   runtime residue, and no secondary failure. All 102 repository contract tests
@@ -116,5 +131,10 @@ superseded_by:
   2,815 passes, six platform skips, and one expected nested Seatbelt denial.
   That exact broker test passed 1/1 outside the parent sandbox in 2.601
   seconds.
+- The sticky-ancestor fix reran the same 2,822-test discovery in 1238.657
+  seconds with 2,815 passes, six platform skips, and only the expected nested
+  Seatbelt denial. The exact broker regression passed 1/1 outside the parent
+  sandbox in 2.314 seconds, and the production-equivalent live no-child suite
+  passed 9/9 in 7.585 seconds.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.

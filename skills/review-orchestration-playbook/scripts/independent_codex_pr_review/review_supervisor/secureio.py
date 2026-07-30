@@ -798,6 +798,7 @@ def open_absolute_directory_chain(
     *,
     create: bool = False,
     private_leaf: bool = False,
+    allow_sticky_writable_ancestors: bool = True,
 ) -> tuple[int, Identity]:
     if not path.is_absolute():
         raise ValueError("directory path must be absolute")
@@ -807,7 +808,8 @@ def open_absolute_directory_chain(
         raise ValueError("directory path contains a dot component")
     active_binding = _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.get()
     selected_path = (
-        active_binding is not None
+        allow_sticky_writable_ancestors
+        and active_binding is not None
         and active_binding.matches_selected_walk_path(walk_path)
     )
     if selected_path:
@@ -819,11 +821,18 @@ def open_absolute_directory_chain(
         fd = os.open(b"/", flags)
         current = pathlib.Path("/")
     try:
-        identity, _ = _validate_directory_fd_with_policy(
+        identity, root_policy = _validate_directory_fd_with_policy(
             fd,
             current,
             private=private_leaf and not raw_parts,
         )
+        if not allow_sticky_writable_ancestors and root_policy.mode & (
+            stat.S_IWGRP | stat.S_IWOTH
+        ):
+            raise OSError(
+                errno.EPERM,
+                f"directory ancestor is group- or world-writable: {current}",
+            )
         for index, part in enumerate(raw_parts):
             current /= os.fsdecode(part)
             created = False
@@ -845,6 +854,13 @@ def open_absolute_directory_chain(
                         or (private_leaf and index == len(raw_parts) - 1),
                     )
                 )
+                if not allow_sticky_writable_ancestors and descriptor_policy.mode & (
+                    stat.S_IWGRP | stat.S_IWOTH
+                ):
+                    raise OSError(
+                        errno.EPERM,
+                        f"directory ancestor is group- or world-writable: {current}",
+                    )
                 path_metadata = os.stat(
                     part,
                     dir_fd=fd,

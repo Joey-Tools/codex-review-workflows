@@ -92,6 +92,46 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         support._validated_private_runtime_parent(str(parent))
                     )
 
+    def test_runtime_parent_rejects_sticky_writable_ancestor(self) -> None:
+        with owned_temporary_directory("runtime-parent-sticky-") as root:
+            ancestor = root / "ancestor"
+            ancestor.mkdir(mode=0o700)
+            parent = ancestor / "parent"
+            parent.mkdir(mode=0o700)
+
+            self.assertEqual(
+                support._validated_private_runtime_parent(str(parent)),
+                parent.resolve(strict=True),
+            )
+            ancestor.chmod(0o1777)
+            try:
+                self.assertIsNone(
+                    support._validated_private_runtime_parent(str(parent))
+                )
+            finally:
+                ancestor.chmod(0o700)
+
+    def test_runtime_parent_revalidation_rejects_writable_ancestor(self) -> None:
+        with owned_temporary_directory("runtime-parent-drift-") as root:
+            ancestor = root / "ancestor"
+            ancestor.mkdir(mode=0o700)
+            parent = ancestor / "parent"
+            parent.mkdir(mode=0o700)
+            binding = support._open_directory_parent(
+                parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                ancestor.chmod(0o1777)
+                with self.assertRaisesRegex(
+                    OSError,
+                    "group- or world-writable",
+                ):
+                    binding.revalidate()
+            finally:
+                ancestor.chmod(0o700)
+                binding.close()
+
     def test_private_directory_creation_rejects_new_child_acl(self) -> None:
         with owned_temporary_directory("runtime-child-acl-") as root:
             parent = root / "parent"

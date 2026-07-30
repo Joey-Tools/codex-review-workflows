@@ -3,7 +3,7 @@ id: 20260727-rsr001
 title: Review Runtime State Root
 status: completed
 created: 2026-07-27
-updated: 2026-07-30
+updated: 2026-07-31
 branch: wip/review-runtime-state-no-bytecode
 pr:
 supersedes: []
@@ -242,6 +242,9 @@ superseded_by:
 - The deterministic independent-supervisor gate passed 619/619 in 278.468
   seconds with the reviewed 619-test selected identity and SHA-256
   `346a50ba8b68780fb7afee2e71c9c2caa9f1805d6bb7d4da96ed71cbc1401787`.
+- The current hardened runtime-parent suite passed 621/621 in 225.264 seconds
+  with the reviewed 621-test selected identity and SHA-256
+  `0203bf84f76bfe4fcb49362ac3137474753af30c4aea0a0a31c47774a6929f4d`.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

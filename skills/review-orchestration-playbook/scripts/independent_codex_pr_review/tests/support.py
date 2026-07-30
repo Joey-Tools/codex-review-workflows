@@ -96,7 +96,10 @@ class _DirectoryParentBinding:
                 f"test runtime parent identity or access policy changed: {self.path}",
             )
 
-        reopened_fd, reopened_identity = open_absolute_directory_chain(self.path)
+        reopened_fd, reopened_identity = open_absolute_directory_chain(
+            self.path,
+            allow_sticky_writable_ancestors=(not self.require_owned_private_parent),
+        )
         try:
             reopened_policy = validate_directory_policy_fd(
                 reopened_fd,
@@ -126,7 +129,10 @@ def _open_directory_parent(
     require_owned_private_parent: bool,
 ) -> _DirectoryParentBinding:
     canonical = _canonical_ascii_directory(raw_path)
-    fd, identity = open_absolute_directory_chain(canonical)
+    fd, identity = open_absolute_directory_chain(
+        canonical,
+        allow_sticky_writable_ancestors=not require_owned_private_parent,
+    )
     try:
         policy = validate_directory_policy_fd(fd, canonical, private=False)
         if require_owned_private_parent:
@@ -209,6 +215,9 @@ def _create_owned_private_directory(
                     path_fd, path_identity = open_absolute_directory_chain(
                         child_path,
                         private_leaf=True,
+                        allow_sticky_writable_ancestors=(
+                            not require_owned_private_parent
+                        ),
                     )
                     try:
                         path_policy = validate_directory_policy_fd(
