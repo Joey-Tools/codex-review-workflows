@@ -1049,14 +1049,36 @@ class CliLifecycleTests(unittest.TestCase):
             default_root = parent / "retention"
             explicit_root = pathlib.Path(f"//{default_root.as_posix().lstrip('/')}")
             arguments = argparse.Namespace(retention_root=explicit_root)
-            with mock.patch.object(
-                cli_module,
-                "default_retention_root",
-                return_value=default_root,
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=default_root,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "installed_legacy_retention_fence",
+                    return_value=contextlib.nullcontext(()),
+                ),
+                contextlib.redirect_stdout(output),
             ):
                 self.assertTrue(
                     cli_module._uses_account_local_retention_root(arguments)
                 )
+                exit_code = cli_module.main(
+                    (
+                        "status",
+                        "--retention-root",
+                        str(explicit_root),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["retention_root"], str(explicit_root))
+            self.assertTrue((default_root / "retention.lock").is_file())
 
     def test_case_alias_uses_existing_object_identity_or_missing_leaf_policy(
         self,

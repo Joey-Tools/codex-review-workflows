@@ -120,12 +120,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 1049.456 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 1044.895 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.062 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 2.139 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.866 seconds.
-- The complete 100-test contract module passed in 8.043 seconds.
+- The complete 100-test contract module passed in 7.634 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -212,10 +212,16 @@ superseded_by:
   Persistent parent replacement fails closed before lock or durable-state
   creation, while replacement followed by restoration of the same bound parent
   remains safe and supported.
-- The deterministic independent-supervisor gate passed 599/599 in 211.618
+- The replacement-head Fresh Codex review found that a double-leading-slash
+  root alias retained a different lexical root marker than the descriptor-bound
+  prefix and therefore failed when the selected root was actually opened.
+  Missing-suffix traversal now uses the bound snapshot prefix directly, and the
+  alias regression exercises the real public `status` command through lock
+  creation.
+- The deterministic independent-supervisor gate passed 599/599 in 218.364
   seconds with the reviewed 599-test selected identity and SHA-256
   `aab4d688c8e024101b341c2a71125ddfd788c1fe2f634781f773c5c45b8c78ac`.
-- The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 44.260
+- The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

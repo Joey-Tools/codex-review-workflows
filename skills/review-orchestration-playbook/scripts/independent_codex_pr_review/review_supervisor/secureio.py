@@ -567,16 +567,8 @@ class DirectoryPathEquivalenceBinding:
         remaining_parts = (
             self.left.walk_path.parts[-remaining_count:] if remaining_count else ()
         )
-        prefix = self.left.walk_path
-        for _ in remaining_parts:
-            prefix = prefix.parent
-        if prefix != self.left.prefix:
-            raise OSError(
-                errno.ESTALE,
-                "selected retention root prefix binding is inconsistent",
-            )
         raw_parts = tuple(os.fsencode(part) for part in remaining_parts)
-        return os.dup(self.left.fd), prefix, raw_parts
+        return os.dup(self.left.fd), self.left.prefix, raw_parts
 
     @staticmethod
     def _revalidate_held_prefix(
