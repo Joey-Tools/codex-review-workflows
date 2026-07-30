@@ -112,6 +112,10 @@ jobs:
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 -m tests.run_required_deterministic_supervisor
+      - name: Verify installed release tree remains immutable
+        working-directory: skills/review-orchestration-playbook/tests
+        run: |
+          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
       - name: Verify independent review supervisor CLI
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |

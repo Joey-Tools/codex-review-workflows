@@ -15,6 +15,7 @@ from .constants import (
     VERSION,
     default_checkout_parent,
     default_retention_root,
+    default_state_root,
 )
 from .custody import custody_helper_main
 from .errors import (
@@ -158,11 +159,14 @@ def _uses_account_local_retention_root(arguments: argparse.Namespace) -> bool:
 def _resolve_public_default_roots(
     arguments: argparse.Namespace,
 ) -> Iterator[None]:
-    account_local_retention = default_retention_root()
+    account_local_state = default_state_root()
+    account_local_retention = default_retention_root(state_root=account_local_state)
     if arguments.retention_root is None:
         arguments.retention_root = account_local_retention
     if hasattr(arguments, "checkout_parent") and arguments.checkout_parent is None:
-        arguments.checkout_parent = default_checkout_parent()
+        arguments.checkout_parent = default_checkout_parent(
+            state_root=account_local_state,
+        )
     with bind_directory_path_equivalence(
         arguments.retention_root,
         account_local_retention,

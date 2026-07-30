@@ -231,12 +231,65 @@ class _LegacyRetentionRoot:
                 cleanup.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _LegacyRetentionProbe:
     root: _LegacyRetentionRoot | None
     tool_path: pathlib.Path | None
     tool_binding: DirectoryPolicyBinding | None
     uses_account_local_retention: bool
+    components: tuple[tuple[bytes, DirectoryPolicyBinding, bool], ...]
+    anchor_fd: int = -1
+    anchor_path: pathlib.Path | None = None
+    anchor_binding: DirectoryPolicyBinding | None = None
+    anchor_private: bool = False
+
+    def take_root(self) -> _LegacyRetentionRoot:
+        root, self.root = self.root, None
+        if root is None:
+            raise RuntimeError("legacy retention probe has no root")
+        return root
+
+    def close(self) -> None:
+        root, self.root = self.root, None
+        anchor_fd, self.anchor_fd = self.anchor_fd, -1
+        cleanup_errors: list[BaseException] = []
+        if root is not None:
+            try:
+                root.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if anchor_fd >= 0:
+            try:
+                os.close(anchor_fd)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            primary_error = cleanup_errors[0]
+            for secondary_error in cleanup_errors[1:]:
+                _record_secondary_error(
+                    primary_error,
+                    label="legacy retention probe cleanup failed",
+                    secondary_error=secondary_error,
+                )
+            raise primary_error
+
+
+def _close_legacy_probe(
+    probe: _LegacyRetentionProbe,
+    *,
+    label: str,
+) -> None:
+    primary_error = sys.exception()
+    try:
+        probe.close()
+    except BaseException as cleanup_error:
+        if primary_error is None:
+            raise
+        _record_secondary_error(
+            primary_error,
+            label=f"{label} cleanup failed",
+            secondary_error=cleanup_error,
+        )
 
 
 def _record_secondary_error(
@@ -406,11 +459,18 @@ def _open_legacy_retention_root(
                     private=private,
                 )
             except FileNotFoundError:
+                anchor_fd = opened_fd
+                opened_fd = -1
                 return _LegacyRetentionProbe(
                     root=None,
                     tool_path=tool_path,
                     tool_binding=tool_binding,
                     uses_account_local_retention=uses_account_local_retention,
+                    components=tuple(components),
+                    anchor_fd=anchor_fd,
+                    anchor_path=current_path.parent if components else None,
+                    anchor_binding=components[-1][1] if components else None,
+                    anchor_private=components[-1][2] if components else False,
                 )
             try:
                 policy = validate_directory_policy_fd(
@@ -461,6 +521,7 @@ def _open_legacy_retention_root(
             tool_path=tool_path,
             tool_binding=tool_binding,
             uses_account_local_retention=uses_account_local_retention,
+            components=tuple(components),
         )
     except (OSError, ValueError) as error:
         raise RuntimeError("cannot inspect legacy retention path safely") from error
@@ -509,61 +570,132 @@ def _validate_current_release_probe(
     current_tool_path: pathlib.Path,
     current_root: _LegacyRetentionRoot | None,
 ) -> None:
+    if probe.tool_path is None or probe.tool_binding is None:
+        raise RuntimeError(
+            "current installed helper is missing from its release catalog"
+        )
     try:
-        if probe.tool_path is None or probe.tool_binding is None:
-            raise RuntimeError(
-                "current installed helper is missing from its release catalog"
-            )
+        current_tool_fd, _ = open_absolute_directory_chain(current_tool_path)
         try:
-            current_tool_fd, _ = open_absolute_directory_chain(current_tool_path)
-            try:
-                current_tool_policy = validate_directory_policy_fd(
-                    current_tool_fd,
-                    current_tool_path,
-                    private=False,
-                )
-            finally:
-                _close_inspection_fd(
-                    current_tool_fd,
-                    label="current installed helper",
-                )
-        except (OSError, ValueError) as error:
-            raise RuntimeError(
-                "cannot revalidate current installed helper safely"
-            ) from error
-        if current_tool_policy != probe.tool_binding:
-            raise RuntimeError(
-                "current installed helper path changed while being inspected"
+            current_tool_policy = validate_directory_policy_fd(
+                current_tool_fd,
+                current_tool_path,
+                private=False,
             )
-        if not probe.uses_account_local_retention:
-            raise RuntimeError(
-                "current installed helper lost its account-local retention policy"
+        finally:
+            _close_inspection_fd(
+                current_tool_fd,
+                label="current installed helper",
             )
-        if current_root is None:
-            if probe.root is not None:
-                raise RuntimeError(
-                    "current helper legacy retention path changed while being inspected"
-                )
-        elif (
-            probe.root is None
-            or probe.root.retention_binding != current_root.retention_binding
-        ):
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "cannot revalidate current installed helper safely"
+        ) from error
+    if current_tool_policy != probe.tool_binding:
+        raise RuntimeError(
+            "current installed helper path changed while being inspected"
+        )
+    if not probe.uses_account_local_retention:
+        raise RuntimeError(
+            "current installed helper lost its account-local retention policy"
+        )
+    if current_root is None:
+        if probe.root is not None:
             raise RuntimeError(
                 "current helper legacy retention path changed while being inspected"
             )
-    finally:
-        if probe.root is not None:
-            primary_error = sys.exception()
-            try:
-                probe.root.close()
-            except BaseException as cleanup_error:
-                if primary_error is None:
-                    raise
-                _record_secondary_error(
-                    primary_error,
-                    label="current installed release probe cleanup failed",
-                    secondary_error=cleanup_error,
-                )
+    elif (
+        probe.root is None
+        or probe.root.retention_binding != current_root.retention_binding
+    ):
+        raise RuntimeError(
+            "current helper legacy retention path changed while being inspected"
+        )
+
+
+def _revalidate_legacy_probe_anchor(probe: _LegacyRetentionProbe) -> None:
+    if probe.anchor_fd < 0:
+        if (
+            probe.anchor_path is not None
+            or probe.anchor_binding is not None
+            or (probe.components and probe.root is None)
+        ):
+            raise RuntimeError("legacy retention probe anchor is incomplete")
+        return
+    if probe.anchor_path is None or probe.anchor_binding is None:
+        raise RuntimeError("legacy retention probe anchor is incomplete")
+    held_policy = validate_directory_policy_fd(
+        probe.anchor_fd,
+        probe.anchor_path,
+        private=probe.anchor_private,
+    )
+    if held_policy != probe.anchor_binding:
+        raise RuntimeError(
+            "installed helper path changed while migration fence was active"
+        )
+
+
+def _revalidate_legacy_probe_snapshot(
+    initial: _LegacyRetentionProbe,
+    current: _LegacyRetentionProbe,
+    *,
+    releases_fd: int,
+    releases_root: pathlib.Path,
+) -> None:
+    if initial.root is None:
+        _revalidate_legacy_probe_anchor(initial)
+    else:
+        _revalidate_legacy_retention_root(
+            releases_fd,
+            releases_root,
+            initial.root,
+        )
+    if current.root is None:
+        _revalidate_legacy_probe_anchor(current)
+    else:
+        _revalidate_legacy_retention_root(
+            releases_fd,
+            releases_root,
+            current.root,
+        )
+    if initial.root is None and current.root is not None:
+        raise RuntimeError(
+            "legacy retention path appeared while migration fence was active"
+        )
+    if initial.root is not None and current.root is None:
+        raise RuntimeError(
+            "legacy retention path changed while migration fence was active"
+        )
+    if (
+        initial.components != current.components
+        or initial.tool_path != current.tool_path
+        or initial.tool_binding != current.tool_binding
+    ):
+        raise RuntimeError(
+            "installed helper path or retention policy changed while migration "
+            "fence was active"
+        )
+    if initial.uses_account_local_retention != current.uses_account_local_retention:
+        if (
+            initial.uses_account_local_retention
+            and not current.uses_account_local_retention
+        ):
+            raise RuntimeError(
+                "installed legacy helper lost its account-local retention policy "
+                "while migration fence was active"
+            )
+        raise RuntimeError(
+            "installed helper retention policy changed while migration fence was active"
+        )
+    if initial.root is None:
+        return
+    if (
+        current.root is None
+        or initial.root.retention_binding != current.root.retention_binding
+    ):
+        raise RuntimeError(
+            "legacy retention path changed while migration fence was active"
+        )
 
 
 def _revalidate_current_tool_legacy_retention_root(
@@ -862,11 +994,12 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
     releases_root: pathlib.Path | None = None
     current_release_name: bytes | None = None
     current_release_binding: _DirectoryStatBinding | None = None
+    current_catalog_probe: _LegacyRetentionProbe | None = None
     releases_fd = -1
     releases_policy: DirectoryPolicyBinding | None = None
     releases_entries: tuple[tuple[bytes, os.stat_result], ...] = ()
     roots: list[_LegacyRetentionRoot] = []
-    absent_roots: list[tuple[bytes, _DirectoryStatBinding]] = []
+    absent_roots: list[tuple[bytes, _DirectoryStatBinding, _LegacyRetentionProbe]] = []
     try:
         try:
             unresolved: list[pathlib.Path] = []
@@ -920,14 +1053,15 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     release_binding = _binding(release_metadata)
                     if name == current_release_name:
                         current_release_binding = release_binding
-                        current_probe = _open_legacy_retention_root(
+                        current_catalog_probe = _open_legacy_retention_root(
                             releases_fd,
                             releases_root,
                             name,
                             release_binding,
                         )
+                        cleanup.callback(current_catalog_probe.close)
                         _validate_current_release_probe(
-                            current_probe,
+                            current_catalog_probe,
                             current_tool_path=current_tool_path,
                             current_root=current_root,
                         )
@@ -939,14 +1073,15 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         release_binding,
                     )
                     if probe.root is None:
-                        absent_roots.append((name, release_binding))
+                        absent_roots.append((name, release_binding, probe))
+                        cleanup.callback(probe.close)
                         if (
                             probe.tool_path is not None
                             and not probe.uses_account_local_retention
                         ):
                             unfenced_tools.append(probe.tool_path)
                         continue
-                    root = probe.root
+                    root = probe.take_root()
                     roots.append(root)
                     cleanup.callback(root.close)
                     _acquire_legacy_retention_lock(root)
@@ -1019,44 +1154,55 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     releases_root is not None
                     and current_release_name is not None
                     and current_release_binding is not None
+                    and current_catalog_probe is not None
                     and releases_fd >= 0
                 ):
-                    current_probe = _open_legacy_retention_root(
+                    refreshed_current_probe = _open_legacy_retention_root(
                         releases_fd,
                         releases_root,
                         current_release_name,
                         current_release_binding,
                     )
-                    _validate_current_release_probe(
-                        current_probe,
-                        current_tool_path=current_tool_path,
-                        current_root=current_root,
-                    )
+                    try:
+                        _revalidate_legacy_probe_snapshot(
+                            current_catalog_probe,
+                            refreshed_current_probe,
+                            releases_fd=releases_fd,
+                            releases_root=releases_root,
+                        )
+                        _validate_current_release_probe(
+                            refreshed_current_probe,
+                            current_tool_path=current_tool_path,
+                            current_root=current_root,
+                        )
+                    finally:
+                        _close_legacy_probe(
+                            refreshed_current_probe,
+                            label="refreshed current installed release probe",
+                        )
                 if (
                     releases_root is not None
                     and releases_policy is not None
                     and releases_fd >= 0
                 ):
-                    for name, release_binding in absent_roots:
+                    for name, release_binding, initial_probe in absent_roots:
                         appeared = _open_legacy_retention_root(
                             releases_fd,
                             releases_root,
                             name,
                             release_binding,
                         )
-                        if appeared.root is not None:
-                            appeared.root.close()
-                            raise RuntimeError(
-                                "legacy retention path appeared while migration fence "
-                                "was active"
+                        try:
+                            _revalidate_legacy_probe_snapshot(
+                                initial_probe,
+                                appeared,
+                                releases_fd=releases_fd,
+                                releases_root=releases_root,
                             )
-                        if (
-                            appeared.tool_path is not None
-                            and not appeared.uses_account_local_retention
-                        ):
-                            raise RuntimeError(
-                                "installed legacy helper lost its account-local "
-                                "retention policy while migration fence was active"
+                        finally:
+                            _close_legacy_probe(
+                                appeared,
+                                label="refreshed installed release probe",
                             )
                     _revalidate_releases_root(
                         releases_root,

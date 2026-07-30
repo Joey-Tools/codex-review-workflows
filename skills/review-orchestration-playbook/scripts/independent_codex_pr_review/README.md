@@ -60,10 +60,12 @@ $HELPER stateful wait --state-dir "$HELPER_STATE" --timeout-seconds 60
 $HELPER stateful final --state-dir "$HELPER_STATE"
 ```
 
-The CLI resolves the same default state root from the current POSIX account
-database, not from `$HOME`, so installed release trees remain immutable and
-retained evidence survives release replacement. Non-default explicit
-`--retention-root` and `--checkout-parent` values remain available for
+For each public command, the CLI resolves one default state-root snapshot from
+the current POSIX account database, not from `$HOME`, and derives both retention
+and checkout defaults from it. Installed release trees therefore remain
+immutable, retained evidence survives release replacement, and an account-home
+change cannot split one command's defaults across two roots. Non-default
+explicit `--retention-root` and `--checkout-parent` values remain available for
 task-scoped isolated runs. Every explicitly supplied retention root is compared
 with the account-local default through the secure descriptor walk before the
 tool can select custom-root behavior. Existing prefixes are compared by object
@@ -73,8 +75,8 @@ before returning, so object or access-policy replacement and missing-suffix
 creation observed between the initial snapshots and final revalidation fail
 closed. A proven distinct retention root skips the default migration gate; an
 equivalent alias uses it, and an unavailable proof fails through the CLI's
-single-line JSON failure contract. Explicit checkout-parent lookup remains
-independent and lazy.
+single-line JSON failure contract. An explicit checkout parent avoids a second
+default-path helper call.
 
 从使用 release-local `runtime/retention` 的旧版本升级时，新版本始终先扫描当前
 helper 根下的旧 retention root，因此 self-contained 或非标准安装布局不会绕过迁移
@@ -99,6 +101,10 @@ bytes 必须完全一致。时间戳变化不构成内容变化。当前正在�
 fence，不重复加锁。若仍包含 helper 的未标记 release 没有可获取的 legacy retention
 lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该 release，不能用一次
 “路径暂时不存在”的探测推断它之后不会启动。
+对于当前或 sibling release 中尚无 legacy root 的 helper，扫描会把初始逐组件 policy
+和最深层 existing descriptor 保持到公共命令结束；终态 fresh probe 必须与初始
+custody 完全一致。替换嵌套 helper 目录会失败关闭，而只改变目录 child entries 不会被
+误判为对象或访问策略替换。
 公共命令失败后仍执行完整 fence finalization 和 descriptor cleanup；若它们也失败，
 原命令异常的类型与结构化诊断保持主错误，后续故障只作为次级 exception evidence
 附加，并通过可选的 `secondary_errors` 数组输出；该数组最多 4 条、每条最多 512

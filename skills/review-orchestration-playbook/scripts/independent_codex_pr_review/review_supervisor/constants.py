@@ -137,9 +137,19 @@ def default_state_root() -> pathlib.Path:
     return account_home / ".codex" / "review-runtime" / "independent-codex-pr-review"
 
 
-def default_retention_root() -> pathlib.Path:
-    return default_state_root() / "retention"
+def default_retention_root(
+    *,
+    state_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    return (
+        state_root if state_root is not None else default_state_root()
+    ) / "retention"
 
 
-def default_checkout_parent() -> pathlib.Path:
-    return default_state_root() / "checkouts"
+def default_checkout_parent(
+    *,
+    state_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    return (
+        state_root if state_root is not None else default_state_root()
+    ) / "checkouts"

@@ -376,6 +376,65 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["failure_code"], "cli-failed")
         self.assertIn("current POSIX account home is unavailable", payload["message"])
 
+    def test_public_defaults_share_one_account_state_snapshot(self) -> None:
+        with owned_temporary_directory("cli-default-root-snapshot-") as root:
+            first_home = root / "account-a"
+            second_home = root / "account-b"
+            first_home.mkdir(mode=0o700)
+            second_home.mkdir(mode=0o700)
+            first_account = mock.Mock(pw_dir=str(first_home))
+            second_account = mock.Mock(pw_dir=str(second_home))
+            binding = mock.Mock(equivalent=False)
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.constants.pwd.getpwuid",
+                    side_effect=(first_account, second_account),
+                ) as account_lookup,
+                mock.patch.object(
+                    cli_module,
+                    "bind_directory_path_equivalence",
+                    return_value=contextlib.nullcontext(binding),
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "preflight",
+                    return_value={"status": "admitted"},
+                ) as preflight_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                code = cli_module.main(
+                    (
+                        "preflight",
+                        "--helper-state",
+                        str(root / "helper"),
+                        "--repo",
+                        str(root / "repo"),
+                        "--base",
+                        "a" * 40,
+                        "--head",
+                        "b" * 40,
+                        "--pr-url",
+                        "https://github.com/owner/repo/pull/1",
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+        self.assertEqual(code, 0)
+        account_lookup.assert_called_once_with(os.getuid())
+        expected_state = (
+            first_home / ".codex" / "review-runtime" / "independent-codex-pr-review"
+        )
+        self.assertEqual(
+            preflight_mock.call_args.kwargs["retention_root"],
+            expected_state / "retention",
+        )
+        self.assertEqual(
+            preflight_mock.call_args.kwargs["checkout_parent"],
+            expected_state / "checkouts",
+        )
+        binding.revalidate.assert_called_once_with()
+
     def test_explicit_distinct_roots_skip_only_the_legacy_scan(self) -> None:
         with owned_temporary_directory("cli-explicit-roots-") as root:
             retention = root / "retention"
@@ -1421,6 +1480,139 @@ class CliLifecycleTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             status_mock.assert_called_once()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["attempt_count"], 0)
+
+    def test_current_helper_replacement_during_command_fails_closed(self) -> None:
+        with owned_temporary_directory("cli-current-helper-replaced-") as root:
+            _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+            _write_retention_lock(legacy_retention)
+            account_default = root / "account-default"
+            displaced_tool = current_tool.with_name("displaced-current-tool")
+            original_status = cli_module.status
+
+            def replace_current_tool(**kwargs: object) -> dict[str, object]:
+                result = original_status(**kwargs)
+                current_tool.rename(displaced_tool)
+                current_tool.mkdir(mode=0o755)
+                _write_account_local_marker(current_tool)
+                return result
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=replace_current_tool,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "installed helper path or retention policy changed",
+                payload["message"],
+            )
+
+    def test_marked_sibling_replacement_during_command_fails_closed(self) -> None:
+        with owned_temporary_directory("cli-sibling-helper-replaced-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_tool = releases / ("b" * 40) / RELATIVE_TOOL
+            sibling_tool = releases / ("a" * 40) / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            sibling_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
+            _write_account_local_marker(sibling_tool)
+            account_default = root / "account-default"
+            displaced_tool = sibling_tool.with_name("displaced-sibling-tool")
+            original_status = cli_module.status
+
+            def replace_sibling_tool(**kwargs: object) -> dict[str, object]:
+                result = original_status(**kwargs)
+                sibling_tool.rename(displaced_tool)
+                sibling_tool.mkdir(mode=0o755)
+                _write_account_local_marker(sibling_tool)
+                return result
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=replace_sibling_tool,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "installed helper path or retention policy changed",
+                payload["message"],
+            )
+
+    def test_current_helper_child_churn_preserves_catalog_binding(self) -> None:
+        with owned_temporary_directory("cli-current-helper-churn-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_tool = releases / ("b" * 40) / RELATIVE_TOOL
+            sibling_tool = releases / ("a" * 40) / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            sibling_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
+            _write_account_local_marker(sibling_tool)
+            account_default = root / "account-default"
+            original_status = cli_module.status
+
+            def add_benign_child(**kwargs: object) -> dict[str, object]:
+                result = original_status(**kwargs)
+                (current_tool / "benign-child").write_text(
+                    "child churn does not change directory custody\n",
+                    encoding="utf-8",
+                )
+                return result
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=add_benign_child,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["attempt_count"], 0)
 

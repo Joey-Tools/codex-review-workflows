@@ -3,7 +3,7 @@ id: 20260727-rsr001
 title: Review Runtime State Root
 status: completed
 created: 2026-07-27
-updated: 2026-07-29
+updated: 2026-07-30
 branch: wip/review-runtime-state-no-bytecode
 pr:
 supersedes: []
@@ -26,8 +26,10 @@ superseded_by:
 - Every explicit retention root resolves and proves stable equivalence against
   the account-local default inside the CLI failure boundary. Proven distinct
   roots skip the migration gate, equivalent aliases use it, and unavailable
-  proof fails closed. Explicit checkout-parent lookup remains independent and
-  lazy.
+  proof fails closed. Each public command resolves the POSIX account state root
+  once, then derives default retention and checkout paths from that one
+  snapshot; an explicit checkout parent avoids an unnecessary second helper
+  call.
 - The CLI retains the selected/default path snapshots through command
   completion. Every exact selected-root open binds the object identity and
   private access policy to that classification before a retention lock or
@@ -67,7 +69,11 @@ superseded_by:
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
   policy with device, inode, type, generation, owner, group, mode, flags, and
   normalized ACL/xattr evidence while deliberately ignoring timestamps,
-  directory size, and link count.
+  directory size, and link count. For current or sibling helpers without a
+  legacy root, the initial component bindings and deepest existing descriptor
+  remain held through the command; a final fresh probe must match that initial
+  custody. Nested helper replacement fails closed, while ordinary child-entry
+  churn remains benign.
 - The scanner acquires every existing legacy `retention.lock` with a
   nonblocking exclusive flock, enumerates attempts while holding that fence,
   and retains it through the default-root command plus final path/catalog
@@ -95,7 +101,9 @@ superseded_by:
 - Installed-symlink preflight coverage proves the release tree inventory and
   bytes remain unchanged while runtime directories are created externally.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
-  syntax validation and explicit zero-cache guards.
+  syntax validation and explicit zero-cache guards. Their Python 3.13
+  independent-supervisor jobs also run the installed-release immutability
+  regression explicitly.
 
 ## Next Steps
 
@@ -109,12 +117,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 920.687 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 939.260 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.327 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 2.314 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.504 seconds.
-- The complete 100-test contract module passed in 7.292 seconds.
+- The complete 100-test contract module passed in 7.158 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -186,10 +194,17 @@ superseded_by:
   bindings across held descriptors and path reopens; allowed-to-allowed ACL
   drift and group drift fail closed. FIFO coverage and device-driver limits are
   now stated separately.
-- The deterministic independent-supervisor gate passed 593/593 in 202.870
-  seconds with the reviewed 593-test selected identity and SHA-256
-  `300a1b68a151a47d4f292648c3c31d3ef85e9eae5e5c8038de5b2d0ccc3e1a6f`.
-- The focused post-fix CLI and secure-I/O modules passed 72/72 tests in 47.822
+- The following exact-head Fresh Codex review found that initial current and
+  no-root sibling helper bindings were discarded before the migration-fenced
+  command, that retention and checkout defaults could query two different
+  account homes, and that the installed-release immutability regression was
+  skipped by hosted Python 3.13 CI. Command-lifetime catalog probes now retain
+  component policies and held descriptors, public defaults share one state-root
+  snapshot, and both canonical/private Python 3.13 jobs run the regression.
+- The deterministic independent-supervisor gate passed 597/597 in 195.354
+  seconds with the reviewed 597-test selected identity and SHA-256
+  `cd810f99ad39dd711597594d5de9035a41d4604c9c44f577019b438619996763`.
+- The focused post-fix CLI and secure-I/O modules passed 76/76 tests in 44.260
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

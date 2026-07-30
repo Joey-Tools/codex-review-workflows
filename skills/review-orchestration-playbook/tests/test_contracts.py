@@ -1736,7 +1736,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 593", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 597", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1840,6 +1840,14 @@ class RepositoryContractTest(unittest.TestCase):
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         run: |
           python3 -m tests.run_required_deterministic_supervisor
+""",
+                    supervisor_job,
+                )
+                self.assertIn(
+                    f"""      - name: Verify installed release tree remains immutable
+        working-directory: {skill_root}/tests
+        run: |
+          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
 """,
                     supervisor_job,
                 )
