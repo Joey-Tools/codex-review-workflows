@@ -58,7 +58,7 @@ require_digest() {
   output="$("${probe_environment[@]}" /usr/bin/shasum -a 256 "$path")"
   actual="${output%% *}"
   [[ "$actual" == "$expected" ]] ||
-    fail "$label digest does not match the reviewed pin"
+    fail "$label digest does not match the reviewed pin (expected=$expected actual=$actual)"
 }
 
 require_artifact_pins() {

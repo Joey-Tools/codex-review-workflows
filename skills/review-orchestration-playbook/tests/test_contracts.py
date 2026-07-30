@@ -1692,6 +1692,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--output", script)
         self.assertIn("not a security boundary", script)
         self.assertIn("byte-reproducible", script)
+        self.assertIn(
+            "digest does not match the reviewed pin "
+            "(expected=$expected actual=$actual)",
+            script,
+        )
         for mode in ("DEVELOPER", "HOSTED"):
             for tool in (
                 "CLANG",
