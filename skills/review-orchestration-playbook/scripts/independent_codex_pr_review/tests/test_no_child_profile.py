@@ -38,8 +38,8 @@ from tests.support import owned_temporary_directory
 
 
 REQUIRE_LIVE_NO_CHILD_PROFILE_ENV = "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"
-GITHUB_HOSTED_RUNTIME_PROFILE = "github-macos-26-arm64-26.4-25E246"
-GITHUB_HOSTED_RUNTIME_PIN = profile.RuntimePin(
+GITHUB_HOSTED_LEGACY_RUNTIME_PROFILE = "github-macos-26-arm64-26.4-25E246"
+GITHUB_HOSTED_LEGACY_RUNTIME_PIN = profile.RuntimePin(
     macos_product_version="26.4",
     macos_build_version="25E246",
     darwin_release="25.4.0",
@@ -47,6 +47,17 @@ GITHUB_HOSTED_RUNTIME_PIN = profile.RuntimePin(
         "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42"
     ),
 )
+GITHUB_HOSTED_RUNTIME_PINS = {
+    GITHUB_HOSTED_LEGACY_RUNTIME_PROFILE: GITHUB_HOSTED_LEGACY_RUNTIME_PIN,
+    "github-macos-26-arm64-26.5.2-25F84": profile.RuntimePin(
+        macos_product_version="26.5.2",
+        macos_build_version="25F84",
+        darwin_release="25.5.0",
+        sandbox_exec_sha256=(
+            "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16"
+        ),
+    ),
+}
 
 
 class _SyntheticProbeProcess:
@@ -631,7 +642,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
             )
             return profile.CompatibilityEvidence(
                 schema_version=profile.EVIDENCE_SCHEMA_VERSION,
-                runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
+                runtime_pin=GITHUB_HOSTED_LEGACY_RUNTIME_PIN,
                 runtime=profile.RuntimeFingerprint(
                     platform="darwin",
                     system="Darwin",
@@ -777,7 +788,14 @@ class NoChildProfileUnitTests(unittest.TestCase):
             NoChildProfileDarwinIntegrationTests.setUpClass()
 
     def test_hosted_live_runtime_profile_is_exact_and_test_only(self) -> None:
-        pin = GITHUB_HOSTED_RUNTIME_PIN
+        pin = GITHUB_HOSTED_LEGACY_RUNTIME_PIN
+        self.assertEqual(
+            set(GITHUB_HOSTED_RUNTIME_PINS),
+            {
+                "github-macos-26-arm64-26.4-25E246",
+                "github-macos-26-arm64-26.5.2-25F84",
+            },
+        )
         self.assertEqual(pin.macos_product_version, "26.4")
         self.assertEqual(pin.macos_build_version, "25E246")
         self.assertEqual(pin.darwin_release, "25.4.0")
@@ -786,11 +804,74 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42",
         )
         self.assertNotEqual(pin, profile.PINNED_RUNTIME)
+        current = GITHUB_HOSTED_RUNTIME_PINS[
+            "github-macos-26-arm64-26.5.2-25F84"
+        ]
+        self.assertEqual(current.macos_product_version, "26.5.2")
+        self.assertEqual(current.macos_build_version, "25F84")
+        self.assertEqual(current.darwin_release, "25.5.0")
+        self.assertEqual(
+            current.sandbox_exec_sha256,
+            "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
+        )
+        self.assertEqual(current, profile.PINNED_RUNTIME)
+
+    def test_hosted_runtime_selector_requires_an_exact_reviewed_match(self) -> None:
+        from tests.run_hosted_no_child_fail_closed import (
+            _select_hosted_runtime_profile,
+        )
+
+        cases = (
+            (
+                "github-macos-26-arm64-26.4-25E246",
+                "26.4",
+                "25E246",
+                "25.4.0",
+                (3, 13, 0),
+            ),
+            (
+                "github-macos-26-arm64-26.5.2-25F84",
+                "26.5.2",
+                "25F84",
+                "25.5.0",
+                (3, 13, 1),
+            ),
+            (None, "26.6", "25G100", "25.6.0", (3, 13, 0)),
+            (None, "26.5.2", "25F84", "25.5.0", (3, 14, 0)),
+        )
+        for expected_name, product, build, darwin, python_version in cases:
+            with self.subTest(
+                product=product,
+                build=build,
+                darwin=darwin,
+                python_version=python_version,
+            ):
+                runtime = profile.RuntimeFingerprint(
+                    platform="darwin",
+                    system="Darwin",
+                    macos_product_version=product,
+                    macos_build_version=build,
+                    darwin_release=darwin,
+                    python_version=python_version,
+                    python_executable="/synthetic/python3.13",
+                    effective_uid=501,
+                )
+                selected = _select_hosted_runtime_profile(runtime)
+                if expected_name is None:
+                    self.assertIsNone(selected)
+                else:
+                    self.assertIsNotNone(selected)
+                    assert selected is not None
+                    self.assertEqual(selected[0], expected_name)
+                    self.assertEqual(
+                        selected[1],
+                        GITHUB_HOSTED_RUNTIME_PINS[expected_name],
+                    )
 
     def test_custom_runtime_pin_evidence_is_not_production_capable(self) -> None:
         evidence = profile.CompatibilityEvidence(
             schema_version=profile.EVIDENCE_SCHEMA_VERSION,
-            runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
+            runtime_pin=GITHUB_HOSTED_LEGACY_RUNTIME_PIN,
             runtime=profile.RuntimeFingerprint(
                 platform="darwin",
                 system="Darwin",

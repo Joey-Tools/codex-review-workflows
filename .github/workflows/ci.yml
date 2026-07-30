@@ -103,7 +103,6 @@ jobs:
       - name: Match hosted no-child blocker signature
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |

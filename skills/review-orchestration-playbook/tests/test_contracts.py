@@ -1724,6 +1724,8 @@ class RepositoryContractTest(unittest.TestCase):
             "06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337",
             "macOS 26.5.2 build `25F84`",
             "214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7",
+            "90814780194",
+            "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
         ):
             self.assertIn(evidence, journal)
 
@@ -1786,7 +1788,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 604", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 605", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1823,10 +1825,12 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(contract, helper_contract)
         for contract in (
             'platform.machine() != "arm64"',
+            "_select_hosted_runtime_profile(observed_runtime)",
             "_matches_hosted_fail_closed_observations(evidence)",
             "blockers == expected_blockers",
             "len(blockers) == len(evidence.blockers)",
             '"reviewed_fail_closed_signature": signature_matches',
+            '"runtime_profile": runtime_profile',
             "if evidence.compatible or evidence.production_capable",
         ):
             self.assertIn(contract, hosted_probe)
@@ -1852,9 +1856,12 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS
             / "independent_codex_pr_review/review_supervisor/no_child_profile.py"
         ).read_text(encoding="utf-8")
-        hosted_profile = "github-macos-26-arm64-26.4-25E246"
-        self.assertIn(hosted_profile, integration_test)
-        self.assertNotIn(hosted_profile, production_profile)
+        for hosted_profile in (
+            "github-macos-26-arm64-26.4-25E246",
+            "github-macos-26-arm64-26.5.2-25F84",
+        ):
+            self.assertIn(hosted_profile, integration_test)
+            self.assertNotIn(hosted_profile, production_profile)
         self.assertNotIn("25E246", production_profile)
 
         profile_contracts = {
@@ -1890,7 +1897,6 @@ class RepositoryContractTest(unittest.TestCase):
                     f"""      - name: Match hosted no-child blocker signature
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
           CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
         run: |
