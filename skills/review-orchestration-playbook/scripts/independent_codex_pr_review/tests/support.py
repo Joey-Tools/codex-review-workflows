@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import hashlib
 import json
 import os
 import pathlib
 import pwd
+import secrets
 import shutil
 import stat
 import subprocess
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from review_supervisor.constants import (
     CONTROL_ARTIFACT_SPECS,
     HELPER_PREFLIGHT_STATUS,
     HELPER_STATE_MARKER_TEXT,
 )
-from review_supervisor.secureio import identity_from_stat
+from review_supervisor.models import Identity
+from review_supervisor.secureio import (
+    DirectoryPolicyBinding,
+    directory_identities_match,
+    identity_from_stat,
+    open_absolute_directory_chain,
+    open_directory_at,
+    validate_directory_policy_fd,
+)
 
 
 _RUNTIME_ROOT: pathlib.Path | None = None
@@ -26,53 +36,216 @@ _RUNTIME_ROOT_PID: int | None = None
 _EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 
 
-def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
+def _canonical_ascii_directory(raw_path: str | pathlib.Path) -> pathlib.Path:
     candidate = pathlib.Path(raw_path)
     if not candidate.is_absolute():
-        return None
-    try:
-        canonical = candidate.resolve(strict=True)
-    except OSError:
-        return None
+        raise ValueError("directory path must be absolute")
+    canonical = candidate.resolve(strict=True)
     try:
         str(canonical).encode("ascii")
-    except UnicodeEncodeError:
-        return None
-
-    owner_uid = os.getuid()
-    current = pathlib.Path("/")
-    try:
-        root_metadata = current.stat(follow_symlinks=False)
-    except OSError:
-        return None
-    if (
-        not stat.S_ISDIR(root_metadata.st_mode)
-        or root_metadata.st_uid != 0
-        or root_metadata.st_mode
-        & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-    ):
-        return None
-    for part in canonical.parts[1:]:
-        current /= part
-        try:
-            metadata = current.stat(follow_symlinks=False)
-        except OSError:
-            return None
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid not in {0, owner_uid}
-            or metadata.st_mode
-            & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
-        ):
-            return None
-
-    try:
-        leaf = canonical.stat(follow_symlinks=False)
-    except OSError:
-        return None
-    if leaf.st_uid != owner_uid or not os.access(canonical, os.W_OK | os.X_OK):
-        return None
+    except UnicodeEncodeError as error:
+        raise ValueError("directory path must be ASCII") from error
     return canonical
+
+
+def _require_owned_private_parent_policy(
+    policy: DirectoryPolicyBinding,
+    *,
+    path: pathlib.Path,
+) -> None:
+    forbidden_mode = stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID
+    required_mode = stat.S_IWUSR | stat.S_IXUSR
+    if (
+        policy.file_type != stat.S_IFDIR
+        or policy.uid != os.getuid()
+        or policy.mode & forbidden_mode
+        or policy.mode & required_mode != required_mode
+    ):
+        raise OSError(
+            errno.EPERM,
+            f"test runtime parent has an unsafe access policy: {path}",
+        )
+
+
+@dataclass(slots=True)
+class _DirectoryParentBinding:
+    path: pathlib.Path
+    fd: int
+    identity: Identity
+    policy: DirectoryPolicyBinding
+    require_owned_private_parent: bool
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def revalidate(self) -> None:
+        held_policy = validate_directory_policy_fd(
+            self.fd,
+            self.path,
+            private=False,
+        )
+        held_identity = identity_from_stat(os.fstat(self.fd))
+        if self.require_owned_private_parent:
+            _require_owned_private_parent_policy(held_policy, path=self.path)
+        if (
+            not directory_identities_match(self.identity, held_identity)
+            or held_policy != self.policy
+        ):
+            raise OSError(
+                errno.ESTALE,
+                f"test runtime parent identity or access policy changed: {self.path}",
+            )
+
+        reopened_fd, reopened_identity = open_absolute_directory_chain(self.path)
+        try:
+            reopened_policy = validate_directory_policy_fd(
+                reopened_fd,
+                self.path,
+                private=False,
+            )
+            if self.require_owned_private_parent:
+                _require_owned_private_parent_policy(
+                    reopened_policy,
+                    path=self.path,
+                )
+            if (
+                not directory_identities_match(self.identity, reopened_identity)
+                or reopened_policy != self.policy
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"test runtime parent path changed: {self.path}",
+                )
+        finally:
+            os.close(reopened_fd)
+
+
+def _open_directory_parent(
+    raw_path: str | pathlib.Path,
+    *,
+    require_owned_private_parent: bool,
+) -> _DirectoryParentBinding:
+    canonical = _canonical_ascii_directory(raw_path)
+    fd, identity = open_absolute_directory_chain(canonical)
+    try:
+        policy = validate_directory_policy_fd(fd, canonical, private=False)
+        if require_owned_private_parent:
+            _require_owned_private_parent_policy(policy, path=canonical)
+        binding = _DirectoryParentBinding(
+            path=canonical,
+            fd=fd,
+            identity=identity,
+            policy=policy,
+            require_owned_private_parent=require_owned_private_parent,
+        )
+        binding.revalidate()
+        return binding
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
+    try:
+        binding = _open_directory_parent(
+            raw_path,
+            require_owned_private_parent=True,
+        )
+    except (OSError, ValueError):
+        return None
+    try:
+        return binding.path
+    finally:
+        binding.close()
+
+
+def _create_owned_private_directory(
+    parent: pathlib.Path,
+    prefix: str,
+    *,
+    require_owned_private_parent: bool = True,
+) -> pathlib.Path:
+    try:
+        raw_prefix = prefix.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("temporary-directory prefix must be ASCII") from error
+    if (
+        not raw_prefix
+        or len(raw_prefix) > 160
+        or b"/" in raw_prefix
+        or b"\0" in raw_prefix
+        or raw_prefix in {b".", b".."}
+    ):
+        raise ValueError("temporary-directory prefix is unsafe")
+
+    parent_binding = _open_directory_parent(
+        parent,
+        require_owned_private_parent=require_owned_private_parent,
+    )
+    try:
+        for _ in range(128):
+            name = raw_prefix + secrets.token_hex(16).encode("ascii")
+            child_path = parent_binding.path / os.fsdecode(name)
+            parent_binding.revalidate()
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_binding.fd)
+            except FileExistsError:
+                continue
+            try:
+                os.fsync(parent_binding.fd)
+                child_fd, child_identity = open_directory_at(
+                    parent_binding.fd,
+                    name,
+                    path_hint=child_path,
+                    private=True,
+                )
+                try:
+                    child_policy = validate_directory_policy_fd(
+                        child_fd,
+                        child_path,
+                        private=True,
+                    )
+                    parent_binding.revalidate()
+                    path_fd, path_identity = open_absolute_directory_chain(
+                        child_path,
+                        private_leaf=True,
+                    )
+                    try:
+                        path_policy = validate_directory_policy_fd(
+                            path_fd,
+                            child_path,
+                            private=True,
+                        )
+                        if (
+                            not directory_identities_match(
+                                child_identity,
+                                path_identity,
+                            )
+                            or child_policy != path_policy
+                        ):
+                            raise OSError(
+                                errno.ESTALE,
+                                "temporary-directory path identity or access "
+                                "policy changed",
+                            )
+                    finally:
+                        os.close(path_fd)
+                finally:
+                    os.close(child_fd)
+                return child_path
+            except BaseException as error:
+                try:
+                    os.rmdir(name, dir_fd=parent_binding.fd)
+                    os.fsync(parent_binding.fd)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "temporary-directory rollback failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
+        raise FileExistsError("temporary-directory name collision limit reached")
+    finally:
+        parent_binding.close()
 
 
 def _private_runtime_parent() -> pathlib.Path:
@@ -159,17 +332,10 @@ def _process_runtime_root() -> pathlib.Path:
     if _RUNTIME_ROOT is not None and _RUNTIME_ROOT_PID == current_pid:
         return _RUNTIME_ROOT
 
-    root = pathlib.Path(
-        tempfile.mkdtemp(
-            prefix=".codex-review-tests-",
-            dir=_private_runtime_parent(),
-        )
+    root = _create_owned_private_directory(
+        _private_runtime_parent(),
+        ".codex-review-tests-",
     )
-    os.chmod(root, 0o700)
-    metadata = root.stat(follow_symlinks=False)
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
-        shutil.rmtree(root, ignore_errors=True)
-        raise RuntimeError("test runtime root has an unsafe identity")
     _RUNTIME_ROOT = root
     _RUNTIME_ROOT_PID = current_pid
     atexit.register(_cleanup_process_runtime_root, root, current_pid)
@@ -178,13 +344,10 @@ def _process_runtime_root() -> pathlib.Path:
 
 @contextmanager
 def owned_temporary_directory(prefix: str) -> Iterator[pathlib.Path]:
-    path = pathlib.Path(
-        tempfile.mkdtemp(
-            prefix=f".codex-review-{prefix}",
-            dir=_process_runtime_root(),
-        )
+    path = _create_owned_private_directory(
+        _process_runtime_root(),
+        f".codex-review-{prefix}",
     )
-    os.chmod(path, 0o700)
     try:
         yield path
     finally:

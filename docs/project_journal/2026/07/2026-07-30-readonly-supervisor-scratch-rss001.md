@@ -17,6 +17,8 @@ superseded_by:
 - Move every no-child-profile test scratch directory out of the source or
   installed release tree and into the validated owner-private test runtime.
 - Add a fail-closed explicit runtime-parent binding for isolated test runners.
+- Bind every runtime-parent component through no-follow descriptors, reject
+  unsafe ACL/xattr policy, and revalidate each newly created private directory.
 - Exercise the complete deterministic supervisor suite from a read-only copy
   below `/private/tmp`, while keeping scratch under an independently validated
   owner-private root.
@@ -33,9 +35,14 @@ superseded_by:
 - The read-only runner verifies the sticky/world-writable source ancestor,
   object identity, content or link targets, owner/group/mode, file flags,
   ACLs, and xattr values across the installed tree, plus empty runtime residue
-  and all deterministic supervisor tests. Timestamp, link-count, directory-size,
-  and completed child-entry churn are outside the declared protected property
-  and do not create false mutation findings.
+  and all deterministic supervisor tests. Every regular file must retain exactly
+  one link; timestamps, directory link-count and size, and completed child-entry
+  churn are outside the declared protected property and do not create false
+  mutation findings.
+- Runtime-parent selection and child creation use the existing secure-I/O
+  descriptor chain. The held parent and its path must retain object identity,
+  owner/mode, flags, ACL, and xattr policy; every new `0700` child is opened
+  no-follow and compared with a fresh path-bound descriptor before use.
 - Cleanup completes before success output. Every ordinary primary exception is
   reported in the structured summary; a concurrent cleanup error returns
   nonzero, preserves the primary failure and child return code, and reports the
@@ -65,9 +72,15 @@ superseded_by:
   scratch allocation as incompatible with read-only installed releases and
   untrusted `01777` ancestors.
 - Focused no-child regressions passed 6/6.
-- The ordinary deterministic suite passed 615/615 in 242.046 seconds with
+- The ordinary deterministic suite passed 618/618 in 246.656 seconds with
   selected-identity SHA-256
-  `eff105b9684821650adaa25232152b09088f32e51f8d00cb4709fa444fbf4389`.
+  `72a2f40d533257fa90d72fb96cb08e4c2833e65379b05908b7c5ddf54dd88b37`.
+- A replacement-head Fresh Codex review found that the prior runtime-parent
+  selector ignored macOS ACL inheritance and that the read-only tree snapshot
+  did not reject a regular file with an external hardlink alias. New regressions
+  cover an ACL-bearing ancestor, an ACL attached between child creation and
+  validation, and a tree-external hardlink while retaining benign directory
+  link-count churn.
 - A fresh-context Codex reviewer found that the prior `subprocess.run` timeout
   path did not prove descendant closure before deleting the trees. The bounded
   replacement has live regressions for a lingering same-group descendant,
@@ -80,9 +93,9 @@ superseded_by:
   test passed after replacing that assumption with an explicit `dup2`.
 - The final read-only run returned
   `{"child_process_closure":"proven","cleanup_failures":[],"cleanup_status":"complete","install_parent_is_sticky_world_writable":true,"primary_failure":null,"primary_status":"complete","release_tree_immutable":true,"release_tree_property":"object-identity-content-access-policy","retained_paths":[],"returncode":0,"runtime_residue":[],"signal_number":null,"timed_out":false}`.
-- The complete playbook discovery ran 2,822 tests in 1111.726 seconds with
+- The complete playbook discovery ran 2,822 tests in 1171.121 seconds with
   2,815 passes, six platform skips, and one expected nested Seatbelt denial.
-  That exact broker test passed 1/1 outside the parent sandbox in 2.681
+  That exact broker test passed 1/1 outside the parent sandbox in 2.601
   seconds.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.

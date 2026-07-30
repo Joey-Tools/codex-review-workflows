@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest import mock
 
+from . import support
 from . import run_readonly_install_deterministic_supervisor as runner
 from .support import owned_temporary_directory
 
@@ -44,6 +45,111 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self._process_group_exists(process_group),
             f"process group {process_group} remained live",
         )
+
+    def test_runtime_parent_rejects_extended_ancestor_acl(self) -> None:
+        with owned_temporary_directory("runtime-parent-acl-") as root:
+            ancestor = root / "ancestor"
+            ancestor.mkdir(mode=0o700)
+            parent = ancestor / "parent"
+            parent.mkdir(mode=0o700)
+
+            if sys.platform == "darwin":
+                subprocess.run(
+                    (
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow read",
+                        str(ancestor),
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=5,
+                )
+                try:
+                    self.assertIsNone(
+                        support._validated_private_runtime_parent(str(parent))
+                    )
+                finally:
+                    subprocess.run(
+                        ("/bin/chmod", "-N", str(ancestor)),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                        timeout=5,
+                    )
+            else:
+                with mock.patch.object(
+                    support,
+                    "open_absolute_directory_chain",
+                    side_effect=ValueError(
+                        "extended ACLs, xattrs, and quarantine are forbidden"
+                    ),
+                ):
+                    self.assertIsNone(
+                        support._validated_private_runtime_parent(str(parent))
+                    )
+
+    def test_private_directory_creation_rejects_new_child_acl(self) -> None:
+        with owned_temporary_directory("runtime-child-acl-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+
+            if sys.platform == "darwin":
+                original_mkdir = os.mkdir
+
+                def mkdir_with_acl(
+                    name: bytes,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> None:
+                    original_mkdir(name, mode, dir_fd=dir_fd)
+                    child = parent / os.fsdecode(name)
+                    subprocess.run(
+                        (
+                            "/bin/chmod",
+                            "+a",
+                            "everyone allow read,write,execute,"
+                            "file_inherit,directory_inherit",
+                            str(child),
+                        ),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                        timeout=5,
+                    )
+
+                validation_patch = mock.patch.object(
+                    support.os,
+                    "mkdir",
+                    side_effect=mkdir_with_acl,
+                )
+            else:
+                validation_patch = mock.patch.object(
+                    support,
+                    "open_directory_at",
+                    side_effect=ValueError(
+                        "private filesystem object has extended metadata"
+                    ),
+                )
+
+            with (
+                validation_patch,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "extended metadata",
+                ),
+            ):
+                support._create_owned_private_directory(
+                    parent,
+                    ".new-child-",
+                )
+
+            self.assertEqual(tuple(parent.iterdir()), ())
 
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
@@ -93,6 +199,24 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertNotEqual(before[target.name], after[target.name])
             self.assertFalse(runner._tree_property_unchanged(before, after))
 
+    def test_snapshot_rejects_regular_file_external_hardlink_alias(self) -> None:
+        with (
+            owned_temporary_directory("readonly-snapshot-hardlink-tree-") as root,
+            owned_temporary_directory("readonly-snapshot-hardlink-alias-") as outside,
+        ):
+            target = root / "target"
+            target.write_text("content", encoding="utf-8")
+            alias = outside / "alias"
+            os.link(target, alias)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "external hardlink alias",
+                ):
+                    runner._tree_snapshot(root)
+            finally:
+                alias.unlink()
+
     def test_property_comparison_ignores_benign_metadata_churn(self) -> None:
         with owned_temporary_directory("readonly-snapshot-metadata-") as root:
             target = root / "target"
@@ -113,6 +237,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 after = runner._tree_snapshot(root)
 
             self.assertNotEqual(prior_mtime_ns, target.stat().st_mtime_ns)
+            self.assertIsNone(before["."].link_count)
+            self.assertEqual(before[target.name].link_count, 1)
             self.assertTrue(runner._tree_property_unchanged(before, after))
 
     def test_cleanup_restores_write_and_removes_tree(self) -> None:
@@ -351,9 +477,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     return_value=runtime_home,
                 ),
                 mock.patch.object(
-                    runner.tempfile,
-                    "mkdtemp",
-                    side_effect=(str(install_container), str(runtime_parent)),
+                    runner,
+                    "_create_owned_private_directory",
+                    side_effect=(install_container, runtime_parent),
                 ),
                 mock.patch.object(
                     runner.shutil,
@@ -436,9 +562,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     return_value=runtime_home,
                 ),
                 mock.patch.object(
-                    runner.tempfile,
-                    "mkdtemp",
-                    side_effect=(str(install_container), str(runtime_parent)),
+                    runner,
+                    "_create_owned_private_directory",
+                    side_effect=(install_container, runtime_parent),
                 ),
                 mock.patch.object(
                     runner.shutil,

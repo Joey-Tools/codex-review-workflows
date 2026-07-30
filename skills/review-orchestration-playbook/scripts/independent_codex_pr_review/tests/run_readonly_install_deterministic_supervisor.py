@@ -11,7 +11,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from types import FrameType
@@ -23,7 +22,7 @@ from review_supervisor.signal_relay import (
     activate_deferred_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
-from .support import _private_runtime_parent
+from .support import _create_owned_private_directory, _private_runtime_parent
 
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
@@ -52,6 +51,7 @@ class TreeEntrySnapshot:
     gid: int
     mode: int
     flags: int
+    link_count: int | None
     digest: str | None
     xattrs: tuple[tuple[bytes, str], ...]
     acl_entries: tuple[bytes, ...]
@@ -66,6 +66,7 @@ class TreeEntrySnapshot:
             self.gid,
             self.mode,
             self.flags,
+            self.link_count,
             self.digest,
             self.xattrs,
             self.acl_entries,
@@ -330,17 +331,25 @@ def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
         relative = "." if path == root else path.relative_to(root).as_posix()
         mode = stat.S_IMODE(metadata.st_mode)
         if stat.S_ISREG(metadata.st_mode):
+            if metadata.st_nlink != 1:
+                raise RuntimeError(
+                    f"regular file has an external hardlink alias: {relative}"
+                )
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             kind = "file"
+            link_count = metadata.st_nlink
         elif stat.S_ISDIR(metadata.st_mode):
             digest = None
             kind = "directory"
+            link_count = None
         elif stat.S_ISLNK(metadata.st_mode):
             digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
             kind = "symlink"
+            link_count = None
         else:
             digest = None
             kind = "other"
+            link_count = None
         snapshot[relative] = TreeEntrySnapshot(
             kind=kind,
             device=metadata.st_dev,
@@ -350,6 +359,7 @@ def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
             gid=metadata.st_gid,
             mode=mode,
             flags=getattr(metadata, "st_flags", 0),
+            link_count=link_count,
             digest=digest,
             xattrs=_xattr_snapshot(path),
             acl_entries=_acl_entries(path),
@@ -499,22 +509,17 @@ def main() -> int:
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     stage = "install-container"
     try:
-        install_container = pathlib.Path(
-            tempfile.mkdtemp(
-                prefix=".codex-review-readonly-install-",
-                dir=READONLY_INSTALL_PARENT,
-            )
+        install_container = _create_owned_private_directory(
+            READONLY_INSTALL_PARENT,
+            ".codex-review-readonly-install-",
+            require_owned_private_parent=False,
         )
         stage = "runtime-parent"
-        runtime_parent = pathlib.Path(
-            tempfile.mkdtemp(
-                prefix=".codex-review-readonly-runtime-",
-                dir=_private_runtime_parent(),
-            )
+        runtime_parent = _create_owned_private_directory(
+            _private_runtime_parent(),
+            ".codex-review-readonly-runtime-",
         )
         stage = "permissions"
-        os.chmod(install_container, 0o700)
-        os.chmod(runtime_parent, 0o700)
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
         shutil.copytree(
