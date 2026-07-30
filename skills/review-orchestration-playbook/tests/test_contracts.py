@@ -2357,7 +2357,9 @@ class RepositoryContractTest(unittest.TestCase):
             "stable recorded scope",
             "normalized body is exactly `@codex review`",
             "record each request's id, url, `created_at`, `updated_at`, normalized body, and scope",
-            "record every reaction's id, canonical reaction-resource api url",
+            "record every reaction's positive id, `parent_request_id`, the exact",
+            "does not return a reaction self url, so never synthesize one",
+            "stable native identity is the tuple",
             "`parent_request_id`",
             "`issues/comments/<parent_request_id>/reactions?per_page=100` fetch url",
             "`created_at`, content, login, and type",
@@ -4213,9 +4215,6 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> dict[str, object]:
             return {
                 "id": reaction_id,
-                "api_url": (
-                    f"https://api.github.com/repos/OWNER/REPO/reactions/{reaction_id}"
-                ),
                 "parent_request_id": request_id,
                 "parent_reactions_api_url": (
                     "https://api.github.com/repos/OWNER/REPO/issues/comments/"
@@ -4254,7 +4253,6 @@ class RepositoryContractTest(unittest.TestCase):
         }
         reaction_fields = {
             "id",
-            "api_url",
             "parent_request_id",
             "parent_reactions_api_url",
             "created_at",
@@ -4795,11 +4793,6 @@ class RepositoryContractTest(unittest.TestCase):
                     or not user_login
                     or not isinstance(user_type, str)
                     or not user_type
-                    or item.get("api_url")
-                    != (
-                        "https://api.github.com/repos/OWNER/REPO/reactions/"
-                        f"{reaction_id}"
-                    )
                     or item.get("parent_reactions_api_url")
                     != (
                         "https://api.github.com/repos/OWNER/REPO/issues/comments/"
@@ -5018,11 +5011,6 @@ class RepositoryContractTest(unittest.TestCase):
                     or created_at > history_as_of_server_time
                     or not isinstance(content, str)
                     or not content
-                    or item.get("api_url")
-                    != (
-                        "https://api.github.com/repos/OWNER/REPO/reactions/"
-                        f"{reaction_id}"
-                    )
                     or item.get("parent_reactions_api_url")
                     != (
                         "https://api.github.com/repos/OWNER/REPO/issues/comments/"
@@ -5055,19 +5043,30 @@ class RepositoryContractTest(unittest.TestCase):
             selected_request_id = record.get("selected_request_id")
             selected_reaction_id = record.get("selected_reaction_id")
             if plus_ones:
-                selected_plus = max(
-                    plus_ones,
-                    key=lambda item: (int(item["created_at"]), int(item["id"])),
+                selected_plus = next(
+                    (
+                        item
+                        for item in plus_ones
+                        if item["id"] == selected_reaction_id
+                        and item.get("parent_request_id") == selected_request_id
+                    ),
+                    None,
                 )
                 if (
                     type(selected_request_id) is not int
                     or selected_request_id <= 0
                     or type(selected_reaction_id) is not int
                     or selected_reaction_id <= 0
-                    or selected_plus["id"] != selected_reaction_id
-                    or selected_plus.get("parent_request_id") != selected_request_id
+                    or selected_plus is None
                 ):
                     return None
+                if not artifact_bases:
+                    latest_plus = max(
+                        plus_ones,
+                        key=lambda item: (int(item["created_at"]), int(item["id"])),
+                    )
+                    if latest_plus is not selected_plus:
+                        return None
             elif selected_request_id is not None or selected_reaction_id is not None:
                 return None
 
@@ -5096,11 +5095,6 @@ class RepositoryContractTest(unittest.TestCase):
                     _,
                     _,
                 ) = max(latest_artifacts, key=artifact_precedence)
-                if any(
-                    int(item["created_at"]) >= server_time
-                    for item in exact_provider_reactions
-                ):
-                    return None
             else:
                 if not request_times or not exact_provider_reactions:
                     return None
@@ -5201,14 +5195,170 @@ class RepositoryContractTest(unittest.TestCase):
                 "final_candidates": clone(candidates),
             }
 
-        def classify_fallback(
-            profile: str,
+        def compute_provider_profile(
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
             current: dict[str, object],
         ) -> str:
-            if profile != "thumbs-up-clean":
+            expected_history_fields = {
+                "complete",
+                "repository",
+                "as_of_source",
+                "as_of_api_url",
+                "as_of_server_time",
+                "window_seconds",
+                "window_start_exclusive",
+                "window_end_inclusive",
+                "candidate_universe_count",
+                "initial_inventory",
+                "final_inventory",
+                "initial_candidates",
+                "final_candidates",
+            }
+            if (
+                not isinstance(candidate_history, dict)
+                or set(candidate_history) != expected_history_fields
+                or candidate_history.get("complete") is not True
+                or candidate_history.get("repository") != current_repository
+                or candidate_history.get("as_of_source")
+                != "github-response-date-header"
+                or candidate_history.get("as_of_api_url")
+                != (
+                    f"https://api.github.com/repos/{current_repository}/pulls/"
+                    f"{current_pr}"
+                )
+                or type(candidate_history.get("as_of_server_time")) is not int
+                or candidate_history.get("as_of_server_time")
+                != history_as_of_server_time
+                or type(candidate_history.get("window_seconds")) is not int
+                or candidate_history.get("window_seconds") != history_window_seconds
+                or type(candidate_history.get("window_start_exclusive")) is not int
+                or candidate_history.get("window_start_exclusive")
+                != history_start_exclusive
+                or type(candidate_history.get("window_end_inclusive")) is not int
+                or candidate_history.get("window_end_inclusive")
+                != history_as_of_server_time
+            ):
+                return "unknown"
+            initial_candidates = candidate_history.get("initial_candidates")
+            final_candidates = candidate_history.get("final_candidates")
+            initial_inventory = candidate_history.get("initial_inventory")
+            final_inventory = candidate_history.get("final_inventory")
+            if (
+                not isinstance(initial_candidates, list)
+                or not isinstance(final_candidates, list)
+                or not typed_json_equal(initial_candidates, final_candidates)
+                or type(candidate_history.get("candidate_universe_count")) is not int
+                or candidate_history.get("candidate_universe_count")
+                != len(final_candidates)
+                or not isinstance(initial_inventory, dict)
+                or not isinstance(final_inventory, dict)
+                or not typed_json_equal(initial_inventory, final_inventory)
+                or not typed_json_equal(
+                    final_inventory,
+                    universe_inventory(final_candidates),
+                )
+            ):
+                return "unknown"
+
+            ordering_keys: set[tuple[int, int]] = set()
+            scope_keys: set[tuple[object, ...]] = set()
+            ordered: list[tuple[tuple[int, int], str, dict[str, object]]] = []
+
+            def carrier_kind(basis_kind: object) -> str | None:
+                if basis_kind == "reaction":
+                    return "reaction"
+                if basis_kind in {
+                    "terminal-payload",
+                    "active-top-level-finding",
+                    "unresolved-thread-finding",
+                }:
+                    return "terminal-payload"
+                return None
+
+            for candidate in final_candidates:
+                if not isinstance(candidate, dict):
+                    return "unknown"
+                candidate_scope_key = scope_key(candidate)
+                ordering_key = candidate_order_basis(candidate)
+                basis = candidate.get("candidate_basis")
+                candidate_carrier = (
+                    carrier_kind(basis.get("kind")) if isinstance(basis, dict) else None
+                )
+                if (
+                    candidate_scope_key is None
+                    or candidate_scope_key == current_scope_key
+                    or candidate_scope_key in scope_keys
+                    or ordering_key is None
+                    or ordering_key in ordering_keys
+                    or not (
+                        history_start_exclusive
+                        < ordering_key[0]
+                        <= history_as_of_server_time
+                    )
+                    or not isinstance(basis, dict)
+                    or candidate_carrier is None
+                ):
+                    return "unknown"
+                scope_keys.add(candidate_scope_key)
+                ordering_keys.add(ordering_key)
+                ordered.append((ordering_key, candidate_carrier, candidate))
+
+            current_ordering_key = candidate_order_basis(current)
+            current_basis = current.get("candidate_basis")
+            current_carrier = (
+                carrier_kind(current_basis.get("kind"))
+                if isinstance(current_basis, dict)
+                else None
+            )
+            if (
+                not current_lifecycle_is_eligible(current)
+                or scope_key(current) != current_scope_key
+                or current_ordering_key is None
+                or current_ordering_key[0] > history_as_of_server_time
+                or not isinstance(current_basis, dict)
+                or current_carrier is None
+            ):
+                return "unknown"
+
+            ordered.sort(key=lambda item: item[0], reverse=True)
+            selected = ordered[:10]
+            selected_kinds = [item[1] for item in selected]
+            observed_kinds = {*selected_kinds, current_carrier}
+            if observed_kinds == {"terminal-payload"}:
+                return "terminal-payload"
+            if "terminal-payload" in observed_kinds:
+                return "mixed"
+            if (
+                len(selected) < 3
+                or not declaration_is_authoritative(provider_declaration)
+                or any(
+                    classify_reaction_scope(candidate) != "clean"
+                    for _, _, candidate in selected
+                )
+                or classify_reaction_scope(
+                    current,
+                    expected_scope=current_scope_key,
+                )
+                != "clean"
+            ):
+                return "unknown"
+            return "thumbs-up-clean"
+
+        def classify_fallback(
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current: dict[str, object],
+        ) -> str:
+            profile = compute_provider_profile(
+                provider_declaration,
+                candidate_history,
+                current,
+            )
+            if profile in {"terminal-payload", "mixed"}:
                 return "not-clean"
+            if profile != "thumbs-up-clean":
+                return "unknown"
             if not declaration_is_authoritative(provider_declaration):
                 return "unknown"
             if (
@@ -5423,6 +5573,489 @@ class RepositoryContractTest(unittest.TestCase):
             record["candidate_basis"]["server_time"] = reaction_time
             return restamp(record)
 
+        def same_scope_request_audit(
+            record: dict[str, object],
+        ) -> list[dict[str, object]] | None:
+            raw_requests = record.get("requests")
+            raw_reactions = record.get("reactions")
+            if not isinstance(raw_requests, list) or not isinstance(
+                raw_reactions,
+                list,
+            ):
+                return None
+            audit: list[dict[str, object]] = []
+            for raw_request in raw_requests:
+                if not isinstance(raw_request, dict):
+                    return None
+                request_id = raw_request.get("id")
+                if type(request_id) is not int:
+                    return None
+                returned_reactions = [
+                    clone(item)
+                    for item in raw_reactions
+                    if isinstance(item, dict)
+                    and item.get("parent_request_id") == request_id
+                ]
+                audit.append(
+                    {
+                        "request": clone(raw_request),
+                        "reactions": returned_reactions,
+                    }
+                )
+            return audit
+
+        def selected_reaction_provenance(
+            record: dict[str, object],
+        ) -> tuple[dict[str, object], dict[str, object]] | None:
+            selected_request_id = record.get("selected_request_id")
+            selected_reaction_id = record.get("selected_reaction_id")
+            raw_requests = record.get("requests")
+            raw_reactions = record.get("reactions")
+            if (
+                type(selected_request_id) is not int
+                or type(selected_reaction_id) is not int
+                or not isinstance(raw_requests, list)
+                or not isinstance(raw_reactions, list)
+            ):
+                return None
+            selected_request = next(
+                (
+                    item
+                    for item in raw_requests
+                    if isinstance(item, dict) and item.get("id") == selected_request_id
+                ),
+                None,
+            )
+            selected_reaction = next(
+                (
+                    item
+                    for item in raw_reactions
+                    if isinstance(item, dict) and item.get("id") == selected_reaction_id
+                ),
+                None,
+            )
+            if (
+                not isinstance(selected_request, dict)
+                or not isinstance(selected_reaction, dict)
+                or selected_reaction.get("parent_request_id") != selected_request_id
+            ):
+                return None
+            return (selected_request, selected_reaction)
+
+        def ordered_selected_history(
+            candidate_history: dict[str, object],
+        ) -> list[dict[str, object]] | None:
+            final_candidates = candidate_history.get("final_candidates")
+            if not isinstance(final_candidates, list):
+                return None
+            ordered: list[tuple[tuple[int, int], dict[str, object]]] = []
+            for candidate in final_candidates:
+                if not isinstance(candidate, dict):
+                    return None
+                ordering_key = candidate_order_basis(candidate)
+                if ordering_key is None:
+                    return None
+                ordered.append((ordering_key, candidate))
+            ordered.sort(key=lambda item: item[0], reverse=True)
+            return [candidate for _, candidate in ordered[:10]]
+
+        def report_candidate_snapshots(
+            candidates: object,
+        ) -> list[dict[str, object]] | None:
+            if not isinstance(candidates, list):
+                return None
+            snapshots: list[dict[str, object]] = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    return None
+                audit = same_scope_request_audit(candidate)
+                if audit is None:
+                    return None
+                snapshots.append(
+                    {
+                        **record_snapshot(candidate),
+                        "same_scope_request_audit": clone(audit),
+                    }
+                )
+            return snapshots
+
+        def reaction_evidence_basis_from_inputs(
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+        ) -> dict[str, object] | None:
+            if (
+                compute_provider_profile(
+                    provider_declaration,
+                    candidate_history,
+                    current_record,
+                )
+                != "thumbs-up-clean"
+                or classify_fallback(
+                    provider_declaration,
+                    candidate_history,
+                    current_record,
+                )
+                != "clean"
+                or not isinstance(provider_declaration, dict)
+            ):
+                return None
+            declaration_final = provider_declaration.get("final_snapshot")
+            selected_history = ordered_selected_history(candidate_history)
+            current_provenance = selected_reaction_provenance(current_record)
+            current_audit = same_scope_request_audit(current_record)
+            initial_report_candidates = report_candidate_snapshots(
+                candidate_history.get("initial_candidates")
+            )
+            final_report_candidates = report_candidate_snapshots(
+                candidate_history.get("final_candidates")
+            )
+            if (
+                not isinstance(declaration_final, dict)
+                or selected_history is None
+                or current_provenance is None
+                or current_audit is None
+                or initial_report_candidates is None
+                or final_report_candidates is None
+                or not typed_json_equal(
+                    initial_report_candidates,
+                    final_report_candidates,
+                )
+            ):
+                return None
+
+            provider_declaration_basis = {
+                "initial_snapshot": clone(provider_declaration["initial_snapshot"]),
+                "final_snapshot": clone(provider_declaration["final_snapshot"]),
+                **clone(declaration_final),
+            }
+            history_window = {
+                "as_of_source": candidate_history["as_of_source"],
+                "as_of_api_url": candidate_history["as_of_api_url"],
+                "as_of_server_time": candidate_history["as_of_server_time"],
+                "window_seconds": candidate_history["window_seconds"],
+                "window_start_exclusive": candidate_history["window_start_exclusive"],
+                "window_end_inclusive": candidate_history["window_end_inclusive"],
+                "candidate_universe_count": candidate_history[
+                    "candidate_universe_count"
+                ],
+            }
+            historical_universe = {
+                "initial_inventory": clone(candidate_history["initial_inventory"]),
+                "final_inventory": clone(candidate_history["final_inventory"]),
+                "initial_candidates": initial_report_candidates,
+                "final_candidates": final_report_candidates,
+            }
+            current_request, current_reaction = current_provenance
+            current_snapshot = {
+                **record_snapshot(current_record),
+                "same_scope_request_audit": clone(current_audit),
+            }
+            current_basis = {
+                "initial_snapshot": clone(current_snapshot),
+                "final_snapshot": clone(current_snapshot),
+                **clone(current_snapshot),
+                "request": clone(current_request),
+                "reaction": clone(current_reaction),
+            }
+
+            sample_bases: list[dict[str, object]] = []
+            for historical_record in selected_history:
+                provenance = selected_reaction_provenance(historical_record)
+                audit = same_scope_request_audit(historical_record)
+                historical_scope = historical_record.get("scope")
+                historical_basis = historical_record.get("candidate_basis")
+                if (
+                    provenance is None
+                    or audit is None
+                    or not isinstance(historical_scope, dict)
+                    or not isinstance(historical_basis, dict)
+                ):
+                    return None
+                historical_request, historical_reaction = provenance
+                sample_bases.append(
+                    {
+                        "scope": clone(historical_scope),
+                        "candidate_basis": clone(historical_basis),
+                        "request": clone(historical_request),
+                        "reaction": clone(historical_reaction),
+                        "same_scope_request_audit": clone(audit),
+                    }
+                )
+            return {
+                "kind": "reaction",
+                "provider_declaration": provider_declaration_basis,
+                "history_window": history_window,
+                "historical_universe": historical_universe,
+                "current": current_basis,
+                "samples": sample_bases,
+            }
+
+        def request_policy_from_inputs(
+            lane_state: str,
+            current_record: dict[str, object],
+            local_lane_timing: object,
+        ) -> dict[str, object]:
+            if lane_state == "pre-provider-ineligible":
+                return {"status": "not-applicable", "warnings": []}
+            initial_snapshot = current_record.get("initial_snapshot")
+            final_snapshot = current_record.get("final_snapshot")
+            if (
+                set(current_record) != record_fields
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or not typed_json_equal(initial_snapshot, final_snapshot)
+                or not typed_json_equal(
+                    final_snapshot,
+                    record_snapshot(current_record),
+                )
+            ):
+                return {"status": "unknown", "warnings": []}
+            pagination = current_record.get("pagination")
+            if (
+                current_record.get("complete") is not True
+                or not isinstance(pagination, dict)
+                or set(pagination) != set(required_pagination)
+                or pagination.get("request_comments") is not True
+                or pagination.get("request_reactions") is not True
+            ):
+                return {"status": "unknown", "warnings": []}
+            raw_requests = current_record.get("requests")
+            current_scope = scope_key(current_record)
+            if not isinstance(raw_requests, list) or current_scope is None:
+                return {"status": "unknown", "warnings": []}
+            current_pr_number = current_scope[1]
+            accepted_request_ids: set[int] = set()
+            request_times: list[int] = []
+            for item in raw_requests:
+                if not isinstance(item, dict) or set(item) != request_fields:
+                    return {"status": "unknown", "warnings": []}
+                request_id = item.get("id")
+                created_at = item.get("created_at")
+                updated_at = item.get("updated_at")
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in accepted_request_ids
+                    or type(created_at) is not int
+                    or type(updated_at) is not int
+                    or created_at <= 0
+                    or updated_at < created_at
+                    or type(item.get("request_server_time")) is not int
+                    or item.get("request_server_time")
+                    != (created_at if updated_at == created_at else updated_at)
+                    or not isinstance(item.get("request_server_time_field"), str)
+                    or item.get("request_server_time_field")
+                    != ("created_at" if updated_at == created_at else "updated_at")
+                    or item.get("normalized_body") != "@codex review"
+                    or item.get("url")
+                    != (
+                        f"https://github.com/{current_repository}/pull/"
+                        f"{current_pr_number}#issuecomment-{request_id}"
+                    )
+                ):
+                    return {"status": "unknown", "warnings": []}
+                accepted_request_ids.add(request_id)
+                request_times.append(item["request_server_time"])
+            warnings = ["duplicate-observed"] if len(raw_requests) > 1 else []
+            if request_times:
+                if (
+                    not isinstance(local_lane_timing, dict)
+                    or set(local_lane_timing) != {"initial_snapshot", "final_snapshot"}
+                    or not typed_json_equal(
+                        local_lane_timing.get("initial_snapshot"),
+                        local_lane_timing.get("final_snapshot"),
+                    )
+                ):
+                    return {"status": "unknown", "warnings": warnings}
+                final_timing = local_lane_timing.get("final_snapshot")
+                if (
+                    not isinstance(final_timing, dict)
+                    or set(final_timing)
+                    != {"codex_terminal_time", "claude_terminal_time"}
+                    or type(final_timing.get("codex_terminal_time")) is not int
+                    or final_timing["codex_terminal_time"] <= 0
+                    or type(final_timing.get("claude_terminal_time")) is not int
+                    or final_timing["claude_terminal_time"] <= 0
+                ):
+                    return {"status": "unknown", "warnings": warnings}
+                latest_local_terminal_time = max(final_timing.values())
+                if latest_local_terminal_time in request_times:
+                    return {"status": "unknown", "warnings": warnings}
+                if any(
+                    request_time < latest_local_terminal_time
+                    for request_time in request_times
+                ):
+                    warnings.insert(0, "early-request-observed")
+            return {
+                "status": "warning" if warnings else "compliant",
+                "warnings": warnings,
+            }
+
+        def terminal_evidence_basis_from_inputs(
+            current_record: dict[str, object],
+            *,
+            expected_outcome: str,
+        ) -> dict[str, object] | None:
+            if expected_outcome not in {"clean", "findings"}:
+                return None
+            ordering_key = candidate_order_basis(current_record)
+            candidate_basis = current_record.get("candidate_basis")
+            evidence_state = current_record.get("evidence_state")
+            current_scope = scope_key(current_record)
+            if (
+                ordering_key is None
+                or not current_lifecycle_is_eligible(current_record)
+                or not isinstance(candidate_basis, dict)
+                or set(candidate_basis) != {"kind", "server_time", "stable_artifact_id"}
+                or not isinstance(evidence_state, dict)
+                or current_scope is None
+            ):
+                return None
+            basis_kind = candidate_basis.get("kind")
+            artifact_field_by_kind = {
+                "terminal-payload": "terminal_payloads",
+                "active-top-level-finding": "active_top_level_findings",
+                "unresolved-thread-finding": "unresolved_thread_findings",
+            }
+            artifact_field = artifact_field_by_kind.get(basis_kind)
+            if artifact_field is None:
+                return None
+            raw_artifacts = evidence_state.get(artifact_field)
+            if not isinstance(raw_artifacts, list):
+                return None
+            selected_artifacts: list[dict[str, object]] = []
+            for artifact in raw_artifacts:
+                validated = validate_candidate_artifact(
+                    artifact,
+                    expected_kind=str(basis_kind),
+                    expected_scope=current_scope,
+                )
+                if (
+                    validated is not None
+                    and validated[0] == ordering_key[0]
+                    and validated[1] == ordering_key[1]
+                    and validated[2] == basis_kind
+                    and validated[3] == expected_outcome
+                    and isinstance(artifact, dict)
+                ):
+                    selected_artifacts.append(artifact)
+            initial_snapshot = current_record.get("initial_snapshot")
+            final_snapshot = current_record.get("final_snapshot")
+            if (
+                len(selected_artifacts) != 1
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or not typed_json_equal(initial_snapshot, final_snapshot)
+            ):
+                return None
+            selected_artifact = selected_artifacts[0]
+            selected_final = selected_artifact.get("final_snapshot")
+            if not isinstance(selected_final, dict):
+                return None
+            return {
+                "kind": selected_final["channel"],
+                "selection_snapshots": {
+                    "initial": clone(initial_snapshot),
+                    "final": clone(final_snapshot),
+                },
+                "artifact": clone(selected_artifact),
+            }
+
+        def expected_report_from_inputs(
+            lane_state: str,
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+            local_lane_timing: object,
+        ) -> dict[str, object] | None:
+            if lane_state not in {
+                "pre-provider-ineligible",
+                "eligible-waiting",
+                "accepted-terminal-clean",
+                "accepted-terminal-findings",
+                "accepted-reaction-clean",
+                "inconclusive",
+            }:
+                return None
+            if lane_state == "pre-provider-ineligible":
+                provider_profile: str | None = None
+                evidence_basis: dict[str, object] | None = None
+            else:
+                provider_profile = compute_provider_profile(
+                    provider_declaration,
+                    candidate_history,
+                    current_record,
+                )
+                evidence_basis = None
+                if lane_state in {
+                    "accepted-terminal-clean",
+                    "accepted-terminal-findings",
+                }:
+                    if provider_profile not in {"terminal-payload", "mixed"}:
+                        return None
+                    evidence_basis = terminal_evidence_basis_from_inputs(
+                        current_record,
+                        expected_outcome=(
+                            "clean"
+                            if lane_state == "accepted-terminal-clean"
+                            else "findings"
+                        ),
+                    )
+                    if evidence_basis is None:
+                        return None
+                elif lane_state == "accepted-reaction-clean":
+                    if (
+                        provider_profile != "thumbs-up-clean"
+                        or classify_fallback(
+                            provider_declaration,
+                            candidate_history,
+                            current_record,
+                        )
+                        != "clean"
+                    ):
+                        return None
+                    evidence_basis = reaction_evidence_basis_from_inputs(
+                        provider_declaration,
+                        candidate_history,
+                        current_record,
+                    )
+                    if evidence_basis is None:
+                        return None
+            return {
+                "request_policy": request_policy_from_inputs(
+                    lane_state,
+                    current_record,
+                    local_lane_timing,
+                ),
+                "provider_profile": provider_profile,
+                "evidence_basis": evidence_basis,
+            }
+
+        def validate_complete_report(
+            report: object,
+            *,
+            lane_state: str,
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+            local_lane_timing: object,
+        ) -> bool:
+            expected = expected_report_from_inputs(
+                lane_state,
+                provider_declaration,
+                candidate_history,
+                current_record,
+                local_lane_timing,
+            )
+            return (
+                expected is not None
+                and isinstance(report, dict)
+                and set(report)
+                == {"request_policy", "provider_profile", "evidence_basis"}
+                and typed_json_equal(report, expected)
+            )
+
         samples = [sample(pr) for pr in (2, 3, 4)]
         current = outcome(
             current_pr,
@@ -5505,23 +6138,898 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(samples),
                 current,
             ),
             "clean",
         )
-        for profile in ("terminal-payload", "mixed", "unknown"):
-            with self.subTest(non_reaction_profile=profile):
+        self.assertEqual(
+            compute_provider_profile(declaration, history(samples), current),
+            "thumbs-up-clean",
+        )
+
+        def with_terminal_payload(
+            record: dict[str, object],
+            artifact_id: int,
+            *,
+            artifact_outcome: str = "clean",
+        ) -> dict[str, object]:
+            reaction_times = [
+                item["created_at"]
+                for item in record["reactions"]
+                if isinstance(item, dict) and type(item.get("created_at")) is int
+            ]
+            terminal_time = max(reaction_times) + 1
+            record["evidence_state"]["terminal_payloads"] = [
+                complete_review_artifact(
+                    record,
+                    artifact_id,
+                    terminal_time,
+                    outcome=artifact_outcome,
+                )
+            ]
+            record["candidate_basis"] = {
+                "kind": "terminal-payload",
+                "server_time": terminal_time,
+                "stable_artifact_id": artifact_id,
+            }
+            return restamp(record)
+
+        terminal_history = clone(samples)
+        assert isinstance(terminal_history, list)
+        for index, historical_record in enumerate(terminal_history, start=1):
+            with_terminal_payload(historical_record, 80_000 + index)
+        terminal_current = clone(current)
+        assert isinstance(terminal_current, dict)
+        with_terminal_payload(terminal_current, 80_100)
+        profile_matrix = {
+            "terminal-payload": (
+                history(terminal_history),
+                terminal_current,
+            ),
+            "mixed": (
+                history(samples),
+                terminal_current,
+            ),
+            "thumbs-up-clean": (
+                history(samples),
+                current,
+            ),
+            "unknown": (
+                history(samples[:2]),
+                current,
+            ),
+        }
+        for expected_profile, (
+            profile_history,
+            profile_current,
+        ) in profile_matrix.items():
+            with self.subTest(computed_provider_profile=expected_profile):
                 self.assertEqual(
-                    classify_fallback(
-                        profile,
+                    compute_provider_profile(
+                        declaration,
+                        profile_history,
+                        profile_current,
+                    ),
+                    expected_profile,
+                )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                history(terminal_history),
+                terminal_current,
+            ),
+            "not-clean",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                history(samples),
+                terminal_current,
+            ),
+            "not-clean",
+        )
+        terminal_current_with_later_reactions: dict[str, dict[str, object]] = {}
+        for offset, later_content in enumerate(("eyes", "+1"), start=1):
+            with self.subTest(current_terminal_basis_with_later_reaction=later_content):
+                terminal_current_with_later_reaction = clone(terminal_current)
+                assert isinstance(terminal_current_with_later_reaction, dict)
+                selected_request_id = terminal_current_with_later_reaction[
+                    "selected_request_id"
+                ]
+                terminal_basis = clone(
+                    terminal_current_with_later_reaction["candidate_basis"]
+                )
+                assert isinstance(selected_request_id, int)
+                assert isinstance(terminal_basis, dict)
+                terminal_current_with_later_reaction["reactions"].append(
+                    reaction(
+                        80_100 + offset,
+                        selected_request_id,
+                        int(terminal_basis["server_time"]) + offset,
+                        content=later_content,
+                    )
+                )
+                restamp(terminal_current_with_later_reaction)
+                self.assertEqual(
+                    candidate_order_basis(terminal_current_with_later_reaction),
+                    (
+                        terminal_basis["server_time"],
+                        terminal_basis["stable_artifact_id"],
+                    ),
+                )
+                self.assertEqual(
+                    compute_provider_profile(
                         declaration,
                         history(samples),
-                        current,
+                        terminal_current_with_later_reaction,
+                    ),
+                    "mixed",
+                )
+                self.assertEqual(
+                    classify_fallback(
+                        declaration,
+                        history(samples),
+                        terminal_current_with_later_reaction,
                     ),
                     "not-clean",
+                )
+                terminal_current_with_later_reactions[later_content] = (
+                    terminal_current_with_later_reaction
+                )
+
+        def lane_timing(
+            codex_terminal_time: object,
+            claude_terminal_time: object,
+        ) -> dict[str, object]:
+            snapshot = {
+                "codex_terminal_time": codex_terminal_time,
+                "claude_terminal_time": claude_terminal_time,
+            }
+            return {
+                "initial_snapshot": clone(snapshot),
+                "final_snapshot": clone(snapshot),
+            }
+
+        normal_lane_timing = lane_timing(1, 2)
+        terminal_report_cases = {
+            "terminal-payload": (
+                history(terminal_history),
+                terminal_current,
+                "terminal-payload",
+            ),
+            "mixed-later-eyes": (
+                history(samples),
+                terminal_current_with_later_reactions["eyes"],
+                "mixed",
+            ),
+            "mixed-later-plus-one": (
+                history(samples),
+                terminal_current_with_later_reactions["+1"],
+                "mixed",
+            ),
+        }
+        for (
+            case_name,
+            (
+                terminal_report_history,
+                terminal_report_current,
+                expected_terminal_profile,
+            ),
+        ) in terminal_report_cases.items():
+            with self.subTest(accepted_terminal_report=case_name):
+                terminal_report = expected_report_from_inputs(
+                    "accepted-terminal-clean",
+                    declaration,
+                    terminal_report_history,
+                    terminal_report_current,
+                    normal_lane_timing,
+                )
+                self.assertIsNotNone(terminal_report)
+                assert isinstance(terminal_report, dict)
+                self.assertEqual(
+                    terminal_report["provider_profile"],
+                    expected_terminal_profile,
+                )
+                terminal_report_basis = terminal_report["evidence_basis"]
+                assert isinstance(terminal_report_basis, dict)
+                self.assertEqual(
+                    set(terminal_report_basis),
+                    {"kind", "selection_snapshots", "artifact"},
+                )
+                self.assertEqual(
+                    terminal_report_basis["kind"],
+                    "pull-request-review",
+                )
+                self.assertTrue(
+                    typed_json_equal(
+                        terminal_report_basis["selection_snapshots"]["initial"],
+                        terminal_report_basis["selection_snapshots"]["final"],
+                    )
+                )
+                self.assertTrue(
+                    typed_json_equal(
+                        terminal_report_basis["artifact"]["initial_snapshot"],
+                        terminal_report_basis["artifact"]["final_snapshot"],
+                    )
+                )
+                self.assertTrue(
+                    validate_complete_report(
+                        terminal_report,
+                        lane_state="accepted-terminal-clean",
+                        provider_declaration=declaration,
+                        candidate_history=terminal_report_history,
+                        current_record=terminal_report_current,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
+                tampered_terminal_report = clone(terminal_report)
+                assert isinstance(tampered_terminal_report, dict)
+                tampered_terminal_report["evidence_basis"]["artifact"][
+                    "final_snapshot"
+                ]["body"] = "No findings. "
+                self.assertFalse(
+                    validate_complete_report(
+                        tampered_terminal_report,
+                        lane_state="accepted-terminal-clean",
+                        provider_declaration=declaration,
+                        candidate_history=terminal_report_history,
+                        current_record=terminal_report_current,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
+
+        terminal_findings_current = clone(current)
+        assert isinstance(terminal_findings_current, dict)
+        with_terminal_payload(
+            terminal_findings_current,
+            80_200,
+            artifact_outcome="findings",
+        )
+        terminal_findings_report = expected_report_from_inputs(
+            "accepted-terminal-findings",
+            declaration,
+            history(samples),
+            terminal_findings_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_findings_report)
+        assert isinstance(terminal_findings_report, dict)
+        self.assertEqual(terminal_findings_report["provider_profile"], "mixed")
+        self.assertIsNotNone(terminal_findings_report["evidence_basis"])
+        self.assertTrue(
+            validate_complete_report(
+                terminal_findings_report,
+                lane_state="accepted-terminal-findings",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=terminal_findings_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                history(samples),
+                terminal_findings_current,
+                normal_lane_timing,
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-findings",
+                declaration,
+                history(samples),
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        duplicate_current = clone(current)
+        assert isinstance(duplicate_current, dict)
+        duplicate_current["requests"].insert(0, request(9, 5, pr=current_pr))
+        restamp(duplicate_current)
+        complete_report = expected_report_from_inputs(
+            "accepted-reaction-clean",
+            declaration,
+            history(samples),
+            duplicate_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(complete_report)
+        assert isinstance(complete_report, dict)
+        self.assertTrue(
+            validate_complete_report(
+                complete_report,
+                lane_state="accepted-reaction-clean",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=duplicate_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+        self.assertEqual(
+            complete_report["request_policy"],
+            {
+                "status": "warning",
+                "warnings": ["duplicate-observed"],
+            },
+        )
+        early_lane_timing = lane_timing(5, 15)
+        early_report = expected_report_from_inputs(
+            "accepted-reaction-clean",
+            declaration,
+            history(samples),
+            current,
+            early_lane_timing,
+        )
+        self.assertIsNotNone(early_report)
+        assert isinstance(early_report, dict)
+        self.assertEqual(
+            early_report["request_policy"],
+            {
+                "status": "warning",
+                "warnings": ["early-request-observed"],
+            },
+        )
+        self.assertTrue(
+            validate_complete_report(
+                early_report,
+                lane_state="accepted-reaction-clean",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=current,
+                local_lane_timing=early_lane_timing,
+            )
+        )
+        combined_warning_timing = lane_timing(6, 8)
+        combined_warning_report = expected_report_from_inputs(
+            "accepted-reaction-clean",
+            declaration,
+            history(samples),
+            duplicate_current,
+            combined_warning_timing,
+        )
+        self.assertIsNotNone(combined_warning_report)
+        assert isinstance(combined_warning_report, dict)
+        self.assertEqual(
+            combined_warning_report["request_policy"],
+            {
+                "status": "warning",
+                "warnings": [
+                    "early-request-observed",
+                    "duplicate-observed",
+                ],
+            },
+        )
+        for name, unknown_timing in {
+            "missing": None,
+            "equal-time": lane_timing(5, 10),
+            "boolean-type": lane_timing(False, 2),
+        }.items():
+            with self.subTest(request_policy_unknown_timing=name):
+                unknown_timing_report = expected_report_from_inputs(
+                    "accepted-reaction-clean",
+                    declaration,
+                    history(samples),
+                    current,
+                    unknown_timing,
+                )
+                self.assertIsNotNone(unknown_timing_report)
+                assert isinstance(unknown_timing_report, dict)
+                self.assertEqual(
+                    unknown_timing_report["request_policy"],
+                    {"status": "unknown", "warnings": []},
+                )
+                self.assertTrue(
+                    validate_complete_report(
+                        unknown_timing_report,
+                        lane_state="accepted-reaction-clean",
+                        provider_declaration=declaration,
+                        candidate_history=history(samples),
+                        current_record=current,
+                        local_lane_timing=unknown_timing,
+                    )
+                )
+        timing_reread_drift = lane_timing(1, 2)
+        timing_reread_drift["final_snapshot"]["claude_terminal_time"] = 3
+        drift_report = expected_report_from_inputs(
+            "accepted-reaction-clean",
+            declaration,
+            history(samples),
+            current,
+            timing_reread_drift,
+        )
+        self.assertIsNotNone(drift_report)
+        assert isinstance(drift_report, dict)
+        self.assertEqual(
+            drift_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        self.assertFalse(
+            validate_complete_report(
+                complete_report,
+                lane_state="accepted-reaction-clean",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=duplicate_current,
+                local_lane_timing=combined_warning_timing,
+            )
+        )
+        self.assertEqual(
+            complete_report["provider_profile"],
+            "thumbs-up-clean",
+        )
+        complete_basis = complete_report["evidence_basis"]
+        assert isinstance(complete_basis, dict)
+        self.assertEqual(
+            set(complete_basis),
+            {
+                "kind",
+                "provider_declaration",
+                "history_window",
+                "historical_universe",
+                "current",
+                "samples",
+            },
+        )
+        report_current = complete_basis["current"]
+        report_samples = complete_basis["samples"]
+        assert isinstance(report_current, dict)
+        assert isinstance(report_samples, list)
+        self.assertEqual(len(report_samples), 3)
+        self.assertIn("same_scope_request_audit", report_current)
+        self.assertTrue(
+            all(
+                isinstance(item, dict) and "same_scope_request_audit" in item
+                for item in report_samples
+            )
+        )
+        report_universe = complete_basis["historical_universe"]
+        assert isinstance(report_universe, dict)
+        for candidate_array_name in ("initial_candidates", "final_candidates"):
+            report_candidates = report_universe[candidate_array_name]
+            assert isinstance(report_candidates, list)
+            self.assertTrue(
+                all(
+                    isinstance(item, dict) and "same_scope_request_audit" in item
+                    for item in report_candidates
+                )
+            )
+        current_report_reaction = report_current["reaction"]
+        assert isinstance(current_report_reaction, dict)
+        self.assertNotIn("api_url", current_report_reaction)
+        self.assertEqual(
+            (
+                current_report_reaction["parent_reactions_api_url"],
+                current_report_reaction["id"],
+            ),
+            (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments/"
+                "10/reactions?per_page=100",
+                100,
+            ),
+        )
+
+        report_near_misses: dict[str, object] = {}
+        for field in (
+            "request_policy",
+            "provider_profile",
+            "evidence_basis",
+        ):
+            missing_outer_field = clone(complete_report)
+            assert isinstance(missing_outer_field, dict)
+            del missing_outer_field[field]
+            report_near_misses[f"missing-outer-{field}"] = missing_outer_field
+        extended_report = clone(complete_report)
+        assert isinstance(extended_report, dict)
+        extended_report["outcome_override"] = "clean"
+        report_near_misses["unknown-outer-field"] = extended_report
+
+        for field in ("status", "warnings"):
+            missing_request_policy_field = clone(complete_report)
+            assert isinstance(missing_request_policy_field, dict)
+            del missing_request_policy_field["request_policy"][field]
+            report_near_misses[f"request-policy-missing-{field}"] = (
+                missing_request_policy_field
+            )
+        request_policy_boolean_status = clone(complete_report)
+        assert isinstance(request_policy_boolean_status, dict)
+        request_policy_boolean_status["request_policy"]["status"] = True
+        report_near_misses["request-policy-boolean-status"] = (
+            request_policy_boolean_status
+        )
+        request_policy_string_warnings = clone(complete_report)
+        assert isinstance(request_policy_string_warnings, dict)
+        request_policy_string_warnings["request_policy"]["warnings"] = (
+            "duplicate-observed"
+        )
+        report_near_misses["request-policy-string-warnings"] = (
+            request_policy_string_warnings
+        )
+        request_policy_boolean_warning = clone(complete_report)
+        assert isinstance(request_policy_boolean_warning, dict)
+        request_policy_boolean_warning["request_policy"]["warnings"] = [True]
+        report_near_misses["request-policy-boolean-warning"] = (
+            request_policy_boolean_warning
+        )
+        request_policy_status_mismatch = clone(complete_report)
+        assert isinstance(request_policy_status_mismatch, dict)
+        request_policy_status_mismatch["request_policy"]["status"] = "compliant"
+        report_near_misses["request-policy-status-warning-mismatch"] = (
+            request_policy_status_mismatch
+        )
+        request_policy_unknown_warning = clone(complete_report)
+        assert isinstance(request_policy_unknown_warning, dict)
+        request_policy_unknown_warning["request_policy"]["warnings"].append(
+            "caller-approved-duplicate"
+        )
+        report_near_misses["request-policy-unknown-warning"] = (
+            request_policy_unknown_warning
+        )
+
+        supplied_profile = clone(complete_report)
+        assert isinstance(supplied_profile, dict)
+        supplied_profile["provider_profile"] = "terminal-payload"
+        report_near_misses["caller-supplied-provider-profile"] = supplied_profile
+        for field in (
+            "kind",
+            "provider_declaration",
+            "history_window",
+            "historical_universe",
+            "current",
+            "samples",
+        ):
+            missing_basis_field = clone(complete_report)
+            assert isinstance(missing_basis_field, dict)
+            del missing_basis_field["evidence_basis"][field]
+            report_near_misses[f"evidence-basis-missing-{field}"] = missing_basis_field
+        missing_current_audit = clone(complete_report)
+        assert isinstance(missing_current_audit, dict)
+        del missing_current_audit["evidence_basis"]["current"][
+            "same_scope_request_audit"
+        ]
+        report_near_misses["current-missing-same-scope-request-audit"] = (
+            missing_current_audit
+        )
+        missing_sample_audit = clone(complete_report)
+        assert isinstance(missing_sample_audit, dict)
+        del missing_sample_audit["evidence_basis"]["samples"][0][
+            "same_scope_request_audit"
+        ]
+        report_near_misses["sample-missing-same-scope-request-audit"] = (
+            missing_sample_audit
+        )
+        missing_universe_audit = clone(complete_report)
+        assert isinstance(missing_universe_audit, dict)
+        del missing_universe_audit["evidence_basis"]["historical_universe"][
+            "final_candidates"
+        ][0]["same_scope_request_audit"]
+        report_near_misses["universe-missing-same-scope-request-audit"] = (
+            missing_universe_audit
+        )
+        empty_samples_report = clone(complete_report)
+        assert isinstance(empty_samples_report, dict)
+        empty_samples_report["evidence_basis"]["samples"] = []
+        report_near_misses["empty-samples"] = empty_samples_report
+        boolean_report_reaction_id = clone(complete_report)
+        assert isinstance(boolean_report_reaction_id, dict)
+        boolean_report_reaction_id["evidence_basis"]["current"]["reaction"]["id"] = True
+        report_near_misses["report-reaction-id-boolean-alias"] = (
+            boolean_report_reaction_id
+        )
+        current_final_drift = clone(complete_report)
+        assert isinstance(current_final_drift, dict)
+        current_final_drift["evidence_basis"]["current"]["final_snapshot"]["reactions"][
+            0
+        ]["content"] = "eyes"
+        report_near_misses["current-initial-final-drift"] = current_final_drift
+        history_final_drift = clone(complete_report)
+        assert isinstance(history_final_drift, dict)
+        history_final_drift["evidence_basis"]["historical_universe"][
+            "final_candidates"
+        ][0]["reactions"][0]["content"] = "eyes"
+        report_near_misses["history-initial-final-drift"] = history_final_drift
+
+        for name, report_near_miss in report_near_misses.items():
+            with self.subTest(complete_report_near_miss=name):
+                self.assertFalse(
+                    validate_complete_report(
+                        report_near_miss,
+                        lane_state="accepted-reaction-clean",
+                        provider_declaration=declaration,
+                        candidate_history=history(samples),
+                        current_record=duplicate_current,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
+
+        changed_authoritative_current = clone(duplicate_current)
+        assert isinstance(changed_authoritative_current, dict)
+        changed_authoritative_current["final_snapshot"]["reactions"][0]["content"] = (
+            "eyes"
+        )
+        self.assertFalse(
+            validate_complete_report(
+                complete_report,
+                lane_state="accepted-reaction-clean",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=changed_authoritative_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        unknown_policy_current = clone(current)
+        assert isinstance(unknown_policy_current, dict)
+        unknown_policy_current["requests"] = "unavailable"
+        request_reread_drift_current = clone(current)
+        assert isinstance(request_reread_drift_current, dict)
+        request_reread_drift_current["final_snapshot"]["requests"] = []
+        incomplete_request_snapshot_current = clone(current)
+        assert isinstance(incomplete_request_snapshot_current, dict)
+        incomplete_request_snapshot_current["complete"] = False
+        restamp(incomplete_request_snapshot_current)
+        missing_request_snapshot_current = clone(current)
+        assert isinstance(missing_request_snapshot_current, dict)
+        del missing_request_snapshot_current["complete"]
+        restamp(missing_request_snapshot_current)
+        non_boolean_request_snapshot_current = clone(current)
+        assert isinstance(non_boolean_request_snapshot_current, dict)
+        non_boolean_request_snapshot_current["complete"] = 1
+        restamp(non_boolean_request_snapshot_current)
+        incomplete_request_comments_current = clone(current)
+        assert isinstance(incomplete_request_comments_current, dict)
+        incomplete_request_comments_current["pagination"]["request_comments"] = False
+        restamp(incomplete_request_comments_current)
+        missing_request_comments_current = clone(current)
+        assert isinstance(missing_request_comments_current, dict)
+        del missing_request_comments_current["pagination"]["request_comments"]
+        restamp(missing_request_comments_current)
+        non_boolean_request_comments_current = clone(current)
+        assert isinstance(non_boolean_request_comments_current, dict)
+        non_boolean_request_comments_current["pagination"]["request_comments"] = 1
+        restamp(non_boolean_request_comments_current)
+        incomplete_request_reactions_current = clone(current)
+        assert isinstance(incomplete_request_reactions_current, dict)
+        incomplete_request_reactions_current["pagination"]["request_reactions"] = False
+        restamp(incomplete_request_reactions_current)
+        missing_request_reactions_current = clone(current)
+        assert isinstance(missing_request_reactions_current, dict)
+        del missing_request_reactions_current["pagination"]["request_reactions"]
+        restamp(missing_request_reactions_current)
+        non_boolean_request_reactions_current = clone(current)
+        assert isinstance(non_boolean_request_reactions_current, dict)
+        non_boolean_request_reactions_current["pagination"]["request_reactions"] = 1
+        restamp(non_boolean_request_reactions_current)
+        null_status_matrix = {
+            "pre-provider-ineligible": expected_report_from_inputs(
+                "pre-provider-ineligible",
+                declaration,
+                history(samples),
+                current,
+                None,
+            ),
+            "eligible-waiting": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples[:2]),
+                current,
+                normal_lane_timing,
+            ),
+            "inconclusive": expected_report_from_inputs(
+                "inconclusive",
+                declaration,
+                history(samples),
+                current,
+                normal_lane_timing,
+            ),
+            "unknown-request-policy": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                unknown_policy_current,
+                normal_lane_timing,
+            ),
+            "request-final-reread-drift": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                request_reread_drift_current,
+                normal_lane_timing,
+            ),
+            "incomplete-request-snapshot": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                incomplete_request_snapshot_current,
+                normal_lane_timing,
+            ),
+            "missing-request-snapshot": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                missing_request_snapshot_current,
+                normal_lane_timing,
+            ),
+            "non-boolean-request-snapshot": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                non_boolean_request_snapshot_current,
+                normal_lane_timing,
+            ),
+            "incomplete-request-comments": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                incomplete_request_comments_current,
+                normal_lane_timing,
+            ),
+            "missing-request-comments": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                missing_request_comments_current,
+                normal_lane_timing,
+            ),
+            "non-boolean-request-comments": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                non_boolean_request_comments_current,
+                normal_lane_timing,
+            ),
+            "incomplete-request-reactions": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                incomplete_request_reactions_current,
+                normal_lane_timing,
+            ),
+            "missing-request-reactions": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                missing_request_reactions_current,
+                normal_lane_timing,
+            ),
+            "non-boolean-request-reactions": expected_report_from_inputs(
+                "eligible-waiting",
+                declaration,
+                history(samples),
+                non_boolean_request_reactions_current,
+                normal_lane_timing,
+            ),
+        }
+        expected_null_statuses = {
+            "pre-provider-ineligible": ("not-applicable", None),
+            "eligible-waiting": ("compliant", "unknown"),
+            "inconclusive": ("compliant", "thumbs-up-clean"),
+            "unknown-request-policy": ("unknown", "unknown"),
+            "request-final-reread-drift": ("unknown", "unknown"),
+            "incomplete-request-snapshot": ("unknown", "unknown"),
+            "missing-request-snapshot": ("unknown", "unknown"),
+            "non-boolean-request-snapshot": ("unknown", "unknown"),
+            "incomplete-request-comments": ("unknown", "unknown"),
+            "missing-request-comments": ("unknown", "unknown"),
+            "non-boolean-request-comments": ("unknown", "unknown"),
+            "incomplete-request-reactions": ("unknown", "unknown"),
+            "missing-request-reactions": ("unknown", "unknown"),
+            "non-boolean-request-reactions": ("unknown", "unknown"),
+        }
+        for case_name, null_report in null_status_matrix.items():
+            with self.subTest(report_null_status_matrix=case_name):
+                self.assertIsNotNone(null_report)
+                assert isinstance(null_report, dict)
+                expected_status, expected_profile = expected_null_statuses[case_name]
+                self.assertEqual(
+                    null_report["request_policy"],
+                    {"status": expected_status, "warnings": []},
+                )
+                self.assertEqual(
+                    null_report["provider_profile"],
+                    expected_profile,
+                )
+                self.assertIsNone(null_report["evidence_basis"])
+                lane_state = (
+                    "eligible-waiting"
+                    if case_name
+                    in {
+                        "unknown-request-policy",
+                        "request-final-reread-drift",
+                        "incomplete-request-snapshot",
+                        "missing-request-snapshot",
+                        "non-boolean-request-snapshot",
+                        "incomplete-request-comments",
+                        "missing-request-comments",
+                        "non-boolean-request-comments",
+                        "incomplete-request-reactions",
+                        "missing-request-reactions",
+                        "non-boolean-request-reactions",
+                    }
+                    else case_name
+                )
+                matrix_current = {
+                    "unknown-request-policy": unknown_policy_current,
+                    "request-final-reread-drift": request_reread_drift_current,
+                    "incomplete-request-snapshot": incomplete_request_snapshot_current,
+                    "missing-request-snapshot": missing_request_snapshot_current,
+                    "non-boolean-request-snapshot": (
+                        non_boolean_request_snapshot_current
+                    ),
+                    "incomplete-request-comments": incomplete_request_comments_current,
+                    "missing-request-comments": missing_request_comments_current,
+                    "non-boolean-request-comments": non_boolean_request_comments_current,
+                    "incomplete-request-reactions": incomplete_request_reactions_current,
+                    "missing-request-reactions": missing_request_reactions_current,
+                    "non-boolean-request-reactions": (
+                        non_boolean_request_reactions_current
+                    ),
+                }.get(case_name, current)
+                matrix_history = (
+                    history(samples[:2])
+                    if case_name == "eligible-waiting"
+                    else history(samples)
+                )
+                matrix_lane_timing = (
+                    None
+                    if case_name == "pre-provider-ineligible"
+                    else normal_lane_timing
+                )
+                self.assertTrue(
+                    validate_complete_report(
+                        null_report,
+                        lane_state=lane_state,
+                        provider_declaration=declaration,
+                        candidate_history=matrix_history,
+                        current_record=matrix_current,
+                        local_lane_timing=matrix_lane_timing,
+                    )
+                )
+                for request_policy_field in ("status", "warnings"):
+                    missing_matrix_policy_field = clone(null_report)
+                    assert isinstance(missing_matrix_policy_field, dict)
+                    del missing_matrix_policy_field["request_policy"][
+                        request_policy_field
+                    ]
+                    self.assertFalse(
+                        validate_complete_report(
+                            missing_matrix_policy_field,
+                            lane_state=lane_state,
+                            provider_declaration=declaration,
+                            candidate_history=matrix_history,
+                            current_record=matrix_current,
+                            local_lane_timing=matrix_lane_timing,
+                        )
+                    )
+                boolean_matrix_profile = clone(null_report)
+                assert isinstance(boolean_matrix_profile, dict)
+                boolean_matrix_profile["provider_profile"] = False
+                self.assertFalse(
+                    validate_complete_report(
+                        boolean_matrix_profile,
+                        lane_state=lane_state,
+                        provider_declaration=declaration,
+                        candidate_history=matrix_history,
+                        current_record=matrix_current,
+                        local_lane_timing=matrix_lane_timing,
+                    )
+                )
+                boolean_matrix_basis = clone(null_report)
+                assert isinstance(boolean_matrix_basis, dict)
+                boolean_matrix_basis["evidence_basis"] = False
+                self.assertFalse(
+                    validate_complete_report(
+                        boolean_matrix_basis,
+                        lane_state=lane_state,
+                        provider_declaration=declaration,
+                        candidate_history=matrix_history,
+                        current_record=matrix_current,
+                        local_lane_timing=matrix_lane_timing,
+                    )
                 )
 
         invalid_cases: dict[str, tuple[object, object, object]] = {
@@ -5993,16 +7501,16 @@ class RepositoryContractTest(unittest.TestCase):
             missing_reaction_id,
         )
 
-        wrong_reaction_api_url = clone(current)
-        assert isinstance(wrong_reaction_api_url, dict)
-        wrong_reaction_api_url["reactions"][0]["api_url"] = (
+        fabricated_reaction_self_url = clone(current)
+        assert isinstance(fabricated_reaction_self_url, dict)
+        fabricated_reaction_self_url["reactions"][0]["api_url"] = (
             "https://api.github.com/repos/OWNER/REPO/reactions/101"
         )
-        restamp(wrong_reaction_api_url)
-        invalid_cases["wrong-reaction-api-url"] = (
+        restamp(fabricated_reaction_self_url)
+        invalid_cases["fabricated-reaction-self-url"] = (
             declaration,
             history(samples),
-            wrong_reaction_api_url,
+            fabricated_reaction_self_url,
         )
 
         extended_reaction_schema = clone(current)
@@ -6132,9 +7640,6 @@ class RepositoryContractTest(unittest.TestCase):
         boolean_reaction_id = clone(current)
         assert isinstance(boolean_reaction_id, dict)
         boolean_reaction_id["reactions"][0]["id"] = True
-        boolean_reaction_id["reactions"][0]["api_url"] = (
-            "https://api.github.com/repos/OWNER/REPO/reactions/True"
-        )
         boolean_reaction_id["selected_reaction_id"] = True
         boolean_reaction_id["candidate_basis"]["stable_artifact_id"] = True
         restamp(boolean_reaction_id)
@@ -6267,7 +7772,6 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(reaction_fallback_near_miss=name):
                 self.assertEqual(
                     classify_fallback(
-                        "thumbs-up-clean",
                         case_declaration,
                         case_history,
                         case_current,
@@ -6284,7 +7788,6 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(first_in_window_samples),
                 current,
@@ -6301,7 +7804,6 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(as_of_boundary_samples),
                 current,
@@ -6316,7 +7818,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(compatible_earlier_eyes)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(samples),
                 compatible_earlier_eyes,
@@ -6339,7 +7840,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(confirmed_human_reaction)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(samples),
                 confirmed_human_reaction,
@@ -6362,7 +7862,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(confirmed_unrelated_bot_reaction)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(samples),
                 confirmed_unrelated_bot_reaction,
@@ -6381,7 +7880,6 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history([same_pr_different_scope, sample(2), sample(3)]),
                 current,
@@ -6396,7 +7894,6 @@ class RepositoryContractTest(unittest.TestCase):
                 ]
                 self.assertEqual(
                     classify_fallback(
-                        "thumbs-up-clean",
                         declaration,
                         history(candidate_universe),
                         current,
@@ -6425,7 +7922,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(declaration_collision_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(declaration_id_reused_as_request),
                 current,
@@ -6454,7 +7950,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(request_collision_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(cross_scope_request_id_reuse),
                 current,
@@ -6467,9 +7962,6 @@ class RepositoryContractTest(unittest.TestCase):
         first_reaction_id = cross_scope_reaction_id_reuse[0]["reactions"][0]["id"]
         reaction_collision_candidate = cross_scope_reaction_id_reuse[1]
         reaction_collision_candidate["reactions"][0]["id"] = first_reaction_id
-        reaction_collision_candidate["reactions"][0]["api_url"] = (
-            f"https://api.github.com/repos/OWNER/REPO/reactions/{first_reaction_id}"
-        )
         reaction_collision_candidate["selected_reaction_id"] = first_reaction_id
         reaction_collision_candidate["candidate_basis"]["stable_artifact_id"] = (
             first_reaction_id
@@ -6477,7 +7969,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(reaction_collision_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(cross_scope_reaction_id_reuse),
                 current,
@@ -6504,7 +7995,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(current_history_request_id_reuse)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(eleven_candidates),
                 current_history_request_id_reuse,
@@ -6516,10 +8006,6 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(current_history_reaction_id_reuse, dict)
         historical_reaction_id = eleven_candidates[0]["reactions"][0]["id"]
         current_history_reaction_id_reuse["reactions"][0]["id"] = historical_reaction_id
-        current_history_reaction_id_reuse["reactions"][0]["api_url"] = (
-            "https://api.github.com/repos/OWNER/REPO/reactions/"
-            f"{historical_reaction_id}"
-        )
         current_history_reaction_id_reuse["selected_reaction_id"] = (
             historical_reaction_id
         )
@@ -6529,7 +8015,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(current_history_reaction_id_reuse)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(eleven_candidates),
                 current_history_reaction_id_reuse,
@@ -6571,7 +8056,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(oldest_provenance_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_stale_selected_provenance),
                 current,
@@ -6601,7 +8085,6 @@ class RepositoryContractTest(unittest.TestCase):
             restamp(artifact_collision_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(cross_scope_artifact_id_reuse),
                 current,
@@ -6632,7 +8115,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(negative_time_candidate)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_negative_request_reaction_times),
                 current,
@@ -6659,12 +8141,11 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(terminal_payload_changes_candidate_order[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(terminal_payload_changes_candidate_order),
                 current,
             ),
-            "unknown",
+            "not-clean",
         )
 
         def history_with_unselected_terminal_basis() -> list[dict[str, object]]:
@@ -6685,7 +8166,6 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(history_with_unselected_terminal_basis()),
                 current,
@@ -6698,7 +8178,6 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> None:
             self.assertEqual(
                 classify_fallback(
-                    "thumbs-up-clean",
                     declaration,
                     history(candidates),
                     current,
@@ -6886,7 +8365,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         for later_content in ("eyes", "+1"):
             with self.subTest(
-                unselected_artifact_basis_with_later_reaction=later_content
+                terminal_basis_preserved_with_later_reaction=later_content
             ):
                 artifact_basis_with_later_reaction = (
                     history_with_unselected_terminal_basis()
@@ -6903,8 +8382,20 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 )
                 restamp(oldest)
-                assert_unselected_artifact_history_rejected(
-                    artifact_basis_with_later_reaction
+                self.assertEqual(
+                    candidate_order_basis(oldest),
+                    (
+                        oldest["candidate_basis"]["server_time"],
+                        oldest["candidate_basis"]["stable_artifact_id"],
+                    ),
+                )
+                self.assertEqual(
+                    classify_fallback(
+                        declaration,
+                        history(artifact_basis_with_later_reaction),
+                        current,
+                    ),
+                    "clean",
                 )
 
         terminal_basis_with_future_human = history_with_unselected_terminal_basis()
@@ -6924,7 +8415,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(oldest)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(terminal_basis_with_future_human),
                 current,
@@ -6944,7 +8434,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(oldest)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(terminal_basis_with_relocated_reaction),
                 current,
@@ -6960,7 +8449,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(oldest)
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(terminal_basis_with_ambiguous_reaction),
                 current,
@@ -6975,7 +8463,6 @@ class RepositoryContractTest(unittest.TestCase):
         ] = 2_900_000
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_final_reread_drift),
                 current,
@@ -6989,7 +8476,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(unselected_incomplete_pagination[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_incomplete_pagination),
                 current,
@@ -7012,7 +8498,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(unselected_newer_eyes[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_newer_eyes),
                 current,
@@ -7026,7 +8511,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(invalid_oldest_unselected[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(invalid_oldest_unselected),
                 current,
@@ -7042,7 +8526,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(unselected_lookalike_bot[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_lookalike_bot),
                 current,
@@ -7056,7 +8539,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(unselected_missing_type[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_missing_type),
                 current,
@@ -7070,7 +8552,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(unselected_conflicting_content[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(unselected_conflicting_content),
                 current,
@@ -7084,7 +8565,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(invalid_newest_selected[-1])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(invalid_newest_selected),
                 current,
@@ -7098,7 +8578,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(invalid_tenth_newest_selected[1])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(invalid_tenth_newest_selected),
                 current,
@@ -7113,7 +8592,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(invalid_oldest_of_exact_ten[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(invalid_oldest_of_exact_ten),
                 current,
@@ -7128,7 +8606,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(invalid_oldest_selected[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(invalid_oldest_selected),
                 current,
@@ -7142,7 +8619,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(missing_unselected_order_key[0])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(missing_unselected_order_key),
                 current,
@@ -7156,7 +8632,6 @@ class RepositoryContractTest(unittest.TestCase):
         restamp(forged_unselected_order_key[-1])
         self.assertEqual(
             classify_fallback(
-                "thumbs-up-clean",
                 declaration,
                 history(forged_unselected_order_key),
                 current,
@@ -7548,20 +9023,23 @@ class RepositoryContractTest(unittest.TestCase):
         )[1].split("```", 1)[0]
         for anchor in (
             "--method GET --paginate --slurp",
-            "api_url",
-            "https://api.github.com/repos/<owner>/<repo>/reactions/",
-            ".id",
+            "{id",
             ".user.login",
             ".user.type",
             "content",
             "created_at",
         ):
             self.assertIn(anchor, reaction_probe)
+        self.assertNotIn("api_url:", reaction_probe)
+        self.assertNotIn(
+            "https://api.github.com/repos/<owner>/<repo>/reactions/",
+            reaction_probe,
+        )
         for anchor in (
-            "reactions list does not supply a stable reaction-resource url",
-            "canonical positive numeric `id`",
-            "do not accept a caller-supplied url",
-            "reconstruct and compare the same url during the final re-read",
+            "returns each reaction id but no reaction self url",
+            "do not synthesize a standalone reaction resource url",
+            "`(parent_reactions_api_url, reaction.id)`",
+            "stable native identity",
         ):
             self.assertIn(anchor, " ".join(probes.split()).lower())
         for anchor in (
@@ -7826,11 +9304,11 @@ class RepositoryContractTest(unittest.TestCase):
             agents_policy,
         ):
             normalized = " ".join(content.split()).lower().replace("`", "")
+            self.assertIn("historical", normalized)
             self.assertTrue(
-                "historical/current" in normalized
-                or "historical and current" in normalized
-                or "every sampled outcome" in normalized
-                or ("historical" in normalized and "current outcome" in normalized)
+                "current outcome" in normalized
+                or "current snapshot" in normalized
+                or "current scope" in normalized
             )
             self.assertIn("parent", normalized)
             self.assertIn("child", normalized)

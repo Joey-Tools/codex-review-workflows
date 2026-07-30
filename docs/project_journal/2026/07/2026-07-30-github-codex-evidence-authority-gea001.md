@@ -61,11 +61,14 @@ superseded_by:
   3–10 selected historical outcomes establish the profile, while the current
   outcome separately proves this review. Every historical sample and the
   separate current outcome bind one selected exact `@codex review` parent
-  request to its individual child exact-bot `+1` by IDs, URLs, immutable scope,
-  server times, and strict ordering. Every reaction records
-  `parent_request_id` and the exact fully paginated parent reactions endpoint;
-  both must match the enclosing audited request, so local nesting cannot move an
-  R1 reaction under R2. They also record every accepted same-scope request and
+  request to its individual child exact-bot `+1` by positive ID, canonical
+  parent endpoint, immutable scope, server times, and strict ordering. GitHub's
+  reaction-list response has no reaction self URL, so the playbook never
+  synthesizes one: `(parent_reactions_api_url, reaction.id)` is the stable
+  native identity. Every reaction also records `parent_request_id`; it and the
+  exact fully paginated parent reactions endpoint must match the enclosing
+  audited request, so local nesting cannot move an R1 reaction under R2. They
+  also record every accepted same-scope request and
   fully paginated reaction so a later duplicate request or cross-parent
   `eyes`/conflict cannot be hidden. The record binds the
   authenticated provider declaration identity/digest. Every historical
@@ -75,8 +78,11 @@ superseded_by:
   precedence. Candidates outside the selected newest-10 window remain
   completeness, ordering, and audit inputs, but do not themselves select the
   provider profile. A newer terminal/finding artifact, later `eyes`, or
-  incomplete page therefore cannot be hidden by an older reaction time. Current
-  initial/final snapshots bind exact open/unmerged lifecycle, complete
+  incomplete page therefore cannot be hidden by an older reaction-only basis.
+  Once terminal precedence selects a terminal/finding artifact, a later `+1`
+  or `eyes` remains visible audit/liveness evidence but does not replace or
+  reorder that stronger basis. Current initial/final snapshots bind exact
+  open/unmerged lifecycle, complete
   pagination, stable whole-PR scope, no trustworthy current-scope terminal
   payload or conflicting finding/thread evidence, and an unchanged final
   re-read. The reaction report embeds identical initial/final discovery
@@ -112,6 +118,11 @@ superseded_by:
   request comment contains only the intent to start work. Provider evidence is
   therefore the verdict authority, while requests remain producer controls and
   audit records.
+- Individual reactions carry less information than terminal comments/reviews:
+  notably, they have no native commit-head binding. They are therefore a
+  bounded fallback only when recent eligible outcomes show reaction-only
+  provider behaviour. A later `+1` or `eyes` cannot demote an already selected
+  terminal payload; newer `eyes` blocks only the weaker reaction-only fallback.
 - GitHub review and issue-comment APIs expose no general request/run lineage.
   Requiring that unavailable binding would permanently classify valid
   current-head results as inconclusive. Duplicate or mistimed requests remain
@@ -175,6 +186,11 @@ superseded_by:
   `submitted_at`. Review-thread joins use current GitHub GraphQL
   `fullDatabaseId: BigInt`, normalized with REST IDs as canonical positive
   decimal text.
+- Reaction identity follows the documented GitHub REST data model rather than
+  a locally invented URL. A future endpoint or schema change must update the
+  pinned documentation reference and the executable closed-schema tests
+  together; adding a caller-supplied or derived self URL is not a compatible
+  extension.
 
 ## Implementation Intent
 
@@ -217,19 +233,25 @@ superseded_by:
 ## Validation
 
 - Focused contract suite:
-  `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts`
-  passed 102 tests.
+  `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
+  passed 102 tests in 10.259 seconds.
 - Full review-orchestration suite:
   `python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
-  passed 2,822 tests in 1,235.314 seconds with 6 expected skips. It ran outside
+  passed 2,822 tests in 1,336.946 seconds with 6 expected skips. It ran outside
   the filesystem sandbox because loopback socket tests require local `bind`.
 - System `skill-creator` validation passed for
   `review-orchestration-playbook` and `change-delivery-workflow`.
 - The bundled project-journal validator passed.
 - Ruff lint and format checks for `tests/test_contracts.py` passed.
 - `git diff --check` passed.
-- Two independent final audits completed clean after probing closed schemas,
-  JSON type identity, cross-scope native-ID collisions, selected provenance,
+- An earlier named-single review found two P2 contract gaps: a synthesized
+  reaction self URL and a self-consistency-only report classifier. Both were
+  removed and replaced by parent-endpoint-plus-ID reaction identity and a
+  report validator rebuilt from authoritative inputs.
+- Follow-up independent audits completed clean after probing accepted terminal
+  clean/findings reports, later-reaction terminal precedence, every
+  missing/false/numeric request-completeness combination, closed schemas, JSON
+  type identity, cross-scope native-ID collisions, selected provenance,
   terminal child/thread joins, newest-10 ordering, fixed Action provenance,
   and the result-present decision rationale.
 
@@ -240,6 +262,10 @@ superseded_by:
   [`JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`](https://github.com/JoeyTeng/codex-review-gate/commit/16366aa81270ad2c875d2ceb8ce194f5b2308af6)
 - Released Action baseline:
   [`JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`](https://github.com/JoeyTeng/codex-review-gate-action/commit/2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6)
+- GitHub REST reaction model:
+  [List reactions for an issue comment](https://docs.github.com/en/rest/reactions/reactions#list-reactions-for-an-issue-comment)
+  returns the reaction ID from the parent-scoped collection and does not
+  define a reaction self URL.
 - Authenticated GitHub GraphQL schema introspection on 2026-07-30 returned
   `fullDatabaseId: BigInt` for both `PullRequestReviewComment` and
   `PullRequestReview`, with no `databaseId` field in either selected field set.

@@ -201,7 +201,10 @@ Evaluate provider artifacts independently of request count:
    below.
 8. If no trustworthy current-scope terminal payload exists, apply the selected
    provider profile. Only `thumbs-up-clean` can reach the weak `+1` fallback;
-   `mixed` still requires terminal payload for a clean result.
+   `mixed` still requires terminal payload for a clean result. A later `+1` or
+   `eyes` reaction remains audit and liveness evidence; it does not demote,
+   replace, or reorder an already selected terminal payload. The newer-`eyes`
+   exclusion applies only while evaluating the reaction-only fallback.
 9. Perform the final re-read. The result counts only if scope, lifecycle,
    request history, profile inputs, provider evidence, and thread state are
    unchanged.
@@ -590,9 +593,13 @@ evidence for every candidate before sorting, including candidates that will
 fall outside the selected 10-outcome window. This pre-sort validation includes
 the candidate's stable initial/final scope snapshot, every required pagination
 flag, all provider-like reactions across every controlled request parent, and
-terminal precedence. A later `eyes`, another provider-like reaction, a
-terminal artifact, or an incomplete evidence page must therefore change or
-invalidate the basis even when that candidate would otherwise rank eleventh.
+terminal precedence. When a terminal or finding artifact determines the scope
+outcome, later `+1` and `eyes` reactions remain in the audit but cannot replace
+or reorder that artifact's basis. When the scope outcome is reaction-only, a
+later `eyes` or another provider-like reaction must change or invalidate the
+reaction basis. A later terminal artifact or an incomplete evidence page
+always changes or invalidates the recorded basis, even when that candidate
+would otherwise rank eleventh.
 
 Sort candidates newest first by the validated candidate-basis server time,
 then stable artifact ID. If any candidate lacks a trustworthy or correctly
@@ -617,9 +624,13 @@ request's ID, URL, `created_at`, `updated_at`, normalized body, and scope. Use
 the currently observed exact request body became authoritative. Record the
 selected value and
 `request_server_time_field: created_at | updated_at`. Record every reaction's
-ID, canonical reaction-resource API URL, `parent_request_id`, the exact
+positive ID, `parent_request_id`, the exact
 `issues/comments/<parent_request_id>/reactions?per_page=100` fetch URL,
-`created_at`, content, login, and type. The parent ID and fetch URL must equal
+`created_at`, content, login, and type. GitHub's
+[issue-comment reaction list endpoint](https://docs.github.com/en/rest/reactions/reactions#list-reactions-for-an-issue-comment)
+does not return a reaction self URL, so never synthesize one. The stable native
+identity is the tuple of the exact canonical fully paginated parent endpoint
+and the returned positive reaction ID. The parent ID and fetch URL must equal
 the enclosing audited request and selected request when applicable; nesting a
 reaction under a request in local data is not parent evidence by itself. Prove
 strict trusted-server ordering against that fetched parent:
@@ -1011,7 +1022,6 @@ evidence_basis:
       normalized_body: "@codex review"
     reaction:
       id: "789012"
-      api_url: <exact reaction API resource>
       parent_request_id: "123456"
       parent_reactions_api_url: https://api.github.com/repos/OWNER/REPO/issues/comments/123456/reactions?per_page=100
       created_at: <server time after request.request_server_time>
@@ -1023,7 +1033,7 @@ evidence_basis:
     same_scope_request_audit:
       - request: <same seven request fields>
         reactions:
-          - <same eight reaction fields>
+          - <same seven reaction fields>
     candidate_basis:
       kind: reaction
       server_time: <trusted scope-final reaction time>
@@ -1035,11 +1045,11 @@ evidence_basis:
         server_time: <trusted semantic server time after scope-local precedence>
         stable_artifact_id: <positive native numeric ID>
       request: <same seven request fields>
-      reaction: <same eight reaction fields>
+      reaction: <same seven reaction fields>
       same_scope_request_audit:
         - request: <same seven request fields>
           reactions:
-            - <same eight reaction fields>
+            - <same seven reaction fields>
 ```
 
 The report embeds both historical-universe inventories and both complete
@@ -1083,8 +1093,10 @@ conflict even when its actor and timestamp remain plausible.
 `candidate_basis` is recomputed from the final scope outcome after terminal
 precedence; a reaction basis is invalid when a terminal or finding artifact
 actually determines that scope, when a later provider-like reaction exists, or
-when any required candidate page/snapshot is incomplete. References to an
-external ledger do not replace these fields.
+when any required candidate page/snapshot is incomplete. A terminal basis
+remains the basis when a later `+1` or `eyes` exists; those reactions remain
+visible in the complete audit and may prevent only reaction-only fallback.
+References to an external ledger do not replace these fields.
 Immediately before success, re-fetch and revalidate the authenticated
 declaration artifact, window/count, every universe candidate before sorting,
 every ordered `samples[]`, and every `current` field, including every
