@@ -49,7 +49,10 @@ superseded_by:
   existing root retain the same migration protection; if that root is absent,
   they fail closed before the public command because no immutable catalog
   marker can prove that an older writer will not create it after a final
-  pathname check. The current standard release also passes the catalog
+  pathname check. Documented self-contained commands therefore select explicit
+  release-local retention and checkout roots; account-local defaults are for
+  standard installed-overlay catalogs. The current standard release also
+  passes the catalog
   capability and directory-identity checks while reusing the already-held
   current-root fence instead of acquiring its lock twice.
 - Releases that use account-local retention carry a source-controlled
@@ -72,7 +75,11 @@ superseded_by:
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
   policy with device, inode, type, generation, owner, group, mode, flags, and
   normalized ACL/xattr evidence while deliberately ignoring timestamps,
-  directory size, and link count. For current or sibling helpers without a
+  directory size, and link count. Catalog discovery retains the releases-root,
+  current-release, and current-helper descriptors plus their policy bindings
+  through the public command; the scan consumes those held objects directly
+  and revalidates both descriptors and pathname mappings before and after the
+  command. For current or sibling helpers without a
   legacy root, the initial component bindings and deepest existing descriptor
   remain held through the command; a final fresh probe must match that initial
   custody. Nested helper replacement fails closed, while ordinary child-entry
@@ -120,12 +127,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 1044.895 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 1026.912 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.139 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 2.641 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.866 seconds.
-- The complete 100-test contract module passed in 7.634 seconds.
+- The complete 100-test contract module passed in 8.001 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -218,9 +225,24 @@ superseded_by:
   Missing-suffix traversal now uses the bound snapshot prefix directly, and the
   alias regression exercises the real public `status` command through lock
   creation.
-- The deterministic independent-supervisor gate passed 599/599 in 218.364
-  seconds with the reviewed 599-test selected identity and SHA-256
-  `aab4d688c8e024101b341c2a71125ddfd788c1fe2f634781f773c5c45b8c78ac`.
+- The next exact-head Fresh Codex review found that installed catalog discovery
+  closed its releases/current-release/helper descriptors before the migration
+  fence reopened the catalog, and that self-contained README examples omitted
+  the explicit roots required by the fail-closed non-catalog policy. Catalog
+  custody now survives discovery through finalization, with a regression that
+  replaces the complete catalog after discovery but before scan. The
+  self-contained examples again pin distinct release-local runtime roots
+  without weakening the account-local migration gate.
+- A two-agent internal review then found descriptor-transfer cleanup gaps,
+  incomplete multi-descriptor cleanup, a possible cleanup override of a
+  catalog-mismatch error, missing standard-overlay examples, and tests coupled
+  to a private revalidation call count. New regressions prove every acquired
+  descriptor is attempted, preserve the primary mismatch, parse both public
+  command matrices, and induce real catalog replacement during finalization.
+- The deterministic independent-supervisor gate passed 604/604 in 211.998
+  seconds with the reviewed 604-test selected identity and SHA-256
+  `b62309210d115ed54e9e6dc3c37f1f26ecdcbfbfc97f22cd8ba55ebb94403175`.
+- The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,

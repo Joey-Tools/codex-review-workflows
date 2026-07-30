@@ -47,6 +47,8 @@ REPO=/absolute/path/to/repo
 BASE_SHA=<full-base-commit-oid>
 HEAD_SHA=<full-head-commit-oid>
 PR_URL=https://github.com/OWNER/REPO/pull/NUMBER
+RETENTION="$TOOL_DIR/runtime/retention"
+CHECKOUTS="$TOOL_DIR/runtime/checkouts"
 
 HELPER_STATE="$($HELPER stateful start \
   --repo "$REPO" \
@@ -59,6 +61,11 @@ $HELPER stateful status --state-dir "$HELPER_STATE"
 $HELPER stateful wait --state-dir "$HELPER_STATE" --timeout-seconds 60
 $HELPER stateful final --state-dir "$HELPER_STATE"
 ```
+
+本节的 self-contained 示例必须显式使用上面的独立 runtime roots；
+account-local defaults 只用于标准 installed overlay catalog，那里可以持续绑定当前
+release、helper 与 sibling release 目录。缺少该 catalog 的 self-contained helper
+若使用默认 root，会因无法证明 legacy migration fence 而按设计失败关闭。
 
 For each public command, the CLI resolves one default state-root snapshot from
 the current POSIX account database, not from `$HOME`, and derives both retention
@@ -126,12 +133,39 @@ python3.13 -B "$SUPERVISOR" preflight \
   --repo "$REPO" \
   --base "$BASE_SHA" \
   --head "$HEAD_SHA" \
-  --pr-url "$PR_URL"
+  --pr-url "$PR_URL" \
+  --retention-root "$RETENTION" \
+  --checkout-parent "$CHECKOUTS"
 ```
 
 只有 preflight 返回一行 `{"status":"ready",...}` 后才运行 reviewer：
 
 ```bash
+python3.13 -B "$SUPERVISOR" run \
+  --helper-state "$HELPER_STATE" \
+  --repo "$REPO" \
+  --base "$BASE_SHA" \
+  --head "$HEAD_SHA" \
+  --pr-url "$PR_URL" \
+  --retention-root "$RETENTION" \
+  --checkout-parent "$CHECKOUTS"
+```
+
+### Standard Installed Overlay Defaults
+
+标准 installed overlay 必须省略显式 runtime roots，让 CLI 使用 account-local defaults
+并执行 sibling-release migration fence。对应的 preflight/run 形式如下；后续
+`status`、`final`、`recover`、`release` 和 `cleanup` 同样省略
+`--retention-root`：
+
+```bash
+python3.13 -B "$SUPERVISOR" preflight \
+  --helper-state "$HELPER_STATE" \
+  --repo "$REPO" \
+  --base "$BASE_SHA" \
+  --head "$HEAD_SHA" \
+  --pr-url "$PR_URL"
+
 python3.13 -B "$SUPERVISOR" run \
   --helper-state "$HELPER_STATE" \
   --repo "$REPO" \
@@ -147,9 +181,11 @@ final artifact；不要把 stdout/stderr JSONL、tail 或 keepalive 当成 findi
 ATTEMPT_DIR=<attempt_dir-from-run-json>
 
 python3.13 -B "$SUPERVISOR" status \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 
 python3.13 -B "$SUPERVISOR" final \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -178,6 +214,7 @@ $HELPER stateful cleanup --state-dir "$HELPER_STATE"
 
 ```bash
 python3.13 -B "$SUPERVISOR" status \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -187,6 +224,7 @@ owner。记录的 boot ID 与当前 boot ID 不同时，运行：
 
 ```bash
 python3.13 -B "$SUPERVISOR" recover \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -212,12 +250,14 @@ terminal status 或年龄本身不会释放 evidence。parent 确认已经消费
 
 ```bash
 python3.13 -B "$SUPERVISOR" release \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason resolved
 ```
 
 ```bash
 python3.13 -B "$SUPERVISOR" release \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason handoff-complete
 ```
@@ -227,6 +267,7 @@ released 时，才可回收整个 attempt：
 
 ```bash
 python3.13 -B "$SUPERVISOR" cleanup \
+  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 

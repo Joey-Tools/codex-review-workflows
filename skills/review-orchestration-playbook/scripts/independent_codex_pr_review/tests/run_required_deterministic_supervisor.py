@@ -9,10 +9,10 @@ from collections.abc import Iterator
 
 from .run_required_no_child_profile import REQUIRED_TEST_KEYS
 
-EXPECTED_TEST_COUNT = 599
+EXPECTED_TEST_COUNT = 604
 # Update this only after reviewing the complete discovered test-identity change.
 EXPECTED_TEST_ID_SHA256 = (
-    "aab4d688c8e024101b341c2a71125ddfd788c1fe2f634781f773c5c45b8c78ac"
+    "b62309210d115ed54e9e6dc3c37f1f26ecdcbfbfc97f22cd8ba55ebb94403175"
 )
 
 

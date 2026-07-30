@@ -332,12 +332,93 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
-    def test_readme_default_examples_delegate_root_resolution_to_cli(self) -> None:
+    def test_readme_self_contained_examples_pin_distinct_runtime_roots(self) -> None:
         readme = (TOOL_ROOT / "README.md").read_text()
 
-        self.assertNotIn('--retention-root "$RETENTION"', readme)
-        self.assertNotIn('--checkout-parent "$CHECKOUTS"', readme)
+        self.assertIn('RETENTION="$TOOL_DIR/runtime/retention"', readme)
+        self.assertIn('CHECKOUTS="$TOOL_DIR/runtime/checkouts"', readme)
+        self.assertEqual(readme.count('--retention-root "$RETENTION"'), 9)
+        self.assertEqual(readme.count('--checkout-parent "$CHECKOUTS"'), 2)
         self.assertNotIn('RETENTION="$STATE_ROOT/retention"', readme)
+        self.assertIn(
+            "account-local defaults 只用于标准 installed overlay catalog",
+            readme,
+        )
+        self.assertIn("### Standard Installed Overlay Defaults", readme)
+        self.assertEqual(
+            readme.count('python3.13 -B "$SUPERVISOR" preflight \\'),
+            2,
+        )
+        self.assertEqual(
+            readme.count('python3.13 -B "$SUPERVISOR" run \\'),
+            2,
+        )
+
+        source_arguments = (
+            "--helper-state",
+            "/tmp/helper-state",
+            "--repo",
+            "/tmp/repo",
+            "--base",
+            "a" * 40,
+            "--head",
+            "b" * 40,
+            "--pr-url",
+            "https://github.com/owner/repo/pull/1",
+        )
+        parser = cli_module._public_parser()
+        for command in ("preflight", "run"):
+            with self.subTest(command=command, roots="overlay-default"):
+                arguments = parser.parse_args((command, *source_arguments))
+                self.assertIsNone(arguments.retention_root)
+                self.assertIsNone(arguments.checkout_parent)
+            with self.subTest(command=command, roots="self-contained"):
+                arguments = parser.parse_args(
+                    (
+                        command,
+                        *source_arguments,
+                        "--retention-root",
+                        "/tmp/tool/runtime/retention",
+                        "--checkout-parent",
+                        "/tmp/tool/runtime/checkouts",
+                    )
+                )
+                self.assertEqual(
+                    arguments.retention_root,
+                    pathlib.Path("/tmp/tool/runtime/retention"),
+                )
+                self.assertEqual(
+                    arguments.checkout_parent,
+                    pathlib.Path("/tmp/tool/runtime/checkouts"),
+                )
+
+        for command, tail in (
+            ("status", ()),
+            ("final", ()),
+            ("recover", ()),
+            ("release", ("--reason", "resolved")),
+            ("cleanup", ()),
+        ):
+            with self.subTest(command=command, roots="overlay-default"):
+                arguments = parser.parse_args(
+                    (command, "--attempt-dir", "/tmp/attempt", *tail)
+                )
+                self.assertIsNone(arguments.retention_root)
+            with self.subTest(command=command, roots="self-contained"):
+                arguments = parser.parse_args(
+                    (
+                        command,
+                        "--retention-root",
+                        "/tmp/tool/runtime/retention",
+                        "--attempt-dir",
+                        "/tmp/attempt",
+                        *tail,
+                    )
+                )
+                self.assertEqual(
+                    arguments.retention_root,
+                    pathlib.Path("/tmp/tool/runtime/retention"),
+                )
 
     def test_default_state_roots_are_host_local(self) -> None:
         account_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -682,9 +763,15 @@ class CliLifecycleTests(unittest.TestCase):
 
             catalog = legacy_retention_module._installed_release_catalog(alias_tool)
             self.assertIsNotNone(catalog)
-            catalog_root, release_name = catalog
-            self.assertTrue(os.path.samefile(catalog_root, releases))
-            self.assertEqual(release_name, os.fsencode("b" * 40))
+            assert catalog is not None
+            try:
+                self.assertTrue(os.path.samefile(catalog.releases_root, releases))
+                self.assertEqual(
+                    catalog.current_release_name,
+                    os.fsencode("b" * 40),
+                )
+            finally:
+                catalog.close()
 
             output = io.StringIO()
             with (
@@ -813,6 +900,312 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn(
                 "installed release changed while being inspected",
                 payload["message"],
+            )
+
+    def test_installed_upgrade_retains_catalog_descriptors_after_discovery(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-catalog-custody-race-") as root:
+            releases, current_tool, _, legacy_retention = _installed_upgrade_layout(
+                root
+            )
+            _write_retention_lock(legacy_retention)
+            _write_attempt(
+                legacy_retention,
+                suffix="a" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+            displaced_releases = root / "displaced-releases"
+            original_catalog = legacy_retention_module._installed_release_catalog
+            replacement_done = False
+
+            def replace_after_discovery(
+                tool_path: pathlib.Path,
+            ) -> object:
+                nonlocal replacement_done
+                catalog = original_catalog(tool_path)
+                self.assertIsNotNone(catalog)
+                releases.rename(displaced_releases)
+                replacement_current = releases / ("b" * 40) / RELATIVE_TOOL
+                replacement_sibling = releases / ("a" * 40) / RELATIVE_TOOL
+                replacement_current.mkdir(parents=True)
+                replacement_sibling.mkdir(parents=True)
+                _write_account_local_marker(replacement_current)
+                _write_account_local_marker(replacement_sibling)
+                replacement_done = True
+                return catalog
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    legacy_retention_module,
+                    "_installed_release_catalog",
+                    side_effect=replace_after_discovery,
+                ),
+                mock.patch.object(cli_module, "status") as status_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(replacement_done)
+            status_mock.assert_not_called()
+            payload = json.loads(output.getvalue())
+            _assert_low_level_contract(self, payload)
+            self.assertIn(
+                "installed release changed while being inspected",
+                payload["message"],
+            )
+
+    def test_catalog_tool_walk_closes_new_fd_after_parent_close_failure(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-catalog-tool-close-") as root:
+            release_root = root / "release"
+            (release_root / RELATIVE_TOOL).mkdir(parents=True)
+            release_fd = os.open(
+                release_root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            opened_fds: list[int] = []
+            original_open = legacy_retention_module.open_directory_at
+            original_close = os.close
+            close_failed = False
+
+            def track_open(*args: object, **kwargs: object) -> tuple[int, object]:
+                fd, identity = original_open(*args, **kwargs)
+                opened_fds.append(fd)
+                return fd, identity
+
+            def close_parent_then_fail(fd: int) -> None:
+                nonlocal close_failed
+                original_close(fd)
+                if not close_failed and opened_fds and fd == opened_fds[0]:
+                    close_failed = True
+                    raise OSError(errno.EIO, "simulated parent close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        legacy_retention_module,
+                        "open_directory_at",
+                        side_effect=track_open,
+                    ),
+                    mock.patch.object(
+                        legacy_retention_module.os,
+                        "close",
+                        side_effect=close_parent_then_fail,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "simulated parent close failure",
+                    ),
+                ):
+                    legacy_retention_module._open_installed_tool_from_release(
+                        release_fd,
+                        release_root,
+                    )
+            finally:
+                os.close(release_fd)
+
+            self.assertTrue(close_failed)
+            self.assertGreaterEqual(len(opened_fds), 2)
+            for fd in opened_fds:
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(fd)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_bound_current_root_walk_closes_new_fd_after_parent_close_failure(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-bound-root-close-") as root:
+            _, current_tool, _, _ = _installed_upgrade_layout(root)
+            (current_tool / "runtime" / "retention").mkdir(
+                parents=True,
+                mode=0o700,
+            )
+            catalog = legacy_retention_module._installed_release_catalog(current_tool)
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            opened_fds: list[int] = []
+            original_open = legacy_retention_module.open_directory_at
+            original_close = os.close
+            close_failed = False
+
+            def track_open(*args: object, **kwargs: object) -> tuple[int, object]:
+                fd, identity = original_open(*args, **kwargs)
+                opened_fds.append(fd)
+                return fd, identity
+
+            def close_parent_then_fail(fd: int) -> None:
+                nonlocal close_failed
+                original_close(fd)
+                if not close_failed and opened_fds and fd == opened_fds[0]:
+                    close_failed = True
+                    raise OSError(errno.EIO, "simulated parent close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        legacy_retention_module,
+                        "open_directory_at",
+                        side_effect=track_open,
+                    ),
+                    mock.patch.object(
+                        legacy_retention_module.os,
+                        "close",
+                        side_effect=close_parent_then_fail,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "cannot inspect current helper legacy retention path safely",
+                    ),
+                ):
+                    legacy_retention_module._open_bound_current_tool_legacy_retention_root(
+                        catalog
+                    )
+            finally:
+                catalog.close()
+
+            self.assertTrue(close_failed)
+            self.assertEqual(len(opened_fds), 2)
+            for fd in opened_fds:
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(fd)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_catalog_revalidation_attempts_every_descriptor_cleanup(self) -> None:
+        with owned_temporary_directory("cli-catalog-revalidate-close-") as root:
+            _, current_tool, _, _ = _installed_upgrade_layout(root)
+            catalog = legacy_retention_module._installed_release_catalog(current_tool)
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            refreshed_fds: list[int] = []
+            original_open = legacy_retention_module.open_absolute_directory_chain
+            original_close = os.close
+            failed_fd = -1
+            close_failed = False
+
+            def track_open(
+                path: pathlib.Path,
+                **kwargs: object,
+            ) -> tuple[int, object]:
+                nonlocal failed_fd
+                fd, identity = original_open(path, **kwargs)
+                refreshed_fds.append(fd)
+                if path == catalog.tool_path:
+                    failed_fd = fd
+                return fd, identity
+
+            def close_tool_then_fail(fd: int) -> None:
+                nonlocal close_failed
+                original_close(fd)
+                if not close_failed and fd == failed_fd:
+                    close_failed = True
+                    raise OSError(errno.EIO, "simulated tool close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        legacy_retention_module,
+                        "open_absolute_directory_chain",
+                        side_effect=track_open,
+                    ),
+                    mock.patch.object(
+                        legacy_retention_module.os,
+                        "close",
+                        side_effect=close_tool_then_fail,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "simulated tool close failure",
+                    ),
+                ):
+                    legacy_retention_module._revalidate_installed_release_catalog(
+                        catalog
+                    )
+            finally:
+                catalog.close()
+
+            self.assertTrue(close_failed)
+            self.assertEqual(len(refreshed_fds), 3)
+            for fd in refreshed_fds:
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(fd)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_current_root_revalidation_preserves_mismatch_on_cleanup_failure(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-current-root-cleanup-") as root:
+            _, current_tool, _, _ = _installed_upgrade_layout(root)
+            retention = current_tool / "runtime" / "retention"
+            retention.mkdir(parents=True, mode=0o700)
+            catalog = legacy_retention_module._installed_release_catalog(current_tool)
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            current_root = (
+                legacy_retention_module._open_bound_current_tool_legacy_retention_root(
+                    catalog
+                )
+            )
+            self.assertIsNotNone(current_root)
+            assert current_root is not None
+            original_open = (
+                legacy_retention_module._open_bound_current_tool_legacy_retention_root
+            )
+            original_close = legacy_retention_module._LegacyRetentionRoot.close
+
+            def open_with_mismatched_policy(
+                selected_catalog: object,
+            ) -> object:
+                refreshed = original_open(selected_catalog)
+                self.assertIsNotNone(refreshed)
+                assert refreshed is not None
+                refreshed.retention_binding = dataclasses.replace(
+                    refreshed.retention_binding,
+                    gid=refreshed.retention_binding.gid + 1,
+                )
+                return refreshed
+
+            def close_then_fail(selected_root: object) -> None:
+                original_close(selected_root)
+                raise OSError(errno.EIO, "simulated refreshed-root close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        legacy_retention_module,
+                        "_open_bound_current_tool_legacy_retention_root",
+                        side_effect=open_with_mismatched_policy,
+                    ),
+                    mock.patch.object(
+                        legacy_retention_module._LegacyRetentionRoot,
+                        "close",
+                        autospec=True,
+                        side_effect=close_then_fail,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "current helper legacy retention path changed",
+                    ) as raised,
+                ):
+                    legacy_retention_module._revalidate_current_tool_legacy_retention_root(
+                        current_root,
+                        catalog=catalog,
+                    )
+            finally:
+                current_root.close()
+                catalog.close()
+
+            self.assertIn(
+                "refreshed current legacy retention cleanup failed",
+                "\n".join(raised.exception.__notes__),
             )
 
     def test_installed_release_gid_drift_fails_catalog_revalidation(self) -> None:
@@ -1875,15 +2268,15 @@ class CliLifecycleTests(unittest.TestCase):
 
     def test_legacy_migration_fence_revalidates_after_command_failure(self) -> None:
         with owned_temporary_directory("cli-legacy-failed-command-") as root:
-            _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+            releases, current_tool, _, legacy_retention = _installed_upgrade_layout(
+                root
+            )
             _write_retention_lock(legacy_retention)
-            original_revalidate = legacy_retention_module._revalidate_releases_root
-            revalidation_count = 0
+            displaced_releases = root / "displaced-releases"
 
-            def count_revalidation(*args: object, **kwargs: object) -> None:
-                nonlocal revalidation_count
-                revalidation_count += 1
-                original_revalidate(*args, **kwargs)
+            def replace_catalog_then_fail(**_: object) -> dict[str, object]:
+                releases.rename(displaced_releases)
+                raise RuntimeError("synthetic command failure")
 
             output = io.StringIO()
             with (
@@ -1892,23 +2285,23 @@ class CliLifecycleTests(unittest.TestCase):
                     return_value=current_tool,
                 ),
                 mock.patch.object(
-                    legacy_retention_module,
-                    "_revalidate_releases_root",
-                    side_effect=count_revalidation,
-                ),
-                mock.patch.object(
                     cli_module,
                     "status",
-                    side_effect=RuntimeError("synthetic command failure"),
+                    side_effect=replace_catalog_then_fail,
                 ),
                 contextlib.redirect_stdout(output),
             ):
                 exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
 
             self.assertEqual(exit_code, 2)
-            self.assertEqual(revalidation_count, 2)
             payload = json.loads(output.getvalue())
             self.assertIn("synthetic command failure", payload["message"])
+            self.assertTrue(
+                any(
+                    "legacy retention fence finalization failed" in error
+                    for error in payload["secondary_errors"]
+                )
+            )
 
     def test_legacy_migration_fence_preserves_command_os_and_value_errors(
         self,
@@ -1968,39 +2361,24 @@ class CliLifecycleTests(unittest.TestCase):
                 self.subTest(failure=type(failure).__name__),
                 owned_temporary_directory("cli-legacy-dual-failure-") as root,
             ):
-                _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+                releases, current_tool, _, legacy_retention = _installed_upgrade_layout(
+                    root
+                )
                 _write_retention_lock(legacy_retention)
-                original_revalidate = legacy_retention_module._revalidate_releases_root
-                revalidation_count = 0
-
-                def fail_final_revalidation(
-                    *args: object,
-                    **kwargs: object,
-                ) -> None:
-                    nonlocal revalidation_count
-                    revalidation_count += 1
-                    if revalidation_count == 1:
-                        original_revalidate(*args, **kwargs)
-                        return
-                    raise OSError(errno.ESTALE, "synthetic finalization drift")
+                displaced_releases = root / "displaced-releases"
 
                 with (
                     mock.patch(
                         "review_supervisor.legacy_retention.tool_root",
                         return_value=current_tool,
                     ),
-                    mock.patch.object(
-                        legacy_retention_module,
-                        "_revalidate_releases_root",
-                        side_effect=fail_final_revalidation,
-                    ),
                     self.assertRaises(type(failure)) as raised,
                 ):
                     with legacy_retention_module.installed_legacy_retention_fence():
+                        releases.rename(displaced_releases)
                         raise failure
 
                 self.assertIs(raised.exception, failure)
-                self.assertEqual(revalidation_count, 2)
                 self.assertIn(
                     "legacy retention fence finalization failed",
                     "\n".join(raised.exception.__notes__),

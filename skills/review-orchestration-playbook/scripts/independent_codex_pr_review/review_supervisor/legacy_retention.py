@@ -113,9 +113,88 @@ def _stable_directory_entries_fd(
     return after
 
 
+@dataclass(slots=True)
+class _InstalledReleaseCatalog:
+    releases_root: pathlib.Path
+    release_root: pathlib.Path
+    tool_path: pathlib.Path
+    current_release_name: bytes
+    releases_fd: int
+    release_fd: int
+    tool_fd: int
+    releases_policy: DirectoryPolicyBinding
+    release_policy: DirectoryPolicyBinding
+    tool_policy: DirectoryPolicyBinding
+    releases_entries: tuple[tuple[bytes, os.stat_result], ...]
+
+    def close(self) -> None:
+        tool_fd, self.tool_fd = self.tool_fd, -1
+        release_fd, self.release_fd = self.release_fd, -1
+        releases_fd, self.releases_fd = self.releases_fd, -1
+        _close_inspection_fds(
+            (
+                (tool_fd, "installed helper"),
+                (release_fd, "installed release"),
+                (releases_fd, "installed release catalog"),
+            )
+        )
+
+
+def _open_installed_tool_from_release(
+    release_fd: int,
+    release_root: pathlib.Path,
+) -> tuple[int, DirectoryPolicyBinding]:
+    current_fd = release_fd
+    current_path = release_root
+    opened_fd = -1
+    tool_policy: DirectoryPolicyBinding | None = None
+    try:
+        for part_text in _INSTALLED_TOOL_SUFFIX:
+            part = os.fsencode(part_text)
+            current_path /= part_text
+            next_fd, _ = open_directory_at(
+                current_fd,
+                part,
+                path_hint=current_path,
+                private=False,
+            )
+            try:
+                policy = validate_directory_policy_fd(
+                    next_fd,
+                    current_path,
+                    private=False,
+                )
+            except BaseException:
+                _close_inspection_fd(
+                    next_fd,
+                    label="installed helper path component",
+                )
+                raise
+            previous_fd = opened_fd
+            opened_fd = next_fd
+            if previous_fd >= 0:
+                _close_inspection_fd(
+                    previous_fd,
+                    label="installed helper parent path component",
+                )
+            current_fd = opened_fd
+            tool_policy = policy
+        if tool_policy is None:
+            raise RuntimeError("installed helper path is incomplete")
+        tool_fd = opened_fd
+        opened_fd = -1
+        return tool_fd, tool_policy
+    finally:
+        if opened_fd >= 0:
+            _close_inspection_fd(
+                opened_fd,
+                label="installed helper path",
+            )
+
+
 def _installed_release_catalog(
     root: pathlib.Path,
-) -> tuple[pathlib.Path, bytes] | None:
+) -> _InstalledReleaseCatalog | None:
     if not root.is_absolute() or len(root.parents) < len(_INSTALLED_TOOL_SUFFIX):
         return None
     release_root = root.parents[len(_INSTALLED_TOOL_SUFFIX) - 1]
@@ -124,7 +203,7 @@ def _installed_release_catalog(
     expected_tool_root = release_root.joinpath(*_INSTALLED_TOOL_SUFFIX)
     releases_fd = -1
     release_fd = -1
-    refreshed_release_fd = -1
+    tool_fd = -1
     try:
         if not directory_paths_equivalent(spelled_releases_root, releases_root):
             return None
@@ -143,6 +222,10 @@ def _installed_release_catalog(
             release_root,
             private=False,
         )
+        tool_fd, tool_policy = _open_installed_tool_from_release(
+            release_fd,
+            release_root,
+        )
         release_binding = release_policy.stat_binding
         releases_entries = _stable_directory_entries_fd(
             releases_fd,
@@ -160,36 +243,38 @@ def _installed_release_catalog(
                 "current installed release has no unique catalog identity"
             )
 
-        held_release_policy = validate_directory_policy_fd(
-            release_fd,
-            release_root,
-            private=False,
-        )
-        refreshed_release_fd, _ = open_absolute_directory_chain(release_root)
-        refreshed_release_policy = validate_directory_policy_fd(
-            refreshed_release_fd,
-            release_root,
-            private=False,
-        )
-        if (
-            release_policy != held_release_policy
-            or release_policy != refreshed_release_policy
+        release_name = matching_names[0]
+        if len(release_name) != _RELEASE_NAME_LENGTH or any(
+            character not in _LOWER_HEX for character in release_name
         ):
-            raise RuntimeError("installed release changed while being inspected")
-        _revalidate_installed_release_catalog(
+            return None
+        catalog = _InstalledReleaseCatalog(
             releases_root,
+            release_root,
+            root,
+            release_name,
+            releases_fd,
+            release_fd,
+            tool_fd,
             releases_policy,
+            release_policy,
+            tool_policy,
             releases_entries,
         )
+        _revalidate_installed_release_catalog(catalog)
+        releases_fd = -1
+        release_fd = -1
+        tool_fd = -1
+        return catalog
     except (OSError, ValueError) as error:
         raise RuntimeError(
             "cannot identify installed release catalog safely"
         ) from error
     finally:
-        if refreshed_release_fd >= 0:
+        if tool_fd >= 0:
             _close_inspection_fd(
-                refreshed_release_fd,
-                label="refreshed installed release",
+                tool_fd,
+                label="installed helper",
             )
         if release_fd >= 0:
             _close_inspection_fd(
@@ -201,13 +286,6 @@ def _installed_release_catalog(
                 releases_fd,
                 label="installed release catalog",
             )
-
-    release_name = matching_names[0]
-    if len(release_name) != _RELEASE_NAME_LENGTH or any(
-        character not in _LOWER_HEX for character in release_name
-    ):
-        return None
-    return releases_root, release_name
 
 
 @dataclass(slots=True)
@@ -319,41 +397,125 @@ def _close_inspection_fd(fd: int, *, label: str) -> None:
         )
 
 
-def _revalidate_installed_release_catalog(
-    releases_root: pathlib.Path,
-    releases_policy: DirectoryPolicyBinding,
-    releases_entries: tuple[tuple[bytes, os.stat_result], ...],
+def _close_inspection_fds(
+    descriptors: tuple[tuple[int, str], ...],
 ) -> None:
-    refreshed_fd = -1
+    primary_error = sys.exception()
+    first_cleanup_error: BaseException | None = None
+    for fd, label in descriptors:
+        if fd < 0:
+            continue
+        try:
+            os.close(fd)
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                _record_secondary_error(
+                    primary_error,
+                    label=f"{label} descriptor cleanup failed",
+                    secondary_error=cleanup_error,
+                )
+            elif first_cleanup_error is None:
+                first_cleanup_error = cleanup_error
+            else:
+                _record_secondary_error(
+                    first_cleanup_error,
+                    label=f"{label} descriptor cleanup failed",
+                    secondary_error=cleanup_error,
+                )
+    if primary_error is None and first_cleanup_error is not None:
+        raise first_cleanup_error
+
+
+def _revalidate_installed_release_catalog(
+    catalog: _InstalledReleaseCatalog,
+) -> None:
+    refreshed_releases_fd = -1
+    refreshed_release_fd = -1
+    refreshed_tool_fd = -1
     try:
-        refreshed_fd, _ = open_absolute_directory_chain(releases_root)
-        refreshed_policy = validate_directory_policy_fd(
-            refreshed_fd,
-            releases_root,
+        held_releases_policy = validate_directory_policy_fd(
+            catalog.releases_fd,
+            catalog.releases_root,
             private=False,
         )
-        if releases_policy != refreshed_policy:
+        held_release_policy = validate_directory_policy_fd(
+            catalog.release_fd,
+            catalog.release_root,
+            private=False,
+        )
+        held_tool_policy = validate_directory_policy_fd(
+            catalog.tool_fd,
+            catalog.tool_path,
+            private=False,
+        )
+        if (
+            held_releases_policy != catalog.releases_policy
+            or held_release_policy != catalog.release_policy
+            or held_tool_policy != catalog.tool_policy
+        ):
             raise RuntimeError("installed release changed while being inspected")
-        refreshed_entries = _stable_directory_entries_fd(
-            refreshed_fd,
-            path_hint=releases_root,
+
+        held_entries = _stable_directory_entries_fd(
+            catalog.releases_fd,
+            path_hint=catalog.releases_root,
             private=False,
             label="installed release directory",
         )
-        if tuple(
-            (name, _binding(metadata)) for name, metadata in releases_entries
-        ) != tuple((name, _binding(metadata)) for name, metadata in refreshed_entries):
+        refreshed_releases_fd, _ = open_absolute_directory_chain(catalog.releases_root)
+        refreshed_releases_policy = validate_directory_policy_fd(
+            refreshed_releases_fd,
+            catalog.releases_root,
+            private=False,
+        )
+        refreshed_entries = _stable_directory_entries_fd(
+            refreshed_releases_fd,
+            path_hint=catalog.releases_root,
+            private=False,
+            label="installed release directory",
+        )
+        refreshed_release_fd, _ = open_absolute_directory_chain(catalog.release_root)
+        refreshed_release_policy = validate_directory_policy_fd(
+            refreshed_release_fd,
+            catalog.release_root,
+            private=False,
+        )
+        refreshed_tool_fd, _ = open_absolute_directory_chain(catalog.tool_path)
+        refreshed_tool_policy = validate_directory_policy_fd(
+            refreshed_tool_fd,
+            catalog.tool_path,
+            private=False,
+        )
+        if (
+            refreshed_releases_policy != catalog.releases_policy
+            or refreshed_release_policy != catalog.release_policy
+            or refreshed_tool_policy != catalog.tool_policy
+        ):
+            raise RuntimeError("installed release changed while being inspected")
+        expected_entries = tuple(
+            (name, _binding(metadata)) for name, metadata in catalog.releases_entries
+        )
+        if (
+            tuple((name, _binding(metadata)) for name, metadata in held_entries)
+            != expected_entries
+            or tuple((name, _binding(metadata)) for name, metadata in refreshed_entries)
+            != expected_entries
+        ):
             raise RuntimeError("installed release changed while being inspected")
     except (OSError, ValueError) as error:
         raise RuntimeError(
             "cannot revalidate installed release catalog safely"
         ) from error
     finally:
-        if refreshed_fd >= 0:
-            _close_inspection_fd(
-                refreshed_fd,
-                label="revalidated installed release catalog",
+        _close_inspection_fds(
+            (
+                (refreshed_tool_fd, "revalidated installed helper"),
+                (refreshed_release_fd, "revalidated installed release"),
+                (
+                    refreshed_releases_fd,
+                    "revalidated installed release catalog",
+                ),
             )
+        )
 
 
 def _release_uses_account_local_retention(
@@ -498,9 +660,13 @@ def _open_legacy_retention_root(
                         secondary_error=cleanup_error,
                     )
                 raise error
-            if opened_fd >= 0:
-                os.close(opened_fd)
+            previous_fd = opened_fd
             opened_fd = next_fd
+            if previous_fd >= 0:
+                _close_inspection_fd(
+                    previous_fd,
+                    label="legacy retention parent path component",
+                )
             current_fd = opened_fd
             components.append((part, policy, private))
             if index == len(_INSTALLED_TOOL_SUFFIX):
@@ -564,9 +730,76 @@ def _open_current_tool_legacy_retention_root(
     )
 
 
+def _open_bound_current_tool_legacy_retention_root(
+    catalog: _InstalledReleaseCatalog,
+) -> _LegacyRetentionRoot | None:
+    current_fd = catalog.tool_fd
+    current_path = catalog.tool_path
+    opened_fd = -1
+    try:
+        held_tool_policy = validate_directory_policy_fd(
+            catalog.tool_fd,
+            catalog.tool_path,
+            private=False,
+        )
+        if held_tool_policy != catalog.tool_policy:
+            raise RuntimeError("current installed helper changed while being inspected")
+        for index, part in enumerate((b"runtime", b"retention")):
+            current_path /= os.fsdecode(part)
+            private = index == 1
+            try:
+                next_fd, _ = open_directory_at(
+                    current_fd,
+                    part,
+                    path_hint=current_path,
+                    private=private,
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                policy = validate_directory_policy_fd(
+                    next_fd,
+                    current_path,
+                    private=private,
+                )
+            except BaseException:
+                _close_inspection_fd(
+                    next_fd,
+                    label="current helper legacy retention path component",
+                )
+                raise
+            previous_fd = opened_fd
+            opened_fd = next_fd
+            if previous_fd >= 0:
+                _close_inspection_fd(
+                    previous_fd,
+                    label="current helper legacy retention parent",
+                )
+            current_fd = opened_fd
+        retention_fd = opened_fd
+        opened_fd = -1
+        return _LegacyRetentionRoot(
+            path=current_path,
+            components=(),
+            retention_fd=retention_fd,
+            retention_binding=policy,
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "cannot inspect current helper legacy retention path safely"
+        ) from error
+    finally:
+        if opened_fd >= 0:
+            _close_inspection_fd(
+                opened_fd,
+                label="current helper legacy retention path",
+            )
+
+
 def _validate_current_release_probe(
     probe: _LegacyRetentionProbe,
     *,
+    catalog: _InstalledReleaseCatalog,
     current_tool_path: pathlib.Path,
     current_root: _LegacyRetentionRoot | None,
 ) -> None:
@@ -591,7 +824,16 @@ def _validate_current_release_probe(
         raise RuntimeError(
             "cannot revalidate current installed helper safely"
         ) from error
-    if current_tool_policy != probe.tool_binding:
+    held_tool_policy = validate_directory_policy_fd(
+        catalog.tool_fd,
+        catalog.tool_path,
+        private=False,
+    )
+    if (
+        held_tool_policy != catalog.tool_policy
+        or current_tool_policy != catalog.tool_policy
+        or probe.tool_binding != catalog.tool_policy
+    ):
         raise RuntimeError(
             "current installed helper path changed while being inspected"
         )
@@ -700,7 +942,41 @@ def _revalidate_legacy_probe_snapshot(
 
 def _revalidate_current_tool_legacy_retention_root(
     root: _LegacyRetentionRoot,
+    *,
+    catalog: _InstalledReleaseCatalog | None = None,
 ) -> None:
+    if catalog is not None:
+        refreshed_root: _LegacyRetentionRoot | None = None
+        try:
+            refreshed_root = _open_bound_current_tool_legacy_retention_root(catalog)
+            held_policy = validate_directory_policy_fd(
+                root.retention_fd,
+                root.path,
+                private=True,
+            )
+            if (
+                refreshed_root is None
+                or held_policy != root.retention_binding
+                or refreshed_root.retention_binding != root.retention_binding
+            ):
+                raise RuntimeError(
+                    "current helper legacy retention path changed while being inspected"
+                )
+        finally:
+            if refreshed_root is not None:
+                primary_error = sys.exception()
+                try:
+                    refreshed_root.close()
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    _record_secondary_error(
+                        primary_error,
+                        label="refreshed current legacy retention cleanup failed",
+                        secondary_error=cleanup_error,
+                    )
+        return
+
     refreshed_fd = -1
     try:
         refreshed_fd, _ = open_absolute_directory_chain(
@@ -1000,12 +1276,20 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
     releases_entries: tuple[tuple[bytes, os.stat_result], ...] = ()
     roots: list[_LegacyRetentionRoot] = []
     absent_roots: list[tuple[bytes, _DirectoryStatBinding, _LegacyRetentionProbe]] = []
+    if catalog is not None:
+        cleanup.callback(catalog.close)
     try:
         try:
             unresolved: list[pathlib.Path] = []
             unfenced_tools: list[pathlib.Path] = []
 
-            current_root = _open_current_tool_legacy_retention_root(current_tool_path)
+            if catalog is None:
+                current_root = _open_current_tool_legacy_retention_root(
+                    current_tool_path
+                )
+            else:
+                _revalidate_installed_release_catalog(catalog)
+                current_root = _open_bound_current_tool_legacy_retention_root(catalog)
             if current_root is None:
                 current_root_absent = True
                 if catalog is None:
@@ -1020,23 +1304,17 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                 if _record_initial_attempt_state(current_root):
                     unresolved.append(current_root.path)
                 _revalidate_legacy_retention_lock(current_root)
-                _revalidate_current_tool_legacy_retention_root(current_root)
+                _revalidate_current_tool_legacy_retention_root(
+                    current_root,
+                    catalog=catalog,
+                )
 
             if catalog is not None:
-                releases_root, current_release_name = catalog
-                releases_fd, _ = open_absolute_directory_chain(releases_root)
-                releases_policy = validate_directory_policy_fd(
-                    releases_fd,
-                    releases_root,
-                    private=False,
-                )
-                cleanup.callback(os.close, releases_fd)
-                releases_entries = _stable_directory_entries_fd(
-                    releases_fd,
-                    path_hint=releases_root,
-                    private=False,
-                    label="installed release directory",
-                )
+                releases_root = catalog.releases_root
+                current_release_name = catalog.current_release_name
+                releases_fd = catalog.releases_fd
+                releases_policy = catalog.releases_policy
+                releases_entries = catalog.releases_entries
                 for name, release_metadata in releases_entries:
                     if len(name) != _RELEASE_NAME_LENGTH or any(
                         character not in _LOWER_HEX for character in name
@@ -1052,6 +1330,11 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         )
                     release_binding = _binding(release_metadata)
                     if name == current_release_name:
+                        if release_binding != catalog.release_policy.stat_binding:
+                            raise RuntimeError(
+                                "current installed release changed while being "
+                                "inspected"
+                            )
                         current_release_binding = release_binding
                         current_catalog_probe = _open_legacy_retention_root(
                             releases_fd,
@@ -1062,6 +1345,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         cleanup.callback(current_catalog_probe.close)
                         _validate_current_release_probe(
                             current_catalog_probe,
+                            catalog=catalog,
                             current_tool_path=current_tool_path,
                             current_root=current_root,
                         )
@@ -1098,11 +1382,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     raise RuntimeError(
                         "current installed release is missing from its release catalog"
                     )
-                _revalidate_releases_root(
-                    releases_root,
-                    releases_policy,
-                    releases_entries,
-                )
+                _revalidate_installed_release_catalog(catalog)
             if unfenced_tools:
                 reported = ", ".join(
                     str(path)
@@ -1131,11 +1411,19 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                 if current_root is not None:
                     _revalidate_legacy_retention_lock(current_root)
                     _reject_new_attempt(current_root)
-                    _revalidate_current_tool_legacy_retention_root(current_root)
-                elif current_root_absent:
-                    appeared_current = _open_current_tool_legacy_retention_root(
-                        current_tool_path
+                    _revalidate_current_tool_legacy_retention_root(
+                        current_root,
+                        catalog=catalog,
                     )
+                elif current_root_absent:
+                    if catalog is None:
+                        appeared_current = _open_current_tool_legacy_retention_root(
+                            current_tool_path
+                        )
+                    else:
+                        appeared_current = (
+                            _open_bound_current_tool_legacy_retention_root(catalog)
+                        )
                     if appeared_current is not None:
                         appeared_current.close()
                         raise RuntimeError(
@@ -1172,6 +1460,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         )
                         _validate_current_release_probe(
                             refreshed_current_probe,
+                            catalog=catalog,
                             current_tool_path=current_tool_path,
                             current_root=current_root,
                         )
@@ -1204,11 +1493,11 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                                 appeared,
                                 label="refreshed installed release probe",
                             )
-                    _revalidate_releases_root(
-                        releases_root,
-                        releases_policy,
-                        releases_entries,
-                    )
+                    if catalog is None:
+                        raise RuntimeError(
+                            "installed release catalog binding is missing"
+                        )
+                    _revalidate_installed_release_catalog(catalog)
             except (OSError, ValueError) as error:
                 if body_error is None:
                     raise RuntimeError(
