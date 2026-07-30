@@ -57,8 +57,10 @@ require_digest() {
     fail "$label is not a real regular file: $path"
   output="$("${probe_environment[@]}" /usr/bin/shasum -a 256 "$path")"
   actual="${output%% *}"
-  [[ "$actual" == "$expected" ]] ||
+  if [[ "$actual" != "$expected" ]]; then
     fail "$label digest does not match the reviewed pin (expected=$expected actual=$actual)"
+  fi
+  printf 'verified %s sha256=%s\n' "$label" "$actual"
 }
 
 require_artifact_pins() {

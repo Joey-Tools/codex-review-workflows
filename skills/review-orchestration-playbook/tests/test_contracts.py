@@ -1697,6 +1697,7 @@ class RepositoryContractTest(unittest.TestCase):
             "(expected=$expected actual=$actual)",
             script,
         )
+        self.assertIn("verified %s sha256=%s", script)
         for mode in ("DEVELOPER", "HOSTED"):
             for tool in (
                 "CLANG",
