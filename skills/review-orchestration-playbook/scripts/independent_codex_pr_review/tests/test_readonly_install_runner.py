@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
 import sys
@@ -276,6 +277,120 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             finally:
                 binding.close()
 
+    def test_bound_cleanup_removes_the_staged_descriptor_tree(self) -> None:
+        with owned_temporary_directory("runtime-cleanup-bound-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            nested = runtime_parent / "nested"
+            nested.mkdir(mode=0o700)
+            payload = nested / "payload"
+            payload.write_text("content", encoding="utf-8")
+            nested.chmod(0o500)
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                failure = runner._cleanup_bound_tree(
+                    binding,
+                    restore_owner_write=True,
+                )
+
+                self.assertIsNone(failure)
+                self.assertFalse(runtime_parent.exists())
+                self.assertFalse(tuple(root.glob(".codex-cleanup-*")))
+            finally:
+                binding.close()
+
+    def test_bound_cleanup_detects_final_root_replacement(self) -> None:
+        with owned_temporary_directory("runtime-cleanup-final-race-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            escaped = root / "escaped"
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            real_rmdir = runner.os.rmdir
+
+            def replace_before_final_rmdir(
+                name: str,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                assert dir_fd is not None
+                os.rename(
+                    name,
+                    escaped.name,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                os.mkdir(name, mode=0o700, dir_fd=dir_fd)
+                real_rmdir(name, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    runner.os,
+                    "rmdir",
+                    side_effect=replace_before_final_rmdir,
+                ):
+                    failure = runner._cleanup_bound_tree(
+                        binding,
+                        restore_owner_write=False,
+                    )
+
+                self.assertIsNotNone(failure)
+                assert failure is not None
+                self.assertEqual(failure.path, str(escaped))
+                self.assertEqual(failure.error_kind, "OSError")
+                self.assertEqual(failure.error_errno, errno.ESTALE)
+                self.assertTrue(failure.retained)
+                self.assertTrue(escaped.is_dir())
+                self.assertFalse(runtime_parent.exists())
+            finally:
+                binding.close()
+                if escaped.exists():
+                    escaped.rmdir()
+
+    def test_lifecycle_signal_fence_records_without_interrupting(self) -> None:
+        fence = runner._install_lifecycle_signal_fence()
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            self.assertEqual(fence.received_signal, signal.SIGTERM)
+        finally:
+            received_signal = runner._restore_lifecycle_signal_fence(fence)
+        self.assertEqual(received_signal, signal.SIGTERM)
+
+        with owned_temporary_directory("readonly-lifecycle-late-signal-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir(mode=0o700)
+            sticky_parent.chmod(0o1777)
+            late_fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+            )
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_install_lifecycle_signal_fence",
+                    return_value=late_fence,
+                ),
+                mock.patch.object(runner, "_run_main", return_value=0),
+                mock.patch.object(
+                    runner,
+                    "_restore_lifecycle_signal_fence",
+                    return_value=signal.SIGTERM,
+                ),
+            ):
+                self.assertEqual(runner.main(), 128 + signal.SIGTERM)
+
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
@@ -448,7 +563,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     return_value=self._no_child_result(
                         stdout=b"selected tests passed\n",
                     ),
-                ),
+                ) as run_bounded_command,
             ):
                 result = runner._run_no_child_test_suite(
                     installed_root=root,
@@ -463,6 +578,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "selected tests passed\n")
             self.assertEqual(result.stderr, "")
+            argv = run_bounded_command.call_args.args[0]
+            self.assertIn("os.environ['TMPDIR']=sys.argv[2]", argv[3])
+            self.assertIn("tempfile.tempdir=sys.argv[2]", argv[3])
 
     def test_no_child_suite_rejects_process_group_only_closure(self) -> None:
         with owned_temporary_directory("readonly-no-child-forged-") as root:

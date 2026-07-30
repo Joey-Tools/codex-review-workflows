@@ -114,9 +114,12 @@ superseded_by:
   descriptor and revalidated for the same object before use, so restrictive
   process umasks cannot make valid scratch allocation fail. The read-only
   installed runner retains exact descriptors for both the sticky-parent install
-  container and the runtime directory through child closure, revalidates each
-  pathname before cleanup, and conservatively reports a held renamed object as
-  retained even when its old lexical path is absent.
+  container and the runtime directory through child closure. Cleanup exclusively
+  stages each bound object, walks and removes descendants relative to held
+  descriptors, and verifies final unlink state; replacement or path drift is an
+  explicit retained failure. A lifecycle signal fence spans allocation, child
+  settlement, cleanup, and receipt emission. The no-child subprocess also binds
+  both `TMPDIR` and Python's `tempfile` cache to the external runtime parent.
 - The ordinary deterministic gate retains full behavior coverage, including
   tests that intentionally fork and exercise `setsid`/double-fork rejection.
   The installed-release immutability gate separately runs a fixed-identity
@@ -275,6 +278,17 @@ superseded_by:
   under the authenticated Darwin profile and returned proven closure, complete
   cleanup, an immutable release tree, no retained paths, no runtime residue, and
   no secondary failures.
+- The descriptor-root cleanup, lifecycle signal fence, and temporary-directory
+  binding repair passed 631/631 in 239.594 seconds with the
+  reviewed 631-test selected identity and SHA-256
+  `58394d63ab19912324b89fe551c758275b2d8327e72037fd8e2efd2792205c6e`.
+  The focused runner/secure-I/O modules passed 56/56 in 2.092 seconds, the live
+  no-child/Seatbelt gate passed 9/9 in 9.188 seconds, and the real read-only
+  installed gate again returned proven child closure, complete cleanup, an
+  immutable release tree, no retained paths, no runtime residue, and no
+  secondary failures. The repository contracts passed 102/102 in 7.820 seconds,
+  and the full Python 3.13 platform suite passed 2,822 tests with 6 skips in
+  1260.240 seconds.
 - The current Python 3.13 validation also passed the focused runner/secure-I/O
   modules 53/53 in 3.378 seconds, the repository contracts 102/102 in 11.628
   seconds, the live no-child/Seatbelt gate 9/9 in 14.660 seconds, and the full

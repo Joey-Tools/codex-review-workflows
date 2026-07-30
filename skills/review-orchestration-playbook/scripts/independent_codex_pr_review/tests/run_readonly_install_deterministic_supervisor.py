@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
+import secrets
 import signal
 import shutil
 import stat
@@ -20,6 +22,7 @@ from review_supervisor.codex_executable import run_bounded_command
 from review_supervisor.no_child_profile import (
     prepare_sandboxed_python_no_child_profile,
 )
+from review_supervisor.secureio import open_absolute_directory_chain
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
@@ -39,9 +42,11 @@ CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
 NO_CHILD_SUITE_CODE = (
-    "import os,runpy,sys\n"
+    "import os,runpy,sys,tempfile\n"
     "root=sys.argv[1]\n"
     f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
+    "os.environ['TMPDIR']=sys.argv[2]\n"
+    "tempfile.tempdir=sys.argv[2]\n"
     "os.chdir(root)\n"
     "sys.path.insert(0,root)\n"
     "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
@@ -55,6 +60,9 @@ XATTR_NOFOLLOW = 0x0001
 XATTR_NAMES_LIMIT_BYTES = 64 * 1024
 XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
+F_GETPATH = 50
+DARWIN_MAXPATHLEN = 1024
+RENAME_EXCL = 0x00000004
 
 
 @dataclass(frozen=True)
@@ -137,8 +145,77 @@ class ChildSignalGuard:
 
 
 @dataclass
+class LifecycleSignalFence:
+    signals: tuple[signal.Signals, ...]
+    previous_handlers: tuple[Any, ...]
+    previous_mask: set[signal.Signals]
+    received_signal: int | None = None
+
+
+@dataclass
 class ChildProcessClosureProof:
     proven: bool = False
+
+
+def _install_lifecycle_signal_fence() -> LifecycleSignalFence:
+    handled = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers: list[Any] = []
+    fence = LifecycleSignalFence(
+        signals=handled,
+        previous_handlers=(),
+        previous_mask=previous_mask,
+    )
+
+    def retain_lifecycle_signal(
+        signal_number: int,
+        _frame: FrameType | None,
+    ) -> None:
+        if fence.received_signal is None:
+            fence.received_signal = signal_number
+
+    try:
+        for signal_number in handled:
+            previous_handlers.append(
+                signal.signal(signal_number, retain_lifecycle_signal)
+            )
+        fence.previous_handlers = tuple(previous_handlers)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        for signal_number, previous in zip(
+            handled[: len(previous_handlers)],
+            previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
+    return fence
+
+
+def _restore_lifecycle_signal_fence(fence: LifecycleSignalFence) -> int | None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    try:
+        received_signal = fence.received_signal
+        for signal_number, previous in zip(
+            fence.signals,
+            fence.previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, fence.previous_mask)
+    return received_signal
+
+
+@contextmanager
+def _bound_lifecycle_signals() -> Iterator[LifecycleSignalFence]:
+    fence = _install_lifecycle_signal_fence()
+    try:
+        yield fence
+    finally:
+        _restore_lifecycle_signal_fence(fence)
 
 
 def _install_child_signal_guard() -> ChildSignalGuard:
@@ -615,6 +692,183 @@ def _list_bound_directory(
     return entries
 
 
+def _node_key(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+    )
+
+
+def _binding_node_key(binding: _DirectoryParentBinding) -> tuple[int, int, int, int]:
+    return (
+        binding.identity.device,
+        binding.identity.inode,
+        stat.S_IFMT(binding.identity.mode),
+        binding.identity.uid,
+    )
+
+
+def _descriptor_path(descriptor: int) -> pathlib.Path:
+    payload = fcntl.fcntl(descriptor, F_GETPATH, b"\0" * DARWIN_MAXPATHLEN)
+    raw_path = payload.split(b"\0", 1)[0]
+    if not raw_path or not raw_path.startswith(b"/"):
+        raise OSError(errno.ESTALE, "bound directory path is unavailable")
+    return pathlib.Path(os.fsdecode(raw_path))
+
+
+def _rename_exclusive(
+    source_parent_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = libc.renameatx_np
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameatx_np.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameatx_np(
+        source_parent_fd,
+        os.fsencode(source_name),
+        target_parent_fd,
+        os.fsencode(target_name),
+        RENAME_EXCL,
+    )
+    if result != 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot exclusively stage a bound cleanup entry",
+        )
+
+
+def _exclusive_stage_name(parent_fd: int, source_name: str) -> str:
+    for _attempt in range(8):
+        staged_name = f".codex-cleanup-{secrets.token_hex(16)}"
+        try:
+            _rename_exclusive(
+                parent_fd,
+                source_name,
+                parent_fd,
+                staged_name,
+            )
+        except FileExistsError:
+            continue
+        return staged_name
+    raise FileExistsError(errno.EEXIST, "cannot allocate a cleanup staging name")
+
+
+def _path_entry_absent(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _open_bound_cleanup_entry(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if stat.S_ISDIR(initial.st_mode):
+        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISREG(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISLNK(initial.st_mode):
+        symlink_flag = getattr(os, "O_SYMLINK", None)
+        if symlink_flag is None:
+            raise OSError(errno.ENOTSUP, "symlink descriptor opens are unavailable")
+        flags = common_flags | symlink_flag
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in bound cleanup tree")
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if _node_key(opened) != _node_key(initial):
+            raise OSError(errno.ESTALE, "cleanup entry changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_staged_entry(
+    parent_fd: int,
+    staged_name: str,
+    descriptor: int,
+    expected_path: pathlib.Path,
+) -> None:
+    staged = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+    if _node_key(staged) != _node_key(os.fstat(descriptor)):
+        raise OSError(errno.ESTALE, "cleanup staging moved a different object")
+    if _descriptor_path(descriptor) != expected_path:
+        raise OSError(errno.ESTALE, "cleanup staging path changed")
+
+
+def _remove_bound_directory_contents(
+    descriptor: int,
+    expected_path: pathlib.Path,
+    *,
+    restore_owner_write: bool,
+) -> None:
+    if restore_owner_write:
+        metadata = os.fstat(descriptor)
+        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR)
+    names = tuple(sorted(os.listdir(descriptor)))
+    for name in names:
+        entry_fd, initial = _open_bound_cleanup_entry(descriptor, name)
+        try:
+            staged_name = _exclusive_stage_name(descriptor, name)
+            staged_path = expected_path / staged_name
+            _verify_staged_entry(
+                descriptor,
+                staged_name,
+                entry_fd,
+                staged_path,
+            )
+            if not _path_entry_absent(descriptor, name):
+                raise OSError(
+                    errno.ESTALE,
+                    "cleanup source name was repopulated after staging",
+                )
+            if stat.S_ISDIR(initial.st_mode):
+                _remove_bound_directory_contents(
+                    entry_fd,
+                    staged_path,
+                    restore_owner_write=restore_owner_write,
+                )
+                os.rmdir(staged_name, dir_fd=descriptor)
+                if _descriptor_path(entry_fd) != staged_path or not _path_entry_absent(
+                    descriptor, staged_name
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound cleanup directory survived final removal",
+                    )
+            else:
+                os.unlink(staged_name, dir_fd=descriptor)
+                if os.fstat(entry_fd).st_nlink != 0 or not _path_entry_absent(
+                    descriptor, staged_name
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound cleanup entry survived final removal",
+                    )
+        finally:
+            os.close(entry_fd)
+    if os.listdir(descriptor):
+        raise OSError(errno.ESTALE, "bound cleanup directory gained new entries")
+
+
 def _cleanup_bound_tree(
     binding: _DirectoryParentBinding | None,
     *,
@@ -628,10 +882,57 @@ def _cleanup_bound_tree(
         # A failed path revalidation leaves the held directory object retained,
         # even when its original lexical path is now absent.
         return _cleanup_failure_from_error(binding.path, error, retained=True)
-    return _cleanup_tree(
-        binding.path,
-        restore_owner_write=restore_owner_write,
-    )
+    parent_fd: int | None = None
+    staged_path = binding.path
+    try:
+        parent_fd, _parent_identity = open_absolute_directory_chain(
+            binding.path.parent,
+            allow_sticky_writable_ancestors=(not binding.require_owned_private_parent),
+        )
+        staged_name = _exclusive_stage_name(parent_fd, binding.path.name)
+        staged_path = binding.path.parent / staged_name
+        staged = os.stat(
+            staged_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if _node_key(staged) != _binding_node_key(binding):
+            raise OSError(errno.ESTALE, "cleanup staged a different root object")
+        if _descriptor_path(binding.fd) != staged_path:
+            raise OSError(errno.ESTALE, "bound cleanup root staging path changed")
+        if not _path_entry_absent(parent_fd, binding.path.name):
+            raise OSError(
+                errno.ESTALE,
+                "cleanup root name was repopulated after staging",
+            )
+        _remove_bound_directory_contents(
+            binding.fd,
+            staged_path,
+            restore_owner_write=restore_owner_write,
+        )
+        os.rmdir(staged_name, dir_fd=parent_fd)
+        if _descriptor_path(binding.fd) != staged_path or not _path_entry_absent(
+            parent_fd, staged_name
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "bound cleanup root survived final removal",
+            )
+        if not _path_entry_absent(parent_fd, binding.path.name):
+            raise OSError(
+                errno.ESTALE,
+                "cleanup root path was repopulated before completion",
+            )
+        return None
+    except Exception as error:
+        try:
+            retained_path = _descriptor_path(binding.fd)
+        except Exception:
+            retained_path = staged_path
+        return _cleanup_failure_from_error(retained_path, error, retained=True)
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _retained_for_unproven_child_closure(
@@ -664,21 +965,7 @@ def _retained_bound_tree_for_unproven_child_closure(
     )
 
 
-def main() -> int:
-    if sys.platform != "darwin":
-        print(
-            "read-only installed supervisor regression requires Darwin", file=sys.stderr
-        )
-        return 2
-    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(parent_metadata.st_mode)
-        or not parent_metadata.st_mode & stat.S_ISVTX
-        or not parent_metadata.st_mode & stat.S_IWOTH
-    ):
-        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
-        return 2
-
+def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
     install_container_binding: _DirectoryParentBinding | None = None
@@ -738,6 +1025,8 @@ def main() -> int:
         stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "child-run"
         child_process_closure = "pending"
         completed = _run_no_child_test_suite(
@@ -747,6 +1036,8 @@ def main() -> int:
             closure_proof=closure_proof,
         )
         child_process_closure = "proven"
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "snapshot-after"
         install_container_binding.revalidate()
         after = _tree_snapshot(installed_root)
@@ -829,6 +1120,10 @@ def main() -> int:
             failure for failure in cleanup_results if failure is not None
         )
 
+    if lifecycle_fence.received_signal is not None and signal_error is None:
+        signal_error = ChildRunInterrupted(lifecycle_fence.received_signal)
+        if primary_failure is None:
+            primary_failure = _primary_failure(stage, signal_error)
     release_tree_immutable = (
         before is not None
         and after is not None
@@ -917,8 +1212,46 @@ def main() -> int:
             file=sys.stderr,
         )
     if signal_error is not None:
-        return 128 + signal_error.signal_number
-    return 1 if primary_failed or cleanup_failures else 0
+        returncode = 128 + signal_error.signal_number
+    else:
+        returncode = 1 if primary_failed or cleanup_failures else 0
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if lifecycle_fence.received_signal is not None:
+        return 128 + lifecycle_fence.received_signal
+    return returncode
+
+
+def main() -> int:
+    if sys.platform != "darwin":
+        print(
+            "read-only installed supervisor regression requires Darwin", file=sys.stderr
+        )
+        return 2
+    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or not parent_metadata.st_mode & stat.S_ISVTX
+        or not parent_metadata.st_mode & stat.S_IWOTH
+    ):
+        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
+        return 2
+    lifecycle_fence = _install_lifecycle_signal_fence()
+    try:
+        returncode = _run_main(lifecycle_fence)
+    except BaseException as primary_error:
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            primary_error.add_note(
+                "lifecycle signal restoration failed: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+        raise
+    received_signal = _restore_lifecycle_signal_fence(lifecycle_fence)
+    if received_signal is not None:
+        return 128 + received_signal
+    return returncode
 
 
 if __name__ == "__main__":

@@ -1798,7 +1798,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 628", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 631", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1834,6 +1834,12 @@ class RepositoryContractTest(unittest.TestCase):
             "closure.permitted_process_closure_proven",
             "closure.process_group_emptiness_used_as_descendant_proof",
             "install_container_binding = _open_directory_parent(",
+            "os.environ['TMPDIR']=sys.argv[2]",
+            "tempfile.tempdir=sys.argv[2]",
+            "_bound_lifecycle_signals()",
+            "_exclusive_stage_name(",
+            "_remove_bound_directory_contents(",
+            "_descriptor_path(binding.fd)",
             "_cleanup_bound_tree(",
             '"child_process_closure": child_process_closure',
             '"primary_failure": (',
@@ -1842,7 +1848,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"release_tree_property": "object-identity-content-access-policy"',
             '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
             '"retained_paths": retained_paths',
-            "return 1 if primary_failed or cleanup_failures else 0",
+            "returncode = 1 if primary_failed or cleanup_failures else 0",
             "tests.run_readonly_no_child_supervisor",
         ):
             self.assertIn(contract, readonly_install_runner)
