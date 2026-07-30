@@ -1747,7 +1747,7 @@ class RepositoryContractTest(unittest.TestCase):
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
-            "ordinary deterministic suite passed 604/604",
+            "ordinary deterministic suite passed 605/605",
             '"release_tree_immutable":true',
             '"runtime_residue":[]',
         ):

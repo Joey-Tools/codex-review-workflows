@@ -28,7 +28,7 @@ superseded_by:
 - The deterministic suite contains no source-tree `TemporaryDirectory`
   allocation in the no-child tests or hosted fail-closed probe.
 - The read-only runner verifies the sticky/world-writable source ancestor,
-  immutable installed tree, empty runtime residue, and all 604 deterministic
+  immutable installed tree, empty runtime residue, and all 605 deterministic
   supervisor tests.
 - CI runs both the ordinary deterministic suite and the read-only installed
   regression on macOS with Python 3.13.
@@ -44,7 +44,7 @@ superseded_by:
   scratch allocation as incompatible with read-only installed releases and
   untrusted `01777` ancestors.
 - Focused no-child regressions passed 6/6.
-- The ordinary deterministic suite passed 604/604 in 210.784 seconds.
+- The ordinary deterministic suite passed 605/605 in 219.242 seconds.
 - The first read-only run preserved the release tree and cleaned all runtime
   residue while exposing one fd-allocation-order assumption; the exact focused
   test passed after replacing that assumption with an explicit `dup2`.
