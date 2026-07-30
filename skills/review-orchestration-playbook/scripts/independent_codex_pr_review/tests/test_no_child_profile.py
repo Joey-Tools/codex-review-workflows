@@ -804,9 +804,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42",
         )
         self.assertNotEqual(pin, profile.PINNED_RUNTIME)
-        current = GITHUB_HOSTED_RUNTIME_PINS[
-            "github-macos-26-arm64-26.5.2-25F84"
-        ]
+        current = GITHUB_HOSTED_RUNTIME_PINS["github-macos-26-arm64-26.5.2-25F84"]
         self.assertEqual(current.macos_product_version, "26.5.2")
         self.assertEqual(current.macos_build_version, "25F84")
         self.assertEqual(current.darwin_release, "25.5.0")
@@ -2641,12 +2639,16 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
         evidence = mock.Mock()
         evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
+        runtime_pin = replace(
+            profile.PINNED_RUNTIME,
+            macos_product_version="synthetic-reviewed-runtime",
+        )
         with (
             mock.patch.object(
                 profile,
                 "probe_compatibility",
                 return_value=evidence,
-            ),
+            ) as probe_compatibility,
             mock.patch.object(profile, "require_compatible"),
             mock.patch.object(
                 profile,
@@ -2666,12 +2668,14 @@ class NoChildProfileUnitTests(unittest.TestCase):
         ):
             prepared = profile.prepare_sandboxed_python_no_child_profile(
                 additional_seatbelt_rules="(deny file-write*)",
+                runtime_pin=runtime_pin,
             )
 
         authenticate_loader.assert_called_once_with(
             profile.SANDBOX_EXEC,
             expected_sha256=sandbox_exec.sha256,
         )
+        probe_compatibility.assert_called_once_with(pin=runtime_pin)
         authenticate_target.assert_called_once_with(pathlib.Path(target.path))
         self.assertEqual(prepared.sandboxed_target, target)
         self.assertIs(
@@ -2759,9 +2763,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
         for mutation, message in cases:
             with (
                 self.subTest(mutation=mutation),
-                owned_temporary_directory(
-                    f"path-target-{mutation}-"
-                ) as temporary,
+                owned_temporary_directory(f"path-target-{mutation}-") as temporary,
             ):
                 root = temporary.resolve(strict=True)
                 root.chmod(0o700)

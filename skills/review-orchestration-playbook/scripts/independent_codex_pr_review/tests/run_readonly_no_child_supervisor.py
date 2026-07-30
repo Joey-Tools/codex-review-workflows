@@ -32,10 +32,10 @@ READONLY_NO_CHILD_MODULES = frozenset(
         "tests.test_wire",
     }
 )
-EXPECTED_TEST_COUNT = 272
+EXPECTED_TEST_COUNT = 274
 # Update both constants only after reviewing the complete selected identity.
 EXPECTED_TEST_ID_SHA256 = (
-    "29d2474218a6ee9998442d0e469b89f185c5e76805bcd033cd5fe7367a60f783"
+    "8a7732243d8f3eeedda6fd14aab612913407b608b168dffcf18b226e0fca1ede"
 )
 
 

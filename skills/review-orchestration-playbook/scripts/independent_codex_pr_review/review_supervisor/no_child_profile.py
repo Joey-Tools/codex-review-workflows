@@ -3265,10 +3265,11 @@ def prepare_no_child_profile(
 def prepare_sandboxed_python_no_child_profile(
     *,
     additional_seatbelt_rules: str = "",
+    runtime_pin: RuntimePin = PINNED_RUNTIME,
 ) -> PreparedNoChildProfile:
     """Prepare the current path-bound Python behind the sandbox loader."""
 
-    evidence = probe_compatibility()
+    evidence = probe_compatibility(pin=runtime_pin)
     require_compatible(evidence)
     sandbox_exec = authenticate_executable(
         SANDBOX_EXEC,

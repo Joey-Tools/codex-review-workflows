@@ -1798,14 +1798,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 631", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 638", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 272", readonly_no_child_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 274", readonly_no_child_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", readonly_no_child_runner)
         self.assertIn("READONLY_NO_CHILD_MODULES", readonly_no_child_runner)
         self.assertIn(
@@ -1826,13 +1826,15 @@ class RepositoryContractTest(unittest.TestCase):
             "acl_entries=_acl_entries(path)",
             "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
-            "prepare_sandboxed_python_no_child_profile()",
+            "prepare_sandboxed_python_no_child_profile(",
+            "runtime_pin=runtime_pin",
             "run_bounded_command(",
+            "bounded_command_process_closure(error)",
             "CHILD_STDOUT_LIMIT_BYTES",
             "CHILD_STDERR_LIMIT_BYTES",
-            "closure.authenticated_no_child_profile",
-            "closure.permitted_process_closure_proven",
-            "closure.process_group_emptiness_used_as_descendant_proof",
+            '"authenticated_no_child_profile"',
+            '"permitted_process_closure_proven"',
+            '"process_group_emptiness_used_as_descendant_proof"',
             "install_container_binding = _open_directory_parent(",
             "os.environ['TMPDIR']=sys.argv[2]",
             "tempfile.tempdir=sys.argv[2]",
@@ -1840,6 +1842,8 @@ class RepositoryContractTest(unittest.TestCase):
             "_exclusive_stage_name(",
             "_remove_bound_directory_contents(",
             "_descriptor_path(binding.fd)",
+            "_bound_tree_retention_locator(",
+            "descriptor-object://",
             "_cleanup_bound_tree(",
             '"child_process_closure": child_process_closure',
             '"primary_failure": (',
@@ -1995,6 +1999,9 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn(
                     f"""      - name: Run deterministic supervisor from read-only install
         working-directory: {skill_root}/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
+          CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
         run: |
           python3 -B -m tests.run_readonly_install_deterministic_supervisor
 """,

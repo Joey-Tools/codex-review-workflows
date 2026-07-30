@@ -135,6 +135,9 @@ jobs:
           python-version: "3.13"
       - name: Run deterministic supervisor from read-only install
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           python3 -B -m tests.run_readonly_install_deterministic_supervisor
       - name: Require source-only Python tree

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import secrets
 import signal
 import shutil
@@ -18,7 +19,11 @@ from dataclasses import asdict, dataclass
 from types import FrameType
 from typing import Any, Iterator
 
-from review_supervisor.codex_executable import run_bounded_command
+from review_supervisor import no_child_profile
+from review_supervisor.codex_executable import (
+    bounded_command_process_closure,
+    run_bounded_command,
+)
 from review_supervisor.no_child_profile import (
     prepare_sandboxed_python_no_child_profile,
 )
@@ -33,6 +38,11 @@ from .support import (
     _create_owned_private_directory,
     _open_directory_parent,
     _private_runtime_parent,
+)
+from .run_hosted_no_child_fail_closed import (
+    RUNNER_ARCH_ENV,
+    RUNNER_ENVIRONMENT_ENV,
+    _select_hosted_runtime_profile,
 )
 
 
@@ -154,7 +164,70 @@ class LifecycleSignalFence:
 
 @dataclass
 class ChildProcessClosureProof:
+    launch_attempted: bool = False
     proven: bool = False
+    runtime_profile: str | None = None
+
+
+def _select_no_child_runtime_profile() -> tuple[str, no_child_profile.RuntimePin]:
+    runner_environment = os.environ.get(RUNNER_ENVIRONMENT_ENV)
+    runner_arch = os.environ.get(RUNNER_ARCH_ENV)
+    if runner_environment is None and runner_arch is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            raise RuntimeError(
+                "read-only installed supervisor is missing explicit hosted runner "
+                "identity"
+            )
+        return "production-current", no_child_profile.PINNED_RUNTIME
+    if runner_environment != "github-hosted" or runner_arch != "ARM64":
+        raise RuntimeError(
+            "read-only installed supervisor received an incomplete or "
+            "unsupported hosted runner identity"
+        )
+    if platform.machine() != "arm64":
+        raise RuntimeError(
+            "read-only installed supervisor requires an actual arm64 hosted process"
+        )
+    observed_runtime = no_child_profile._runtime_fingerprint()
+    selected = _select_hosted_runtime_profile(observed_runtime)
+    if selected is None:
+        raise RuntimeError(
+            "read-only installed supervisor runtime is not in the reviewed hosted "
+            "profile catalog: "
+            f"product={observed_runtime.macos_product_version!r} "
+            f"build={observed_runtime.macos_build_version!r} "
+            f"darwin={observed_runtime.darwin_release!r} "
+            f"python={observed_runtime.python_version[:2]!r}"
+        )
+    return selected
+
+
+def _authenticated_no_child_closure(
+    closure: object | None,
+    *,
+    require_stdio_closed: bool,
+) -> bool:
+    return bool(
+        closure is not None
+        and getattr(closure, "authenticated_no_child_profile", False) is True
+        and getattr(closure, "permitted_process_closure_proven", False) is True
+        and getattr(closure, "leader_reaped", False) is True
+        and (
+            not require_stdio_closed or getattr(closure, "stdio_closed", False) is True
+        )
+        and getattr(
+            closure,
+            "process_group_emptiness_used_as_descendant_proof",
+            True,
+        )
+        is False
+    )
+
+
+def _child_process_closure_status(proof: ChildProcessClosureProof) -> str:
+    if not proof.launch_attempted:
+        return "not-started"
+    return "proven" if proof.proven else "unproven"
 
 
 def _install_lifecycle_signal_fence() -> LifecycleSignalFence:
@@ -352,10 +425,10 @@ def _run_no_child_test_suite(
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
     secondary_failures: list[SecondaryFailure] | None = None,
     closure_proof: ChildProcessClosureProof | None = None,
+    lifecycle_fence: LifecycleSignalFence | None = None,
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
-    prepared = prepare_sandboxed_python_no_child_profile()
     argv = (
         sys.executable,
         "-B",
@@ -365,6 +438,16 @@ def _run_no_child_test_suite(
         str(runtime_parent),
     )
     with _bound_child_signals(diagnostics):
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        runtime_profile, runtime_pin = _select_no_child_runtime_profile()
+        proof.runtime_profile = runtime_profile
+        prepared = prepare_sandboxed_python_no_child_profile(
+            runtime_pin=runtime_pin,
+        )
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        proof.launch_attempted = True
         try:
             result = run_bounded_command(
                 argv,
@@ -372,28 +455,30 @@ def _run_no_child_test_suite(
                 max_output_bytes=stdout_limit + stderr_limit,
                 _prepared_no_child_profile=prepared,
             )
-        except ValueError as error:
-            if "command output exceeds" in str(error):
+        except BaseException as error:
+            closure = bounded_command_process_closure(error)
+            if _authenticated_no_child_closure(
+                closure,
+                require_stdio_closed=False,
+            ):
+                proof.proven = True
+            if isinstance(error, ValueError) and "command output exceeds" in str(error):
                 raise OverflowError(
                     "bounded no-child test output exceeded its byte cap"
                 ) from error
             raise
-    closure = result.process_closure
-    if (
-        closure is None
-        or not closure.authenticated_no_child_profile
-        or not closure.permitted_process_closure_proven
-        or not closure.leader_reaped
-        or not closure.stdio_closed
-        or closure.process_group_emptiness_used_as_descendant_proof
-    ):
-        raise RuntimeError(
-            "read-only installed test process closure lacks an authenticated "
-            "no-child proof"
-        )
-    proof.proven = True
-    if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
-        raise OverflowError("bounded no-child test output exceeded its byte cap")
+        closure = result.process_closure
+        if not _authenticated_no_child_closure(
+            closure,
+            require_stdio_closed=True,
+        ):
+            raise RuntimeError(
+                "read-only installed test process closure lacks an authenticated "
+                "no-child proof"
+            )
+        proof.proven = True
+        if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
+            raise OverflowError("bounded no-child test output exceeded its byte cap")
     return subprocess.CompletedProcess(
         args=argv,
         returncode=result.returncode,
@@ -667,7 +752,7 @@ def _cleanup_tree(
 
 
 def _cleanup_failure_from_error(
-    path: pathlib.Path,
+    path: pathlib.Path | str,
     error: BaseException,
     *,
     retained: bool | None = None,
@@ -716,6 +801,36 @@ def _descriptor_path(descriptor: int) -> pathlib.Path:
     if not raw_path or not raw_path.startswith(b"/"):
         raise OSError(errno.ESTALE, "bound directory path is unavailable")
     return pathlib.Path(os.fsdecode(raw_path))
+
+
+def _descriptor_object_locator(metadata: os.stat_result) -> str:
+    return f"descriptor-object://{metadata.st_dev}/{metadata.st_ino}"
+
+
+def _bound_tree_retention_locator(
+    binding: _DirectoryParentBinding,
+) -> tuple[str, bool]:
+    metadata = os.fstat(binding.fd)
+    descriptor_locator = _descriptor_object_locator(metadata)
+    if metadata.st_nlink == 0:
+        return descriptor_locator, False
+    try:
+        candidate = _descriptor_path(binding.fd)
+        candidate_fd, _candidate_identity = open_absolute_directory_chain(
+            candidate,
+            allow_sticky_writable_ancestors=(not binding.require_owned_private_parent),
+        )
+        try:
+            if _node_key(os.fstat(candidate_fd)) != _node_key(metadata):
+                raise OSError(
+                    errno.ESTALE,
+                    "descriptor path resolves to a different retained object",
+                )
+        finally:
+            os.close(candidate_fd)
+    except Exception:
+        return descriptor_locator, True
+    return str(candidate), True
 
 
 def _rename_exclusive(
@@ -879,9 +994,12 @@ def _cleanup_bound_tree(
     try:
         binding.revalidate()
     except Exception as error:
-        # A failed path revalidation leaves the held directory object retained,
-        # even when its original lexical path is now absent.
-        return _cleanup_failure_from_error(binding.path, error, retained=True)
+        retained_locator, retained = _bound_tree_retention_locator(binding)
+        return _cleanup_failure_from_error(
+            retained_locator,
+            error,
+            retained=retained,
+        )
     parent_fd: int | None = None
     staged_path = binding.path
     try:
@@ -925,11 +1043,12 @@ def _cleanup_bound_tree(
             )
         return None
     except Exception as error:
-        try:
-            retained_path = _descriptor_path(binding.fd)
-        except Exception:
-            retained_path = staged_path
-        return _cleanup_failure_from_error(retained_path, error, retained=True)
+        retained_locator, retained = _bound_tree_retention_locator(binding)
+        return _cleanup_failure_from_error(
+            retained_locator,
+            error,
+            retained=retained,
+        )
     finally:
         if parent_fd is not None:
             os.close(parent_fd)
@@ -955,11 +1074,12 @@ def _retained_bound_tree_for_unproven_child_closure(
 ) -> CleanupFailure | None:
     if binding is None:
         return None
+    retained_locator, retained = _bound_tree_retention_locator(binding)
     return CleanupFailure(
-        path=str(binding.path),
+        path=retained_locator,
         error_kind="ChildProcessClosureUnproven",
         error_errno=None,
-        retained=True,
+        retained=retained,
         restore_error_kind=None,
         restore_error_errno=None,
     )
@@ -1034,6 +1154,7 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
             runtime_parent=runtime_parent,
             secondary_failures=secondary_failures,
             closure_proof=closure_proof,
+            lifecycle_fence=lifecycle_fence,
         )
         child_process_closure = "proven"
         if lifecycle_fence.received_signal is not None:
@@ -1047,23 +1168,23 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
         stage = "complete"
     except TimeoutError as error:
         timeout_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except OverflowError as error:
         output_limit_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
         if child_process_closure == "pending":
-            child_process_closure = "proven" if closure_proof.proven else "unproven"
+            child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     finally:
-        if child_process_closure == "pending" and closure_proof.proven:
-            child_process_closure = "proven"
+        if child_process_closure == "pending":
+            child_process_closure = _child_process_closure_status(closure_proof)
         cleanup_results: list[CleanupFailure | None]
         if child_process_closure in {"pending", "unproven"}:
             cleanup_results = [
@@ -1156,6 +1277,7 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
         "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
         "cleanup_status": "incomplete" if cleanup_failures else "complete",
         "install_parent_is_sticky_world_writable": True,
+        "no_child_runtime_profile": closure_proof.runtime_profile,
         "primary_failure": (
             asdict(primary_failure) if primary_failure is not None else None
         ),

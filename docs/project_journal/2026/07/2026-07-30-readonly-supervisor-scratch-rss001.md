@@ -171,5 +171,41 @@ superseded_by:
   Seatbelt denial. The exact broker regression passed 1/1 outside the parent
   sandbox in 2.314 seconds, and the production-equivalent live no-child suite
   passed 9/9 in 7.585 seconds.
+- A final Fresh Codex review identified four distinct retained-state risks:
+  the read-only job did not select the legacy hosted runtime pin, signals during
+  profile preparation could be recorded without stopping launch, settled
+  timeout/output/signal exceptions discarded their no-child closure evidence,
+  and path revalidation failures reported the stale lexical name instead of the
+  held directory object. The repair keeps these protected properties separate:
+  exact hosted runtime compatibility, launch cancellation, authenticated
+  process settlement, and retained-object identity.
+- The runner now enters its child-signal guard before runtime selection and
+  profile preparation, records whether launch was attempted, and checks the
+  lifecycle fence again immediately before launch. A prelaunch interruption is
+  therefore `not-started` and permits ordinary cleanup; an attempted launch must
+  still prove authenticated leader settlement.
+- `run_bounded_command()` attaches its authenticated no-child settlement to
+  timeout, output-limit, and signal exceptions after terminating and reaping the
+  leader. The installed runner accepts only the typed evidence with a reaped
+  leader, proven permitted closure, and no process-group-emptiness substitute.
+- Retained cleanup locations now come from a descriptor path reopened through
+  the applicable ancestor policy and compared to the held object identity.
+  When no path can be verified, the report uses a `descriptor-object://`
+  locator; it never attributes retained custody to a stale or replacement
+  lexical path.
+- Focused runner and closure regressions passed 35/35. The full
+  `test_codex_executable` module passed 87 tests with two intentional live skips,
+  and the deterministic suite passed 638/638 in 298.666 seconds with
+  selected-identity SHA-256
+  `7785fd61ddd001a6423783efbf28defa1d050956d51a357e1074845cd365c1f8`.
+- The reviewed read-only selection now contains 274/274 no-child-safe tests with
+  identity SHA-256
+  `8a7732243d8f3eeedda6fd14aab612913407b608b168dffcf18b226e0fca1ede`.
+  Its real installed run returned proven closure, complete cleanup, immutable
+  release-tree identity/content/access policy, no retained paths, no runtime
+  residue, and runtime profile `production-current`. Repository contracts passed
+  102/102 in 12.947 seconds, the live no-child/Seatbelt gate passed 9/9 in
+  11.567 seconds, and the complete Python 3.13 platform discovery passed 2,822
+  tests with six skips in 1308.684 seconds.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.

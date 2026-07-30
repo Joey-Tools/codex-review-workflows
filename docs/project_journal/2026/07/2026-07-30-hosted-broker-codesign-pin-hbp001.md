@@ -33,6 +33,10 @@ superseded_by:
 - Hosted no-child fail-closed probing accepts only the exact reviewed
   macOS 26.4 build `25E246` or macOS 26.5.2 build `25F84` runtime fingerprint;
   an unknown runtime fails before the probe.
+- The read-only installed supervisor job consumes that same exact catalog. CI
+  supplies the authenticated runner environment and architecture explicitly;
+  an incomplete marker set, an unrecognized hosted runtime, or a GitHub Actions
+  run without those markers fails before profile preparation or child launch.
 - Source, artifact, Xcode, SDK, clang, linker, lipo, vtool, and
   `codesign_allocate` pins are unchanged.
 
@@ -57,6 +61,11 @@ superseded_by:
   `25F84`, Darwin `25.5.0`, with `/usr/bin/sandbox-exec` SHA-256
   `8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16`,
   proving the legacy-only workflow failed closed on the new runner generation.
+- A later Fresh Codex review found that the separate read-only installed job
+  still used the production 26.5.2 default while the mutable `macos-26` label
+  could select either reviewed generation. The runner now selects and passes the
+  exact observed pin from the same two-generation catalog, with local runs
+  retaining the production-current default only outside GitHub Actions.
 - Local `--developer-check` reproduced the pinned broker artifact exactly with
   the unchanged source, toolchain, signing identity, and CDHashes.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;

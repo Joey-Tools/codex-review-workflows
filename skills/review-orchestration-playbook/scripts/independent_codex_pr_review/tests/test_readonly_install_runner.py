@@ -241,7 +241,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
                 self.assertIsNotNone(failure)
                 assert failure is not None
-                self.assertEqual(failure.path, str(runtime_parent))
+                self.assertEqual(failure.path, str(original))
                 self.assertEqual(failure.error_kind, "OSError")
                 self.assertEqual(failure.error_errno, errno.ESTALE)
                 self.assertTrue(failure.retained)
@@ -269,11 +269,49 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
                 self.assertIsNotNone(failure)
                 assert failure is not None
-                self.assertEqual(failure.path, str(runtime_parent))
+                self.assertEqual(failure.path, str(original))
                 self.assertEqual(failure.error_kind, "FileNotFoundError")
                 self.assertTrue(failure.retained)
                 self.assertTrue(original.is_dir())
                 self.assertFalse(runtime_parent.exists())
+            finally:
+                binding.close()
+
+    def test_bound_cleanup_uses_descriptor_locator_when_path_is_unverifiable(
+        self,
+    ) -> None:
+        with owned_temporary_directory("runtime-cleanup-locator-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            original = root / "original"
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                runtime_parent.rename(original)
+                with mock.patch.object(
+                    runner,
+                    "_descriptor_path",
+                    side_effect=OSError(
+                        errno.ESTALE,
+                        "synthetic descriptor path failure",
+                    ),
+                ):
+                    failure = runner._cleanup_bound_tree(
+                        binding,
+                        restore_owner_write=False,
+                    )
+
+                self.assertIsNotNone(failure)
+                assert failure is not None
+                self.assertTrue(
+                    failure.path.startswith("descriptor-object://"),
+                    failure.path,
+                )
+                self.assertNotEqual(failure.path, str(runtime_parent))
+                self.assertTrue(failure.retained)
+                self.assertTrue(original.is_dir())
             finally:
                 binding.close()
 
@@ -548,15 +586,127 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             process_closure=closure,
         )
 
+    def test_no_child_runtime_profile_selection_is_exact_and_fail_closed(
+        self,
+    ) -> None:
+        with mock.patch.dict(runner.os.environ, {}, clear=True):
+            name, pin = runner._select_no_child_runtime_profile()
+        self.assertEqual(name, "production-current")
+        self.assertIs(pin, runner.no_child_profile.PINNED_RUNTIME)
+
+        with (
+            mock.patch.dict(
+                runner.os.environ,
+                {"GITHUB_ACTIONS": "true"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "missing explicit hosted"),
+        ):
+            runner._select_no_child_runtime_profile()
+
+        with (
+            mock.patch.dict(
+                runner.os.environ,
+                {
+                    runner.RUNNER_ENVIRONMENT_ENV: "github-hosted",
+                    runner.RUNNER_ARCH_ENV: "ARM64",
+                },
+                clear=True,
+            ),
+            mock.patch.object(runner.platform, "machine", return_value="arm64"),
+            mock.patch.object(
+                runner.no_child_profile,
+                "_runtime_fingerprint",
+                return_value=mock.sentinel.runtime,
+            ),
+            mock.patch.object(
+                runner,
+                "_select_hosted_runtime_profile",
+                return_value=("github-reviewed-runtime", mock.sentinel.runtime_pin),
+            ) as select_hosted,
+        ):
+            name, pin = runner._select_no_child_runtime_profile()
+        self.assertEqual(name, "github-reviewed-runtime")
+        self.assertIs(pin, mock.sentinel.runtime_pin)
+        select_hosted.assert_called_once_with(mock.sentinel.runtime)
+
+        with (
+            mock.patch.dict(
+                runner.os.environ,
+                {runner.RUNNER_ENVIRONMENT_ENV: "github-hosted"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "incomplete or unsupported"),
+        ):
+            runner._select_no_child_runtime_profile()
+
+    def test_no_child_suite_stops_after_signal_during_profile_preparation(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-no-child-preflight-signal-") as root:
+            proof = runner.ChildProcessClosureProof()
+            fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+            )
+
+            def prepare_after_signal(
+                **_kwargs: object,
+            ) -> object:
+                fence.received_signal = signal.SIGTERM
+                return mock.sentinel.prepared
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    side_effect=prepare_after_signal,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                ) as run_bounded_command,
+                self.assertRaises(runner.ChildRunInterrupted) as caught,
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                    lifecycle_fence=fence,
+                )
+
+            self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+            self.assertFalse(proof.launch_attempted)
+            self.assertFalse(proof.proven)
+            self.assertEqual(
+                runner._child_process_closure_status(proof),
+                "not-started",
+            )
+            run_bounded_command.assert_not_called()
+
     def test_no_child_suite_accepts_authenticated_tree_closure(self) -> None:
         with owned_temporary_directory("readonly-no-child-accepted-") as root:
             proof = runner.ChildProcessClosureProof()
             with (
                 mock.patch.object(
                     runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
                     "prepare_sandboxed_python_no_child_profile",
                     return_value=mock.sentinel.prepared,
-                ),
+                ) as prepare_profile,
                 mock.patch.object(
                     runner,
                     "run_bounded_command",
@@ -575,6 +725,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             self.assertTrue(proof.proven)
+            self.assertTrue(proof.launch_attempted)
+            self.assertEqual(proof.runtime_profile, "synthetic-runtime")
+            prepare_profile.assert_called_once_with(
+                runtime_pin=mock.sentinel.runtime_pin,
+            )
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "selected tests passed\n")
             self.assertEqual(result.stderr, "")
@@ -638,6 +793,90 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             self.assertTrue(proof.proven)
+
+    def test_no_child_suite_timeout_uses_attached_settlement_proof(self) -> None:
+        with owned_temporary_directory("readonly-no-child-timeout-") as root:
+            proof = runner.ChildProcessClosureProof()
+            timeout = TimeoutError("synthetic bounded timeout")
+            closure = self._no_child_result(stdio_closed=False).process_closure
+            with (
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    side_effect=timeout,
+                ),
+                mock.patch.object(
+                    runner,
+                    "bounded_command_process_closure",
+                    return_value=closure,
+                ) as process_closure,
+                self.assertRaisesRegex(TimeoutError, "bounded timeout"),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertTrue(proof.launch_attempted)
+            self.assertTrue(proof.proven)
+            process_closure.assert_called_once_with(timeout)
+
+    def test_no_child_suite_output_exception_uses_attached_settlement_proof(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-no-child-output-error-") as root:
+            proof = runner.ChildProcessClosureProof()
+            output_error = ValueError("command output exceeds 2048 bytes")
+            closure = self._no_child_result(stdio_closed=False).process_closure
+            with (
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    side_effect=output_error,
+                ),
+                mock.patch.object(
+                    runner,
+                    "bounded_command_process_closure",
+                    return_value=closure,
+                ) as process_closure,
+                self.assertRaisesRegex(OverflowError, "byte cap"),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertTrue(proof.launch_attempted)
+            self.assertTrue(proof.proven)
+            process_closure.assert_called_once_with(output_error)
 
     def test_no_child_suite_does_not_claim_closure_before_process_supervision(
         self,
@@ -915,7 +1154,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 "snapshot-after",
             )
             self.assertEqual(summary["cleanup_status"], "incomplete")
-            self.assertEqual(summary["retained_paths"], [str(install_container)])
+            self.assertEqual(
+                summary["retained_paths"],
+                [str(install_container)],
+            )
             self.assertIn("child stdout evidence", error_text)
             self.assertIn("child stderr evidence", error_text)
             self.assertLess(
@@ -1002,7 +1244,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 "snapshot-after",
             )
             self.assertEqual(summary["cleanup_status"], "incomplete")
-            self.assertEqual(summary["retained_paths"], [str(install_container)])
+            self.assertEqual(
+                summary["retained_paths"],
+                [str(original_install_container)],
+            )
             self.assertTrue(original_install_container.is_dir())
             self.assertTrue(install_container.is_dir())
             self.assertIn("test runtime parent path changed", stderr.getvalue())
@@ -1086,7 +1331,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 "runtime-residue",
             )
             self.assertEqual(summary["cleanup_status"], "incomplete")
-            self.assertEqual(summary["retained_paths"], [str(runtime_parent)])
+            self.assertEqual(
+                summary["retained_paths"],
+                [str(original_runtime_parent)],
+            )
             self.assertTrue(original_runtime_parent.is_dir())
             self.assertTrue(runtime_parent.is_dir())
             self.assertIn("test runtime parent path changed", stderr.getvalue())

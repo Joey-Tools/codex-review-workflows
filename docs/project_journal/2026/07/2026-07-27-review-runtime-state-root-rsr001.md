@@ -293,6 +293,20 @@ superseded_by:
   modules 53/53 in 3.378 seconds, the repository contracts 102/102 in 11.628
   seconds, the live no-child/Seatbelt gate 9/9 in 14.660 seconds, and the full
   platform suite, which ran 2,822 tests with 6 skips in 1459.085 seconds.
+- The exact-hosted-runtime, prelaunch-signal, aborted-command closure, and
+  descriptor-retention-locator repair passed 638/638 in 298.666 seconds with the
+  reviewed 638-test selected identity and SHA-256
+  `7785fd61ddd001a6423783efbf28defa1d050956d51a357e1074845cd365c1f8`.
+  A read-only hosted job now selects the exact reviewed macOS 26.4 or 26.5.2
+  no-child pin, signals stop before child launch during profile preparation,
+  timeout/output/signal failures carry authenticated leader settlement, and a
+  renamed retained tree is reported only through a descriptor-verified path or
+  a descriptor-object locator.
+- Final Python 3.13 validation passed the repository contracts 102/102 in 12.947
+  seconds, the read-only installed 274-test no-child-safe gate with proven
+  closure and zero residue, the live no-child/Seatbelt gate 9/9 in 11.567
+  seconds, and the complete 2,822-test platform discovery with six skips in
+  1308.684 seconds.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

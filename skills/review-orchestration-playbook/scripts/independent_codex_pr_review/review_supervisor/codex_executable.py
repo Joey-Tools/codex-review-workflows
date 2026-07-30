@@ -383,6 +383,32 @@ class CommandResult:
     process_closure: PreflightProcessClosureEvidence | None = None
 
 
+_BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE = "_codex_bounded_command_process_closure"
+
+
+def bounded_command_process_closure(
+    error: BaseException,
+) -> PreflightProcessClosureEvidence | None:
+    """Return authenticated settlement evidence carried by an aborted command."""
+
+    try:
+        evidence = getattr(error, _BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE, None)
+    except BaseException:
+        return None
+    return evidence if isinstance(evidence, PreflightProcessClosureEvidence) else None
+
+
+def _attach_bounded_command_process_closure(
+    error: BaseException,
+    evidence: PreflightProcessClosureEvidence,
+) -> None:
+    try:
+        setattr(error, _BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE, evidence)
+    except BaseException:
+        # A non-extensible control-flow exception remains fail closed for callers.
+        return
+
+
 class CommandRunner(Protocol):
     def __call__(
         self,
@@ -4013,6 +4039,8 @@ def run_bounded_command(
             )
             retain_runtime_resources = True
             raise retained from cleanup_error
+        if closure is not None:
+            _attach_bounded_command_process_closure(primary_error, closure)
         raise
     finally:
         close_errors: list[BaseException] = []
