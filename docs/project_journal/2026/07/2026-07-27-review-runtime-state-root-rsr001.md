@@ -239,9 +239,9 @@ superseded_by:
   to a private revalidation call count. New regressions prove every acquired
   descriptor is attempted, preserve the primary mismatch, parse both public
   command matrices, and induce real catalog replacement during finalization.
-- The deterministic independent-supervisor gate passed 605/605 in 219.242
-  seconds with the reviewed 605-test selected identity and SHA-256
-  `b910e4b428fa1bf3809f1930b246e498f5c1d40f9266ae12a213ef0e30f52813`.
+- The deterministic independent-supervisor gate passed 609/609 in 306.459
+  seconds with the reviewed 609-test selected identity and SHA-256
+  `3042ac1af87dc2a7efe902cb2a04a39d14fd5df256214423ef9602ad62c24b9e`.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

@@ -1747,7 +1747,7 @@ class RepositoryContractTest(unittest.TestCase):
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
-            "ordinary deterministic suite passed 605/605",
+            "ordinary deterministic suite passed 609/609",
             '"release_tree_immutable":true',
             '"runtime_residue":[]',
         ):
@@ -1788,7 +1788,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 605", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 609", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1798,12 +1798,26 @@ class RepositoryContractTest(unittest.TestCase):
         for contract in (
             'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
             "CODEX_REVIEW_TEST_RUNTIME_PARENT",
+            "class TreeEntrySnapshot:",
+            "device=metadata.st_dev",
+            "inode=metadata.st_ino",
+            'flags=getattr(metadata, "st_flags", 0)',
+            "xattrs=_xattr_snapshot(path)",
+            "acl_entries=_acl_entries(path)",
             "_set_tree_read_only(installed_root)",
-            '"release_tree_immutable": after == before',
-            '"runtime_residue": runtime_residue',
+            '"release_tree_immutable": release_tree_immutable',
+            '"release_tree_property": "object-identity-content-access-policy"',
+            '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
+            '"retained_paths": retained_paths',
+            "return 1 if primary_failed or cleanup_failures else 0",
             '"tests.run_required_deterministic_supervisor"',
         ):
             self.assertIn(contract, readonly_install_runner)
+        self.assertNotIn("ignore_errors=True", readonly_install_runner)
+        self.assertLess(
+            readonly_install_runner.index("cleanup_failures = tuple("),
+            readonly_install_runner.index("print(json.dumps(summary"),
+        )
         for contract in (
             "return-before-ownership publisher",
             "launch `CALL`-to-caller-`STORE`",
