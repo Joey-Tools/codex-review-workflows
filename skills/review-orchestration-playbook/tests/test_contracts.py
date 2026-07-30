@@ -5912,6 +5912,11 @@ class RepositoryContractTest(unittest.TestCase):
                 or current_scope is None
             ):
                 return None
+            unresolved_threads = evidence_state.get("unresolved_thread_findings")
+            if not isinstance(unresolved_threads, list) or (
+                expected_outcome == "clean" and unresolved_threads
+            ):
+                return None
             basis_kind = candidate_basis.get("kind")
             artifact_field_by_kind = {
                 "terminal-payload": "terminal_payloads",
@@ -6424,6 +6429,76 @@ class RepositoryContractTest(unittest.TestCase):
                 history(samples),
                 terminal_current,
                 normal_lane_timing,
+            )
+        )
+
+        clean_report_before_unresolved = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            history(samples),
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(clean_report_before_unresolved)
+        terminal_current_with_unresolved = clone(terminal_current)
+        assert isinstance(terminal_current_with_unresolved, dict)
+        terminal_basis = terminal_current_with_unresolved["candidate_basis"]
+        assert isinstance(terminal_basis, dict)
+        terminal_time = terminal_basis["server_time"]
+        terminal_id = terminal_basis["stable_artifact_id"]
+        assert isinstance(terminal_time, int)
+        assert isinstance(terminal_id, int)
+        unresolved_thread_id = 80_300
+        terminal_current_with_unresolved["evidence_state"][
+            "unresolved_thread_findings"
+        ] = [
+            complete_review_artifact(
+                terminal_current_with_unresolved,
+                unresolved_thread_id,
+                terminal_time - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+        ]
+        restamp(terminal_current_with_unresolved)
+        self.assertEqual(
+            candidate_order_basis(terminal_current_with_unresolved),
+            (terminal_time, terminal_id),
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                history(samples),
+                terminal_current_with_unresolved,
+            ),
+            "mixed",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                history(samples),
+                terminal_current_with_unresolved,
+                normal_lane_timing,
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-findings",
+                declaration,
+                history(samples),
+                terminal_current_with_unresolved,
+                normal_lane_timing,
+            )
+        )
+        self.assertFalse(
+            validate_complete_report(
+                clean_report_before_unresolved,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=history(samples),
+                current_record=terminal_current_with_unresolved,
+                local_lane_timing=normal_lane_timing,
             )
         )
 

@@ -234,10 +234,10 @@ superseded_by:
 
 - Focused contract suite:
   `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed 102 tests in 10.259 seconds.
+  passed 102 tests in 8.252 seconds.
 - Full review-orchestration suite:
   `python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
-  passed 2,822 tests in 1,336.946 seconds with 6 expected skips. It ran outside
+  passed 2,822 tests in 1,539.069 seconds with 6 expected skips. It ran outside
   the filesystem sandbox because loopback socket tests require local `bind`.
 - System `skill-creator` validation passed for
   `review-orchestration-playbook` and `change-delivery-workflow`.
@@ -248,6 +248,12 @@ superseded_by:
   reaction self URL and a self-consistency-only report classifier. Both were
   removed and replaced by parent-endpoint-plus-ID reaction identity and a
   report validator rebuilt from authoritative inputs.
+- The first final-range named-single review found one P1 reference-evaluator
+  gap: a newer clean terminal artifact could bypass an older unresolved review
+  thread. The report derivation now preserves the latest provider terminal
+  outcome while globally refusing completed-clean until every applicable
+  thread-backed finding is resolved, with an executable regression for the
+  older-unresolved-thread plus newer-clean case.
 - Follow-up independent audits completed clean after probing accepted terminal
   clean/findings reports, later-reaction terminal precedence, every
   missing/false/numeric request-completeness combination, closed schemas, JSON
