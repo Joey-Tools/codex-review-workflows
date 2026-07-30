@@ -6,18 +6,31 @@ import hashlib
 import json
 import os
 import pathlib
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from types import FrameType
+from typing import Any, Iterator
 
+from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.signal_relay import (
+    DeferredSignalInterrupt,
+    activate_deferred_signal_interrupt,
+    deactivate_deferred_signal_interrupt,
+)
 from .support import _private_runtime_parent
 
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
+CHILD_TIMEOUT_SECONDS = 600.0
+CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
 ACL_LISTING_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -75,6 +88,113 @@ class PrimaryFailure:
     error_kind: str
     error_errno: int | None
     message: str
+
+
+class ChildRunInterrupted(RuntimeError):
+    def __init__(self, signal_number: int) -> None:
+        self.signal_number = signal_number
+        super().__init__(f"child run interrupted by signal {signal_number}")
+
+
+@dataclass(frozen=True)
+class ChildSignalGuard:
+    signals: tuple[signal.Signals, ...]
+    previous_handlers: tuple[Any, ...]
+    previous_mask: set[signal.Signals]
+    interrupt: DeferredSignalInterrupt
+
+
+def _install_child_signal_guard() -> ChildSignalGuard:
+    handled = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers: list[Any] = []
+    interrupt = DeferredSignalInterrupt(ChildRunInterrupted)
+
+    def interrupt_child_run(
+        signal_number: int,
+        _frame: FrameType | None,
+    ) -> None:
+        interrupt.request(signal_number)
+
+    try:
+        for signal_number in handled:
+            previous_handlers.append(signal.signal(signal_number, interrupt_child_run))
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        for signal_number, previous in zip(
+            handled[: len(previous_handlers)],
+            previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
+    return ChildSignalGuard(
+        signals=handled,
+        previous_handlers=tuple(previous_handlers),
+        previous_mask=previous_mask,
+        interrupt=interrupt,
+    )
+
+
+def _restore_child_signal_guard(guard: ChildSignalGuard) -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, guard.signals)
+    try:
+        for signal_number, previous in zip(
+            guard.signals,
+            guard.previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, guard.previous_mask)
+
+
+@contextmanager
+def _bound_child_signals() -> Iterator[None]:
+    guard = _install_child_signal_guard()
+    binding: Any | None = None
+    try:
+        binding = activate_deferred_signal_interrupt(guard.interrupt)
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, guard.signals)
+        try:
+            if binding is not None:
+                deactivate_deferred_signal_interrupt(binding)
+        finally:
+            _restore_child_signal_guard(guard)
+
+
+def _run_bounded_child(
+    argv: tuple[str, ...],
+    *,
+    cwd: pathlib.Path,
+    environment: dict[str, str],
+    timeout: float = CHILD_TIMEOUT_SECONDS,
+    stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
+    stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    with _bound_child_signals():
+        try:
+            returncode, stdout, stderr = run_bounded(
+                argv,
+                cwd=cwd,
+                environment=environment,
+                timeout=timeout,
+                stdout_limit=stdout_limit,
+                stderr_limit=stderr_limit,
+            )
+        except GitProcessClosureUnproven as error:
+            error.finish_signal_deferral(deliver=False)
+            raise
+    return subprocess.CompletedProcess(
+        args=argv,
+        returncode=returncode,
+        stdout=stdout.decode("utf-8", "replace"),
+        stderr=stderr.decode("utf-8", "replace"),
+    )
 
 
 def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
@@ -332,6 +452,21 @@ def _cleanup_tree(
     return None
 
 
+def _retained_for_unproven_child_closure(
+    path: pathlib.Path | None,
+) -> CleanupFailure | None:
+    if path is None or not os.path.lexists(path):
+        return None
+    return CleanupFailure(
+        path=str(path),
+        error_kind="ChildProcessClosureUnproven",
+        error_errno=None,
+        retained=True,
+        restore_error_kind=None,
+        restore_error_errno=None,
+    )
+
+
 def main() -> int:
     if sys.platform != "darwin":
         print(
@@ -355,7 +490,11 @@ def main() -> int:
     before: dict[str, TreeEntrySnapshot] | None = None
     after: dict[str, TreeEntrySnapshot] | None = None
     runtime_residue: tuple[str, ...] = ()
-    timeout_error: subprocess.TimeoutExpired | None = None
+    timeout_error: TimeoutError | None = None
+    output_limit_error: OverflowError | None = None
+    signal_error: ChildRunInterrupted | None = None
+    closure_error: GitProcessClosureUnproven | None = None
+    child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     stage = "install-container"
@@ -401,7 +540,8 @@ def main() -> int:
             }
         )
         stage = "child-run"
-        completed = subprocess.run(
+        child_process_closure = "pending"
+        completed = _run_bounded_child(
             (
                 sys.executable,
                 "-B",
@@ -409,32 +549,53 @@ def main() -> int:
                 "tests.run_required_deterministic_supervisor",
             ),
             cwd=installed_root,
-            env=environment,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=600,
+            environment=environment,
         )
+        child_process_closure = "proven"
         stage = "snapshot-after"
         after = _tree_snapshot(installed_root)
         stage = "runtime-residue"
         runtime_residue = tuple(sorted(path.name for path in runtime_parent.iterdir()))
         stage = "complete"
-    except subprocess.TimeoutExpired as error:
+    except GitProcessClosureUnproven as error:
+        closure_error = error
+        child_process_closure = "unproven"
+        primary_failure = _primary_failure(stage, error)
+    except TimeoutError as error:
         timeout_error = error
+        child_process_closure = "proven"
+        primary_failure = _primary_failure(stage, error)
+    except OverflowError as error:
+        output_limit_error = error
+        child_process_closure = "proven"
+        primary_failure = _primary_failure(stage, error)
+    except ChildRunInterrupted as error:
+        signal_error = error
+        child_process_closure = "proven"
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
+        if child_process_closure == "pending":
+            child_process_closure = "proven"
         primary_failure = _primary_failure(stage, error)
     finally:
-        cleanup_failures = tuple(
-            failure
-            for failure in (
-                _cleanup_tree(install_container, restore_owner_write=True),
-                _cleanup_tree(runtime_parent, restore_owner_write=False),
+        if closure_error is not None:
+            cleanup_failures = tuple(
+                failure
+                for failure in (
+                    _retained_for_unproven_child_closure(install_container),
+                    _retained_for_unproven_child_closure(runtime_parent),
+                )
+                if failure is not None
             )
-            if failure is not None
-        )
+        else:
+            cleanup_failures = tuple(
+                failure
+                for failure in (
+                    _cleanup_tree(install_container, restore_owner_write=True),
+                    _cleanup_tree(runtime_parent, restore_owner_write=False),
+                )
+                if failure is not None
+            )
 
     release_tree_immutable = (
         before is not None
@@ -443,7 +604,16 @@ def main() -> int:
     )
     retained_paths = [failure.path for failure in cleanup_failures if failure.retained]
     if primary_failure is not None:
-        primary_status = "timed-out" if timeout_error is not None else "failed"
+        if timeout_error is not None:
+            primary_status = "timed-out"
+        elif output_limit_error is not None:
+            primary_status = "output-limit"
+        elif signal_error is not None:
+            primary_status = "interrupted"
+        elif closure_error is not None:
+            primary_status = "closure-unproven"
+        else:
+            primary_status = "failed"
     elif completed is None:
         primary_status = "not-completed"
     elif completed.returncode != 0:
@@ -455,6 +625,7 @@ def main() -> int:
     else:
         primary_status = "complete"
     summary = {
+        "child_process_closure": child_process_closure,
         "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
         "cleanup_status": "incomplete" if cleanup_failures else "complete",
         "install_parent_is_sticky_world_writable": True,
@@ -467,6 +638,9 @@ def main() -> int:
         "retained_paths": retained_paths,
         "returncode": completed.returncode if completed is not None else None,
         "runtime_residue": list(runtime_residue),
+        "signal_number": (
+            signal_error.signal_number if signal_error is not None else None
+        ),
         "timed_out": timeout_error is not None,
     }
     print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
@@ -489,14 +663,6 @@ def main() -> int:
             print(_bounded_failure_text(completed.stderr), file=sys.stderr)
     if timeout_error is not None:
         print("read-only installed supervisor regression timed out", file=sys.stderr)
-        for value in (timeout_error.stdout, timeout_error.stderr):
-            if value:
-                text = (
-                    value.decode("utf-8", "replace")
-                    if isinstance(value, bytes)
-                    else value
-                )
-                print(_bounded_failure_text(text), file=sys.stderr)
     if cleanup_failures:
         print(
             "read-only installed supervisor cleanup incomplete: "
@@ -507,6 +673,8 @@ def main() -> int:
             ),
             file=sys.stderr,
         )
+    if signal_error is not None:
+        return 128 + signal_error.signal_number
     return 1 if primary_failed or cleanup_failures else 0
 
 

@@ -6,8 +6,11 @@ import io
 import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
+import sys
+import time
 import unittest
 from unittest import mock
 
@@ -16,6 +19,32 @@ from .support import owned_temporary_directory
 
 
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
+    @staticmethod
+    def _process_group_exists(process_group: int) -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _require_process_group_absent(
+        self,
+        process_group: int,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._process_group_exists(process_group):
+                return
+            time.sleep(0.02)
+        self.assertFalse(
+            self._process_group_exists(process_group),
+            f"process group {process_group} remained live",
+        )
+
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
@@ -128,6 +157,236 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(failure.retained)
             self.assertTrue(os.path.lexists(root))
 
+    def test_bounded_child_settles_same_group_descendant_after_leader_exit(
+        self,
+    ) -> None:
+        child_script = (
+            "import os,pathlib,subprocess,sys\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
+            "subprocess.Popen((sys.executable,'-B','-c',"
+            "'import time; time.sleep(300)'),"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL)\n"
+        )
+        with owned_temporary_directory("readonly-child-descendant-") as root:
+            group_file = root / "process-group"
+            result = runner._run_bounded_child(
+                (
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    child_script,
+                    str(group_file),
+                ),
+                cwd=root,
+                environment={
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                timeout=5,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+
+            process_group = int(group_file.read_text(encoding="ascii"))
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+            self._require_process_group_absent(process_group)
+
+    def test_bounded_child_output_overflow_settles_same_group_descendant(
+        self,
+    ) -> None:
+        child_script = (
+            "import os,pathlib,subprocess,sys,time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
+            "subprocess.Popen((sys.executable,'-B','-c',"
+            "'import time; time.sleep(300)'),"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL)\n"
+            "os.write(1,b'x'*8192)\n"
+            "time.sleep(300)\n"
+        )
+        with owned_temporary_directory("readonly-child-overflow-") as root:
+            group_file = root / "process-group"
+            with self.assertRaisesRegex(OverflowError, "byte cap"):
+                runner._run_bounded_child(
+                    (
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        child_script,
+                        str(group_file),
+                    ),
+                    cwd=root,
+                    environment={
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                )
+
+            process_group = int(group_file.read_text(encoding="ascii"))
+            self._require_process_group_absent(process_group)
+
+    def test_bounded_child_sigterm_settles_group_before_interrupt_returns(
+        self,
+    ) -> None:
+        inner_script = (
+            "import os,pathlib,subprocess,sys,time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
+            "pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii')\n"
+            "subprocess.Popen((sys.executable,'-B','-c',"
+            "'import time; time.sleep(300)'),"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL)\n"
+            "time.sleep(300)\n"
+        )
+        worker_script = (
+            "import os,pathlib,sys\n"
+            "from tests import run_readonly_install_deterministic_supervisor as runner\n"
+            "root=pathlib.Path(sys.argv[1])\n"
+            "try:\n"
+            " runner._run_bounded_child("
+            "(sys.executable,'-B','-c',sys.argv[2],sys.argv[3],sys.argv[4]),"
+            "cwd=root,environment={'LANG':'C','LC_ALL':'C',"
+            "'PATH':'/usr/bin:/bin','PYTHONDONTWRITEBYTECODE':'1'},"
+            "timeout=30,stdout_limit=1024,stderr_limit=1024)\n"
+            "except runner.ChildRunInterrupted as error:\n"
+            " raise SystemExit(128+error.signal_number)\n"
+            "raise SystemExit(3)\n"
+        )
+        with owned_temporary_directory("readonly-child-sigterm-") as root:
+            group_file = root / "process-group"
+            ready_file = root / "ready"
+            worker = subprocess.Popen(
+                (
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    worker_script,
+                    str(root),
+                    inner_script,
+                    str(group_file),
+                    str(ready_file),
+                ),
+                cwd=pathlib.Path(__file__).resolve().parents[1],
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not ready_file.is_file() and time.monotonic() < deadline:
+                    if worker.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(
+                    ready_file.is_file(), "bounded child did not become ready"
+                )
+                process_group = int(group_file.read_text(encoding="ascii"))
+
+                worker.send_signal(signal.SIGTERM)
+                stdout, stderr = worker.communicate(timeout=10)
+
+                self.assertEqual(worker.returncode, 128 + signal.SIGTERM)
+                self.assertEqual(stdout, b"")
+                self.assertEqual(stderr, b"")
+                self._require_process_group_absent(process_group)
+            finally:
+                if worker.poll() is None:
+                    os.killpg(worker.pid, signal.SIGKILL)
+                    worker.wait(timeout=5)
+
+    def test_main_retains_trees_when_child_process_closure_is_unproven(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-main-closure-gap-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir()
+            sticky_parent.chmod(0o1777)
+            install_container = sticky_parent / "install"
+            install_container.mkdir()
+            runtime_home = root / "runtime-home"
+            runtime_home.mkdir()
+            runtime_parent = runtime_home / "runtime"
+            runtime_parent.mkdir()
+
+            def fake_copytree(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                **_kwargs: object,
+            ) -> pathlib.Path:
+                pathlib.Path(destination).mkdir()
+                return pathlib.Path(destination)
+
+            closure_error = runner.GitProcessClosureUnproven(
+                None,
+                None,
+                RuntimeError("synthetic closure failure"),
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    return_value=runtime_home,
+                ),
+                mock.patch.object(
+                    runner.tempfile,
+                    "mkdtemp",
+                    side_effect=(str(install_container), str(runtime_parent)),
+                ),
+                mock.patch.object(
+                    runner.shutil,
+                    "copytree",
+                    side_effect=fake_copytree,
+                ),
+                mock.patch.object(runner, "_set_tree_read_only"),
+                mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                mock.patch.object(
+                    runner,
+                    "_run_bounded_child",
+                    side_effect=closure_error,
+                ),
+                mock.patch.object(runner, "_cleanup_tree") as cleanup_tree,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                returncode = runner.main()
+
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(summary["primary_status"], "closure-unproven")
+            self.assertEqual(summary["child_process_closure"], "unproven")
+            self.assertEqual(summary["cleanup_status"], "incomplete")
+            self.assertEqual(
+                summary["retained_paths"],
+                [str(install_container), str(runtime_parent)],
+            )
+            self.assertTrue(install_container.is_dir())
+            self.assertTrue(runtime_parent.is_dir())
+            cleanup_tree.assert_not_called()
+            self.assertIn("GitProcessClosureUnproven", stderr.getvalue())
+
     def test_main_reports_primary_and_cleanup_failures_in_order(self) -> None:
         with owned_temporary_directory("readonly-main-failures-") as root:
             sticky_parent = root / "sticky"
@@ -195,11 +454,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         RuntimeError("synthetic post-snapshot failure"),
                     ),
                 ),
-                mock.patch.object(
-                    runner.subprocess,
-                    "run",
-                    return_value=completed,
-                ),
+                mock.patch.object(runner, "_run_bounded_child", return_value=completed),
                 mock.patch.object(
                     runner,
                     "_cleanup_tree",
