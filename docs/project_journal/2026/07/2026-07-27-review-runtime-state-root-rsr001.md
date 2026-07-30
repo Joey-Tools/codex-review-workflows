@@ -112,8 +112,8 @@ superseded_by:
   bytes remain unchanged while runtime directories are created externally.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
   syntax validation and explicit zero-cache guards. Their Python 3.13
-  independent-supervisor jobs also run the installed-release immutability
-  regression explicitly.
+  workflows run the installed-release immutability regression in a dedicated
+  20-minute job, separate from the ordinary deterministic supervisor job.
 
 ## Next Steps
 
@@ -127,10 +127,10 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 1026.912 seconds.
+- The final platform suite ran 2,822 tests with 6 skips in 1051.356 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.641 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 3.056 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.866 seconds.
 - The complete 100-test contract module passed in 8.001 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
@@ -239,9 +239,9 @@ superseded_by:
   to a private revalidation call count. New regressions prove every acquired
   descriptor is attempted, preserve the primary mismatch, parse both public
   command matrices, and induce real catalog replacement during finalization.
-- The deterministic independent-supervisor gate passed 609/609 in 306.459
-  seconds with the reviewed 609-test selected identity and SHA-256
-  `3042ac1af87dc2a7efe902cb2a04a39d14fd5df256214423ef9602ad62c24b9e`.
+- The deterministic independent-supervisor gate passed 611/611 in 261.917
+  seconds with the reviewed 611-test selected identity and SHA-256
+  `2154c3cd7c983d56a5d7a8f8d8e6478f207bbd04fe489b0fbd4f4bda533bf541`.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

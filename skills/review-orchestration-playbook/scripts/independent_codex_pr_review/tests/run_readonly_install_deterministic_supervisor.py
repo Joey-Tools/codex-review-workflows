@@ -38,14 +38,25 @@ class TreeEntrySnapshot:
     uid: int
     gid: int
     mode: int
-    link_count: int
     flags: int
-    size: int
-    mtime_ns: int
-    ctime_ns: int
     digest: str | None
     xattrs: tuple[tuple[bytes, str], ...]
     acl_entries: tuple[bytes, ...]
+
+    def protected_key(self) -> tuple[object, ...]:
+        return (
+            self.kind,
+            self.device,
+            self.inode,
+            self.generation,
+            self.uid,
+            self.gid,
+            self.mode,
+            self.flags,
+            self.digest,
+            self.xattrs,
+            self.acl_entries,
+        )
 
 
 @dataclass(frozen=True)
@@ -56,6 +67,14 @@ class CleanupFailure:
     retained: bool
     restore_error_kind: str | None
     restore_error_errno: int | None
+
+
+@dataclass(frozen=True)
+class PrimaryFailure:
+    stage: str
+    error_kind: str
+    error_errno: int | None
+    message: str
 
 
 def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
@@ -137,6 +156,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
     aggregate_size = 0
     snapshot: list[tuple[bytes, str]] = []
     for name in names:
+
         def read_value() -> bytes:
             ctypes.set_errno(0)
             size = getxattr(raw_path, name, None, 0, 0, XATTR_NOFOLLOW)
@@ -209,16 +229,23 @@ def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
             uid=metadata.st_uid,
             gid=metadata.st_gid,
             mode=mode,
-            link_count=metadata.st_nlink,
             flags=getattr(metadata, "st_flags", 0),
-            size=metadata.st_size,
-            mtime_ns=metadata.st_mtime_ns,
-            ctime_ns=metadata.st_ctime_ns,
             digest=digest,
             xattrs=_xattr_snapshot(path),
             acl_entries=_acl_entries(path),
         )
     return snapshot
+
+
+def _tree_property_unchanged(
+    before: dict[str, TreeEntrySnapshot],
+    after: dict[str, TreeEntrySnapshot],
+) -> bool:
+    if before.keys() != after.keys():
+        return False
+    return all(
+        before[path].protected_key() == after[path].protected_key() for path in before
+    )
 
 
 def _set_tree_read_only(root: pathlib.Path) -> None:
@@ -249,6 +276,16 @@ def _bounded_failure_text(value: str, *, limit: int = 16_384) -> str:
     return value[-limit:]
 
 
+def _primary_failure(stage: str, error: BaseException) -> PrimaryFailure:
+    error_errno = getattr(error, "errno", None)
+    return PrimaryFailure(
+        stage=stage,
+        error_kind=type(error).__name__,
+        error_errno=error_errno if isinstance(error_errno, int) else None,
+        message=_bounded_failure_text(str(error), limit=2_048),
+    )
+
+
 def _cleanup_tree(
     path: pathlib.Path | None,
     *,
@@ -256,25 +293,27 @@ def _cleanup_tree(
 ) -> CleanupFailure | None:
     if path is None or not os.path.lexists(path):
         return None
-    restore_error: OSError | None = None
+    restore_error: BaseException | None = None
     if restore_owner_write:
         try:
             _restore_owner_write(path)
-        except OSError as error:
+        except Exception as error:
             restore_error = error
     try:
         shutil.rmtree(path)
-    except OSError as error:
+    except Exception as error:
+        error_errno = getattr(error, "errno", None)
+        restore_error_errno = getattr(restore_error, "errno", None)
         return CleanupFailure(
             path=str(path),
             error_kind=type(error).__name__,
-            error_errno=error.errno,
+            error_errno=error_errno if isinstance(error_errno, int) else None,
             retained=os.path.lexists(path),
             restore_error_kind=(
                 type(restore_error).__name__ if restore_error is not None else None
             ),
             restore_error_errno=(
-                restore_error.errno if restore_error is not None else None
+                restore_error_errno if isinstance(restore_error_errno, int) else None
             ),
         )
     if os.path.lexists(path):
@@ -295,7 +334,9 @@ def _cleanup_tree(
 
 def main() -> int:
     if sys.platform != "darwin":
-        print("read-only installed supervisor regression requires Darwin", file=sys.stderr)
+        print(
+            "read-only installed supervisor regression requires Darwin", file=sys.stderr
+        )
         return 2
     parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
     if (
@@ -315,7 +356,9 @@ def main() -> int:
     after: dict[str, TreeEntrySnapshot] | None = None
     runtime_residue: tuple[str, ...] = ()
     timeout_error: subprocess.TimeoutExpired | None = None
+    primary_failure: PrimaryFailure | None = None
     cleanup_failures: tuple[CleanupFailure, ...] = ()
+    stage = "install-container"
     try:
         install_container = pathlib.Path(
             tempfile.mkdtemp(
@@ -323,23 +366,29 @@ def main() -> int:
                 dir=READONLY_INSTALL_PARENT,
             )
         )
+        stage = "runtime-parent"
         runtime_parent = pathlib.Path(
             tempfile.mkdtemp(
                 prefix=".codex-review-readonly-runtime-",
                 dir=_private_runtime_parent(),
             )
         )
+        stage = "permissions"
         os.chmod(install_container, 0o700)
         os.chmod(runtime_parent, 0o700)
         installed_root = install_container / "independent_codex_pr_review"
+        stage = "install-copy"
         shutil.copytree(
             source_root,
             installed_root,
             symlinks=True,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
         )
+        stage = "install-read-only"
         _set_tree_read_only(installed_root)
+        stage = "snapshot-before"
         before = _tree_snapshot(installed_root)
+        stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
         environment = os.environ.copy()
@@ -351,6 +400,7 @@ def main() -> int:
                 EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
             }
         )
+        stage = "child-run"
         completed = subprocess.run(
             (
                 sys.executable,
@@ -366,10 +416,16 @@ def main() -> int:
             text=True,
             timeout=600,
         )
+        stage = "snapshot-after"
         after = _tree_snapshot(installed_root)
+        stage = "runtime-residue"
         runtime_residue = tuple(sorted(path.name for path in runtime_parent.iterdir()))
+        stage = "complete"
     except subprocess.TimeoutExpired as error:
         timeout_error = error
+        primary_failure = _primary_failure(stage, error)
+    except Exception as error:
+        primary_failure = _primary_failure(stage, error)
     finally:
         cleanup_failures = tuple(
             failure
@@ -381,15 +437,31 @@ def main() -> int:
         )
 
     release_tree_immutable = (
-        before is not None and after is not None and after == before
+        before is not None
+        and after is not None
+        and _tree_property_unchanged(before, after)
     )
-    retained_paths = [
-        failure.path for failure in cleanup_failures if failure.retained
-    ]
+    retained_paths = [failure.path for failure in cleanup_failures if failure.retained]
+    if primary_failure is not None:
+        primary_status = "timed-out" if timeout_error is not None else "failed"
+    elif completed is None:
+        primary_status = "not-completed"
+    elif completed.returncode != 0:
+        primary_status = "child-failed"
+    elif not release_tree_immutable:
+        primary_status = "property-mismatch"
+    elif runtime_residue:
+        primary_status = "runtime-residue"
+    else:
+        primary_status = "complete"
     summary = {
         "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
         "cleanup_status": "incomplete" if cleanup_failures else "complete",
         "install_parent_is_sticky_world_writable": True,
+        "primary_failure": (
+            asdict(primary_failure) if primary_failure is not None else None
+        ),
+        "primary_status": primary_status,
         "release_tree_immutable": release_tree_immutable,
         "release_tree_property": "object-identity-content-access-policy",
         "retained_paths": retained_paths,
@@ -399,12 +471,17 @@ def main() -> int:
     }
     print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
 
-    primary_failed = (
-        completed is None
-        or completed.returncode != 0
-        or not release_tree_immutable
-        or bool(runtime_residue)
-    )
+    primary_failed = primary_status != "complete"
+    if primary_failure is not None:
+        print(
+            "read-only installed supervisor primary failure: "
+            + json.dumps(
+                asdict(primary_failure),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
     if completed is not None and primary_failed:
         if completed.stdout:
             print(_bounded_failure_text(completed.stdout), file=sys.stderr)

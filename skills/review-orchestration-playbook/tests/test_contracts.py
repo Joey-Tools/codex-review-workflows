@@ -1504,7 +1504,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
     def test_reviewed_ci_snapshots_use_source_only_python_checks(self) -> None:
-        expected_cache_guards = {"canonical": 2, "private": 4}
+        expected_cache_guards = {"canonical": 3, "private": 5}
         for profile, guard_count in expected_cache_guards.items():
             with self.subTest(profile=profile):
                 workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
@@ -1571,6 +1571,7 @@ class RepositoryContractTest(unittest.TestCase):
       - platform_tests
       - broker_reproducibility
       - independent_supervisor_tests
+      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1578,10 +1579,12 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             canonical,
         )
@@ -1595,6 +1598,7 @@ class RepositoryContractTest(unittest.TestCase):
       - platform-safety
       - broker_reproducibility
       - independent_supervisor_tests
+      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1604,12 +1608,14 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             private,
         )
@@ -1747,7 +1753,7 @@ class RepositoryContractTest(unittest.TestCase):
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
-            "ordinary deterministic suite passed 609/609",
+            "ordinary deterministic suite passed 611/611",
             '"release_tree_immutable":true',
             '"runtime_residue":[]',
         ):
@@ -1788,7 +1794,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 609", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 611", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1804,7 +1810,10 @@ class RepositoryContractTest(unittest.TestCase):
             'flags=getattr(metadata, "st_flags", 0)',
             "xattrs=_xattr_snapshot(path)",
             "acl_entries=_acl_entries(path)",
+            "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
+            '"primary_failure": (',
+            '"primary_status": primary_status',
             '"release_tree_immutable": release_tree_immutable',
             '"release_tree_property": "object-identity-content-access-policy"',
             '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
@@ -1813,6 +1822,13 @@ class RepositoryContractTest(unittest.TestCase):
             '"tests.run_required_deterministic_supervisor"',
         ):
             self.assertIn(contract, readonly_install_runner)
+        for excluded_signal in (
+            "link_count=metadata.st_nlink",
+            "size=metadata.st_size",
+            "mtime_ns=metadata.st_mtime_ns",
+            "ctime_ns=metadata.st_ctime_ns",
+        ):
+            self.assertNotIn(excluded_signal, readonly_install_runner)
         self.assertNotIn("ignore_errors=True", readonly_install_runner)
         self.assertLess(
             readonly_install_runner.index("cleanup_failures = tuple("),
@@ -1891,8 +1907,13 @@ class RepositoryContractTest(unittest.TestCase):
         for profile, (next_job, skill_root) in profile_contracts.items():
             workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
             start = workflow.index("  independent_supervisor_tests:")
-            end = workflow.index(f"\n  {next_job}:", start)
-            supervisor_job = workflow[start:end]
+            readonly_start = workflow.index(
+                "\n  readonly_install_supervisor_tests:",
+                start,
+            )
+            end = workflow.index(f"\n  {next_job}:", readonly_start)
+            supervisor_job = workflow[start:readonly_start]
+            readonly_job = workflow[readonly_start + 1 : end]
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
                 self.assertIn("timeout-minutes: 15", supervisor_job)
@@ -1930,12 +1951,8 @@ class RepositoryContractTest(unittest.TestCase):
 """,
                     supervisor_job,
                 )
-                self.assertIn(
-                    f"""      - name: Run deterministic supervisor from read-only install
-        working-directory: {skill_root}/scripts/independent_codex_pr_review
-        run: |
-          python3 -B -m tests.run_readonly_install_deterministic_supervisor
-""",
+                self.assertNotIn(
+                    "tests.run_readonly_install_deterministic_supervisor",
                     supervisor_job,
                 )
                 self.assertNotIn("tests.run_required_no_child_profile", supervisor_job)
@@ -1943,6 +1960,17 @@ class RepositoryContractTest(unittest.TestCase):
                     "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE",
                     supervisor_job,
                 )
+                self.assertIn("runs-on: macos-26", readonly_job)
+                self.assertIn("timeout-minutes: 20", readonly_job)
+                self.assertIn(
+                    f"""      - name: Run deterministic supervisor from read-only install
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        run: |
+          python3 -B -m tests.run_readonly_install_deterministic_supervisor
+""",
+                    readonly_job,
+                )
+                self.assertIn("if: always()", readonly_job)
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"
