@@ -1503,6 +1503,29 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
+    def test_reviewed_ci_snapshots_use_source_only_python_checks(self) -> None:
+        expected_cache_guards = {"canonical": 2, "private": 4}
+        for profile, guard_count in expected_cache_guards.items():
+            with self.subTest(profile=profile):
+                workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', workflow)
+                self.assertNotIn("python3 -m py_compile", workflow)
+                self.assertNotIn("python3 -m compileall", workflow)
+                self.assertIn(
+                    'compile(pathlib.Path(path).read_bytes(), path, "exec")',
+                    workflow,
+                )
+                self.assertIn(
+                    'compile(path.read_bytes(), str(path), "exec")',
+                    workflow,
+                )
+                self.assertEqual(
+                    workflow.count("- name: Require source-only Python tree"),
+                    guard_count,
+                )
+
     def test_claude_auth_policy_files_match_distribution_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)
@@ -1603,6 +1626,52 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("`>=2.1.211,<3.0.0`", journal)
         self.assertNotIn(">=2.1.187", journal)
 
+    def test_runtime_state_journal_matches_deterministic_identity(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
+        runner_path = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_required_deterministic_supervisor.py"
+        )
+        assignments: dict[str, object] = {}
+        for statement in ast.parse(runner_path.read_text(encoding="utf-8")).body:
+            if (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id
+                in {"EXPECTED_TEST_COUNT", "EXPECTED_TEST_ID_SHA256"}
+            ):
+                assignments[statement.targets[0].id] = ast.literal_eval(statement.value)
+
+        expected_count = assignments["EXPECTED_TEST_COUNT"]
+        expected_sha256 = assignments["EXPECTED_TEST_ID_SHA256"]
+        self.assertIsInstance(expected_count, int)
+        self.assertIsInstance(expected_sha256, str)
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-27-review-runtime-state-root-rsr001.md"
+        ).read_text(encoding="utf-8")
+        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f"passed {expected_count}/{expected_count}",
+            journal,
+        )
+        self.assertIn(
+            f"reviewed {expected_count}-test selected identity",
+            journal,
+        )
+        self.assertIn(f"`{expected_sha256}`", journal)
+        self.assertIn(
+            "Latest workstream: "
+            "`docs/project_journal/2026/07/"
+            "2026-07-27-review-runtime-state-root-rsr001.md`",
+            project_state,
+        )
+
     def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
             encoding="utf-8"
@@ -1667,7 +1736,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 550", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 604", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1771,6 +1840,14 @@ class RepositoryContractTest(unittest.TestCase):
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         run: |
           python3 -m tests.run_required_deterministic_supervisor
+""",
+                    supervisor_job,
+                )
+                self.assertIn(
+                    f"""      - name: Verify installed release tree remains immutable
+        working-directory: {skill_root}/tests
+        run: |
+          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
 """,
                     supervisor_job,
                 )
@@ -5827,6 +5904,123 @@ class RepositoryContractTest(unittest.TestCase):
                 if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
             )
             self.assertEqual(bytecode, [])
+
+    @unittest.skipIf(
+        sys.version_info < (3, 13),
+        "the independent supervisor requires Python 3.13",
+    )
+    def test_installed_supervisor_preflight_keeps_release_tree_immutable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="review-installed-preflight-immutable-"
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            release_skill = (
+                root
+                / "releases"
+                / ("b" * 40)
+                / "personal_codex"
+                / "skills"
+                / "review-orchestration-playbook"
+            )
+            shutil.copytree(
+                SKILL_ROOT,
+                release_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            stable_skill = root / "stable/review-orchestration-playbook"
+            stable_skill.parent.mkdir(mode=0o700)
+            stable_skill.symlink_to(release_skill, target_is_directory=True)
+            tool_root = stable_skill / "scripts" / "independent_codex_pr_review"
+            entrypoint = tool_root / "independent-codex-pr-review"
+            account_home = root / "account-home"
+            account_home.mkdir(mode=0o700)
+            repository = root / "repository"
+            repository.mkdir(mode=0o700)
+
+            def release_snapshot() -> dict[str, bytes | None]:
+                return {
+                    path.relative_to(release_skill).as_posix(): (
+                        path.read_bytes() if path.is_file() else None
+                    )
+                    for path in (release_skill, *sorted(release_skill.rglob("*")))
+                }
+
+            before = release_snapshot()
+            wrapper = root / "run-installed-preflight.py"
+            wrapper.write_text(
+                "\n".join(
+                    (
+                        "import os",
+                        "import pwd",
+                        "import runpy",
+                        "import sys",
+                        "",
+                        "account = type(",
+                        "    'Account',",
+                        "    (),",
+                        "    {'pw_dir': os.environ['TEST_ACCOUNT_HOME']},",
+                        ")()",
+                        "pwd.getpwuid = lambda _uid: account",
+                        "entrypoint = os.environ['TEST_ENTRYPOINT']",
+                        "sys.path.insert(0, os.path.dirname(entrypoint))",
+                        "sys.argv = [entrypoint, *sys.argv[1:]]",
+                        "runpy.run_path(entrypoint, run_name='__main__')",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+            environment.update(
+                {
+                    "TEST_ACCOUNT_HOME": str(account_home),
+                    "TEST_ENTRYPOINT": str(entrypoint),
+                }
+            )
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-B",
+                    str(wrapper),
+                    "preflight",
+                    "--helper-state",
+                    str(root / "missing-helper-state"),
+                    "--repo",
+                    str(repository),
+                    "--base",
+                    "1" * 40,
+                    "--head",
+                    "2" * 40,
+                    "--pr-url",
+                    "https://github.com/example/example/pull/1",
+                ),
+                cwd=tool_root,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertNotEqual(payload.get("status"), "ready")
+
+            state_root = (
+                account_home
+                / ".codex"
+                / "review-runtime"
+                / "independent-codex-pr-review"
+            )
+            self.assertTrue((state_root / "retention").is_dir())
+            self.assertTrue((state_root / "checkouts").is_dir())
+            self.assertFalse((release_skill / "runtime").exists())
+            self.assertEqual(release_snapshot(), before)
 
     def test_documented_validation_does_not_create_bundle_bytecode(self) -> None:
         syntax_probe = (

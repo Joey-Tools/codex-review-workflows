@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import pathlib
+import pwd
 
 
 VERSION = "2.0.0"
@@ -123,9 +125,31 @@ def tool_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
-def default_retention_root() -> pathlib.Path:
-    return tool_root() / "runtime" / "retention"
+def default_state_root() -> pathlib.Path:
+    try:
+        account_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError) as error:
+        raise RuntimeError("current POSIX account home is unavailable") from error
+    if not account_home.is_absolute() or any(
+        part in {"", ".", ".."} for part in account_home.parts[1:]
+    ):
+        raise RuntimeError("current POSIX account home is not an absolute safe path")
+    return account_home / ".codex" / "review-runtime" / "independent-codex-pr-review"
 
 
-def default_checkout_parent() -> pathlib.Path:
-    return tool_root() / "runtime" / "checkouts"
+def default_retention_root(
+    *,
+    state_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    return (
+        state_root if state_root is not None else default_state_root()
+    ) / "retention"
+
+
+def default_checkout_parent(
+    *,
+    state_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    return (
+        state_root if state_root is not None else default_state_root()
+    ) / "checkouts"

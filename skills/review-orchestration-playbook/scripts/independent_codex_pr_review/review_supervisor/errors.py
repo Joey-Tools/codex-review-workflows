@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+SECONDARY_ERROR_NOTE_PREFIX = "review-supervisor-secondary-error: "
+
+
+def record_secondary_error(
+    primary_error: BaseException,
+    *,
+    label: str,
+    secondary_error: BaseException,
+) -> None:
+    primary_error.add_note(
+        f"{SECONDARY_ERROR_NOTE_PREFIX}{label}: "
+        f"{type(secondary_error).__name__}: {secondary_error}"
+    )
+
+
 @dataclass(frozen=True)
 class Failure:
     status: str

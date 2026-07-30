@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import pathlib
+import signal
 import stat
 import unittest
 from unittest import mock
 
 import review_supervisor.ledger as ledger_module
+import review_supervisor.secureio as secureio_module
 from review_supervisor.codex_executable import ExtendedMetadataEvidence
 from review_supervisor.errors import SupervisorError
 from review_supervisor.ledger import acquire_retention_lease
@@ -21,7 +24,10 @@ from review_supervisor.secureio import (
     atomic_write_json,
     canonical_json,
     decode_json_bytes,
+    directory_paths_equivalent,
     open_absolute_directory_chain,
+    open_directory_at,
+    open_regular_at,
     open_regular_nofollow,
     require_private_directory,
 )
@@ -76,6 +82,75 @@ class StrictJsonTests(unittest.TestCase):
 
 
 class PrivateDirectoryAnchorTests(unittest.TestCase):
+    def test_regular_openers_avoid_fifo_rendezvous_and_reject_dev_null(
+        self,
+    ) -> None:
+        if not hasattr(signal, "setitimer"):
+            self.skipTest("requires POSIX interval timers")
+
+        class BlockingOpenTimeout(RuntimeError):
+            pass
+
+        def reject_blocking_open(_signum: int, _frame: object) -> None:
+            raise BlockingOpenTimeout("regular-file opener exceeded the test deadline")
+
+        previous_handler = signal.signal(signal.SIGALRM, reject_blocking_open)
+        try:
+            with owned_temporary_directory("secureio-fifo-") as root:
+                parent_fd, _ = open_absolute_directory_chain(
+                    root,
+                    private_leaf=True,
+                )
+                try:
+                    for name, opener in (
+                        (
+                            "descriptor-relative",
+                            lambda: open_regular_at(
+                                parent_fd,
+                                b"control.fifo",
+                                expected_uid=os.getuid(),
+                            ),
+                        ),
+                        (
+                            "absolute",
+                            lambda: open_regular_nofollow(
+                                root / "control.fifo",
+                                expected_uid=os.getuid(),
+                            ),
+                        ),
+                    ):
+                        with self.subTest(opener=name):
+                            fifo = root / "control.fifo"
+                            if fifo.exists():
+                                fifo.unlink()
+                            os.mkfifo(fifo, 0o600)
+                            signal.setitimer(signal.ITIMER_REAL, 1.0)
+                            try:
+                                with self.assertRaises(OSError) as caught:
+                                    opener()
+                            finally:
+                                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                            self.assertEqual(caught.exception.errno, errno.EINVAL)
+                finally:
+                    os.close(parent_fd)
+
+            device = pathlib.Path("/dev/null")
+            if device.exists():
+                # This is a smoke case, not a bound on arbitrary driver latency.
+                with self.subTest(opener="dev-null-smoke"):
+                    signal.setitimer(signal.ITIMER_REAL, 1.0)
+                    try:
+                        with self.assertRaises(OSError) as caught:
+                            open_regular_nofollow(
+                                device,
+                                require_link_one=False,
+                            )
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    self.assertEqual(caught.exception.errno, errno.EINVAL)
+        finally:
+            signal.signal(signal.SIGALRM, previous_handler)
+
     def test_creates_missing_private_chain_descriptor_relatively(self) -> None:
         with owned_temporary_directory("secureio-create-") as root:
             target = root / "one" / "two"
@@ -159,6 +234,287 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             ):
                 require_private_directory(target)
             self.assertIn("private ACL", caught.exception.failure.message)
+
+    def test_directory_at_rejects_private_acl(self) -> None:
+        with owned_temporary_directory("secureio-directory-at-acl-") as root:
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            parent_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.secureio._verify_macos_metadata",
+                        side_effect=ValueError("private ACL"),
+                    ),
+                    self.assertRaisesRegex(ValueError, "private ACL"),
+                ):
+                    open_directory_at(
+                        parent_fd,
+                        b"child",
+                        path_hint=child,
+                        private=True,
+                    )
+            finally:
+                os.close(parent_fd)
+
+    def test_directory_at_rejects_path_replacement_during_validation(self) -> None:
+        with owned_temporary_directory("secureio-directory-at-replace-") as root:
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            replacement = root / "replacement"
+            replacement.mkdir(mode=0o700)
+            parent_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+            original_validate = secureio_module._validate_directory_fd_with_policy
+            replaced = False
+
+            def replace_path(
+                fd: int,
+                path: pathlib.Path,
+                *,
+                private: bool,
+            ) -> tuple[Identity, secureio_module.DirectoryPolicyBinding]:
+                nonlocal replaced
+                identity = original_validate(fd, path, private=private)
+                if not replaced:
+                    replaced = True
+                    child.rename(root / "displaced")
+                    replacement.rename(child)
+                return identity
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.secureio._validate_directory_fd_with_policy",
+                        side_effect=replace_path,
+                    ),
+                    self.assertRaisesRegex(OSError, "path identity changed"),
+                ):
+                    open_directory_at(
+                        parent_fd,
+                        b"child",
+                        path_hint=child,
+                        private=True,
+                    )
+            finally:
+                os.close(parent_fd)
+
+    def test_selected_missing_root_rejects_bound_prefix_replacement(self) -> None:
+        with owned_temporary_directory("secureio-selected-prefix-replace-") as root:
+            selected_parent = root / "selected-parent"
+            selected_parent.mkdir(mode=0o700)
+            selected = selected_parent / "retention"
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            replacement_parent = root / "replacement-parent"
+            replacement_parent.mkdir(mode=0o700)
+            displaced_parent = root / "displaced-parent"
+            original_validate = secureio_module.DirectoryPathEquivalenceBinding.validate_before_selected_open
+            replaced = False
+
+            def replace_after_validation(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+            ) -> None:
+                nonlocal replaced
+                original_validate(binding)
+                if not replaced:
+                    selected_parent.rename(displaced_parent)
+                    replacement_parent.rename(selected_parent)
+                    replaced = True
+
+            with (
+                secureio_module.bind_directory_path_equivalence(
+                    selected,
+                    account_default,
+                ),
+                mock.patch.object(
+                    secureio_module.DirectoryPathEquivalenceBinding,
+                    "validate_before_selected_open",
+                    new=replace_after_validation,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                open_absolute_directory_chain(
+                    selected,
+                    create=True,
+                    private_leaf=True,
+                )
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertTrue((displaced_parent / "retention").is_dir())
+            self.assertFalse(selected.exists())
+            self.assertFalse((selected / "retention.lock").exists())
+            self.assertFalse(
+                (displaced_parent / "retention" / "retention.lock").exists()
+            )
+
+    def test_selected_missing_root_allows_bound_prefix_restore(self) -> None:
+        with owned_temporary_directory("secureio-selected-prefix-restore-") as root:
+            selected_parent = root / "selected-parent"
+            selected_parent.mkdir(mode=0o700)
+            selected = selected_parent / "retention"
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            replacement_parent = root / "replacement-parent"
+            replacement_parent.mkdir(mode=0o700)
+            displaced_parent = root / "displaced-parent"
+            retired_replacement = root / "retired-replacement"
+            binding_type = secureio_module.DirectoryPathEquivalenceBinding
+            original_validate = binding_type.validate_before_selected_open
+            original_bind = binding_type.bind_selected_open
+            replaced = False
+
+            def replace_after_validation(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+            ) -> None:
+                nonlocal replaced
+                original_validate(binding)
+                if not replaced:
+                    selected_parent.rename(displaced_parent)
+                    replacement_parent.rename(selected_parent)
+                    replaced = True
+
+            def restore_before_binding(
+                binding: secureio_module.DirectoryPathEquivalenceBinding,
+                fd: int,
+                identity: Identity,
+            ) -> None:
+                selected_parent.rename(retired_replacement)
+                displaced_parent.rename(selected_parent)
+                original_bind(binding, fd, identity)
+
+            with (
+                secureio_module.bind_directory_path_equivalence(
+                    selected,
+                    account_default,
+                ),
+                mock.patch.object(
+                    binding_type,
+                    "validate_before_selected_open",
+                    new=replace_after_validation,
+                ),
+                mock.patch.object(
+                    binding_type,
+                    "bind_selected_open",
+                    new=restore_before_binding,
+                ),
+            ):
+                selected_fd, _ = open_absolute_directory_chain(
+                    selected,
+                    create=True,
+                    private_leaf=True,
+                )
+                os.close(selected_fd)
+
+            self.assertTrue(replaced)
+            self.assertTrue(selected.is_dir())
+            self.assertFalse((retired_replacement / "retention").exists())
+
+    def test_directory_equivalence_rejects_missing_leaf_creation(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-create-") as root:
+            target = root / "retention"
+            original_open = secureio_module._open_directory_path_equivalence_snapshot
+            calls = 0
+
+            def open_then_create(
+                path: pathlib.Path,
+            ) -> secureio_module._DirectoryPathEquivalenceSnapshot:
+                nonlocal calls
+                snapshot = original_open(path)
+                calls += 1
+                if calls == 1:
+                    target.mkdir(mode=0o700)
+                return snapshot
+
+            with (
+                mock.patch.object(
+                    secureio_module,
+                    "_open_directory_path_equivalence_snapshot",
+                    side_effect=open_then_create,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                directory_paths_equivalent(target, target)
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+
+    def test_directory_equivalence_rejects_existing_target_replacement(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-replace-") as root:
+            target = root / "retention"
+            target.mkdir(mode=0o700)
+            replacement = root / "replacement"
+            replacement.mkdir(mode=0o700)
+            original_open = secureio_module._open_directory_path_equivalence_snapshot
+            calls = 0
+
+            def open_then_replace(
+                path: pathlib.Path,
+            ) -> secureio_module._DirectoryPathEquivalenceSnapshot:
+                nonlocal calls
+                snapshot = original_open(path)
+                calls += 1
+                if calls == 1:
+                    target.rename(root / "displaced")
+                    replacement.rename(target)
+                return snapshot
+
+            with (
+                mock.patch.object(
+                    secureio_module,
+                    "_open_directory_path_equivalence_snapshot",
+                    side_effect=open_then_replace,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                directory_paths_equivalent(target, target)
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+
+    def test_directory_equivalence_rejects_allowed_acl_policy_drift(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-acl-") as root:
+            target = root / "retention"
+            target.mkdir(mode=0o700)
+            target_identity = os.stat(target)
+            clear = ExtendedMetadataEvidence(0, (), False)
+            restrictive_acl = ExtendedMetadataEvidence(
+                1,
+                (),
+                False,
+                ("group:fixture:deny:write",),
+            )
+            current_evidence = clear
+
+            def metadata_for_descriptor(
+                fd: int,
+                _path: pathlib.Path,
+                _kind: str,
+                *,
+                private: bool,
+            ) -> ExtendedMetadataEvidence:
+                del private
+                if os.fstat(fd).st_ino == target_identity.st_ino:
+                    return current_evidence
+                return clear
+
+            with mock.patch(
+                "review_supervisor.secureio._verify_macos_metadata",
+                side_effect=metadata_for_descriptor,
+            ):
+                snapshot = secureio_module._open_directory_path_equivalence_snapshot(
+                    target
+                )
+                try:
+                    current_evidence = restrictive_acl
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "directory path changed",
+                    ) as caught:
+                        secureio_module._revalidate_directory_path_equivalence_snapshot(
+                            snapshot
+                        )
+                finally:
+                    snapshot.close()
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
 
     def test_retention_lease_detects_root_replacement(self) -> None:
         cases = (

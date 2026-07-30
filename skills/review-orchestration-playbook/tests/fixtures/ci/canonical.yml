@@ -41,9 +41,14 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Compile Python helpers
+      - name: Check Python helper syntax without bytecode
         run: |
-          python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py
+          python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(path).read_bytes(), path, "exec") for path in sys.argv[1:]]' \
+            skills/review-orchestration-playbook/scripts/isolated_review \
+            skills/review-orchestration-playbook/scripts/named_claude_preflight \
+            skills/review-orchestration-playbook/scripts/named_lane_guard \
+            skills/review-orchestration-playbook/scripts/validate_claude_stream.py \
+            skills/review-orchestration-playbook/scripts/review_runtime/*.py
       - name: Check Linux launcher C syntax
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only skills/review-orchestration-playbook/scripts/review_runtime/claude_linux_launcher.c
@@ -56,6 +61,10 @@ jobs:
           CODEX_REVIEW_RUN_LINUX_ISOLATION_INTEGRATION: "1"
         run: |
           python3 -m unittest -v skills/review-orchestration-playbook/tests/test_claude_linux.py
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
 
   broker_reproducibility:
     name: broker-reproducibility (macos-26)
@@ -80,10 +89,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Compile independent review supervisor
+      - name: Check independent review supervisor syntax without bytecode
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
-          python3 -m compileall -q review_supervisor independent-codex-pr-review
+          python3 -B -c 'import pathlib; paths = [pathlib.Path("independent-codex-pr-review"), *sorted(pathlib.Path("review_supervisor").rglob("*.py"))]; [compile(path.read_bytes(), str(path), "exec") for path in paths]'
       - name: Report hosted no-child runtime fingerprint
         run: |
           /usr/bin/sw_vers -productVersion
@@ -103,10 +112,18 @@ jobs:
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 -m tests.run_required_deterministic_supervisor
+      - name: Verify installed release tree remains immutable
+        working-directory: skills/review-orchestration-playbook/tests
+        run: |
+          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
       - name: Verify independent review supervisor CLI
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 independent-codex-pr-review --help
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
 
   test:
     name: test

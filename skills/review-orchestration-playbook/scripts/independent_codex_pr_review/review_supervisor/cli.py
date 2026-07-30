@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import pathlib
 import signal
 import sys
 from collections.abc import Sequence
+from collections.abc import Iterator
 from typing import Any
 
 from .constants import (
@@ -13,10 +15,16 @@ from .constants import (
     VERSION,
     default_checkout_parent,
     default_retention_root,
+    default_state_root,
 )
 from .custody import custody_helper_main
-from .errors import SupervisorError
+from .errors import (
+    SECONDARY_ERROR_NOTE_PREFIX,
+    SupervisorError,
+    record_secondary_error,
+)
 from .final_transport import run_fifo_reader
+from .legacy_retention import installed_legacy_retention_fence
 from .runtime import (
     attempt_supervisor_main,
     authorization_helper_main,
@@ -25,7 +33,12 @@ from .runtime import (
     prompt_helper_main,
     prompt_verifier_main,
 )
-from .secureio import canonical_json, require_python_313
+from .secureio import (
+    bind_directory_path_equivalence,
+    canonical_json,
+    directory_paths_equivalent,
+    require_python_313,
+)
 from .supervisor import cleanup, final_result, preflight, recover, release, run, status
 
 
@@ -47,12 +60,10 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     parser.add_argument(
         "--checkout-parent",
         type=_absolute,
-        default=default_checkout_parent(),
     )
     parser.add_argument("--git", dest="git_executable", default="/usr/bin/git")
     parser.add_argument("--codex", dest="codex_executable")
@@ -84,7 +95,6 @@ def _public_parser() -> argparse.ArgumentParser:
     status_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     status_parser.add_argument("--attempt-dir", type=_absolute)
 
@@ -95,7 +105,6 @@ def _public_parser() -> argparse.ArgumentParser:
     final_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     final_parser.add_argument("--attempt-dir", required=True, type=_absolute)
 
@@ -106,7 +115,6 @@ def _public_parser() -> argparse.ArgumentParser:
     recover_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     recover_parser.add_argument("--attempt-dir", required=True, type=_absolute)
 
@@ -117,7 +125,6 @@ def _public_parser() -> argparse.ArgumentParser:
     release_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     release_parser.add_argument("--attempt-dir", required=True, type=_absolute)
     release_parser.add_argument(
@@ -133,10 +140,65 @@ def _public_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     cleanup_parser.add_argument("--attempt-dir", required=True, type=_absolute)
     return parser
+
+
+def _uses_account_local_retention_root(arguments: argparse.Namespace) -> bool:
+    if arguments.retention_root is None:
+        arguments.retention_root = default_retention_root()
+        return True
+    return directory_paths_equivalent(
+        arguments.retention_root,
+        default_retention_root(),
+    )
+
+
+@contextlib.contextmanager
+def _resolve_public_default_roots(
+    arguments: argparse.Namespace,
+) -> Iterator[None]:
+    account_local_state = default_state_root()
+    account_local_retention = default_retention_root(state_root=account_local_state)
+    if arguments.retention_root is None:
+        arguments.retention_root = account_local_retention
+    if hasattr(arguments, "checkout_parent") and arguments.checkout_parent is None:
+        arguments.checkout_parent = default_checkout_parent(
+            state_root=account_local_state,
+        )
+    with bind_directory_path_equivalence(
+        arguments.retention_root,
+        account_local_retention,
+    ) as retention_binding:
+        body_error: BaseException | None = None
+        try:
+            if not retention_binding.equivalent:
+                yield
+                return
+            with installed_legacy_retention_fence() as legacy_roots:
+                if legacy_roots:
+                    roots = ", ".join(str(root) for root in legacy_roots)
+                    raise RuntimeError(
+                        "legacy release-local attempts require explicit draining with "
+                        "--retention-root before using the account-local default: "
+                        f"{roots}"
+                    )
+                yield
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            try:
+                retention_binding.revalidate()
+            except BaseException as revalidation_error:
+                if body_error is None:
+                    raise
+                record_secondary_error(
+                    body_error,
+                    label="retention root binding finalization failed",
+                    secondary_error=revalidation_error,
+                )
 
 
 def _internal_parser(mode: str) -> argparse.ArgumentParser:
@@ -289,10 +351,32 @@ def _emit(value: dict[str, Any]) -> None:
     sys.stdout.write(serialized)
 
 
+_MAX_SECONDARY_ERRORS = 4
+_MAX_SECONDARY_ERROR_CHARACTERS = 512
+
+
+def _secondary_errors(error: BaseException) -> list[str]:
+    notes = getattr(error, "__notes__", ())
+    if not isinstance(notes, list):
+        return []
+    secondary_errors: list[str] = []
+    for note in notes:
+        if not isinstance(note, str) or not note.startswith(
+            SECONDARY_ERROR_NOTE_PREFIX
+        ):
+            continue
+        detail = note.removeprefix(SECONDARY_ERROR_NOTE_PREFIX)
+        if detail:
+            secondary_errors.append(detail[:_MAX_SECONDARY_ERROR_CHARACTERS])
+        if len(secondary_errors) == _MAX_SECONDARY_ERRORS:
+            break
+    return secondary_errors
+
+
 def _failure_payload(error: BaseException) -> dict[str, Any]:
     if isinstance(error, SupervisorError):
         failure = error.failure
-        return {
+        payload = {
             "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
             "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "overall_status": failure.status,
@@ -301,15 +385,20 @@ def _failure_payload(error: BaseException) -> dict[str, Any]:
             "failure_code": failure.code,
             "message": failure.message,
         }
-    return {
-        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
-        "overall_status": "inconclusive",
-        "review_status": "not-run",
-        "failure_stage": "cli",
-        "failure_code": "cli-failed",
-        "message": f"{type(error).__name__}: {error}",
-    }
+    else:
+        payload = {
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+            "overall_status": "inconclusive",
+            "review_status": "not-run",
+            "failure_stage": "cli",
+            "failure_code": "cli-failed",
+            "message": f"{type(error).__name__}: {error}",
+        }
+    secondary_errors = _secondary_errors(error)
+    if secondary_errors:
+        payload["secondary_errors"] = secondary_errors
+    return payload
 
 
 def main(
@@ -322,65 +411,66 @@ def main(
         return _run_internal(values[0], values[1:])
     parser = _public_parser()
     arguments = parser.parse_args(values)
-    executable = (entrypoint or pathlib.Path(sys.argv[0])).resolve(strict=True)
     try:
-        if arguments.command == "preflight":
-            result = preflight(
-                helper_state=arguments.helper_state,
-                repo=arguments.repo,
-                base_sha=arguments.base_sha,
-                head_sha=arguments.head_sha,
-                pr_url=arguments.pr_url,
-                retention_root=arguments.retention_root,
-                checkout_parent=arguments.checkout_parent,
-                git_executable=arguments.git_executable,
-                codex_executable=arguments.codex_executable,
-            )
-            exit_code = 0
-        elif arguments.command == "run":
-            exit_code, result = run(
-                entrypoint=executable,
-                helper_state=arguments.helper_state,
-                repo=arguments.repo,
-                base_sha=arguments.base_sha,
-                head_sha=arguments.head_sha,
-                pr_url=arguments.pr_url,
-                retention_root=arguments.retention_root,
-                checkout_parent=arguments.checkout_parent,
-                git_executable=arguments.git_executable,
-                codex_executable=arguments.codex_executable,
-            )
-        elif arguments.command == "status":
-            result = status(
-                retention_root=arguments.retention_root,
-                attempt_dir=arguments.attempt_dir,
-            )
-            exit_code = 0
-        elif arguments.command == "final":
-            result = final_result(
-                retention_root=arguments.retention_root,
-                attempt_dir=arguments.attempt_dir,
-            )
-            exit_code = 0
-        elif arguments.command == "recover":
-            exit_code, result = recover(
-                entrypoint=executable,
-                retention_root=arguments.retention_root,
-                attempt_dir=arguments.attempt_dir,
-            )
-        elif arguments.command == "release":
-            exit_code, result = release(
-                entrypoint=executable,
-                retention_root=arguments.retention_root,
-                attempt_dir=arguments.attempt_dir,
-                reason=arguments.reason,
-            )
-        else:
-            exit_code, result = cleanup(
-                entrypoint=executable,
-                retention_root=arguments.retention_root,
-                attempt_dir=arguments.attempt_dir,
-            )
+        with _resolve_public_default_roots(arguments):
+            executable = (entrypoint or pathlib.Path(sys.argv[0])).resolve(strict=True)
+            if arguments.command == "preflight":
+                result = preflight(
+                    helper_state=arguments.helper_state,
+                    repo=arguments.repo,
+                    base_sha=arguments.base_sha,
+                    head_sha=arguments.head_sha,
+                    pr_url=arguments.pr_url,
+                    retention_root=arguments.retention_root,
+                    checkout_parent=arguments.checkout_parent,
+                    git_executable=arguments.git_executable,
+                    codex_executable=arguments.codex_executable,
+                )
+                exit_code = 0
+            elif arguments.command == "run":
+                exit_code, result = run(
+                    entrypoint=executable,
+                    helper_state=arguments.helper_state,
+                    repo=arguments.repo,
+                    base_sha=arguments.base_sha,
+                    head_sha=arguments.head_sha,
+                    pr_url=arguments.pr_url,
+                    retention_root=arguments.retention_root,
+                    checkout_parent=arguments.checkout_parent,
+                    git_executable=arguments.git_executable,
+                    codex_executable=arguments.codex_executable,
+                )
+            elif arguments.command == "status":
+                result = status(
+                    retention_root=arguments.retention_root,
+                    attempt_dir=arguments.attempt_dir,
+                )
+                exit_code = 0
+            elif arguments.command == "final":
+                result = final_result(
+                    retention_root=arguments.retention_root,
+                    attempt_dir=arguments.attempt_dir,
+                )
+                exit_code = 0
+            elif arguments.command == "recover":
+                exit_code, result = recover(
+                    entrypoint=executable,
+                    retention_root=arguments.retention_root,
+                    attempt_dir=arguments.attempt_dir,
+                )
+            elif arguments.command == "release":
+                exit_code, result = release(
+                    entrypoint=executable,
+                    retention_root=arguments.retention_root,
+                    attempt_dir=arguments.attempt_dir,
+                    reason=arguments.reason,
+                )
+            else:
+                exit_code, result = cleanup(
+                    entrypoint=executable,
+                    retention_root=arguments.retention_root,
+                    attempt_dir=arguments.attempt_dir,
+                )
         _emit(result)
         return exit_code
     except BaseException as error:

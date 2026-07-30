@@ -2,6 +2,16 @@
 
 Public review orchestration, synthetic fixture selection, and local delivery gate skills.
 
+Independent-review mutable state lives below the current account's home-derived
+review-runtime root rather than an immutable installed release. The shared
+regular-file openers request nonblocking, no-follow descriptors before
+validating file type, ownership, mode, link count, and identity;
+content-sensitive callers then reread bounded bytes from those descriptors.
+`O_NONBLOCK` avoids FIFO peer-rendezvous blocking, so FIFO substitutions fail
+closed without waiting for a peer. Device nodes fail regular-file validation
+only after `open()` returns; arbitrary device-driver open latency remains
+unbounded.
+
 `review-orchestration-playbook` is the single entrypoint for named single, double, and triple review plus PR readiness. The canonical Claude Code lane admits stable publisher-verified releases in `>=2.1.211,<3.0.0`; that compatibility range is defined once in [claude_version_policy.py](skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py). Claude Code `2.1.212` remains the audited per-version stream-schema baseline, not a global eligibility pin. A selected release must still pass its exact signed per-version manifest, digest, and executable-identity checks, the advertised-capability contract, and strict fail-closed stream validation before it can supply findings.
 
 The canonical Claude lane captures bounded raw stdout outside the model-visible worktree and must pass it through the trusted bundle's `named_lane_guard validate-claude-stream` profile, launched by the recorded absolute Python interpreter with `-I -B -S`. The profile raw-loads the manifest-bound [validate_claude_stream.py](skills/review-orchestration-playbook/scripts/validate_claude_stream.py), compatibility profile, audited schema baseline, and capability-contract evidence, then binds the selected release and all referenced source digests. It checks the parent-private accepted preflight result, exact cwd, model, fixed local-login authentication source, and child return code; selects the reviewed closed legacy or extended stream profile for the preflight-selected version; and validates every admitted intermediate event against the selected closed, session-bound contract before checking the terminal result. The preflight evidence must be a current-user-owned, single-link regular file outside the reviewer worktree, with no group or world permission bits. Direct execution of the validator script is compatibility-only. Only `classification: accepted` with a zero child exit supplies findings; prose inspection, partial output, or an ad hoc parser does not satisfy named double/triple review, and acceptance does not prove the final merged sandbox.

@@ -1,11 +1,12 @@
 # Independent Codex Low-Level Review Supervisor v2
 
 这是 `independent-codex-pr-review` 低层工具的任务级实现。它不满足 named single、
-double、triple review，也不是 canonical PR-readiness 的隐式门禁。它只在本目录的默认
-`runtime/` 下创建 supervisor 状态、独立 checkout 和测试临时文件，不修改目标仓库
-源码、文档、refs、当前 checkout 或 helper 状态。只有现有 access token 无法覆盖有界
-review deadline 时，`run` 才允许经过同一受限 Codex snapshot 执行 no-model managed-auth
-refresh；该步骤可能由 Codex 原子更新正常账户的 `~/.codex/auth.json`。
+double、triple review，也不是 canonical PR-readiness 的隐式门禁。它默认在当前 POSIX
+账户的 `~/.codex/review-runtime/independent-codex-pr-review/` 下创建 supervisor
+状态和独立 checkout，不修改目标仓库源码、文档、refs、当前 checkout 或 helper
+状态。只有现有 access token 无法覆盖有界 review deadline 时，`run` 才允许经过同一
+受限 Codex snapshot 执行 no-model managed-auth refresh；该步骤可能由 Codex 原子更新
+正常账户的 `~/.codex/auth.json`。
 
 `preflight` 不启动 Codex。`run` 是唯一会启动实际 reviewer 的公共命令。
 supervisor 只把验证过的 external ChatGPT auth generation 通过内存协议交给 reviewer。
@@ -61,6 +62,64 @@ $HELPER stateful wait --state-dir "$HELPER_STATE" --timeout-seconds 60
 $HELPER stateful final --state-dir "$HELPER_STATE"
 ```
 
+本节的 self-contained 示例必须显式使用上面的独立 runtime roots；
+account-local defaults 只用于标准 installed overlay catalog，那里可以持续绑定当前
+release、helper 与 sibling release 目录。缺少该 catalog 的 self-contained helper
+若使用默认 root，会因无法证明 legacy migration fence 而按设计失败关闭。
+
+For each public command, the CLI resolves one default state-root snapshot from
+the current POSIX account database, not from `$HOME`, and derives both retention
+and checkout defaults from it. Installed release trees therefore remain
+immutable, retained evidence survives release replacement, and an account-home
+change cannot split one command's defaults across two roots. Non-default
+explicit `--retention-root` and `--checkout-parent` values remain available for
+task-scoped isolated runs. Every explicitly supplied retention root is compared
+with the account-local default through the secure descriptor walk before the
+tool can select custom-root behavior. Existing prefixes are compared by object
+identity and missing suffixes use a conservative case-insensitive policy. The
+comparison retains the existing-prefix descriptors and reopens both paths
+before returning, so object or access-policy replacement and missing-suffix
+creation observed between the initial snapshots and final revalidation fail
+closed. A proven distinct retention root skips the default migration gate; an
+equivalent alias uses it, and an unavailable proof fails through the CLI's
+single-line JSON failure contract. An explicit checkout parent avoids a second
+default-path helper call.
+
+从使用 release-local `runtime/retention` 的旧版本升级时，新版本始终先扫描当前
+helper 根下的旧 retention root，因此 self-contained 或非标准安装布局不会绕过迁移
+门禁；若当前 helper 位于标准 installed overlay，还会扫描 sibling releases。只要任一
+旧 root 仍有 attempt，所有使用 account-local default 的公共命令都会失败关闭并报告
+精确旧 root。扫描逐级持有 no-follow descriptors，复用 ACL/xattr access-policy
+检查，并对旧 `retention.lock` 获取非阻塞 migration fence；活动旧 writer 会失败
+关闭，该 fence 保持到本次默认-root 命令完成。使用报告的旧路径显式运行 `status`、
+`final`、`recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除
+旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local
+root。
+CLI 会把显式或默认 retention root 与 account-local default 的等价性快照保持到公共
+命令结束，并让该命令对所选 root 的每次精确打开都验证同一 binding。binding 保护
+对象身份、访问策略和两条路径的等价关系；missing leaf 的预期创建和目录 child-entry
+churn 可以继续，现有前缀、所选 root、default root 或等价关系的替换会在写入
+`retention.lock` 或后续状态前失败关闭。命令结束后还会再次验证该 binding。
+采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
+`ACCOUNT_LOCAL_RETENTION_V1` 标记。扫描先精确读取标记，再完成 held descriptor、
+reopened path、ACL/xattr 和对象身份复验，随后从原 descriptor 第二次完整读取；两次
+bytes 必须完全一致。时间戳变化不构成内容变化。当前正在执行的 installed release
+也必须通过同一 marker、目录身份和 catalog 稳定性检查，但复用已经持有的 current-root
+fence，不重复加锁。若仍包含 helper 的未标记 release 没有可获取的 legacy retention
+lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该 release，不能用一次
+“路径暂时不存在”的探测推断它之后不会启动。
+对于当前或 sibling release 中尚无 legacy root 的 helper，扫描会把初始逐组件 policy
+和最深层 existing descriptor 保持到公共命令结束；终态 fresh probe 必须与初始
+custody 完全一致。替换嵌套 helper 目录会失败关闭，而只改变目录 child entries 不会被
+误判为对象或访问策略替换。
+公共命令失败后仍执行完整 fence finalization 和 descriptor cleanup；若它们也失败，
+原命令异常的类型与结构化诊断保持主错误，后续故障只作为次级 exception evidence
+附加，并通过可选的 `secondary_errors` 数组输出；该数组最多 4 条、每条最多 512
+字符。命令成功时的 finalization 或 cleanup 故障仍会失败关闭。
+每个 legacy root 的初始 attempt 状态也属于 fence 证据：起初为空且已加锁的 root
+若在公共命令期间出现 `attempt-*`，finalization 会失败关闭，不能把最终枚举到的新
+attempt 当作无关 child-entry churn。
+
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source
 metadata、最终 primary-evidence byte limit、账本、host floor、raw Git manifests、prompt
@@ -90,6 +149,29 @@ python3.13 -B "$SUPERVISOR" run \
   --pr-url "$PR_URL" \
   --retention-root "$RETENTION" \
   --checkout-parent "$CHECKOUTS"
+```
+
+### Standard Installed Overlay Defaults
+
+标准 installed overlay 必须省略显式 runtime roots，让 CLI 使用 account-local defaults
+并执行 sibling-release migration fence。对应的 preflight/run 形式如下；后续
+`status`、`final`、`recover`、`release` 和 `cleanup` 同样省略
+`--retention-root`：
+
+```bash
+python3.13 -B "$SUPERVISOR" preflight \
+  --helper-state "$HELPER_STATE" \
+  --repo "$REPO" \
+  --base "$BASE_SHA" \
+  --head "$HEAD_SHA" \
+  --pr-url "$PR_URL"
+
+python3.13 -B "$SUPERVISOR" run \
+  --helper-state "$HELPER_STATE" \
+  --repo "$REPO" \
+  --base "$BASE_SHA" \
+  --head "$HEAD_SHA" \
+  --pr-url "$PR_URL"
 ```
 
 `run` 返回单行 JSON。保存其中的 `attempt_dir`，然后读取状态并重新验证唯一 sealed
