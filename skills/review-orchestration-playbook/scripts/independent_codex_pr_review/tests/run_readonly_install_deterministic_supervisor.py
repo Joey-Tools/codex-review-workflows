@@ -16,7 +16,10 @@ from dataclasses import asdict, dataclass
 from types import FrameType
 from typing import Any, Iterator
 
-from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.codex_executable import run_bounded_command
+from review_supervisor.no_child_profile import (
+    prepare_sandboxed_python_no_child_profile,
+)
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
@@ -35,6 +38,14 @@ READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
+NO_CHILD_SUITE_CODE = (
+    "import os,runpy,sys\n"
+    "root=sys.argv[1]\n"
+    f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
+    "os.chdir(root)\n"
+    "sys.path.insert(0,root)\n"
+    "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
+)
 ACL_LISTING_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -255,11 +266,10 @@ def _bound_child_signals(
             raise ChildSignalTeardownError(tuple(secondary_failures))
 
 
-def _run_bounded_child(
-    argv: tuple[str, ...],
+def _run_no_child_test_suite(
     *,
-    cwd: pathlib.Path,
-    environment: dict[str, str],
+    installed_root: pathlib.Path,
+    runtime_parent: pathlib.Path,
     timeout: float = CHILD_TIMEOUT_SECONDS,
     stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
@@ -268,36 +278,50 @@ def _run_bounded_child(
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    prepared = prepare_sandboxed_python_no_child_profile()
+    argv = (
+        sys.executable,
+        "-B",
+        "-c",
+        NO_CHILD_SUITE_CODE,
+        str(installed_root),
+        str(runtime_parent),
+    )
     with _bound_child_signals(diagnostics):
         try:
-            returncode, stdout, stderr = run_bounded(
+            result = run_bounded_command(
                 argv,
-                cwd=cwd,
-                environment=environment,
-                timeout=timeout,
-                stdout_limit=stdout_limit,
-                stderr_limit=stderr_limit,
+                timeout_seconds=timeout,
+                max_output_bytes=stdout_limit + stderr_limit,
+                _prepared_no_child_profile=prepared,
             )
-        except GitProcessClosureUnproven as error:
-            try:
-                error.finish_signal_deferral(deliver=False)
-            except BaseException as teardown_error:
-                diagnostics.append(
-                    _secondary_failure(
-                        "finish-closure-signal-deferral",
-                        teardown_error,
-                    )
-                )
+        except ValueError as error:
+            if "command output exceeds" in str(error):
+                raise OverflowError(
+                    "bounded no-child test output exceeded its byte cap"
+                ) from error
             raise
-        except BaseException:
-            proof.proven = True
-            raise
-        proof.proven = True
+    closure = result.process_closure
+    if (
+        closure is None
+        or not closure.authenticated_no_child_profile
+        or not closure.permitted_process_closure_proven
+        or not closure.leader_reaped
+        or not closure.stdio_closed
+        or closure.process_group_emptiness_used_as_descendant_proof
+    ):
+        raise RuntimeError(
+            "read-only installed test process closure lacks an authenticated "
+            "no-child proof"
+        )
+    proof.proven = True
+    if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
+        raise OverflowError("bounded no-child test output exceeded its byte cap")
     return subprocess.CompletedProcess(
         args=argv,
-        returncode=returncode,
-        stdout=stdout.decode("utf-8", "replace"),
-        stderr=stderr.decode("utf-8", "replace"),
+        returncode=result.returncode,
+        stdout=result.stdout.decode("utf-8", "replace"),
+        stderr=result.stderr.decode("utf-8", "replace"),
     )
 
 
@@ -568,13 +592,15 @@ def _cleanup_tree(
 def _cleanup_failure_from_error(
     path: pathlib.Path,
     error: BaseException,
+    *,
+    retained: bool | None = None,
 ) -> CleanupFailure:
     error_errno = getattr(error, "errno", None)
     return CleanupFailure(
         path=str(path),
         error_kind=type(error).__name__,
         error_errno=error_errno if isinstance(error_errno, int) else None,
-        retained=os.path.lexists(path),
+        retained=os.path.lexists(path) if retained is None else retained,
         restore_error_kind=None,
         restore_error_errno=None,
     )
@@ -599,7 +625,9 @@ def _cleanup_bound_tree(
     try:
         binding.revalidate()
     except Exception as error:
-        return _cleanup_failure_from_error(binding.path, error)
+        # A failed path revalidation leaves the held directory object retained,
+        # even when its original lexical path is now absent.
+        return _cleanup_failure_from_error(binding.path, error, retained=True)
     return _cleanup_tree(
         binding.path,
         restore_owner_write=restore_owner_write,
@@ -613,6 +641,21 @@ def _retained_for_unproven_child_closure(
         return None
     return CleanupFailure(
         path=str(path),
+        error_kind="ChildProcessClosureUnproven",
+        error_errno=None,
+        retained=True,
+        restore_error_kind=None,
+        restore_error_errno=None,
+    )
+
+
+def _retained_bound_tree_for_unproven_child_closure(
+    binding: _DirectoryParentBinding | None,
+) -> CleanupFailure | None:
+    if binding is None:
+        return None
+    return CleanupFailure(
+        path=str(binding.path),
         error_kind="ChildProcessClosureUnproven",
         error_errno=None,
         retained=True,
@@ -638,6 +681,7 @@ def main() -> int:
 
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
+    install_container_binding: _DirectoryParentBinding | None = None
     runtime_parent: pathlib.Path | None = None
     runtime_parent_binding: _DirectoryParentBinding | None = None
     installed_root: pathlib.Path | None = None
@@ -648,7 +692,6 @@ def main() -> int:
     timeout_error: TimeoutError | None = None
     output_limit_error: OverflowError | None = None
     signal_error: ChildRunInterrupted | None = None
-    closure_error: GitProcessClosureUnproven | None = None
     child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
     secondary_failures: list[SecondaryFailure] = []
@@ -659,6 +702,11 @@ def main() -> int:
         install_container = _create_owned_private_directory(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
+            require_owned_private_parent=False,
+        )
+        stage = "install-container-binding"
+        install_container_binding = _open_directory_parent(
+            install_container,
             require_owned_private_parent=False,
         )
         stage = "runtime-parent"
@@ -674,52 +722,38 @@ def main() -> int:
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
+        install_container_binding.revalidate()
         shutil.copytree(
             source_root,
             installed_root,
             symlinks=True,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
         )
+        install_container_binding.revalidate()
         stage = "install-read-only"
         _set_tree_read_only(installed_root)
         stage = "snapshot-before"
+        install_container_binding.revalidate()
         before = _tree_snapshot(installed_root)
         stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment.pop("PYTHONPYCACHEPREFIX", None)
-        environment.update(
-            {
-                "PYTHONDONTWRITEBYTECODE": "1",
-                EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
-            }
-        )
         stage = "child-run"
         child_process_closure = "pending"
-        completed = _run_bounded_child(
-            (
-                sys.executable,
-                "-B",
-                "-m",
-                "tests.run_required_deterministic_supervisor",
-            ),
-            cwd=installed_root,
-            environment=environment,
+        completed = _run_no_child_test_suite(
+            installed_root=installed_root,
+            runtime_parent=runtime_parent,
             secondary_failures=secondary_failures,
             closure_proof=closure_proof,
         )
         child_process_closure = "proven"
         stage = "snapshot-after"
+        install_container_binding.revalidate()
         after = _tree_snapshot(installed_root)
+        install_container_binding.revalidate()
         stage = "runtime-residue"
         runtime_residue = _list_bound_directory(runtime_parent_binding)
         stage = "complete"
-    except GitProcessClosureUnproven as error:
-        closure_error = error
-        child_process_closure = "unproven"
-        primary_failure = _primary_failure(stage, error)
     except TimeoutError as error:
         timeout_error = error
         child_process_closure = "proven" if closure_proof.proven else "unproven"
@@ -742,20 +776,47 @@ def main() -> int:
         cleanup_results: list[CleanupFailure | None]
         if child_process_closure in {"pending", "unproven"}:
             cleanup_results = [
-                _retained_for_unproven_child_closure(install_container),
-                _retained_for_unproven_child_closure(runtime_parent),
+                _retained_bound_tree_for_unproven_child_closure(
+                    install_container_binding
+                ),
+                _retained_bound_tree_for_unproven_child_closure(runtime_parent_binding),
             ]
+            if install_container_binding is None:
+                cleanup_results.append(
+                    _retained_for_unproven_child_closure(install_container)
+                )
+            if runtime_parent_binding is None:
+                cleanup_results.append(
+                    _retained_for_unproven_child_closure(runtime_parent)
+                )
         else:
             cleanup_results = [
-                _cleanup_tree(install_container, restore_owner_write=True),
+                _cleanup_bound_tree(
+                    install_container_binding,
+                    restore_owner_write=True,
+                ),
                 _cleanup_bound_tree(
                     runtime_parent_binding,
                     restore_owner_write=False,
                 ),
             ]
+            if install_container_binding is None:
+                cleanup_results.append(
+                    _cleanup_tree(install_container, restore_owner_write=True)
+                )
             if runtime_parent_binding is None:
                 cleanup_results.append(
                     _cleanup_tree(runtime_parent, restore_owner_write=False)
+                )
+        if install_container_binding is not None:
+            try:
+                install_container_binding.close()
+            except Exception as error:
+                cleanup_results.append(
+                    _cleanup_failure_from_error(
+                        install_container_binding.path,
+                        error,
+                    )
                 )
         if runtime_parent_binding is not None:
             try:
@@ -781,7 +842,7 @@ def main() -> int:
             primary_status = "output-limit"
         elif signal_error is not None:
             primary_status = "interrupted"
-        elif closure_error is not None or child_process_closure == "unproven":
+        elif child_process_closure == "unproven":
             primary_status = "closure-unproven"
         else:
             primary_status = "failed"

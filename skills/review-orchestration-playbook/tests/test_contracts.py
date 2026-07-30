@@ -1768,6 +1768,10 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_required_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
+        readonly_no_child_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_readonly_no_child_supervisor.py"
+        ).read_text(encoding="utf-8")
         readonly_install_runner = (
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_readonly_install_deterministic_supervisor.py"
@@ -1782,7 +1786,7 @@ class RepositoryContractTest(unittest.TestCase):
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
         )
-        for runner in (live_runner, deterministic_runner):
+        for runner in (live_runner, deterministic_runner, readonly_no_child_runner):
             self.assertIn("result.skipped,", runner)
             self.assertIn("result.wasSuccessful()", runner)
             self.assertIn("result.testsRun !=", runner)
@@ -1794,13 +1798,21 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 626", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 628", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 272", readonly_no_child_runner)
+        self.assertIn("EXPECTED_TEST_ID_SHA256 =", readonly_no_child_runner)
+        self.assertIn("READONLY_NO_CHILD_MODULES", readonly_no_child_runner)
+        self.assertIn(
+            "selected_modules != READONLY_NO_CHILD_MODULES",
+            readonly_no_child_runner,
+        )
+        self.assertIn("expected_discovered_count", readonly_no_child_runner)
         for contract in (
             'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
             "CODEX_REVIEW_TEST_RUNTIME_PARENT",
@@ -1814,10 +1826,15 @@ class RepositoryContractTest(unittest.TestCase):
             "acl_entries=_acl_entries(path)",
             "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
-            "run_bounded(",
+            "prepare_sandboxed_python_no_child_profile()",
+            "run_bounded_command(",
             "CHILD_STDOUT_LIMIT_BYTES",
             "CHILD_STDERR_LIMIT_BYTES",
-            "ChildProcessClosureUnproven",
+            "closure.authenticated_no_child_profile",
+            "closure.permitted_process_closure_proven",
+            "closure.process_group_emptiness_used_as_descendant_proof",
+            "install_container_binding = _open_directory_parent(",
+            "_cleanup_bound_tree(",
             '"child_process_closure": child_process_closure',
             '"primary_failure": (',
             '"primary_status": primary_status',
@@ -1826,7 +1843,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
             '"retained_paths": retained_paths',
             "return 1 if primary_failed or cleanup_failures else 0",
-            '"tests.run_required_deterministic_supervisor"',
+            "tests.run_readonly_no_child_supervisor",
         ):
             self.assertIn(contract, readonly_install_runner)
         for excluded_signal in (

@@ -113,9 +113,17 @@ superseded_by:
 - Test-runtime directories are normalized to `0700` relative to a held parent
   descriptor and revalidated for the same object before use, so restrictive
   process umasks cannot make valid scratch allocation fail. The read-only
-  installed runner retains the exact runtime-directory descriptor through child
-  closure, enumerates residue from that object, and revalidates the pathname
-  before cleanup; a replacement cannot be mistaken for an empty clean tree.
+  installed runner retains exact descriptors for both the sticky-parent install
+  container and the runtime directory through child closure, revalidates each
+  pathname before cleanup, and conservatively reports a held renamed object as
+  retained even when its old lexical path is absent.
+- The ordinary deterministic gate retains full behavior coverage, including
+  tests that intentionally fork and exercise `setsid`/double-fork rejection.
+  The installed-release immutability gate separately runs a fixed-identity
+  no-child-safe module set behind the authenticated Darwin no-child profile.
+  Cleanup is permitted only after that profile's evidence proves the sole
+  leader was reaped and its streams drained; process-group emptiness is never
+  accepted as whole-descendant closure.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
   syntax validation and explicit zero-cache guards. Their Python 3.13
   workflows run the installed-release immutability regression in a dedicated
@@ -257,6 +265,20 @@ superseded_by:
   The real read-only installed runner also returned proven child closure,
   complete cleanup, an immutable release tree, no retained paths, no runtime
   residue, and no secondary failures.
+- The install-container binding and authenticated no-child closure repair
+  passed 628/628 in the full ordinary deterministic gate in 325.987 seconds
+  with the reviewed 628-test selected identity and SHA-256
+  `84a688c51cfdbaabd78977a56ac0871f8b5028dc70779a8e0d7d6df2b1532b76`.
+  Its complementary read-only installed gate ran 272/272 no-child-safe tests
+  with selected identity SHA-256
+  `29d2474218a6ee9998442d0e469b89f185c5e76805bcd033cd5fe7367a60f783`
+  under the authenticated Darwin profile and returned proven closure, complete
+  cleanup, an immutable release tree, no retained paths, no runtime residue, and
+  no secondary failures.
+- The current Python 3.13 validation also passed the focused runner/secure-I/O
+  modules 53/53 in 3.378 seconds, the repository contracts 102/102 in 11.628
+  seconds, the live no-child/Seatbelt gate 9/9 in 14.660 seconds, and the full
+  platform suite, which ran 2,822 tests with 6 skips in 1459.085 seconds.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

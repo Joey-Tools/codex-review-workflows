@@ -6,11 +6,9 @@ import io
 import json
 import os
 import pathlib
-import signal
 import stat
 import subprocess
 import sys
-import time
 import unittest
 from unittest import mock
 
@@ -20,32 +18,6 @@ from .support import owned_temporary_directory
 
 
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
-    @staticmethod
-    def _process_group_exists(process_group: int) -> bool:
-        try:
-            os.killpg(process_group, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-
-    def _require_process_group_absent(
-        self,
-        process_group: int,
-        *,
-        timeout: float = 5.0,
-    ) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not self._process_group_exists(process_group):
-                return
-            time.sleep(0.02)
-        self.assertFalse(
-            self._process_group_exists(process_group),
-            f"process group {process_group} remained live",
-        )
-
     def test_runtime_parent_rejects_extended_ancestor_acl(self) -> None:
         with owned_temporary_directory("runtime-parent-acl-") as root:
             ancestor = root / "ancestor"
@@ -277,6 +249,33 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             finally:
                 binding.close()
 
+    def test_bound_cleanup_retains_renamed_object_when_path_is_absent(self) -> None:
+        with owned_temporary_directory("runtime-cleanup-rename-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            original = root / "original"
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                runtime_parent.rename(original)
+
+                failure = runner._cleanup_bound_tree(
+                    binding,
+                    restore_owner_write=False,
+                )
+
+                self.assertIsNotNone(failure)
+                assert failure is not None
+                self.assertEqual(failure.path, str(runtime_parent))
+                self.assertEqual(failure.error_kind, "FileNotFoundError")
+                self.assertTrue(failure.retained)
+                self.assertTrue(original.is_dir())
+                self.assertFalse(runtime_parent.exists())
+            finally:
+                binding.close()
+
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
@@ -409,88 +408,123 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(failure.retained)
             self.assertTrue(os.path.lexists(root))
 
-    def test_bounded_child_settles_same_group_descendant_after_leader_exit(
-        self,
-    ) -> None:
-        child_script = (
-            "import os,pathlib,subprocess,sys\n"
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
-            "subprocess.Popen((sys.executable,'-B','-c',"
-            "'import time; time.sleep(300)'),"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
-            "stderr=subprocess.DEVNULL)\n"
+    @staticmethod
+    def _no_child_result(
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        authenticated: bool = True,
+        closure_proven: bool = True,
+        leader_reaped: bool = True,
+        stdio_closed: bool = True,
+        group_emptiness_used: bool = False,
+    ) -> mock.Mock:
+        closure = mock.Mock(
+            authenticated_no_child_profile=authenticated,
+            permitted_process_closure_proven=closure_proven,
+            leader_reaped=leader_reaped,
+            stdio_closed=stdio_closed,
+            process_group_emptiness_used_as_descendant_proof=group_emptiness_used,
         )
-        with owned_temporary_directory("readonly-child-descendant-") as root:
-            group_file = root / "process-group"
-            result = runner._run_bounded_child(
-                (
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    child_script,
-                    str(group_file),
+        return mock.Mock(
+            returncode=0,
+            stdout=stdout,
+            stderr=stderr,
+            process_closure=closure,
+        )
+
+    def test_no_child_suite_accepts_authenticated_tree_closure(self) -> None:
+        with owned_temporary_directory("readonly-no-child-accepted-") as root:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
                 ),
-                cwd=root,
-                environment={
-                    "LANG": "C",
-                    "LC_ALL": "C",
-                    "PATH": "/usr/bin:/bin",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                timeout=5,
-                stdout_limit=1024,
-                stderr_limit=1024,
-            )
-
-            process_group = int(group_file.read_text(encoding="ascii"))
-            self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "")
-            self.assertEqual(result.stderr, "")
-            self._require_process_group_absent(process_group)
-
-    def test_bounded_child_output_overflow_settles_same_group_descendant(
-        self,
-    ) -> None:
-        child_script = (
-            "import os,pathlib,subprocess,sys,time\n"
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
-            "subprocess.Popen((sys.executable,'-B','-c',"
-            "'import time; time.sleep(300)'),"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
-            "stderr=subprocess.DEVNULL)\n"
-            "os.write(1,b'x'*8192)\n"
-            "time.sleep(300)\n"
-        )
-        with owned_temporary_directory("readonly-child-overflow-") as root:
-            group_file = root / "process-group"
-            with self.assertRaisesRegex(OverflowError, "byte cap"):
-                runner._run_bounded_child(
-                    (
-                        sys.executable,
-                        "-B",
-                        "-c",
-                        child_script,
-                        str(group_file),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    return_value=self._no_child_result(
+                        stdout=b"selected tests passed\n",
                     ),
-                    cwd=root,
-                    environment={
-                        "LANG": "C",
-                        "LC_ALL": "C",
-                        "PATH": "/usr/bin:/bin",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                    },
+                ),
+            ):
+                result = runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
+                    closure_proof=proof,
                 )
 
-            process_group = int(group_file.read_text(encoding="ascii"))
-            self._require_process_group_absent(process_group)
+            self.assertTrue(proof.proven)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "selected tests passed\n")
+            self.assertEqual(result.stderr, "")
 
-    def test_bounded_child_does_not_claim_closure_before_process_supervision(
+    def test_no_child_suite_rejects_process_group_only_closure(self) -> None:
+        with owned_temporary_directory("readonly-no-child-forged-") as root:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    return_value=self._no_child_result(group_emptiness_used=True),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "authenticated no-child proof",
+                ),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertFalse(proof.proven)
+
+    def test_no_child_suite_output_overflow_keeps_closure_proof(self) -> None:
+        with owned_temporary_directory("readonly-no-child-overflow-") as root:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    return_value=self._no_child_result(stdout=b"x" * 1025),
+                ),
+                self.assertRaisesRegex(OverflowError, "byte cap"),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertTrue(proof.proven)
+
+    def test_no_child_suite_does_not_claim_closure_before_process_supervision(
         self,
     ) -> None:
-        with owned_temporary_directory("readonly-child-pre-supervision-") as root:
+        with owned_temporary_directory("readonly-no-child-pre-supervision-") as root:
             signal_guard = runner.ChildSignalGuard(
                 signals=(),
                 previous_handlers=(),
@@ -510,18 +544,20 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     side_effect=TimeoutError("synthetic activation failure"),
                 ),
                 mock.patch.object(runner, "_restore_child_signal_guard"),
-                mock.patch.object(runner, "run_bounded") as run_bounded,
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                ) as run_bounded_command,
                 self.assertRaisesRegex(TimeoutError, "activation failure"),
             ):
-                runner._run_bounded_child(
-                    (sys.executable, "-B", "-c", "raise SystemExit(0)"),
-                    cwd=root,
-                    environment={
-                        "LANG": "C",
-                        "LC_ALL": "C",
-                        "PATH": "/usr/bin:/bin",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                    },
+                runner._run_no_child_test_suite(
+                    installed_root=root,
+                    runtime_parent=root,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -529,81 +565,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             self.assertFalse(closure_proof.proven)
-            run_bounded.assert_not_called()
-
-    def test_bounded_child_sigterm_settles_group_before_interrupt_returns(
-        self,
-    ) -> None:
-        inner_script = (
-            "import os,pathlib,subprocess,sys,time\n"
-            "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
-            "pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii')\n"
-            "subprocess.Popen((sys.executable,'-B','-c',"
-            "'import time; time.sleep(300)'),"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
-            "stderr=subprocess.DEVNULL)\n"
-            "time.sleep(300)\n"
-        )
-        worker_script = (
-            "import os,pathlib,sys\n"
-            "from tests import run_readonly_install_deterministic_supervisor as runner\n"
-            "root=pathlib.Path(sys.argv[1])\n"
-            "try:\n"
-            " runner._run_bounded_child("
-            "(sys.executable,'-B','-c',sys.argv[2],sys.argv[3],sys.argv[4]),"
-            "cwd=root,environment={'LANG':'C','LC_ALL':'C',"
-            "'PATH':'/usr/bin:/bin','PYTHONDONTWRITEBYTECODE':'1'},"
-            "timeout=30,stdout_limit=1024,stderr_limit=1024)\n"
-            "except runner.ChildRunInterrupted as error:\n"
-            " raise SystemExit(128+error.signal_number)\n"
-            "raise SystemExit(3)\n"
-        )
-        with owned_temporary_directory("readonly-child-sigterm-") as root:
-            group_file = root / "process-group"
-            ready_file = root / "ready"
-            worker = subprocess.Popen(
-                (
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    worker_script,
-                    str(root),
-                    inner_script,
-                    str(group_file),
-                    str(ready_file),
-                ),
-                cwd=pathlib.Path(__file__).resolve().parents[1],
-                env={
-                    **os.environ,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                deadline = time.monotonic() + 5
-                while not ready_file.is_file() and time.monotonic() < deadline:
-                    if worker.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                self.assertTrue(
-                    ready_file.is_file(), "bounded child did not become ready"
-                )
-                process_group = int(group_file.read_text(encoding="ascii"))
-
-                worker.send_signal(signal.SIGTERM)
-                stdout, stderr = worker.communicate(timeout=10)
-
-                self.assertEqual(worker.returncode, 128 + signal.SIGTERM)
-                self.assertEqual(stdout, b"")
-                self.assertEqual(stderr, b"")
-                self._require_process_group_absent(process_group)
-            finally:
-                if worker.poll() is None:
-                    os.killpg(worker.pid, signal.SIGKILL)
-                    worker.wait(timeout=5)
+            run_bounded_command.assert_not_called()
 
     def test_main_preserves_closure_failure_across_signal_teardown(
         self,
@@ -627,11 +589,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 pathlib.Path(destination).mkdir()
                 return pathlib.Path(destination)
 
-            closure_error = runner.GitProcessClosureUnproven(
-                None,
-                None,
-                RuntimeError("synthetic closure failure"),
-            )
+            closure_error = RuntimeError("synthetic no-child closure failure")
             signal_guard = runner.ChildSignalGuard(
                 signals=(),
                 previous_handlers=(),
@@ -693,7 +651,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ) as restore,
                 mock.patch.object(
                     runner,
-                    "run_bounded",
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
                     side_effect=closure_error,
                 ),
                 mock.patch.object(runner, "_cleanup_tree") as cleanup_tree,
@@ -708,7 +671,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(summary["child_process_closure"], "unproven")
             self.assertEqual(
                 summary["primary_failure"]["error_kind"],
-                "GitProcessClosureUnproven",
+                "RuntimeError",
             )
             self.assertEqual(
                 [failure["operation"] for failure in summary["secondary_failures"]],
@@ -732,7 +695,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             deactivate.assert_called_once_with(mock.sentinel.binding)
             restore.assert_called_once_with(signal_guard)
             error_text = stderr.getvalue()
-            self.assertIn("GitProcessClosureUnproven", error_text)
+            self.assertIn("synthetic no-child closure failure", error_text)
             self.assertLess(
                 error_text.index("primary failure"),
                 error_text.index("secondary failures"),
@@ -809,10 +772,14 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         RuntimeError("synthetic post-snapshot failure"),
                     ),
                 ),
-                mock.patch.object(runner, "_run_bounded_child", return_value=completed),
                 mock.patch.object(
                     runner,
-                    "_cleanup_tree",
+                    "_run_no_child_test_suite",
+                    return_value=completed,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_cleanup_bound_tree",
                     side_effect=(cleanup_failure, None),
                 ),
                 contextlib.redirect_stdout(stdout),
@@ -837,6 +804,90 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 error_text.index("primary failure"),
                 error_text.index("cleanup incomplete"),
             )
+
+    def test_main_rejects_replaced_install_container(self) -> None:
+        with owned_temporary_directory("readonly-main-install-replace-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir()
+            sticky_parent.chmod(0o1777)
+            install_container = sticky_parent / "install"
+            install_container.mkdir()
+            original_install_container = sticky_parent / "original-install"
+            runtime_home = root / "runtime-home"
+            runtime_home.mkdir()
+            runtime_parent = runtime_home / "runtime"
+            runtime_parent.mkdir()
+            completed = subprocess.CompletedProcess(
+                args=("python3",),
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            def fake_copytree(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                **_kwargs: object,
+            ) -> pathlib.Path:
+                pathlib.Path(destination).mkdir()
+                return pathlib.Path(destination)
+
+            def replace_install_container(
+                *_args: object,
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                install_container.rename(original_install_container)
+                install_container.mkdir(mode=0o700)
+                return completed
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    return_value=runtime_home,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_create_owned_private_directory",
+                    side_effect=(install_container, runtime_parent),
+                ),
+                mock.patch.object(
+                    runner.shutil,
+                    "copytree",
+                    side_effect=fake_copytree,
+                ),
+                mock.patch.object(runner, "_set_tree_read_only"),
+                mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                mock.patch.object(
+                    runner,
+                    "_run_no_child_test_suite",
+                    side_effect=replace_install_container,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                returncode = runner.main()
+
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(summary["primary_status"], "failed")
+            self.assertEqual(
+                summary["primary_failure"]["stage"],
+                "snapshot-after",
+            )
+            self.assertEqual(summary["cleanup_status"], "incomplete")
+            self.assertEqual(summary["retained_paths"], [str(install_container)])
+            self.assertTrue(original_install_container.is_dir())
+            self.assertTrue(install_container.is_dir())
+            self.assertIn("test runtime parent path changed", stderr.getvalue())
 
     def test_main_rejects_replaced_runtime_parent(self) -> None:
         with owned_temporary_directory("readonly-main-runtime-replace-") as root:
@@ -901,7 +952,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(runner, "_tree_snapshot", return_value={}),
                 mock.patch.object(
                     runner,
-                    "_run_bounded_child",
+                    "_run_no_child_test_suite",
                     side_effect=replace_runtime_parent,
                 ),
                 contextlib.redirect_stdout(stdout),
