@@ -1653,9 +1653,6 @@ class RepositoryContractTest(unittest.TestCase):
             / "docs/project_journal/2026/07/"
             / "2026-07-27-review-runtime-state-root-rsr001.md"
         ).read_text(encoding="utf-8")
-        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
-            encoding="utf-8"
-        )
         self.assertIn(
             f"passed {expected_count}/{expected_count}",
             journal,
@@ -1665,12 +1662,6 @@ class RepositoryContractTest(unittest.TestCase):
             journal,
         )
         self.assertIn(f"`{expected_sha256}`", journal)
-        self.assertIn(
-            "Latest workstream: "
-            "`docs/project_journal/2026/07/"
-            "2026-07-27-review-runtime-state-root-rsr001.md`",
-            project_state,
-        )
 
     def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
@@ -1698,6 +1689,15 @@ class RepositoryContractTest(unittest.TestCase):
             script,
         )
         self.assertIn("verified %s sha256=%s", script)
+        self.assertIn("select_hosted_codesign_sha256", script)
+        self.assertIn('EXPECTED_HOSTED_OS_VERSION="26.5.2"', script)
+        self.assertIn('EXPECTED_HOSTED_OS_BUILD="25F84"', script)
+        self.assertIn('EXPECTED_HOSTED_LEGACY_OS_VERSION="26.4"', script)
+        self.assertIn('EXPECTED_HOSTED_LEGACY_OS_BUILD="25E246"', script)
+        self.assertIn(
+            "hosted runner OS version/build is not reviewed",
+            script,
+        )
         for mode in ("DEVELOPER", "HOSTED"):
             for tool in (
                 "CLANG",
@@ -1711,6 +1711,46 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
         self.assertIn("initialize_expected_tool_digests", script)
 
+    def test_hosted_codesign_pin_journal_records_both_runner_generations(
+        self,
+    ) -> None:
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-30-hosted-broker-codesign-pin-hbp001.md"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "macOS 26.4 build `25E246`",
+            "06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337",
+            "macOS 26.5.2 build `25F84`",
+            "214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7",
+        ):
+            self.assertIn(evidence, journal)
+
+    def test_readonly_supervisor_journal_is_recovery_pointer(self) -> None:
+        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
+            encoding="utf-8"
+        )
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-30-readonly-supervisor-scratch-rss001.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Latest workstream: "
+            "`docs/project_journal/2026/07/"
+            "2026-07-30-readonly-supervisor-scratch-rss001.md`",
+            project_state,
+        )
+        for evidence in (
+            "read-only installed releases",
+            "untrusted `01777` ancestors",
+            "ordinary deterministic suite passed 604/604",
+            '"release_tree_immutable":true',
+            '"runtime_residue":[]',
+        ):
+            self.assertIn(evidence, journal)
+
     def test_independent_supervisor_ci_separates_hosted_and_live_gates(self) -> None:
         live_runner = (
             SCRIPTS
@@ -1719,6 +1759,10 @@ class RepositoryContractTest(unittest.TestCase):
         deterministic_runner = (
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_required_deterministic_supervisor.py"
+        ).read_text(encoding="utf-8")
+        readonly_install_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
         hosted_probe = (
             SCRIPTS / "independent_codex_pr_review/tests/"
@@ -1749,6 +1793,15 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
+        for contract in (
+            'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
+            "CODEX_REVIEW_TEST_RUNTIME_PARENT",
+            "_set_tree_read_only(installed_root)",
+            '"release_tree_immutable": after == before',
+            '"runtime_residue": runtime_residue',
+            '"tests.run_required_deterministic_supervisor"',
+        ):
+            self.assertIn(contract, readonly_install_runner)
         for contract in (
             "return-before-ownership publisher",
             "launch `CALL`-to-caller-`STORE`",
@@ -1854,6 +1907,14 @@ class RepositoryContractTest(unittest.TestCase):
         working-directory: {skill_root}/tests
         run: |
           python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
+""",
+                    supervisor_job,
+                )
+                self.assertIn(
+                    f"""      - name: Run deterministic supervisor from read-only install
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        run: |
+          python3 -B -m tests.run_readonly_install_deterministic_supervisor
 """,
                     supervisor_job,
                 )

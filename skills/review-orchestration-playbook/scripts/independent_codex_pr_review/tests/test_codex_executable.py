@@ -3140,10 +3140,19 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                         and getattr(frame, "f_lasti", None) == target_offset
                     ):
                         injected = True
-                        reused_fd = os.open(
+                        candidate_fd = os.open(
                             output_path,
                             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                         )
+                        if candidate_fd != original_output_fd:
+                            os.dup2(
+                                candidate_fd,
+                                original_output_fd,
+                                inheritable=False,
+                            )
+                            os.close(candidate_fd)
+                            candidate_fd = original_output_fd
+                        reused_fd = candidate_fd
                         raise interruption
                 return interrupt_and_reopen_same_root
 

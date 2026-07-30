@@ -7,7 +7,7 @@
 
 ## Recovery Pointers
 
-- Latest workstream: `docs/project_journal/2026/07/2026-07-27-review-runtime-state-root-rsr001.md`
+- Latest workstream: `docs/project_journal/2026/07/2026-07-30-readonly-supervisor-scratch-rss001.md`
 
 ## Global Blockers
 

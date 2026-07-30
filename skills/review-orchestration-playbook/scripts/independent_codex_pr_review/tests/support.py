@@ -23,6 +23,7 @@ from review_supervisor.secureio import identity_from_stat
 
 _RUNTIME_ROOT: pathlib.Path | None = None
 _RUNTIME_ROOT_PID: int | None = None
+_EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 
 
 def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
@@ -75,6 +76,16 @@ def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
 
 
 def _private_runtime_parent() -> pathlib.Path:
+    explicit_parent = os.environ.get(_EXPLICIT_RUNTIME_PARENT_ENV)
+    if explicit_parent is not None:
+        validated = _validated_private_runtime_parent(explicit_parent)
+        if validated is None:
+            raise RuntimeError(
+                f"{_EXPLICIT_RUNTIME_PARENT_ENV} is not a trusted private "
+                "test runtime parent"
+            )
+        return validated
+
     account_home = pwd.getpwuid(os.getuid()).pw_dir
     # Shared OS runtime roots have unrelated metadata churn that invalidates
     # executable path-identity checks while a fixture is under authentication.

@@ -15,7 +15,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from collections.abc import Callable
@@ -35,6 +34,7 @@ from review_supervisor.codex_executable import (
     build_snapshot_seatbelt_policy,
 )
 from review_supervisor import no_child_profile as profile
+from tests.support import owned_temporary_directory
 
 
 REQUIRE_LIVE_NO_CHILD_PROFILE_ENV = "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"
@@ -956,12 +956,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
     def test_custodied_snapshot_profile_uses_fd_attestations_and_explicit_roots(
         self,
     ) -> None:
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".owner-snapshot-profile-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("owner-snapshot-profile-") as temporary:
+            root = temporary.resolve(strict=True)
             os.chmod(root, 0o700)
             attestation = _build_owner_snapshot_attestation(
                 root,
@@ -1049,12 +1045,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
     def test_data_volume_alias_cannot_be_attested_as_snapshot_writable_root(
         self,
     ) -> None:
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".owner-snapshot-alias-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("owner-snapshot-alias-") as temporary:
+            root = temporary.resolve(strict=True)
             os.chmod(root, 0o700)
             attestation = _build_owner_snapshot_attestation(
                 root,
@@ -1100,12 +1092,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
     def test_snapshot_launch_revalidation_checks_current_single_link_policy(
         self,
     ) -> None:
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".snapshot-link-policy-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("snapshot-link-policy-") as temporary:
+            root = temporary.resolve(strict=True)
             root.chmod(0o700)
             source = root / "source"
             _write_synthetic_macho(source)
@@ -2628,12 +2616,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
         self,
     ) -> None:
         clear_metadata = ExtendedMetadataEvidence(0, (), False)
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".path-target-policy-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("path-target-policy-") as temporary:
+            root = temporary.resolve(strict=True)
             root.chmod(0o700)
             unsafe = root / "unsafe"
             unsafe.mkdir(mode=0o755)
@@ -2656,11 +2640,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
             finally:
                 unsafe.chmod(0o755)
 
-        with tempfile.TemporaryDirectory(
-            prefix=".path-target-owner-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("path-target-owner-") as temporary:
+            root = temporary.resolve(strict=True)
             root.chmod(0o700)
             target = root / "python3.13"
             _write_synthetic_macho(target)
@@ -2686,7 +2667,6 @@ class NoChildProfileUnitTests(unittest.TestCase):
         self,
     ) -> None:
         clear_metadata = ExtendedMetadataEvidence(0, (), False)
-        test_root = pathlib.Path(__file__).resolve().parent
         cases = (
             (
                 "object-identity",
@@ -2698,12 +2678,11 @@ class NoChildProfileUnitTests(unittest.TestCase):
         for mutation, message in cases:
             with (
                 self.subTest(mutation=mutation),
-                tempfile.TemporaryDirectory(
-                    prefix=f".path-target-{mutation}-",
-                    dir=test_root,
+                owned_temporary_directory(
+                    f"path-target-{mutation}-"
                 ) as temporary,
             ):
-                root = pathlib.Path(temporary).resolve(strict=True)
+                root = temporary.resolve(strict=True)
                 root.chmod(0o700)
                 runtime = root / "runtime"
                 runtime.mkdir(mode=0o755)
@@ -3337,12 +3316,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
     def test_writable_synthetic_target_cannot_be_authenticated_for_production(
         self,
     ) -> None:
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".no-child-auth-",
-            dir=test_root,
-        ) as temporary:
-            synthetic = pathlib.Path(temporary) / "synthetic-app-server"
+        with owned_temporary_directory("no-child-auth-") as temporary:
+            synthetic = temporary / "synthetic-app-server"
             shutil.copyfile(pathlib.Path(sys.executable).resolve(), synthetic)
             synthetic.chmod(0o755)
 
@@ -3449,13 +3424,11 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
             )
             cls._skip_or_fail(message)
         cls._parent_limit_before = resource.getrlimit(resource.RLIMIT_NPROC)
-        test_root = pathlib.Path(__file__).resolve().parent
-        cls._temporary = tempfile.TemporaryDirectory(
-            prefix=".no-child-probe-",
-            dir=test_root,
+        cls._temporary = contextlib.ExitStack()
+        cls.addClassCleanup(cls._temporary.close)
+        root = cls._temporary.enter_context(
+            owned_temporary_directory("no-child-probe-")
         )
-        cls.addClassCleanup(cls._temporary.cleanup)
-        root = pathlib.Path(cls._temporary.name)
         cls.synthetic_python = root / "synthetic-python3.13"
         cls.synthetic_alternate = root / "synthetic-alternate"
         shutil.copyfile(profile.python_runtime_executable(), cls.synthetic_python)
@@ -3645,12 +3618,8 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
                 "nested Seatbelt profile is unavailable in this host context"
             )
 
-        test_root = pathlib.Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(
-            prefix=".secure-owner-snapshot-",
-            dir=test_root,
-        ) as temporary:
-            root = pathlib.Path(temporary).resolve(strict=True)
+        with owned_temporary_directory("secure-owner-snapshot-") as temporary:
+            root = temporary.resolve(strict=True)
             os.chmod(root, 0o700)
             attestation = _build_owner_snapshot_attestation(
                 root,

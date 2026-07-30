@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import platform
 import shutil
 import sys
-import tempfile
 
 from review_supervisor import no_child_profile as profile
 
+from .support import owned_temporary_directory
 from .test_no_child_profile import (
     GITHUB_HOSTED_RUNTIME_PIN,
     GITHUB_HOSTED_RUNTIME_PROFILE,
@@ -187,12 +186,7 @@ def main() -> int:
         print("hosted no-child probe requires an actual arm64 process", file=sys.stderr)
         return 2
 
-    tests_directory = pathlib.Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(
-        prefix=".hosted-no-child-probe-",
-        dir=tests_directory,
-    ) as temporary:
-        root = pathlib.Path(temporary)
+    with owned_temporary_directory("hosted-no-child-probe-") as root:
         root.chmod(0o700)
         synthetic_python = root / "synthetic-python3.13"
         synthetic_alternate = root / "synthetic-alternate"
