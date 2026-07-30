@@ -165,6 +165,61 @@ def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
         binding.close()
 
 
+def _directory_object_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        getattr(metadata, "st_flags", 0),
+    )
+
+
+def _normalize_created_private_directory_mode(
+    parent_binding: _DirectoryParentBinding,
+    name: bytes,
+    child_path: pathlib.Path,
+) -> None:
+    created_metadata = os.stat(
+        name,
+        dir_fd=parent_binding.fd,
+        follow_symlinks=False,
+    )
+    created_key = _directory_object_key(created_metadata)
+    if (
+        not stat.S_ISDIR(created_metadata.st_mode)
+        or created_metadata.st_uid != os.getuid()
+    ):
+        raise OSError(
+            errno.EPERM,
+            f"new temporary directory has an unsafe identity: {child_path}",
+        )
+
+    os.chmod(
+        name,
+        0o700,
+        dir_fd=parent_binding.fd,
+        follow_symlinks=False,
+    )
+    normalized_metadata = os.stat(
+        name,
+        dir_fd=parent_binding.fd,
+        follow_symlinks=False,
+    )
+    if _directory_object_key(normalized_metadata) != created_key:
+        raise OSError(
+            errno.ESTALE,
+            f"new temporary directory changed during mode normalization: {child_path}",
+        )
+    if stat.S_IMODE(normalized_metadata.st_mode) != 0o700:
+        raise OSError(
+            errno.EPERM,
+            f"new temporary directory mode was not normalized: {child_path}",
+        )
+
+
 def _create_owned_private_directory(
     parent: pathlib.Path,
     prefix: str,
@@ -199,6 +254,12 @@ def _create_owned_private_directory(
                 continue
             try:
                 os.fsync(parent_binding.fd)
+                _normalize_created_private_directory_mode(
+                    parent_binding,
+                    name,
+                    child_path,
+                )
+                parent_binding.revalidate()
                 child_fd, child_identity = open_directory_at(
                     parent_binding.fd,
                     name,

@@ -110,6 +110,12 @@ superseded_by:
   diagnostic.
 - Installed-symlink preflight coverage proves the release tree inventory and
   bytes remain unchanged while runtime directories are created externally.
+- Test-runtime directories are normalized to `0700` relative to a held parent
+  descriptor and revalidated for the same object before use, so restrictive
+  process umasks cannot make valid scratch allocation fail. The read-only
+  installed runner retains the exact runtime-directory descriptor through child
+  closure, enumerates residue from that object, and revalidates the pathname
+  before cleanup; a replacement cannot be mistaken for an empty clean tree.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
   syntax validation and explicit zero-cache guards. Their Python 3.13
   workflows run the installed-release immutability regression in a dedicated
@@ -245,6 +251,12 @@ superseded_by:
 - The current hardened runtime-parent suite passed 621/621 in 225.264 seconds
   with the reviewed 621-test selected identity and SHA-256
   `0203bf84f76bfe4fcb49362ac3137474753af30c4aea0a0a31c47774a6929f4d`.
+- The post-GitHub-review runtime binding and umask hardening passed 626/626 in
+  243.743 seconds with the reviewed 626-test selected identity and SHA-256
+  `135686bbf5d166fe7a050c739ea88a4d6080cd2019298762650e3372fee9fe76`.
+  The real read-only installed runner also returned proven child closure,
+  complete cleanup, an immutable release tree, no retained paths, no runtime
+  residue, and no secondary failures.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.

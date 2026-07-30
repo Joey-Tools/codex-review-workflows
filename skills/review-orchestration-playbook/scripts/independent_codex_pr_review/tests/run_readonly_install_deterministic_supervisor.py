@@ -22,7 +22,12 @@ from review_supervisor.signal_relay import (
     activate_deferred_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
-from .support import _create_owned_private_directory, _private_runtime_parent
+from .support import (
+    _DirectoryParentBinding,
+    _create_owned_private_directory,
+    _open_directory_parent,
+    _private_runtime_parent,
+)
 
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
@@ -560,6 +565,47 @@ def _cleanup_tree(
     return None
 
 
+def _cleanup_failure_from_error(
+    path: pathlib.Path,
+    error: BaseException,
+) -> CleanupFailure:
+    error_errno = getattr(error, "errno", None)
+    return CleanupFailure(
+        path=str(path),
+        error_kind=type(error).__name__,
+        error_errno=error_errno if isinstance(error_errno, int) else None,
+        retained=os.path.lexists(path),
+        restore_error_kind=None,
+        restore_error_errno=None,
+    )
+
+
+def _list_bound_directory(
+    binding: _DirectoryParentBinding,
+) -> tuple[str, ...]:
+    binding.revalidate()
+    entries = tuple(sorted(os.listdir(binding.fd)))
+    binding.revalidate()
+    return entries
+
+
+def _cleanup_bound_tree(
+    binding: _DirectoryParentBinding | None,
+    *,
+    restore_owner_write: bool,
+) -> CleanupFailure | None:
+    if binding is None:
+        return None
+    try:
+        binding.revalidate()
+    except Exception as error:
+        return _cleanup_failure_from_error(binding.path, error)
+    return _cleanup_tree(
+        binding.path,
+        restore_owner_write=restore_owner_write,
+    )
+
+
 def _retained_for_unproven_child_closure(
     path: pathlib.Path | None,
 ) -> CleanupFailure | None:
@@ -593,6 +639,7 @@ def main() -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
     runtime_parent: pathlib.Path | None = None
+    runtime_parent_binding: _DirectoryParentBinding | None = None
     installed_root: pathlib.Path | None = None
     completed: subprocess.CompletedProcess[str] | None = None
     before: dict[str, TreeEntrySnapshot] | None = None
@@ -618,6 +665,11 @@ def main() -> int:
         runtime_parent = _create_owned_private_directory(
             _private_runtime_parent(),
             ".codex-review-readonly-runtime-",
+        )
+        stage = "runtime-parent-binding"
+        runtime_parent_binding = _open_directory_parent(
+            runtime_parent,
+            require_owned_private_parent=True,
         )
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
@@ -662,7 +714,7 @@ def main() -> int:
         stage = "snapshot-after"
         after = _tree_snapshot(installed_root)
         stage = "runtime-residue"
-        runtime_residue = tuple(sorted(path.name for path in runtime_parent.iterdir()))
+        runtime_residue = _list_bound_directory(runtime_parent_binding)
         stage = "complete"
     except GitProcessClosureUnproven as error:
         closure_error = error
@@ -687,24 +739,34 @@ def main() -> int:
     finally:
         if child_process_closure == "pending" and closure_proof.proven:
             child_process_closure = "proven"
+        cleanup_results: list[CleanupFailure | None]
         if child_process_closure in {"pending", "unproven"}:
-            cleanup_failures = tuple(
-                failure
-                for failure in (
-                    _retained_for_unproven_child_closure(install_container),
-                    _retained_for_unproven_child_closure(runtime_parent),
-                )
-                if failure is not None
-            )
+            cleanup_results = [
+                _retained_for_unproven_child_closure(install_container),
+                _retained_for_unproven_child_closure(runtime_parent),
+            ]
         else:
-            cleanup_failures = tuple(
-                failure
-                for failure in (
-                    _cleanup_tree(install_container, restore_owner_write=True),
-                    _cleanup_tree(runtime_parent, restore_owner_write=False),
+            cleanup_results = [
+                _cleanup_tree(install_container, restore_owner_write=True),
+                _cleanup_bound_tree(
+                    runtime_parent_binding,
+                    restore_owner_write=False,
+                ),
+            ]
+            if runtime_parent_binding is None:
+                cleanup_results.append(
+                    _cleanup_tree(runtime_parent, restore_owner_write=False)
                 )
-                if failure is not None
-            )
+        if runtime_parent_binding is not None:
+            try:
+                runtime_parent_binding.close()
+            except Exception as error:
+                cleanup_results.append(
+                    _cleanup_failure_from_error(runtime_parent_binding.path, error)
+                )
+        cleanup_failures = tuple(
+            failure for failure in cleanup_results if failure is not None
+        )
 
     release_tree_immutable = (
         before is not None

@@ -191,6 +191,92 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             self.assertEqual(tuple(parent.iterdir()), ())
 
+    def test_private_directory_creation_normalizes_restrictive_umask(self) -> None:
+        with owned_temporary_directory("runtime-child-umask-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+
+            for restrictive_umask in (0o177, 0o777):
+                with self.subTest(umask=oct(restrictive_umask)):
+                    previous_umask = os.umask(restrictive_umask)
+                    try:
+                        child = support._create_owned_private_directory(
+                            parent,
+                            ".new-child-",
+                        )
+                    finally:
+                        os.umask(previous_umask)
+
+                    self.assertEqual(
+                        stat.S_IMODE(child.stat(follow_symlinks=False).st_mode),
+                        0o700,
+                    )
+                    child.rmdir()
+
+    def test_bound_runtime_directory_allows_benign_child_churn(self) -> None:
+        with owned_temporary_directory("runtime-binding-churn-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                transient = runtime_parent / "transient"
+                transient.write_text("temporary", encoding="utf-8")
+                transient.unlink()
+
+                self.assertEqual(runner._list_bound_directory(binding), ())
+            finally:
+                binding.close()
+
+    def test_bound_runtime_directory_rejects_path_replacement(self) -> None:
+        with owned_temporary_directory("runtime-binding-replace-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            original = root / "original"
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                runtime_parent.rename(original)
+                runtime_parent.mkdir(mode=0o700)
+
+                with self.assertRaisesRegex(OSError, "path changed"):
+                    runner._list_bound_directory(binding)
+            finally:
+                binding.close()
+
+    def test_bound_runtime_cleanup_rejects_path_replacement(self) -> None:
+        with owned_temporary_directory("runtime-cleanup-replace-") as root:
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            original = root / "original"
+            binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                runtime_parent.rename(original)
+                runtime_parent.mkdir(mode=0o700)
+
+                failure = runner._cleanup_bound_tree(
+                    binding,
+                    restore_owner_write=False,
+                )
+
+                self.assertIsNotNone(failure)
+                assert failure is not None
+                self.assertEqual(failure.path, str(runtime_parent))
+                self.assertEqual(failure.error_kind, "OSError")
+                self.assertEqual(failure.error_errno, errno.ESTALE)
+                self.assertTrue(failure.retained)
+                self.assertTrue(original.is_dir())
+                self.assertTrue(runtime_parent.is_dir())
+            finally:
+                binding.close()
+
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
@@ -751,6 +837,90 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 error_text.index("primary failure"),
                 error_text.index("cleanup incomplete"),
             )
+
+    def test_main_rejects_replaced_runtime_parent(self) -> None:
+        with owned_temporary_directory("readonly-main-runtime-replace-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir()
+            sticky_parent.chmod(0o1777)
+            install_container = sticky_parent / "install"
+            install_container.mkdir()
+            runtime_home = root / "runtime-home"
+            runtime_home.mkdir()
+            runtime_parent = runtime_home / "runtime"
+            runtime_parent.mkdir()
+            original_runtime_parent = runtime_home / "original-runtime"
+            completed = subprocess.CompletedProcess(
+                args=("python3",),
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            def fake_copytree(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                **_kwargs: object,
+            ) -> pathlib.Path:
+                pathlib.Path(destination).mkdir()
+                return pathlib.Path(destination)
+
+            def replace_runtime_parent(
+                *_args: object,
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                runtime_parent.rename(original_runtime_parent)
+                runtime_parent.mkdir(mode=0o700)
+                return completed
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    return_value=runtime_home,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_create_owned_private_directory",
+                    side_effect=(install_container, runtime_parent),
+                ),
+                mock.patch.object(
+                    runner.shutil,
+                    "copytree",
+                    side_effect=fake_copytree,
+                ),
+                mock.patch.object(runner, "_set_tree_read_only"),
+                mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                mock.patch.object(
+                    runner,
+                    "_run_bounded_child",
+                    side_effect=replace_runtime_parent,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                returncode = runner.main()
+
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(returncode, 1)
+            self.assertEqual(summary["primary_status"], "failed")
+            self.assertEqual(
+                summary["primary_failure"]["stage"],
+                "runtime-residue",
+            )
+            self.assertEqual(summary["cleanup_status"], "incomplete")
+            self.assertEqual(summary["retained_paths"], [str(runtime_parent)])
+            self.assertTrue(original_runtime_parent.is_dir())
+            self.assertTrue(runtime_parent.is_dir())
+            self.assertIn("test runtime parent path changed", stderr.getvalue())
 
 
 if __name__ == "__main__":

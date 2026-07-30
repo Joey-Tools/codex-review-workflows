@@ -46,9 +46,19 @@ superseded_by:
   descriptor chain. The held parent and its path must retain object identity,
   owner/mode, flags, ACL, and xattr policy. Initial open, path reopen, and child
   path reopen walk the complete owner-private chain and reject every group- or
-  world-writable ancestor, including sticky directories; every new `0700` child
-  is opened no-follow and compared with a fresh path-bound descriptor before
-  use. The install container remains a separate explicit sticky-parent case.
+  world-writable ancestor, including sticky directories. A newly created child
+  is normalized to `0700` through the held parent descriptor with no symlink
+  following, then must retain device, inode, type, generation, owner, group, and
+  flags across that expected mode transition. The child is opened no-follow and
+  compared with a fresh path-bound descriptor before use, independent of the
+  process umask. The install container remains a separate explicit sticky-parent
+  case.
+- The read-only runner keeps a descriptor and policy binding for the exact
+  runtime directory before the child starts. Residue is enumerated from that
+  descriptor between full path revalidations; cleanup is attempted only after
+  proven child-process closure and only when the path still maps to the held
+  object. Persistent replacement is a primary failure plus an explicit cleanup
+  gap, while completed child-entry churn remains benign.
 - Cleanup completes before success output. Every ordinary primary exception is
   reported in the structured summary; a concurrent cleanup error returns
   nonzero, preserves the primary failure and child return code, and reports the
@@ -119,6 +129,31 @@ superseded_by:
   passed, and an independent state-machine audit returned `No findings.`.
   Ruff lint/format, source compilation, actionlint, skill validation, project
   journal validation, and `git diff --check` passed on the final files.
+- GitHub Codex review `4821503396` on head
+  `d66244b550f06f69395c04878d45d0d2ed6fb721` found two remaining installed-test
+  gaps: restrictive umasks could remove owner permissions before child
+  validation, and lexical residue/cleanup checks could observe an empty
+  replacement instead of the child-exposed runtime object. Descriptor-relative
+  no-follow mode normalization and a command-lifetime runtime-directory binding
+  close both gaps. Five new regressions cover umasks `0177` and `0777`, benign
+  child churn, residue-path replacement, cleanup-path replacement, and the
+  complete runner failure result.
+- The focused secure-I/O and read-only-runner suite passed 51/51 in 3.515
+  seconds. The reviewed deterministic selection passed 626/626 in 243.743
+  seconds with identity SHA-256
+  `135686bbf5d166fe7a050c739ea88a4d6080cd2019298762650e3372fee9fe76`.
+  The real read-only installed runner then proved child closure, immutable
+  release-tree identity/content/access policy, complete cleanup, no retained
+  paths, no runtime residue, and no secondary failures.
+- The complete playbook discovery ran 2,822 tests in 1310.748 seconds with six
+  platform skips. Its only failure was the expected parent-sandbox denial of
+  nested `sandbox-exec`; that exact broker regression passed 1/1 outside the
+  parent sandbox in 2.363 seconds, and the production-equivalent live no-child
+  suite passed 9/9 in 9.351 seconds. All 102 repository contract tests passed
+  in 7.999 seconds. Ruff lint and changed-file formatting, source-only
+  compilation of 107 Python/entrypoint files, actionlint, Bash syntax,
+  ShellCheck, skill validation, project-journal validation, zero-bytecode
+  inventory, and `git diff --check` passed.
 - GitHub Ubuntu image `20260726.254.1` exposed `/usr` as non-root-owned and
   correctly triggered the production trust policy. The host-independent
   fixture preserves that policy instead of weakening it.
