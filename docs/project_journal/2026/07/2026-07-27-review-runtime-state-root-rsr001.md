@@ -266,6 +266,11 @@ superseded_by:
 - No local Python 3.10 run is required for this delivery; local validation uses
   Python 3.13 only.
 - The process-census, inherited Seatbelt, and descriptor-custody hardening
-  passed 644/644 in 92.541 seconds on the host-level uv-managed CPython 3.13.13
-  runtime, with the reviewed 644-test selected identity and SHA-256
-  `612677903695910280385505004f6a9339f6f1290bdfd8579e75000a8f64bfba`.
+  passed 646/646 in 91.255 seconds on the host-level uv-managed CPython 3.13.13
+  runtime, with the reviewed 646-test selected identity and SHA-256
+  `cc1b2204ad8af6de52668bf83779aac60ec5bab00b20578e20419b5b6fe8f57e`.
+  The Darwin object identity is the exact `(PID, start seconds, start
+  microseconds)` returned by the SDK-declared `sysctl(KERN_PROC_PID)` interface:
+  PID detects the process-table slot, the start timeval distinguishes slot
+  reuse, and mutable state or credential fields are intentionally not identity
+  signals.

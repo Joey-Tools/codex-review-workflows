@@ -204,20 +204,29 @@ superseded_by:
   Seatbelt denial. The exact broker regression passed 1/1 outside the parent
   sandbox in 2.314 seconds, and the production-equivalent live no-child suite
   passed 9/9 in 7.585 seconds.
-- The final process-census and descriptor-custody regressions pass 38/38 on the
+- The final process-census and descriptor-custody regressions pass 40/40 on the
   uv-managed CPython 3.13 runtime. Coverage includes a `setsid()` double-fork
   escape with standard descriptors closed, zombie handoff visibility, bounded
-  `libproc` enumeration with `proc_pid_rusage` start-abstime identity and safe
-  prelaunch churn union, inherited Seatbelt enforcement, install/runtime pathname
-  replacement, access-policy-only drift, and a quarantine-rename race that
-  preserves machine-visible recovery identities for both objects.
-- The final deterministic independent-supervisor gate passed 644/644 in
-  92.541 seconds on the host-level uv-managed CPython 3.13.13 runtime, with
+  `libproc` enumeration with the SDK-declared `sysctl(KERN_PROC_PID)`
+  start-time identity and safe prelaunch churn union, inherited Seatbelt
+  enforcement, install/runtime pathname replacement, access-policy-only drift, and a
+  quarantine-rename race that preserves machine-visible recovery identities
+  for both objects. Unlike `proc_pid_rusage`, the read-only sysctl path is
+  expected to remain available for protected same-UID hosted-runner processes;
+  empty or vanished records restart the complete bounded census, while every other incomplete or
+  malformed identity fails closed.
+- The final deterministic independent-supervisor gate passed 646/646 in
+  91.255 seconds on the host-level uv-managed CPython 3.13.13 runtime, with
   selected-identity SHA-256
-  `612677903695910280385505004f6a9339f6f1290bdfd8579e75000a8f64bfba`.
+  `cc1b2204ad8af6de52668bf83779aac60ec5bab00b20578e20419b5b6fe8f57e`.
   The selected suite includes the unresolved-retention and safe prelaunch
   same-UID churn regressions.
   All 104 repository contract tests passed under the same uv-managed runtime.
+  The hosted read-only job now installs that one exact CPython through pinned
+  setup-uv v8.1.0 and uv 0.11.18 into a root-private staging tree, relocates and
+  seals one physical version root, and revalidates its content, object identity,
+  access policy, loader metadata, symlinks, and code signature before and after
+  the isolated run.
   The enclosing parent sandbox makes Apple Git emit a `confstr()` temporary-root
   diagnostic that the strict raw-Git tests correctly reject; the four affected
   tests pass 4/4 when rerun at their required host level.

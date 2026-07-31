@@ -1794,7 +1794,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 644", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 646", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2046,7 +2046,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "if (( runner_status != 0 )); then"
                 )
                 isolated_parser = (
-                    '"$trusted_python" -I -B -S -c \'import json, pathlib, sys;'
+                    '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;'
                 )
                 parser_index = readonly_job.index(isolated_parser)
                 evidence_index = readonly_job.index(
@@ -2101,7 +2101,7 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job,
                 )
                 self.assertNotIn(
-                    '"$trusted_python" -B -c \'import json, pathlib, sys;',
+                    '"$isolated_python" -B -c \'import json, pathlib, sys;',
                     readonly_job,
                 )
                 self.assertEqual(
@@ -2168,6 +2168,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_readonly_ci_binds_profile_and_denies_executable_setid_modes(
         self,
     ) -> None:
+        self._assert_readonly_ci_uses_a_sealed_uv_managed_runtime()
         sandbox_profile = (
             SCRIPTS / "independent_codex_pr_review/tests/readonly_child_isolation.sb"
         ).read_text(encoding="utf-8")
@@ -2193,8 +2194,8 @@ class RepositoryContractTest(unittest.TestCase):
             end = workflow.index(f"\n  {next_job}:", start)
             readonly_job = workflow[start:end]
             with self.subTest(profile=profile):
-                trusted_python_probe_index = readonly_job.index(
-                    'if ! /usr/bin/sudo -u nobody /bin/test -x "$trusted_python"; then'
+                runtime_postinstall_custody_index = readonly_job.index(
+                    "verify_runtime_custody post-install"
                 )
                 source_root_path_index = readonly_job.index(
                     'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"'
@@ -2267,7 +2268,10 @@ class RepositoryContractTest(unittest.TestCase):
                     'profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat'
                 )
 
-                self.assertLess(trusted_python_probe_index, source_root_path_index)
+                self.assertLess(
+                    runtime_postinstall_custody_index,
+                    source_root_path_index,
+                )
                 self.assertLess(source_root_path_index, source_root_binding_index)
                 self.assertLess(source_root_binding_index, source_profile_path_index)
                 self.assertLess(source_profile_path_index, source_copy_index)
@@ -2342,9 +2346,7 @@ class RepositoryContractTest(unittest.TestCase):
                     3,
                 )
                 for binding in (
-                    'if ! /usr/bin/sudo -u nobody /bin/test -x "$trusted_python"; then',
-                    "Trusted Python is not executable by nobody; retained at "
-                    "$isolated_root",
+                    "verify_runtime_custody post-install",
                     'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"',
                     'source_review_root_physical="$(cd "$source_review_root" '
                     '&& pwd -P)"',
@@ -2383,7 +2385,8 @@ class RepositoryContractTest(unittest.TestCase):
                     '"$isolated_source/tests/'
                     'run_readonly_install_deterministic_supervisor.py"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
-                    'sh "$isolated_source" "$trusted_python"',
+                    '"$isolated_python" -P -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
                     '/bin/test -f "$source_review_profile"',
                     '/bin/test ! -L "$source_review_profile"',
                     'source_profile_binding="$(/usr/bin/stat -f '
@@ -2457,6 +2460,274 @@ class RepositoryContractTest(unittest.TestCase):
                     "profile_literal",
                 ):
                     self.assertNotIn(removed_inventory_contract, readonly_job)
+
+    def _assert_readonly_ci_uses_a_sealed_uv_managed_runtime(self) -> None:
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                action_index = readonly_job.index(
+                    "uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+                )
+                root_mode_index = readonly_job.index(
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "
+                    '"$isolated_root")" = "700"'
+                )
+                minimal_uv_environment_index = readonly_job.index(
+                    "/usr/bin/sudo /usr/bin/env -i"
+                )
+                uv_install_index = readonly_job.index(
+                    "run_trusted_uv python install 3.13.13"
+                )
+                staging_inventory_index = readonly_job.index(
+                    'staging_unexpected_entry="$(/usr/bin/sudo '
+                    '/usr/bin/find "$uv_staging_dir"'
+                )
+                relocation_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"'
+                )
+                staging_cleanup_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" "$uv_staging_dir"'
+                )
+                unique_root_index = readonly_job.index(
+                    'managed_python_unexpected_entry="$(/usr/bin/sudo '
+                    '/usr/bin/find "$managed_python_dir"'
+                )
+                interpreter_index = readonly_job.index(
+                    'isolated_python="$runtime_root/bin/python3.13"'
+                )
+                hardlink_index = readonly_job.index(
+                    'runtime_hardlink="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" -type f -links +1 -print -quit)"'
+                )
+                loader_index = readonly_job.index(
+                    'runtime_libraries="$(/usr/bin/sudo /usr/bin/otool -L '
+                )
+                symlink_index = readonly_job.index(
+                    'runtime_symlink_binding="$(compute_runtime_symlink_binding)"'
+                )
+                runtime_custody_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"'
+                )
+                runtime_acl_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -RN "$managed_python_dir"'
+                )
+                runtime_xattr_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"'
+                )
+                runtime_readonly_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"'
+                )
+                tree_binding_index = readonly_job.index(
+                    'runtime_tree_binding="$(compute_runtime_tree_binding)"'
+                )
+                postinstall_index = readonly_job.index(
+                    "verify_runtime_custody post-install"
+                )
+                source_copy_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"'
+                )
+                root_traversal_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                )
+                nobody_runtime_index = readonly_job.index(
+                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"'
+                )
+                prelaunch_index = readonly_job.index("verify_runtime_custody prelaunch")
+                sandbox_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    '-f "$review_profile" /usr/bin/env -i'
+                )
+                postrun_index = readonly_job.index("verify_runtime_custody postrun")
+                source_postrun_index = readonly_job.index(
+                    'source_profile_postrun_binding="$(/usr/bin/stat'
+                )
+
+                self.assertLess(action_index, root_mode_index)
+                self.assertLess(root_mode_index, minimal_uv_environment_index)
+                self.assertLess(minimal_uv_environment_index, uv_install_index)
+                self.assertLess(uv_install_index, staging_inventory_index)
+                self.assertLess(staging_inventory_index, relocation_index)
+                self.assertLess(relocation_index, staging_cleanup_index)
+                self.assertLess(staging_cleanup_index, unique_root_index)
+                self.assertLess(unique_root_index, interpreter_index)
+                self.assertLess(interpreter_index, hardlink_index)
+                self.assertLess(hardlink_index, loader_index)
+                self.assertLess(loader_index, symlink_index)
+                self.assertLess(symlink_index, runtime_custody_index)
+                self.assertLess(runtime_custody_index, runtime_acl_index)
+                self.assertLess(runtime_acl_index, runtime_xattr_index)
+                self.assertLess(runtime_xattr_index, runtime_readonly_index)
+                self.assertLess(runtime_readonly_index, tree_binding_index)
+                self.assertLess(tree_binding_index, postinstall_index)
+                self.assertLess(postinstall_index, source_copy_index)
+                self.assertLess(source_copy_index, root_traversal_index)
+                self.assertLess(root_traversal_index, nobody_runtime_index)
+                self.assertLess(nobody_runtime_index, prelaunch_index)
+                self.assertLess(prelaunch_index, sandbox_index)
+                self.assertLess(sandbox_index, postrun_index)
+                self.assertLess(postrun_index, source_postrun_index)
+                self.assertIn(
+                    "          run_trusted_uv() {\n"
+                    "            /usr/bin/sudo /usr/bin/env -i \\\n"
+                    '              HOME="$uv_root_home" \\\n'
+                    "              LANG=C \\\n"
+                    "              LC_ALL=C \\\n"
+                    "              PATH=/usr/bin:/bin \\\n"
+                    '              TMPDIR="$uv_root_tmp" \\\n'
+                    '              "$trusted_uv" "$@"\n'
+                    "          }\n",
+                    readonly_job,
+                )
+
+                for contract in (
+                    "id: setup-uv",
+                    "uses: astral-sh/setup-uv@"
+                    "08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0",
+                    'version: "0.11.18"',
+                    "enable-cache: false",
+                    "UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}",
+                    'uv_root_home="$isolated_root/uv-home"',
+                    '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"',
+                    'uv_root_tmp="$uv_root_home/tmp"',
+                    '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"',
+                    'stat -f \'%u:%g:%Lp\' "$uv_root_tmp")" = "0:0:700"',
+                    "run_trusted_uv() {",
+                    "/usr/bin/sudo /usr/bin/env -i",
+                    'HOME="$uv_root_home"',
+                    "LANG=C",
+                    "LC_ALL=C",
+                    "PATH=/usr/bin:/bin",
+                    'TMPDIR="$uv_root_tmp"',
+                    '"$trusted_uv" "$@"',
+                    '[[ "$(run_trusted_uv --version)" != "uv 0.11.18" ]]',
+                    'trusted_uv_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"',
+                    'uv_staging_dir="$isolated_root/uv-managed-staging"',
+                    "run_trusted_uv python install 3.13.13",
+                    "--managed-python",
+                    '--install-dir "$uv_staging_dir"',
+                    "--no-bin",
+                    "--no-cache",
+                    "--no-progress",
+                    "--no-config",
+                    "staged_runtime_count != 1",
+                    "cpython-3.13.13-macos-aarch64-none",
+                    "cpython-3.13.13-macos-x86_64-none",
+                    "staging_unexpected_entry",
+                    'staging_unexpected_entry="<unreadable>"',
+                    "staging_temp_entry",
+                    'staging_temp_entry="<unreadable>"',
+                    '"$uv_staging_dir/.lock"',
+                    'stat -f \'%z\' "$uv_staging_dir/.lock")" != "0"',
+                    '"$uv_staging_dir/.temp"',
+                    '"$uv_staging_dir/.gitignore"',
+                    'stat -f \'%z\' "$uv_staging_dir/.gitignore")" != "1"',
+                    'cat "$uv_staging_dir/.gitignore")" != "*"',
+                    '/usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"',
+                    '/usr/bin/sudo /bin/rm "$uv_staging_dir/.lock" '
+                    '"$uv_staging_dir/.gitignore"',
+                    '/usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" '
+                    '"$uv_staging_dir"',
+                    '/usr/bin/sudo /bin/test -e "$uv_staging_dir"',
+                    '/usr/bin/sudo /bin/test -L "$uv_staging_dir"',
+                    "managed_python_unexpected_entry",
+                    'managed_python_unexpected_entry="<unreadable>"',
+                    '! /usr/bin/sudo /bin/test -d "$runtime_root"',
+                    '/usr/bin/sudo /bin/test -L "$runtime_root"',
+                    "^cpython-3\\.13\\.13-macos-(aarch64|x86_64)-none$",
+                    'isolated_python="$runtime_root/bin/python3.13"',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%HT:%l' "
+                    '"$isolated_python")" != "Regular File:1" ]]',
+                    'runtime_hardlink="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" -type f -links +1 -print -quit)"',
+                    'runtime_special="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" ! -type d ! -type f ! -type l '
+                    '-print -quit)"',
+                    '/usr/bin/sudo /usr/bin/otool -L "$isolated_python"',
+                    '$0 !~ "^/System/" && $0 !~ "^/usr/lib/"',
+                    'runtime_rpaths" != "@executable_path/../lib"',
+                    "path.resolve(strict=True)",
+                    "root not in target.parents",
+                    "os.readlink(path)",
+                    'runtime_identity" != "3.13.13|$isolated_python|'
+                    '$runtime_root|$runtime_root"',
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"',
+                    '/usr/bin/sudo /bin/chmod -RN "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"',
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"',
+                    "metadata.st_dev",
+                    "metadata.st_ino",
+                    "stat.S_IMODE(metadata.st_mode)",
+                    'getattr(metadata, "st_flags", 0)',
+                    "metadata.st_nlink",
+                    "hashlib.sha256(path.read_bytes()).digest()",
+                    "current_runtime_owner_violation",
+                    "current_runtime_write_violation",
+                    "current_runtime_read_violation",
+                    "current_runtime_traverse_violation",
+                    "current_runtime_xattr_violation",
+                    "current_runtime_acl_violation",
+                    "/usr/bin/sudo /usr/bin/codesign --verify --strict "
+                    '"$isolated_python"',
+                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"',
+                    "PYTHONDONTWRITEBYTECODE=1 \\\n"
+                    '            PYTHONPATH="$isolated_source"',
+                    '"$isolated_python" -P -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;',
+                    'if ! bytecode_artifact="$(/usr/bin/find .',
+                    "\\( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \\)",
+                    "-name '*.pyc'",
+                    "-name '*.pyo'",
+                    "-print -quit",
+                    "Unable to inspect the checkout for Python bytecode artifacts",
+                    "Python bytecode artifact: $bytecode_artifact",
+                ):
+                    self.assertIn(contract, readonly_job)
+
+                for phase in ("post-install", "prelaunch", "postrun"):
+                    self.assertEqual(
+                        readonly_job.count(f"verify_runtime_custody {phase}"),
+                        1,
+                    )
+                self.assertEqual(
+                    readonly_job.count(
+                        '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    1,
+                )
+                for prohibited in (
+                    "actions/setup-python",
+                    "trusted_python",
+                    "command -v python3",
+                    "/usr/bin/python",
+                    "python3 -B -c",
+                    "PYTHONHOME",
+                    "/usr/bin/rsync",
+                    '/usr/bin/sudo "$trusted_uv"',
+                    '"$trusted_uv" --version',
+                    '/bin/rm -rf "$uv_staging_dir"',
+                    '"$isolated_python" -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    "-type d -name __pycache__",
+                    "-type f \\( -name '*.pyc'",
+                    'sh "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod 0711 "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/sbin/chown nobody:nobody "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/sbin/chown -R nobody:nobody "$runtime_root"',
+                ):
+                    self.assertNotIn(prohibited, readonly_job)
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"

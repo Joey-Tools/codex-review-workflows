@@ -62,7 +62,10 @@ XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
 DARWIN_PROC_UID_ONLY = 4
 DARWIN_PROC_RUID_ONLY = 5
-DARWIN_RUSAGE_INFO_V0 = 0
+DARWIN_CTL_KERN = 1
+DARWIN_KERN_PROC = 14
+DARWIN_KERN_PROC_PID = 1
+DARWIN_KINFO_PROC_BYTES = 648
 DARWIN_PROCESS_CENSUS_CAP = 4096
 DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS = 5.0
 SANDBOX_FILTER_NONE = 0
@@ -182,8 +185,13 @@ class BoundPathEvidence:
 
 @dataclass(frozen=True, order=True)
 class DarwinProcessIdentity:
+    # Protected property: process-object identity. PID selects the process
+    # table slot but can be recycled; the exact kernel start timeval
+    # distinguishes successive occupants. State and credential metadata are
+    # deliberately excluded because they can change without object replacement.
     pid: int
-    start_abstime: int
+    start_seconds: int
+    start_microseconds: int
 
 
 class ChildProcessTreeClosureUnproven(RuntimeError):
@@ -195,7 +203,8 @@ class ChildProcessTreeClosureUnproven(RuntimeError):
         self.processes = processes
         self.cause = cause
         identities = ",".join(
-            f"{item.pid}:{item.start_abstime}" for item in processes[:16]
+            f"{item.pid}:{item.start_seconds}.{item.start_microseconds:06d}"
+            for item in processes[:16]
         )
         if len(processes) > 16:
             identities += f",...(+{len(processes) - 16})"
@@ -209,19 +218,38 @@ class ChildProcessTreeClosureUnproven(RuntimeError):
         super().__init__(f"same-UID child process-tree closure is unproven: {detail}")
 
 
-class _DarwinRusageInfoV0(ctypes.Structure):
+class _DarwinTimeval(ctypes.Structure):
     _fields_ = (
-        ("ri_uuid", ctypes.c_uint8 * 16),
-        ("ri_user_time", ctypes.c_uint64),
-        ("ri_system_time", ctypes.c_uint64),
-        ("ri_pkg_idle_wkups", ctypes.c_uint64),
-        ("ri_interrupt_wkups", ctypes.c_uint64),
-        ("ri_pageins", ctypes.c_uint64),
-        ("ri_wired_size", ctypes.c_uint64),
-        ("ri_resident_size", ctypes.c_uint64),
-        ("ri_phys_footprint", ctypes.c_uint64),
-        ("ri_proc_start_abstime", ctypes.c_uint64),
-        ("ri_proc_exit_abstime", ctypes.c_uint64),
+        ("tv_sec", ctypes.c_long),
+        ("tv_usec", ctypes.c_int),
+    )
+
+
+class _DarwinKinfoProcPrefix(ctypes.Structure):
+    # SDK-declared 64-bit Darwin layout prefix of kinfo_proc.kp_proc
+    # (extern_proc). The initial union has the same layout as timeval.
+    _fields_ = (
+        ("p_starttime", _DarwinTimeval),
+        ("p_vmspace", ctypes.c_void_p),
+        ("p_sigacts", ctypes.c_void_p),
+        ("p_flag", ctypes.c_int),
+        ("p_stat", ctypes.c_char),
+        ("p_pid", ctypes.c_int),
+    )
+
+
+class _DarwinKinfoProcScope(ctypes.Structure):
+    # SDK-declared 64-bit Darwin kinfo_proc offsets through the real/effective
+    # UID fields. These are census-scope signals, not process-object identity.
+    _fields_ = (
+        ("identity", _DarwinKinfoProcPrefix),
+        (
+            "_through_real_uid",
+            ctypes.c_uint8 * (392 - ctypes.sizeof(_DarwinKinfoProcPrefix)),
+        ),
+        ("real_uid", ctypes.c_uint32),
+        ("_through_effective_uid", ctypes.c_uint8 * (420 - 392 - 4)),
+        ("effective_uid", ctypes.c_uint32),
     )
 
 
@@ -371,9 +399,21 @@ def _darwin_same_uid_processes(
     _require_process_census_time(operation_deadline)
     if sys.platform != "darwin":
         raise OSError(errno.ENOTSUP, "Darwin process census is unavailable")
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    if (
+        ctypes.sizeof(_DarwinTimeval) != 16
+        or _DarwinTimeval.tv_usec.offset != 8
+        or _DarwinKinfoProcPrefix.p_pid.offset != 40
+        or ctypes.sizeof(_DarwinKinfoProcPrefix) != 48
+        or _DarwinKinfoProcScope.real_uid.offset != 392
+        or _DarwinKinfoProcScope.effective_uid.offset != 420
+        or ctypes.sizeof(_DarwinKinfoProcScope) != 424
+    ):
+        raise OSError(errno.ENOTSUP, "unsupported Darwin kinfo_proc ABI")
+    user_id = os.getuid()
+    process_library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    system_library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
     _require_process_census_time(operation_deadline)
-    list_pids = library.proc_listpids
+    list_pids = process_library.proc_listpids
     list_pids.argtypes = (
         ctypes.c_uint32,
         ctypes.c_uint32,
@@ -381,13 +421,16 @@ def _darwin_same_uid_processes(
         ctypes.c_int,
     )
     list_pids.restype = ctypes.c_int
-    pid_rusage = library.proc_pid_rusage
-    pid_rusage.argtypes = (
-        ctypes.c_int,
-        ctypes.c_int,
+    inspect_pid = system_library.sysctl
+    inspect_pid.argtypes = (
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
         ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
     )
-    pid_rusage.restype = ctypes.c_int
+    inspect_pid.restype = ctypes.c_int
 
     while True:
         process_ids: set[int] = set()
@@ -398,7 +441,7 @@ def _darwin_same_uid_processes(
             ctypes.set_errno(0)
             result = list_pids(
                 process_type,
-                os.getuid(),
+                user_id,
                 buffer,
                 buffer_bytes,
             )
@@ -419,15 +462,25 @@ def _darwin_same_uid_processes(
             process_ids.update(item for item in buffer[:count] if item > 0)
 
         processes: list[DarwinProcessIdentity] = []
-        retry_after_exit = False
+        retry_census = False
         for pid in sorted(process_ids):
             _require_process_census_time(operation_deadline)
-            value = _DarwinRusageInfoV0()
-            ctypes.set_errno(0)
-            info_result = pid_rusage(
+            mib = (ctypes.c_int * 4)(
+                DARWIN_CTL_KERN,
+                DARWIN_KERN_PROC,
+                DARWIN_KERN_PROC_PID,
                 pid,
-                DARWIN_RUSAGE_INFO_V0,
-                ctypes.byref(value),
+            )
+            buffer = (ctypes.c_uint8 * DARWIN_KINFO_PROC_BYTES)()
+            buffer_size = ctypes.c_size_t(ctypes.sizeof(buffer))
+            ctypes.set_errno(0)
+            info_result = inspect_pid(
+                mib,
+                len(mib),
+                buffer,
+                ctypes.byref(buffer_size),
+                None,
+                0,
             )
             _require_process_census_time(operation_deadline)
             error_number = ctypes.get_errno()
@@ -437,24 +490,50 @@ def _darwin_same_uid_processes(
                     # could be bound. Restart the complete census under the
                     # shared deadline so PID reuse is rebound rather than
                     # skipped under the old object's numeric PID.
-                    retry_after_exit = True
+                    retry_census = True
                     break
                 raise OSError(
                     error_number or errno.EIO,
                     f"cannot bind same-UID Darwin process identity: {pid}",
                 )
-            if value.ri_proc_start_abstime == 0:
+            if buffer_size.value == 0:
+                # KERN_PROC_PID reports an exited process as a successful,
+                # empty result on current Darwin releases.
+                retry_census = True
+                break
+            if buffer_size.value != DARWIN_KINFO_PROC_BYTES:
                 raise OSError(
                     errno.EIO,
                     f"cannot bind same-UID Darwin process identity: {pid}",
                 )
+            value = ctypes.cast(
+                buffer,
+                ctypes.POINTER(_DarwinKinfoProcScope),
+            ).contents
+            if (
+                value.identity.p_pid != pid
+                or value.identity.p_starttime.tv_sec <= 0
+                or not 0 <= value.identity.p_starttime.tv_usec < 1_000_000
+            ):
+                raise OSError(
+                    errno.EIO,
+                    f"cannot bind same-UID Darwin process identity: {pid}",
+                )
+            if value.effective_uid != user_id and value.real_uid != user_id:
+                # UID is the census scope, not object identity. A credential
+                # transition or cross-UID PID reuse between enumeration and
+                # binding restarts the complete snapshot rather than being
+                # mislabeled as object replacement or silently skipped.
+                retry_census = True
+                break
             processes.append(
                 DarwinProcessIdentity(
                     pid=pid,
-                    start_abstime=value.ri_proc_start_abstime,
+                    start_seconds=value.identity.p_starttime.tv_sec,
+                    start_microseconds=value.identity.p_starttime.tv_usec,
                 )
             )
-        if not retry_after_exit:
+        if not retry_census:
             return tuple(processes)
 
 
@@ -471,7 +550,8 @@ def _stable_same_uid_processes(
     _require_process_census_time(operation_deadline)
     second = _darwin_same_uid_processes(deadline=operation_deadline)
     # Both scans finish before the supervised child can start. Exact
-    # (pid, start_abstime) identities from either scan are therefore valid
+    # (pid, start_seconds, start_microseconds) identities from either scan are
+    # therefore valid
     # baseline objects, while PID reuse after either scan produces a distinct
     # identity. Taking their union tolerates unrelated same-UID process churn
     # without allowing a post-baseline process to hide behind a recycled PID.

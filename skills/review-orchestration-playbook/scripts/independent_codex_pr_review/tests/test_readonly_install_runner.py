@@ -68,6 +68,93 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             f"process group {process_group} remained live",
         )
 
+    @staticmethod
+    def _synthetic_darwin_process_library(
+        pid: int,
+        inspect_pid: object,
+    ) -> object:
+        class SyntheticProcListPids:
+            argtypes: object = None
+            restype: object = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(
+                self,
+                _process_type: object,
+                _uid: object,
+                buffer: object,
+                _buffer_bytes: object,
+            ) -> int:
+                self.calls += 1
+                pid_buffer = runner.ctypes.cast(
+                    buffer,
+                    runner.ctypes.POINTER(runner.ctypes.c_int),
+                )
+                pid_buffer[0] = pid
+                return runner.ctypes.sizeof(runner.ctypes.c_int)
+
+        class SyntheticLibproc:
+            def __init__(self) -> None:
+                self.proc_listpids = SyntheticProcListPids()
+                self.sysctl = inspect_pid
+
+        return SyntheticLibproc()
+
+    @staticmethod
+    def _write_synthetic_kinfo(
+        buffer: object,
+        buffer_size: object,
+        *,
+        pid: int,
+        start_seconds: int = 1_700_000_000,
+        start_microseconds: int = 123_456,
+        process_state: bytes = b"S",
+        returned_size: int = 648,
+        real_uid: int | None = None,
+        effective_uid: int | None = None,
+    ) -> None:
+        value = runner.ctypes.cast(
+            buffer,
+            runner.ctypes.POINTER(runner._DarwinKinfoProcScope),
+        ).contents
+        value.identity.p_starttime.tv_sec = start_seconds
+        value.identity.p_starttime.tv_usec = start_microseconds
+        value.identity.p_stat = process_state
+        value.identity.p_pid = pid
+        value.real_uid = runner.os.getuid() if real_uid is None else real_uid
+        value.effective_uid = (
+            runner.os.getuid() if effective_uid is None else effective_uid
+        )
+        length = runner.ctypes.cast(
+            buffer_size,
+            runner.ctypes.POINTER(runner.ctypes.c_size_t),
+        )
+        length[0] = returned_size
+
+    @staticmethod
+    def _require_synthetic_kern_proc_pid_mib(
+        mib: object,
+        mib_length: object,
+        pid: int,
+    ) -> None:
+        if mib_length != 4:
+            raise AssertionError(f"unexpected KERN_PROC_PID MIB length: {mib_length}")
+        values = runner.ctypes.cast(
+            mib,
+            runner.ctypes.POINTER(runner.ctypes.c_int),
+        )
+        observed = tuple(values[index] for index in range(4))
+        expected = (
+            runner.DARWIN_CTL_KERN,
+            runner.DARWIN_KERN_PROC,
+            runner.DARWIN_KERN_PROC_PID,
+            pid,
+        )
+        if observed != expected:
+            raise AssertionError(f"unexpected KERN_PROC_PID MIB: {observed}")
+
     def test_darwin_process_census_rejects_zero_result_with_errno(self) -> None:
         class SyntheticProcListPids:
             argtypes: object = None
@@ -77,7 +164,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 runner.ctypes.set_errno(errno.EIO)
                 return 0
 
-        class SyntheticProcPidRusage:
+        class SyntheticSysctl:
             argtypes: object = None
             restype: object = None
 
@@ -87,7 +174,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         class SyntheticLibproc:
             def __init__(self) -> None:
                 self.proc_listpids = SyntheticProcListPids()
-                self.proc_pid_rusage = SyntheticProcPidRusage()
+                self.sysctl = SyntheticSysctl()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -105,8 +192,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
     def test_darwin_process_census_retries_and_rebinds_disappearing_pid(self) -> None:
         pid = 2_147_483_647
+        write_kinfo = self._write_synthetic_kinfo
+        require_mib = self._require_synthetic_kern_proc_pid_mib
 
-        class SyntheticProcListPids:
+        class SyntheticSysctl:
             argtypes: object = None
             restype: object = None
 
@@ -115,44 +204,47 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             def __call__(
                 self,
-                _process_type: object,
-                _uid: object,
+                mib: object,
+                mib_length: object,
                 buffer: object,
-                _buffer_bytes: object,
+                buffer_size: object,
+                _new_value: object,
+                _new_value_size: object,
             ) -> int:
                 self.calls += 1
-                pid_buffer = runner.ctypes.cast(
-                    buffer,
-                    runner.ctypes.POINTER(runner.ctypes.c_int),
-                )
-                pid_buffer[0] = pid
-                return runner.ctypes.sizeof(runner.ctypes.c_int)
-
-        class SyntheticProcPidRusage:
-            argtypes: object = None
-            restype: object = None
-
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def __call__(self, _pid: int, _flavor: object, buffer: object) -> int:
-                self.calls += 1
+                require_mib(mib, mib_length, pid)
                 if self.calls == 1:
                     runner.ctypes.set_errno(errno.ESRCH)
                     return -1
-                value = runner.ctypes.cast(
+                if self.calls == 2:
+                    length = runner.ctypes.cast(
+                        buffer_size,
+                        runner.ctypes.POINTER(runner.ctypes.c_size_t),
+                    )
+                    length[0] = 0
+                    return 0
+                if self.calls == 3:
+                    write_kinfo(
+                        buffer,
+                        buffer_size,
+                        pid=pid,
+                        real_uid=runner.os.getuid() + 1,
+                        effective_uid=runner.os.getuid() + 1,
+                    )
+                    return 0
+                write_kinfo(
                     buffer,
-                    runner.ctypes.POINTER(runner._DarwinRusageInfoV0),
-                ).contents
-                value.ri_proc_start_abstime = 987_654
+                    buffer_size,
+                    pid=pid,
+                    start_seconds=1_700_000_001,
+                    start_microseconds=987_654,
+                    real_uid=runner.os.getuid(),
+                    effective_uid=runner.os.getuid() + 1,
+                )
                 return 0
 
-        class SyntheticLibproc:
-            def __init__(self) -> None:
-                self.proc_listpids = SyntheticProcListPids()
-                self.proc_pid_rusage = SyntheticProcPidRusage()
-
-        library = SyntheticLibproc()
+        inspect_pid = SyntheticSysctl()
+        library = self._synthetic_darwin_process_library(pid, inspect_pid)
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
             mock.patch.object(
@@ -165,54 +257,47 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             observed,
-            (runner.DarwinProcessIdentity(pid=pid, start_abstime=987_654),),
+            (
+                runner.DarwinProcessIdentity(
+                    pid=pid,
+                    start_seconds=1_700_000_001,
+                    start_microseconds=987_654,
+                ),
+            ),
         )
-        self.assertEqual(library.proc_listpids.calls, 4)
-        self.assertEqual(library.proc_pid_rusage.calls, 2)
+        self.assertEqual(library.proc_listpids.calls, 8)
+        self.assertEqual(inspect_pid.calls, 4)
 
     def test_darwin_process_census_includes_zombie_identity(self) -> None:
         pid = 90_001
+        write_kinfo = self._write_synthetic_kinfo
+        require_mib = self._require_synthetic_kern_proc_pid_mib
 
-        class SyntheticProcListPids:
+        class SyntheticSysctl:
             argtypes: object = None
             restype: object = None
 
             def __call__(
                 self,
-                _process_type: object,
-                _uid: object,
+                mib: object,
+                mib_length: object,
                 buffer: object,
-                _buffer_bytes: object,
+                buffer_size: object,
+                _new_value: object,
+                _new_value_size: object,
             ) -> int:
-                pid_buffer = runner.ctypes.cast(
+                require_mib(mib, mib_length, pid)
+                write_kinfo(
                     buffer,
-                    runner.ctypes.POINTER(runner.ctypes.c_int),
+                    buffer_size,
+                    pid=pid,
+                    start_seconds=1_700_000_002,
+                    start_microseconds=123_456,
+                    process_state=b"Z",
+                    real_uid=502,
+                    effective_uid=501,
                 )
-                pid_buffer[0] = pid
-                return runner.ctypes.sizeof(runner.ctypes.c_int)
-
-        class SyntheticProcPidRusage:
-            argtypes: object = None
-            restype: object = None
-
-            def __call__(
-                self,
-                _observed_pid: int,
-                _flavor: object,
-                buffer: object,
-            ) -> int:
-                value = runner.ctypes.cast(
-                    buffer,
-                    runner.ctypes.POINTER(runner._DarwinRusageInfoV0),
-                ).contents
-                value.ri_proc_start_abstime = 123_456
-                value.ri_proc_exit_abstime = 123_999
                 return 0
-
-        class SyntheticLibproc:
-            def __init__(self) -> None:
-                self.proc_listpids = SyntheticProcListPids()
-                self.proc_pid_rusage = SyntheticProcPidRusage()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -220,7 +305,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             mock.patch.object(
                 runner.ctypes,
                 "CDLL",
-                return_value=SyntheticLibproc(),
+                return_value=self._synthetic_darwin_process_library(
+                    pid,
+                    SyntheticSysctl(),
+                ),
             ),
         ):
             observed = runner._darwin_same_uid_processes()
@@ -230,47 +318,130 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             (
                 runner.DarwinProcessIdentity(
                     pid=pid,
-                    start_abstime=123_456,
+                    start_seconds=1_700_000_002,
+                    start_microseconds=123_456,
                 ),
             ),
         )
 
+    def test_darwin_process_census_rejects_malformed_sysctl_identity(self) -> None:
+        pid = 90_002
+        write_kinfo = self._write_synthetic_kinfo
+        require_mib = self._require_synthetic_kern_proc_pid_mib
+        self.assertEqual(runner.ctypes.sizeof(runner._DarwinTimeval), 16)
+        self.assertEqual(runner._DarwinTimeval.tv_usec.offset, 8)
+        self.assertEqual(runner._DarwinKinfoProcPrefix.p_pid.offset, 40)
+        self.assertEqual(runner._DarwinKinfoProcScope.real_uid.offset, 392)
+        self.assertEqual(runner._DarwinKinfoProcScope.effective_uid.offset, 420)
+        malformed_cases = (
+            {"pid": pid + 1},
+            {
+                "pid": pid,
+                "returned_size": runner.DARWIN_KINFO_PROC_BYTES - 1,
+            },
+            {
+                "pid": pid,
+                "returned_size": runner.DARWIN_KINFO_PROC_BYTES + 1,
+            },
+            {"pid": pid, "returned_size": runner.DARWIN_KINFO_PROC_BYTES * 2},
+            {"pid": pid, "start_seconds": 0},
+            {"pid": pid, "start_microseconds": 1_000_000},
+        )
+
+        for malformed in malformed_cases:
+            with self.subTest(malformed=malformed):
+
+                class SyntheticSysctl:
+                    argtypes: object = None
+                    restype: object = None
+
+                    def __call__(
+                        self,
+                        mib: object,
+                        mib_length: object,
+                        buffer: object,
+                        buffer_size: object,
+                        _new_value: object,
+                        _new_value_size: object,
+                    ) -> int:
+                        require_mib(mib, mib_length, pid)
+                        write_kinfo(buffer, buffer_size, **malformed)
+                        return 0
+
+                with (
+                    mock.patch.object(runner.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        runner.ctypes,
+                        "CDLL",
+                        return_value=self._synthetic_darwin_process_library(
+                            pid,
+                            SyntheticSysctl(),
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "cannot bind same-UID Darwin process identity",
+                    ),
+                ):
+                    runner._darwin_same_uid_processes()
+
+    def test_darwin_process_census_fails_closed_on_sysctl_permission_error(
+        self,
+    ) -> None:
+        pid = 90_003
+
+        class SyntheticSysctl:
+            argtypes: object = None
+            restype: object = None
+
+            def __call__(self, *_args: object) -> int:
+                runner.ctypes.set_errno(errno.EPERM)
+                return -1
+
+        with (
+            mock.patch.object(runner.sys, "platform", "darwin"),
+            mock.patch.object(
+                runner.ctypes,
+                "CDLL",
+                return_value=self._synthetic_darwin_process_library(
+                    pid,
+                    SyntheticSysctl(),
+                ),
+            ),
+            self.assertRaisesRegex(
+                PermissionError,
+                "cannot bind same-UID Darwin process identity",
+            ),
+        ):
+            runner._darwin_same_uid_processes()
+
     def test_darwin_process_census_expires_during_pid_binding(self) -> None:
         clock = {"now": 0.0}
-        pid = 90_002
+        pid = 90_004
         inspected: list[int] = []
+        require_mib = self._require_synthetic_kern_proc_pid_mib
 
-        class SyntheticProcListPids:
+        class SyntheticSysctl:
             argtypes: object = None
             restype: object = None
 
             def __call__(
                 self,
-                _process_type: object,
-                _uid: object,
-                buffer: object,
-                _buffer_bytes: object,
+                mib: object,
+                _mib_length: object,
+                _buffer: object,
+                _buffer_size: object,
+                _new_value: object,
+                _new_value_size: object,
             ) -> int:
-                pid_buffer = runner.ctypes.cast(
-                    buffer,
+                require_mib(mib, _mib_length, pid)
+                mib_values = runner.ctypes.cast(
+                    mib,
                     runner.ctypes.POINTER(runner.ctypes.c_int),
                 )
-                pid_buffer[0] = pid
-                return runner.ctypes.sizeof(runner.ctypes.c_int)
-
-        class SyntheticProcPidRusage:
-            argtypes: object = None
-            restype: object = None
-
-            def __call__(self, observed_pid: int, *_args: object) -> int:
-                inspected.append(observed_pid)
+                inspected.append(mib_values[3])
                 clock["now"] = 2.0
                 return 0
-
-        class SyntheticLibproc:
-            def __init__(self) -> None:
-                self.proc_listpids = SyntheticProcListPids()
-                self.proc_pid_rusage = SyntheticProcPidRusage()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -278,7 +449,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             mock.patch.object(
                 runner.ctypes,
                 "CDLL",
-                return_value=SyntheticLibproc(),
+                return_value=self._synthetic_darwin_process_library(
+                    pid,
+                    SyntheticSysctl(),
+                ),
             ),
             mock.patch.object(
                 runner.time,
@@ -291,9 +465,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         self.assertEqual(inspected, [pid])
 
     def test_stable_process_baseline_unions_prelaunch_identity_churn(self) -> None:
-        existing = runner.DarwinProcessIdentity(pid=101, start_abstime=1_001)
-        departing = runner.DarwinProcessIdentity(pid=102, start_abstime=1_002)
-        arriving = runner.DarwinProcessIdentity(pid=102, start_abstime=2_002)
+        existing = runner.DarwinProcessIdentity(101, 1_700_000_001, 1_001)
+        departing = runner.DarwinProcessIdentity(102, 1_700_000_002, 1_002)
+        arriving = runner.DarwinProcessIdentity(102, 1_700_000_003, 2_002)
         with (
             mock.patch.object(
                 runner,
@@ -1404,7 +1578,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             process_baseline = (
                 runner.DarwinProcessIdentity(
                     pid=os.getpid(),
-                    start_abstime=1,
+                    start_seconds=1_700_000_000,
+                    start_microseconds=1,
                 ),
             )
             stdout = io.StringIO()
