@@ -1794,7 +1794,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 643", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 644", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1945,6 +1945,8 @@ class RepositoryContractTest(unittest.TestCase):
           python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
         working-directory: {skill_root}/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{{{ runner.temp }}}}
         run: |
           python3 -m tests.run_required_deterministic_supervisor
 """,
@@ -1982,7 +1984,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo /usr/bin/mktemp -d "
                     "/Users/codex-review-readonly.XXXXXX",
                     "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
-                    "/usr/bin/sudo -u nobody /usr/bin/ditto",
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"',
                     "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
                     "CODEX_REVIEW_TEST_RUNTIME_PARENT=",
                     "LOGNAME=nobody",
@@ -2190,18 +2193,55 @@ class RepositoryContractTest(unittest.TestCase):
             end = workflow.index(f"\n  {next_job}:", start)
             readonly_job = workflow[start:end]
             with self.subTest(profile=profile):
+                trusted_python_probe_index = readonly_job.index(
+                    'if ! /usr/bin/sudo -u nobody /bin/test -x "$trusted_python"; then'
+                )
+                source_root_path_index = readonly_job.index(
+                    'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"'
+                )
+                source_root_binding_index = readonly_job.index(
+                    'source_root_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%p:%u:%g\' "$source_review_root")"'
+                )
                 source_profile_path_index = readonly_job.index(
-                    'source_review_profile="$checkout_root/$REVIEW_SOURCE_RELATIVE/'
-                    'tests/readonly_child_isolation.sb"'
+                    'source_review_profile="$source_review_root/tests/'
+                    'readonly_child_isolation.sb"'
                 )
                 source_copy_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /usr/bin/ditto"
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"'
+                )
+                source_postcopy_symlink_index = readonly_job.index(
+                    'source_tree_postcopy_symlink="$(/usr/bin/find '
+                    '"$source_review_root" -type l -print -quit)"'
+                )
+                isolated_postcopy_symlink_index = readonly_job.index(
+                    'isolated_tree_postcopy_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"'
+                )
+                source_custody_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"'
+                )
+                source_readonly_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"'
+                )
+                isolated_source_binding_index = readonly_job.index(
+                    'isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"'
+                )
+                isolated_root_traversal_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                )
+                nobody_source_probe_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/'
+                    'run_readonly_install_deterministic_supervisor.py"'
                 )
                 isolated_profile_path_index = readonly_job.index(
                     'review_profile="$isolated_root/readonly_child_isolation.sb"'
                 )
                 profile_copy_index = readonly_job.index(
-                    '/usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"'
+                    '/usr/bin/sudo /bin/cp "$isolated_source_profile" "$review_profile"'
                 )
                 profile_binding_index = readonly_job.index(
                     'profile_binding="$(/usr/bin/sudo /usr/bin/stat '
@@ -2227,8 +2267,24 @@ class RepositoryContractTest(unittest.TestCase):
                     'profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat'
                 )
 
+                self.assertLess(trusted_python_probe_index, source_root_path_index)
+                self.assertLess(source_root_path_index, source_root_binding_index)
+                self.assertLess(source_root_binding_index, source_profile_path_index)
                 self.assertLess(source_profile_path_index, source_copy_index)
-                self.assertLess(source_copy_index, isolated_profile_path_index)
+                self.assertLess(source_copy_index, source_postcopy_symlink_index)
+                self.assertLess(
+                    source_postcopy_symlink_index, isolated_postcopy_symlink_index
+                )
+                self.assertLess(isolated_postcopy_symlink_index, source_custody_index)
+                self.assertLess(source_custody_index, source_readonly_index)
+                self.assertLess(source_readonly_index, isolated_source_binding_index)
+                self.assertLess(
+                    isolated_source_binding_index, isolated_root_traversal_index
+                )
+                self.assertLess(
+                    isolated_root_traversal_index, nobody_source_probe_index
+                )
+                self.assertLess(nobody_source_probe_index, isolated_profile_path_index)
                 self.assertLess(isolated_profile_path_index, profile_copy_index)
                 self.assertLess(profile_copy_index, profile_binding_index)
                 self.assertLess(profile_binding_index, immutable_index)
@@ -2245,7 +2301,89 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo -u nobody /usr/bin/env -i",
                     readonly_job,
                 )
+                self.assertNotIn(
+                    "/usr/bin/sudo -u nobody /usr/bin/ditto",
+                    readonly_job,
+                )
+                self.assertNotIn(
+                    '/usr/bin/ditto "$REVIEW_SOURCE_RELATIVE"',
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    1,
+                )
+                self.assertNotIn(
+                    "/usr/bin/sudo /usr/sbin/chown -R nobody:nobody",
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count("'%d:%i:%p:%u:%g' \"$source_review_root\")"),
+                    4,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        "/usr/bin/sudo /usr/bin/diff -qr "
+                        '"$source_review_root" "$isolated_source" >/dev/null'
+                    ),
+                    3,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '$(/usr/bin/find "$source_review_root" -type l -print -quit)'
+                    ),
+                    2,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '$(/usr/bin/sudo /usr/bin/find "$isolated_source" '
+                        "-type l -print -quit)"
+                    ),
+                    3,
+                )
                 for binding in (
+                    'if ! /usr/bin/sudo -u nobody /bin/test -x "$trusted_python"; then',
+                    "Trusted Python is not executable by nobody; retained at "
+                    "$isolated_root",
+                    'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"',
+                    'source_review_root_physical="$(cd "$source_review_root" '
+                    '&& pwd -P)"',
+                    '[[ "$source_review_root_physical" != "$source_review_root" ]]',
+                    '/bin/test -d "$source_review_root"',
+                    '/bin/test -L "$source_review_root"',
+                    "# Bind source object identity/access policy separately "
+                    "from copied content.",
+                    'source_root_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%p:%u:%g\' "$source_review_root")"',
+                    'source_tree_symlink="$(/usr/bin/find "$source_review_root" '
+                    '-type l -print -quit)"',
+                    'isolated_source="$isolated_root/source"',
+                    '/usr/bin/sudo /bin/test ! -e "$isolated_source"',
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"',
+                    'source_tree_postcopy_symlink="$(/usr/bin/find '
+                    '"$source_review_root" -type l -print -quit)"',
+                    'isolated_tree_postcopy_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$source_tree_postcopy_symlink" ]]',
+                    '[[ -n "$isolated_tree_postcopy_symlink" ]]',
+                    '[[ "$source_root_postcopy_binding" != "$source_root_binding" ]]',
+                    '[[ "$source_review_root_postcopy_physical" '
+                    '!= "$source_review_root" ]]',
+                    '/usr/bin/sudo /usr/bin/diff -qr "$source_review_root" '
+                    '"$isolated_source" >/dev/null',
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod -RN "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"',
+                    'isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
+                    '"$isolated_source")" = "0:0:555"',
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/'
+                    'run_readonly_install_deterministic_supervisor.py"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
+                    'sh "$isolated_source" "$trusted_python"',
                     '/bin/test -f "$source_review_profile"',
                     '/bin/test ! -L "$source_review_profile"',
                     'source_profile_binding="$(/usr/bin/stat -f '
@@ -2253,12 +2391,17 @@ class RepositoryContractTest(unittest.TestCase):
                     'review_profile="$isolated_root/readonly_child_isolation.sb"',
                     '/usr/bin/sudo /bin/test ! -e "$review_profile"',
                     '/usr/bin/sudo /bin/test ! -L "$review_profile"',
-                    '/usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"',
+                    'isolated_source_profile="$isolated_source/tests/'
+                    'readonly_child_isolation.sb"',
+                    '/usr/bin/sudo /bin/cp "$isolated_source_profile" '
+                    '"$review_profile"',
                     '/usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"',
                     '/usr/bin/sudo /bin/chmod -N "$review_profile"',
                     '/usr/bin/sudo /bin/chmod 0444 "$review_profile"',
                     '/usr/bin/sudo /bin/test -f "$review_profile"',
                     '/usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" '
+                    '"$review_profile"',
+                    '/usr/bin/sudo /usr/bin/cmp -s "$isolated_source_profile" '
                     '"$review_profile"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
                     '"$review_profile")" = "0:0:444"',
@@ -2271,6 +2414,18 @@ class RepositoryContractTest(unittest.TestCase):
                     '!= "$source_profile_binding" ]]',
                     '[[ "$source_profile_postrun_binding" '
                     '!= "$source_profile_binding" ]]',
+                    '[[ "$source_root_prelaunch_binding" != "$source_root_binding" ]]',
+                    '[[ "$source_root_postrun_binding" != "$source_root_binding" ]]',
+                    '[[ "$isolated_source_prelaunch_binding" '
+                    '!= "$isolated_source_binding" ]]',
+                    '[[ "$isolated_source_postrun_binding" '
+                    '!= "$isolated_source_binding" ]]',
+                    'isolated_tree_prelaunch_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$isolated_tree_prelaunch_symlink" ]]',
+                    'isolated_tree_postrun_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$isolated_tree_postrun_symlink" ]]',
                     '[[ "$profile_prelaunch_binding" != "$profile_binding" ]]',
                     '[[ "$profile_postrun_binding" != "$profile_binding" ]]',
                 ):
@@ -2300,7 +2455,6 @@ class RepositoryContractTest(unittest.TestCase):
                     "probe_nobody_executable",
                     "access_probe_stderr",
                     "profile_literal",
-                    "/usr/bin/sudo /usr/bin/find",
                 ):
                     self.assertNotIn(removed_inventory_contract, readonly_job)
 

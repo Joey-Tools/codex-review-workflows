@@ -77,7 +77,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 runner.ctypes.set_errno(errno.EIO)
                 return 0
 
-        class SyntheticProcPidInfo:
+        class SyntheticProcPidRusage:
             argtypes: object = None
             restype: object = None
 
@@ -87,7 +87,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         class SyntheticLibproc:
             def __init__(self) -> None:
                 self.proc_listpids = SyntheticProcListPids()
-                self.proc_pidinfo = SyntheticProcPidInfo()
+                self.proc_pid_rusage = SyntheticProcPidRusage()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -103,12 +103,15 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         ):
             runner._darwin_same_uid_processes()
 
-    def test_darwin_process_census_rejects_disappearing_pid(self) -> None:
+    def test_darwin_process_census_retries_and_rebinds_disappearing_pid(self) -> None:
         pid = 2_147_483_647
 
         class SyntheticProcListPids:
             argtypes: object = None
             restype: object = None
+
+            def __init__(self) -> None:
+                self.calls = 0
 
             def __call__(
                 self,
@@ -117,6 +120,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 buffer: object,
                 _buffer_bytes: object,
             ) -> int:
+                self.calls += 1
                 pid_buffer = runner.ctypes.cast(
                     buffer,
                     runner.ctypes.POINTER(runner.ctypes.c_int),
@@ -124,32 +128,47 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 pid_buffer[0] = pid
                 return runner.ctypes.sizeof(runner.ctypes.c_int)
 
-        class SyntheticProcPidInfo:
+        class SyntheticProcPidRusage:
             argtypes: object = None
             restype: object = None
 
-            def __call__(self, *_args: object) -> int:
-                runner.ctypes.set_errno(errno.ESRCH)
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, _pid: int, _flavor: object, buffer: object) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    runner.ctypes.set_errno(errno.ESRCH)
+                    return -1
+                value = runner.ctypes.cast(
+                    buffer,
+                    runner.ctypes.POINTER(runner._DarwinRusageInfoV0),
+                ).contents
+                value.ri_proc_start_abstime = 987_654
                 return 0
 
         class SyntheticLibproc:
             def __init__(self) -> None:
                 self.proc_listpids = SyntheticProcListPids()
-                self.proc_pidinfo = SyntheticProcPidInfo()
+                self.proc_pid_rusage = SyntheticProcPidRusage()
 
+        library = SyntheticLibproc()
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
             mock.patch.object(
                 runner.ctypes,
                 "CDLL",
-                return_value=SyntheticLibproc(),
-            ),
-            self.assertRaisesRegex(
-                OSError,
-                f"cannot bind same-UID Darwin process identity: {pid}",
+                return_value=library,
             ),
         ):
-            runner._darwin_same_uid_processes()
+            observed = runner._darwin_same_uid_processes()
+
+        self.assertEqual(
+            observed,
+            (runner.DarwinProcessIdentity(pid=pid, start_abstime=987_654),),
+        )
+        self.assertEqual(library.proc_listpids.calls, 4)
+        self.assertEqual(library.proc_pid_rusage.calls, 2)
 
     def test_darwin_process_census_includes_zombie_identity(self) -> None:
         pid = 90_001
@@ -172,34 +191,28 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 pid_buffer[0] = pid
                 return runner.ctypes.sizeof(runner.ctypes.c_int)
 
-        class SyntheticProcPidInfo:
+        class SyntheticProcPidRusage:
             argtypes: object = None
             restype: object = None
 
             def __call__(
                 self,
-                observed_pid: int,
+                _observed_pid: int,
                 _flavor: object,
-                _arg: object,
                 buffer: object,
-                _buffer_bytes: object,
             ) -> int:
                 value = runner.ctypes.cast(
                     buffer,
-                    runner.ctypes.POINTER(runner._DarwinProcBsdInfo),
+                    runner.ctypes.POINTER(runner._DarwinRusageInfoV0),
                 ).contents
-                value.pbi_pid = observed_pid
-                value.pbi_uid = 501
-                value.pbi_ruid = 501
-                value.pbi_status = 5
-                value.pbi_start_tvsec = 123
-                value.pbi_start_tvusec = 456
-                return runner.ctypes.sizeof(runner._DarwinProcBsdInfo)
+                value.ri_proc_start_abstime = 123_456
+                value.ri_proc_exit_abstime = 123_999
+                return 0
 
         class SyntheticLibproc:
             def __init__(self) -> None:
                 self.proc_listpids = SyntheticProcListPids()
-                self.proc_pidinfo = SyntheticProcPidInfo()
+                self.proc_pid_rusage = SyntheticProcPidRusage()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -217,8 +230,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             (
                 runner.DarwinProcessIdentity(
                     pid=pid,
-                    start_seconds=123,
-                    start_microseconds=456,
+                    start_abstime=123_456,
                 ),
             ),
         )
@@ -246,19 +258,19 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 pid_buffer[0] = pid
                 return runner.ctypes.sizeof(runner.ctypes.c_int)
 
-        class SyntheticProcPidInfo:
+        class SyntheticProcPidRusage:
             argtypes: object = None
             restype: object = None
 
             def __call__(self, observed_pid: int, *_args: object) -> int:
                 inspected.append(observed_pid)
                 clock["now"] = 2.0
-                return runner.ctypes.sizeof(runner._DarwinProcBsdInfo)
+                return 0
 
         class SyntheticLibproc:
             def __init__(self) -> None:
                 self.proc_listpids = SyntheticProcListPids()
-                self.proc_pidinfo = SyntheticProcPidInfo()
+                self.proc_pid_rusage = SyntheticProcPidRusage()
 
         with (
             mock.patch.object(runner.sys, "platform", "darwin"),
@@ -277,6 +289,24 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         ):
             runner._darwin_same_uid_processes(deadline=1.0)
         self.assertEqual(inspected, [pid])
+
+    def test_stable_process_baseline_unions_prelaunch_identity_churn(self) -> None:
+        existing = runner.DarwinProcessIdentity(pid=101, start_abstime=1_001)
+        departing = runner.DarwinProcessIdentity(pid=102, start_abstime=1_002)
+        arriving = runner.DarwinProcessIdentity(pid=102, start_abstime=2_002)
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=((existing, departing), (existing, arriving)),
+            ),
+            mock.patch.object(runner.time, "sleep"),
+        ):
+            baseline = runner._stable_same_uid_processes(
+                deadline=runner.time.monotonic() + 1.0
+            )
+
+        self.assertEqual(baseline, (existing, departing, arriving))
 
     def test_isolated_child_account_rejects_admin_membership(self) -> None:
         with (
@@ -1374,8 +1404,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             process_baseline = (
                 runner.DarwinProcessIdentity(
                     pid=os.getpid(),
-                    start_seconds=1,
-                    start_microseconds=0,
+                    start_abstime=1,
                 ),
             )
             stdout = io.StringIO()

@@ -204,17 +204,19 @@ superseded_by:
   Seatbelt denial. The exact broker regression passed 1/1 outside the parent
   sandbox in 2.314 seconds, and the production-equivalent live no-child suite
   passed 9/9 in 7.585 seconds.
-- The final process-census and descriptor-custody regressions pass 36/36 on the
+- The final process-census and descriptor-custody regressions pass 38/38 on the
   uv-managed CPython 3.13 runtime. Coverage includes a `setsid()` double-fork
   escape with standard descriptors closed, zombie handoff visibility, bounded
-  `libproc` enumeration, inherited Seatbelt enforcement, install/runtime
-  pathname replacement, access-policy-only drift, and a quarantine-rename race
-  that preserves machine-visible recovery identities for both objects.
-- The final deterministic independent-supervisor gate passed 643/643 in
-  92.684 seconds on the host-level uv-managed CPython 3.13.13 runtime, with
+  `libproc` enumeration with `proc_pid_rusage` start-abstime identity and safe
+  prelaunch churn union, inherited Seatbelt enforcement, install/runtime pathname
+  replacement, access-policy-only drift, and a quarantine-rename race that
+  preserves machine-visible recovery identities for both objects.
+- The final deterministic independent-supervisor gate passed 644/644 in
+  92.541 seconds on the host-level uv-managed CPython 3.13.13 runtime, with
   selected-identity SHA-256
-  `f3636c9637c6d7f7d353748570f0fb74608f242617c2fc4b80aa3b8bc7678846`.
-  The selected suite includes the unresolved-retention regression.
+  `612677903695910280385505004f6a9339f6f1290bdfd8579e75000a8f64bfba`.
+  The selected suite includes the unresolved-retention and safe prelaunch
+  same-UID churn regressions.
   All 104 repository contract tests passed under the same uv-managed runtime.
   The enclosing parent sandbox makes Apple Git emit a `confstr()` temporary-root
   diagnostic that the strict raw-Git tests correctly reject; the four affected

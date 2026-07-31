@@ -109,6 +109,8 @@ jobs:
           python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{ runner.temp }}
         run: |
           python3 -m tests.run_required_deterministic_supervisor
       - name: Verify installed release tree remains immutable
@@ -149,28 +151,81 @@ jobs:
           /usr/bin/sudo /bin/test ! -L "$isolated_root"
           isolated_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" = "0"
+          if ! /usr/bin/sudo -u nobody /bin/test -x "$trusted_python"; then
+            echo "::error::Trusted Python is not executable by nobody; retained at $isolated_root"
+            exit 1
+          fi
           checkout_root="$(pwd -P)"
-          source_review_profile="$checkout_root/$REVIEW_SOURCE_RELATIVE/tests/readonly_child_isolation.sb"
+          source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"
+          source_review_root_physical="$(cd "$source_review_root" && pwd -P)"
+          if [[ "$source_review_root_physical" != "$source_review_root" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root"; then
+            echo "::error::Checkout review source is not the expected physical directory; retained at $isolated_root"
+            exit 1
+          fi
+          # Bind source object identity/access policy separately from copied content.
+          source_root_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_tree_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)"
+          if [[ -n "$source_tree_symlink" ]]; then
+            echo "::error::Checkout review source contains a symlink; retained at $isolated_root"
+            exit 1
+          fi
+          source_review_profile="$source_review_root/tests/readonly_child_isolation.sb"
           /bin/test -f "$source_review_profile"
           /bin/test ! -L "$source_review_profile"
           source_profile_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          isolated_source="$isolated_root/source"
+          /usr/bin/sudo /bin/test ! -e "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          /usr/bin/sudo /usr/bin/ditto "$source_review_root" "$isolated_source"
+          /usr/bin/sudo /bin/test -d "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          source_tree_postcopy_symlink=""
+          source_tree_postcopy_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)" \
+            || source_tree_postcopy_symlink="<unreadable>"
+          isolated_tree_postcopy_symlink=""
+          isolated_tree_postcopy_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postcopy_symlink="<unreadable>"
+          source_root_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_review_root_postcopy_physical=""
+          source_review_root_postcopy_physical="$(cd "$source_review_root" && pwd -P)" \
+            || source_review_root_postcopy_physical="<unreadable>"
+          if [[ "$source_root_postcopy_binding" != "$source_root_binding" ]] \
+            || [[ "$source_review_root_postcopy_physical" != "$source_review_root" ]] \
+            || [[ -n "$source_tree_postcopy_symlink" ]] \
+            || [[ -n "$isolated_tree_postcopy_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null; then
+            echo "::error::Checkout review source changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"
+          /usr/bin/sudo /bin/chmod -RN "$isolated_source"
+          /usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"
+          isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
           /usr/bin/sudo /bin/chmod 0711 "$isolated_root"
           /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
           /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
           /usr/bin/sudo -u nobody /bin/test ! -w /Users
           /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"
-          /usr/bin/sudo -u nobody /usr/bin/ditto "$REVIEW_SOURCE_RELATIVE" "$isolated_root/payload/source"
+          /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"
           /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
+          isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
           review_profile="$isolated_root/readonly_child_isolation.sb"
           /usr/bin/sudo /bin/test ! -e "$review_profile"
           /usr/bin/sudo /bin/test ! -L "$review_profile"
-          /usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"
+          /usr/bin/sudo /bin/cp "$isolated_source_profile" "$review_profile"
           /usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"
           /usr/bin/sudo /bin/chmod -N "$review_profile"
           /usr/bin/sudo /bin/chmod 0444 "$review_profile"
           /usr/bin/sudo /bin/test -f "$review_profile"
           /usr/bin/sudo /bin/test ! -L "$review_profile"
           /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$isolated_source_profile" "$review_profile"
           profile_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$review_profile")" = "0:0:444"
           /bin/test ! -w "$review_profile"
@@ -208,10 +263,29 @@ jobs:
           source_profile_prelaunch_binding=""
           source_profile_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
             || source_profile_prelaunch_binding="<unreadable>"
+          source_root_prelaunch_binding=""
+          source_root_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_prelaunch_binding="<unreadable>"
+          isolated_source_prelaunch_binding=""
+          isolated_source_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_prelaunch_binding="<unreadable>"
+          isolated_tree_prelaunch_symlink=""
+          isolated_tree_prelaunch_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_prelaunch_symlink="<unreadable>"
           profile_prelaunch_binding=""
           profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
             || profile_prelaunch_binding="<unreadable>"
           if [[ "$source_profile_prelaunch_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_prelaunch_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_prelaunch_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_prelaunch_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
             || /bin/test -L "$source_review_profile" \
             || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
@@ -234,15 +308,34 @@ jobs:
             PATH=/usr/bin:/bin \
             USER=nobody \
             /bin/sh -c 'cd "$1" && exec "$2" -B -m tests.run_readonly_install_deterministic_supervisor' \
-            sh "$isolated_root/payload/source" "$trusted_python" \
+            sh "$isolated_source" "$trusted_python" \
             | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
           source_profile_postrun_binding=""
           source_profile_postrun_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
             || source_profile_postrun_binding="<unreadable>"
+          source_root_postrun_binding=""
+          source_root_postrun_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_postrun_binding="<unreadable>"
+          isolated_source_postrun_binding=""
+          isolated_source_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_postrun_binding="<unreadable>"
+          isolated_tree_postrun_symlink=""
+          isolated_tree_postrun_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postrun_symlink="<unreadable>"
           profile_postrun_binding=""
           profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
             || profile_postrun_binding="<unreadable>"
           if [[ "$source_profile_postrun_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_postrun_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_postrun_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_postrun_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
             || /bin/test -L "$source_review_profile" \
             || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
