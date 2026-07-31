@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import unittest
+from collections.abc import Iterator
 from unittest import mock
 
 from . import support
@@ -586,6 +587,43 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             process_closure=closure,
         )
 
+    @contextlib.contextmanager
+    def _bound_no_child_roots(
+        self,
+        prefix: str,
+    ) -> Iterator[
+        tuple[
+            pathlib.Path,
+            support._DirectoryParentBinding,
+            support._DirectoryParentBinding,
+        ]
+    ]:
+        with owned_temporary_directory(prefix) as root:
+            install_container = root / "install"
+            install_container.mkdir(mode=0o700)
+            installed_root = install_container / "independent_codex_pr_review"
+            installed_root.mkdir(mode=0o700)
+            runtime_parent = root / "runtime"
+            runtime_parent.mkdir(mode=0o700)
+            install_binding = support._open_directory_parent(
+                install_container,
+                require_owned_private_parent=True,
+            )
+            runtime_binding = support._open_directory_parent(
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                with mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ):
+                    yield installed_root, install_binding, runtime_binding
+            finally:
+                runtime_binding.close()
+                install_binding.close()
+
     def test_no_child_runtime_profile_selection_is_exact_and_fail_closed(
         self,
     ) -> None:
@@ -643,7 +681,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
     def test_no_child_suite_stops_after_signal_during_profile_preparation(
         self,
     ) -> None:
-        with owned_temporary_directory("readonly-no-child-preflight-signal-") as root:
+        with self._bound_no_child_roots("readonly-no-child-preflight-signal-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             fence = runner.LifecycleSignalFence(
                 signals=(),
@@ -675,8 +714,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertRaises(runner.ChildRunInterrupted) as caught,
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -694,7 +734,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             run_bounded_command.assert_not_called()
 
     def test_no_child_suite_accepts_authenticated_tree_closure(self) -> None:
-        with owned_temporary_directory("readonly-no-child-accepted-") as root:
+        with self._bound_no_child_roots("readonly-no-child-accepted-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             with (
                 mock.patch.object(
@@ -716,8 +757,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ) as run_bounded_command,
             ):
                 result = runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -728,7 +770,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(proof.launch_attempted)
             self.assertEqual(proof.runtime_profile, "synthetic-runtime")
             prepare_profile.assert_called_once_with(
+                additional_seatbelt_rules="(deny file-write*)",
                 runtime_pin=mock.sentinel.runtime_pin,
+                writable_roots=(mock.sentinel.writable_runtime,),
             )
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "selected tests passed\n")
@@ -738,7 +782,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertIn("tempfile.tempdir=sys.argv[2]", argv[3])
 
     def test_no_child_suite_rejects_process_group_only_closure(self) -> None:
-        with owned_temporary_directory("readonly-no-child-forged-") as root:
+        with self._bound_no_child_roots("readonly-no-child-forged-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             with (
                 mock.patch.object(
@@ -757,8 +802,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -768,7 +814,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertFalse(proof.proven)
 
     def test_no_child_suite_output_overflow_keeps_closure_proof(self) -> None:
-        with owned_temporary_directory("readonly-no-child-overflow-") as root:
+        with self._bound_no_child_roots("readonly-no-child-overflow-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             with (
                 mock.patch.object(
@@ -784,8 +831,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertRaisesRegex(OverflowError, "byte cap"),
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -795,7 +843,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(proof.proven)
 
     def test_no_child_suite_timeout_uses_attached_settlement_proof(self) -> None:
-        with owned_temporary_directory("readonly-no-child-timeout-") as root:
+        with self._bound_no_child_roots("readonly-no-child-timeout-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             timeout = TimeoutError("synthetic bounded timeout")
             closure = self._no_child_result(stdio_closed=False).process_closure
@@ -823,8 +872,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertRaisesRegex(TimeoutError, "bounded timeout"),
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -838,7 +888,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
     def test_no_child_suite_output_exception_uses_attached_settlement_proof(
         self,
     ) -> None:
-        with owned_temporary_directory("readonly-no-child-output-error-") as root:
+        with self._bound_no_child_roots("readonly-no-child-output-error-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
             output_error = ValueError("command output exceeds 2048 bytes")
             closure = self._no_child_result(stdio_closed=False).process_closure
@@ -866,8 +917,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertRaisesRegex(OverflowError, "byte cap"),
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -881,7 +933,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
     def test_no_child_suite_does_not_claim_closure_before_process_supervision(
         self,
     ) -> None:
-        with owned_temporary_directory("readonly-no-child-pre-supervision-") as root:
+        with self._bound_no_child_roots("readonly-no-child-pre-supervision-") as roots:
+            installed_root, install_binding, runtime_binding = roots
             signal_guard = runner.ChildSignalGuard(
                 signals=(),
                 previous_handlers=(),
@@ -913,8 +966,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertRaisesRegex(TimeoutError, "activation failure"),
             ):
                 runner._run_no_child_test_suite(
-                    installed_root=root,
-                    runtime_parent=root,
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
                     timeout=5,
                     stdout_limit=1024,
                     stderr_limit=1024,
@@ -923,6 +977,143 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             self.assertFalse(closure_proof.proven)
             run_bounded_command.assert_not_called()
+
+    def test_no_child_suite_defers_signal_until_caller_proof_is_published(
+        self,
+    ) -> None:
+        with self._bound_no_child_roots(
+            "readonly-no-child-post-return-signal-"
+        ) as roots:
+            installed_root, install_binding, runtime_binding = roots
+            proof = runner.ChildProcessClosureProof()
+            interrupt = runner.DeferredSignalInterrupt(runner.ChildRunInterrupted)
+            signal_guard = runner.ChildSignalGuard(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                interrupt=interrupt,
+            )
+            self_outer = self
+
+            class CompletedAfterSignal:
+                returncode = 0
+                stdout = b""
+                stderr = b""
+
+                @property
+                def process_closure(self) -> mock.Mock:
+                    interrupt.request(signal.SIGTERM)
+                    self_outer.assertFalse(proof.proven)
+                    return ReadOnlyInstallRunnerTests._no_child_result().process_closure
+
+            def completed_after_signal(
+                *_args: object,
+                **_kwargs: object,
+            ) -> CompletedAfterSignal:
+                return CompletedAfterSignal()
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_install_child_signal_guard",
+                    return_value=signal_guard,
+                ),
+                mock.patch.object(runner, "_restore_child_signal_guard"),
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    side_effect=completed_after_signal,
+                ),
+                self.assertRaises(runner.ChildRunInterrupted) as caught,
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+            self.assertTrue(proof.launch_attempted)
+            self.assertTrue(proof.proven)
+
+    def test_no_child_suite_retains_unproven_failure_over_pending_signal(
+        self,
+    ) -> None:
+        with self._bound_no_child_roots("readonly-no-child-unproven-signal-") as roots:
+            installed_root, install_binding, runtime_binding = roots
+            proof = runner.ChildProcessClosureProof()
+            interrupt = runner.DeferredSignalInterrupt(runner.ChildRunInterrupted)
+            signal_guard = runner.ChildSignalGuard(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                interrupt=interrupt,
+            )
+            closure_error = RuntimeError("synthetic unproven closure")
+
+            def fail_after_signal(
+                *_args: object,
+                **_kwargs: object,
+            ) -> None:
+                interrupt.request(signal.SIGTERM)
+                raise closure_error
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_install_child_signal_guard",
+                    return_value=signal_guard,
+                ),
+                mock.patch.object(runner, "_restore_child_signal_guard"),
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    side_effect=fail_after_signal,
+                ),
+                mock.patch.object(
+                    runner,
+                    "bounded_command_process_closure",
+                    return_value=None,
+                ),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertIs(caught.exception, closure_error)
+            self.assertTrue(proof.launch_attempted)
+            self.assertFalse(proof.proven)
 
     def test_main_preserves_closure_failure_across_signal_teardown(
         self,
@@ -1010,6 +1201,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
                     return_value=mock.sentinel.prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
                 ),
                 mock.patch.object(
                     runner,

@@ -25,12 +25,15 @@ from review_supervisor.codex_executable import (
     run_bounded_command,
 )
 from review_supervisor.no_child_profile import (
+    attest_writable_root,
     prepare_sandboxed_python_no_child_profile,
 )
 from review_supervisor.secureio import open_absolute_directory_chain
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
 from .support import (
@@ -52,13 +55,43 @@ CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
 NO_CHILD_SUITE_CODE = (
-    "import os,runpy,sys,tempfile\n"
-    "root=sys.argv[1]\n"
+    "import errno,os,pathlib,runpy,sys,tempfile\n"
+    "root=pathlib.Path(sys.argv[1])\n"
+    "runtime=pathlib.Path(sys.argv[2])\n"
     f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
     "os.environ['TMPDIR']=sys.argv[2]\n"
     "tempfile.tempdir=sys.argv[2]\n"
+    "def require_denied(action,label):\n"
+    " try:\n"
+    "  result=action()\n"
+    " except OSError as error:\n"
+    "  if error.errno in {errno.EACCES,errno.EPERM}:\n"
+    "   return\n"
+    "  raise\n"
+    " if isinstance(result,int):\n"
+    "  os.close(result)\n"
+    " raise RuntimeError(f'read-only install policy allowed {label}')\n"
+    "probe=root/'tests'/'__init__.py'\n"
+    "require_denied(lambda:os.chmod(root,0o700),'root chmod')\n"
+    "require_denied(lambda:os.chmod(probe,0o600),'file chmod')\n"
+    "require_denied(lambda:os.open(probe,os.O_WRONLY),'file write-open')\n"
+    "parent_probe=root.parent/'seatbelt-parent-write-probe'\n"
+    "require_denied(lambda:os.open(parent_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,"
+    "0o600),'install-parent create')\n"
+    "runtime_probe=runtime/'seatbelt-write-probe'\n"
+    "try:\n"
+    " fd=os.open(runtime_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
+    " try:\n"
+    "  os.write(fd,b'allowed runtime write\\n')\n"
+    " finally:\n"
+    "  os.close(fd)\n"
+    "finally:\n"
+    " try:\n"
+    "  os.unlink(runtime_probe)\n"
+    " except FileNotFoundError:\n"
+    "  pass\n"
     "os.chdir(root)\n"
-    "sys.path.insert(0,root)\n"
+    "sys.path.insert(0,str(root))\n"
     "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
 )
 ACL_LISTING_ENVIRONMENT = {
@@ -419,7 +452,8 @@ def _bound_child_signals(
 def _run_no_child_test_suite(
     *,
     installed_root: pathlib.Path,
-    runtime_parent: pathlib.Path,
+    install_container_binding: _DirectoryParentBinding,
+    runtime_parent_binding: _DirectoryParentBinding,
     timeout: float = CHILD_TIMEOUT_SECONDS,
     stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
@@ -429,6 +463,26 @@ def _run_no_child_test_suite(
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    runtime_parent = runtime_parent_binding.path
+    if installed_root.parent != install_container_binding.path:
+        raise RuntimeError(
+            "read-only installed root is outside its bound install container"
+        )
+    install_container_binding.revalidate()
+    runtime_parent_binding.revalidate()
+    if _binding_node_key(install_container_binding) == _binding_node_key(
+        runtime_parent_binding
+    ):
+        raise RuntimeError("runtime root aliases the read-only install container")
+    install_container = str(install_container_binding.path)
+    runtime_root = str(runtime_parent)
+    common = os.path.commonpath((install_container, runtime_root))
+    if common in {install_container, runtime_root}:
+        raise RuntimeError("runtime root overlaps the read-only install container")
+    writable_runtime = attest_writable_root(
+        runtime_parent,
+        directory_fd=runtime_parent_binding.fd,
+    )
     argv = (
         sys.executable,
         "-B",
@@ -443,42 +497,56 @@ def _run_no_child_test_suite(
         runtime_profile, runtime_pin = _select_no_child_runtime_profile()
         proof.runtime_profile = runtime_profile
         prepared = prepare_sandboxed_python_no_child_profile(
+            additional_seatbelt_rules="(deny file-write*)",
             runtime_pin=runtime_pin,
+            writable_roots=(writable_runtime,),
         )
         if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
             raise ChildRunInterrupted(lifecycle_fence.received_signal)
-        proof.launch_attempted = True
+        install_container_binding.revalidate()
+        runtime_parent_binding.revalidate()
+        proof_scope = begin_bound_signal_deferral()
         try:
-            result = run_bounded_command(
-                argv,
-                timeout_seconds=timeout,
-                max_output_bytes=stdout_limit + stderr_limit,
-                _prepared_no_child_profile=prepared,
-            )
-        except BaseException as error:
-            closure = bounded_command_process_closure(error)
-            if _authenticated_no_child_closure(
+            checkpoint_bound_signal_interrupt(force=True)
+            proof.launch_attempted = True
+            try:
+                result = run_bounded_command(
+                    argv,
+                    timeout_seconds=timeout,
+                    max_output_bytes=stdout_limit + stderr_limit,
+                    _prepared_no_child_profile=prepared,
+                )
+            except BaseException as error:
+                closure = bounded_command_process_closure(error)
+                if _authenticated_no_child_closure(
+                    closure,
+                    require_stdio_closed=False,
+                ):
+                    proof.proven = True
+                if isinstance(error, ValueError) and "command output exceeds" in str(
+                    error
+                ):
+                    raise OverflowError(
+                        "bounded no-child test output exceeded its byte cap"
+                    ) from error
+                raise
+            closure = result.process_closure
+            if not _authenticated_no_child_closure(
                 closure,
-                require_stdio_closed=False,
+                require_stdio_closed=True,
             ):
-                proof.proven = True
-            if isinstance(error, ValueError) and "command output exceeds" in str(error):
+                raise RuntimeError(
+                    "read-only installed test process closure lacks an authenticated "
+                    "no-child proof"
+                )
+            proof.proven = True
+            if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
                 raise OverflowError(
                     "bounded no-child test output exceeded its byte cap"
-                ) from error
-            raise
-        closure = result.process_closure
-        if not _authenticated_no_child_closure(
-            closure,
-            require_stdio_closed=True,
-        ):
-            raise RuntimeError(
-                "read-only installed test process closure lacks an authenticated "
-                "no-child proof"
-            )
-        proof.proven = True
-        if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
-            raise OverflowError("bounded no-child test output exceeded its byte cap")
+                )
+        finally:
+            if proof_scope is not None:
+                proof_scope.finish(deliver=proof.proven or not proof.launch_attempted)
     return subprocess.CompletedProcess(
         args=argv,
         returncode=result.returncode,
@@ -1151,7 +1219,8 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
         child_process_closure = "pending"
         completed = _run_no_child_test_suite(
             installed_root=installed_root,
-            runtime_parent=runtime_parent,
+            install_container_binding=install_container_binding,
+            runtime_parent_binding=runtime_parent_binding,
             secondary_failures=secondary_failures,
             closure_proof=closure_proof,
             lifecycle_fence=lifecycle_fence,

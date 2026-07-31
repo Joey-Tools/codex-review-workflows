@@ -1476,6 +1476,56 @@ def _validated_writable_roots(
     return validated
 
 
+def _validated_sandboxed_writable_roots(
+    roots: Sequence[WritableRootAttestation],
+    *,
+    protected_component_keys: frozenset[tuple[int, int]],
+) -> tuple[WritableRootAttestation, ...]:
+    if isinstance(roots, (str, bytes)) or len(roots) > MAX_WRITABLE_ROOTS:
+        raise ExecutableAuthenticationError(
+            "writable root attestations exceed their bound"
+        )
+    if not protected_component_keys:
+        raise ExecutableAuthenticationError(
+            "sandboxed target has no protected component identity"
+        )
+    validated = tuple(_revalidate_writable_root(root) for root in roots)
+    root_components: list[tuple[tuple[int, int], ...]] = []
+    root_keys: list[tuple[int, int]] = []
+    root_paths: set[str] = set()
+    for root in validated:
+        path = pathlib.Path(root.path)
+        first_components = _path_component_keys(path)
+        second_components = _path_component_keys(path)
+        if first_components != second_components:
+            raise ExecutableAuthenticationError(
+                "writable root path changed during authentication"
+            )
+        root_key = (root.identity.device, root.identity.inode)
+        if first_components[-1] != root_key:
+            raise ExecutableAuthenticationError(
+                "writable root path does not identify its attested object"
+            )
+        if root_key in protected_component_keys:
+            raise ExecutableAuthenticationError(
+                "writable root overlaps the sandboxed target through a path alias"
+            )
+        if root.path in root_paths or root_key in root_keys:
+            raise ExecutableAuthenticationError(
+                "writable root attestations are duplicated"
+            )
+        root_paths.add(root.path)
+        root_components.append(first_components)
+        root_keys.append(root_key)
+    for index, root_key in enumerate(root_keys):
+        for other_index, components in enumerate(root_components):
+            if index != other_index and root_key in components:
+                raise ExecutableAuthenticationError(
+                    "writable root attestations overlap"
+                )
+    return validated
+
+
 def _require_protected_path(
     attestation: PathExecutedExecutableAttestation,
 ) -> None:
@@ -3266,8 +3316,14 @@ def prepare_sandboxed_python_no_child_profile(
     *,
     additional_seatbelt_rules: str = "",
     runtime_pin: RuntimePin = PINNED_RUNTIME,
+    writable_roots: Sequence[WritableRootAttestation] = (),
 ) -> PreparedNoChildProfile:
-    """Prepare the current path-bound Python behind the sandbox loader."""
+    """Prepare the current path-bound Python behind the sandbox loader.
+
+    Writable roots require FD-bound attestations and an explicit global
+    ``file-write*`` denial. The caller retains every attested descriptor
+    through launch.
+    """
 
     evidence = probe_compatibility(pin=runtime_pin)
     require_compatible(evidence)
@@ -3279,15 +3335,39 @@ def prepare_sandboxed_python_no_child_profile(
         python_runtime_executable()
     )
     target = target_attestation.executable
+    target_component_keys = frozenset(
+        {
+            (target.device, target.inode),
+            *(
+                (component.identity.device, component.identity.inode)
+                for component in target_attestation.components
+            ),
+        }
+    )
+    validated_roots = _validated_sandboxed_writable_roots(
+        writable_roots,
+        protected_component_keys=target_component_keys,
+    )
+    if (
+        validated_roots
+        and "(deny file-write*)" not in additional_seatbelt_rules.splitlines()
+    ):
+        raise NoChildProfileError(
+            "sandboxed writable roots require default-deny filesystem writes"
+        )
     return PreparedNoChildProfile(
         executable=sandbox_exec,
         expected_sha256=sandbox_exec.sha256,
-        seatbelt_profile=build_seatbelt_profile(
-            target.path,
+        seatbelt_profile=_render_seatbelt_profile(
+            (pathlib.Path(target.path),),
             additional_rules=additional_seatbelt_rules,
+            writable_root_paths=tuple(
+                pathlib.Path(root.path) for root in validated_roots
+            ),
         ),
         evidence=evidence,
         additional_seatbelt_rules=additional_seatbelt_rules,
+        writable_roots=validated_roots,
         sandboxed_target=target,
         sandboxed_target_attestation=target_attestation,
     )
@@ -3362,7 +3442,7 @@ def _revalidate_prepared_profile(
     prepared: PreparedNoChildProfile,
 ) -> ExecutableIdentity:
     if prepared.owner_snapshot_attestation is None:
-        if prepared.writable_roots:
+        if prepared.sandboxed_target is None and prepared.writable_roots:
             raise NoChildProfileError(
                 "ordinary executable profile contains writable-root authority"
             )
@@ -3400,10 +3480,38 @@ def _revalidate_prepared_profile(
                     "sandboxed target authority was modified after preparation"
                 )
             target = _revalidate_path_executed_executable(target_attestation)
-            expected_profile = build_seatbelt_profile(
-                target.path,
-                additional_rules=prepared.additional_seatbelt_rules,
+            target_component_keys = frozenset(
+                {
+                    (target.device, target.inode),
+                    *(
+                        (component.identity.device, component.identity.inode)
+                        for component in target_attestation.components
+                    ),
+                }
             )
+            writable_roots = _validated_sandboxed_writable_roots(
+                prepared.writable_roots,
+                protected_component_keys=target_component_keys,
+            )
+            if (
+                writable_roots
+                and "(deny file-write*)"
+                not in prepared.additional_seatbelt_rules.splitlines()
+            ):
+                raise NoChildProfileError(
+                    "sandboxed writable roots require default-deny filesystem writes"
+                )
+            expected_profile = _render_seatbelt_profile(
+                (pathlib.Path(target.path),),
+                additional_rules=prepared.additional_seatbelt_rules,
+                writable_root_paths=tuple(
+                    pathlib.Path(root.path) for root in writable_roots
+                ),
+            )
+            if writable_roots != prepared.writable_roots:
+                raise NoChildProfileError(
+                    "prepared writable-root authority was modified"
+                )
     else:
         if (
             prepared.sandboxed_target is not None
@@ -4032,11 +4140,11 @@ def launch_prepared_no_child_process(
 ) -> LaunchedNoChildProcess:
     """Launch one prepared target after parent and child-side revalidation.
 
-    For a custodied snapshot, the custody and writable-root FDs attested during
-    preparation must still be open, read-only, and non-inheritable. They are used
-    again in the forked child immediately before ``sandbox-exec`` and are never
-    included in the target's inherited descriptor set. Only ``pass_fds`` are
-    remapped to consecutive descriptors beginning at 3.
+    Custody and writable-root FDs attested during preparation must still be
+    open, read-only, and non-inheritable. They are used again in the forked
+    child immediately before ``sandbox-exec`` and are never included in the
+    target's inherited descriptor set. Only ``pass_fds`` are remapped to
+    consecutive descriptors beginning at 3.
     """
 
     require_compatible(prepared.evidence)
@@ -4055,16 +4163,16 @@ def launch_prepared_no_child_process(
         raise ValueError("launch descriptors must be non-negative integers")
     if len(set(pass_fds)) != len(pass_fds):
         raise ValueError("pass_fds must not contain duplicates")
+    protected_fds = {root.directory_fd for root in prepared.writable_roots}
     if prepared.owner_snapshot_attestation is not None:
-        protected_fds = {
-            prepared.owner_snapshot_attestation.executable_fd,
-            prepared.owner_snapshot_attestation.directory_fd,
-            *(root.directory_fd for root in prepared.writable_roots),
-        }
-        if protected_fds.intersection(launch_fds):
-            raise ValueError(
-                "custody and writable-root descriptors cannot be inherited"
-            )
+        protected_fds.update(
+            {
+                prepared.owner_snapshot_attestation.executable_fd,
+                prepared.owner_snapshot_attestation.directory_fd,
+            }
+        )
+    if protected_fds.intersection(launch_fds):
+        raise ValueError("custody and writable-root descriptors cannot be inherited")
     _revalidate_prepared_profile(prepared)
     child_environment = _validated_environment(environment)
     sandbox_argv = (

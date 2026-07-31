@@ -310,6 +310,19 @@ superseded_by:
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.
+- The installed-tree write-isolation and signal-publication repair passed 642/642
+  in 246.962 seconds with the reviewed 642-test selected identity and
+  SHA-256
+  `4688e2cdafda8f42c650a75ddfddd9f8b64c1b07afcdb00c46bc98444615f455`.
+  Its complementary read-only selection passed 275/275 with selected identity
+  SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+- Final Python 3.13 validation also passed the repository contracts 102/102,
+  the production-equivalent live no-child/Seatbelt gate 9/9 with zero skips,
+  and the complete package discovery 651/651 with two expected platform skips.
+  One initial discovery run hit the known evidence-file publication race; the
+  exact live process-group test passed three consecutive retries before the
+  clean full rerun.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,
   and the zero-bytecode inventory passed.

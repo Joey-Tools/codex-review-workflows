@@ -59,6 +59,11 @@ from review_supervisor.recovery_cleanup import (
     CustodiedManifest,
     QuarantinedRootRecoveryEvidence,
 )
+from review_supervisor.signal_relay import (
+    DeferredSignalInterrupt,
+    activate_deferred_signal_interrupt,
+    deactivate_deferred_signal_interrupt,
+)
 from tests.support import owned_temporary_directory
 
 
@@ -757,6 +762,74 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
         self.assertFalse(evidence.stdio_closed)
         self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
         self.assertTrue(selector.closed)
+
+    def test_post_reap_signal_waits_for_closure_publication_and_cleanup(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        interruption = KeyboardInterrupt("synthetic post-reap signal")
+        interrupt = DeferredSignalInterrupt(lambda _signal_number: interruption)
+
+        def reap_after_signal(_pid: int, *, deadline: float) -> int:
+            self.assertGreater(deadline, 0)
+            interrupt.request(signal.SIGTERM)
+            return 0
+
+        binding = activate_deferred_signal_interrupt(interrupt)
+        try:
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=_published_launch(
+                        launched,
+                        stdout_read,
+                        stderr_read,
+                    ),
+                ),
+                mock.patch.object(codex_executable, "wait_terminal"),
+                mock.patch.object(
+                    codex_executable,
+                    "reap",
+                    side_effect=reap_after_signal,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                run_bounded_command(
+                    ("/usr/bin/true",),
+                    timeout_seconds=1.0,
+                    max_output_bytes=1024,
+                )
+        finally:
+            deactivate_deferred_signal_interrupt(binding)
+
+        self.assertIs(caught.exception, interruption)
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.leader_reaped)
+        self.assertTrue(evidence.stdio_closed)
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertFalse(evidence.runtime_descriptors_retained)
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
 
     def test_launch_receipt_setup_interrupt_terminates_and_reaps(self) -> None:
         stdout_read, stdout_write = os.pipe()

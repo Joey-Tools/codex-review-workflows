@@ -188,6 +188,15 @@ superseded_by:
   timeout, output-limit, and signal exceptions after terminating and reaping the
   leader. The installed runner accepts only the typed evidence with a reaped
   leader, proven permitted closure, and no process-group-emptiness substitute.
+- The authenticated sandbox now applies a global `file-write*` denial to the
+  installed-test process and grants one exception only for the independently
+  FD-attested runtime root. Parent and child revalidation bind that root's
+  object identity and exact owner-private access policy through launch. The
+  installed tree and its container remain outside the writable authority.
+- Signal deferral now spans leader reap, closure-evidence publication,
+  descriptor cleanup, and caller proof publication. A pending signal is
+  delivered only after the caller records a proven closure; an unproven launch
+  keeps its original retention failure primary.
 - Retained cleanup locations now come from a descriptor path reopened through
   the applicable ancestor policy and compared to the held object identity.
   When no path can be verified, the report uses a `descriptor-object://`
@@ -207,5 +216,34 @@ superseded_by:
   102/102 in 12.947 seconds, the live no-child/Seatbelt gate passed 9/9 in
   11.567 seconds, and the complete Python 3.13 platform discovery passed 2,822
   tests with six skips in 1308.684 seconds.
+- A subsequent Fresh Codex review found two final gaps: mode-only read-only
+  installation could be undone by the same-UID child, and signals could arrive
+  after reap or after bounded-command return but before closure proof was
+  published. The repair adds live kernel-policy probes for root/file chmod,
+  file write-open, install-parent creation, and runtime-root creation, plus
+  deterministic post-reap and caller-proof signal regressions.
+- The final ordinary deterministic gate passed 642/642 in 246.962 seconds with
+  selected-identity SHA-256
+  `4688e2cdafda8f42c650a75ddfddd9f8b64c1b07afcdb00c46bc98444615f455`.
+  The no-child-safe selection passed 275/275 with identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+  The real read-only installed gate returned proven child closure, complete
+  cleanup, immutable release-tree identity/content/access policy, no retained
+  paths, no runtime residue, and runtime profile `production-current`.
+- Final Python 3.13 validation passed the focused no-child profile 58/58,
+  read-only runner 33/33, and Codex executable 90/90 modules, with the two
+  expected live skips in the last module. Repository contracts passed 102/102
+  in 9.471 seconds, and the production-equivalent live no-child/Seatbelt gate
+  passed 9/9 in 7.633 seconds with zero skips.
+- The first package-aware 651-test discovery exposed one pre-existing test
+  publication race: the parent observed an evidence file after creation but
+  before the child had written its six fields. The exact live process-group
+  test then passed three consecutive same-condition retries, and the complete
+  package discovery reran clean with 651 tests and two expected skips in
+  264.201 seconds. No production file involved in that race is changed here.
+- Ruff lint/format, actionlint for canonical and private CI profiles,
+  source-only syntax checks, skill validation, project-journal validation,
+  `git diff --check`, and the zero-bytecode inventory passed after removing the
+  validator's ignored task-local dependency cache.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.

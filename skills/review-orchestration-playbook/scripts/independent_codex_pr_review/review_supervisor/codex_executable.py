@@ -32,6 +32,10 @@ from .recovery_cleanup import (
     quarantined_root_recovery_evidence,
     remove_published_manifest,
 )
+from .signal_relay import (
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
+)
 
 
 EXPECTED_CODEX_SHA256 = (
@@ -3868,6 +3872,7 @@ def run_bounded_command(
     selector: selectors.BaseSelector | None = None
     leader_reaped = False
     retain_runtime_resources = False
+    signal_scope = begin_bound_signal_deferral()
 
     def streams_are_drained() -> bool:
         if selector is None:
@@ -3885,6 +3890,7 @@ def run_bounded_command(
         )
         launch_ownership.transfer_receipt(launch_receipt)
         launched, stdout_fd, stderr_fd = launch_receipt
+        checkpoint_bound_signal_interrupt(force=True)
         streams = {
             stdout_fd: bytearray(),
             stderr_fd: bytearray(),
@@ -3894,12 +3900,14 @@ def run_bounded_command(
         for descriptor in streams:
             selector.register(descriptor, selectors.EVENT_READ)
         while selector.get_map():
+            checkpoint_bound_signal_interrupt(force=True)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
-            events = selector.select(remaining)
+            events = selector.select(min(remaining, 0.25))
+            checkpoint_bound_signal_interrupt(force=True)
             if not events:
-                raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
+                continue
             for key, _ in events:
                 chunk = os.read(
                     key.fd,
@@ -3915,6 +3923,7 @@ def run_bounded_command(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
+        checkpoint_bound_signal_interrupt(force=True)
         wait_terminal(launched.pid, deadline=deadline)
         returncode = reap(launched.pid, deadline=deadline)
         leader_reaped = True
@@ -4044,6 +4053,8 @@ def run_bounded_command(
         raise
     finally:
         close_errors: list[BaseException] = []
+        finalizer_error: CodexExecutableRetentionRequired | None = None
+        signal_error: BaseException | None = None
         if not retain_runtime_resources and selector is not None:
             try:
                 selector.close()
@@ -4098,9 +4109,22 @@ def run_bounded_command(
                 closure=retained_closure,
                 reason=(f"{type(close_errors[0]).__name__}: {close_errors[0]}"),
             )
-            raise retained from close_errors[0]
-        if not retain_runtime_resources and not launch_ownership.descriptors:
+            finalizer_error = retained
+        elif not retain_runtime_resources and not launch_ownership.descriptors:
             launch_ownership.mark_closed()
+        if signal_scope is not None:
+            try:
+                signal_scope.finish(
+                    deliver=finalizer_error is None and not retain_runtime_resources
+                )
+            except BaseException as error:
+                signal_error = error
+        if finalizer_error is not None:
+            raise finalizer_error from close_errors[0]
+        if signal_error is not None:
+            if closure is not None:
+                _attach_bounded_command_process_closure(signal_error, closure)
+            raise signal_error
     assert returncode is not None
     assert closure is not None
     return CommandResult(
