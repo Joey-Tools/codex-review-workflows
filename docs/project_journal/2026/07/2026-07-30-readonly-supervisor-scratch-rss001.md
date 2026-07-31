@@ -25,9 +25,18 @@ superseded_by:
 - Exercise the complete deterministic supervisor suite from a read-only copy
   below `/private/tmp`, while keeping scratch under an independently validated
   owner-private root.
-- Run that nested suite through the existing bounded process-group supervisor,
-  with explicit output caps, signal deferral, descendant settlement, and
-  fail-closed retention when process closure cannot be proved.
+- Bind both the installed copy and runtime directory for the command lifetime,
+  keep object-identity proof distinct from access-policy proof, and delete only
+  the descriptor-custodied object recorded in a private cleanup manifest.
+- Keep descriptor-bound retention unknown when its current namespace path
+  cannot be recovered; only an identity-matched held directory with zero links
+  proves that exact object is absent from the namespace.
+- Run the nested suite through the bounded process-group supervisor and a full
+  same-UID process-identity census from an isolated non-admin account, with
+  fail-closed retention whenever system-wide child-process closure is unproved.
+- Inherit a Seatbelt profile that denies launchd `job-creation` and execution
+  of every set-user-ID or set-group-ID file by mode rather than by path, and
+  require kernel-visible denial before the nested child starts.
 - Make the descriptor-reuse injection explicitly duplicate onto the protected
   descriptor number instead of relying on incidental kernel allocation order.
 
@@ -53,30 +62,54 @@ superseded_by:
   compared with a fresh path-bound descriptor before use, independent of the
   process umask. The install container remains a separate explicit sticky-parent
   case.
-- The read-only runner keeps a descriptor and policy binding for the exact
-  runtime directory before the child starts. Residue is enumerated from that
-  descriptor between full path revalidations; cleanup is attempted only after
-  proven child-process closure and only when the path still maps to the held
-  object. Persistent replacement is a primary failure plus an explicit cleanup
-  gap, while completed child-entry churn remains benign.
+- The read-only runner keeps descriptor and policy bindings for the exact
+  installed copy and runtime directory before the child starts. Original-path
+  identity, held-object identity, and access policy are reported separately:
+  replacement, unreadable revalidation, policy drift, and benign child-entry
+  churn cannot be collapsed into one generic mutation result.
+- Cleanup requires proven process closure, creates a custodied manifest in a
+  private cleanup-control directory, quarantines the exact descriptor-bound
+  root relative to its held parent, revalidates the quarantined identity, and
+  then performs descriptor-relative recursive deletion. A missing cleanup
+  control root, pathname replacement, policy drift, or check-to-delete swap
+  retains the affected object instead of deleting an unproved target.
 - Cleanup completes before success output. Every ordinary primary exception is
   reported in the structured summary; a concurrent cleanup error returns
   nonzero, preserves the primary failure and child return code, and reports the
   exact retained path as secondary evidence.
 - The child suite runs in a fresh process group with 8 MiB caps for stdout and
   stderr. Normal leader exit, output overflow, timeout, and SIGTERM settle the
-  leader and same-group descendants before cleanup. Unproven process closure
-  retains both exact trees and reports `closure-unproven`.
+  leader and same-group descendants. A Darwin `libproc` census binds every
+  same-real-or-effective-UID PID, including zombies, to its start time before
+  the child and after process-group settlement; any new identity, including a
+  `setsid()` and double-fork escape, prevents cleanup. Each census phase has an
+  independent five-second monotonic deadline. Enumeration errors, disappearing
+  identities, and incomplete identities fail closed. A pre-start account or
+  census failure is reported as `child_process_closure:not-started`, never as
+  an unproved child.
 - Signal-guard teardown cannot replace an already raised
   `GitProcessClosureUnproven`. Deactivation and handler-restoration failures are
   retained as ordered secondary diagnostics, while cleanup is authorized only
   by an explicit process-closure proof; a still-pending or unproven child keeps
   both the installed and runtime trees.
 - CI runs the ordinary deterministic suite and the read-only installed
-  regression in separate macOS Python 3.13 jobs. The read-only job has a
-  20-minute emergency outer budget around the runner's 10-minute child timeout.
-  CI success requires the terminal structured closure and cleanup proof; a host
-  cancellation or missing terminal summary cannot count as a clean gate.
+  regression in separate macOS Python 3.13 jobs. The read-only job copies the
+  tracked source into an owner-private `/Users` root and executes the runner as
+  `nobody` with an empty environment inside an inherited Seatbelt profile.
+  Before starting the child, the runner proves real/effective UID equality,
+  non-root and non-admin membership, kernel-visible `job-creation` denial,
+  generic set-ID exec filtering through a direct `sudo` EPERM probe, and a
+  same-UID baseline containing only the supervisor. The job has a 20-minute
+  emergency outer budget around the
+  runner's 10-minute child timeout. CI success requires the terminal structured
+  closure and cleanup proof; a host cancellation or missing terminal summary
+  cannot count as a clean gate. The root-owned outer isolation container is
+  removed only after that proof and otherwise remains at the reported recovery
+  path. The Seatbelt profile is copied into that root-owned outer container,
+  byte- and identity-bound there without changing checkout metadata, and
+  revalidated before and after launch. The outer summary parser runs with
+  isolated, site-disabled Python imports and accepts only the exact terminal
+  schema; its identity-bound path is reported whenever failure retains it.
 - Linux sandbox-command unit tests use a synthetic trusted runtime mount instead
   of assuming `/usr` ownership on a hosted image. A separate policy test still
   accepts a system path only when every resolved component is root-owned and
@@ -171,5 +204,26 @@ superseded_by:
   Seatbelt denial. The exact broker regression passed 1/1 outside the parent
   sandbox in 2.314 seconds, and the production-equivalent live no-child suite
   passed 9/9 in 7.585 seconds.
-- `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
-  the unrun lane is not counted as a completed named double or triple.
+- The final process-census and descriptor-custody regressions pass 36/36 on the
+  uv-managed CPython 3.13 runtime. Coverage includes a `setsid()` double-fork
+  escape with standard descriptors closed, zombie handoff visibility, bounded
+  `libproc` enumeration, inherited Seatbelt enforcement, install/runtime
+  pathname replacement, access-policy-only drift, and a quarantine-rename race
+  that preserves machine-visible recovery identities for both objects.
+- The final deterministic independent-supervisor gate passed 643/643 in
+  92.684 seconds on the host-level uv-managed CPython 3.13.13 runtime, with
+  selected-identity SHA-256
+  `f3636c9637c6d7f7d353748570f0fb74608f242617c2fc4b80aa3b8bc7678846`.
+  The selected suite includes the unresolved-retention regression.
+  All 104 repository contract tests passed under the same uv-managed runtime.
+  The enclosing parent sandbox makes Apple Git emit a `confstr()` temporary-root
+  diagnostic that the strict raw-Git tests correctly reject; the four affected
+  tests pass 4/4 when rerun at their required host level.
+  A local production-shaped invocation correctly rejected the interactive
+  admin account before starting a child and still reported complete cleanup
+  with no retained paths. The hosted isolated-account success path remains a
+  required CI result rather than a locally claimed success.
+- A host-level Seatbelt probe for the path-independent set-ID filter allowed
+  ordinary `/usr/bin/true`, while both root-setuid `/usr/bin/sudo` and setgid
+  `/usr/bin/write` were rejected at `exec` with `EPERM` (sandbox exit 71). The
+  hosted runner still must prove the same inherited policy before CI can pass.

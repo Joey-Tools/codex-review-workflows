@@ -38,8 +38,7 @@ def _select_hosted_runtime_profile(
             runtime.macos_product_version == pin.macos_product_version
             and runtime.macos_build_version == pin.macos_build_version
             and runtime.darwin_release == pin.darwin_release
-            and runtime.python_version[:2]
-            == (pin.python_major, pin.python_minor)
+            and runtime.python_version[:2] == (pin.python_major, pin.python_minor)
         )
     ]
     return matches[0] if len(matches) == 1 else None

@@ -265,3 +265,7 @@ superseded_by:
   and the zero-bytecode inventory passed.
 - No local Python 3.10 run is required for this delivery; local validation uses
   Python 3.13 only.
+- The process-census, inherited Seatbelt, and descriptor-custody hardening
+  passed 643/643 in 92.684 seconds on the host-level uv-managed CPython 3.13.13
+  runtime, with the reviewed 643-test selected identity and SHA-256
+  `f3636c9637c6d7f7d353748570f0fb74608f242617c2fc4b80aa3b8bc7678846`.

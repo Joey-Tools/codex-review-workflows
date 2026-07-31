@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +36,8 @@ from review_supervisor.secureio import (
 _RUNTIME_ROOT: pathlib.Path | None = None
 _RUNTIME_ROOT_PID: int | None = None
 _EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+_DARWIN_F_GETPATH = 50
+_DARWIN_MAXPATHLEN = 1024
 
 
 def _canonical_ascii_directory(raw_path: str | pathlib.Path) -> pathlib.Path:
@@ -78,23 +82,135 @@ class _DirectoryParentBinding:
     def close(self) -> None:
         os.close(self.fd)
 
-    def revalidate(self) -> None:
+    def object_locator(self) -> dict[str, int]:
+        return {
+            "device": self.policy.device,
+            "inode": self.policy.inode,
+            "file_type": self.policy.file_type,
+            "generation": self.policy.generation,
+        }
+
+    def _object_key(self) -> tuple[int, int, int, int]:
+        return (
+            self.policy.device,
+            self.policy.inode,
+            self.policy.file_type,
+            self.policy.generation,
+        )
+
+    @staticmethod
+    def _metadata_object_key(metadata: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            getattr(metadata, "st_gen", 0),
+        )
+
+    def revalidate_held_identity(self) -> None:
+        if self._metadata_object_key(os.fstat(self.fd)) != self._object_key():
+            raise OSError(
+                errno.ESTALE,
+                f"test runtime parent object identity changed: {self.path}",
+            )
+
+    def access_policy_status(self) -> str:
+        try:
+            held_policy = validate_directory_policy_fd(
+                self.fd,
+                self.path,
+                private=False,
+            )
+        except (OSError, ValueError):
+            return "unreadable"
+        return "same" if held_policy == self.policy else "changed"
+
+    def original_path_identity_status(self) -> str:
+        try:
+            metadata = os.stat(self.path, follow_symlinks=False)
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unreadable"
+        if self._metadata_object_key(metadata) != self._object_key():
+            return "replaced"
+        try:
+            descriptor = os.open(
+                self.path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unreadable"
+        try:
+            observed = self._metadata_object_key(os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+        return "same" if observed == self._object_key() else "replaced"
+
+    def revalidate_held(self) -> None:
+        self.revalidate_held_identity()
         held_policy = validate_directory_policy_fd(
             self.fd,
             self.path,
             private=False,
         )
-        held_identity = identity_from_stat(os.fstat(self.fd))
         if self.require_owned_private_parent:
             _require_owned_private_parent_policy(held_policy, path=self.path)
-        if (
-            not directory_identities_match(self.identity, held_identity)
-            or held_policy != self.policy
-        ):
+        if held_policy != self.policy:
             raise OSError(
                 errno.ESTALE,
-                f"test runtime parent identity or access policy changed: {self.path}",
+                f"test runtime parent access policy changed: {self.path}",
             )
+
+    def current_path(self) -> pathlib.Path:
+        self.revalidate_held_identity()
+        if sys.platform != "darwin":
+            raise OSError(
+                errno.ENOTSUP,
+                "held directory path recovery is unsupported",
+                str(self.path),
+            )
+        raw = fcntl.fcntl(
+            self.fd,
+            _DARWIN_F_GETPATH,
+            b"\0" * _DARWIN_MAXPATHLEN,
+        )
+        raw_path, separator, _ = raw.partition(b"\0")
+        if not separator or not raw_path or not raw_path.startswith(b"/"):
+            raise OSError(
+                errno.ESTALE,
+                "held directory current path is unavailable",
+                str(self.path),
+            )
+        try:
+            decoded = os.fsdecode(raw_path)
+            decoded.encode("ascii")
+        except (UnicodeDecodeError, UnicodeEncodeError) as error:
+            raise OSError(
+                errno.ESTALE,
+                "held directory current path is not canonical ASCII",
+                str(self.path),
+            ) from error
+        current = pathlib.Path(decoded)
+        reopened_fd = os.open(
+            current,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            if self._metadata_object_key(os.fstat(reopened_fd)) != self._object_key():
+                raise OSError(
+                    errno.ESTALE,
+                    f"held directory current path changed: {current}",
+                )
+        finally:
+            os.close(reopened_fd)
+        self.revalidate_held_identity()
+        return current
+
+    def revalidate(self) -> None:
+        self.revalidate_held()
 
         reopened_fd, reopened_identity = open_absolute_directory_chain(
             self.path,
@@ -220,12 +336,12 @@ def _normalize_created_private_directory_mode(
         )
 
 
-def _create_owned_private_directory(
+def _create_bound_owned_private_directory(
     parent: pathlib.Path,
     prefix: str,
     *,
     require_owned_private_parent: bool = True,
-) -> pathlib.Path:
+) -> _DirectoryParentBinding:
     try:
         raw_prefix = prefix.encode("ascii")
     except UnicodeEncodeError as error:
@@ -300,9 +416,19 @@ def _create_owned_private_directory(
                             )
                     finally:
                         os.close(path_fd)
+                    binding = _DirectoryParentBinding(
+                        path=child_path,
+                        fd=child_fd,
+                        identity=child_identity,
+                        policy=child_policy,
+                        require_owned_private_parent=require_owned_private_parent,
+                    )
+                    binding.revalidate()
+                    child_fd = -1
+                    return binding
                 finally:
-                    os.close(child_fd)
-                return child_path
+                    if child_fd >= 0:
+                        os.close(child_fd)
             except BaseException as error:
                 try:
                     os.rmdir(name, dir_fd=parent_binding.fd)
@@ -316,6 +442,23 @@ def _create_owned_private_directory(
         raise FileExistsError("temporary-directory name collision limit reached")
     finally:
         parent_binding.close()
+
+
+def _create_owned_private_directory(
+    parent: pathlib.Path,
+    prefix: str,
+    *,
+    require_owned_private_parent: bool = True,
+) -> pathlib.Path:
+    binding = _create_bound_owned_private_directory(
+        parent,
+        prefix,
+        require_owned_private_parent=require_owned_private_parent,
+    )
+    try:
+        return binding.path
+    finally:
+        binding.close()
 
 
 def _private_runtime_parent() -> pathlib.Path:

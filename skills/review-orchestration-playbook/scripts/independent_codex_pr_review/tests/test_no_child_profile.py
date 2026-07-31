@@ -804,9 +804,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42",
         )
         self.assertNotEqual(pin, profile.PINNED_RUNTIME)
-        current = GITHUB_HOSTED_RUNTIME_PINS[
-            "github-macos-26-arm64-26.5.2-25F84"
-        ]
+        current = GITHUB_HOSTED_RUNTIME_PINS["github-macos-26-arm64-26.5.2-25F84"]
         self.assertEqual(current.macos_product_version, "26.5.2")
         self.assertEqual(current.macos_build_version, "25F84")
         self.assertEqual(current.darwin_release, "25.5.0")
@@ -2759,9 +2757,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
         for mutation, message in cases:
             with (
                 self.subTest(mutation=mutation),
-                owned_temporary_directory(
-                    f"path-target-{mutation}-"
-                ) as temporary,
+                owned_temporary_directory(f"path-target-{mutation}-") as temporary,
             ):
                 root = temporary.resolve(strict=True)
                 root.chmod(0o700)

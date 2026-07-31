@@ -134,9 +134,198 @@ jobs:
         with:
           python-version: "3.13"
       - name: Run deterministic supervisor from read-only install
-        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          REVIEW_SOURCE_RELATIVE: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
-          python3 -B -m tests.run_readonly_install_deterministic_supervisor
+          trusted_python="$(command -v python3)"
+          test -x "$trusted_python"
+          isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /Users/codex-review-readonly.XXXXXX)"
+          echo "Read-only isolation recovery root: $isolated_root"
+          if [[ ! "$isolated_root" =~ ^/Users/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
+            echo "::error::Refusing an unexpected isolation root; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /bin/test -d "$isolated_root"
+          /usr/bin/sudo /bin/test ! -L "$isolated_root"
+          isolated_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" = "0"
+          checkout_root="$(pwd -P)"
+          source_review_profile="$checkout_root/$REVIEW_SOURCE_RELATIVE/tests/readonly_child_isolation.sb"
+          /bin/test -f "$source_review_profile"
+          /bin/test ! -L "$source_review_profile"
+          source_profile_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          /usr/bin/sudo /bin/chmod 0711 "$isolated_root"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
+          /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
+          /usr/bin/sudo -u nobody /bin/test ! -w /Users
+          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"
+          /usr/bin/sudo -u nobody /usr/bin/ditto "$REVIEW_SOURCE_RELATIVE" "$isolated_root/payload/source"
+          /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
+          review_profile="$isolated_root/readonly_child_isolation.sb"
+          /usr/bin/sudo /bin/test ! -e "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"
+          /usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"
+          /usr/bin/sudo /bin/chmod -N "$review_profile"
+          /usr/bin/sudo /bin/chmod 0444 "$review_profile"
+          /usr/bin/sudo /bin/test -f "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"
+          profile_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$review_profile")" = "0:0:444"
+          /bin/test ! -w "$review_profile"
+          /usr/bin/sudo -u nobody /bin/test -r "$review_profile"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"
+          source_profile_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          if [[ "$source_profile_postcopy_binding" != "$source_profile_binding" ]] \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"; then
+            echo "::error::Checkout child profile changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"
+          isolated_flags="$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")"
+          (( (isolated_flags & 2) == 2 ))
+          test -n "${RUNNER_TEMP:-}"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"
+          summary_file="$(/usr/bin/mktemp "$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"
+          echo "Read-only supervisor summary file (retained on failure): $summary_file"
+          /bin/test -f "$summary_file"
+          /bin/test ! -L "$summary_file"
+          summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")"
+          set -o pipefail
+          literal_profile_status=0
+          /usr/bin/grep -Fq '(literal ' "$review_profile" \
+            || literal_profile_status=$?
+          if ! /usr/bin/grep -Fqx '(deny job-creation)' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '(deny process-exec*' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '  (file-mode #o4000 #o2000))' "$review_profile" \
+            || (( literal_profile_status != 1 )); then
+            echo "::error::Read-only child profile lacks required denials; retained at $isolated_root"
+            exit 1
+          fi
+          source_profile_prelaunch_binding=""
+          source_profile_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_prelaunch_binding="<unreadable>"
+          profile_prelaunch_binding=""
+          profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_prelaunch_binding="<unreadable>"
+          if [[ "$source_profile_prelaunch_binding" != "$source_profile_binding" ]] \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_prelaunch_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed before launch; retained at $isolated_root"
+            exit 1
+          fi
+          runner_status=0
+          /usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
+            CODEX_REVIEW_TEST_RUNTIME_PARENT="$isolated_root/payload/runtime" \
+            HOME="$isolated_root/payload" \
+            LANG=C \
+            LC_ALL=C \
+            LOGNAME=nobody \
+            PATH=/usr/bin:/bin \
+            USER=nobody \
+            /bin/sh -c 'cd "$1" && exec "$2" -B -m tests.run_readonly_install_deterministic_supervisor' \
+            sh "$isolated_root/payload/source" "$trusted_python" \
+            | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
+          source_profile_postrun_binding=""
+          source_profile_postrun_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_postrun_binding="<unreadable>"
+          profile_postrun_binding=""
+          profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_postrun_binding="<unreadable>"
+          if [[ "$source_profile_postrun_binding" != "$source_profile_binding" ]] \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_postrun_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed during launch; retained at $isolated_root"
+            exit 1
+          fi
+          current_summary_object_id=""
+          current_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || current_summary_object_id="<unreadable>"
+          if [[ "$current_summary_object_id" != "$summary_object_id" ]]; then
+            echo "::error::Supervisor summary identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          /bin/cat "$summary_file"
+          if (( runner_status != 0 )); then
+            echo "::error::Read-only supervisor exited $runner_status; retained at $isolated_root"
+            exit "$runner_status"
+          fi
+          summary_status=0
+          "$trusted_python" -I -B -S -c 'import json, pathlib, sys; raw = pathlib.Path(sys.argv[1]).read_bytes(); valid_line = raw.endswith(b"\n") and b"\n" not in raw[:-1] and b"\r" not in raw; reject_duplicates = lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else (_ for _ in ()).throw(ValueError("duplicate JSON key")); payload = json.loads(raw, object_pairs_hook=reject_duplicates) if valid_line else {}; expected = {"child_process_closure": "proven", "cleanup_failures": [], "cleanup_status": "complete", "install_parent_is_sticky_world_writable": True, "primary_failure": None, "primary_status": "complete", "release_tree_immutable": True, "release_tree_property": "object-identity-content-access-policy", "retained_paths": [], "returncode": 0, "runtime_residue": [], "secondary_failures": [], "signal_number": None, "timed_out": False}; keys_exact = isinstance(payload, dict) and set(payload) == set(expected); invalid_values = {key: payload.get(key) for key, value in expected.items() if key not in payload or type(payload[key]) is not type(value) or payload[key] != value} if isinstance(payload, dict) else {"payload_type": type(payload).__name__}; sys.exit("invalid terminal supervisor summary: " + json.dumps({"invalid_values": invalid_values, "keys_exact": keys_exact}, sort_keys=True, separators=(",", ":"))) if not valid_line or not keys_exact or invalid_values else None' \
+            "$summary_file" || summary_status=$?
+          if (( summary_status != 0 )); then
+            echo "::error::Terminal supervisor evidence was not cleanup-safe; retained at $isolated_root"
+            exit "$summary_status"
+          fi
+          current_object_id=""
+          current_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || current_object_id="<unreadable>"
+          if [[ "$current_object_id" != "$isolated_object_id" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_root" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_root" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" != "0" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")" != "$isolated_flags" ]]; then
+            echo "::error::Isolation root identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/chflags nouchg "$isolated_root"
+          post_clear_object_id=""
+          post_clear_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || post_clear_object_id="<unreadable>"
+          if [[ "$post_clear_object_id" != "$isolated_object_id" ]]; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root changed while opening cleanup; retained at $isolated_root"
+            exit 1
+          fi
+          root_cleanup_status=0
+          /usr/bin/sudo /bin/rm -rf "$isolated_root" || root_cleanup_status=$?
+          if (( root_cleanup_status != 0 )) \
+            || /usr/bin/sudo /bin/test -e "$isolated_root" \
+            || /usr/bin/sudo /bin/test -L "$isolated_root"; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root cleanup incomplete at $isolated_root"
+            exit 1
+          fi
+          final_summary_object_id=""
+          final_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || final_summary_object_id="<unreadable>"
+          if [[ "$final_summary_object_id" != "$summary_object_id" ]] \
+            || ! /bin/test -f "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup identity changed; retained at $summary_file"
+            exit 1
+          fi
+          summary_cleanup_status=0
+          /bin/rm "$summary_file" || summary_cleanup_status=$?
+          if (( summary_cleanup_status != 0 )) \
+            || /bin/test -e "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup incomplete at $summary_file"
+            exit 1
+          fi
       - name: Require source-only Python tree
         if: always()
         run: |

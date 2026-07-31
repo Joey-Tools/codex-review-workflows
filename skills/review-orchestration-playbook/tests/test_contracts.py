@@ -1794,7 +1794,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 626", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 643", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1970,14 +1970,339 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("runs-on: macos-26", readonly_job)
                 self.assertIn("timeout-minutes: 20", readonly_job)
                 self.assertIn(
-                    f"""      - name: Run deterministic supervisor from read-only install
-        working-directory: {skill_root}/scripts/independent_codex_pr_review
-        run: |
-          python3 -B -m tests.run_readonly_install_deterministic_supervisor
-""",
+                    "Run deterministic supervisor from read-only install",
                     readonly_job,
                 )
+                self.assertIn(
+                    f"REVIEW_SOURCE_RELATIVE: "
+                    f"{skill_root}/scripts/independent_codex_pr_review",
+                    readonly_job,
+                )
+                for requirement in (
+                    "/usr/bin/sudo /usr/bin/mktemp -d "
+                    "/Users/codex-review-readonly.XXXXXX",
+                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
+                    "/usr/bin/sudo -u nobody /usr/bin/ditto",
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
+                    "CODEX_REVIEW_TEST_RUNTIME_PARENT=",
+                    "LOGNAME=nobody",
+                    "USER=nobody",
+                    "tests.run_readonly_install_deterministic_supervisor",
+                ):
+                    self.assertIn(requirement, readonly_job)
                 self.assertIn("if: always()", readonly_job)
+
+    def test_readonly_ci_deletes_only_a_proven_root_owned_outer_root(self) -> None:
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                create_index = readonly_job.index(
+                    'isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d '
+                    '/Users/codex-review-readonly.XXXXXX)"'
+                )
+                recovery_index = readonly_job.index(
+                    'echo "Read-only isolation recovery root: $isolated_root"'
+                )
+                path_guard_index = readonly_job.index(
+                    '[[ ! "$isolated_root" =~ '
+                    "^/Users/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
+                )
+                identity_index = readonly_job.index(
+                    'isolated_object_id="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i\' "$isolated_root")"'
+                )
+                payload_index = readonly_job.index(
+                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody "
+                    '"$isolated_root/payload"'
+                )
+                immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"'
+                )
+                summary_create_index = readonly_job.index(
+                    'summary_file="$(/usr/bin/mktemp '
+                    '"$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"'
+                )
+                summary_recovery_index = readonly_job.index(
+                    'echo "Read-only supervisor summary file '
+                    '(retained on failure): $summary_file"'
+                )
+                summary_validation_index = readonly_job.index(
+                    '/bin/test -f "$summary_file"'
+                )
+                launch_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f"
+                )
+                runner_failure_index = readonly_job.index(
+                    "if (( runner_status != 0 )); then"
+                )
+                isolated_parser = (
+                    '"$trusted_python" -I -B -S -c \'import json, pathlib, sys;'
+                )
+                parser_index = readonly_job.index(isolated_parser)
+                evidence_index = readonly_job.index(
+                    'expected = {"child_process_closure": "proven"'
+                )
+                evidence_failure_index = readonly_job.index(
+                    "if (( summary_status != 0 )); then"
+                )
+                revalidation_index = readonly_job.index(
+                    'current_object_id="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i\' "$isolated_root")"'
+                )
+                clear_immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags nouchg "$isolated_root"'
+                )
+                deletion = '/usr/bin/sudo /bin/rm -rf "$isolated_root"'
+                delete_index = readonly_job.index(deletion)
+                final_summary_index = readonly_job.index(
+                    'final_summary_object_id="$(/usr/bin/stat -f '
+                    '\'%d:%i\' "$summary_file")"'
+                )
+                summary_deletion = '/bin/rm "$summary_file"'
+                summary_delete_index = readonly_job.index(summary_deletion)
+
+                self.assertLess(create_index, recovery_index)
+                self.assertLess(recovery_index, path_guard_index)
+                self.assertLess(path_guard_index, identity_index)
+                self.assertLess(identity_index, payload_index)
+                self.assertLess(payload_index, immutable_index)
+                self.assertLess(immutable_index, summary_create_index)
+                self.assertLess(summary_create_index, summary_recovery_index)
+                self.assertLess(summary_recovery_index, summary_validation_index)
+                self.assertLess(summary_validation_index, launch_index)
+                self.assertLess(launch_index, runner_failure_index)
+                self.assertLess(runner_failure_index, parser_index)
+                self.assertLess(parser_index, evidence_index)
+                self.assertLess(evidence_index, evidence_failure_index)
+                self.assertLess(evidence_failure_index, revalidation_index)
+                self.assertLess(revalidation_index, clear_immutable_index)
+                self.assertLess(clear_immutable_index, delete_index)
+                self.assertLess(delete_index, final_summary_index)
+                self.assertLess(final_summary_index, summary_delete_index)
+                self.assertEqual(readonly_job.count(deletion), 1)
+                self.assertEqual(readonly_job.count(summary_deletion), 1)
+                self.assertEqual(readonly_job.count(isolated_parser), 1)
+                self.assertIn(
+                    'summary_file="$(/usr/bin/mktemp '
+                    '"$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"\n'
+                    '          echo "Read-only supervisor summary file '
+                    '(retained on failure): $summary_file"\n'
+                    '          /bin/test -f "$summary_file"',
+                    readonly_job,
+                )
+                self.assertNotIn(
+                    '"$trusted_python" -B -c \'import json, pathlib, sys;',
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test -f "$summary_file"'),
+                    2,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test ! -L "$summary_file"'),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test -L "$summary_file"'),
+                    2,
+                )
+
+                self.assertNotIn(
+                    '/usr/sbin/chown nobody:nobody "$isolated_root"\n',
+                    readonly_job,
+                )
+                for protection in (
+                    '/usr/bin/sudo /bin/test ! -L "$isolated_root"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u' "
+                    '"$isolated_root")" = "0"',
+                    "/usr/bin/sudo -u nobody /bin/test ! -w /Users",
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
+                    "(( (isolated_flags & 2) == 2 ))",
+                    "set -o pipefail",
+                    '| /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?',
+                    '[[ "$current_summary_object_id" != "$summary_object_id" ]]',
+                    '[[ "$current_object_id" != "$isolated_object_id" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%f' "
+                    '"$isolated_root")" != "$isolated_flags" ]]',
+                    '[[ "$post_clear_object_id" != "$isolated_object_id" ]]',
+                    "if (( root_cleanup_status != 0 ))",
+                    '[[ "$final_summary_object_id" != "$summary_object_id" ]]',
+                    "if (( summary_cleanup_status != 0 ))",
+                    "object_pairs_hook=reject_duplicates",
+                    'ValueError("duplicate JSON key")',
+                    "set(payload) == set(expected)",
+                    "type(payload[key]) is not type(value)",
+                ):
+                    self.assertIn(protection, readonly_job)
+                for evidence in (
+                    '"cleanup_failures": []',
+                    '"cleanup_status": "complete"',
+                    '"install_parent_is_sticky_world_writable": True',
+                    '"primary_failure": None',
+                    '"primary_status": "complete"',
+                    '"release_tree_immutable": True',
+                    '"release_tree_property": "object-identity-content-access-policy"',
+                    '"retained_paths": []',
+                    '"returncode": 0',
+                    '"runtime_residue": []',
+                    '"secondary_failures": []',
+                    '"signal_number": None',
+                    '"timed_out": False',
+                ):
+                    self.assertIn(evidence, readonly_job)
+                self.assertGreaterEqual(
+                    readonly_job.count("retained at $isolated_root"), 3
+                )
+
+    def test_readonly_ci_binds_profile_and_denies_executable_setid_modes(
+        self,
+    ) -> None:
+        sandbox_profile = (
+            SCRIPTS / "independent_codex_pr_review/tests/readonly_child_isolation.sb"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            sandbox_profile.splitlines(),
+            [
+                "(version 1)",
+                "(allow default)",
+                "(deny job-creation)",
+                "(deny process-exec*",
+                "  (file-mode #o4000 #o2000))",
+            ],
+        )
+        self.assertNotIn("(literal ", sandbox_profile)
+
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                source_profile_path_index = readonly_job.index(
+                    'source_review_profile="$checkout_root/$REVIEW_SOURCE_RELATIVE/'
+                    'tests/readonly_child_isolation.sb"'
+                )
+                source_copy_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/ditto"
+                )
+                isolated_profile_path_index = readonly_job.index(
+                    'review_profile="$isolated_root/readonly_child_isolation.sb"'
+                )
+                profile_copy_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"'
+                )
+                profile_binding_index = readonly_job.index(
+                    'profile_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$review_profile")"'
+                )
+                immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"'
+                )
+                policy_index = readonly_job.index(
+                    "/usr/bin/grep -Fqx '(deny job-creation)'"
+                )
+                source_prelaunch_index = readonly_job.index(
+                    'source_profile_prelaunch_binding="$(/usr/bin/stat'
+                )
+                prelaunch_index = readonly_job.index(
+                    'profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat'
+                )
+                sandbox_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    '-f "$review_profile" /usr/bin/env -i'
+                )
+                postrun_index = readonly_job.index(
+                    'profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat'
+                )
+
+                self.assertLess(source_profile_path_index, source_copy_index)
+                self.assertLess(source_copy_index, isolated_profile_path_index)
+                self.assertLess(isolated_profile_path_index, profile_copy_index)
+                self.assertLess(profile_copy_index, profile_binding_index)
+                self.assertLess(profile_binding_index, immutable_index)
+                self.assertLess(immutable_index, policy_index)
+                self.assertLess(policy_index, source_prelaunch_index)
+                self.assertLess(source_prelaunch_index, prelaunch_index)
+                self.assertLess(prelaunch_index, sandbox_index)
+                self.assertLess(sandbox_index, postrun_index)
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo -u nobody /usr/bin/sandbox-exec"),
+                    1,
+                )
+                self.assertNotIn(
+                    "/usr/bin/sudo -u nobody /usr/bin/env -i",
+                    readonly_job,
+                )
+                for binding in (
+                    '/bin/test -f "$source_review_profile"',
+                    '/bin/test ! -L "$source_review_profile"',
+                    'source_profile_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%u:%g:%Lp:%z:%m\' "$source_review_profile")"',
+                    'review_profile="$isolated_root/readonly_child_isolation.sb"',
+                    '/usr/bin/sudo /bin/test ! -e "$review_profile"',
+                    '/usr/bin/sudo /bin/test ! -L "$review_profile"',
+                    '/usr/bin/sudo /bin/cp "$source_review_profile" "$review_profile"',
+                    '/usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"',
+                    '/usr/bin/sudo /bin/chmod -N "$review_profile"',
+                    '/usr/bin/sudo /bin/chmod 0444 "$review_profile"',
+                    '/usr/bin/sudo /bin/test -f "$review_profile"',
+                    '/usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" '
+                    '"$review_profile"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
+                    '"$review_profile")" = "0:0:444"',
+                    '/bin/test ! -w "$review_profile"',
+                    '/usr/bin/sudo -u nobody /bin/test -r "$review_profile"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"',
+                    '[[ "$source_profile_postcopy_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$source_profile_prelaunch_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$source_profile_postrun_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$profile_prelaunch_binding" != "$profile_binding" ]]',
+                    '[[ "$profile_postrun_binding" != "$profile_binding" ]]',
+                ):
+                    self.assertIn(binding, readonly_job)
+                for prohibited_checkout_mutation in (
+                    '\n          review_profile="$checkout_root/',
+                    '/usr/sbin/chown root:wheel "$source_review_profile"',
+                    '/bin/chmod -N "$source_review_profile"',
+                    '/bin/chmod 0444 "$source_review_profile"',
+                    '/usr/bin/chflags uchg "$source_review_profile"',
+                    '/usr/bin/chflags uchg "$review_profile"',
+                    "profile_flags",
+                    "'%d:%i:%u:%g:%Lp:%f' \"$review_profile\"",
+                ):
+                    self.assertNotIn(prohibited_checkout_mutation, readonly_job)
+                for policy_contract in (
+                    "/usr/bin/grep -Fqx '(deny job-creation)'",
+                    "/usr/bin/grep -Fqx '(deny process-exec*'",
+                    "/usr/bin/grep -Fqx '  (file-mode #o4000 #o2000))'",
+                    "/usr/bin/grep -Fq '(literal '",
+                    "(( literal_profile_status != 1 ))",
+                ):
+                    self.assertIn(policy_contract, readonly_job)
+                for removed_inventory_contract in (
+                    "setuid_inventory",
+                    "setuid_find_status",
+                    "probe_nobody_executable",
+                    "access_probe_stderr",
+                    "profile_literal",
+                    "/usr/bin/sudo /usr/bin/find",
+                ):
+                    self.assertNotIn(removed_inventory_contract, readonly_job)
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"

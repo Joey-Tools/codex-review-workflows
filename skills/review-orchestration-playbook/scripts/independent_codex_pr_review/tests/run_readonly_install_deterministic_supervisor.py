@@ -2,33 +2,49 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import grp
 import hashlib
 import json
 import os
 import pathlib
-import signal
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from types import FrameType
-from typing import Any, Iterator
+from typing import Any
 
 from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.recovery_cleanup import (
+    CustodiedDeletionResultOwner,
+    RootSpec,
+    build_custodied_manifest,
+    delete_custodied_roots,
+    quarantine_and_remove_empty_root,
+    quarantined_root_recovery_evidence,
+    remove_published_manifest,
+)
+from review_supervisor.secureio import (
+    directory_identities_match,
+    identity_from_stat,
+)
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
+
 from .support import (
+    _create_bound_owned_private_directory,
     _DirectoryParentBinding,
-    _create_owned_private_directory,
     _open_directory_parent,
     _private_runtime_parent,
 )
-
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
@@ -44,6 +60,22 @@ XATTR_NOFOLLOW = 0x0001
 XATTR_NAMES_LIMIT_BYTES = 64 * 1024
 XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
+DARWIN_PROC_UID_ONLY = 4
+DARWIN_PROC_RUID_ONLY = 5
+DARWIN_PROC_PIDTBSDINFO = 3
+DARWIN_PROCESS_CENSUS_CAP = 4096
+DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS = 5.0
+SANDBOX_FILTER_NONE = 0
+CHILD_ACCOUNT_PROBE_ENVIRONMENT = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+}
+CHILD_ACCOUNT_PROBE_TIMEOUT_SECONDS = 5.0
+BOUND_CLEANUP_ENTRY_CAP = 8192
+BOUND_CLEANUP_MANIFEST_BYTES = 4 * 1024 * 1024
+BOUND_CLEANUP_TIMEOUT_SECONDS = 60.0
+_CLEANUP_RECOVERY_EVIDENCE_ATTR = "_readonly_cleanup_recovery_evidence"
 
 
 @dataclass(frozen=True)
@@ -83,9 +115,16 @@ class CleanupFailure:
     path: str
     error_kind: str
     error_errno: int | None
-    retained: bool
+    retained: bool | None
     restore_error_kind: str | None
     restore_error_errno: int | None
+    original_path: str | None = None
+    path_status: str = "lexical"
+    replacement_path: str | None = None
+    held_identity: dict[str, int] | None = None
+    original_path_status: str | None = None
+    access_policy_status: str | None = None
+    recovery_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,7 +166,76 @@ class ChildSignalGuard:
 
 @dataclass
 class ChildProcessClosureProof:
+    started: bool = False
     proven: bool = False
+
+
+@dataclass(frozen=True)
+class BoundPathEvidence:
+    path: pathlib.Path
+    retained: bool | None
+    path_status: str
+    replacement_path: pathlib.Path | None
+    original_path_status: str
+    access_policy_status: str
+
+
+@dataclass(frozen=True, order=True)
+class DarwinProcessIdentity:
+    pid: int
+    start_seconds: int
+    start_microseconds: int
+
+
+class ChildProcessTreeClosureUnproven(RuntimeError):
+    def __init__(
+        self,
+        processes: tuple[DarwinProcessIdentity, ...],
+        cause: BaseException | None = None,
+    ) -> None:
+        self.processes = processes
+        self.cause = cause
+        identities = ",".join(
+            f"{item.pid}:{item.start_seconds}:{item.start_microseconds}"
+            for item in processes[:16]
+        )
+        if len(processes) > 16:
+            identities += f",...(+{len(processes) - 16})"
+        detail = (
+            identities
+            if identities
+            else type(cause).__name__
+            if cause is not None
+            else "unknown"
+        )
+        super().__init__(f"same-UID child process-tree closure is unproven: {detail}")
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = (
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    )
 
 
 def _install_child_signal_guard() -> ChildSignalGuard:
@@ -255,6 +363,220 @@ def _bound_child_signals(
             raise ChildSignalTeardownError(tuple(secondary_failures))
 
 
+def _process_census_deadline(deadline: float | None = None) -> float:
+    return (
+        time.monotonic() + DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS
+        if deadline is None
+        else deadline
+    )
+
+
+def _require_process_census_time(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("same-UID Darwin process census deadline expired")
+
+
+def _darwin_same_uid_processes(
+    *,
+    deadline: float | None = None,
+) -> tuple[DarwinProcessIdentity, ...]:
+    operation_deadline = _process_census_deadline(deadline)
+    _require_process_census_time(operation_deadline)
+    if sys.platform != "darwin":
+        raise OSError(errno.ENOTSUP, "Darwin process census is unavailable")
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    _require_process_census_time(operation_deadline)
+    list_pids = library.proc_listpids
+    list_pids.argtypes = (
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    list_pids.restype = ctypes.c_int
+    pid_info = library.proc_pidinfo
+    pid_info.argtypes = (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    pid_info.restype = ctypes.c_int
+
+    process_ids: set[int] = set()
+    for process_type in (DARWIN_PROC_UID_ONLY, DARWIN_PROC_RUID_ONLY):
+        _require_process_census_time(operation_deadline)
+        buffer = (ctypes.c_int * DARWIN_PROCESS_CENSUS_CAP)()
+        buffer_bytes = ctypes.sizeof(buffer)
+        ctypes.set_errno(0)
+        result = list_pids(
+            process_type,
+            os.getuid(),
+            buffer,
+            buffer_bytes,
+        )
+        _require_process_census_time(operation_deadline)
+        error_number = ctypes.get_errno()
+        if (
+            result < 0
+            or (result == 0 and error_number != 0)
+            or result % ctypes.sizeof(ctypes.c_int) != 0
+        ):
+            raise OSError(
+                error_number or errno.EIO,
+                "cannot enumerate same-UID Darwin processes",
+            )
+        if result >= buffer_bytes:
+            raise OverflowError("same-UID Darwin process census exceeds its cap")
+        count = result // ctypes.sizeof(ctypes.c_int)
+        process_ids.update(item for item in buffer[:count] if item > 0)
+
+    processes: list[DarwinProcessIdentity] = []
+    for pid in sorted(process_ids):
+        _require_process_census_time(operation_deadline)
+        value = _DarwinProcBsdInfo()
+        ctypes.set_errno(0)
+        info_result = pid_info(
+            pid,
+            DARWIN_PROC_PIDTBSDINFO,
+            0,
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+        )
+        _require_process_census_time(operation_deadline)
+        error_number = ctypes.get_errno()
+        if (
+            info_result != ctypes.sizeof(value)
+            or value.pbi_pid != pid
+            or (value.pbi_uid != os.getuid() and value.pbi_ruid != os.getuid())
+            or value.pbi_start_tvsec == 0
+            or value.pbi_start_tvusec >= 1_000_000
+        ):
+            raise OSError(
+                error_number or errno.EIO,
+                f"cannot bind same-UID Darwin process identity: {pid}",
+            )
+        processes.append(
+            DarwinProcessIdentity(
+                pid=pid,
+                start_seconds=value.pbi_start_tvsec,
+                start_microseconds=value.pbi_start_tvusec,
+            )
+        )
+    return tuple(processes)
+
+
+def _stable_same_uid_processes(
+    *,
+    deadline: float | None = None,
+) -> tuple[DarwinProcessIdentity, ...]:
+    operation_deadline = _process_census_deadline(deadline)
+    first = _darwin_same_uid_processes(deadline=operation_deadline)
+    remaining = operation_deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("same-UID Darwin process census deadline expired")
+    time.sleep(min(0.01, remaining))
+    _require_process_census_time(operation_deadline)
+    second = _darwin_same_uid_processes(deadline=operation_deadline)
+    if first != second:
+        raise ChildProcessTreeClosureUnproven(
+            tuple(sorted(set(first) | set(second))),
+            OSError(errno.ESTALE, "same-UID process baseline changed"),
+        )
+    return second
+
+
+def _require_no_new_same_uid_processes(
+    baseline: tuple[DarwinProcessIdentity, ...],
+    *,
+    deadline: float | None = None,
+) -> None:
+    operation_deadline = _process_census_deadline(deadline)
+    baseline_set = set(baseline)
+    for pause in (0.0, 0.01):
+        if pause:
+            remaining = operation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("same-UID Darwin process census deadline expired")
+            time.sleep(min(pause, remaining))
+            _require_process_census_time(operation_deadline)
+        observed = _darwin_same_uid_processes(deadline=operation_deadline)
+        escaped = tuple(item for item in observed if item not in baseline_set)
+        if escaped:
+            raise ChildProcessTreeClosureUnproven(escaped)
+        if not any(item.pid == os.getpid() for item in observed):
+            raise ChildProcessTreeClosureUnproven(
+                (),
+                OSError(errno.ESTALE, "process census omitted the supervisor"),
+            )
+
+
+def _require_sudo_exec_denied() -> None:
+    try:
+        subprocess.run(
+            ("/usr/bin/sudo", "-n", "-l"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=CHILD_ACCOUNT_PROBE_TIMEOUT_SECONDS,
+            env=CHILD_ACCOUNT_PROBE_ENVIRONMENT,
+        )
+    except PermissionError as error:
+        if error.errno == errno.EPERM:
+            return
+        raise RuntimeError(
+            "cannot prove the inherited sandbox denies sudo execution"
+        ) from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            "cannot prove the inherited sandbox denies sudo execution"
+        ) from error
+    raise RuntimeError("sudo execution was not denied by the inherited sandbox")
+
+
+def _require_job_creation_denied() -> None:
+    if sys.platform != "darwin":
+        raise OSError(errno.ENOTSUP, "Darwin Seatbelt inspection is unavailable")
+    library = ctypes.CDLL("/usr/lib/libsandbox.1.dylib", use_errno=True)
+    sandbox_check = library.sandbox_check
+    sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    sandbox_check.restype = ctypes.c_int
+    result = sandbox_check(
+        os.getpid(),
+        b"job-creation",
+        SANDBOX_FILTER_NONE,
+    )
+    if result != 1:
+        raise RuntimeError(
+            "cannot prove the inherited sandbox denies launchd job creation"
+        )
+
+
+def _require_isolated_child_account() -> tuple[DarwinProcessIdentity, ...]:
+    if os.getuid() == 0 or os.geteuid() != os.getuid():
+        raise PermissionError(errno.EPERM, "read-only child account UID is privileged")
+    try:
+        admin_group = grp.getgrnam("admin").gr_gid
+    except KeyError as error:
+        raise RuntimeError("cannot resolve the Darwin admin group") from error
+    if admin_group in os.getgroups():
+        raise PermissionError(
+            errno.EPERM,
+            "read-only child account is a member of the admin group",
+        )
+    _require_job_creation_denied()
+    _require_sudo_exec_denied()
+    baseline = _stable_same_uid_processes()
+    if len(baseline) != 1 or baseline[0].pid != os.getpid():
+        raise ChildProcessTreeClosureUnproven(
+            baseline,
+            OSError(errno.EBUSY, "read-only child account is not process-isolated"),
+        )
+    return baseline
+
+
 def _run_bounded_child(
     argv: tuple[str, ...],
     *,
@@ -265,12 +587,21 @@ def _run_bounded_child(
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
     secondary_failures: list[SecondaryFailure] | None = None,
     closure_proof: ChildProcessClosureProof | None = None,
+    require_isolated_account: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
     with _bound_child_signals(diagnostics):
+        baseline = (
+            _require_isolated_child_account()
+            if require_isolated_account
+            else _stable_same_uid_processes()
+        )
+        result: tuple[int, bytes, bytes] | None = None
+        pending_error: BaseException | None = None
+        proof.started = True
         try:
-            returncode, stdout, stderr = run_bounded(
+            result = run_bounded(
                 argv,
                 cwd=cwd,
                 environment=environment,
@@ -288,11 +619,22 @@ def _run_bounded_child(
                         teardown_error,
                     )
                 )
-            raise
-        except BaseException:
-            proof.proven = True
-            raise
+            pending_error = error
+        except BaseException as error:
+            pending_error = error
+        try:
+            _require_no_new_same_uid_processes(baseline)
+        except ChildProcessTreeClosureUnproven as error:
+            raise error from pending_error
+        except BaseException as error:
+            raise ChildProcessTreeClosureUnproven((), error) from pending_error
+        if isinstance(pending_error, GitProcessClosureUnproven):
+            raise pending_error
         proof.proven = True
+        if pending_error is not None:
+            raise pending_error
+        assert result is not None
+        returncode, stdout, stderr = result
     return subprocess.CompletedProcess(
         args=argv,
         returncode=returncode,
@@ -503,6 +845,66 @@ def _restore_owner_write(root: pathlib.Path) -> None:
             continue
 
 
+def _filesystem_object_key(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+    )
+
+
+def _restore_owner_write_below_bound_root(root_fd: int) -> None:
+    deadline = time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS
+    remaining = BOUND_CLEANUP_ENTRY_CAP
+
+    def visit(directory_fd: int, depth: int) -> None:
+        nonlocal remaining
+        if depth > 512:
+            raise ValueError("bound cleanup tree exceeds its depth cap")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("bound cleanup write restoration timed out")
+        with os.scandir(directory_fd) as entries:
+            names = tuple(os.fsencode(entry.name) for entry in entries)
+        for name in names:
+            if remaining <= 0:
+                raise ValueError("bound cleanup tree exceeds its entry cap")
+            remaining -= 1
+            if time.monotonic() >= deadline:
+                raise TimeoutError("bound cleanup write restoration timed out")
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                before = os.fstat(child_fd)
+                if _filesystem_object_key(before) != _filesystem_object_key(metadata):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound cleanup directory changed before write restoration",
+                    )
+                visit(child_fd, depth + 1)
+                os.fchmod(
+                    child_fd,
+                    stat.S_IMODE(before.st_mode) | stat.S_IWUSR | stat.S_IXUSR,
+                )
+                if _filesystem_object_key(os.fstat(child_fd)) != _filesystem_object_key(
+                    before
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound cleanup directory changed during write restoration",
+                    )
+            finally:
+                os.close(child_fd)
+
+    visit(root_fd, 1)
+
+
 def _bounded_failure_text(value: str, *, limit: int = 16_384) -> str:
     if len(value) <= limit:
         return value
@@ -568,15 +970,33 @@ def _cleanup_tree(
 def _cleanup_failure_from_error(
     path: pathlib.Path,
     error: BaseException,
+    *,
+    retained: bool | None,
+    original_path: pathlib.Path | None = None,
+    path_status: str = "lexical",
+    replacement_path: pathlib.Path | None = None,
+    held_identity: dict[str, int] | None = None,
+    original_path_status: str | None = None,
+    access_policy_status: str | None = None,
+    recovery_evidence: dict[str, Any] | None = None,
 ) -> CleanupFailure:
     error_errno = getattr(error, "errno", None)
     return CleanupFailure(
         path=str(path),
         error_kind=type(error).__name__,
         error_errno=error_errno if isinstance(error_errno, int) else None,
-        retained=os.path.lexists(path),
+        retained=retained,
         restore_error_kind=None,
         restore_error_errno=None,
+        original_path=str(original_path) if original_path is not None else None,
+        path_status=path_status,
+        replacement_path=(
+            str(replacement_path) if replacement_path is not None else None
+        ),
+        held_identity=held_identity,
+        original_path_status=original_path_status,
+        access_policy_status=access_policy_status,
+        recovery_evidence=recovery_evidence,
     )
 
 
@@ -589,20 +1009,339 @@ def _list_bound_directory(
     return entries
 
 
+def _bound_path_evidence(binding: _DirectoryParentBinding) -> BoundPathEvidence:
+    original_status = binding.original_path_identity_status()
+    access_policy_status = binding.access_policy_status()
+    try:
+        current = binding.current_path()
+    except (OSError, ValueError):
+        return BoundPathEvidence(
+            path=binding.path,
+            retained=_held_object_namespace_retention(binding),
+            path_status="bound-unresolved",
+            replacement_path=(binding.path if original_status == "replaced" else None),
+            original_path_status=original_status,
+            access_policy_status=access_policy_status,
+        )
+    if current == binding.path and original_status != "same":
+        original_status = "unstable"
+    return BoundPathEvidence(
+        path=current,
+        retained=True,
+        path_status="bound-original" if current == binding.path else "bound-moved",
+        replacement_path=(
+            binding.path
+            if current != binding.path and original_status == "replaced"
+            else None
+        ),
+        original_path_status=original_status,
+        access_policy_status=access_policy_status,
+    )
+
+
+def _held_object_namespace_retention(
+    binding: _DirectoryParentBinding,
+) -> bool | None:
+    """Classify namespace retention of the exact descriptor-bound directory."""
+    try:
+        held_metadata = os.fstat(binding.fd)
+    except OSError:
+        return None
+    if _stat_object_locator(held_metadata) != binding.object_locator():
+        return None
+    # A positive link count cannot distinguish a non-ASCII move, a transient
+    # reopen failure, or another unresolved location. Zero alone proves that
+    # this exact held directory object is no longer linked into the namespace.
+    return False if held_metadata.st_nlink == 0 else None
+
+
+def _bound_cleanup_failure(
+    binding: _DirectoryParentBinding,
+    error: BaseException,
+) -> CleanupFailure:
+    evidence = _bound_path_evidence(binding)
+    recovery_evidence = getattr(error, _CLEANUP_RECOVERY_EVIDENCE_ATTR, None)
+    if not isinstance(recovery_evidence, dict):
+        recovery_evidence = None
+    return _cleanup_failure_from_error(
+        evidence.path,
+        error,
+        retained=evidence.retained,
+        original_path=binding.path,
+        path_status=evidence.path_status,
+        replacement_path=evidence.replacement_path,
+        held_identity=binding.object_locator(),
+        original_path_status=evidence.original_path_status,
+        access_policy_status=evidence.access_policy_status,
+        recovery_evidence=recovery_evidence,
+    )
+
+
+def _stat_object_locator(value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": value.st_dev,
+        "inode": value.st_ino,
+        "file_type": stat.S_IFMT(value.st_mode),
+        "generation": getattr(value, "st_gen", 0),
+    }
+
+
+def _snapshot_bound_cleanup_recovery(
+    error: BaseException,
+    *,
+    parent_binding: _DirectoryParentBinding,
+    manifest_path: pathlib.Path,
+    manifest_seal: dict[str, Any] | None,
+    deletion_owner: CustodiedDeletionResultOwner,
+) -> None:
+    try:
+        parent_path = parent_binding.current_path()
+        parent_path_status = (
+            "bound-original" if parent_path == parent_binding.path else "bound-moved"
+        )
+    except (OSError, ValueError):
+        parent_path = parent_binding.path
+        parent_path_status = "bound-unresolved"
+
+    deletion_recovery = deletion_owner.recovery_evidence(expected_root_count=1)
+    root_states = {
+        item["quarantine_name_hex"]: item["state"]
+        for item in deletion_recovery["roots"]
+    }
+    quarantined_roots: list[dict[str, Any]] = []
+    for evidence in quarantined_root_recovery_evidence(error):
+        quarantine_name = os.fsdecode(evidence.quarantine_name)
+        quarantine_path = parent_path / quarantine_name
+        observed_identity: dict[str, int] | None = None
+        observed_locator: dict[str, int] | None = None
+        try:
+            observed_stat = os.stat(
+                evidence.quarantine_name,
+                dir_fd=evidence.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            quarantine_status = "missing"
+            retained: bool | None = False
+        except OSError:
+            quarantine_status = "unreadable"
+            retained = None
+        else:
+            observed = identity_from_stat(observed_stat)
+            observed_identity = observed.to_json()
+            observed_locator = _stat_object_locator(observed_stat)
+            quarantine_status = (
+                "expected-object"
+                if directory_identities_match(observed, evidence.expected_identity)
+                else "different-object"
+            )
+            retained = True
+        try:
+            held_root_locator = _stat_object_locator(os.fstat(evidence.root_fd))
+        except OSError:
+            held_root_locator = None
+        quarantined_roots.append(
+            {
+                "label": evidence.label,
+                "stage": evidence.stage,
+                "protected_property": evidence.protected_property,
+                "original_name_hex": evidence.original_name.hex(),
+                "quarantine_name_hex": evidence.quarantine_name.hex(),
+                "original_path": str(parent_path / os.fsdecode(evidence.original_name)),
+                "quarantine_path": str(quarantine_path),
+                "parent_path_status": parent_path_status,
+                "parent_identity": evidence.parent_identity.to_json(),
+                "parent_held_identity": parent_binding.object_locator(),
+                "parent_access_policy_status": (parent_binding.access_policy_status()),
+                "expected_root_identity": evidence.expected_identity.to_json(),
+                "held_root_identity": held_root_locator,
+                "observed_quarantine_identity": observed_identity,
+                "observed_quarantine_locator": observed_locator,
+                "quarantine_status": quarantine_status,
+                "retained": retained,
+                "deletion_state": root_states.get(
+                    evidence.quarantine_name.hex(),
+                    "not-published",
+                ),
+            }
+        )
+
+    manifest_evidence = {
+        "path": str(manifest_path),
+        "state": "published" if manifest_seal is not None else "not-published",
+        "sha256": (manifest_seal.get("sha256") if manifest_seal is not None else None),
+        "record_count": (
+            manifest_seal.get("record_count") if manifest_seal is not None else None
+        ),
+    }
+    setattr(
+        error,
+        _CLEANUP_RECOVERY_EVIDENCE_ATTR,
+        {
+            "protected_property": (
+                "recovery-object-identity-and-deletion-result-ownership"
+            ),
+            "manifest": manifest_evidence,
+            "deletion_result": deletion_recovery,
+            "quarantined_roots": quarantined_roots,
+        },
+    )
+
+
+def _delete_bound_tree(
+    binding: _DirectoryParentBinding,
+    *,
+    restore_owner_write: bool,
+    manifest_path: pathlib.Path,
+) -> None:
+    binding.revalidate()
+    if restore_owner_write:
+        _restore_owner_write_below_bound_root(binding.fd)
+        binding.revalidate()
+    parent_binding = _open_directory_parent(
+        binding.path.parent,
+        require_owned_private_parent=binding.require_owned_private_parent,
+    )
+    manifest = None
+    seal: dict[str, Any] | None = None
+    deletion_owner = CustodiedDeletionResultOwner()
+    try:
+        deadline = time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS
+        manifest = build_custodied_manifest(
+            roots=(
+                RootSpec(
+                    label="read-only-installed-test-tree",
+                    parent_fd=parent_binding.fd,
+                    parent_identity=parent_binding.identity,
+                    name=os.fsencode(binding.path.name),
+                    expected_identity=binding.identity,
+                    private_metadata=True,
+                ),
+            ),
+            manifest_path=manifest_path,
+            entry_cap=BOUND_CLEANUP_ENTRY_CAP,
+            payload_cap=BOUND_CLEANUP_MANIFEST_BYTES,
+            deadline=deadline,
+        )
+        seal = manifest.seal
+        delete_custodied_roots(
+            manifest,
+            deadline=deadline,
+            result_owner=deletion_owner,
+        )
+    except BaseException as error:
+        attached_owner = getattr(
+            error,
+            "custodied_deletion_result_owner",
+            deletion_owner,
+        )
+        if not isinstance(attached_owner, CustodiedDeletionResultOwner):
+            attached_owner = deletion_owner
+        try:
+            _snapshot_bound_cleanup_recovery(
+                error,
+                parent_binding=parent_binding,
+                manifest_path=manifest_path,
+                manifest_seal=seal,
+                deletion_owner=attached_owner,
+            )
+        except BaseException as recovery_error:
+            error.add_note(
+                "cleanup recovery evidence capture failed: "
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
+        raise
+    finally:
+        try:
+            if manifest is not None:
+                manifest.close()
+        finally:
+            parent_binding.close()
+    assert seal is not None
+    remove_published_manifest(seal)
+
+
 def _cleanup_bound_tree(
     binding: _DirectoryParentBinding | None,
     *,
     restore_owner_write: bool,
+    manifest_path: pathlib.Path | None = None,
 ) -> CleanupFailure | None:
     if binding is None:
         return None
     try:
         binding.revalidate()
     except Exception as error:
-        return _cleanup_failure_from_error(binding.path, error)
-    return _cleanup_tree(
-        binding.path,
-        restore_owner_write=restore_owner_write,
+        return _bound_cleanup_failure(binding, error)
+    if manifest_path is None:
+        return _bound_cleanup_failure(
+            binding,
+            RuntimeError("descriptor-bound cleanup control is unavailable"),
+        )
+    try:
+        _delete_bound_tree(
+            binding,
+            restore_owner_write=restore_owner_write,
+            manifest_path=manifest_path,
+        )
+    except Exception as error:
+        return _bound_cleanup_failure(binding, error)
+    return None
+
+
+def _cleanup_empty_bound_control(
+    binding: _DirectoryParentBinding,
+) -> CleanupFailure | None:
+    try:
+        binding.revalidate()
+        parent_binding = _open_directory_parent(
+            binding.path.parent,
+            require_owned_private_parent=binding.require_owned_private_parent,
+        )
+        try:
+            quarantine_and_remove_empty_root(
+                RootSpec(
+                    label="read-only-cleanup-control",
+                    parent_fd=parent_binding.fd,
+                    parent_identity=parent_binding.identity,
+                    name=os.fsencode(binding.path.name),
+                    expected_identity=binding.identity,
+                    private_metadata=True,
+                ),
+                binding.fd,
+                deadline=time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS,
+            )
+        finally:
+            parent_binding.close()
+    except Exception as error:
+        return _bound_cleanup_failure(binding, error)
+    return None
+
+
+def _retained_bound_for_unproven_child_closure(
+    binding: _DirectoryParentBinding | None,
+    fallback: pathlib.Path | None,
+) -> CleanupFailure | None:
+    if binding is None:
+        return _retained_for_unproven_child_closure(fallback)
+    evidence = _bound_path_evidence(binding)
+    return CleanupFailure(
+        path=str(evidence.path),
+        error_kind="ChildProcessClosureUnproven",
+        error_errno=None,
+        retained=evidence.retained,
+        restore_error_kind=None,
+        restore_error_errno=None,
+        original_path=str(binding.path),
+        path_status=evidence.path_status,
+        replacement_path=(
+            str(evidence.replacement_path)
+            if evidence.replacement_path is not None
+            else None
+        ),
+        held_identity=binding.object_locator(),
+        original_path_status=evidence.original_path_status,
+        access_policy_status=evidence.access_policy_status,
     )
 
 
@@ -638,8 +1377,10 @@ def main() -> int:
 
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
+    install_container_binding: _DirectoryParentBinding | None = None
     runtime_parent: pathlib.Path | None = None
     runtime_parent_binding: _DirectoryParentBinding | None = None
+    cleanup_control_binding: _DirectoryParentBinding | None = None
     installed_root: pathlib.Path | None = None
     completed: subprocess.CompletedProcess[str] | None = None
     before: dict[str, TreeEntrySnapshot] | None = None
@@ -656,21 +1397,18 @@ def main() -> int:
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     stage = "install-container"
     try:
-        install_container = _create_owned_private_directory(
+        install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
             require_owned_private_parent=False,
         )
+        install_container = install_container_binding.path
         stage = "runtime-parent"
-        runtime_parent = _create_owned_private_directory(
+        runtime_parent_binding = _create_bound_owned_private_directory(
             _private_runtime_parent(),
             ".codex-review-readonly-runtime-",
         )
-        stage = "runtime-parent-binding"
-        runtime_parent_binding = _open_directory_parent(
-            runtime_parent,
-            require_owned_private_parent=True,
-        )
+        runtime_parent = runtime_parent_binding.path
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
@@ -697,7 +1435,6 @@ def main() -> int:
             }
         )
         stage = "child-run"
-        child_process_closure = "pending"
         completed = _run_bounded_child(
             (
                 sys.executable,
@@ -709,8 +1446,11 @@ def main() -> int:
             environment=environment,
             secondary_failures=secondary_failures,
             closure_proof=closure_proof,
+            require_isolated_account=True,
         )
         child_process_closure = "proven"
+        stage = "install-container-revalidation"
+        install_container_binding.revalidate()
         stage = "snapshot-after"
         after = _tree_snapshot(installed_root)
         stage = "runtime-residue"
@@ -722,47 +1462,181 @@ def main() -> int:
         primary_failure = _primary_failure(stage, error)
     except TimeoutError as error:
         timeout_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = (
+            "proven"
+            if closure_proof.proven
+            else "unproven"
+            if closure_proof.started
+            else "not-started"
+        )
         primary_failure = _primary_failure(stage, error)
     except OverflowError as error:
         output_limit_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = (
+            "proven"
+            if closure_proof.proven
+            else "unproven"
+            if closure_proof.started
+            else "not-started"
+        )
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
-        child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = (
+            "proven"
+            if closure_proof.proven
+            else "unproven"
+            if closure_proof.started
+            else "not-started"
+        )
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
-        if child_process_closure == "pending":
-            child_process_closure = "proven" if closure_proof.proven else "unproven"
+        child_process_closure = (
+            "proven"
+            if closure_proof.proven
+            else "unproven"
+            if closure_proof.started
+            else "not-started"
+        )
         primary_failure = _primary_failure(stage, error)
     finally:
-        if child_process_closure == "pending" and closure_proof.proven:
-            child_process_closure = "proven"
         cleanup_results: list[CleanupFailure | None]
-        if child_process_closure in {"pending", "unproven"}:
+        if child_process_closure == "unproven":
             cleanup_results = [
-                _retained_for_unproven_child_closure(install_container),
-                _retained_for_unproven_child_closure(runtime_parent),
+                _retained_bound_for_unproven_child_closure(
+                    install_container_binding,
+                    install_container,
+                ),
+                _retained_bound_for_unproven_child_closure(
+                    runtime_parent_binding,
+                    runtime_parent,
+                ),
             ]
         else:
+            try:
+                cleanup_control_binding = _create_bound_owned_private_directory(
+                    _private_runtime_parent(),
+                    ".codex-review-readonly-cleanup-",
+                )
+            except Exception as error:
+                secondary_failures.append(
+                    _secondary_failure("create-bound-cleanup-control", error)
+                )
             cleanup_results = [
-                _cleanup_tree(install_container, restore_owner_write=True),
+                _cleanup_bound_tree(
+                    install_container_binding,
+                    restore_owner_write=True,
+                    manifest_path=(
+                        cleanup_control_binding.path / "install.manifest"
+                        if cleanup_control_binding is not None
+                        else None
+                    ),
+                ),
                 _cleanup_bound_tree(
                     runtime_parent_binding,
                     restore_owner_write=False,
+                    manifest_path=(
+                        cleanup_control_binding.path / "runtime.manifest"
+                        if cleanup_control_binding is not None
+                        else None
+                    ),
                 ),
             ]
+            if install_container_binding is None:
+                cleanup_results.append(
+                    _cleanup_tree(install_container, restore_owner_write=True)
+                )
             if runtime_parent_binding is None:
                 cleanup_results.append(
                     _cleanup_tree(runtime_parent, restore_owner_write=False)
+                )
+            if cleanup_control_binding is not None:
+                try:
+                    cleanup_control_entries = _list_bound_directory(
+                        cleanup_control_binding
+                    )
+                except Exception:
+                    cleanup_control_entries = ("<unreadable>",)
+                if cleanup_control_entries:
+                    evidence = _bound_path_evidence(cleanup_control_binding)
+                    cleanup_results.append(
+                        CleanupFailure(
+                            path=str(evidence.path),
+                            error_kind="CleanupControlRetained",
+                            error_errno=None,
+                            retained=evidence.retained,
+                            restore_error_kind=None,
+                            restore_error_errno=None,
+                            original_path=str(cleanup_control_binding.path),
+                            path_status=evidence.path_status,
+                            replacement_path=(
+                                str(evidence.replacement_path)
+                                if evidence.replacement_path is not None
+                                else None
+                            ),
+                            held_identity=cleanup_control_binding.object_locator(),
+                            original_path_status=evidence.original_path_status,
+                            access_policy_status=evidence.access_policy_status,
+                        )
+                    )
+                else:
+                    cleanup_results.append(
+                        _cleanup_empty_bound_control(cleanup_control_binding)
+                    )
+        if install_container_binding is not None:
+            try:
+                install_container_binding.close()
+            except Exception as error:
+                cleanup_results.append(
+                    _cleanup_failure_from_error(
+                        install_container_binding.path,
+                        error,
+                        retained=None,
+                        original_path=install_container_binding.path,
+                        path_status="close-unresolved",
+                        replacement_path=(
+                            install_container_binding.path
+                            if os.path.lexists(install_container_binding.path)
+                            else None
+                        ),
+                    )
                 )
         if runtime_parent_binding is not None:
             try:
                 runtime_parent_binding.close()
             except Exception as error:
                 cleanup_results.append(
-                    _cleanup_failure_from_error(runtime_parent_binding.path, error)
+                    _cleanup_failure_from_error(
+                        runtime_parent_binding.path,
+                        error,
+                        retained=None,
+                        original_path=runtime_parent_binding.path,
+                        path_status="close-unresolved",
+                        replacement_path=(
+                            runtime_parent_binding.path
+                            if os.path.lexists(runtime_parent_binding.path)
+                            else None
+                        ),
+                    )
+                )
+        if cleanup_control_binding is not None:
+            try:
+                cleanup_control_binding.close()
+            except Exception as error:
+                cleanup_results.append(
+                    _cleanup_failure_from_error(
+                        cleanup_control_binding.path,
+                        error,
+                        retained=None,
+                        original_path=cleanup_control_binding.path,
+                        path_status="close-unresolved",
+                        replacement_path=(
+                            cleanup_control_binding.path
+                            if os.path.lexists(cleanup_control_binding.path)
+                            else None
+                        ),
+                        held_identity=cleanup_control_binding.object_locator(),
+                    )
                 )
         cleanup_failures = tuple(
             failure for failure in cleanup_results if failure is not None
@@ -773,7 +1647,9 @@ def main() -> int:
         and after is not None
         and _tree_property_unchanged(before, after)
     )
-    retained_paths = [failure.path for failure in cleanup_failures if failure.retained]
+    retained_paths = [
+        failure.path for failure in cleanup_failures if failure.retained is not False
+    ]
     if primary_failure is not None:
         if timeout_error is not None:
             primary_status = "timed-out"

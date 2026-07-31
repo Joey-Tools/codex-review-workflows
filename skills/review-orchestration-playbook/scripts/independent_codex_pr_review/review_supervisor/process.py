@@ -1072,10 +1072,14 @@ def _darwin_process_group_members(
     buffer_bytes = ctypes.sizeof(buffer)
     ctypes.set_errno(0)
     result = function(2, process_group, buffer, buffer_bytes)
+    error_number = ctypes.get_errno()
     if time.monotonic() >= deadline:
         raise TimeoutError("process-group inspection deadline expired")
-    if result < 0 or result % ctypes.sizeof(ctypes.c_int) != 0:
-        error_number = ctypes.get_errno()
+    if (
+        result < 0
+        or (result == 0 and error_number != 0)
+        or result % ctypes.sizeof(ctypes.c_int) != 0
+    ):
         raise ValueError(
             "cannot enumerate Darwin process-group members"
             + (f": {os.strerror(error_number)}" if error_number else "")

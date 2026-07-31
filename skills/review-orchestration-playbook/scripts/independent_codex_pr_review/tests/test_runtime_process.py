@@ -166,6 +166,37 @@ class ProcessStartIdentityTests(unittest.TestCase):
             process_start_identity(pid)
 
 
+class DarwinProcessGroupEnumerationTests(unittest.TestCase):
+    def test_zero_result_with_errno_is_an_enumeration_failure(self) -> None:
+        class SyntheticProcListPids:
+            argtypes: object = None
+            restype: object = None
+
+            def __call__(self, *_args: object) -> int:
+                process_module.ctypes.set_errno(errno.EIO)
+                return 0
+
+        class SyntheticLibproc:
+            def __init__(self) -> None:
+                self.proc_listpids = SyntheticProcListPids()
+
+        with (
+            mock.patch.object(
+                process_module.ctypes,
+                "CDLL",
+                return_value=SyntheticLibproc(),
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "cannot enumerate Darwin process-group members",
+            ),
+        ):
+            process_module._darwin_process_group_members(
+                700,
+                deadline=time.monotonic() + 1,
+            )
+
+
 class LinuxProcessGroupEnumerationTests(unittest.TestCase):
     def test_terminal_proc_states_do_not_block_group_closure(self) -> None:
         process_group = 700
