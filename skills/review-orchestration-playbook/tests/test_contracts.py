@@ -185,6 +185,7 @@ def _github_codex_issue_body_semantic(
     *,
     repository: str,
     head: str,
+    allow_foreign_finding_sha: bool = False,
 ) -> tuple[str, str | None]:
     body = _normalize_github_codex_body(raw_body)
     if body is None or not _github_codex_issue_terminal_looking(body):
@@ -260,8 +261,10 @@ def _github_codex_issue_body_semantic(
             ):
                 return ("malformed", None)
             shas.add(match.group("sha"))
-        if shas == {head}:
-            return ("findings", head)
+        if len(shas) == 1:
+            finding_sha = next(iter(shas))
+            if finding_sha == head or allow_foreign_finding_sha:
+                return ("findings", finding_sha)
     return ("malformed", None)
 
 
@@ -357,6 +360,84 @@ def _review_thread_pages(
     }
 
 
+def _graphql_thread_comment_fixture(
+    comment_id: int,
+    *,
+    parent_id: int | None,
+    repository: str = "OWNER/REPO",
+    pull_request: int = 1,
+) -> dict[str, object]:
+    return {
+        "id": f"PRRC_{comment_id}",
+        "fullDatabaseId": str(comment_id),
+        "url": (
+            f"https://github.com/{repository}/pull/{pull_request}"
+            f"#discussion_r{comment_id}"
+        ),
+        "pullRequestReview": (
+            {
+                "id": f"PRR_{parent_id}",
+                "fullDatabaseId": str(parent_id),
+            }
+            if parent_id is not None
+            else None
+        ),
+    }
+
+
+def _selected_review_target_children(
+    children: object,
+    *,
+    repository: str,
+    pull_request: int,
+    parent_review_id: int,
+) -> list[dict[str, object]] | None:
+    if not isinstance(children, list):
+        return None
+    exact_login = "chatgpt-codex-connector[bot]"
+    seen_child_ids: set[int] = set()
+    targets: list[dict[str, object]] = []
+    for child in children:
+        if not isinstance(child, dict):
+            return None
+        child_id = child.get("id")
+        parent_id = child.get("pull_request_review_id")
+        login = child.get("user_login")
+        user_type = child.get("user_type")
+        if (
+            type(child_id) is not int
+            or child_id <= 0
+            or child_id in seen_child_ids
+            or child.get("url")
+            != (
+                f"https://github.com/{repository}/pull/{pull_request}"
+                f"#discussion_r{child_id}"
+            )
+            or (
+                parent_id is not None and (type(parent_id) is not int or parent_id <= 0)
+            )
+        ):
+            return None
+        seen_child_ids.add(child_id)
+
+        if login == exact_login and user_type == "Bot":
+            actor = "exact"
+        elif (
+            isinstance(login, str)
+            and login
+            and login != exact_login
+            and user_type in {"User", "Bot"}
+            and not (user_type == "Bot" and "codex" in login.lower())
+        ):
+            actor = "different"
+        else:
+            return None
+
+        if actor == "exact" and parent_id == parent_review_id:
+            targets.append(child)
+    return targets
+
+
 def _review_thread_findings_from_raw(
     children: object,
     thread_pages: object,
@@ -376,30 +457,15 @@ def _review_thread_findings_from_raw(
     ):
         return None
 
-    rest_children: dict[str, dict[str, object]] = {}
-    for child in children:
-        if not isinstance(child, dict):
-            return None
-        raw_child_id = child.get("id")
-        raw_parent_review_id = child.get("pull_request_review_id")
-        child_id = (
-            str(raw_child_id)
-            if type(raw_child_id) is int and raw_child_id > 0
-            else None
-        )
-        if (
-            child_id is None
-            or child_id in rest_children
-            or child.get("url")
-            != (
-                f"https://github.com/{repository}/pull/{pull_request}"
-                f"#discussion_r{child_id}"
-            )
-            or type(raw_parent_review_id) is not int
-            or raw_parent_review_id != parent_review_id
-        ):
-            return None
-        rest_children[child_id] = child
+    target_children = _selected_review_target_children(
+        children,
+        repository=repository,
+        pull_request=pull_request,
+        parent_review_id=parent_review_id,
+    )
+    if target_children is None:
+        return None
+    rest_children = {str(child["id"]): child for child in target_children}
 
     def connection_nodes(
         connection: object,
@@ -466,6 +532,7 @@ def _review_thread_findings_from_raw(
     mapped_children: dict[str, dict[str, object]] = {}
     thread_ids: set[str] = set()
     graphql_comment_ids: set[str] = set()
+    graphql_child_ids: set[str] = set()
     graphql_review_ids: set[str] = set()
     for thread in thread_nodes:
         thread_id = thread.get("id")
@@ -498,21 +565,40 @@ def _review_thread_findings_from_raw(
                 or not graphql_comment_id
                 or graphql_comment_id in graphql_comment_ids
                 or child_id is None
-                or child_id in mapped_children
-                or child_id not in rest_children
+                or child_id in graphql_child_ids
+                or comment.get("url")
+                != (
+                    f"https://github.com/{repository}/pull/{pull_request}"
+                    f"#discussion_r{child_id}"
+                )
+                or (
+                    parent is not None
+                    and (
+                        not isinstance(parent, dict)
+                        or set(parent) != {"id", "fullDatabaseId"}
+                        or not isinstance(parent.get("id"), str)
+                        or not parent["id"]
+                        or not isinstance(parent.get("fullDatabaseId"), str)
+                        or _canonical_positive_decimal(parent.get("fullDatabaseId"))
+                        is None
+                    )
+                )
+            ):
+                return None
+            graphql_comment_ids.add(graphql_comment_id)
+            graphql_child_ids.add(child_id)
+            if child_id not in rest_children:
+                continue
+            if (
+                child_id in mapped_children
                 or comment.get("url") != rest_children[child_id].get("url")
                 or not isinstance(parent, dict)
-                or set(parent) != {"id", "fullDatabaseId"}
-                or not isinstance(parent.get("id"), str)
-                or not parent["id"]
-                or not isinstance(parent.get("fullDatabaseId"), str)
                 or (
                     _canonical_positive_decimal(parent.get("fullDatabaseId"))
                     != str(parent_review_id)
                 )
             ):
                 return None
-            graphql_comment_ids.add(graphql_comment_id)
             graphql_review_ids.add(parent["id"])
             mapped_children[child_id] = {
                 "child_id": int(child_id),
@@ -2853,7 +2939,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "the only clean-completion path that deliberately has no terminal "
                 "review/comment payload"
             ),
-            "`schema_version: 2`",
+            "`schema_version: 3`",
             "`merge_base_commit.sha`",
             "`source_evidence`",
             "raw github rest timestamps remain canonical whole-second rfc3339",
@@ -2974,12 +3060,48 @@ class RepositoryContractTest(unittest.TestCase):
             "d03de9035d20f285e6a93986d436403b4a30e9bc",
             authority,
         )
-        for relative_path, blob_id in baseline_manifest.items():
-            with self.subTest(action_baseline_path=relative_path):
-                self.assertIn(
-                    f"| `{relative_path}` | `{blob_id}` |",
-                    authority,
+
+        def parsed_baseline_manifest(document: str) -> dict[str, str] | None:
+            lines = document.splitlines()
+            header = "| Relative path | Git blob ID |"
+            header_indexes = [
+                index for index, line in enumerate(lines) if line == header
+            ]
+            if len(header_indexes) != 1:
+                return None
+            header_index = header_indexes[0]
+            if (
+                header_index + 2 >= len(lines)
+                or lines[header_index + 1] != "| --- | --- |"
+            ):
+                return None
+            manifest_lines: list[str] = []
+            line_index = header_index + 2
+            while line_index < len(lines) and lines[line_index].startswith("|"):
+                manifest_lines.append(lines[line_index])
+                line_index += 1
+            if line_index >= len(lines) or lines[line_index] != "":
+                return None
+            manifest_rows: list[tuple[str, str]] = []
+            for manifest_line in manifest_lines:
+                match = re.fullmatch(
+                    r"\| `([^`]+)` \| `([0-9a-f]{40})` \|",
+                    manifest_line,
                 )
+                if match is None:
+                    return None
+                manifest_rows.append(match.groups())
+            if len(manifest_rows) != 15:
+                return None
+            parsed_manifest = dict(manifest_rows)
+            if len(parsed_manifest) != len(manifest_rows):
+                return None
+            return parsed_manifest
+
+        self.assertEqual(
+            parsed_baseline_manifest(authority),
+            baseline_manifest,
+        )
 
         anti_drift_documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
@@ -3004,11 +3126,39 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     self.assertIn(baseline_id, document)
         journal = anti_drift_documents["project-journal"]
+        github_pr_probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
         for relative_path, blob_id in baseline_manifest.items():
             with self.subTest(journal_action_baseline_path=relative_path):
                 self.assertIn(
                     f"| `{relative_path}` | `{blob_id}` |",
                     journal,
+                )
+        self.assertEqual(
+            parsed_baseline_manifest(journal),
+            baseline_manifest,
+        )
+        for document_name, document in (
+            ("authority", authority),
+            ("journal", journal),
+        ):
+            malformed_manifest_lines = document.splitlines()
+            manifest_header_index = malformed_manifest_lines.index(
+                "| Relative path | Git blob ID |"
+            )
+            manifest_end_index = manifest_header_index + 2
+            while manifest_end_index < len(
+                malformed_manifest_lines
+            ) and malformed_manifest_lines[manifest_end_index].startswith("|"):
+                manifest_end_index += 1
+            malformed_manifest_lines.insert(
+                manifest_end_index,
+                "| `unexpected.md` | `not-a-git-blob` |",
+            )
+            with self.subTest(malformed_manifest_row=document_name):
+                self.assertIsNone(
+                    parsed_baseline_manifest("\n".join(malformed_manifest_lines))
                 )
 
         for rationale in (
@@ -3024,6 +3174,237 @@ class RepositoryContractTest(unittest.TestCase):
                 rationale,
                 " ".join(journal.split()).lower(),
             )
+
+        def normalized_markdown_section(
+            document: str,
+            heading: str,
+        ) -> list[str]:
+            lines = document.splitlines()
+            heading_indexes = [
+                index for index, line in enumerate(lines) if line == heading
+            ]
+            if len(heading_indexes) != 1:
+                return ""
+            heading_level = len(heading) - len(heading.lstrip("#"))
+            section_lines: list[str] = []
+            for line in lines[heading_indexes[0] + 1 :]:
+                next_heading = re.match(r"^(#+) ", line)
+                if (
+                    next_heading is not None
+                    and len(next_heading.group(1)) <= heading_level
+                ):
+                    break
+                section_lines.append(line)
+            return " ".join(section_lines).lower().replace("`", "").split()
+
+        def section_text(document: str, heading: str) -> str:
+            normalized_words = normalized_markdown_section(document, heading)
+            return " ".join(normalized_words)
+
+        schema_v3_sections = {
+            "authority": section_text(
+                authority,
+                "## Dynamic Provider Profiles",
+            ),
+            "skill": section_text(
+                anti_drift_documents["skill"],
+                "## GitHub Codex Lane",
+            ),
+            "github-pr-probes": section_text(
+                github_pr_probes,
+                "### Provider-evidence reconciliation",
+            ),
+            "pr-readiness": section_text(
+                anti_drift_documents["pr-readiness"],
+                "## GitHub Codex Evidence",
+            ),
+            "project-journal": section_text(
+                journal,
+                "## Final Formal-Review Authority Hardening",
+            ),
+        }
+        schema_v3_contracts = {
+            "authority": (
+                "schema-version-3 repository-wide seed",
+                "every canonical pull number returned anywhere in the "
+                "repository-wide list must seed exactly one complete pr-detail "
+                "traversal",
+                "excludes the exact current scope only after every seeded "
+                "pr—including current and confirmed non-candidates—was fully "
+                "traversed and parsed",
+                "a version-2 transcript has no independent repository-wide seed "
+                "and therefore cannot prove thumbs-up-clean",
+            ),
+            "skill": (
+                "schema-version-3 discovery_endpoint_transcript",
+                "seed drives exactly one complete detail traversal for every pr, "
+                "including current and confirmed non-candidates",
+                "exclude current only after all seeded prs are fully parsed",
+                "version 2 cannot prove the fallback",
+            ),
+            "github-pr-probes": (
+                "schema-version-3 discovery inventory",
+                "complete repository-wide state-all pull-list traversal plus "
+                "exactly one complete detail traversal for every seeded pr number",
+                "the fixed parser excludes current from historical candidates only "
+                "after every seeded traversal is fully parsed and classified",
+                "a version-2 transcript lacks the independent repository-wide seed "
+                "and cannot prove reaction fallback",
+            ),
+            "pr-readiness": (
+                "schema-version-3 raw discovery transcript",
+                "seed drives exactly one complete detail traversal for every pr, "
+                "including the current pr and confirmed non-candidates",
+                "excludes current from the historical candidate set only after "
+                "full parsing",
+                "a version-2 transcript cannot prove reaction fallback",
+            ),
+            "project-journal": (
+                "schema version 3",
+                "every seeded pr drives exactly one complete detail traversal, "
+                "including current and confirmed non-candidates",
+                "current is excluded from historical candidates only after full "
+                "parsing",
+                "version 2 cannot prove fallback",
+            ),
+        }
+        for document_name, anchors in schema_v3_contracts.items():
+            for anchor in anchors:
+                with self.subTest(
+                    schema_v3_document=document_name,
+                    schema_v3_contract=anchor,
+                ):
+                    self.assertIn(anchor, schema_v3_sections[document_name])
+        schema_v3_version_markers = {
+            document_name: anchors[0]
+            for document_name, anchors in schema_v3_contracts.items()
+        }
+
+        def assert_schema_v3_version(section: str, marker: str) -> None:
+            self.assertIn(marker, section)
+
+        for document_name, marker in schema_v3_version_markers.items():
+            assert_schema_v3_version(schema_v3_sections[document_name], marker)
+            drifted_section = schema_v3_sections[document_name].replace(
+                marker,
+                marker.replace("3", "4", 1),
+                1,
+            )
+            with self.subTest(schema_version_drift_document=document_name):
+                with self.assertRaises(AssertionError):
+                    assert_schema_v3_version(drifted_section, marker)
+
+        result_present_sections = {
+            "authority": section_text(
+                authority,
+                "### Why Result-Present Acceptance Is Deliberate",
+            ),
+            "skill": schema_v3_sections["skill"],
+            "github-pr-probes": schema_v3_sections["github-pr-probes"],
+            "pr-readiness": schema_v3_sections["pr-readiness"],
+            "project-journal": section_text(
+                journal,
+                "## Decision Rationale",
+            ),
+        }
+        result_present_contracts = {
+            "authority": (
+                "a complete, trustworthy current-scope provider result can "
+                "establish the outcome without proving which request or run caused it",
+                "duplicate or mistimed requests are still actionable orchestration "
+                "defects, but they do not contradict what the provider reported",
+                "result-present acceptance is not optimistic acceptance. a newer "
+                "finding or malformed terminal artifact, unresolved thread, "
+                "incomplete page",
+            ),
+            "skill": (
+                "complete trustworthy results decide regardless of request/run "
+                "lineage. producer warnings do not negate them",
+                "the producer-policy violation is outcome-neutral. a pending later "
+                "request does not erase an already selected current-scope clean "
+                "artifact",
+                "an unresolved exact-provider selected-review target-thread finding "
+                "blocks",
+            ),
+            "github-pr-probes": (
+                "complete trustworthy current-scope results decide without "
+                "request/run attribution",
+                "early or duplicate requests remain outcome-neutral producer warnings",
+                "findings, malformed terminal artifacts, unresolved applicable "
+                "target threads, incomplete pagination, stale scope, and unstable "
+                "final evidence still fail closed",
+            ),
+            "pr-readiness": (
+                "request history is producer/audit evidence, not verdict authority",
+                "neither duplicate count nor missing request/run lineage invalidates "
+                "a trustworthy current-head terminal artifact",
+                "an unresolved target-thread finding or malformed target join blocks "
+                "even when a later clean payload exists",
+            ),
+            "project-journal": (
+                "provider evidence is therefore the verdict authority, while "
+                "requests remain producer controls and audit records",
+                "duplicate or mistimed requests are still actionable orchestration "
+                "defects, but they do not contradict what the provider reported",
+                "silently weaken identity, scope, pagination, finding, or "
+                "final-stability gates",
+            ),
+        }
+        for document_name, anchors in result_present_contracts.items():
+            for anchor in anchors:
+                with self.subTest(
+                    result_present_document=document_name,
+                    result_present_contract=anchor,
+                ):
+                    self.assertIn(anchor, result_present_sections[document_name])
+
+        action_boundary_sections = {
+            "authority": section_text(
+                authority,
+                "## Alignment And Intentional Differences From The Fixed Action Baseline",
+            ),
+            "skill": schema_v3_sections["skill"],
+            "github-pr-probes": schema_v3_sections["github-pr-probes"],
+            "pr-readiness": schema_v3_sections["pr-readiness"],
+            "project-journal": result_present_sections["project-journal"],
+        }
+        action_boundary_contracts = {
+            "authority": (
+                "only the provider-result authority is inherited from the fixed "
+                "action baseline",
+                "the stricter evidence carriers and scope gates below are "
+                "deliberate playbook extensions",
+            ),
+            "skill": (
+                "the inherited rule is provider-result authority—complete "
+                "trustworthy results decide regardless of request/run lineage",
+                "playbook extensions, not claims about the action",
+            ),
+            "github-pr-probes": (
+                "only provider-result authority is inherited from the fixed "
+                "codex-review-gate / released action baseline",
+                "are deliberate playbook extensions, not behaviour attributed to "
+                "the fixed action",
+            ),
+            "pr-readiness": (
+                "only provider-result authority is inherited",
+                "raw thread proof, whole-pr lifecycle/scope, the closed "
+                "issue-comment carrier, and +1 fallback are playbook extensions",
+            ),
+            "project-journal": (
+                "the action alignment is intentionally asymmetric. provider-result "
+                "authority, duplicate-result consumption, and early-result "
+                "consumption are inherited",
+                "are deliberate playbook extensions",
+            ),
+        }
+        for document_name, anchors in action_boundary_contracts.items():
+            for anchor in anchors:
+                with self.subTest(
+                    action_boundary_document=document_name,
+                    action_boundary_contract=anchor,
+                ):
+                    self.assertIn(anchor, action_boundary_sections[document_name])
         for upstream_regression in (
             "valid current-head clean passes without creating a review marker",
             "current-head clean passes regardless of marker timing or deadline",
@@ -3051,6 +3432,17 @@ class RepositoryContractTest(unittest.TestCase):
             "early-result consumption aligns with the action",
         ):
             self.assertIn(anchor, normalized)
+        journal_normalized = " ".join(journal.split()).lower()
+        for anchor in (
+            "provider-result authority",
+            "duplicate/early-result consumption",
+            "warning/report fields",
+            "local-lane sequencing",
+            "stricter whole-pr lifecycle and scope",
+            "explicit terminal-payload grammar",
+            "conditional `+1` fallback",
+        ):
+            self.assertIn(anchor, journal_normalized)
 
         for anchor in (
             "fixed authority baseline intentionally defines no accepted no-start body grammar",
@@ -3214,6 +3606,14 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(children, list)
             ):
                 return "malformed"
+            target_children = _selected_review_target_children(
+                children,
+                repository="OWNER/REPO",
+                pull_request=1,
+                parent_review_id=parent_id,
+            )
+            if target_children is None:
+                return "malformed"
             thread_findings = _review_thread_findings_from_raw(
                 children,
                 record.get("review_thread_pages"),
@@ -3227,7 +3627,7 @@ class RepositoryContractTest(unittest.TestCase):
                 if commit_id != current_sha or body != "No findings.":
                     return "malformed"
                 child_ids: set[int] = set()
-                for child_record in children:
+                for child_record in target_children:
                     if (
                         not exact_inline_child(
                             child_record,
@@ -3238,7 +3638,7 @@ class RepositoryContractTest(unittest.TestCase):
                     ):
                         return "malformed"
                     child_ids.add(child_record["id"])
-                return "findings" if children else "clean"
+                return "findings" if target_children else "clean"
             found_sha = finding_sha(body)
             if found_sha is not None:
                 return (
@@ -3251,11 +3651,11 @@ class RepositoryContractTest(unittest.TestCase):
                 state != "COMMENTED"
                 or commit_id not in eligible_finding_commits
                 or body not in ("", inline_container(str(commit_id)))
-                or not children
+                or not target_children
             ):
                 return "malformed"
             child_ids = set()
-            for child in children:
+            for child in target_children:
                 if (
                     not exact_inline_child(
                         child,
@@ -4001,7 +4401,15 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return "inconclusive"
                 child_ids: set[int] = set()
-                for child_record in children:
+                target_children = _selected_review_target_children(
+                    children,
+                    repository="OWNER/REPO",
+                    pull_request=1,
+                    parent_review_id=artifact_id,
+                )
+                if target_children is None:
+                    return "inconclusive"
+                for child_record in target_children:
                     if (
                         not exact_inline_child(
                             child_record,
@@ -4049,6 +4457,46 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_terminal_report(inline_finding_report),
             "findings",
+        )
+
+        human_audit_child = clone(child)
+        human_audit_child.update(
+            {
+                "id": 987654322,
+                "url": ("https://github.com/OWNER/REPO/pull/1#discussion_r987654322"),
+                "user_login": "octocat",
+                "user_type": "User",
+            }
+        )
+        unrelated_bot_audit_child = clone(child)
+        unrelated_bot_audit_child.update(
+            {
+                "id": 987654323,
+                "url": ("https://github.com/OWNER/REPO/pull/1#discussion_r987654323"),
+                "user_login": "dependabot[bot]",
+                "user_type": "Bot",
+            }
+        )
+        null_parent_audit_child = clone(child)
+        null_parent_audit_child.update(
+            {
+                "id": 987654324,
+                "url": ("https://github.com/OWNER/REPO/pull/1#discussion_r987654324"),
+                "pull_request_review_id": None,
+            }
+        )
+        clean_with_audit_children = clone(clean_review)
+        clean_with_audit_children["children"] = [
+            human_audit_child,
+            unrelated_bot_audit_child,
+            null_parent_audit_child,
+        ]
+        self.assertEqual(classify(clean_with_audit_children), "clean")
+        self.assertEqual(
+            classify_terminal_report(
+                terminal_report(clean_with_audit_children, "clean")
+            ),
+            "clean",
         )
 
         boolean_child_parent_report = clone(inline_finding_report)
@@ -4172,6 +4620,46 @@ class RepositoryContractTest(unittest.TestCase):
                         parent_review_id=review_id,
                     )
                 )
+
+        for audit_child in (
+            human_audit_child,
+            unrelated_bot_audit_child,
+            null_parent_audit_child,
+        ):
+            with self.subTest(
+                target_only_audit_child=audit_child["id"],
+            ):
+                joined = _review_thread_findings_from_raw(
+                    [child, audit_child],
+                    _review_thread_pages([child], parent_review_id=review_id),
+                    repository="OWNER/REPO",
+                    pull_request=1,
+                    parent_review_id=review_id,
+                )
+                self.assertIsNotNone(joined)
+                assert joined is not None
+                self.assertEqual(
+                    [finding["child_id"] for finding in joined],
+                    [child["id"]],
+                )
+
+        ambiguous_null_parent = clone(null_parent_audit_child)
+        ambiguous_null_parent.update(
+            {
+                "id": 987654325,
+                "url": ("https://github.com/OWNER/REPO/pull/1#discussion_r987654325"),
+                "user_login": "codex-shadow[bot]",
+            }
+        )
+        self.assertIsNone(
+            _review_thread_findings_from_raw(
+                [ambiguous_null_parent],
+                _review_thread_pages([], parent_review_id=review_id),
+                repository="OWNER/REPO",
+                pull_request=1,
+                parent_review_id=review_id,
+            )
+        )
 
         numeric_child_resolution_report = clone(inline_finding_report)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
@@ -4512,6 +5000,7 @@ class RepositoryContractTest(unittest.TestCase):
             "review_threads": True,
         }
         required_universe_pagination = {
+            "repository_pull_requests": True,
             "pull_requests": True,
             "compare": True,
             "issue_comments": True,
@@ -6463,8 +6952,10 @@ class RepositoryContractTest(unittest.TestCase):
             if (
                 type(inline_id) is not int
                 or inline_id <= 0
-                or type(parent_review_id) is not int
-                or parent_review_id <= 0
+                or (
+                    parent_review_id is not None
+                    and (type(parent_review_id) is not int or parent_review_id <= 0)
+                )
                 or not isinstance(value.get("html_url"), str)
                 or not isinstance(user, dict)
                 or not isinstance(user.get("login"), str)
@@ -6488,12 +6979,13 @@ class RepositoryContractTest(unittest.TestCase):
             }
 
         def build_discovery_endpoint_transcript(
-            candidates: list[dict[str, object]],
+            raw_scopes: list[dict[str, object]],
         ) -> dict[str, object]:
+            repository_pull_records: list[dict[str, object]] = []
             scope_transcripts: list[dict[str, object]] = []
-            for candidate in candidates:
-                raw_scope = candidate.get("scope")
-                raw_lifecycle = candidate.get("lifecycle")
+            for raw_scope_record in raw_scopes:
+                raw_scope = raw_scope_record.get("scope")
+                raw_lifecycle = raw_scope_record.get("lifecycle")
                 scope = raw_scope if isinstance(raw_scope, dict) else {}
                 lifecycle = raw_lifecycle if isinstance(raw_lifecycle, dict) else {}
                 repository = scope.get("repository")
@@ -6529,15 +7021,35 @@ class RepositoryContractTest(unittest.TestCase):
                     api_root = f"https://api.github.com/repos/{repository}"
                 else:
                     api_root = "https://api.github.com/repos/INVALID/INVALID"
-                requests = candidate.get("requests")
+                pull_api_url = f"{api_root}/pulls/{pr}"
+                repository_pull_records.append(
+                    {
+                        "number": clone(pr),
+                        "url": pull_api_url,
+                        "base": {
+                            "sha": base_oid,
+                            "ref": "master",
+                        },
+                        "head": {
+                            "sha": clone(head),
+                            "ref": f"fixture-{pr}",
+                        },
+                        "state": clone(lifecycle.get("state")),
+                        "node_id": f"PR_{pr}",
+                    }
+                )
+                requests = raw_scope_record.get("requests")
                 raw_requests = requests if isinstance(requests, list) else []
-                reactions = candidate.get("reactions")
+                reactions = raw_scope_record.get("reactions")
                 raw_reactions = reactions if isinstance(reactions, list) else []
                 issue_records = [raw_request_record(item) for item in raw_requests]
+                extra_issue_records = raw_scope_record.get("raw_issue_records")
+                if isinstance(extra_issue_records, list):
+                    issue_records.extend(clone(extra_issue_records))
                 review_records: list[dict[str, object]] = []
                 inline_records: list[object] = []
                 thread_nodes: list[dict[str, object]] = []
-                evidence_state = candidate.get("evidence_state")
+                evidence_state = raw_scope_record.get("evidence_state")
                 if isinstance(evidence_state, dict):
                     for field in (
                         "terminal_payloads",
@@ -6645,10 +7157,24 @@ class RepositoryContractTest(unittest.TestCase):
                             parent_comment_id=request_id,
                         )
                     )
-                scope_transcripts.append({"fetches": fetches})
+                scope_transcripts.append(
+                    {
+                        "pull_number": clone(pr),
+                        "fetches": fetches,
+                    }
+                )
+            scope_discovery_url = (
+                f"https://api.github.com/repos/{current_repository}/pulls"
+                "?state=all&sort=created&direction=asc&per_page=100"
+            )
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "repository": current_repository,
+                "scope_discovery": rest_fetch(
+                    "repository_pull_requests",
+                    scope_discovery_url,
+                    repository_pull_records,
+                ),
                 "scopes": scope_transcripts,
             }
 
@@ -6905,25 +7431,88 @@ class RepositoryContractTest(unittest.TestCase):
 
         def parse_discovery_endpoint_transcript(
             value: object,
+            *,
+            current_ancestry: dict[str, int] | None = None,
         ) -> list[dict[str, object]] | None:
             if (
                 not isinstance(value, dict)
-                or set(value) != {"schema_version", "repository", "scopes"}
+                or set(value)
+                != {"schema_version", "repository", "scope_discovery", "scopes"}
                 or type(value.get("schema_version")) is not int
-                or value.get("schema_version") != 2
+                or value.get("schema_version") != 3
                 or value.get("repository") != current_repository
                 or not isinstance(value.get("scopes"), list)
             ):
                 return None
+            api_root = f"https://api.github.com/repos/{current_repository}"
+            scope_discovery_url = (
+                f"{api_root}/pulls?state=all&sort=created&direction=asc&per_page=100"
+            )
+            scope_discovery = value.get("scope_discovery")
+            if (
+                not isinstance(scope_discovery, dict)
+                or scope_discovery.get("parent_comment_id") is not None
+            ):
+                return None
+            repository_pull_records = parse_rest_pages(
+                scope_discovery,
+                expected_kind="repository_pull_requests",
+                expected_url=scope_discovery_url,
+            )
+            if not isinstance(repository_pull_records, list):
+                return None
+            discovered_pulls: dict[int, tuple[str, str]] = {}
+            for raw_pull in repository_pull_records:
+                if not isinstance(raw_pull, dict):
+                    return None
+                pr = raw_pull.get("number")
+                base = raw_pull.get("base")
+                pull_head = raw_pull.get("head")
+                base_oid = base.get("sha") if isinstance(base, dict) else None
+                head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                if (
+                    type(pr) is not int
+                    or pr <= 0
+                    or pr in discovered_pulls
+                    or raw_pull.get("url") != f"{api_root}/pulls/{pr}"
+                    or not isinstance(base_oid, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                    or not isinstance(head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                ):
+                    return None
+                discovered_pulls[pr] = (base_oid, head)
+
             entries: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
+            seen_detail_pulls: set[int] = set()
+            observed_current_finding_heads: set[str] = set()
+            ancestry = current_ancestry if current_ancestry is not None else {}
+            if not isinstance(ancestry, dict) or any(
+                not isinstance(candidate, str)
+                or re.fullmatch(r"[0-9a-f]{40}", candidate) is None
+                or type(returncode) is not int
+                or returncode not in {0, 1}
+                for candidate, returncode in ancestry.items()
+            ):
+                return None
+            detail_kinds = set(required_universe_pagination) - {
+                "repository_pull_requests"
+            }
             for scope_transcript in value["scopes"]:
                 if (
                     not isinstance(scope_transcript, dict)
-                    or set(scope_transcript) != {"fetches"}
+                    or set(scope_transcript) != {"pull_number", "fetches"}
+                    or type(scope_transcript.get("pull_number")) is not int
+                    or scope_transcript.get("pull_number") <= 0
                     or not isinstance(scope_transcript.get("fetches"), list)
                 ):
                     return None
+                pr = scope_transcript["pull_number"]
+                if pr not in discovered_pulls or pr in seen_detail_pulls:
+                    return None
+                seen_detail_pulls.add(pr)
+                repository = current_repository
                 fetches = scope_transcript["fetches"]
                 by_kind: dict[str, list[dict[str, object]]] = {}
                 for fetch in fetches:
@@ -6933,52 +7522,19 @@ class RepositoryContractTest(unittest.TestCase):
                     if not isinstance(kind, str):
                         return None
                     by_kind.setdefault(kind, []).append(fetch)
-                singleton_kinds = set(required_universe_pagination) - {
-                    "request_reactions"
-                }
+                singleton_kinds = detail_kinds - {"request_reactions"}
                 if not singleton_kinds.issubset(by_kind) or set(by_kind) - set(
-                    required_universe_pagination
+                    detail_kinds
                 ):
                     return None
                 if any(len(by_kind[kind]) != 1 for kind in singleton_kinds):
                     return None
-                pull_fetch = by_kind["pull_requests"][0]
-                pull_pages = pull_fetch.get("pages")
-                if not isinstance(pull_pages, list) or not pull_pages:
-                    return None
-                first_pull_page = pull_pages[0]
-                first_pull_url = (
-                    first_pull_page.get("request_url")
-                    if isinstance(first_pull_page, dict)
-                    else None
-                )
-                if (
-                    not isinstance(first_pull_url, str)
-                    or re.fullmatch(
-                        (
-                            r"https://api\.github\.com/repos/"
-                            r"([^/]+/[^/]+)/pulls/([1-9][0-9]*)"
-                            r"\?per_page=100"
-                        ),
-                        first_pull_url,
-                    )
-                    is None
+                if any(
+                    by_kind[kind][0].get("parent_comment_id") is not None
+                    for kind in singleton_kinds
                 ):
                     return None
-                pull_match = re.fullmatch(
-                    (
-                        r"https://api\.github\.com/repos/"
-                        r"([^/]+/[^/]+)/pulls/([1-9][0-9]*)"
-                        r"\?per_page=100"
-                    ),
-                    first_pull_url,
-                )
-                assert pull_match is not None
-                repository = pull_match.group(1)
-                pr = int(pull_match.group(2))
-                if repository != current_repository:
-                    return None
-                api_root = f"https://api.github.com/repos/{repository}"
+                pull_fetch = by_kind["pull_requests"][0]
                 pull_records = parse_rest_pages(
                     pull_fetch,
                     expected_kind="pull_requests",
@@ -6995,13 +7551,16 @@ class RepositoryContractTest(unittest.TestCase):
                 pull_head = pull_record.get("head")
                 base_oid = base.get("sha") if isinstance(base, dict) else None
                 head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                discovered_base_oid, discovered_head = discovered_pulls[pr]
                 if (
                     type(pull_record.get("number")) is not int
                     or pull_record.get("number") != pr
                     or not isinstance(base_oid, str)
                     or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                    or base_oid != discovered_base_oid
                     or not isinstance(head, str)
                     or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                    or head != discovered_head
                     or pull_record.get("state") not in {"open", "closed"}
                     or type(pull_record.get("merged")) is not bool
                     or (
@@ -7039,7 +7598,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
                 ):
                     return None
-                parsed_scope = (repository, pr, merge_base, head)
+                parsed_scope = (current_repository, pr, merge_base, head)
                 if parsed_scope in seen_scopes:
                     return None
                 seen_scopes.add(parsed_scope)
@@ -7126,7 +7685,8 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     if body == "@codex review":
                         if (
-                            projected_issue.get("url")
+                            raw_actor(projected_issue.get("user")) != "different"
+                            or projected_issue.get("url")
                             != f"{api_root}/issues/comments/{issue_id}"
                             or projected_issue.get("html_url")
                             != (
@@ -7147,7 +7707,9 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                         actor = raw_actor(projected_issue.get("user"))
                         if not terminal_looking:
-                            continue
+                            if actor == "different":
+                                continue
+                            return None
                         if actor == "different":
                             continue
                         if actor != "exact":
@@ -7221,12 +7783,52 @@ class RepositoryContractTest(unittest.TestCase):
                     if actor != "exact":
                         return None
                     if projected_review.get("state") == "PENDING":
-                        other_review_ids.add(review_id)
-                        continue
+                        return None
                     review_by_id[review_id] = projected_review
+
+                inline_by_review: dict[int, list[dict[str, object]]] = {
+                    review_id: [] for review_id in review_by_id
+                }
+                target_review_by_child_id: dict[str, int] = {}
+                seen_inline_ids: set[int] = set()
+                for raw_inline in inline_records:
+                    if not isinstance(raw_inline, dict):
+                        return None
+                    projected_inline = project_raw_inline_record(raw_inline)
+                    if projected_inline is None:
+                        return None
+                    inline_id = projected_inline.get("id")
+                    if type(inline_id) is not int or inline_id in seen_inline_ids:
+                        return None
+                    seen_inline_ids.add(inline_id)
+                    parent_id = projected_inline.get("pull_request_review_id")
+                    actor = raw_actor(
+                        {
+                            "login": projected_inline.get("user_login"),
+                            "type": projected_inline.get("user_type"),
+                        }
+                    )
+                    if actor == "ambiguous":
+                        return None
+                    if parent_id is None or actor == "different":
+                        continue
+                    if type(parent_id) is not int:
+                        return None
+                    if parent_id in other_review_ids:
+                        continue
+                    if parent_id not in inline_by_review:
+                        return None
+                    child_id = str(projected_inline["id"])
+                    if child_id in target_review_by_child_id:
+                        return None
+                    target_review_by_child_id[child_id] = parent_id
+                    inline_by_review[parent_id].append(projected_inline)
+
                 thread_nodes_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
+                seen_graphql_comment_ids: set[str] = set()
+                seen_graphql_database_ids: set[str] = set()
                 for thread in thread_nodes:
                     if not isinstance(thread, dict):
                         return None
@@ -7234,7 +7836,7 @@ class RepositoryContractTest(unittest.TestCase):
                     pages = (
                         comments.get("pages") if isinstance(comments, dict) else None
                     )
-                    parent_ids: set[str] = set()
+                    target_review_ids: set[int] = set()
                     if not isinstance(pages, list):
                         return None
                     for page in pages:
@@ -7242,51 +7844,52 @@ class RepositoryContractTest(unittest.TestCase):
                         if not isinstance(nodes, list):
                             return None
                         for comment in nodes:
-                            parent = (
-                                comment.get("pullRequestReview")
-                                if isinstance(comment, dict)
-                                else None
-                            )
-                            parent_id = (
-                                parent.get("fullDatabaseId")
-                                if isinstance(parent, dict)
-                                else None
-                            )
-                            canonical_parent = _canonical_positive_decimal(parent_id)
-                            if canonical_parent is None:
+                            if not isinstance(comment, dict):
                                 return None
-                            parent_ids.add(canonical_parent)
-                    if len(parent_ids) != 1:
-                        return None
-                    review_id = int(next(iter(parent_ids)))
-                    if review_id in other_review_ids:
-                        continue
-                    if review_id not in thread_nodes_by_review:
-                        return None
-                    thread_nodes_by_review[review_id].append(thread)
-
-                inline_by_review: dict[int, list[dict[str, object]]] = {
-                    review_id: [] for review_id in review_by_id
-                }
-                for raw_inline in inline_records:
-                    if not isinstance(raw_inline, dict):
-                        return None
-                    parent_id = raw_inline.get("pull_request_review_id")
-                    if type(parent_id) is not int:
-                        return None
-                    if parent_id in other_review_ids:
-                        continue
-                    if parent_id not in inline_by_review:
-                        return None
-                    projected_inline = project_raw_inline_record(raw_inline)
-                    if projected_inline is None:
-                        return None
-                    inline_by_review[parent_id].append(projected_inline)
+                            graphql_comment_id = comment.get("id")
+                            child_id = _canonical_positive_decimal(
+                                comment.get("fullDatabaseId")
+                            )
+                            parent = comment.get("pullRequestReview")
+                            if (
+                                not isinstance(graphql_comment_id, str)
+                                or not graphql_comment_id
+                                or graphql_comment_id in seen_graphql_comment_ids
+                                or child_id is None
+                                or child_id in seen_graphql_database_ids
+                                or comment.get("url")
+                                != (
+                                    f"https://github.com/{repository}/pull/{pr}"
+                                    f"#discussion_r{child_id}"
+                                )
+                                or (
+                                    parent is not None
+                                    and (
+                                        not isinstance(parent, dict)
+                                        or set(parent) != {"id", "fullDatabaseId"}
+                                        or not isinstance(parent.get("id"), str)
+                                        or not parent["id"]
+                                        or _canonical_positive_decimal(
+                                            parent.get("fullDatabaseId")
+                                        )
+                                        is None
+                                    )
+                                )
+                            ):
+                                return None
+                            seen_graphql_comment_ids.add(graphql_comment_id)
+                            seen_graphql_database_ids.add(child_id)
+                            target_review_id = target_review_by_child_id.get(child_id)
+                            if target_review_id is not None:
+                                target_review_ids.add(target_review_id)
+                    for target_review_id in target_review_ids:
+                        thread_nodes_by_review[target_review_id].append(thread)
 
                 artifact_bases: list[tuple[int, int, str, str, str]] = []
                 for review_id, raw_review in review_by_id.items():
                     user = raw_review.get("user")
                     submitted_at = raw_review.get("submitted_at")
+                    review_commit = raw_review.get("commit_id")
                     if (
                         raw_actor(user) != "exact"
                         or type(submitted_at) is not int
@@ -7297,7 +7900,8 @@ class RepositoryContractTest(unittest.TestCase):
                             f"https://github.com/{repository}/pull/{pr}"
                             f"#pullrequestreview-{review_id}"
                         )
-                        or raw_review.get("commit_id") != head
+                        or not isinstance(review_commit, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", review_commit) is None
                     ):
                         return None
                     per_review_threads = {
@@ -7337,6 +7941,23 @@ class RepositoryContractTest(unittest.TestCase):
                         semantic = "findings"
                     else:
                         semantic = "malformed"
+                    if (
+                        parsed_scope == current_scope_key
+                        and semantic == "findings"
+                        and current_ancestry is not None
+                    ):
+                        observed_current_finding_heads.add(review_commit)
+                        relation = ancestry.get(review_commit)
+                        if relation is None or (
+                            review_commit == head and relation != 0
+                        ):
+                            return None
+                        if relation == 1:
+                            continue
+                    elif review_commit != head:
+                        if parsed_scope == current_scope_key and semantic == "clean":
+                            continue
+                        return None
                     source_bundle = {
                         "artifact": clone(raw_review),
                         "inline_comments": clone(inline_by_review[review_id]),
@@ -7378,12 +7999,30 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     server_time = created_at if updated_at == created_at else updated_at
                     body = raw_issue.get("body")
-                    semantic, _ = _github_codex_issue_body_semantic(
+                    semantic, parsed_commit = _github_codex_issue_body_semantic(
                         body,
                         repository=repository,
                         head=head,
+                        allow_foreign_finding_sha=(parsed_scope == current_scope_key),
                     )
                     if semantic == "nonterminal":
+                        return None
+                    if (
+                        semantic == "findings"
+                        and parsed_scope == current_scope_key
+                        and current_ancestry is not None
+                    ):
+                        if not isinstance(parsed_commit, str):
+                            return None
+                        observed_current_finding_heads.add(parsed_commit)
+                        relation = ancestry.get(parsed_commit)
+                        if relation is None or (
+                            parsed_commit == head and relation != 0
+                        ):
+                            return None
+                        if relation == 1:
+                            continue
+                    elif semantic == "findings" and parsed_commit != head:
                         return None
                     artifact_bases.append(
                         (
@@ -7448,7 +8087,11 @@ class RepositoryContractTest(unittest.TestCase):
                         "source_record_sha256": selected[4],
                     }
                 else:
-                    if not provider_reactions or not request_times:
+                    if not provider_reactions:
+                        if request_times:
+                            return None
+                        continue
+                    if not request_times:
                         return None
                     selected_reaction = max(provider_reactions)
                     latest_request_time = max(request_times.values())
@@ -7509,9 +8152,19 @@ class RepositoryContractTest(unittest.TestCase):
                         "source_evidence": source_evidence,
                     }
                 )
+            if (
+                seen_detail_pulls != set(discovered_pulls)
+                or current_scope_key not in seen_scopes
+                or (
+                    current_ancestry is not None
+                    and set(ancestry) != observed_current_finding_heads
+                )
+            ):
+                return None
             return entries
 
         def universe_inventory(
+            raw_scopes: list[dict[str, object]],
             candidates: list[dict[str, object]],
         ) -> dict[str, object]:
             return {
@@ -7519,10 +8172,183 @@ class RepositoryContractTest(unittest.TestCase):
                 "repository": current_repository,
                 "pagination": clone(required_universe_pagination),
                 "discovery_endpoint_transcript": (
-                    build_discovery_endpoint_transcript(candidates)
+                    build_discovery_endpoint_transcript(raw_scopes)
                 ),
                 "entries": derived_inventory_entries(candidates),
             }
+
+        def current_endpoint_inventory(
+            raw_current: dict[str, object],
+            *,
+            observation_marker: str,
+        ) -> dict[str, object]:
+            transcript = build_discovery_endpoint_transcript([clone(raw_current)])
+            scope = transcript["scopes"][0]
+            fetches = clone(scope["fetches"])
+            assert isinstance(fetches, list)
+            pull_fetches = [
+                fetch
+                for fetch in fetches
+                if isinstance(fetch, dict) and fetch.get("kind") == "pull_requests"
+            ]
+            assert len(pull_fetches) == 1
+            pull_pages = pull_fetches[0]["pages"]
+            assert isinstance(pull_pages, list) and len(pull_pages) == 1
+            pull_page = pull_pages[0]
+            assert isinstance(pull_page, dict)
+            pull_body = json.loads(pull_page["body_utf8"])
+            assert isinstance(pull_body, dict)
+            pull_body["node_id"] = f"{pull_body.get('node_id')}:{observation_marker}"
+            pull_page["body_utf8"] = canonical_raw_body(pull_body)
+            pull_page["body_sha256"] = hashlib.sha256(
+                pull_page["body_utf8"].encode("utf-8")
+            ).hexdigest()
+            raw_scope = raw_current.get("scope")
+            assert isinstance(raw_scope, dict)
+            return {
+                "repository": current_repository,
+                "pull_number": current_pr,
+                "head": clone(raw_scope.get("head")),
+                "fetches": fetches,
+            }
+
+        def parse_current_endpoint_inventory(
+            value: object,
+            *,
+            current_ancestry: dict[str, int],
+        ) -> dict[str, object] | None:
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"repository", "pull_number", "head", "fetches"}
+                or value.get("repository") != current_repository
+                or value.get("pull_number") != current_pr
+                or value.get("head") != current_head
+                or not isinstance(value.get("fetches"), list)
+            ):
+                return None
+            fetches = value["fetches"]
+            pull_fetches = [
+                fetch
+                for fetch in fetches
+                if isinstance(fetch, dict) and fetch.get("kind") == "pull_requests"
+            ]
+            if len(pull_fetches) != 1:
+                return None
+            api_root = f"https://api.github.com/repos/{current_repository}"
+            pull_records = parse_rest_pages(
+                pull_fetches[0],
+                expected_kind="pull_requests",
+                expected_url=f"{api_root}/pulls/{current_pr}?per_page=100",
+            )
+            if (
+                not isinstance(pull_records, list)
+                or len(pull_records) != 1
+                or not isinstance(pull_records[0], dict)
+            ):
+                return None
+            pull_record = pull_records[0]
+            base = pull_record.get("base")
+            head = pull_record.get("head")
+            if (
+                pull_record.get("number") != current_pr
+                or not isinstance(base, dict)
+                or not isinstance(head, dict)
+                or head.get("sha") != current_head
+            ):
+                return None
+            root_record = {
+                "number": current_pr,
+                "url": f"{api_root}/pulls/{current_pr}",
+                "base": clone(base),
+                "head": clone(head),
+                "state": clone(pull_record.get("state")),
+                "node_id": clone(pull_record.get("node_id")),
+            }
+            transcript = {
+                "schema_version": 3,
+                "repository": current_repository,
+                "scope_discovery": rest_fetch(
+                    "repository_pull_requests",
+                    (
+                        f"{api_root}/pulls"
+                        "?state=all&sort=created&direction=asc&per_page=100"
+                    ),
+                    [root_record],
+                ),
+                "scopes": [
+                    {
+                        "pull_number": current_pr,
+                        "fetches": clone(fetches),
+                    }
+                ],
+            }
+            entries = parse_discovery_endpoint_transcript(
+                transcript,
+                current_ancestry=current_ancestry,
+            )
+            if (
+                entries is None
+                or len(entries) != 1
+                or not typed_json_equal(
+                    entries[0].get("scope_key"),
+                    list(current_scope_key),
+                )
+            ):
+                return None
+            return entries[0]
+
+        def current_ancestry_snapshot(
+            returncodes: dict[str, int],
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "finding_commit": candidate,
+                    "head": current_head,
+                    "object_check_return_code": 0,
+                    "ancestry_return_code": returncodes[candidate],
+                }
+                for candidate in sorted(returncodes)
+            ]
+
+        def current_ancestry_mapping(
+            candidate_history: object,
+        ) -> dict[str, int] | None:
+            if not isinstance(candidate_history, dict):
+                return None
+            initial = candidate_history.get("initial_current_ancestry")
+            final = candidate_history.get("final_current_ancestry")
+            if (
+                not isinstance(initial, list)
+                or not isinstance(final, list)
+                or not typed_json_equal(initial, final)
+            ):
+                return None
+            mapping: dict[str, int] = {}
+            for check in initial:
+                if not isinstance(check, dict) or set(check) != {
+                    "finding_commit",
+                    "head",
+                    "object_check_return_code",
+                    "ancestry_return_code",
+                }:
+                    return None
+                candidate = check.get("finding_commit")
+                object_check_return_code = check.get("object_check_return_code")
+                ancestry_return_code = check.get("ancestry_return_code")
+                if (
+                    not isinstance(candidate, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", candidate) is None
+                    or candidate in mapping
+                    or check.get("head") != current_head
+                    or type(object_check_return_code) is not int
+                    or object_check_return_code != 0
+                    or type(ancestry_return_code) is not int
+                    or ancestry_return_code not in {0, 1}
+                    or (candidate == current_head and ancestry_return_code != 0)
+                ):
+                    return None
+                mapping[candidate] = ancestry_return_code
+            return mapping
 
         def validate_history_universe(
             candidate_history: dict[str, object],
@@ -7558,30 +8384,112 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             transcript_entries = parse_discovery_endpoint_transcript(
-                initial_inventory.get("discovery_endpoint_transcript")
+                initial_inventory.get("discovery_endpoint_transcript"),
+            )
+            final_transcript_entries = parse_discovery_endpoint_transcript(
+                final_inventory.get("discovery_endpoint_transcript"),
+            )
+            historical_transcript_entries = (
+                [
+                    entry
+                    for entry in transcript_entries
+                    if not typed_json_equal(
+                        entry.get("scope_key"),
+                        list(current_scope_key),
+                    )
+                ]
+                if transcript_entries is not None
+                else None
             )
             candidate_entries = derived_inventory_entries(final_candidates)
             if (
                 transcript_entries is None
+                or final_transcript_entries is None
+                or not typed_json_equal(
+                    transcript_entries,
+                    final_transcript_entries,
+                )
+                or historical_transcript_entries is None
                 or not typed_json_equal(
                     initial_inventory.get("entries"),
-                    transcript_entries,
+                    historical_transcript_entries,
                 )
-                or not typed_json_equal(transcript_entries, candidate_entries)
+                or not typed_json_equal(
+                    historical_transcript_entries,
+                    candidate_entries,
+                )
                 or type(candidate_history.get("candidate_universe_count")) is not int
                 or candidate_history.get("candidate_universe_count")
-                != len(transcript_entries)
-                or len(final_candidates) != len(transcript_entries)
+                != len(historical_transcript_entries)
+                or len(final_candidates) != len(historical_transcript_entries)
             ):
                 return None
             return final_candidates
+
+        def current_raw_authority_matches(
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+        ) -> bool:
+            ancestry = current_ancestry_mapping(candidate_history)
+            initial_inventory = candidate_history.get("initial_current_raw_inventory")
+            final_inventory = candidate_history.get("final_current_raw_inventory")
+            if (
+                ancestry is None
+                or not isinstance(initial_inventory, dict)
+                or not isinstance(final_inventory, dict)
+            ):
+                return False
+            initial_entry = parse_current_endpoint_inventory(
+                initial_inventory,
+                current_ancestry=ancestry,
+            )
+            final_entry = parse_current_endpoint_inventory(
+                final_inventory,
+                current_ancestry=ancestry,
+            )
+            if (
+                initial_entry is None
+                or final_entry is None
+                or not typed_json_equal(initial_entry, final_entry)
+            ):
+                return False
+            expected_entries = derived_inventory_entries([current_record])
+            return len(expected_entries) == 1 and typed_json_equal(
+                initial_entry, expected_entries[0]
+            )
 
         def history(
             candidates: list[dict[str, object]],
             *,
             complete: bool = True,
+            confirmed_noncandidate_scopes: list[dict[str, object]] | None = None,
+            current_raw: dict[str, object] | None = None,
+            final_current_raw: dict[str, object] | None = None,
+            current_ancestry: dict[str, int] | None = None,
         ) -> dict[str, object]:
-            inventory = universe_inventory(candidates)
+            raw_scopes: list[dict[str, object]] = []
+            for candidate in candidates:
+                raw_candidate = clone(candidate)
+                assert isinstance(raw_candidate, dict)
+                raw_scopes.append(raw_candidate)
+            discovery_current = clone(current)
+            assert isinstance(discovery_current, dict)
+            raw_scopes.append(discovery_current)
+            if confirmed_noncandidate_scopes is not None:
+                for noncandidate_scope in confirmed_noncandidate_scopes:
+                    raw_noncandidate_scope = clone(noncandidate_scope)
+                    assert isinstance(raw_noncandidate_scope, dict)
+                    raw_scopes.append(raw_noncandidate_scope)
+            inventory = universe_inventory(raw_scopes, candidates)
+            initial_raw_current = clone(current if current_raw is None else current_raw)
+            final_raw_current = clone(
+                initial_raw_current if final_current_raw is None else final_current_raw
+            )
+            assert isinstance(initial_raw_current, dict)
+            assert isinstance(final_raw_current, dict)
+            ancestry_snapshot = current_ancestry_snapshot(
+                {} if current_ancestry is None else current_ancestry
+            )
             return {
                 "complete": complete,
                 "repository": current_repository,
@@ -7595,6 +8503,16 @@ class RepositoryContractTest(unittest.TestCase):
                 "candidate_universe_count": len(candidates),
                 "initial_inventory": clone(inventory),
                 "final_inventory": clone(inventory),
+                "initial_current_raw_inventory": current_endpoint_inventory(
+                    initial_raw_current,
+                    observation_marker="initial",
+                ),
+                "final_current_raw_inventory": current_endpoint_inventory(
+                    final_raw_current,
+                    observation_marker="final",
+                ),
+                "initial_current_ancestry": clone(ancestry_snapshot),
+                "final_current_ancestry": clone(ancestry_snapshot),
                 "initial_candidates": clone(candidates),
                 "final_candidates": clone(candidates),
             }
@@ -7649,6 +8567,10 @@ class RepositoryContractTest(unittest.TestCase):
                 "candidate_universe_count",
                 "initial_inventory",
                 "final_inventory",
+                "initial_current_raw_inventory",
+                "final_current_raw_inventory",
+                "initial_current_ancestry",
+                "final_current_ancestry",
                 "initial_candidates",
                 "final_candidates",
             }
@@ -7734,7 +8656,8 @@ class RepositoryContractTest(unittest.TestCase):
             if "terminal-payload" in observed_kinds:
                 return "mixed"
             if (
-                len(selected) < 3
+                not current_raw_authority_matches(candidate_history, current)
+                or len(selected) < 3
                 or not declaration_is_authoritative(provider_declaration)
                 or any(
                     classify_reaction_scope(candidate) != "clean"
@@ -7784,6 +8707,10 @@ class RepositoryContractTest(unittest.TestCase):
                     "candidate_universe_count",
                     "initial_inventory",
                     "final_inventory",
+                    "initial_current_raw_inventory",
+                    "final_current_raw_inventory",
+                    "initial_current_ancestry",
+                    "final_current_ancestry",
                     "initial_candidates",
                     "final_candidates",
                 }
@@ -7794,7 +8721,9 @@ class RepositoryContractTest(unittest.TestCase):
                 return "unknown"
             fallback_start = fallback_as_of - history_window_seconds
             candidates = validate_history_universe(candidate_history)
-            if candidates is None:
+            if candidates is None or not current_raw_authority_matches(
+                candidate_history, current
+            ):
                 return "unknown"
 
             ordering_keys: set[tuple[int, int]] = set()
@@ -7958,6 +8887,20 @@ class RepositoryContractTest(unittest.TestCase):
                 selected_reaction_id=reaction_id,
             )
 
+        def confirmed_nonprovider_scope(pr: int) -> dict[str, object]:
+            raw_scope = sample(pr)
+            raw_scope["requests"] = []
+            raw_scope["reactions"] = []
+            raw_scope["selected_request_id"] = None
+            raw_scope["selected_reaction_id"] = None
+            raw_scope["candidate_basis"] = None
+            human_issue = raw_request_record(
+                request(30_000 + pr, 2_500_000 + pr, pr=pr)
+            )
+            human_issue["body"] = "Human-only scope note."
+            raw_scope["raw_issue_records"] = [human_issue]
+            return raw_scope
+
         def retime_sample(
             record: dict[str, object],
             *,
@@ -8078,6 +9021,52 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             return snapshots
 
+        def current_raw_authority_basis(
+            candidate_history: dict[str, object],
+        ) -> dict[str, object] | None:
+            ancestry = current_ancestry_mapping(candidate_history)
+            if ancestry is None:
+                return None
+            raw_inventories: dict[str, dict[str, object]] = {}
+            projected_entries: dict[str, dict[str, object]] = {}
+            for phase in ("initial", "final"):
+                inventory = candidate_history.get(f"{phase}_current_raw_inventory")
+                if not isinstance(inventory, dict):
+                    return None
+                projected_entry = parse_current_endpoint_inventory(
+                    inventory,
+                    current_ancestry=ancestry,
+                )
+                if projected_entry is None:
+                    return None
+                raw_inventories[phase] = clone(inventory)
+                projected_entries[phase] = projected_entry
+
+            initial_ancestry = candidate_history.get("initial_current_ancestry")
+            final_ancestry = candidate_history.get("final_current_ancestry")
+            if (
+                not isinstance(initial_ancestry, list)
+                or not isinstance(final_ancestry, list)
+                or not typed_json_equal(initial_ancestry, final_ancestry)
+                or not typed_json_equal(
+                    projected_entries["initial"],
+                    projected_entries["final"],
+                )
+            ):
+                return None
+            finding_commits = sorted(ancestry)
+            return {
+                "raw_endpoint_inventories": raw_inventories,
+                "finding_commits": {
+                    "initial": clone(finding_commits),
+                    "final": clone(finding_commits),
+                },
+                "local_git_ancestry_receipts": {
+                    "initial": clone(initial_ancestry),
+                    "final": clone(final_ancestry),
+                },
+            }
+
         def reaction_evidence_basis_from_inputs(
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
@@ -8109,6 +9098,7 @@ class RepositoryContractTest(unittest.TestCase):
             final_report_candidates = report_candidate_snapshots(
                 candidate_history.get("final_candidates")
             )
+            current_raw_authority = current_raw_authority_basis(candidate_history)
             if (
                 not isinstance(declaration_final, dict)
                 or candidate_history.get("as_of_api_url")
@@ -8118,6 +9108,7 @@ class RepositoryContractTest(unittest.TestCase):
                 or current_audit is None
                 or initial_report_candidates is None
                 or final_report_candidates is None
+                or current_raw_authority is None
                 or not typed_json_equal(
                     initial_report_candidates,
                     final_report_candidates,
@@ -8160,6 +9151,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "same_scope_request_audit": clone(current_audit),
             }
             current_basis = {
+                **current_raw_authority,
                 "initial_snapshot": clone(current_snapshot),
                 "final_snapshot": clone(current_snapshot),
                 **clone(current_snapshot),
@@ -8642,6 +9634,18 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIsNone(_parse_github_rfc3339_seconds(invalid_raw_time))
 
+        baseline_ancestry = current_ancestry_mapping(baseline_history)
+        self.assertIsNotNone(baseline_ancestry)
+        assert baseline_ancestry is not None
+        for phase in ("initial", "final"):
+            with self.subTest(baseline_current_raw_phase=phase):
+                self.assertIsNotNone(
+                    parse_current_endpoint_inventory(
+                        baseline_history[f"{phase}_current_raw_inventory"],
+                        current_ancestry=baseline_ancestry,
+                    )
+                )
+        self.assertTrue(current_raw_authority_matches(baseline_history, current))
         self.assertEqual(
             classify_fallback(
                 declaration,
@@ -8653,6 +9657,274 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(declaration, baseline_history, current),
             "thumbs-up-clean",
+        )
+
+        def raw_current_with_issue_finding(
+            finding_head: str,
+            artifact_id: int,
+        ) -> dict[str, object]:
+            raw_current = clone(current)
+            artifact_source = clone(current)
+            assert isinstance(raw_current, dict)
+            assert isinstance(artifact_source, dict)
+            artifact_scope = artifact_source["scope"]
+            assert isinstance(artifact_scope, dict)
+            artifact_scope["head"] = finding_head
+            raw_current["evidence_state"]["active_top_level_findings"] = [
+                complete_issue_comment_artifact(
+                    artifact_source,
+                    artifact_id,
+                    30,
+                    artifact_kind="active-top-level-finding",
+                    outcome="findings",
+                )
+            ]
+            return raw_current
+
+        current_head_raw_finding = raw_current_with_issue_finding(
+            current_head,
+            90_001,
+        )
+        current_head_raw_finding_history = history(
+            samples,
+            current_raw=current_head_raw_finding,
+            current_ancestry={current_head: 0},
+        )
+        self.assertEqual(
+            classify_reaction_scope(
+                current,
+                expected_scope=current_scope_key,
+            ),
+            "clean",
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                current_head_raw_finding_history,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                current_head_raw_finding_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        foreign_finding_head = "fedcba9876543210fedcba9876543210fedcba98"
+        foreign_raw_finding = raw_current_with_issue_finding(
+            foreign_finding_head,
+            90_002,
+        )
+        ancestor_finding_history = history(
+            samples,
+            current_raw=foreign_raw_finding,
+            current_ancestry={foreign_finding_head: 0},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                ancestor_finding_history,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                ancestor_finding_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        nonancestor_finding_history = history(
+            samples,
+            current_raw=foreign_raw_finding,
+            current_ancestry={foreign_finding_head: 1},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                nonancestor_finding_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                nonancestor_finding_history,
+                current,
+            ),
+            "clean",
+        )
+
+        historical_alias_history = clone(nonancestor_finding_history)
+        assert isinstance(historical_alias_history, dict)
+        for phase in ("initial", "final"):
+            historical_alias_history[f"{phase}_current_raw_inventory"] = clone(
+                historical_alias_history[f"{phase}_inventory"][
+                    "discovery_endpoint_transcript"
+                ]
+            )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                historical_alias_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        current_raw_semantic_drift = history(
+            samples,
+            current_raw=current,
+            final_current_raw=current_head_raw_finding,
+            current_ancestry={current_head: 0},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                current_raw_semantic_drift,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                current_raw_semantic_drift,
+                current,
+            ),
+            "unknown",
+        )
+
+        malformed_final_current_raw = clone(baseline_history)
+        assert isinstance(malformed_final_current_raw, dict)
+        malformed_final_current_raw["final_current_raw_inventory"]["fetches"][0][
+            "pages"
+        ][0]["body_sha256"] = "0" * 64
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                malformed_final_current_raw,
+                current,
+            ),
+            "unknown",
+        )
+
+        missing_ancestry_check = history(
+            samples,
+            current_raw=foreign_raw_finding,
+        )
+        missing_ancestry_receipt = clone(nonancestor_finding_history)
+        assert isinstance(missing_ancestry_receipt, dict)
+        del missing_ancestry_receipt["final_current_ancestry"]
+        ancestry_receipt_drift = clone(nonancestor_finding_history)
+        assert isinstance(ancestry_receipt_drift, dict)
+        ancestry_receipt_drift["final_current_ancestry"][0]["ancestry_return_code"] = 0
+        invalid_ancestry_returncodes: dict[str, object] = {
+            "boolean": True,
+            "not-zero-or-one": 2,
+        }
+        current_head_as_nonancestor = history(
+            samples,
+            current_raw=current_head_raw_finding,
+            current_ancestry={current_head: 1},
+        )
+        malformed_ancestry_histories: dict[str, dict[str, object]] = {
+            "missing-candidate-check": missing_ancestry_check,
+            "missing-final-receipt": missing_ancestry_receipt,
+            "initial-final-drift": ancestry_receipt_drift,
+            "current-head-as-nonancestor": current_head_as_nonancestor,
+        }
+        for name, invalid_returncode in invalid_ancestry_returncodes.items():
+            malformed_history = clone(nonancestor_finding_history)
+            assert isinstance(malformed_history, dict)
+            for phase in ("initial", "final"):
+                malformed_history[f"{phase}_current_ancestry"][0][
+                    "ancestry_return_code"
+                ] = invalid_returncode
+            malformed_ancestry_histories[name] = malformed_history
+        for name, invalid_returncode in {
+            "object-check-boolean": True,
+            "object-check-not-zero": 1,
+        }.items():
+            malformed_history = clone(nonancestor_finding_history)
+            assert isinstance(malformed_history, dict)
+            for phase in ("initial", "final"):
+                malformed_history[f"{phase}_current_ancestry"][0][
+                    "object_check_return_code"
+                ] = invalid_returncode
+            malformed_ancestry_histories[name] = malformed_history
+        for name, malformed_history in malformed_ancestry_histories.items():
+            with self.subTest(current_ancestry_receipt_near_miss=name):
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        malformed_history,
+                        current,
+                    ),
+                    "unknown",
+                )
+                self.assertEqual(
+                    classify_fallback(
+                        declaration,
+                        malformed_history,
+                        current,
+                    ),
+                    "unknown",
+                )
+
+        human_only_scope = confirmed_nonprovider_scope(5)
+        complete_scope_history = history(
+            samples,
+            confirmed_noncandidate_scopes=[human_only_scope],
+        )
+        complete_scope_transcript = complete_scope_history["initial_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        complete_scope_roots = parse_rest_pages(
+            complete_scope_transcript["scope_discovery"],
+            expected_kind="repository_pull_requests",
+            expected_url=(
+                f"https://api.github.com/repos/{current_repository}/pulls"
+                "?state=all&sort=created&direction=asc&per_page=100"
+            ),
+        )
+        self.assertIsNotNone(complete_scope_roots)
+        assert complete_scope_roots is not None
+        self.assertEqual(
+            {record["number"] for record in complete_scope_roots},
+            {current_pr, 2, 3, 4, 5},
+        )
+        self.assertEqual(len(complete_scope_transcript["scopes"]), 5)
+        self.assertTrue(
+            typed_json_equal(
+                parse_discovery_endpoint_transcript(complete_scope_transcript),
+                derived_inventory_entries([*samples, current]),
+            )
+        )
+        self.assertEqual(complete_scope_history["candidate_universe_count"], 3)
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                complete_scope_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                complete_scope_history,
+                current,
+            ),
+            "clean",
         )
         unrelated_raw_fields = history(samples)
         for inventory_name in ("initial_inventory", "final_inventory"):
@@ -8762,11 +10034,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
         profile_matrix = {
             "terminal-payload": (
-                history(terminal_history),
+                history(terminal_history, current_raw=terminal_current),
                 terminal_current,
             ),
             "mixed": (
-                history(samples),
+                history(samples, current_raw=terminal_current),
                 terminal_current,
             ),
             "thumbs-up-clean": (
@@ -8794,7 +10066,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(
                 declaration,
-                history(issue_terminal_history),
+                history(
+                    issue_terminal_history,
+                    current_raw=issue_terminal_current,
+                ),
                 issue_terminal_current,
             ),
             "terminal-payload",
@@ -8802,7 +10077,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(
                 declaration,
-                history(requestless_terminal_history),
+                history(
+                    requestless_terminal_history,
+                    current_raw=issue_terminal_current,
+                ),
                 issue_terminal_current,
             ),
             "terminal-payload",
@@ -8810,7 +10088,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(
                 declaration,
-                history(mixed_terminal_history),
+                history(
+                    mixed_terminal_history,
+                    current_raw=issue_terminal_current,
+                ),
                 issue_terminal_current,
             ),
             "terminal-payload",
@@ -8818,7 +10099,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(terminal_history),
+                history(terminal_history, current_raw=terminal_current),
                 terminal_current,
             ),
             "not-clean",
@@ -9395,10 +10676,72 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(len(report_samples), 3)
         self.assertIn("same_scope_request_audit", report_current)
+        current_raw_authority_fields = {
+            "raw_endpoint_inventories",
+            "finding_commits",
+            "local_git_ancestry_receipts",
+        }
+        self.assertTrue(current_raw_authority_fields.issubset(report_current))
         self.assertTrue(
             all(
                 isinstance(item, dict) and "same_scope_request_audit" in item
                 for item in report_samples
+            )
+        )
+        nonancestor_finding_report = expected_report_from_inputs(
+            "accepted-reaction-clean",
+            declaration,
+            nonancestor_finding_history,
+            current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(nonancestor_finding_report)
+        assert isinstance(nonancestor_finding_report, dict)
+        nonancestor_basis = nonancestor_finding_report["evidence_basis"]
+        assert isinstance(nonancestor_basis, dict)
+        nonancestor_current_basis = nonancestor_basis["current"]
+        assert isinstance(nonancestor_current_basis, dict)
+        self.assertEqual(
+            nonancestor_current_basis["finding_commits"],
+            {
+                "initial": [foreign_finding_head],
+                "final": [foreign_finding_head],
+            },
+        )
+        self.assertTrue(
+            typed_json_equal(
+                nonancestor_current_basis["local_git_ancestry_receipts"],
+                {
+                    "initial": nonancestor_finding_history["initial_current_ancestry"],
+                    "final": nonancestor_finding_history["final_current_ancestry"],
+                },
+            )
+        )
+        raw_endpoint_inventories = nonancestor_current_basis["raw_endpoint_inventories"]
+        assert isinstance(raw_endpoint_inventories, dict)
+        self.assertEqual(set(raw_endpoint_inventories), {"initial", "final"})
+        self.assertTrue(
+            not typed_json_equal(
+                raw_endpoint_inventories["initial"],
+                raw_endpoint_inventories["final"],
+            )
+        )
+        for raw_inventory in raw_endpoint_inventories.values():
+            assert isinstance(raw_inventory, dict)
+            self.assertEqual(raw_inventory["repository"], current_repository)
+            self.assertEqual(raw_inventory["pull_number"], current_pr)
+            self.assertEqual(raw_inventory["head"], current_head)
+            self.assertIsInstance(raw_inventory["fetches"], list)
+        self.assertTrue(
+            typed_json_equal(
+                raw_endpoint_inventories["initial"],
+                nonancestor_finding_history["initial_current_raw_inventory"],
+            )
+        )
+        self.assertTrue(
+            typed_json_equal(
+                raw_endpoint_inventories["final"],
+                nonancestor_finding_history["final_current_raw_inventory"],
             )
         )
         report_universe = complete_basis["historical_universe"]
@@ -9507,6 +10850,25 @@ class RepositoryContractTest(unittest.TestCase):
         ]
         report_near_misses["current-missing-same-scope-request-audit"] = (
             missing_current_audit
+        )
+        for field in current_raw_authority_fields:
+            missing_current_raw_authority = clone(complete_report)
+            assert isinstance(missing_current_raw_authority, dict)
+            del missing_current_raw_authority["evidence_basis"]["current"][field]
+            report_near_misses[f"current-missing-{field}"] = (
+                missing_current_raw_authority
+            )
+        copied_final_current_raw = clone(complete_report)
+        assert isinstance(copied_final_current_raw, dict)
+        copied_final_current_raw["evidence_basis"]["current"][
+            "raw_endpoint_inventories"
+        ]["final"] = clone(
+            copied_final_current_raw["evidence_basis"]["current"][
+                "raw_endpoint_inventories"
+            ]["initial"]
+        )
+        report_near_misses["current-final-raw-copied-from-initial"] = (
+            copied_final_current_raw
         )
         missing_sample_audit = clone(complete_report)
         assert isinstance(missing_sample_audit, dict)
@@ -10144,6 +11506,44 @@ class RepositoryContractTest(unittest.TestCase):
             current,
         )
 
+        downgraded_discovery_schema = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            downgraded_discovery_schema[snapshot_name]["discovery_endpoint_transcript"][
+                "schema_version"
+            ] = 2
+        invalid_cases["history-discovery-schema-v2-downgrade"] = (
+            declaration,
+            downgraded_discovery_schema,
+            current,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                downgraded_discovery_schema["initial_inventory"][
+                    "discovery_endpoint_transcript"
+                ]
+            )
+        )
+
+        missing_scope_discovery_page = history(samples)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            scope_discovery_pages = missing_scope_discovery_page[snapshot_name][
+                "discovery_endpoint_transcript"
+            ]["scope_discovery"]["pages"]
+            self.assertGreater(len(scope_discovery_pages), 1)
+            scope_discovery_pages.pop()
+        invalid_cases["history-root-scope-discovery-page-missing"] = (
+            declaration,
+            missing_scope_discovery_page,
+            current,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                missing_scope_discovery_page["initial_inventory"][
+                    "discovery_endpoint_transcript"
+                ]
+            )
+        )
+
         truncated_candidate_universe = history([sample(pr) for pr in (2, 3, 4, 5)])
         truncated_candidate_universe["initial_candidates"].pop()
         truncated_candidate_universe["final_candidates"].pop()
@@ -10181,6 +11581,56 @@ class RepositoryContractTest(unittest.TestCase):
                 current,
                 normal_lane_timing,
             )
+        )
+
+        root_retained_after_synchronized_omission = history(
+            [sample(pr) for pr in (2, 3, 4, 5)]
+        )
+        root_retained_after_synchronized_omission["initial_candidates"].pop()
+        root_retained_after_synchronized_omission["final_candidates"].pop()
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            inventory = root_retained_after_synchronized_omission[snapshot_name]
+            inventory["entries"].pop()
+            scopes = inventory["discovery_endpoint_transcript"]["scopes"]
+            removed_scopes = [
+                scope for scope in scopes if scope.get("pull_number") == 5
+            ]
+            self.assertEqual(len(removed_scopes), 1)
+            scopes.remove(removed_scopes[0])
+        root_retained_after_synchronized_omission["candidate_universe_count"] = 3
+        invalid_cases["history-root-retained-after-synchronized-omission"] = (
+            declaration,
+            root_retained_after_synchronized_omission,
+            current,
+        )
+        retained_root_records = parse_rest_pages(
+            root_retained_after_synchronized_omission["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ]["scope_discovery"],
+            expected_kind="repository_pull_requests",
+            expected_url=(
+                f"https://api.github.com/repos/{current_repository}/pulls"
+                "?state=all&sort=created&direction=asc&per_page=100"
+            ),
+        )
+        self.assertIsNotNone(retained_root_records)
+        assert retained_root_records is not None
+        self.assertIn(5, {record["number"] for record in retained_root_records})
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                root_retained_after_synchronized_omission,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                root_retained_after_synchronized_omission,
+                current,
+            ),
+            "unknown",
         )
 
         raw_carrier_substitution = history(samples)
@@ -10316,6 +11766,188 @@ class RepositoryContractTest(unittest.TestCase):
                 else:
                     records.append(body)
             return records
+
+        ordinary_replies_artifact = clone(valid_thread_artifact)
+        assert isinstance(ordinary_replies_artifact, dict)
+        unrelated_bot_review_id = 920_002
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            target_thread_comments = ordinary_replies_artifact[snapshot_name][
+                "review_thread_pages"
+            ]["pages"][0]["nodes"][0]["comments"]["pages"][0]["nodes"]
+            target_thread_comments.extend(
+                [
+                    _graphql_thread_comment_fixture(
+                        920_011,
+                        parent_id=background_review_id,
+                        repository=current_repository,
+                        pull_request=background_pr,
+                    ),
+                    _graphql_thread_comment_fixture(
+                        920_012,
+                        parent_id=unrelated_bot_review_id,
+                        repository=current_repository,
+                        pull_request=background_pr,
+                    ),
+                    _graphql_thread_comment_fixture(
+                        920_013,
+                        parent_id=None,
+                        repository=current_repository,
+                        pull_request=background_pr,
+                    ),
+                ]
+            )
+        ordinary_replies_candidate = clone(samples[0])
+        assert isinstance(ordinary_replies_candidate, dict)
+        ordinary_replies_candidate["evidence_state"]["unresolved_thread_findings"] = [
+            ordinary_replies_artifact
+        ]
+        ordinary_replies_candidate["candidate_basis"] = {
+            "kind": "unresolved-thread-finding",
+            "server_time": 2_700_001,
+            "stable_artifact_id": 77_001,
+        }
+        restamp(ordinary_replies_candidate)
+        ordinary_replies_transcript = build_discovery_endpoint_transcript(
+            [ordinary_replies_candidate, current]
+        )
+        unrelated_only_thread = clone(background_thread)
+        assert isinstance(unrelated_only_thread, dict)
+        unrelated_only_thread["comments"]["pages"][0]["nodes"].extend(
+            [
+                _graphql_thread_comment_fixture(
+                    920_022,
+                    parent_id=unrelated_bot_review_id,
+                    repository=current_repository,
+                    pull_request=background_pr,
+                ),
+                _graphql_thread_comment_fixture(
+                    920_023,
+                    parent_id=None,
+                    repository=current_repository,
+                    pull_request=background_pr,
+                ),
+            ]
+        )
+        unrelated_bot_review = clone(background_review)
+        assert isinstance(unrelated_bot_review, dict)
+        unrelated_bot_review["id"] = unrelated_bot_review_id
+        unrelated_bot_review["html_url"] = (
+            f"https://github.com/{current_repository}/pull/{background_pr}"
+            f"#pullrequestreview-{unrelated_bot_review_id}"
+        )
+        unrelated_bot_review["user"] = {
+            "login": "dependabot[bot]",
+            "type": "Bot",
+        }
+        ordinary_reply_fetches = ordinary_replies_transcript["scopes"][0]["fetches"]
+        review_index = fetch_index(ordinary_reply_fetches, "reviews")
+        inline_index = fetch_index(ordinary_reply_fetches, "inline_comments")
+        thread_index = fetch_index(ordinary_reply_fetches, "review_threads")
+        selected_review_id = ordinary_replies_artifact["final_snapshot"]["id"]
+        selected_review_commit = ordinary_replies_artifact["final_snapshot"][
+            "commit_id"
+        ]
+        ordinary_rest_replies = [
+            {
+                "id": 920_011,
+                "html_url": (
+                    f"https://github.com/{current_repository}/pull/{background_pr}"
+                    "#discussion_r920011"
+                ),
+                "user": {"login": "octocat", "type": "User"},
+                "pull_request_review_id": selected_review_id,
+                "commit_id": selected_review_commit,
+                "original_commit_id": selected_review_commit,
+                "body": "Human selected-review reply.",
+            },
+            {
+                "id": 920_012,
+                "html_url": (
+                    f"https://github.com/{current_repository}/pull/{background_pr}"
+                    "#discussion_r920012"
+                ),
+                "user": {"login": "dependabot[bot]", "type": "Bot"},
+                "pull_request_review_id": selected_review_id,
+                "commit_id": selected_review_commit,
+                "original_commit_id": selected_review_commit,
+                "body": "Unrelated-bot selected-review reply.",
+            },
+            {
+                "id": 920_013,
+                "html_url": (
+                    f"https://github.com/{current_repository}/pull/{background_pr}"
+                    "#discussion_r920013"
+                ),
+                "user": {
+                    "login": "chatgpt-codex-connector[bot]",
+                    "type": "Bot",
+                },
+                "pull_request_review_id": None,
+                "commit_id": selected_review_commit,
+                "original_commit_id": selected_review_commit,
+                "body": "Exact-provider null-parent reply.",
+            },
+        ]
+        ordinary_reply_fetches[review_index] = rest_fetch(
+            "reviews",
+            (
+                f"https://api.github.com/repos/{current_repository}/pulls/"
+                f"{background_pr}/reviews?per_page=100"
+            ),
+            [
+                *raw_rest_records(ordinary_reply_fetches[review_index]),
+                background_review,
+                unrelated_bot_review,
+            ],
+        )
+        ordinary_reply_fetches[inline_index] = rest_fetch(
+            "inline_comments",
+            (
+                f"https://api.github.com/repos/{current_repository}/pulls/"
+                f"{background_pr}/comments?per_page=100"
+            ),
+            [
+                *raw_rest_records(ordinary_reply_fetches[inline_index]),
+                *ordinary_rest_replies,
+            ],
+        )
+        target_threads = parse_graphql_thread_pages(
+            ordinary_reply_fetches[thread_index]
+        )
+        assert isinstance(target_threads, list)
+        ordinary_reply_fetches[thread_index] = graphql_thread_fetch(
+            [*target_threads, unrelated_only_thread]
+        )
+        self.assertTrue(
+            typed_json_equal(
+                parse_discovery_endpoint_transcript(ordinary_replies_transcript),
+                derived_inventory_entries([ordinary_replies_candidate, current]),
+            )
+        )
+        audit_shadow_transcript = clone(ordinary_replies_transcript)
+        assert isinstance(audit_shadow_transcript, dict)
+        audit_shadow_fetches = audit_shadow_transcript["scopes"][0]["fetches"]
+        audit_shadow_inline_index = fetch_index(
+            audit_shadow_fetches,
+            "inline_comments",
+        )
+        audit_shadow_records = raw_rest_records(
+            audit_shadow_fetches[audit_shadow_inline_index]
+        )
+        target_inline_record = audit_shadow_records[0]
+        assert isinstance(target_inline_record, dict)
+        audit_shadow_record = clone(ordinary_rest_replies[0])
+        audit_shadow_record["id"] = target_inline_record["id"]
+        audit_shadow_record["html_url"] = target_inline_record["html_url"]
+        audit_shadow_fetches[audit_shadow_inline_index] = rest_fetch(
+            "inline_comments",
+            (
+                f"https://api.github.com/repos/{current_repository}/pulls/"
+                f"{background_pr}/comments?per_page=100"
+            ),
+            [*audit_shadow_records, audit_shadow_record],
+        )
+        self.assertIsNone(parse_discovery_endpoint_transcript(audit_shadow_transcript))
 
         for inventory_name in ("initial_inventory", "final_inventory"):
             transcript = background_noise_history[inventory_name][
@@ -11155,7 +12787,7 @@ class RepositoryContractTest(unittest.TestCase):
                 history([same_pr_different_scope, sample(2), sample(3)]),
                 current,
             ),
-            "clean",
+            "unknown",
         )
 
         for candidate_count in (9, 10, 11):
@@ -11925,7 +13557,7 @@ class RepositoryContractTest(unittest.TestCase):
             "`codex`-containing bot login",
             "provider-like identity ambiguity",
             "raw `discovery_endpoint_transcript`, not the candidate array",
-            "each scope is exactly `{fetches}`",
+            "each scope is exactly `{pull_number, fetches}`",
             "deleting a candidate, deleting its inventory entry, and decrementing the count",
             "do not themselves provide a cryptographic proof of github tls origin",
             "including confirmed-different-actor reactions",

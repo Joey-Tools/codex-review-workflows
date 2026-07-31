@@ -102,6 +102,7 @@ playbook changes.
 Result-present acceptance is not optimistic acceptance. A newer finding or
 malformed terminal artifact, unresolved thread, incomplete page, conflicting
 same-time channel evidence, stale scope, or unstable final re-read still blocks.
+An unresolved thread finding is not superseded by a later clean artifact.
 
 ## Decision
 
@@ -175,7 +176,9 @@ Evaluate provider artifacts independently of request count:
    comment, every reaction on a current controlled request, all bounded-history
    candidate outcomes needed to compute the profile, and review threads. The
    profile is selected only after these reads; it cannot decide which evidence
-   is fetched.
+   is fetched. When reaction clean is possible, preserve an independently
+   fetched raw initial current endpoint inventory before deriving the
+   normalized current snapshot or ancestry set.
    Aggregate issue-comment reaction counts do not identify the actor and
    cannot authorize `+1`; consume the fully paginated individual reaction
    records with their IDs, actors, content, and server times.
@@ -224,8 +227,11 @@ Evaluate provider artifacts independently of request count:
    replace, or reorder an already selected terminal payload. The newer-`eyes`
    exclusion applies only while evaluating the reaction-only fallback.
 9. Perform the final re-read. The result counts only if scope, lifecycle,
-   request history, profile inputs, provider evidence, and thread state are
-   unchanged.
+   request history, profile inputs, provider evidence, and target-thread state
+   are unchanged. Reaction clean also requires a new independent raw final
+   current endpoint inventory plus repeated parent-owned local Git ancestry
+   receipts for every raw-derived finding commit; normalized snapshot equality
+   alone is insufficient.
 
 An exact-App check or check run is service-start evidence only. It is not a
 terminal provider artifact and never proves clean, even when its conclusion is
@@ -336,11 +342,19 @@ Only the following terminal payloads are accepted:
 2. **Clean pull-request review.** Require REST `state == "APPROVED"`, a native
    lowercase full-SHA `commit_id` equal to the selected current head, and a
    normalized body exactly equal to `No findings.`. The review's associated
-   inline-comment endpoint must be fully paginated and the joined child set
-   must be present. The review is clean only when that set is empty. A valid
-   exact-provider inline child is a finding and therefore takes precedence
-   over the clean-looking parent; an unread, incomplete, malformed, or
-   conflicting child set is inconclusive or malformed, never clean. Empty
+   inline-comment endpoint and the raw GraphQL thread/comment connections must
+   be fully paginated. The target child set is only the exact-provider REST
+   children whose positive canonical `pull_request_review_id` equals this
+   selected review ID. Every target must complete the canonical one-to-one
+   thread join below. The review is clean only when that target set is empty.
+   A valid target child is a finding and therefore takes precedence over the
+   clean-looking parent; an unread, incomplete, malformed, orphaned,
+   duplicate, or conflicting target join is inconclusive or malformed, never
+   clean. An `APPROVED` / `No findings.` review with zero children is the only
+   clean review shape in this branch. Fully fetched human or unrelated-bot
+   comments, null-parent replies,
+   and threads containing no target child remain audit context. They neither
+   create a selected-review finding nor supply resolution for one. Empty
    bodies, `Looks good.`, coverage summaries, alternative punctuation,
    additional prose, links, HTML, comments, and code fences are malformed
    under this stricter playbook grammar.
@@ -569,19 +583,33 @@ thread's stable `id`, typed `isResolved`, typed `isOutdated`, outer
 comment's GraphQL `id`, `fullDatabaseId`, `url`, and
 `pullRequestReview { id fullDatabaseId }`. Both connections start at a null
 cursor, follow each opaque returned `endCursor` exactly, and terminate only at
-typed `hasNextPage == false`.
+typed `hasNextPage == false`. The raw audit retains all fetched comments and
+threads; target selection happens only after complete pagination.
 
 Normalize each non-null GraphQL `BigInt` to canonical positive decimal text.
 Normalize a REST JSON numeric ID only when it is a positive integer; booleans,
 floats, zero, negatives, signs, leading zeros, and other text forms are
-invalid. Join each raw REST inline comment to exactly one raw GraphQL comment
-by normalized REST `id == fullDatabaseId`, then require the normalized REST
-`pull_request_review_id` to equal
-`pullRequestReview.fullDatabaseId` and require the canonical URLs to agree.
-Every applicable raw REST child and GraphQL comment must participate in one and
-only one join. An orphan, duplicate, parent-review conflict, URL conflict,
-missing page, broken cursor chain, or wrong JSON type makes the snapshot
-incomplete.
+invalid. For one selected review, derive the target set only from raw REST
+records with exact provider identity and a positive canonical
+`pull_request_review_id` equal to the selected review ID. Join every target
+REST child to exactly one raw GraphQL comment by normalized REST
+`id == fullDatabaseId`, then require
+`pullRequestReview.fullDatabaseId` to equal the selected review ID and require
+the canonical URLs to agree. Every target child participates in one and only
+one join. A target orphan, duplicate mapping, parent-review conflict, URL
+conflict, missing page, broken cursor chain, or wrong JSON type makes the
+snapshot incomplete and fails closed.
+
+Fully fetched REST records from confirmed humans or unrelated bots, replies
+whose `pull_request_review_id` is null, GraphQL comments that are not the
+unique target match, and threads that contain no target remain audit context.
+They do not have to be promoted into the target join, cannot create or resolve
+a selected-review finding, and cannot make an otherwise malformed target join
+valid. A missing or ambiguous actor is not a confirmed non-target; apply the
+provider-identity fail-closed rule before excluding it. Likewise, an
+exact-provider REST record with a positive selected-review parent is always a
+target and cannot be relabelled as a reply or unrelated audit context to avoid
+the join.
 
 Fields such as `thread_id`, `thread_resolved`, or `is_resolved` attached to a
 REST inline record are synthesized assertions, not raw GitHub authority. Do
@@ -590,10 +618,12 @@ not copy them into the raw record schema. A derived reader-facing
 `thread_findings` summary is allowed only after the raw join succeeds and must
 be recomputable field for field from those pages.
 
-An unresolved thread finding is not superseded. A later clean terminal
+An unresolved target-thread finding is not superseded. A later clean terminal
 artifact can establish the provider's latest terminal outcome, but the lane
 and PR readiness cannot claim completed-clean while any applicable
-thread-backed finding remains unresolved.
+target-thread finding remains unresolved. Resolution on a human-only,
+unrelated-bot-only, null-parent-only, or otherwise unrelated thread is audit
+context and cannot resolve a target finding.
 
 ### Top-Level Findings
 
@@ -658,20 +688,38 @@ values, and the initial receipt. Self-reported `authenticated` or
 
 The raw `discovery_endpoint_transcript`, not the candidate array, inventory
 entries, or count, is the historical-universe authority. Store it in both the
-initial and final inventory. Its closed top-level shape is exactly
-`{schema_version: 2, repository, scopes}`, and each scope is exactly
-`{fetches}`. Each fetch is exactly
+initial and final inventory, with each inventory produced by its own
+independent fetch traversal. Its closed top-level shape is exactly
+`{schema_version: 3, repository, scope_discovery, scopes}`.
+`scope_discovery` is exactly one `repository_pull_requests` REST fetch record
+for an
+independently fetched, fully paginated repository-wide
+`GET /repos/<owner>/<repo>/pulls?state=all&sort=created&direction=asc&per_page=100`
+traversal, starting at that canonical URL and following every raw
+`Link rel=next` page. It is not a projection of the per-scope records. Each
+scope is exactly `{pull_number, fetches}`, where `pull_number` is a canonical
+positive integer and `fetches` is seeded from one raw repository-list record.
+Each fetch is exactly
 `{kind, transport, parent_comment_id, pages}`. The only fetch kinds are
 `pull_requests`, `compare`, `issue_comments`, `reviews`, `inline_comments`,
-`review_threads`, and `request_reactions`. The fixed parser takes `base.sha`
-and `head.sha` from the raw pull record, binds those exact values into the
-canonical compare request, and takes `pr_merge_base` only from
+`review_threads`, and `request_reactions`.
+
+Every canonical pull number returned anywhere in the repository-wide list must
+seed exactly one complete PR-detail traversal, including the exact current PR
+and PRs that later prove to be outside the 30-day window, contain only
+confirmed non-provider activity, or otherwise normalize as non-candidates.
+There may be no unseeded list record, duplicate scope, caller-injected scope,
+or scope silently removed before detail parsing. The scope's `pull_requests`
+fetch is the canonical detail GET for that exact number. The fixed parser takes
+`base.sha` and `head.sha` from that raw detail record, binds those exact values
+into the canonical compare request, and takes `pr_merge_base` only from
 `compare.merge_base_commit.sha`; neither `base.sha` nor
-`merge_commit_sha` substitutes for the merge base. A version-2
-`review_threads` response stores the real GraphQL
+`merge_commit_sha` substitutes for the merge base.
+
+A schema-version-3 `review_threads` response stores the real GraphQL
 `comments { nodes pageInfo }` connection inside each raw thread node; it never
 stores the report's normalized `comments.pagination_complete/pages` shape in
-the response body. Version 2 accepts that nested connection only when its
+the response body. Version 3 accepts that nested connection only when its
 first response is already complete (`hasNextPage == false` and
 `endCursor == null`). A nested `hasNextPage == true` requires a separately
 bound child-cursor fetch shape that this schema does not define, so the profile
@@ -725,9 +773,14 @@ are not falsely described as raw-derived. These checks never prove the
 transcript complete merely by agreeing with one another. In particular,
 deleting a candidate, deleting its inventory entry, and decrementing the count
 while leaving its raw fetch record present must fail closed. Missing required
-child fetches, an unreadable or over-budget page, a broken Link/cursor chain, a
-body-digest mismatch, initial/final semantic drift, or any projection mismatch
-selects `unknown`; no completeness flag can override it.
+child fetches, an unreadable page, a repository-list or detail traversal that
+exceeds any predeclared page/count/byte/time evidence budget, a broken
+Link/cursor chain, a body-digest mismatch, initial/final semantic drift, or any
+projection mismatch selects `unknown`; no completeness flag can override it.
+Never truncate the repository-wide seed, skip a seeded PR, or keep an older
+in-budget subset after overflow. A version-2 transcript has no independent
+repository-wide seed and therefore cannot prove `thumbs-up-clean`, even when
+its derived candidates, entries, and counts are internally consistent.
 
 The parent GitHub fetch path that captured each response is a trusted workflow
 boundary. The stored offline transcript and hashes preserve the bytes supplied
@@ -741,17 +794,24 @@ times and confirmed-different-actor reactions that are excluded from provider
 semantic ordering. Any later artifact is impossible in the frozen observation
 and makes the profile `unknown`.
 
-Historical candidates exclude the exact current scope: the current outcome is
-validated separately and never counts toward the three-outcome history
-minimum. A historical scope is a candidate when it contains a terminal-looking
-provider record, an exact-bot reaction on a controlled request, or a
-provider-like record whose identity is missing or ambiguous. A confirmed
-different actor is not provider behaviour and does not enter the universe; its
-bounded record remains audit evidence and cannot cause ordinary human
-comments, reviews, inline threads, or reactions to masquerade as provider
-behaviour. A provider terminal artifact may form a candidate even when no
-controlled request was observed. Reaction-only evidence still requires the
-exact controlled parent and can never arise without a request.
+Raw discovery includes the exact current scope and every confirmed
+non-candidate PR. The fixed parser first completes and validates every seeded
+detail traversal, derives the full classified scope inventory, and only then
+excludes the exact current scope from the historical candidate set. The
+current outcome is validated separately and never counts toward the
+three-outcome history minimum. A historical scope is a candidate when it
+contains a terminal-looking provider record, an exact-bot reaction on a
+controlled request, or a provider-like record whose identity is missing or
+ambiguous. Historical candidates exclude the exact current scope. A scope
+containing only confirmed different actors is not provider behaviour and
+becomes a confirmed non-candidate only after full parsing; its raw scope and
+bounded records remain in discovery audit evidence. They cannot cause ordinary
+human comments, reviews, inline threads, or reactions to masquerade as provider
+behaviour. A confirmed different actor is not provider behaviour. A provider
+terminal artifact may form a
+candidate even when no controlled request was observed. Reaction-only evidence
+still requires the exact controlled parent and can never arise without a
+request.
 Complete pagination and scope inventory must prove that universe and its
 recorded count by derivation from the raw transcript. The initial and final
 enumerations must be semantically identical for the same frozen interval.
@@ -916,6 +976,65 @@ condition holds; every other case selects `unknown`. A current trustworthy
 terminal payload plus selected reaction-only history is therefore `mixed`,
 never an implementation choice between profiles.
 
+### Current Reaction-Clean Authority
+
+A normalized `current.initial_snapshot` / `current.final_snapshot` pair is a
+derived reader-facing view. Even when those two objects agree, it cannot prove
+that the current endpoint universe was fetched or that every current/ancestor
+finding commit was checked locally. It is insufficient for `+1` clean.
+
+Before considering current reaction-only clean, the parent independently
+fetches two complete raw current endpoint inventories: one initial traversal
+and a new final traversal immediately before acceptance. Each inventory uses
+the closed shape
+`{repository, pull_number, head, fetches}`. Its `fetches` use the same closed
+fetch/page records, pagination rules, raw bodies, and digests as discovery
+schema version 3 and cover the current pull detail, compare, issue comments,
+reviews, associated inline comments, raw GraphQL review threads/comments, and
+every controlled-request reaction endpoint. The two inventories are
+independent API traversals, not aliases, copies of one body, normalized
+snapshots, or projections supplied by the caller. Each must independently
+derive the same complete provider-artifact, request/reaction, target-thread,
+and finding-commit sets. Missing pages, over-budget traversal, projection
+drift, or initial/final semantic drift selects `unknown`.
+
+From each raw inventory, before applying ancestry or resolution filtering, the
+fixed projector derives every distinct lowercase full finding commit exposed
+by a top-level finding or an exact-provider selected-review target child. A
+missing or malformed commit binding remains a malformed/blocking artifact; it
+cannot be omitted from the derivation. For every derived full commit, the
+parent—not a reviewer, caller, normalized snapshot, or GitHub payload—records
+one local Git ancestry receipt against the exact current head in both the
+initial and final phases. The receipt's closed fields are exactly
+`{finding_commit, head, object_check_return_code,
+ancestry_return_code}`. With lazy fetching and credential prompting disabled,
+`object_check_return_code` is the exact return code from locally resolving
+`<finding_commit>^{commit}` and must be `0`.
+`ancestry_return_code` is the exact return code from
+`git merge-base --is-ancestor <finding_commit> <head>` and must be exactly:
+
+- `0`: the finding commit equals or is an ancestor of the current head, so the
+  finding is applicable to reaction clean;
+- `1`: local Git proves that the finding commit is not an ancestor of the
+  current head, so it remains audit evidence but is not a current/ancestor
+  blocker.
+
+A missing receipt, missing local object, duplicate or extra receipt, a return
+code other than the exact values above, a raw-derived commit-set mismatch, or
+any initial/final inventory or receipt drift makes the current reaction
+classification `unknown`. The initial and final receipt arrays must be
+type-preserving identical and must each cover exactly the full commit set
+derived from its corresponding raw inventory.
+
+Any applicable top-level finding blocks reaction-only clean. Any applicable
+target-thread finding whose raw GraphQL thread has typed
+`isResolved == false` also blocks reaction-only clean. Human,
+unrelated-bot, null-parent, and unrelated-only thread state cannot contribute
+resolution, while a malformed target join still fails closed. The reaction
+`evidence_basis` embeds both independent raw current endpoint inventories and
+both parent-owned local Git ancestry-receipt arrays; external ledgers or the
+normalized current snapshots do not replace them.
+
 ### +1 Fallback
 
 +1 fallback requires all of the following:
@@ -925,15 +1044,19 @@ never an implementation choice between profiles.
    exact-provider GitHub declaration artifact above. Generic issuer/source
    labels, copied prose, and self-hashed paraphrases do not satisfy it.
 3. The complete bounded 30-day same-repository historical candidate universe,
-   excluding the exact current scope, selects 3 to 10 outcomes and every
-   selected candidate is eligible under the profile rule above. No incomplete,
-   conflicting, ambiguous, or unfavourable candidate was skipped. Every
-   selected history entry records its immutable scope, exact selected controlled
-   request, exact child `+1` reaction, every accepted same-scope request/reaction
-   audit, the scope-final `candidate_basis`, and strict
+   derived from a schema-version-3 repository-wide seed, excludes the exact
+   current scope only after every seeded PR—including current and confirmed
+   non-candidates—was fully traversed and parsed. It selects 3 to 10 outcomes
+   and every selected candidate is eligible under the profile rule above. No
+   incomplete, conflicting, ambiguous, over-budget, or unfavourable candidate
+   was skipped. A version-2 transcript cannot satisfy this condition. Every
+   selected history entry records its immutable scope, exact selected
+   controlled request, exact child `+1` reaction, every accepted same-scope
+   request/reaction audit, the scope-final `candidate_basis`, and strict
    request-semantic-time-before-reaction ordering. The trusted GitHub
-   `as_of_server_time`, exact half-open interval, complete universe count, and
-   every pre-sort candidate basis also satisfy the window contract above.
+   `as_of_server_time`, exact half-open interval, complete classified seed
+   inventory/count, and every pre-sort candidate basis also satisfy the window
+   contract above.
 4. The parent recorded the exact accepted request comment for the exact
    current whole-PR scope, including `created_at`, `updated_at`, normalized body,
    selected semantic server time, and its field name, before consuming any
@@ -942,16 +1065,29 @@ never an implementation choice between profiles.
 6. The `+1` was created strictly after the request's semantic server time,
    using `created_at` only for an unedited request and `updated_at` otherwise.
 7. Complete pagination covers request comments, issue reactions, issue
-   comments, reviews, associated inline comments, and review threads.
+   comments, reviews, associated inline comments, and review threads. The
+   independently fetched initial and final raw current endpoint inventories
+   are complete, stable, and embedded in the basis; normalized current
+   snapshots are not a substitute.
 8. The PR remains open and unmerged, and the final base, head, unique merge
    base, and frozen range prove stable current scope.
 9. There is no trustworthy current-scope terminal artifact of any outcome and
    no current-scope terminal-looking malformed artifact. The weaker condition
    “no newer trustworthy terminal artifact” is insufficient: in `mixed`, a
    terminal payload remains authoritative even when the `+1` is later.
-10. There is no active top-level finding on the current head or a proved
-    ancestor head. Reaction-only clean never supersedes a finding.
-11. There is no unresolved thread finding.
+10. Parent-owned initial and final local Git ancestry receipts cover every
+    finding commit independently derived from the corresponding raw current
+    inventory. Every object check returns exact `0`, every ancestry check
+    returns exact `0` or `1`, and both receipt sets are stable. There is no
+    active top-level finding whose receipt returns `0` for the current head:
+    no active top-level finding on the current head or a proved ancestor head.
+    Reaction-only clean never supersedes a finding, including a current or
+    ancestor finding. No unresolved thread finding may remain. Missing,
+    other-return-code, or drifting ancestry evidence selects `unknown`.
+11. There is no unresolved exact-provider selected-review target-thread
+    finding whose commit has ancestry return code `0`. Human,
+    unrelated-bot, null-parent, and unrelated-only threads are audit context
+    and cannot contribute resolution; malformed target joins fail closed.
 12. Every accepted current-scope controlled request and its reactions are
     fully paginated and have no cross-parent conflict under the rule above.
     Its parent is the unique latest request by semantic time, and the selected
@@ -961,10 +1097,12 @@ never an implementation choice between profiles.
     `(created_at, positive numeric ID)` order. `eyes` is liveness-only: it can
     show that work started or restarted, but it never proves clean.
 13. The final re-read is unchanged, including the canonical declaration REST
-    artifact and recomputed digest, trusted history-window anchor/count, every
+    artifact and recomputed digest, trusted history-window anchor/count, the
+    complete repository-wide seed and every seeded PR classification, every
     candidate before sorting, every ordered historical request/reaction sample,
-    the exact current request and reaction, all evidence pages, thread state,
-    lifecycle, and whole-PR scope.
+    the exact current request and reaction, the independently fetched raw
+    current endpoint inventories, both parent-owned ancestry-receipt arrays,
+    all evidence pages, target-thread state, lifecycle, and whole-PR scope.
 
 If any condition is absent, `+1` does not complete the lane. Missing or
 ambiguous evidence is `pending` while bounded waiting remains meaningful and
@@ -1097,11 +1235,15 @@ pages. Every raw REST child record includes its stable ID/URL, exact actor,
 `pull_request_review_id`, `commit_id`, `original_commit_id`, raw/normalized
 body, but no synthesized thread or resolution field. The snapshot separately
 stores the complete raw GraphQL thread/comment pages. The canonical BigInt
-one-to-one join derives `thread_findings`; only the raw GraphQL `isResolved`
-value supplies resolution authority. The pagination and raw join inputs must
-prove the complete child set even when it is empty. Thus an `APPROVED` /
-`No findings.` review with zero children, one with a valid finding child, and
-one whose child page is unread produce distinguishable reports.
+one-to-one join targets only exact-provider REST children whose canonical
+parent is the selected review and derives `thread_findings`; only the joined
+target thread's raw GraphQL `isResolved` value supplies resolution authority.
+The pagination and raw join inputs must prove the complete target set even when
+it is empty. Human, unrelated-bot, null-parent, and unrelated-only records stay
+in the raw audit and cannot supply resolution. Thus an `APPROVED` /
+`No findings.` review with zero targets, one with a valid target finding child,
+one with only unrelated audit children, and one whose target page/join is
+unread or malformed produce distinguishable reports.
 This raw page set plus its canonical derivation is the associated inline-comment
 page/join evidence; the legacy phrase does not authorize synthesized fields.
 
@@ -1174,10 +1316,22 @@ evidence_basis:
       complete: true
       repository: OWNER/REPO
       discovery_endpoint_transcript:
-        schema_version: 2
+        schema_version: 3
         repository: OWNER/REPO
+        scope_discovery:
+          kind: repository_pull_requests
+          transport: rest
+          parent_comment_id: null
+          pages:
+            - request_url: https://api.github.com/repos/OWNER/REPO/pulls?state=all&sort=created&direction=asc&per_page=100
+              status: 200
+              link_header: <raw REST Link header or null>
+              request_after: null
+              body_utf8: <bounded raw repository-wide pull-list JSON response>
+              body_sha256: <recomputed lowercase SHA-256>
         scopes:
-          - fetches:
+          - pull_number: <positive PR number seeded by scope_discovery>
+            fetches:
               - kind: pull_requests | compare | issue_comments | reviews | inline_comments | review_threads | request_reactions
                 transport: rest | graphql
                 parent_comment_id: <positive request-comment ID or null>
@@ -1188,6 +1342,10 @@ evidence_basis:
                     request_after: <null for REST/first GraphQL page or prior raw endCursor>
                     body_utf8: <bounded raw JSON response body>
                     body_sha256: <recomputed lowercase SHA-256>
+      scope_classifications:
+        - pull_number: <every seeded PR, including current and confirmed non-candidates>
+          scope_key: [OWNER/REPO, <pr>, <pr_merge_base>, <head>]
+          classification: current | historical-candidate | confirmed-non-candidate
       entries:
         - scope_key: [OWNER/REPO, <pr>, <pr_merge_base>, <head>]
           source_ordering_key: [<server_time>, <stable_artifact_id>]
@@ -1203,6 +1361,29 @@ evidence_basis:
     final_candidates:
       - <repeat every complete initial candidate snapshot in the same order>
   current:
+    raw_endpoint_inventories:
+      initial:
+        repository: OWNER/REPO
+        pull_number: 123
+        head: <full lowercase SHA>
+        fetches:
+          - kind: pull_requests | compare | issue_comments | reviews | inline_comments | review_threads | request_reactions
+            transport: rest | graphql
+            parent_comment_id: <positive request-comment ID or null>
+            pages:
+              - <same closed raw page shape used by discovery schema version 3>
+      final: <independently re-fetched complete current inventory with identical authority projection>
+    finding_commits:
+      initial:
+        - <every distinct full commit derived from the raw initial inventory>
+      final: <repeat the independently derived type-preserving identical list>
+    local_git_ancestry_receipts:
+      initial:
+        - finding_commit: <full lowercase SHA>
+          head: <same current head>
+          object_check_return_code: 0
+          ancestry_return_code: 0 | 1
+      final: <repeat the complete type-preserving identical parent-owned receipt array>
     initial_snapshot: <complete current snapshot using the fields below>
     final_snapshot: <repeat the complete identical current snapshot>
     complete: true
@@ -1267,24 +1448,33 @@ evidence_basis:
             - <same seven reaction fields>
 ```
 
-The report embeds both raw historical discovery endpoint transcripts, both
-raw-derived source-authority inventories, and both independently validated
-complete candidate arrays, including candidates outside `samples`; a count or
-external ledger reference is insufficient. Each complete candidate snapshot repeats
-these fields: `complete`, all six pagination results, the four
+The report embeds both independently fetched schema-version-3 raw historical
+discovery endpoint transcripts, including each complete repository-wide pull
+seed, every seeded PR traversal, and every current/candidate/non-candidate
+classification. It also embeds both raw-derived source-authority inventories
+and both independently validated complete candidate arrays, including
+candidates outside `samples`; a count, version-2 transcript, or external ledger
+reference is insufficient. Each complete candidate snapshot repeats these
+fields: `complete`, all six pagination results, the four
 `evidence_state` artifact arrays with stable IDs/times, lifecycle, immutable
 scope, every controlled request, every individual reaction (including
 confirmed-different-actor reactions), selected request/reaction IDs when present,
 `same_scope_request_audit`, and `candidate_basis`. The initial and final
 inventory records and candidate arrays must be structurally identical.
 
-`current.initial_snapshot` and `.final_snapshot` likewise embed that complete
-field set for the exact current scope and must be structurally identical. The
-other `current` fields shown above are the selected reader-facing summary, not
-a substitute for those snapshots. Every raw artifact/request/reaction time in
-both historical and current snapshots is checked against the recorded as-of
-bound before actor filtering or candidate selection. This lets a reader
-distinguish a valid
+`current.raw_endpoint_inventories.initial` and `.final` are independent,
+complete endpoint traversals and each is the authority for its corresponding
+raw finding-commit set. The parent-owned
+`current.local_git_ancestry_receipts.initial` and `.final` cover exactly those
+sets and accept only local object-check return code `0` plus ancestry return
+code `0` or `1`. The two receipt arrays and raw authority projections must be
+type-preserving identical. `current.initial_snapshot` and `.final_snapshot`
+likewise embed the complete reader-facing field set for the exact current scope
+and must be structurally identical, but neither normalized snapshot substitutes
+for the raw inventories or ancestry receipts. Every raw
+artifact/request/reaction time in both historical and current inventories is
+checked against the recorded as-of bound before actor filtering or candidate
+selection. This lets a reader distinguish a valid
 11-candidate universe from one whose unselected candidate was truncated,
 incompletely paginated, changed on final reread, or contained a future
 confirmed-human reaction.
@@ -1318,9 +1508,14 @@ visible in the complete audit and may prevent only reaction-only fallback.
 References to an external ledger do not replace these fields.
 Immediately before success, re-fetch and revalidate the authenticated
 declaration artifact without moving the frozen window, re-read every raw
-discovery endpoint transcript, independently rederive the inventory/count and
-every universe candidate before sorting, and revalidate every ordered
-`samples[]` and every `current` field, including every cross-parent audit.
+discovery endpoint transcript, independently rederive the repository-wide
+seed coverage, every seeded PR classification, the historical inventory/count,
+and every universe candidate before sorting, and revalidate every ordered
+`samples[]`. Independently re-fetch the final raw current endpoint inventory,
+rederive its complete finding-commit set, repeat every parent-owned local Git
+ancestry receipt, and revalidate every `current` field and cross-parent audit.
+Missing data, non-`0` object resolution, ancestry return codes outside exact
+`0`/`1`, budget overflow, or any initial/final drift selects `unknown`.
 When a terminal artifact is selected, record it even when its outcome is
 findings. Do not reduce the basis to prose such as “Codex completed”.
 
@@ -1339,9 +1534,12 @@ implementation mechanically:
    `base-changed-same-head`.
 2. **Raw thread resolution is a playbook extension.** This playbook requires
    complete raw REST inline-comment records, complete raw GraphQL thread and
-   nested-comment pages, canonical BigInt normalization, and a one-to-one join.
-   It never treats synthesized REST `thread_id` / `thread_resolved` fields or
-   `isOutdated` as resolution authority.
+   nested-comment pages, canonical BigInt normalization, and a one-to-one join
+   for every exact-provider selected-review target child. Fully fetched human,
+   unrelated-bot, null-parent, and unrelated-only records remain audit context
+   and cannot contribute resolution. It never treats synthesized REST
+   `thread_id` / `thread_resolved` fields or `isOutdated` as resolution
+   authority, and a malformed target join still fails closed.
 3. **The closed terminal issue-comment carrier is a playbook extension.** The
    inheritance does not make the fixed Action's internal carrier schema this
    playbook's schema. The exact Bot/App/API/HTML/body/scope record, parsed
@@ -1356,7 +1554,9 @@ implementation mechanically:
    `plusOne` in its reaction baseline but does not use it as provider-result
    authority; its result selector consumes terminal issue comments and
    reviews. This playbook permits `+1` only under the dynamic-profile and
-   thirteen-condition fallback above.
+   thirteen-condition fallback above, including independent initial/final raw
+   current inventories and parent-owned local Git ancestry receipts. A
+   normalized current snapshot is not that authority.
 6. **`eyes` remains orchestration-only.** The fixed Action uses a new `eyes`
    transition as acknowledgement/liveness. This playbook preserves that
    boundary and additionally rejects `+1` fallback when a newer `eyes`
@@ -1373,12 +1573,20 @@ implementation mechanically:
    `early-request-observed` when that producer order was violated. Do not
    discard a later independently trustworthy provider result solely because of
    that producer-side sequencing defect.
+9. **Repository-wide discovery schema version 3 is a playbook extension.**
+   This playbook independently and fully paginates the repository-wide
+   state-all PR list, traverses every seeded PR including current and confirmed
+   non-candidates, and excludes current only after full parsing. Version 2
+   cannot prove the fallback, and evidence-budget overflow selects `unknown`.
+   None of these discovery gates is attributed to the fixed Action baseline.
 
 ## Non-Goals
 
 - Do not treat checks, status contexts, acknowledgements, progress comments,
   `eyes`, sticky state, deadlines, or request markers as clean results.
 - Do not weaken exact bot identity or full pagination to make a profile fit.
+- Do not use a version-2 transcript, truncated repository seed, normalized
+  current snapshot, or external ancestry ledger as reaction-clean authority.
 - Do not carry a profile across repositories or beyond the bounded 30-day
   evidence window.
 - Do not create a duplicate request, empty commit, or synthetic provider

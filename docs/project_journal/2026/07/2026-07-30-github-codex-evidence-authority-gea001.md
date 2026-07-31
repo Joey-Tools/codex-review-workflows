@@ -50,8 +50,9 @@ superseded_by:
   clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
   `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
   current-head `commit_id` / `No findings.` records whose fully paginated
-  associated inline-child set is present and empty. A valid child is findings;
-  an unread, incomplete, malformed, or conflicting child set is never clean.
+  exact-provider selected-review target-child set is present and empty. A valid
+  target child is findings; an unread, incomplete, malformed, or conflicting
+  target join is never clean. Non-target replies remain audit context.
   Every other terminal-looking exact-provider payload is malformed. Review
   terminal-looking detection is independent of state admissibility:
   `PENDING` remains nonterminal; `DISMISSED`, or a missing/unknown state with a
@@ -98,15 +99,32 @@ superseded_by:
   open/unmerged lifecycle, complete
   pagination, stable whole-PR scope, no trustworthy current-scope terminal
   payload or conflicting finding/thread evidence, and an unchanged final
-    re-read. The reaction report embeds identical initial/final version-2
-    discovery transcripts, raw-derived source-authority inventories, and
-    independently validated complete candidate arrays, not just the selected
-    samples or a caller-adjustable count. Each inventory entry binds scope/order
-    plus carrier, channel, semantic result, native identity, and canonical
-    source-record digest; same time/ID cannot substitute a reaction for a
-    terminal artifact. Pull scope uses a canonical compare fetch, and only
-    `merge_base_commit.sha` supplies `pr_merge_base`. Every raw
-    historical/current server time must be
+  re-read. Those normalized snapshots are now explicitly derived views, not
+  current reaction-clean authority. The reaction basis additionally embeds
+  independent initial/final raw current endpoint inventories and parent-owned
+  initial/final local Git ancestry receipts for every raw-derived finding
+  commit. Object resolution must return exact `0`; ancestry must return exact
+  `0` for current/ancestor or exact `1` for proved non-ancestor. Missing
+  receipts, any other return code, commit-set mismatch, or initial/final drift
+  selects `unknown`. The basis also records independently derived
+  `finding_commits.initial/final`. Any raw-derived top-level finding or
+  unresolved exact-provider selected-review target-thread finding whose
+  `ancestry_return_code` is exact `0` blocks reaction clean.
+  The reaction report embeds independently fetched initial/final
+    schema-version-3 discovery transcripts, raw-derived source-authority
+    inventories, and independently validated complete candidate arrays, not
+    just the selected samples or a caller-adjustable count. Each transcript
+    begins with a fully paginated repository-wide
+    `state=all&sort=created&direction=asc&per_page=100` PR seed and drives one
+    complete detail traversal for every seeded PR, including current and
+    confirmed non-candidates. Current is excluded from historical candidates
+    only after full parsing. Version 2 cannot prove fallback, and any
+    seed/detail/page/count/byte/time budget overflow selects `unknown`. Each
+    inventory entry binds scope/order plus carrier, channel, semantic result,
+    native identity, and canonical source-record digest; same time/ID cannot
+    substitute a reaction for a terminal artifact. Pull scope uses a canonical
+    compare fetch, and only `merge_base_commit.sha` supplies `pr_merge_base`.
+    Every raw historical/current server time must be
   at or before the GitHub response-time as-of, including confirmed-different
     actors excluded from provider ordering. Confirmed different-user and clearly
     unrelated-bot comments, reviews, inline threads, and reactions remain in the
@@ -217,23 +235,30 @@ superseded_by:
   unedited comments and reactions use `created_at` and reviews use
   `submitted_at`. Review-thread joins use current GitHub GraphQL
   `fullDatabaseId: BigInt`, normalized with REST IDs as canonical positive
-  decimal text.
+  decimal text. The join target set contains only exact-provider
+  selected-review REST children. Every target maps exactly once; human,
+  unrelated-bot, null-parent, and unrelated-only records remain fully fetched
+  audit context and cannot supply resolution.
 - Raw REST receipts keep GitHub timestamps as canonical whole-second RFC3339
   `Z` text. A fixed policy projector strictly converts them to positive Unix
   seconds before ordering and source hashing; numeric, offset, fractional, or
   invalid substitutes fail closed, while unrelated transport fields do not
   change the policy projection.
 - Review-thread resolution comes only from fully paginated raw GraphQL
-  `isResolved` evidence joined one-to-one to the fully paginated raw REST inline
-  comment set. Synthesized `thread_id` or `thread_resolved` fields on REST
-  records are not authority; duplicate, orphaned, conflicting, noncanonical,
-  or incompletely paginated joins fail closed. `isOutdated` never substitutes
-  for `isResolved`.
-- Historical discovery transcript v2 records the real nested GraphQL
+  `isResolved` evidence. First derive the exact-provider selected-review target
+  subset from the fully paginated raw REST inline-comment set; only each target
+  in that subset must join exactly once to raw GraphQL evidence. Non-target
+  records remain audit context. Synthesized `thread_id` or `thread_resolved`
+  fields on REST records are not authority; duplicate, orphaned, conflicting,
+  noncanonical, or incompletely paginated target joins fail closed.
+  `isOutdated` never substitutes for `isResolved`.
+- Historical discovery transcript v3 records the real nested GraphQL
   `comments { nodes pageInfo }` response shape. It accepts nested comments only
   when the first connection is complete; a child cursor is fail-closed until a
   later schema version can bind that separate request instead of fabricating
-  normalized pages inside a raw response.
+  normalized pages inside a raw response. Version 3 additionally roots
+  discovery in the independent repository-wide PR inventory above; version 2
+  is no longer sufficient for `thumbs-up-clean`.
 - The reaction-history as-of is frozen from the closed receipt of the initial
   direct REST GET of the exact provider declaration issue comment.
   `as_of_receipt` is that exact receipt, `as_of_api_url` is its request URL, and
@@ -261,9 +286,10 @@ change to result-present acceptance:
    the upstream universe was complete.
 2. **Raw review-thread association.** Preserve both raw REST inline-comment
    pages and raw GraphQL review-thread/comment pages, normalize GraphQL
-   `BigInt` IDs to canonical positive decimal text, require a complete
-   one-to-one join, and take thread resolution only from raw GraphQL
-   `isResolved`.
+   `BigInt` IDs to canonical positive decimal text, require every exact-provider
+   selected-review target child to join exactly once, and take its resolution
+   only from raw GraphQL `isResolved`. Human, unrelated-bot, null-parent, and
+   unrelated-only records remain audit context.
 3. **Issue-comment terminal carrier.** Give provider-authored terminal issue
    comments the same closed-schema, history, current-selection, report, and
    cross-channel ambiguity coverage as pull-request reviews. Edited comments
@@ -284,7 +310,10 @@ A second independent audit intentionally tested whether the new evidence
 contract could prove itself from synchronized summaries. It found additional
 anti-drift gaps, all closed without changing result-present acceptance:
 
-- Version-2 discovery now uses realistic pull plus compare responses. Pull
+- Schema-version-3 discovery retains realistic pull plus compare responses and
+  adds an independent fully paginated repository-wide PR seed that closes the
+  scope universe. Every seeded PR receives one complete detail traversal;
+  current and confirmed non-candidates remain present through parsing. Pull
   `base.sha` and `head.sha` bind the compare URL, and only
   `compare.merge_base_commit.sha` supplies the immutable merge base. Endpoint
   objects may contain unrelated GitHub fields; the fixed projector validates
@@ -312,6 +341,45 @@ anti-drift gaps, all closed without changing result-present acceptance:
 - Equal-time clean/clean ambiguity is exercised across the review and
   issue-comment channels, not by two artifacts from one channel.
 
+## Final Formal-Review Authority Hardening
+
+The latest formal review reported three authority gaps. The documentation fixes
+and executable regressions are now present and validated:
+
+1. **Repository-wide discovery root.** The prior schema-version-2 transcript
+   could validate only scopes already present in the transcript and therefore
+   could not prove that a whole PR scope had not been omitted. Schema version 3
+   adds independent initial/final, fully paginated repository-wide
+   `GET /repos/<owner>/<repo>/pulls?state=all&sort=created&direction=asc&per_page=100`
+   seeds. Every seeded PR drives exactly one complete detail traversal,
+   including current and confirmed non-candidates; current is excluded from
+   historical candidates only after full parsing. Version 2 cannot prove
+   fallback, and any evidence-budget overflow is `unknown`, never truncation.
+2. **Independent current reaction authority.** Matching normalized current
+   snapshots did not independently prove current endpoint completeness or
+   local commit ancestry. Current `+1` clean now requires independent initial
+   and final raw current endpoint inventories plus parent-owned initial/final
+   local Git receipts for every raw-derived finding commit. Exact object return
+   code `0` and ancestry return code `0` / `1` are the only accepted results.
+   Missing receipts, another return code, commit-set mismatch, or drift is
+   `unknown`. The basis records independently derived
+   `finding_commits.initial/final`. Any raw-derived top-level finding or
+   unresolved exact-provider selected-review target-thread finding whose
+   ancestry return code is `0` blocks reaction clean. The reaction
+   `evidence_basis` embeds all authority records.
+3. **Target-only thread joins.** Requiring every raw REST and GraphQL comment
+   to join could let unrelated replies affect the resolution decision. The
+   mandatory exactly-once join now targets only exact-provider
+   selected-review REST children. Fully fetched human, unrelated-bot,
+   null-parent, and unrelated-only records remain audit context and cannot
+   contribute resolution. Orphaned, duplicate, conflicting, or otherwise
+   malformed target joins still fail closed.
+
+These are stricter playbook evidence extensions. They do not change the fixed
+`codex-review-gate` / released Action commits, common tree, 15-path manifest,
+provider-result authority, result-present acceptance rationale, request/result
+plane separation, or warning-only treatment of early/duplicate requests.
+
 ## Implementation Intent
 
 - Use
@@ -321,18 +389,25 @@ anti-drift gaps, all closed without changing result-present acceptance:
   of duplicating the full decision matrix.
 - Preserve the stricter playbook requirements for exact PR lifecycle and
   whole-PR base/head scope.
+- Require schema-version-3 repository-wide raw discovery, full seed-to-detail
+  coverage, post-parse current exclusion, and fail-closed budget handling
+  before reaction fallback.
 - Preserve the report matrix for unsupported/no-PR, waiting, terminal,
   reaction-fallback, reserved authenticated no-start, and inconclusive states,
   including channel-specific `server_time_field` values.
 - Terminal-payload reports embed identical initial/final selection and selected
   artifact snapshots. Review snapshots include exact actor/state/body/commit
-  plus fully paginated associated inline children and thread joins; issue
-  comments include exact actor/App/body/time/commit-marker inputs. Sparse
-  summaries cannot prove the closed grammar or final reread.
+  plus fully paginated associated inline children and target-only thread joins;
+  non-target replies remain audit context. Issue comments include exact
+  actor/App/body/time/commit-marker inputs. Sparse summaries cannot prove the
+  closed grammar or final reread.
+- Reaction reports additionally embed independent initial/final raw current
+  endpoint inventories and parent-owned initial/final ancestry receipts;
+  normalized current snapshots cannot replace them.
 - Require an explicit commit-bound clean payload for terminal-payload
   completion; an empty `APPROVED` review does not count, and an exact
-  `No findings.` review is clean only after its complete associated inline set
-  is proved empty.
+  `No findings.` review is clean only after its complete exact-provider
+  selected-review target-child set is proved empty.
 - Treat the dynamic `+1` fallback as a playbook-specific policy extension, not
   as behaviour inherited from the fixed Action release.
 - This workstream defines documentation and policy contracts only; a runtime
@@ -352,18 +427,14 @@ anti-drift gaps, all closed without changing result-present acceptance:
 
 ## Validation
 
-- The corrected working snapshot's focused contract suite:
+- The final working snapshot's focused contract suite:
   `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed 102 tests in 11.169 seconds.
-- Its first full review-orchestration run:
-  `python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
-  ran 2,822 tests in 1,334.313 seconds with 6 expected skips and one error:
-  `test_state_marker_fifo_is_rejected_without_blocking` exceeded its two-second
-  child-process timeout while the full suite was under load. The current diff
-  does not touch that test or `review_runtime/state.py`; the exact test then
-  passed once in 1.478 seconds and five consecutive times in 6.493 seconds.
-  A final full green rerun and final-range named-single review remain pending
-  and must replace this note before delivery.
+  passed 102 tests in 12.502 seconds.
+- The final full review-orchestration suite ran outside the filesystem sandbox
+  because provider tests require temporary Unix and loopback socket binds:
+  `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
+  passed 2,822 tests in 1,025.721 seconds with 6 expected skips and no failures
+  or errors.
 - System `skill-creator` validation passed for
   `review-orchestration-playbook`.
 - The bundled project-journal validator passed.
@@ -385,6 +456,12 @@ anti-drift gaps, all closed without changing result-present acceptance:
   type identity, cross-scope native-ID collisions, selected provenance,
   terminal child/thread joins, newest-10 ordering, fixed Action provenance,
   and the result-present decision rationale.
+- The final cross-document audit found no remaining P1/P2 after verifying
+  heading-bounded schema-version-3 markers in all five authority/consumer
+  documents and v3-to-v4 drift regressions.
+- The final exact-head named-single review receipt is parent-owned review
+  evidence and is intentionally not written back into this candidate head;
+  doing so would change the range being reviewed.
 
 ## Evidence
 
