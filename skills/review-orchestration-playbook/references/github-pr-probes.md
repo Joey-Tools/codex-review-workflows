@@ -141,10 +141,15 @@ from a minimal query that pages
 `id`, typed `isResolved`, typed `isOutdated`, and
 `pageInfo { hasNextPage endCursor }`. For every paginated thread-comment node,
 record GraphQL `id`, REST-compatible `fullDatabaseId: BigInt`, `url`, and
-`pullRequestReview { id fullDatabaseId }`; exhaust every nested comments
-cursor. Both connections start with a null cursor, require each next request
-cursor to equal the previous raw `endCursor`, and end only at typed
-`hasNextPage == false`.
+`pullRequestReview { id fullDatabaseId }`. Schema version 3 paginates only the
+outer `reviewThreads` connection: it starts with a null cursor, requires each
+next request cursor to equal the previous raw `endCursor`, and ends only at
+typed `hasNextPage == false`. Each nested `comments` connection must be
+complete in its first raw response with typed `hasNextPage == false` and
+`endCursor == null`. If any nested response reports another page, fail closed
+as profile `unknown`; schema version 3 cannot encode a child-cursor fetch. A
+future schema version must define and bind that fetch instead of flattening
+multiple normalized pages into one fabricated raw response.
 
 Normalize each non-null GraphQL BigInt and positive-integer REST JSON ID to
 canonical positive decimal text before comparison; reject booleans, floats,
@@ -270,14 +275,15 @@ cryptographically attest GitHub's TLS origin.
 The current outcome is validated separately and never counts toward the history minimum. Before sorting, bind every candidate's time/ID basis to its scope-final outcome after terminal precedence and validate the candidate's complete pagination, provider-like reaction sequence, and stable initial/final snapshot even when it will fall outside the selected newest 10. A terminal/finding artifact or incomplete page cannot be hidden behind an older reaction timestamp. Later `+1`/`eyes` records remain audited but cannot replace a terminal basis; when the basis is reaction-only, a later provider-like reaction changes or invalidates it. Require every raw historical/current request, reaction, and artifact server time to be no later than the same as-of time before filtering confirmed different actors. When 10 or more historical candidates exist, select exactly the newest 10; otherwise select the complete historical candidate set. Never skip an incomplete, conflicting, ambiguous, or unfavourable candidate. Every selected candidate must be eligible; otherwise the profile is `unknown`. At least three selected historical outcomes must remain, all reaction-only and with no clean comment/review. Every sampled outcome must record one selected parent issue comment whose normalized body is `@codex review`, its ID/URL/`created_at`/`updated_at`/selected semantic server time and field/scope, and the individual child exact-bot `+1` reaction's positive ID/`parent_request_id`/exact parent reactions endpoint/`created_at`/actor/content, with strict server ordering `reaction.created_at > request.request_server_time`. The endpoint-and-ID tuple is the native reaction identity; no standalone reaction resource URL is synthesized. It must also enumerate every accepted same-scope request parent and fully paginate every parent's individual reactions. An edited request uses `updated_at`; a reaction that predates an edit into `@codex review` cannot count. A reaction's parent ID and endpoint must match its enclosing audited request, so an R1 reaction cannot be relocated under R2 by local nesting. Across all parents, de-duplicate only identical endpoint-and-ID reaction identities and order exact-provider reactions globally by `(created_at, positive numeric ID)`: only duplicate `+1` plus strictly earlier `eyes` are compatible. The selected `+1` parent must be the unique latest request by semantic time. Any other reaction content, nonpositive/missing ordering ID, `eyes` at or after the selected `+1`, or request whose `request_server_time >= selected_reaction.created_at` makes the candidate `unknown`. Require the same binding and cross-parent audit for the separate current outcome. Its normalized initial/final snapshots include exact lifecycle `state == open`, `merged == false`, and `merged_at == null`, stable scope, all evidence pages, and no active top-level finding on the current or an ancestor head, unresolved target-thread finding, malformed terminal artifact, terminal payload, or reaction conflict. The current basis cannot be later than the same trusted as-of time. A changed `baseRefOid` does not create another outcome when `pr_merge_base` and head are unchanged. `eyes` is liveness only. A clean-looking `APPROVED` review requires a fully paginated, present, empty exact-provider selected-review target-child set; a valid target child is findings and an unread/malformed target join is inconclusive. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. If payload and reaction carriers coexist, use `mixed` and keep the payload authoritative.
 
 Those normalized current snapshots are necessary derived views but are not
-current reaction-clean authority. The parent performs independent complete
-initial and final raw current endpoint traversals and embeds both inventories
-in `evidence_basis`. Each covers the current pull detail, compare, issue
-comments, reviews, associated inline comments, raw GraphQL threads/comments,
-and every controlled-request reaction page. Derive every full finding commit
-from each raw inventory before ancestry or resolution filtering. With lazy
-fetch and prompts disabled, the parent records one initial and final local
-object and ancestry receipt for every derived commit:
+authority for terminal clean/findings or reaction clean. For every accepted
+current provider result, the parent performs independent complete initial and
+final raw current endpoint traversals and embeds both inventories in
+`evidence_basis`. Each covers the current pull detail, compare, issue comments,
+reviews, associated inline comments, raw GraphQL threads/comments, and every
+controlled-request reaction page. Derive every full finding commit from each
+raw inventory before ancestry or resolution filtering. With lazy fetch and
+prompts disabled, the parent records one initial and final local object and
+ancestry receipt for every derived commit:
 
 ```bash
 GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<finding_commit>^{commit}'
@@ -287,13 +293,17 @@ GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git merge-base --is-ancestor <finding_
 The object check must return exact `0`; the ancestry check must return exact
 `0` for current/ancestor or exact `1` for proved non-ancestor. A missing
 receipt, another return code, commit-set mismatch, or initial/final inventory
-or receipt drift makes the profile `unknown`. Any raw-derived top-level finding
-with ancestry return code `0`, or any unresolved exact-provider
-selected-review target-thread finding with ancestry return code `0`, blocks
-reaction clean.
+or receipt drift makes the profile `unknown`. The complete raw
+artifact/thread projection must type-preservingly equal the normalized current
+record; a raw-only omitted finding makes the profile `unknown`. Any
+raw-derived applicable top-level finding blocks reaction clean. Any unresolved
+applicable exact-provider selected-review target-thread finding blocks every
+clean path; terminal precedence may supersede an older top-level finding only
+when that finding remains present in the compared projection.
 
 For a terminal payload, retain identical initial/final selection and selected
-artifact snapshots in `evidence_basis`. Review snapshots include exact
+artifact snapshots plus the complete raw-current authority above in
+`evidence_basis`. Review snapshots include exact
 actor/state/raw and normalized body/native commit plus complete raw REST inline
 pages, complete raw GraphQL thread/comment pages, and the canonical derived
 target-only join. Human, unrelated-bot, null-parent, and unrelated-only
@@ -302,9 +312,11 @@ resolution fields are forbidden. Issue-comment
 snapshots use the authority's full closed schema: canonical API/HTML identity,
 exact actor/App, raw/normalized body, grammar status, `created_at`,
 `updated_at`, edit-aware server time/field, parsed commit, and immutable scope.
-An ID/time/commit summary alone is not acceptance evidence.
+REST request, reaction, parent, selected, and artifact IDs remain exact
+positive JSON integers; quoted decimal strings are invalid. An
+ID/time/commit summary alone is not acceptance evidence.
 
-Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, and commit binding—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-3 repository-wide seed plus every seeded PR traversal. Rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every complete candidate projection, and revalidate every ordered historical `samples[]` request/reaction record. Separately re-fetch the final raw current endpoint inventory, rederive its finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code and initial/final stability. A missing record, budget overflow, other return code, or drift is `unknown`; field-by-field normalized current equality alone cannot pass.
+Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, and commit binding—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-3 repository-wide seed plus every seeded PR traversal. Rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every complete candidate projection, and revalidate every ordered historical `samples[]` request/reaction record. For terminal clean/findings and reaction clean, independently re-fetch the final raw current endpoint inventory, rederive its artifact/thread projection and finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code, projection equality, and initial/final stability. A missing record, budget overflow, other return code, or drift is `unknown`; field-by-field normalized current equality alone cannot pass.
 
 Before applying the generic same-head/different-base `scope-mismatch` branch, compare an accepted same-head request's audited request-time merge base with current `pr_merge_base` and apply [base-only-retarget-state-machine.json](base-only-retarget-state-machine.json). If it changed while `headRefOid` remained unchanged, the old request/result no longer covers the whole PR and the same-head request limit prevents a replacement. Missing origin, stale-range, and unauthorized parent-rewrite transitions stop before local lanes. An exact current range newly supplied by the caller recovers local lanes for caller-origin state; normal exact-current rederivation recovers them for PR-derived state. Either recovery proceeds to local lanes but keeps readiness `blocked-input` (`base-changed-same-head`) plus `requested: triple`, `effective: triple-inconclusive`, and neither permits another same-head request. Eligibility returns only after a separately authorized ordinary change produces a new head, and no empty or anchor commit may manufacture that epoch.
 

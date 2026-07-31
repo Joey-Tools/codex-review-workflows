@@ -422,8 +422,8 @@ complete: true
 artifact_kind: terminal-payload | active-top-level-finding | malformed-terminal-artifact
 outcome: clean | findings | malformed
 channel: issue-comment
-id: "<canonical positive issue-comment ID>"
-stable_artifact_id: "<same canonical positive issue-comment ID>"
+id: <canonical positive issue-comment ID>
+stable_artifact_id: <same canonical positive issue-comment ID>
 api_url: https://api.github.com/repos/OWNER/REPO/issues/comments/<id>
 url: https://github.com/OWNER/REPO/pull/<pr>#issuecomment-<id>
 user_login: chatgpt-codex-connector[bot]
@@ -976,17 +976,18 @@ condition holds; every other case selects `unknown`. A current trustworthy
 terminal payload plus selected reaction-only history is therefore `mixed`,
 never an implementation choice between profiles.
 
-### Current Reaction-Clean Authority
+### Current Raw Provider-Evidence Authority
 
 A normalized `current.initial_snapshot` / `current.final_snapshot` pair is a
 derived reader-facing view. Even when those two objects agree, it cannot prove
 that the current endpoint universe was fetched or that every current/ancestor
-finding commit was checked locally. It is insufficient for `+1` clean.
+finding commit was checked locally. It is insufficient for terminal clean,
+terminal findings, or `+1` clean.
 
-Before considering current reaction-only clean, the parent independently
-fetches two complete raw current endpoint inventories: one initial traversal
-and a new final traversal immediately before acceptance. Each inventory uses
-the closed shape
+Before accepting any current terminal clean/findings result or current
+reaction-only clean, the parent independently fetches two complete raw current
+endpoint inventories: one initial traversal and a new final traversal
+immediately before acceptance. Each inventory uses the closed shape
 `{repository, pull_number, head, fetches}`. Its `fetches` use the same closed
 fetch/page records, pagination rules, raw bodies, and digests as discovery
 schema version 3 and cover the current pull detail, compare, issue comments,
@@ -1021,18 +1022,24 @@ ancestry_return_code}`. With lazy fetching and credential prompting disabled,
 
 A missing receipt, missing local object, duplicate or extra receipt, a return
 code other than the exact values above, a raw-derived commit-set mismatch, or
-any initial/final inventory or receipt drift makes the current reaction
+any initial/final inventory or receipt drift makes the current provider
 classification `unknown`. The initial and final receipt arrays must be
 type-preserving identical and must each cover exactly the full commit set
 derived from its corresponding raw inventory.
 
-Any applicable top-level finding blocks reaction-only clean. Any applicable
-target-thread finding whose raw GraphQL thread has typed
-`isResolved == false` also blocks reaction-only clean. Human,
-unrelated-bot, null-parent, and unrelated-only thread state cannot contribute
-resolution, while a malformed target join still fails closed. The reaction
+For terminal completion, the complete raw projection must equal the normalized
+current record before terminal precedence is applied. A raw-only artifact or
+thread that the normalized record omits makes the profile `unknown`. An
+unresolved applicable target-thread finding still blocks terminal clean; an
+older top-level finding may be superseded only under the documented strong
+terminal-precedence rule and must remain present in the compared projection.
+For reaction completion, any applicable top-level finding blocks clean, and
+any applicable target-thread finding whose raw GraphQL thread has typed
+`isResolved == false` also blocks clean. Human, unrelated-bot, null-parent,
+and unrelated-only thread state cannot contribute resolution, while a
+malformed target join still fails closed. Every accepted terminal or reaction
 `evidence_basis` embeds both independent raw current endpoint inventories and
-both parent-owned local Git ancestry-receipt arrays; external ledgers or the
+both parent-owned local Git ancestry-receipt arrays; external ledgers or
 normalized current snapshots do not replace them.
 
 ### +1 Fallback
@@ -1180,7 +1187,7 @@ evidence_basis:
     initial_snapshot: <complete selected review record>
     final_snapshot: <repeat the complete identical review record>
     source_channel: reviews
-    id: "123456789"
+    id: 123456789
     url: https://github.com/OWNER/REPO/pull/123#pullrequestreview-123456789
     user_login: chatgpt-codex-connector[bot]
     user_type: Bot
@@ -1195,13 +1202,23 @@ evidence_basis:
       records: []
     review_thread_pages: <complete raw GraphQL pages and nested comment pages>
     thread_findings: []
+  current_raw_authority:
+    raw_endpoint_inventories:
+      initial: <complete independently fetched raw current endpoint inventory>
+      final: <new complete raw current endpoint inventory>
+    finding_commits:
+      initial: <complete raw-derived full-SHA set>
+      final: <repeat the complete identical full-SHA set>
+    local_git_ancestry_receipts:
+      initial: <complete parent-owned object/ancestry receipt array>
+      final: <repeat the complete type-preserving identical receipt array>
 ```
 
 | Lane state | `provider_profile` | `evidence_basis` |
 | --- | --- | --- |
 | Proved pre-provider ineligibility or blocker: no PR, unsupported host/identity, selected PR closed before start, or scope/lifecycle failure before provider evaluation | `null` | `null`; report the exact effective-double or blocker reason separately |
 | Eligible and waiting with no selected provider artifact | Computed profile, or `unknown` when it cannot yet be established | `null` |
-| Accepted terminal clean or findings result | `terminal-payload` or `mixed` | Selected issue comment or pull-request review |
+| Accepted terminal clean or findings result | `terminal-payload` or `mixed` | Selected issue comment or pull-request review plus complete initial/final raw current authority |
 | Accepted weak reaction clean | `thumbs-up-clean` | Exact accepted `+1` reaction plus its controlled request and scope; provider declaration identity/digest and every ordered historical request/reaction sample |
 | Future accepted authenticated no-start rejection after an explicit grammar policy activates it | Actually recomputed profile, normally `terminal-payload` or `mixed` | Exact `no-start-rejection` issue comment plus its controlled request and scope |
 | Inconclusive evidence | Computed profile or `unknown` | Stable blocking artifact when one exists; otherwise `null` |
@@ -1218,8 +1235,12 @@ Every terminal-payload basis embeds identical `selection_snapshots.initial` and
 `.final` records containing lifecycle, immutable whole-PR scope, all required
 pagination results, every terminal candidate's stable ID/channel/time/outcome,
 malformed blockers, and relevant thread state. It also embeds identical
-`artifact.initial_snapshot` and `.final_snapshot` records. A selected-artifact
-summary without those snapshots is not auditable evidence.
+`artifact.initial_snapshot` and `.final_snapshot` records plus
+`current_raw_authority` with independent initial/final raw endpoint
+inventories, raw-derived finding-commit sets, and matching parent-owned local
+Git ancestry receipts. The raw projection must type-preservingly equal the
+normalized current selection input; a selected-artifact summary or normalized
+snapshot without that authority is not auditable evidence.
 
 These evidence records use closed object schemas and JSON type identity.
 Unknown fields are rejected until a future policy version explicitly admits
@@ -1409,7 +1430,7 @@ evidence_basis:
       pr_merge_base: <full lowercase SHA>
       head: <full lowercase SHA>
     request:
-      id: "123456"
+      id: 123456
       url: <exact issue-comment URL>
       created_at: <server time>
       updated_at: <server time>
@@ -1417,15 +1438,15 @@ evidence_basis:
       request_server_time_field: created_at | updated_at
       normalized_body: "@codex review"
     reaction:
-      id: "789012"
-      parent_request_id: "123456"
+      id: 789012
+      parent_request_id: 123456
       parent_reactions_api_url: https://api.github.com/repos/OWNER/REPO/issues/comments/123456/reactions?per_page=100
       created_at: <server time after request.request_server_time>
       content: "+1"
       user_login: chatgpt-codex-connector[bot]
       user_type: Bot
-    selected_request_id: "123456"
-    selected_reaction_id: "789012"
+    selected_request_id: 123456
+    selected_reaction_id: 789012
     same_scope_request_audit:
       - request: <same seven request fields>
         reactions:
@@ -1447,6 +1468,12 @@ evidence_basis:
           reactions:
             - <same seven reaction fields>
 ```
+
+Every REST request ID, reaction ID, reaction parent ID, and selected
+request/reaction ID in this report is an exact positive JSON integer, never a
+quoted decimal string, boolean, or float. Canonical positive decimal text is
+reserved for GraphQL BigInt-to-REST join comparison and does not change the
+REST/report JSON type.
 
 The report embeds both independently fetched schema-version-3 raw historical
 discovery endpoint transcripts, including each complete repository-wide pull

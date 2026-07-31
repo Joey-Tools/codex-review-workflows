@@ -58,17 +58,19 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    GraphQL thread evidence. Fully fetched human, unrelated-bot, null-parent,
    and unrelated-only thread records remain audit context and cannot supply
    resolution; malformed target joins fail closed.
-   If reaction clean is considered, the reaction `evidence_basis` must also
-   embed independently fetched initial/final raw current endpoint inventories
-   and parent-owned initial/final local Git ancestry receipts for every
-   raw-derived finding commit. Exact object return code `0` and ancestry return
-   code `0` or `1` are the only admitted results. Missing receipts, other
-   return codes, commit-set mismatch, evidence-budget overflow, or
+   If any terminal clean/findings or reaction clean result is considered, its
+   `evidence_basis` must also embed independently fetched initial/final raw
+   current endpoint inventories and parent-owned initial/final local Git
+   ancestry receipts for every raw-derived finding commit. Exact object return
+   code `0` and ancestry return code `0` or `1` are the only admitted results.
+   The complete raw artifact/thread projection must type-preservingly equal the
+   normalized current record. Missing receipts, another return code,
+   commit-set or projection mismatch, evidence-budget overflow, or
    initial/final drift selects `unknown`; normalized current snapshot equality
-   is insufficient. `evidence_basis.current` also records the independently
-   derived `finding_commits.initial/final`. Any raw-derived top-level finding or
-   unresolved exact-provider selected-review target-thread finding whose
-   `ancestry_return_code` is exact `0` blocks the reaction path.
+   is insufficient. The basis also records independently derived
+   `finding_commits.initial/final`. Any raw-derived applicable top-level
+   finding blocks the reaction path; an unresolved applicable target-thread
+   finding blocks every clean path.
 For detailed payload normalization, provider profiles, reaction fallback, precedence, and stable-final-reread rules, use [github-codex-evidence-authority.md](github-codex-evidence-authority.md) as the authoritative contract.
 9. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
 10. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier named-lane artifact, optional low-level helper result, and direct admission result whose range/head changed.
@@ -132,7 +134,7 @@ A qualifying third-lane result must prove all of the following:
 - After thread blockers are applied, the latest trustworthy terminal provider artifact is selected by server timestamp. Any latest equal-time set spanning issue-comment and review channels is `triple-inconclusive` before outcome or numeric-ID tie-breaking. Within one channel, malformed blocks, finding takes precedence over clean, and only then may a same-channel positive ID choose the basis.
 - A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head when that finding has no unresolved thread and the complete snapshot contains no newer finding or malformed terminal evidence. The weak reaction fallback never supersedes a finding.
 - The selected `provider_profile` was recomputed from the final complete snapshot and bounded same-repository history using the predeclared definitions: `terminal-payload` is the default, `mixed` still makes terminal payload authoritative, `thumbs-up-clean` is the narrowly qualified reaction-only fallback, and `unknown` never accepts reaction-only clean evidence.
-- Immediately before success, lifecycle, base/head OIDs, unique merge base, complete evidence snapshot, and the selected artifact were re-read. For reaction clean, this includes a new raw current endpoint traversal and a repeat of every parent-owned local Git ancestry receipt. The exact whole-PR scope and `evidence_basis` remained stable and no new blocker appeared; normalized current snapshots alone are insufficient.
+- Immediately before success, lifecycle, base/head OIDs, unique merge base, complete evidence snapshot, and the selected artifact were re-read. For terminal clean/findings and reaction clean, this includes a new raw current endpoint traversal, a repeat of every parent-owned local Git ancestry receipt, and a new type-preserving comparison of the complete raw artifact/thread projection with the normalized current record. The exact whole-PR scope and `evidence_basis` remained stable and no new blocker appeared; normalized current snapshots alone are insufficient.
 
 `eyes` is liveness only; it never proves a clean result.
 

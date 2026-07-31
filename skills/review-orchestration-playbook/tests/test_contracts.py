@@ -3293,6 +3293,48 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(schema_version_drift_document=document_name):
                 with self.assertRaises(AssertionError):
                     assert_schema_v3_version(drifted_section, marker)
+        normalized_github_pr_probes_text = " ".join(
+            github_pr_probes.lower().replace("`", "").split()
+        )
+        self.assertIn(
+            "schema version 3 cannot encode a child-cursor fetch",
+            normalized_github_pr_probes_text,
+        )
+        self.assertIn(
+            "a nested hasnextpage == true requires a separately bound "
+            "child-cursor fetch shape that this schema does not define, so the "
+            "profile is unknown",
+            schema_v3_sections["authority"],
+        )
+        self.assertNotIn(
+            "exhaust every nested comments cursor",
+            normalized_github_pr_probes_text,
+        )
+        normalized_authority_text = " ".join(authority.lower().replace("`", "").split())
+        self.assertIn(
+            "every rest request id, reaction id, reaction parent id, and "
+            "selected request/reaction id in this report is an exact positive "
+            "json integer",
+            normalized_authority_text,
+        )
+        for quoted_id in (
+            'id: "123456"',
+            'id: "789012"',
+            'parent_request_id: "123456"',
+            'selected_request_id: "123456"',
+            'selected_reaction_id: "789012"',
+            'id: "<canonical positive issue-comment ID>"',
+            'stable_artifact_id: "<same canonical positive issue-comment ID>"',
+        ):
+            self.assertNotIn(quoted_id, authority)
+        self.assertIn(
+            "id: <canonical positive issue-comment ID>",
+            authority,
+        )
+        self.assertIn(
+            "stable_artifact_id: <same canonical positive issue-comment ID>",
+            authority,
+        )
 
         result_present_sections = {
             "authority": section_text(
@@ -7433,6 +7475,7 @@ class RepositoryContractTest(unittest.TestCase):
             value: object,
             *,
             current_ancestry: dict[str, int] | None = None,
+            require_current_ancestry_exact: bool = True,
         ) -> list[dict[str, object]] | None:
             if (
                 not isinstance(value, dict)
@@ -8036,7 +8079,7 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     )
 
-                provider_reactions: list[tuple[int, int, int]] = []
+                provider_reactions: list[tuple[int, int, int, str]] = []
                 seen_reaction_ids: set[int] = set()
                 for raw_reaction in reaction_records:
                     reaction_id = raw_reaction.get("id")
@@ -8064,7 +8107,12 @@ class RepositoryContractTest(unittest.TestCase):
                     ):
                         return None
                     provider_reactions.append(
-                        (created_at, reaction_id, parent_comment_id)
+                        (
+                            created_at,
+                            reaction_id,
+                            parent_comment_id,
+                            raw_reaction["content"],
+                        )
                     )
 
                 if artifact_bases:
@@ -8145,18 +8193,70 @@ class RepositoryContractTest(unittest.TestCase):
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
                     }
-                entries.append(
-                    {
-                        "scope_key": list(parsed_scope),
-                        "source_ordering_key": source_ordering_key,
-                        "source_evidence": source_evidence,
+                entry: dict[str, object] = {
+                    "scope_key": list(parsed_scope),
+                    "source_ordering_key": source_ordering_key,
+                    "source_evidence": source_evidence,
+                }
+                if current_ancestry is not None:
+                    entry["current_authority_projection"] = {
+                        "scope": {
+                            "repository": repository,
+                            "pull_request": pr,
+                            "base_oid": base_oid,
+                            "merge_base": merge_base,
+                            "head": head,
+                        },
+                        "lifecycle": {
+                            "state": clone(pull_record.get("state")),
+                            "merged": clone(pull_record.get("merged")),
+                            "merged_at": clone(pull_record.get("merged_at")),
+                        },
+                        "requests": [
+                            {
+                                "id": request_id,
+                                "server_time": request_times[request_id],
+                            }
+                            for request_id in sorted(request_times)
+                        ],
+                        "applicable_artifacts": [
+                            {
+                                "server_time": server_time,
+                                "id": artifact_id,
+                                "channel": channel,
+                                "semantic": semantic,
+                                "source_record_sha256": source_digest,
+                            }
+                            for (
+                                server_time,
+                                artifact_id,
+                                channel,
+                                semantic,
+                                source_digest,
+                            ) in sorted(artifact_bases)
+                        ],
+                        "provider_reactions": [
+                            {
+                                "created_at": created_at,
+                                "id": reaction_id,
+                                "parent_comment_id": parent_comment_id,
+                                "content": content,
+                            }
+                            for (
+                                created_at,
+                                reaction_id,
+                                parent_comment_id,
+                                content,
+                            ) in sorted(provider_reactions)
+                        ],
                     }
-                )
+                entries.append(entry)
             if (
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
                 or (
                     current_ancestry is not None
+                    and require_current_ancestry_exact
                     and set(ancestry) != observed_current_finding_heads
                 )
             ):
@@ -8216,6 +8316,7 @@ class RepositoryContractTest(unittest.TestCase):
             value: object,
             *,
             current_ancestry: dict[str, int],
+            require_current_ancestry_exact: bool = True,
         ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
@@ -8285,6 +8386,7 @@ class RepositoryContractTest(unittest.TestCase):
             entries = parse_discovery_endpoint_transcript(
                 transcript,
                 current_ancestry=current_ancestry,
+                require_current_ancestry_exact=require_current_ancestry_exact,
             )
             if (
                 entries is None
@@ -8453,9 +8555,27 @@ class RepositoryContractTest(unittest.TestCase):
                 or not typed_json_equal(initial_entry, final_entry)
             ):
                 return False
-            expected_entries = derived_inventory_entries([current_record])
-            return len(expected_entries) == 1 and typed_json_equal(
-                initial_entry, expected_entries[0]
+            expected_initial = parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    current_record,
+                    observation_marker="initial",
+                ),
+                current_ancestry=ancestry,
+                require_current_ancestry_exact=False,
+            )
+            expected_final = parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    current_record,
+                    observation_marker="final",
+                ),
+                current_ancestry=ancestry,
+                require_current_ancestry_exact=False,
+            )
+            return (
+                expected_initial is not None
+                and expected_final is not None
+                and typed_json_equal(expected_initial, expected_final)
+                and typed_json_equal(initial_entry, expected_initial)
             )
 
         def history(
@@ -8644,6 +8764,7 @@ class RepositoryContractTest(unittest.TestCase):
                 or current_ordering_key[0] > profile_as_of
                 or not isinstance(current_basis, dict)
                 or current_carrier is None
+                or not current_raw_authority_matches(candidate_history, current)
             ):
                 return "unknown"
 
@@ -8656,8 +8777,7 @@ class RepositoryContractTest(unittest.TestCase):
             if "terminal-payload" in observed_kinds:
                 return "mixed"
             if (
-                not current_raw_authority_matches(candidate_history, current)
-                or len(selected) < 3
+                len(selected) < 3
                 or not declaration_is_authoritative(provider_declaration)
                 or any(
                     classify_reaction_scope(candidate) != "clean"
@@ -9293,6 +9413,7 @@ class RepositoryContractTest(unittest.TestCase):
             }
 
         def terminal_evidence_basis_from_inputs(
+            candidate_history: dict[str, object],
             current_record: dict[str, object],
             *,
             expected_outcome: str,
@@ -9356,7 +9477,15 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             selected_artifact = selected_artifacts[0]
             selected_final = selected_artifact.get("final_snapshot")
-            if not isinstance(selected_final, dict):
+            current_raw_authority = current_raw_authority_basis(candidate_history)
+            if (
+                not isinstance(selected_final, dict)
+                or current_raw_authority is None
+                or not current_raw_authority_matches(
+                    candidate_history,
+                    current_record,
+                )
+            ):
                 return None
             return {
                 "kind": selected_final["channel"],
@@ -9365,6 +9494,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "final": clone(final_snapshot),
                 },
                 "artifact": clone(selected_artifact),
+                "current_raw_authority": current_raw_authority,
             }
 
         def expected_report_from_inputs(
@@ -9400,6 +9530,7 @@ class RepositoryContractTest(unittest.TestCase):
                     if provider_profile not in {"terminal-payload", "mixed"}:
                         return None
                     evidence_basis = terminal_evidence_basis_from_inputs(
+                        candidate_history,
                         current_record,
                         expected_outcome=(
                             "clean"
@@ -9472,8 +9603,74 @@ class RepositoryContractTest(unittest.TestCase):
             merge_base=current_merge_base,
         )
 
+        string_id_records: dict[str, dict[str, object]] = {}
+        string_request_id = clone(current)
+        assert isinstance(string_request_id, dict)
+        string_request_id["requests"][0]["id"] = "10"
+        string_id_records["request-id"] = restamp(string_request_id)
+        string_reaction_id = clone(current)
+        assert isinstance(string_reaction_id, dict)
+        string_reaction_id["reactions"][0]["id"] = "100"
+        string_id_records["reaction-id"] = restamp(string_reaction_id)
+        string_parent_request_id = clone(current)
+        assert isinstance(string_parent_request_id, dict)
+        string_parent_request_id["reactions"][0]["parent_request_id"] = "10"
+        string_id_records["parent-request-id"] = restamp(string_parent_request_id)
+        string_selected_request_id = clone(current)
+        assert isinstance(string_selected_request_id, dict)
+        string_selected_request_id["selected_request_id"] = "10"
+        string_id_records["selected-request-id"] = restamp(string_selected_request_id)
+        string_selected_reaction_id = clone(current)
+        assert isinstance(string_selected_reaction_id, dict)
+        string_selected_reaction_id["selected_reaction_id"] = "100"
+        string_id_records["selected-reaction-id"] = restamp(string_selected_reaction_id)
+        for field_name, string_id_record in string_id_records.items():
+            with self.subTest(reaction_json_integer_id=field_name):
+                self.assertEqual(
+                    classify_reaction_scope(
+                        string_id_record,
+                        expected_scope=current_scope_key,
+                    ),
+                    "unknown",
+                )
+
         thread_scope = scope_key(samples[0])
         assert thread_scope is not None
+        terminal_artifact_builders = {
+            "pull-request-review": complete_review_artifact,
+            "issue-comment": complete_issue_comment_artifact,
+        }
+        for channel, artifact_builder in terminal_artifact_builders.items():
+            valid_terminal_artifact = artifact_builder(
+                samples[0],
+                76_001 if channel == "pull-request-review" else 76_002,
+                2_700_000,
+            )
+            self.assertIsNotNone(
+                validate_candidate_artifact(
+                    valid_terminal_artifact,
+                    expected_kind="terminal-payload",
+                    expected_scope=thread_scope,
+                )
+            )
+            for field_name in ("id", "stable_artifact_id"):
+                string_id_artifact = clone(valid_terminal_artifact)
+                assert isinstance(string_id_artifact, dict)
+                for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                    artifact_snapshot = string_id_artifact[snapshot_name]
+                    assert isinstance(artifact_snapshot, dict)
+                    artifact_snapshot[field_name] = str(artifact_snapshot[field_name])
+                with self.subTest(
+                    terminal_artifact_json_integer_id=(f"{channel}-{field_name}"),
+                ):
+                    self.assertIsNone(
+                        validate_candidate_artifact(
+                            string_id_artifact,
+                            expected_kind="terminal-payload",
+                            expected_scope=thread_scope,
+                        )
+                    )
+
         valid_thread_artifact = complete_review_artifact(
             samples[0],
             77_001,
@@ -10107,7 +10304,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(samples),
+                history(samples, current_raw=terminal_current),
                 terminal_current,
             ),
             "not-clean",
@@ -10144,7 +10341,10 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertEqual(
                     compute_provider_profile(
                         declaration,
-                        history(samples),
+                        history(
+                            samples,
+                            current_raw=terminal_current_with_later_reaction,
+                        ),
                         terminal_current_with_later_reaction,
                     ),
                     "mixed",
@@ -10152,7 +10352,10 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertEqual(
                     classify_fallback(
                         declaration,
-                        history(samples),
+                        history(
+                            samples,
+                            current_raw=terminal_current_with_later_reaction,
+                        ),
                         terminal_current_with_later_reaction,
                     ),
                     "not-clean",
@@ -10177,25 +10380,34 @@ class RepositoryContractTest(unittest.TestCase):
         normal_lane_timing = lane_timing(1, 2)
         terminal_report_cases = {
             "terminal-payload": (
-                history(terminal_history),
+                history(terminal_history, current_raw=terminal_current),
                 terminal_current,
                 "terminal-payload",
                 "pull-request-review",
             ),
             "terminal-issue-comment": (
-                history(issue_terminal_history),
+                history(
+                    issue_terminal_history,
+                    current_raw=issue_terminal_current,
+                ),
                 issue_terminal_current,
                 "terminal-payload",
                 "issue-comment",
             ),
             "mixed-later-eyes": (
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_current_with_later_reactions["eyes"],
+                ),
                 terminal_current_with_later_reactions["eyes"],
                 "mixed",
                 "pull-request-review",
             ),
             "mixed-later-plus-one": (
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_current_with_later_reactions["+1"],
+                ),
                 terminal_current_with_later_reactions["+1"],
                 "mixed",
                 "pull-request-review",
@@ -10228,7 +10440,12 @@ class RepositoryContractTest(unittest.TestCase):
                 assert isinstance(terminal_report_basis, dict)
                 self.assertEqual(
                     set(terminal_report_basis),
-                    {"kind", "selection_snapshots", "artifact"},
+                    {
+                        "kind",
+                        "selection_snapshots",
+                        "artifact",
+                        "current_raw_authority",
+                    },
                 )
                 self.assertEqual(
                     terminal_report_basis["kind"],
@@ -10245,6 +10462,18 @@ class RepositoryContractTest(unittest.TestCase):
                         terminal_report_basis["artifact"]["initial_snapshot"],
                         terminal_report_basis["artifact"]["final_snapshot"],
                     )
+                )
+                terminal_current_raw_authority = terminal_report_basis[
+                    "current_raw_authority"
+                ]
+                assert isinstance(terminal_current_raw_authority, dict)
+                self.assertEqual(
+                    set(terminal_current_raw_authority),
+                    {
+                        "raw_endpoint_inventories",
+                        "finding_commits",
+                        "local_git_ancestry_receipts",
+                    },
                 )
                 self.assertTrue(
                     validate_complete_report(
@@ -10271,6 +10500,21 @@ class RepositoryContractTest(unittest.TestCase):
                         local_lane_timing=normal_lane_timing,
                     )
                 )
+                missing_terminal_raw_authority = clone(terminal_report)
+                assert isinstance(missing_terminal_raw_authority, dict)
+                del missing_terminal_raw_authority["evidence_basis"][
+                    "current_raw_authority"
+                ]
+                self.assertFalse(
+                    validate_complete_report(
+                        missing_terminal_raw_authority,
+                        lane_state="accepted-terminal-clean",
+                        provider_declaration=declaration,
+                        candidate_history=terminal_report_history,
+                        current_record=terminal_report_current,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
 
         terminal_findings_current = clone(current)
         assert isinstance(terminal_findings_current, dict)
@@ -10282,7 +10526,11 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_findings_report = expected_report_from_inputs(
             "accepted-terminal-findings",
             declaration,
-            history(samples),
+            history(
+                samples,
+                current_raw=terminal_findings_current,
+                current_ancestry={current_head: 0},
+            ),
             terminal_findings_current,
             normal_lane_timing,
         )
@@ -10295,7 +10543,11 @@ class RepositoryContractTest(unittest.TestCase):
                 terminal_findings_report,
                 lane_state="accepted-terminal-findings",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=history(
+                    samples,
+                    current_raw=terminal_findings_current,
+                    current_ancestry={current_head: 0},
+                ),
                 current_record=terminal_findings_current,
                 local_lane_timing=normal_lane_timing,
             )
@@ -10304,7 +10556,11 @@ class RepositoryContractTest(unittest.TestCase):
             expected_report_from_inputs(
                 "accepted-terminal-clean",
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_findings_current,
+                    current_ancestry={current_head: 0},
+                ),
                 terminal_findings_current,
                 normal_lane_timing,
             )
@@ -10313,7 +10569,7 @@ class RepositoryContractTest(unittest.TestCase):
             expected_report_from_inputs(
                 "accepted-terminal-findings",
                 declaration,
-                history(samples),
+                history(samples, current_raw=terminal_current),
                 terminal_current,
                 normal_lane_timing,
             )
@@ -10329,7 +10585,11 @@ class RepositoryContractTest(unittest.TestCase):
         issue_findings_report = expected_report_from_inputs(
             "accepted-terminal-findings",
             declaration,
-            history(samples),
+            history(
+                samples,
+                current_raw=issue_findings_current,
+                current_ancestry={current_head: 0},
+            ),
             issue_findings_current,
             normal_lane_timing,
         )
@@ -10344,7 +10604,11 @@ class RepositoryContractTest(unittest.TestCase):
                 issue_findings_report,
                 lane_state="accepted-terminal-findings",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=history(
+                    samples,
+                    current_raw=issue_findings_current,
+                    current_ancestry={current_head: 0},
+                ),
                 current_record=issue_findings_current,
                 local_lane_timing=normal_lane_timing,
             )
@@ -10432,7 +10696,11 @@ class RepositoryContractTest(unittest.TestCase):
             expected_report_from_inputs(
                 "accepted-terminal-findings",
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=cross_channel_finding,
+                    current_ancestry={current_head: 0},
+                ),
                 cross_channel_finding,
                 normal_lane_timing,
             )
@@ -10441,7 +10709,7 @@ class RepositoryContractTest(unittest.TestCase):
         clean_report_before_unresolved = expected_report_from_inputs(
             "accepted-terminal-clean",
             declaration,
-            history(samples),
+            history(samples, current_raw=terminal_current),
             terminal_current,
             normal_lane_timing,
         )
@@ -10474,7 +10742,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_current_with_unresolved,
+                    current_ancestry={current_head: 0},
+                ),
                 terminal_current_with_unresolved,
             ),
             "mixed",
@@ -10483,7 +10755,11 @@ class RepositoryContractTest(unittest.TestCase):
             expected_report_from_inputs(
                 "accepted-terminal-clean",
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_current_with_unresolved,
+                    current_ancestry={current_head: 0},
+                ),
                 terminal_current_with_unresolved,
                 normal_lane_timing,
             )
@@ -10492,7 +10768,11 @@ class RepositoryContractTest(unittest.TestCase):
             expected_report_from_inputs(
                 "accepted-terminal-findings",
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=terminal_current_with_unresolved,
+                    current_ancestry={current_head: 0},
+                ),
                 terminal_current_with_unresolved,
                 normal_lane_timing,
             )
@@ -10502,8 +10782,60 @@ class RepositoryContractTest(unittest.TestCase):
                 clean_report_before_unresolved,
                 lane_state="accepted-terminal-clean",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=history(
+                    samples,
+                    current_raw=terminal_current_with_unresolved,
+                    current_ancestry={current_head: 0},
+                ),
                 current_record=terminal_current_with_unresolved,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+        raw_only_unresolved_current = clone(terminal_current)
+        assert isinstance(raw_only_unresolved_current, dict)
+        raw_only_terminal_basis = raw_only_unresolved_current["candidate_basis"]
+        assert isinstance(raw_only_terminal_basis, dict)
+        raw_only_terminal_time = raw_only_terminal_basis["server_time"]
+        assert isinstance(raw_only_terminal_time, int)
+        raw_only_unresolved_current["evidence_state"]["unresolved_thread_findings"] = [
+            complete_review_artifact(
+                raw_only_unresolved_current,
+                80_301,
+                raw_only_terminal_time - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+        ]
+        restamp(raw_only_unresolved_current)
+        raw_only_unresolved_history = history(
+            samples,
+            current_raw=raw_only_unresolved_current,
+            current_ancestry={current_head: 0},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                raw_only_unresolved_history,
+                terminal_current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                raw_only_unresolved_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+        self.assertFalse(
+            validate_complete_report(
+                clean_report_before_unresolved,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=raw_only_unresolved_history,
+                current_record=terminal_current,
                 local_lane_timing=normal_lane_timing,
             )
         )
@@ -10512,10 +10844,11 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(duplicate_current, dict)
         duplicate_current["requests"].insert(0, request(9, 5, pr=current_pr))
         restamp(duplicate_current)
+        duplicate_history = history(samples, current_raw=duplicate_current)
         complete_report = expected_report_from_inputs(
             "accepted-reaction-clean",
             declaration,
-            history(samples),
+            duplicate_history,
             duplicate_current,
             normal_lane_timing,
         )
@@ -10526,7 +10859,7 @@ class RepositoryContractTest(unittest.TestCase):
                 complete_report,
                 lane_state="accepted-reaction-clean",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=duplicate_history,
                 current_record=duplicate_current,
                 local_lane_timing=normal_lane_timing,
             )
@@ -10569,7 +10902,7 @@ class RepositoryContractTest(unittest.TestCase):
         combined_warning_report = expected_report_from_inputs(
             "accepted-reaction-clean",
             declaration,
-            history(samples),
+            duplicate_history,
             duplicate_current,
             combined_warning_timing,
         )
@@ -10634,7 +10967,7 @@ class RepositoryContractTest(unittest.TestCase):
                 complete_report,
                 lane_state="accepted-reaction-clean",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=duplicate_history,
                 current_record=duplicate_current,
                 local_lane_timing=combined_warning_timing,
             )
@@ -10932,7 +11265,7 @@ class RepositoryContractTest(unittest.TestCase):
                         report_near_miss,
                         lane_state="accepted-reaction-clean",
                         provider_declaration=declaration,
-                        candidate_history=history(samples),
+                        candidate_history=duplicate_history,
                         current_record=duplicate_current,
                         local_lane_timing=normal_lane_timing,
                     )
@@ -10948,7 +11281,7 @@ class RepositoryContractTest(unittest.TestCase):
                 complete_report,
                 lane_state="accepted-reaction-clean",
                 provider_declaration=declaration,
-                candidate_history=history(samples),
+                candidate_history=duplicate_history,
                 current_record=changed_authoritative_current,
                 local_lane_timing=normal_lane_timing,
             )
@@ -12722,7 +13055,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(samples),
+                history(samples, current_raw=compatible_earlier_eyes),
                 compatible_earlier_eyes,
             ),
             "clean",
@@ -12744,7 +13077,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(samples),
+                history(samples, current_raw=confirmed_human_reaction),
                 confirmed_human_reaction,
             ),
             "clean",
@@ -12766,7 +13099,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             classify_fallback(
                 declaration,
-                history(samples),
+                history(
+                    samples,
+                    current_raw=confirmed_unrelated_bot_reaction,
+                ),
                 confirmed_unrelated_bot_reaction,
             ),
             "clean",

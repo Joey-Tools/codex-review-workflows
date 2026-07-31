@@ -100,10 +100,13 @@ superseded_by:
   pagination, stable whole-PR scope, no trustworthy current-scope terminal
   payload or conflicting finding/thread evidence, and an unchanged final
   re-read. Those normalized snapshots are now explicitly derived views, not
-  current reaction-clean authority. The reaction basis additionally embeds
-  independent initial/final raw current endpoint inventories and parent-owned
-  initial/final local Git ancestry receipts for every raw-derived finding
-  commit. Object resolution must return exact `0`; ancestry must return exact
+  terminal or reaction-clean authority. Every accepted terminal clean/findings
+  or reaction-clean basis additionally embeds independent initial/final raw
+  current endpoint inventories and parent-owned initial/final local Git
+  ancestry receipts for every raw-derived finding commit. The complete
+  applicable artifact/thread projection from those inventories must
+  type-preservingly equal the normalized current record. Object resolution
+  must return exact `0`; ancestry must return exact
   `0` for current/ancestor or exact `1` for proved non-ancestor. Missing
   receipts, any other return code, commit-set mismatch, or initial/final drift
   selects `unknown`. The basis also records independently derived
@@ -374,6 +377,20 @@ and executable regressions are now present and validated:
    null-parent, and unrelated-only records remain audit context and cannot
    contribute resolution. Orphaned, duplicate, conflicting, or otherwise
    malformed target joins still fail closed.
+4. **Terminal raw-current binding.** The terminal reference path previously
+   selected from the normalized current record before validating raw current
+   authority. Every terminal and reaction profile now requires a complete
+   initial/final raw-current projection match. A raw-only applicable artifact
+   or unresolved target thread therefore makes the profile `unknown`; the
+   terminal report embeds `current_raw_authority`.
+5. **Exact REST/report ID types.** Request, reaction, reaction-parent,
+   selected, and artifact IDs are positive JSON integers. Quoted decimal
+   strings, booleans, and floats are rejected. Canonical decimal text remains
+   limited to GraphQL BigInt-to-REST joins.
+6. **Schema-version-3 nested pagination.** Version 3 paginates the outer
+   `reviewThreads` connection only. A nested comments connection must be
+   complete in its first response; `hasNextPage == true` is `unknown` until a
+   future schema version defines a bound child-cursor fetch.
 
 These are stricter playbook evidence extensions. They do not change the fixed
 `codex-review-gate` / released Action commits, common tree, 15-path manifest,
@@ -396,14 +413,19 @@ plane separation, or warning-only treatment of early/duplicate requests.
   reaction-fallback, reserved authenticated no-start, and inconclusive states,
   including channel-specific `server_time_field` values.
 - Terminal-payload reports embed identical initial/final selection and selected
-  artifact snapshots. Review snapshots include exact actor/state/body/commit
-  plus fully paginated associated inline children and target-only thread joins;
-  non-target replies remain audit context. Issue comments include exact
-  actor/App/body/time/commit-marker inputs. Sparse summaries cannot prove the
-  closed grammar or final reread.
-- Reaction reports additionally embed independent initial/final raw current
-  endpoint inventories and parent-owned initial/final ancestry receipts;
-  normalized current snapshots cannot replace them.
+  artifact snapshots plus independent initial/final raw-current inventories,
+  raw-derived finding-commit sets, and parent-owned ancestry receipts. Review
+  snapshots include exact actor/state/body/commit plus fully paginated
+  associated inline children and target-only thread joins; non-target replies
+  remain audit context. Issue comments include exact actor/App/body/time/commit
+  marker inputs. Sparse summaries cannot prove the closed grammar or final
+  reread.
+- Reaction reports embed the same raw-current authority. Normalized current
+  snapshots cannot replace its complete applicable artifact/thread projection.
+- Keep REST/report IDs as exact positive JSON integers. Keep GraphQL BigInt
+  canonical decimal text only at the join boundary.
+- Under schema version 3, fail closed when a nested thread-comments connection
+  needs another page; do not claim or fabricate a child-cursor traversal.
 - Require an explicit commit-bound clean payload for terminal-payload
   completion; an empty `APPROVED` review does not count, and an exact
   `No findings.` review is clean only after its complete exact-provider
@@ -427,19 +449,21 @@ plane separation, or warning-only treatment of early/duplicate requests.
 
 ## Validation
 
-- The final working snapshot's focused contract suite:
+- Follow-up validation completed after the final-range reviewer found the
+  terminal raw-current binding, JSON-ID schema, and nested-pagination
+  inconsistencies described above.
+- The corrected final working snapshot's focused contract suite:
   `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed 102 tests in 12.502 seconds.
-- The final full review-orchestration suite ran outside the filesystem sandbox
-  because provider tests require temporary Unix and loopback socket binds:
+  passed 102 tests in 12.707 seconds.
+- The corrected final working snapshot's full review-orchestration suite ran
+  outside the filesystem sandbox because provider tests require temporary
+  Unix and loopback socket binds:
   `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
-  passed 2,822 tests in 1,025.721 seconds with 6 expected skips and no failures
+  passed 2,822 tests in 1,023.213 seconds with 6 expected skips and no failures
   or errors.
-- System `skill-creator` validation passed for
-  `review-orchestration-playbook`.
-- The bundled project-journal validator passed.
-- Ruff lint and format checks for `tests/test_contracts.py` passed.
-- `git diff --check` passed.
+- Ruff check and format-check, the skill validator, the project-journal
+  validator, and `git diff --check` all passed on the corrected final working
+  snapshot.
 - An earlier named-single review found two P2 contract gaps: a synthesized
   reaction self URL and a self-consistency-only report classifier. Both were
   removed and replaced by parent-endpoint-plus-ID reaction identity and a
@@ -459,9 +483,18 @@ plane separation, or warning-only treatment of early/duplicate requests.
 - The final cross-document audit found no remaining P1/P2 after verifying
   heading-bounded schema-version-3 markers in all five authority/consumer
   documents and v3-to-v4 drift regressions.
-- The final exact-head named-single review receipt is parent-owned review
-  evidence and is intentionally not written back into this candidate head;
-  doing so would change the range being reviewed.
+- The named-single review of
+  `0f77fb7b1dd59f5eed522fa9699497aa013695fc..249978b846c108cd3d9ac98fddf54475b8a92504`
+  found the one P1 and two P2 follow-up gaps recorded above. Its receipt is
+  parent-owned evidence. The corrected exact-head review will likewise remain
+  outside the candidate head because writing it back would change the reviewed
+  range.
+- Two final targeted audits then checked the corrective diff. The raw-current
+  authority projection audit returned no findings. The ID/pagination audit
+  found one remaining P2: the issue-comment schema example still quoted
+  `id` and `stable_artifact_id`. The example now uses positive JSON integers,
+  and executable review/issue-comment regressions reject string terminal
+  artifact IDs.
 
 ## Evidence
 
