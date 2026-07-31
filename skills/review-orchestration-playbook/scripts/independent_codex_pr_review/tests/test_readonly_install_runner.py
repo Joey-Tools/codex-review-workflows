@@ -434,26 +434,33 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
             target.write_text("content", encoding="utf-8")
-            acl_entries: dict[pathlib.Path, tuple[bytes, ...]] = {}
-            xattrs: dict[pathlib.Path, tuple[tuple[str, str], ...]] = {}
+            target_inode = target.stat().st_ino
+            acl_entries: dict[int, tuple[bytes, ...]] = {}
+            xattrs: dict[int, tuple[tuple[bytes, str], ...]] = {}
 
             with (
                 mock.patch.object(
                     runner,
                     "_acl_entries",
-                    side_effect=lambda path: acl_entries.get(path, ()),
+                    side_effect=lambda descriptor: acl_entries.get(
+                        os.fstat(descriptor).st_ino,
+                        (),
+                    ),
                 ),
                 mock.patch.object(
                     runner,
                     "_xattr_snapshot",
-                    side_effect=lambda path: xattrs.get(path, ()),
+                    side_effect=lambda descriptor: xattrs.get(
+                        os.fstat(descriptor).st_ino,
+                        (),
+                    ),
                 ),
             ):
                 baseline = runner._tree_snapshot(root)
-                acl_entries[target] = (b" 0: user:synthetic allow write",)
+                acl_entries[target_inode] = (b" 0: user:synthetic allow write",)
                 acl_changed = runner._tree_snapshot(root)
                 acl_entries.clear()
-                xattrs[target] = ((b"com.apple.synthetic", "digest"),)
+                xattrs[target_inode] = ((b"com.apple.synthetic", "digest"),)
                 xattr_changed = runner._tree_snapshot(root)
 
             self.assertNotEqual(baseline[target.name], acl_changed[target.name])
@@ -477,6 +484,200 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertNotEqual(before[target.name].inode, after[target.name].inode)
             self.assertNotEqual(before[target.name], after[target.name])
             self.assertFalse(runner._tree_property_unchanged(before, after))
+
+    def test_snapshot_rejects_path_replacement_during_descriptor_capture(
+        self,
+    ) -> None:
+        with (
+            owned_temporary_directory("readonly-snapshot-path-race-") as root,
+            owned_temporary_directory("readonly-snapshot-replacement-") as outside,
+        ):
+            target = root / "target"
+            target.write_text("content", encoding="utf-8")
+            target.chmod(0o444)
+            target_inode = target.stat().st_ino
+            replacement = outside / "replacement"
+            replacement.write_text("content", encoding="utf-8")
+            replacement.chmod(0o444)
+            original_sample = runner._stable_regular_entry_sample
+            replaced = False
+
+            def replace_after_descriptor_read(
+                descriptor: int,
+            ) -> tuple[
+                str,
+                tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+            ]:
+                nonlocal replaced
+                sample = original_sample(descriptor)
+                if not replaced and os.fstat(descriptor).st_ino == target_inode:
+                    os.replace(replacement, target)
+                    replaced = True
+                return sample
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_stable_regular_entry_sample",
+                    side_effect=replace_after_descriptor_read,
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "snapshot (object changed|path no longer names)",
+                ),
+            ):
+                runner._tree_snapshot_once(root)
+
+            self.assertTrue(replaced)
+            self.assertNotEqual(target_inode, target.stat().st_ino)
+
+    def test_snapshot_rejects_same_inode_same_length_content_mutation(
+        self,
+    ) -> None:
+        for mutation_point in ("after-content-read", "during-access-policy-read"):
+            with (
+                self.subTest(mutation_point=mutation_point),
+                owned_temporary_directory("readonly-snapshot-content-race-") as root,
+            ):
+                target = root / "target"
+                target.write_bytes(b"content")
+                target_inode = target.stat().st_ino
+                mutated = False
+                if mutation_point == "after-content-read":
+                    original_sample = runner._descriptor_digest
+
+                    def mutate_after_sample(descriptor: int) -> str:
+                        nonlocal mutated
+                        sample = original_sample(descriptor)
+                        if not mutated and os.fstat(descriptor).st_ino == target_inode:
+                            target.write_bytes(b"changed")
+                            mutated = True
+                        return sample
+
+                    patch_name = "_descriptor_digest"
+                else:
+                    original_sample = runner._stable_access_policy_snapshot
+
+                    def mutate_after_sample(
+                        descriptor: int,
+                    ) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+                        nonlocal mutated
+                        sample = original_sample(descriptor)
+                        if not mutated and os.fstat(descriptor).st_ino == target_inode:
+                            target.write_bytes(b"changed")
+                            mutated = True
+                        return sample
+
+                    patch_name = "_stable_access_policy_snapshot"
+
+                with (
+                    mock.patch.object(
+                        runner,
+                        patch_name,
+                        side_effect=mutate_after_sample,
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "regular file changed during snapshot",
+                    ),
+                ):
+                    runner._tree_snapshot_once(root)
+
+                self.assertTrue(mutated)
+                self.assertEqual(target.stat().st_ino, target_inode)
+                self.assertEqual(target.read_bytes(), b"changed")
+
+    def test_snapshot_ignores_timestamp_churn_during_descriptor_capture(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-snapshot-timestamp-race-") as root:
+            target = root / "target"
+            target.write_text("content", encoding="utf-8")
+            target_inode = target.stat().st_ino
+            original_sample = runner._regular_entry_sample
+            churned = False
+
+            def churn_timestamp_after_descriptor_read(
+                descriptor: int,
+            ) -> tuple[
+                str,
+                tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+            ]:
+                nonlocal churned
+                sample = original_sample(descriptor)
+                if not churned and os.fstat(descriptor).st_ino == target_inode:
+                    prior = target.stat().st_mtime_ns
+                    os.utime(target, ns=(prior + 1_000_000_000,) * 2)
+                    churned = True
+                return sample
+
+            with mock.patch.object(
+                runner,
+                "_regular_entry_sample",
+                side_effect=churn_timestamp_after_descriptor_read,
+            ):
+                snapshot = runner._tree_snapshot_once(root)
+
+            self.assertTrue(churned)
+            self.assertEqual(
+                snapshot[target.name].digest,
+                runner.hashlib.sha256(b"content").hexdigest(),
+            )
+
+    def test_snapshot_rejects_symlink_without_bound_target_primitive(self) -> None:
+        with owned_temporary_directory("readonly-snapshot-symlink-") as root:
+            target = root / "target"
+            target.write_text("content", encoding="utf-8")
+            (root / "alias").symlink_to(target.name)
+
+            with self.assertRaisesRegex(
+                OSError,
+                "symlinks are unsupported",
+            ):
+                runner._tree_snapshot_once(root)
+
+    def test_snapshot_walk_remains_bound_when_root_path_is_swapped(self) -> None:
+        with owned_temporary_directory("readonly-snapshot-root-binding-") as parent:
+            root = parent / "root"
+            root.mkdir()
+            (root / "target").write_text("original", encoding="utf-8")
+            alternate = parent / "alternate"
+            alternate.mkdir()
+            (alternate / "target").write_text("alternate", encoding="utf-8")
+            parked = parent / "parked"
+            root_inode = root.stat().st_ino
+            original_open = runner._open_snapshot_entry
+            swapped = False
+
+            def swap_root_around_child_open(
+                parent_descriptor: int,
+                name: str,
+            ) -> tuple[int, os.stat_result]:
+                nonlocal swapped
+                if not swapped and os.fstat(parent_descriptor).st_ino == root_inode:
+                    os.rename(root, parked)
+                    os.rename(alternate, root)
+                    try:
+                        result = original_open(parent_descriptor, name)
+                    finally:
+                        os.rename(root, alternate)
+                        os.rename(parked, root)
+                    swapped = True
+                    return result
+                return original_open(parent_descriptor, name)
+
+            with mock.patch.object(
+                runner,
+                "_open_snapshot_entry",
+                side_effect=swap_root_around_child_open,
+            ):
+                snapshot = runner._tree_snapshot_once(root)
+
+            self.assertTrue(swapped)
+            self.assertEqual(
+                snapshot["target"].digest,
+                runner.hashlib.sha256(b"original").hexdigest(),
+            )
 
     def test_snapshot_rejects_regular_file_external_hardlink_alias(self) -> None:
         with (
@@ -563,6 +764,15 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(os.path.lexists(root))
 
     @staticmethod
+    def _prepared_profile(
+        path: str = (
+            "/synthetic/Frameworks/Python.framework/Versions/3.13/"
+            "Resources/Python.app/Contents/MacOS/Python"
+        ),
+    ) -> mock.Mock:
+        return mock.Mock(sandboxed_target=mock.Mock(path=path))
+
+    @staticmethod
     def _no_child_result(
         *,
         stdout: bytes = b"",
@@ -632,51 +842,24 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         self.assertEqual(name, "production-current")
         self.assertIs(pin, runner.no_child_profile.PINNED_RUNTIME)
 
-        with (
-            mock.patch.dict(
-                runner.os.environ,
-                {"GITHUB_ACTIONS": "true"},
-                clear=True,
-            ),
-            self.assertRaisesRegex(RuntimeError, "missing explicit hosted"),
-        ):
-            runner._select_no_child_runtime_profile()
-
-        with (
-            mock.patch.dict(
-                runner.os.environ,
-                {
-                    runner.RUNNER_ENVIRONMENT_ENV: "github-hosted",
-                    runner.RUNNER_ARCH_ENV: "ARM64",
-                },
-                clear=True,
-            ),
-            mock.patch.object(runner.platform, "machine", return_value="arm64"),
-            mock.patch.object(
-                runner.no_child_profile,
-                "_runtime_fingerprint",
-                return_value=mock.sentinel.runtime,
-            ),
-            mock.patch.object(
-                runner,
-                "_select_hosted_runtime_profile",
-                return_value=("github-reviewed-runtime", mock.sentinel.runtime_pin),
-            ) as select_hosted,
-        ):
-            name, pin = runner._select_no_child_runtime_profile()
-        self.assertEqual(name, "github-reviewed-runtime")
-        self.assertIs(pin, mock.sentinel.runtime_pin)
-        select_hosted.assert_called_once_with(mock.sentinel.runtime)
-
-        with (
-            mock.patch.dict(
-                runner.os.environ,
-                {runner.RUNNER_ENVIRONMENT_ENV: "github-hosted"},
-                clear=True,
-            ),
-            self.assertRaisesRegex(RuntimeError, "incomplete or unsupported"),
-        ):
-            runner._select_no_child_runtime_profile()
+        hosted_environments = (
+            {"GITHUB_ACTIONS": "true"},
+            {
+                runner.RUNNER_ENVIRONMENT_ENV: "github-hosted",
+                runner.RUNNER_ARCH_ENV: "ARM64",
+            },
+            {runner.RUNNER_ENVIRONMENT_ENV: "github-hosted"},
+        )
+        for environment in hosted_environments:
+            with (
+                self.subTest(environment=environment),
+                mock.patch.dict(runner.os.environ, environment, clear=True),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "forbidden under GitHub Actions",
+                ),
+            ):
+                runner._select_no_child_runtime_profile()
 
     def test_no_child_suite_stops_after_signal_during_profile_preparation(
         self,
@@ -733,6 +916,47 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
             run_bounded_command.assert_not_called()
 
+        with (
+            self.subTest(case="missing-sandboxed-target"),
+            self._bound_no_child_roots("readonly-no-child-missing-target-") as roots,
+        ):
+            installed_root, install_binding, runtime_binding = roots
+            proof = runner.ChildProcessClosureProof()
+            prepared = mock.Mock(sandboxed_target=None)
+            with (
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=prepared,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                ) as run_bounded_command,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks a bound Python target",
+                ),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=proof,
+                )
+
+            self.assertFalse(proof.launch_attempted)
+            self.assertFalse(proof.proven)
+            run_bounded_command.assert_not_called()
+
     def test_no_child_suite_accepts_authenticated_tree_closure(self) -> None:
         with self._bound_no_child_roots("readonly-no-child-accepted-") as roots:
             installed_root, install_binding, runtime_binding = roots
@@ -746,7 +970,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ) as prepare_profile,
                 mock.patch.object(
                     runner,
@@ -778,8 +1002,22 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(result.stdout, "selected tests passed\n")
             self.assertEqual(result.stderr, "")
             argv = run_bounded_command.call_args.args[0]
+            self.assertEqual(
+                argv[0],
+                "/synthetic/Frameworks/Python.framework/Versions/3.13/"
+                "Resources/Python.app/Contents/MacOS/Python",
+            )
+            self.assertNotEqual(argv[0], sys.executable)
             self.assertIn("os.environ['TMPDIR']=sys.argv[2]", argv[3])
             self.assertIn("tempfile.tempdir=sys.argv[2]", argv[3])
+            self.assertEqual(
+                run_bounded_command.call_args.kwargs["max_stdout_bytes"],
+                1024,
+            )
+            self.assertEqual(
+                run_bounded_command.call_args.kwargs["max_stderr_bytes"],
+                1024,
+            )
 
     def test_no_child_suite_rejects_process_group_only_closure(self) -> None:
         with self._bound_no_child_roots("readonly-no-child-forged-") as roots:
@@ -789,7 +1027,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -821,14 +1059,17 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
                     "run_bounded_command",
                     return_value=self._no_child_result(stdout=b"x" * 1025),
                 ),
-                self.assertRaisesRegex(OverflowError, "byte cap"),
+                self.assertRaisesRegex(
+                    runner.ChildOutputLimitExceeded,
+                    "stdout output exceeded",
+                ) as caught,
             ):
                 runner._run_no_child_test_suite(
                     installed_root=installed_root,
@@ -841,6 +1082,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             self.assertTrue(proof.proven)
+            self.assertEqual(caught.exception.scope, "stdout")
+            self.assertEqual(caught.exception.limit, 1024)
 
     def test_no_child_suite_timeout_uses_attached_settlement_proof(self) -> None:
         with self._bound_no_child_roots("readonly-no-child-timeout-") as roots:
@@ -857,7 +1100,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -891,7 +1134,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         with self._bound_no_child_roots("readonly-no-child-output-error-") as roots:
             installed_root, install_binding, runtime_binding = roots
             proof = runner.ChildProcessClosureProof()
-            output_error = ValueError("command output exceeds 2048 bytes")
+            output_error = runner.BoundedCommandOutputLimitExceeded(
+                scope="stderr",
+                limit=2048,
+            )
             closure = self._no_child_result(stdio_closed=False).process_closure
             with (
                 mock.patch.object(
@@ -902,7 +1148,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -914,7 +1160,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "bounded_command_process_closure",
                     return_value=closure,
                 ) as process_closure,
-                self.assertRaisesRegex(OverflowError, "byte cap"),
+                self.assertRaisesRegex(
+                    runner.ChildOutputLimitExceeded,
+                    "stderr output exceeded",
+                ) as caught,
             ):
                 runner._run_no_child_test_suite(
                     installed_root=installed_root,
@@ -928,6 +1177,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             self.assertTrue(proof.launch_attempted)
             self.assertTrue(proof.proven)
+            self.assertEqual(caught.exception.scope, "stderr")
+            self.assertEqual(caught.exception.limit, 2048)
             process_closure.assert_called_once_with(output_error)
 
     def test_no_child_suite_does_not_claim_closure_before_process_supervision(
@@ -957,7 +1208,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -1027,7 +1278,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -1087,7 +1338,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,
@@ -1200,7 +1451,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "prepare_sandboxed_python_no_child_profile",
-                    return_value=mock.sentinel.prepared,
+                    return_value=self._prepared_profile(),
                 ),
                 mock.patch.object(
                     runner,

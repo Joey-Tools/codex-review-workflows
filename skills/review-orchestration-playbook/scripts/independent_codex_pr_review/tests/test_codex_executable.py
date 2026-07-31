@@ -25,6 +25,7 @@ import review_supervisor.recovery_cleanup as recovery_cleanup
 
 from review_supervisor.codex_executable import (
     AGGREGATE_SCHEMA_NAME,
+    BoundedCommandOutputLimitExceeded,
     CODESIGN_PATH,
     CommandResult,
     CodexExecutableCustody,
@@ -745,7 +746,10 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                 "_terminate_and_reap_preflight",
                 return_value=-signal.SIGKILL,
             ),
-            self.assertRaisesRegex(ValueError, "command output exceeds") as caught,
+            self.assertRaisesRegex(
+                BoundedCommandOutputLimitExceeded,
+                "command output exceeds",
+            ) as caught,
         ):
             run_bounded_command(
                 ("/usr/bin/true",),
@@ -754,6 +758,8 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
             )
 
         evidence = bounded_command_process_closure(caught.exception)
+        self.assertEqual(caught.exception.scope, "aggregate")
+        self.assertEqual(caught.exception.limit, 4)
         self.assertIsNotNone(evidence)
         assert evidence is not None
         self.assertTrue(evidence.authenticated_no_child_profile)
@@ -762,6 +768,106 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
         self.assertFalse(evidence.stdio_closed)
         self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
         self.assertTrue(selector.closed)
+
+    def _assert_per_stream_output_limit_preempts_open_peer_stream(
+        self,
+        selected_stream: str,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(stdout_read)
+                os.close(stderr_read)
+                os.close(ready_read)
+                os.setsid()
+                os.write(ready_write, b"1")
+                os.close(ready_write)
+                selected_write = (
+                    stdout_write if selected_stream == "stdout" else stderr_write
+                )
+                os.write(selected_write, b"12345")
+                while True:
+                    signal.pause()
+            except BaseException:
+                os._exit(127)
+        os.close(ready_write)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        try:
+            self.assertEqual(os.read(ready_read, 1), b"1")
+            os.close(ready_read)
+            launched = SimpleNamespace(
+                pid=pid,
+                pgid=pid,
+                session_id=pid,
+                start_identity=codex_executable.process_start_identity(pid),
+                profile_sha256="a" * 64,
+            )
+            started = time.monotonic()
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=_published_launch(
+                        launched,
+                        stdout_read,
+                        stderr_read,
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    BoundedCommandOutputLimitExceeded,
+                    f"command output exceeds 4 bytes for {selected_stream}",
+                ) as caught,
+            ):
+                run_bounded_command(
+                    ("/usr/bin/true",),
+                    timeout_seconds=30.0,
+                    max_output_bytes=1024,
+                    max_stdout_bytes=4,
+                    max_stderr_bytes=4,
+                )
+            self.assertLess(time.monotonic() - started, 5.0)
+        finally:
+            try:
+                os.close(ready_read)
+            except OSError:
+                pass
+            for descriptor in (stdout_read, stderr_read):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            else:
+                if waited_pid == 0:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertEqual(caught.exception.scope, selected_stream)
+        self.assertEqual(caught.exception.limit, 4)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertTrue(evidence.leader_reaped)
+        self.assertFalse(evidence.stdio_closed)
+
+    def test_stdout_output_limit_preempts_open_stderr_stream(self) -> None:
+        self._assert_per_stream_output_limit_preempts_open_peer_stream("stdout")
+
+    def test_stderr_output_limit_preempts_open_stdout_stream(self) -> None:
+        self._assert_per_stream_output_limit_preempts_open_peer_stream("stderr")
 
     def test_post_reap_signal_waits_for_closure_publication_and_cleanup(
         self,

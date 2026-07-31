@@ -32,6 +32,14 @@ REQUIRED_TEST_CASES = tuple(
         "test_bounded_preflight_cannot_leave_child_after_closing_stdio",
     ),
     (
+        CodexExecutableAuthenticationTests,
+        "test_stdout_output_limit_preempts_open_stderr_stream",
+    ),
+    (
+        CodexExecutableAuthenticationTests,
+        "test_stderr_output_limit_preempts_open_stdout_stream",
+    ),
+    (
         SnapshotMutationProbeTests,
         "test_live_probe_denies_every_snapshot_mutation",
     ),
@@ -54,7 +62,7 @@ def main() -> int:
     )
     expected_count = len(REQUIRED_TEST_CASES)
     if (
-        expected_count != 9
+        expected_count != 11
         or len(REQUIRED_TEST_KEYS) != expected_count
         or suite.countTestCases() != expected_count
     ):

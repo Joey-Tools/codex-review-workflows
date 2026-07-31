@@ -1504,7 +1504,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
     def test_reviewed_ci_snapshots_use_source_only_python_checks(self) -> None:
-        expected_cache_guards = {"canonical": 3, "private": 5}
+        expected_cache_guards = {"canonical": 2, "private": 4}
         for profile, guard_count in expected_cache_guards.items():
             with self.subTest(profile=profile):
                 workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
@@ -1571,7 +1571,6 @@ class RepositoryContractTest(unittest.TestCase):
       - platform_tests
       - broker_reproducibility
       - independent_supervisor_tests
-      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1579,12 +1578,10 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
-          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
-          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             canonical,
         )
@@ -1598,7 +1595,6 @@ class RepositoryContractTest(unittest.TestCase):
       - platform-safety
       - broker_reproducibility
       - independent_supervisor_tests
-      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1608,14 +1604,12 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
-          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
-          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             private,
         )
@@ -1783,6 +1777,9 @@ class RepositoryContractTest(unittest.TestCase):
         pr_readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
+        independent_readme = (
+            SCRIPTS / "independent_codex_pr_review/README.md"
+        ).read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
         )
@@ -1796,9 +1793,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("CodexExecutableAuthenticationTests", live_runner)
         self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
-        self.assertIn("expected_count != 9", live_runner)
+        self.assertIn("expected_count != 11", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 642", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 647", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1817,15 +1814,21 @@ class RepositoryContractTest(unittest.TestCase):
             'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
             "CODEX_REVIEW_TEST_RUNTIME_PARENT",
             "class TreeEntrySnapshot:",
-            "device=metadata.st_dev",
-            "inode=metadata.st_ino",
-            'flags=getattr(metadata, "st_flags", 0)',
+            "device=final_descriptor.st_dev",
+            "inode=final_descriptor.st_ino",
+            'flags=getattr(final_descriptor, "st_flags", 0)',
             "link_count=link_count",
-            "metadata.st_nlink != 1",
-            "xattrs=_xattr_snapshot(path)",
-            "acl_entries=_acl_entries(path)",
+            "initial.st_nlink != 1",
+            "_open_snapshot_root(root)",
+            "os.listdir(descriptor)",
+            "dir_fd=parent_descriptor",
+            "symlinks are unsupported in immutable install snapshots",
+            "_stable_regular_entry_sample(descriptor)",
+            "_stable_access_policy_snapshot(descriptor)",
             "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
+            'os.environ.get("GITHUB_ACTIONS") == "true"',
+            "forbidden under GitHub Actions",
             "prepare_sandboxed_python_no_child_profile(",
             "runtime_pin=runtime_pin",
             "run_bounded_command(",
@@ -1901,18 +1904,40 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("sandbox_apply", hosted_probe)
         for requirement in (
             "operator-enforced exact-head gate",
-            "nine tests run, zero skips",
+            "live runner's eleven tests, zero skips",
             "Any push invalidates that evidence",
             "Hosted CI's blocker-signature probe is not a substitute",
             "cd skills/review-orchestration-playbook/scripts/"
             "independent_codex_pr_review",
             "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
             '"$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile',
+            '"$TRUSTED_PYTHON" -B -m '
+            "tests.run_readonly_install_deterministic_supervisor",
             "no-group-write/no-other-write",
             "interpreter's absolute path and digest",
             "tests.run_required_no_child_profile",
+            "read-only install runner's complete structured summary",
+            "Both commands must use the same recorded interpreter and exact head",
         ):
             self.assertIn(requirement, pr_readiness)
+        summary_predicates = (
+            'primary_status == "complete"',
+            "primary_failure == null",
+            'child_process_closure == "proven"',
+            'cleanup_status == "complete"',
+            "cleanup_failures == []",
+            "release_tree_immutable == true",
+            'no_child_runtime_profile == "production-current"',
+            "returncode == 0",
+            "retained_paths == []",
+            "runtime_residue == []",
+            "secondary_failures == []",
+            "signal_number == null",
+            "timed_out == false",
+        )
+        for document in (pr_readiness, independent_readme):
+            for predicate in summary_predicates:
+                self.assertIn(predicate, document)
         integration_test = (
             SCRIPTS / "independent_codex_pr_review/tests/test_no_child_profile.py"
         ).read_text(encoding="utf-8")
@@ -1941,13 +1966,8 @@ class RepositoryContractTest(unittest.TestCase):
         for profile, (next_job, skill_root) in profile_contracts.items():
             workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
             start = workflow.index("  independent_supervisor_tests:")
-            readonly_start = workflow.index(
-                "\n  readonly_install_supervisor_tests:",
-                start,
-            )
-            end = workflow.index(f"\n  {next_job}:", readonly_start)
-            supervisor_job = workflow[start:readonly_start]
-            readonly_job = workflow[readonly_start + 1 : end]
+            end = workflow.index(f"\n  {next_job}:", start)
+            supervisor_job = workflow[start:end]
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
                 self.assertIn("timeout-minutes: 15", supervisor_job)
@@ -1994,20 +2014,14 @@ class RepositoryContractTest(unittest.TestCase):
                     "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE",
                     supervisor_job,
                 )
-                self.assertIn("runs-on: macos-26", readonly_job)
-                self.assertIn("timeout-minutes: 20", readonly_job)
-                self.assertIn(
-                    f"""      - name: Run deterministic supervisor from read-only install
-        working-directory: {skill_root}/scripts/independent_codex_pr_review
-        env:
-          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
-          CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
-        run: |
-          python3 -B -m tests.run_readonly_install_deterministic_supervisor
-""",
-                    readonly_job,
+                self.assertNotIn(
+                    "readonly_install_supervisor_tests",
+                    workflow,
                 )
-                self.assertIn("if: always()", readonly_job)
+                self.assertNotIn(
+                    "READONLY_INSTALL_SUPERVISOR_RESULT",
+                    workflow,
+                )
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"

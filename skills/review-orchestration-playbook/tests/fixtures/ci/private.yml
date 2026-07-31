@@ -164,27 +164,6 @@ jobs:
         run: |
           python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
 
-  readonly_install_supervisor_tests:
-    name: read-only-install-supervisor (python-3.13)
-    runs-on: macos-26
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Run deterministic supervisor from read-only install
-        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
-        env:
-          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-          CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
-        run: |
-          python3 -B -m tests.run_readonly_install_deterministic_supervisor
-      - name: Require source-only Python tree
-        if: always()
-        run: |
-          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
-
   python-39-compatibility:
     runs-on: ubuntu-latest
     steps:
@@ -240,7 +219,6 @@ jobs:
       - platform-safety
       - broker_reproducibility
       - independent_supervisor_tests
-      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -250,11 +228,9 @@ jobs:
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
-          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
-          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"

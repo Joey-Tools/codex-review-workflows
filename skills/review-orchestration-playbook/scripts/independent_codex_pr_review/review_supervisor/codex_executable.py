@@ -387,6 +387,13 @@ class CommandResult:
     process_closure: PreflightProcessClosureEvidence | None = None
 
 
+class BoundedCommandOutputLimitExceeded(ValueError):
+    def __init__(self, *, scope: str, limit: int) -> None:
+        self.scope = scope
+        self.limit = limit
+        super().__init__(f"command output exceeds {limit} bytes for {scope}")
+
+
 _BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE = "_codex_bounded_command_process_closure"
 
 
@@ -3841,6 +3848,8 @@ def run_bounded_command(
     *,
     timeout_seconds: float,
     max_output_bytes: int,
+    max_stdout_bytes: int | None = None,
+    max_stderr_bytes: int | None = None,
     _prepared_no_child_profile: object | None = None,
 ) -> CommandResult:
     _require_python_313()
@@ -3852,7 +3861,12 @@ def run_bounded_command(
         raise ValueError(
             "bounded command requires an absolute executable and text argv"
         )
-    if timeout_seconds <= 0 or max_output_bytes <= 0:
+    if (
+        timeout_seconds <= 0
+        or max_output_bytes <= 0
+        or (max_stdout_bytes is not None and max_stdout_bytes <= 0)
+        or (max_stderr_bytes is not None and max_stderr_bytes <= 0)
+    ):
         raise ValueError("bounded command limits must be positive")
     prepared = (
         _prepare_root_protected_no_child_profile(pathlib.Path(argv[0]))
@@ -3895,6 +3909,14 @@ def run_bounded_command(
             stdout_fd: bytearray(),
             stderr_fd: bytearray(),
         }
+        stream_limits = {
+            stdout_fd: max_stdout_bytes,
+            stderr_fd: max_stderr_bytes,
+        }
+        stream_labels = {
+            stdout_fd: "stdout",
+            stderr_fd: "stderr",
+        }
         deadline = time.monotonic() + timeout_seconds
         selector = selectors.DefaultSelector()
         for descriptor in streams:
@@ -3909,17 +3931,36 @@ def run_bounded_command(
             if not events:
                 continue
             for key, _ in events:
+                stream = streams[key.fd]
+                stream_limit = stream_limits[key.fd]
+                stream_remaining = (
+                    READ_CHUNK
+                    if stream_limit is None
+                    else stream_limit + 1 - len(stream)
+                )
                 chunk = os.read(
                     key.fd,
-                    min(READ_CHUNK, max_output_bytes + 1 - total),
+                    min(
+                        READ_CHUNK,
+                        max_output_bytes + 1 - total,
+                        stream_remaining,
+                    ),
                 )
                 if not chunk:
                     selector.unregister(key.fd)
                     continue
-                streams[key.fd].extend(chunk)
+                stream.extend(chunk)
                 total += len(chunk)
+                if stream_limit is not None and len(stream) > stream_limit:
+                    raise BoundedCommandOutputLimitExceeded(
+                        scope=stream_labels[key.fd],
+                        limit=stream_limit,
+                    )
                 if total > max_output_bytes:
-                    raise ValueError(f"command output exceeds {max_output_bytes} bytes")
+                    raise BoundedCommandOutputLimitExceeded(
+                        scope="aggregate",
+                        limit=max_output_bytes,
+                    )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
@@ -5735,6 +5776,7 @@ def authenticate_codex_executable(
 
 __all__ = [
     "AGGREGATE_SCHEMA_NAME",
+    "BoundedCommandOutputLimitExceeded",
     "CODESIGN_PATH",
     "CommandResult",
     "CodexExecutableCustody",

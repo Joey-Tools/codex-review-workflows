@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import pathlib
-import platform
 import secrets
 import signal
 import shutil
@@ -21,6 +20,8 @@ from typing import Any, Iterator
 
 from review_supervisor import no_child_profile
 from review_supervisor.codex_executable import (
+    BoundedCommandOutputLimitExceeded,
+    _macos_acl_entries,
     bounded_command_process_closure,
     run_bounded_command,
 )
@@ -42,14 +43,10 @@ from .support import (
     _open_directory_parent,
     _private_runtime_parent,
 )
-from .run_hosted_no_child_fail_closed import (
-    RUNNER_ARCH_ENV,
-    RUNNER_ENVIRONMENT_ENV,
-    _select_hosted_runtime_profile,
-)
-
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
+RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -94,12 +91,6 @@ NO_CHILD_SUITE_CODE = (
     "sys.path.insert(0,str(root))\n"
     "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
 )
-ACL_LISTING_ENVIRONMENT = {
-    "LANG": "C",
-    "LC_ALL": "C",
-    "PATH": "/usr/bin:/bin",
-}
-XATTR_NOFOLLOW = 0x0001
 XATTR_NAMES_LIMIT_BYTES = 64 * 1024
 XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
@@ -202,37 +193,25 @@ class ChildProcessClosureProof:
     runtime_profile: str | None = None
 
 
+class ChildOutputLimitExceeded(OverflowError):
+    def __init__(self, *, scope: str, limit: int) -> None:
+        self.scope = scope
+        self.limit = limit
+        super().__init__(
+            f"bounded no-child test {scope} output exceeded its {limit}-byte cap"
+        )
+
+
 def _select_no_child_runtime_profile() -> tuple[str, no_child_profile.RuntimePin]:
-    runner_environment = os.environ.get(RUNNER_ENVIRONMENT_ENV)
-    runner_arch = os.environ.get(RUNNER_ARCH_ENV)
-    if runner_environment is None and runner_arch is None:
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            raise RuntimeError(
-                "read-only installed supervisor is missing explicit hosted runner "
-                "identity"
-            )
-        return "production-current", no_child_profile.PINNED_RUNTIME
-    if runner_environment != "github-hosted" or runner_arch != "ARM64":
+    if os.environ.get("GITHUB_ACTIONS") == "true" or any(
+        os.environ.get(name) is not None
+        for name in (RUNNER_ENVIRONMENT_ENV, RUNNER_ARCH_ENV)
+    ):
         raise RuntimeError(
-            "read-only installed supervisor received an incomplete or "
-            "unsupported hosted runner identity"
+            "read-only installed supervisor is forbidden under GitHub Actions "
+            "and hosted runner profiles"
         )
-    if platform.machine() != "arm64":
-        raise RuntimeError(
-            "read-only installed supervisor requires an actual arm64 hosted process"
-        )
-    observed_runtime = no_child_profile._runtime_fingerprint()
-    selected = _select_hosted_runtime_profile(observed_runtime)
-    if selected is None:
-        raise RuntimeError(
-            "read-only installed supervisor runtime is not in the reviewed hosted "
-            "profile catalog: "
-            f"product={observed_runtime.macos_product_version!r} "
-            f"build={observed_runtime.macos_build_version!r} "
-            f"darwin={observed_runtime.darwin_release!r} "
-            f"python={observed_runtime.python_version[:2]!r}"
-        )
-    return selected
+    return "production-current", no_child_profile.PINNED_RUNTIME
 
 
 def _authenticated_no_child_closure(
@@ -483,14 +462,6 @@ def _run_no_child_test_suite(
         runtime_parent,
         directory_fd=runtime_parent_binding.fd,
     )
-    argv = (
-        sys.executable,
-        "-B",
-        "-c",
-        NO_CHILD_SUITE_CODE,
-        str(installed_root),
-        str(runtime_parent),
-    )
     with _bound_child_signals(diagnostics):
         if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
             raise ChildRunInterrupted(lifecycle_fence.received_signal)
@@ -503,6 +474,19 @@ def _run_no_child_test_suite(
         )
         if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
             raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        target = prepared.sandboxed_target
+        if target is None:
+            raise RuntimeError(
+                "read-only installed test profile lacks a bound Python target"
+            )
+        argv = (
+            target.path,
+            "-B",
+            "-c",
+            NO_CHILD_SUITE_CODE,
+            str(installed_root),
+            str(runtime_parent),
+        )
         install_container_binding.revalidate()
         runtime_parent_binding.revalidate()
         proof_scope = begin_bound_signal_deferral()
@@ -514,6 +498,8 @@ def _run_no_child_test_suite(
                     argv,
                     timeout_seconds=timeout,
                     max_output_bytes=stdout_limit + stderr_limit,
+                    max_stdout_bytes=stdout_limit,
+                    max_stderr_bytes=stderr_limit,
                     _prepared_no_child_profile=prepared,
                 )
             except BaseException as error:
@@ -523,11 +509,10 @@ def _run_no_child_test_suite(
                     require_stdio_closed=False,
                 ):
                     proof.proven = True
-                if isinstance(error, ValueError) and "command output exceeds" in str(
-                    error
-                ):
-                    raise OverflowError(
-                        "bounded no-child test output exceeded its byte cap"
+                if isinstance(error, BoundedCommandOutputLimitExceeded):
+                    raise ChildOutputLimitExceeded(
+                        scope=error.scope,
+                        limit=error.limit,
                     ) from error
                 raise
             closure = result.process_closure
@@ -540,9 +525,15 @@ def _run_no_child_test_suite(
                     "no-child proof"
                 )
             proof.proven = True
-            if len(result.stdout) > stdout_limit or len(result.stderr) > stderr_limit:
-                raise OverflowError(
-                    "bounded no-child test output exceeded its byte cap"
+            if len(result.stdout) > stdout_limit:
+                raise ChildOutputLimitExceeded(
+                    scope="stdout",
+                    limit=stdout_limit,
+                )
+            if len(result.stderr) > stderr_limit:
+                raise ChildOutputLimitExceeded(
+                    scope="stderr",
+                    limit=stderr_limit,
                 )
         finally:
             if proof_scope is not None:
@@ -555,33 +546,25 @@ def _run_no_child_test_suite(
     )
 
 
-def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
-    completed = subprocess.run(
-        ("/bin/ls", "-lde", str(path)),
-        env=ACL_LISTING_ENVIRONMENT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=5,
+def _acl_entries(descriptor: int) -> tuple[bytes, ...]:
+    return tuple(
+        entry.encode("ascii", "strict") for entry in _macos_acl_entries(descriptor)
     )
-    if completed.returncode != 0:
-        raise RuntimeError("failed to snapshot extended ACL")
-    return tuple(completed.stdout.splitlines()[1:])
 
 
-def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
+def _xattr_snapshot(descriptor: int) -> tuple[tuple[bytes, str], ...]:
     libc = ctypes.CDLL(None, use_errno=True)
-    listxattr = libc.listxattr
+    listxattr = libc.flistxattr
     listxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_void_p,
         ctypes.c_size_t,
         ctypes.c_int,
     )
     listxattr.restype = ctypes.c_ssize_t
-    getxattr = libc.getxattr
+    getxattr = libc.fgetxattr
     getxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_void_p,
         ctypes.c_size_t,
@@ -589,11 +572,10 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
         ctypes.c_int,
     )
     getxattr.restype = ctypes.c_ssize_t
-    raw_path = os.fsencode(path)
 
     def read_names() -> bytes:
         ctypes.set_errno(0)
-        size = listxattr(raw_path, None, 0, XATTR_NOFOLLOW)
+        size = listxattr(descriptor, None, 0, 0)
         if size < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -605,7 +587,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
             return b""
         buffer = ctypes.create_string_buffer(size)
         ctypes.set_errno(0)
-        actual = listxattr(raw_path, buffer, size, XATTR_NOFOLLOW)
+        actual = listxattr(descriptor, buffer, size, 0)
         if actual < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -637,7 +619,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
 
         def read_value() -> bytes:
             ctypes.set_errno(0)
-            size = getxattr(raw_path, name, None, 0, 0, XATTR_NOFOLLOW)
+            size = getxattr(descriptor, name, None, 0, 0, 0)
             if size < 0:
                 raise OSError(
                     ctypes.get_errno() or errno.EIO,
@@ -650,12 +632,12 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
             buffer = ctypes.create_string_buffer(size)
             ctypes.set_errno(0)
             actual = getxattr(
-                raw_path,
+                descriptor,
                 name,
                 buffer,
                 size,
                 0,
-                XATTR_NOFOLLOW,
+                0,
             )
             if actual < 0:
                 raise OSError(
@@ -680,48 +662,249 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
     return tuple(snapshot)
 
 
-def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
-    snapshot: dict[str, TreeEntrySnapshot] = {}
-    paths = (root, *sorted(root.rglob("*")))
-    for path in paths:
-        metadata = path.lstat()
-        relative = "." if path == root else path.relative_to(root).as_posix()
-        mode = stat.S_IMODE(metadata.st_mode)
-        if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_nlink != 1:
-                raise RuntimeError(
-                    f"regular file has an external hardlink alias: {relative}"
-                )
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            kind = "file"
-            link_count = metadata.st_nlink
-        elif stat.S_ISDIR(metadata.st_mode):
-            digest = None
-            kind = "directory"
-            link_count = None
-        elif stat.S_ISLNK(metadata.st_mode):
-            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
-            kind = "symlink"
-            link_count = None
-        else:
-            digest = None
-            kind = "other"
-            link_count = None
-        snapshot[relative] = TreeEntrySnapshot(
-            kind=kind,
-            device=metadata.st_dev,
-            inode=metadata.st_ino,
-            generation=getattr(metadata, "st_gen", 0),
-            uid=metadata.st_uid,
-            gid=metadata.st_gid,
-            mode=mode,
-            flags=getattr(metadata, "st_flags", 0),
-            link_count=link_count,
-            digest=digest,
-            xattrs=_xattr_snapshot(path),
-            acl_entries=_acl_entries(path),
+def _snapshot_binding_key(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+        metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None,
+    )
+
+
+def _open_snapshot_entry(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    if not name or name in {".", ".."} or "/" in name or "\0" in name:
+        raise ValueError("snapshot entry name is malformed")
+    initial = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if stat.S_ISREG(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISDIR(initial.st_mode):
+        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISLNK(initial.st_mode):
+        raise OSError(
+            errno.EPERM,
+            "symlinks are unsupported in immutable install snapshots",
         )
-    return snapshot
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot entry changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_snapshot_root(root: pathlib.Path) -> tuple[int, os.stat_result]:
+    initial = root.lstat()
+    if not stat.S_ISDIR(initial.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "snapshot root is not a directory")
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot root changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _descriptor_digest(descriptor: int) -> str:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError(errno.EINVAL, "snapshot digest requires a regular file")
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        _snapshot_binding_key(before) != _snapshot_binding_key(after)
+        or before.st_size != after.st_size
+        or offset != after.st_size
+    ):
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest.hexdigest()
+
+
+def _access_policy_snapshot(
+    descriptor: int,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    return _xattr_snapshot(descriptor), _acl_entries(descriptor)
+
+
+def _stable_access_policy_snapshot(
+    descriptor: int,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    first = _access_policy_snapshot(descriptor)
+    second = _access_policy_snapshot(descriptor)
+    if first != second:
+        raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    return second
+
+
+def _regular_entry_sample(
+    descriptor: int,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    digest_before = _descriptor_digest(descriptor)
+    access_policy = _stable_access_policy_snapshot(descriptor)
+    digest_after = _descriptor_digest(descriptor)
+    if digest_before != digest_after:
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest_after, access_policy
+
+
+def _stable_regular_entry_sample(
+    descriptor: int,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    first = _regular_entry_sample(descriptor)
+    second = _regular_entry_sample(descriptor)
+    if first != second:
+        raise OSError(
+            errno.ESTALE,
+            "regular file content or access policy changed during snapshot",
+        )
+    return second
+
+
+def _snapshot_opened_entry(
+    descriptor: int,
+    initial: os.stat_result,
+    *,
+    relative: str,
+    snapshot: dict[str, TreeEntrySnapshot],
+) -> TreeEntrySnapshot:
+    if stat.S_ISREG(initial.st_mode):
+        if initial.st_nlink != 1:
+            raise RuntimeError(
+                f"regular file has an external hardlink alias: {relative}"
+            )
+        digest, access_policy = _stable_regular_entry_sample(descriptor)
+        kind = "file"
+        link_count = initial.st_nlink
+    elif stat.S_ISDIR(initial.st_mode):
+        digest = None
+        kind = "directory"
+        link_count = None
+        access_before = _stable_access_policy_snapshot(descriptor)
+        names = tuple(sorted(os.listdir(descriptor)))
+        for name in names:
+            child_relative = name if relative == "." else f"{relative}/{name}"
+            child_descriptor, child_initial = _open_snapshot_entry(descriptor, name)
+            try:
+                child_snapshot = _snapshot_opened_entry(
+                    child_descriptor,
+                    child_initial,
+                    relative=child_relative,
+                    snapshot=snapshot,
+                )
+                final_child = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if _snapshot_binding_key(child_initial) != _snapshot_binding_key(
+                    final_child
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        f"snapshot path no longer names the bound object: "
+                        f"{child_relative}",
+                    )
+                snapshot[child_relative] = child_snapshot
+            finally:
+                os.close(child_descriptor)
+        if names != tuple(sorted(os.listdir(descriptor))):
+            raise OSError(
+                errno.ESTALE, f"directory changed during snapshot: {relative}"
+            )
+        access_policy = _stable_access_policy_snapshot(descriptor)
+        if access_before != access_policy:
+            raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    final_descriptor = os.fstat(descriptor)
+    if _snapshot_binding_key(initial) != _snapshot_binding_key(final_descriptor):
+        raise OSError(
+            errno.ESTALE, f"snapshot object changed during capture: {relative}"
+        )
+    if stat.S_ISREG(initial.st_mode) and initial.st_size != final_descriptor.st_size:
+        raise OSError(errno.ESTALE, f"regular file changed during snapshot: {relative}")
+    xattrs, acl_entries = access_policy
+    return TreeEntrySnapshot(
+        kind=kind,
+        device=final_descriptor.st_dev,
+        inode=final_descriptor.st_ino,
+        generation=getattr(final_descriptor, "st_gen", 0),
+        uid=final_descriptor.st_uid,
+        gid=final_descriptor.st_gid,
+        mode=stat.S_IMODE(final_descriptor.st_mode),
+        flags=getattr(final_descriptor, "st_flags", 0),
+        link_count=link_count,
+        digest=digest,
+        xattrs=xattrs,
+        acl_entries=acl_entries,
+    )
+
+
+def _tree_snapshot_once(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
+    snapshot: dict[str, TreeEntrySnapshot] = {}
+    descriptor, initial = _open_snapshot_root(root)
+    try:
+        root_snapshot = _snapshot_opened_entry(
+            descriptor,
+            initial,
+            relative=".",
+            snapshot=snapshot,
+        )
+        final_descriptor = os.fstat(descriptor)
+        final_path = root.lstat()
+        if _snapshot_binding_key(final_descriptor) != _snapshot_binding_key(final_path):
+            raise OSError(
+                errno.ESTALE,
+                "snapshot root path no longer names the bound object",
+            )
+        snapshot["."] = root_snapshot
+        return snapshot
+    finally:
+        os.close(descriptor)
+
+
+def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
+    first = _tree_snapshot_once(root)
+    second = _tree_snapshot_once(root)
+    if not _tree_property_unchanged(first, second):
+        raise OSError(errno.ESTALE, "install tree changed during snapshot")
+    return second
 
 
 def _tree_property_unchanged(

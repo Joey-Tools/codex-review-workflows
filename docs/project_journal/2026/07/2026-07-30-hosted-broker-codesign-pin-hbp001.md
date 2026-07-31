@@ -33,10 +33,9 @@ superseded_by:
 - Hosted no-child fail-closed probing accepts only the exact reviewed
   macOS 26.4 build `25E246` or macOS 26.5.2 build `25F84` runtime fingerprint;
   an unknown runtime fails before the probe.
-- The read-only installed supervisor job consumes that same exact catalog. CI
-  supplies the authenticated runner environment and architecture explicitly;
-  an incomplete marker set, an unrecognized hosted runtime, or a GitHub Actions
-  run without those markers fails before profile preparation or child launch.
+- Only the hosted fail-closed probe consumes that exact catalog. The positive
+  read-only installed runner rejects GitHub Actions and hosted profile markers;
+  it uses the production pin only in the paired Trusted Mac exact-head gate.
 - Source, artifact, Xcode, SDK, clang, linker, lipo, vtool, and
   `codesign_allocate` pins are unchanged.
 
@@ -61,12 +60,20 @@ superseded_by:
   `25F84`, Darwin `25.5.0`, with `/usr/bin/sandbox-exec` SHA-256
   `8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16`,
   proving the legacy-only workflow failed closed on the new runner generation.
-- A later Fresh Codex review found that the separate read-only installed job
-  still used the production 26.5.2 default while the mutable `macos-26` label
-  could select either reviewed generation. The runner now selects and passes the
-  exact observed pin from the same two-generation catalog, with local runs
-  retaining the production-current default only outside GitHub Actions.
+- Superseded design evidence: a later Fresh Codex review found that the
+  separate read-only installed job used the production 26.5.2 default while the
+  mutable `macos-26` label could select either reviewed generation. That repair
+  temporarily selected from the two-generation hosted catalog.
+- Subsequent review proved that separate hosted jobs can receive different
+  rolling images, so dual green results could not establish one consistent
+  runtime outcome. The hosted positive job and catalog consumer were removed;
+  hosted CI now retains only the negative blocker-signature probe, while the
+  live and read-only positive gates run consecutively on one Trusted Mac and
+  exact head.
 - Local `--developer-check` reproduced the pinned broker artifact exactly with
   the unchanged source, toolchain, signing identity, and CDHashes.
+- The current full Python 3.13 playbook discovery's only failure was the
+  expected parent-sandbox denial of nested `sandbox-exec`; the exact in-memory
+  broker regression passed 1/1 outside that parent sandbox in 2.469 seconds.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.

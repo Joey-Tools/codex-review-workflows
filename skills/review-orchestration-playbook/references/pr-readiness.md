@@ -80,10 +80,24 @@ runner:
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 ```
 
 Record the interpreter's absolute path and digest and exact `head_sha`; record
-nine tests run, zero skips, and the terminal result in the PR delivery evidence.
+the live runner's eleven tests, zero skips, and terminal result, followed by the
+read-only install runner's complete structured summary. Accept that summary
+only when all of these predicates hold:
+
+- `primary_status == "complete"` and `primary_failure == null`
+- `child_process_closure == "proven"`
+- `cleanup_status == "complete"` and `cleanup_failures == []`
+- `release_tree_immutable == true`
+- `no_child_runtime_profile == "production-current"`
+- `returncode == 0`
+- `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`
+- `signal_number == null` and `timed_out == false`
+
+Both commands must use the same recorded interpreter and exact head.
 Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,
 or nonmatching-host evidence blocks merge-readiness;
 Hosted CI's blocker-signature probe is not a substitute.

@@ -128,9 +128,10 @@ superseded_by:
   leader was reaped and its streams drained; process-group emptiness is never
   accepted as whole-descendant closure.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
-  syntax validation and explicit zero-cache guards. Their Python 3.13
-  workflows run the installed-release immutability regression in a dedicated
-  20-minute job, separate from the ordinary deterministic supervisor job.
+  syntax validation and explicit zero-cache guards. Hosted Python 3.13 CI runs
+  the ordinary deterministic suite and the reviewed blocker-signature probe;
+  the positive installed-release immutability regression follows the live
+  isolation suite in one Trusted Mac exact-head gate.
 
 ## Next Steps
 
@@ -328,3 +329,16 @@ superseded_by:
   and the zero-bytecode inventory passed.
 - No local Python 3.10 run is required for this delivery; local validation uses
   Python 3.13 only.
+- The current combined-snapshot and typed-output repair passed 647/647 in the
+  ordinary deterministic gate in 226.329 seconds with the
+  reviewed 647-test selected identity and SHA-256
+  `086d84524704e97791e47ed9b9e3e0a7bab1c99a63ba9bee27e58db3725dbadb`.
+  Its complementary deny-child selection passed 275/275 in 20.480 seconds with
+  identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+- Package-aware discovery passed 658 tests with six expected outer-sandbox or
+  platform skips in 219.658 seconds. The complete Python 3.13 playbook
+  discovery ran 2,822 tests in 983.661 seconds with six skips; its sole failure
+  was the known parent-sandbox denial of nested `sandbox-exec`. That exact
+  broker regression passed 1/1 outside the parent sandbox in 2.469 seconds.
+  Repository contracts passed 102/102 in 7.404 seconds.

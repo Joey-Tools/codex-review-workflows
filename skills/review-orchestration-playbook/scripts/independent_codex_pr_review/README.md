@@ -349,17 +349,25 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
-第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二条命令只允许在匹配生产 pin、
-且没有外层 Seatbelt 的受信任 Mac 上运行，九项测试必须全部执行并通过。GitHub Hosted
-`macos-26` 自身位于外层 Seatbelt 中，不能产生生产等价的 live isolation evidence；CI
-因此只验证该环境以已审阅的 blocker signature 失败关闭，并把真实九项 live suite 保留为
-涉及隔离边界变更时的本机交付门。若 Hosted 环境不再呈现该 signature，CI 会失败并要求
-重新审阅架构，不能把环境指纹相同解释为生产能力证明。
+第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二、三条命令只允许在匹配生产 pin、
+且没有外层 Seatbelt 的受信任 Mac 上连续运行。十一项 live 测试必须全部执行并通过，随后
+read-only install runner 必须返回完整成功的 structured summary。该 summary 只有在
+`primary_status == "complete"`、`primary_failure == null`、
+`child_process_closure == "proven"`、`cleanup_status == "complete"`、
+`cleanup_failures == []`、`release_tree_immutable == true`、
+`no_child_runtime_profile == "production-current"`、`returncode == 0`、
+`retained_paths == []`、`runtime_residue == []`、`secondary_failures == []`、
+`signal_number == null` 且 `timed_out == false` 时才算成功。GitHub Hosted
+`macos-26` 自身位于外层 Seatbelt 中，不能产生这两项正向 evidence；CI 因此只验证该环境
+以已审阅的 blocker signature 失败关闭。若 Hosted 环境不再呈现该 signature，CI 会失败并
+要求重新审阅架构，不能把环境指纹相同解释为生产能力证明。
 
-这个 live gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub check、
-branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR delivery
-evidence 必须记录对应 `head_sha`、9 tests、0 skips 和 terminal result；任何后续 push 都会
-使证据失效。缺少该证据时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。
+这个 Trusted Mac gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub
+check、branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR
+delivery evidence 必须记录对应 `head_sha`、Python absolute path/digest、11 tests、0 skips、
+live terminal result 和紧随其后的 read-only structured summary；任何后续 push 都会使证据
+失效。缺少任一项时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。

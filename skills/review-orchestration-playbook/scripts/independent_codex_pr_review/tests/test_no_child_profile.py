@@ -3790,7 +3790,10 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
         baseline = self.evidence.observation("seatbelt", "baseline")
         self.assertIsNotNone(baseline)
         assert baseline is not None
-        if baseline.outcome == "ambiguous" and "sandbox_apply" in baseline.detail:
+        if (
+            baseline.outcome == "ambiguous"
+            and baseline.detail == profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED
+        ):
             self.assertFalse(self.evidence.compatible)
             self._skip_or_fail(
                 "outer sandbox blocks nested Seatbelt; fail-closed verified"

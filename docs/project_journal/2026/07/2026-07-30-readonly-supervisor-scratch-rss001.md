@@ -72,11 +72,16 @@ superseded_by:
   retained as ordered secondary diagnostics, while cleanup is authorized only
   by an explicit process-closure proof; a still-pending or unproven child keeps
   both the installed and runtime trees.
-- CI runs the ordinary deterministic suite and the read-only installed
-  regression in separate macOS Python 3.13 jobs. The read-only job has a
-  20-minute emergency outer budget around the runner's 10-minute child timeout.
-  CI success requires the terminal structured closure and cleanup proof; a host
-  cancellation or missing terminal summary cannot count as a clean gate.
+- Hosted CI runs the ordinary deterministic suite and the reviewed
+  blocker-signature probe. It does not run the positive read-only installed
+  regression because separate rolling `macos-26` jobs can receive different
+  images and the hosted outer Seatbelt is not production-equivalent.
+- The positive read-only installed regression runs immediately after the live
+  isolation suite as one operator-enforced Trusted Mac exact-head gate. Success
+  requires the documented complete structured predicate, including proven
+  closure, complete cleanup, immutable release content and access policy, the
+  `production-current` runtime profile, zero child return code, and no retained
+  paths, runtime residue, or secondary failures.
 - Linux sandbox-command unit tests use a synthetic trusted runtime mount instead
   of assuming `/usr` ownership on a hosted image. A separate policy test still
   accepts a system path only when every resolved component is root-owned and
@@ -247,3 +252,25 @@ superseded_by:
   validator's ignored task-local dependency cache.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.
+- A later Fresh Codex review showed that two independent jobs on the rolling
+  `macos-26` label could accidentally satisfy conflicting positive and
+  fail-closed expectations by receiving different images. The hosted positive
+  job is therefore superseded by the paired Trusted Mac exact-head procedure;
+  hosted CI retains only the reviewed blocker-signature gate.
+- Follow-up read-only review moved the two real-fork stream-overflow
+  regressions into the live isolation set, replaced text-matched overflow
+  handling with typed stream/limit evidence, and made regular-file content plus
+  access policy one repeated combined sample. Timestamp-only churn remains
+  benign, while same-inode same-length content mutation fails closed.
+- The repaired ordinary deterministic selection passed 647/647 in 226.329
+  seconds with identity SHA-256
+  `086d84524704e97791e47ed9b9e3e0a7bab1c99a63ba9bee27e58db3725dbadb`.
+  The deny-child selection passed 275/275 in 20.480 seconds with identity
+  SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+- Package-aware discovery passed 658 tests with six expected outer-sandbox or
+  platform skips in 219.658 seconds. The complete Python 3.13 playbook
+  discovery ran 2,822 tests in 983.661 seconds with six skips; only the known
+  nested-Seatbelt broker regression failed under the parent sandbox, and that
+  exact test passed 1/1 outside it in 2.469 seconds. Repository contracts passed
+  102/102 in 7.404 seconds.
