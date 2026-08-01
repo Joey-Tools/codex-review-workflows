@@ -1986,7 +1986,7 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 for requirement in (
                     "/usr/bin/sudo /usr/bin/mktemp -d "
-                    "/Users/codex-review-readonly.XXXXXX",
+                    "/private/var/codex-review-readonly.XXXXXX",
                     "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
                     '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
                     '"$isolated_source"',
@@ -2012,14 +2012,14 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 create_index = readonly_job.index(
                     'isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d '
-                    '/Users/codex-review-readonly.XXXXXX)"'
+                    '/private/var/codex-review-readonly.XXXXXX)"'
                 )
                 recovery_index = readonly_job.index(
                     'echo "Read-only isolation recovery root: $isolated_root"'
                 )
                 path_guard_index = readonly_job.index(
                     '[[ ! "$isolated_root" =~ '
-                    "^/Users/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
+                    "^/private/var/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
                 )
                 identity_index = readonly_job.index(
                     'isolated_object_id="$(/usr/bin/sudo /usr/bin/stat '
@@ -2129,7 +2129,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/sudo /bin/test ! -L "$isolated_root"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u' "
                     '"$isolated_root")" = "0"',
-                    "/usr/bin/sudo -u nobody /bin/test ! -w /Users",
+                    "/usr/bin/sudo -u nobody /bin/test ! -w /private/var",
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
                     "(( (isolated_flags & 2) == 2 ))",
