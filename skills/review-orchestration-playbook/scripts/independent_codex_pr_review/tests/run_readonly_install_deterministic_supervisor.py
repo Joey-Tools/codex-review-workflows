@@ -3022,6 +3022,7 @@ def main() -> int:
             {
                 "PYTHONDONTWRITEBYTECODE": "1",
                 EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
+                "TMPDIR": str(runtime_parent),
             }
         )
         stage = "child-run"

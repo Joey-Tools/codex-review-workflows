@@ -265,3 +265,7 @@ superseded_by:
   nobody run. Full descriptor-based ACL/xattr policy validation requires read
   and search access on every ancestor; the outer root remains non-writable and
   the nobody-owned payload and runtime parent remain exact mode `0700`.
+- The installed child suite receives `TMPDIR` bound to its already validated
+  private runtime parent. The outer runner still creates the read-only install
+  container below sticky `/private/tmp`, while nested unittest temporary roots
+  no longer fall back to that intentionally rejected ancestor.

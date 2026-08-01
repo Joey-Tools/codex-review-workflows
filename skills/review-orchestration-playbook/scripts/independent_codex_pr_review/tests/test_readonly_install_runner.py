@@ -6918,7 +6918,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         RuntimeError("synthetic post-snapshot failure"),
                     ),
                 ),
-                mock.patch.object(runner, "_run_bounded_child", return_value=completed),
+                mock.patch.object(
+                    runner,
+                    "_run_bounded_child",
+                    return_value=completed,
+                ) as run_bounded_child,
                 mock.patch.object(
                     runner,
                     "_cleanup_bound_tree",
@@ -6931,6 +6935,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             summary = json.loads(stdout.getvalue())
             error_text = stderr.getvalue()
+            child_environment = run_bounded_child.call_args.kwargs["environment"]
+            self.assertEqual(child_environment["TMPDIR"], str(runtime_parent))
+            self.assertEqual(
+                child_environment[runner.EXPLICIT_RUNTIME_PARENT_ENV],
+                str(runtime_parent),
+            )
             self.assertEqual(returncode, 1)
             self.assertEqual(summary["returncode"], 0)
             self.assertEqual(summary["primary_status"], "failed")
