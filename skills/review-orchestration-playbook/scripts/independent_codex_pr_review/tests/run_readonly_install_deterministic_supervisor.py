@@ -28,7 +28,10 @@ from review_supervisor.no_child_profile import (
     attest_writable_root,
     prepare_sandboxed_python_no_child_profile,
 )
-from review_supervisor.secureio import open_absolute_directory_chain
+from review_supervisor.secureio import (
+    open_absolute_directory_chain,
+    validate_directory_policy_fd,
+)
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
@@ -1010,8 +1013,8 @@ def _source_manifest_sha256(root: pathlib.Path) -> str:
             (
                 path,
                 entry.kind,
-                entry.uid,
-                entry.gid,
+                # Allocation ownership is container-local. The complete
+                # installed snapshot separately binds its actual UID/GID.
                 entry.mode,
                 entry.flags,
                 entry.digest,
@@ -1023,6 +1026,24 @@ def _source_manifest_sha256(root: pathlib.Path) -> str:
         "ascii"
     )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_root_gid(root: pathlib.Path) -> int:
+    return _tree_snapshot(root)["."].gid
+
+
+def _align_created_directory_group(
+    binding: _CreatedPrivateDirectoryBinding,
+    expected_gid: int,
+) -> None:
+    binding.revalidate()
+    os.fchown(binding.fd, -1, expected_gid)
+    binding.policy = validate_directory_policy_fd(
+        binding.fd,
+        binding.path,
+        private=True,
+    )
+    binding.revalidate()
 
 
 def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
@@ -1526,6 +1547,7 @@ def _run_main(
         stage = "source-head-binding"
         source_binding = _bind_source_checkout(source_root)
         source_manifest_before = _source_manifest_sha256(source_root)
+        source_gid = _source_root_gid(source_root)
         stage = "install-container-binding"
         install_container_binding = _create_owned_private_directory_binding(
             READONLY_INSTALL_PARENT,
@@ -1533,6 +1555,8 @@ def _run_main(
             require_owned_private_parent=False,
         )
         install_container = install_container_binding.path
+        stage = "install-container-group"
+        _align_created_directory_group(install_container_binding, source_gid)
         stage = "runtime-parent-binding"
         runtime_parent_binding = _create_owned_private_directory_binding(
             _private_runtime_parent(),

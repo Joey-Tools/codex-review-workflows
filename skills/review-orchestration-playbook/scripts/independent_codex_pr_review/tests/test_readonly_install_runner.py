@@ -127,19 +127,38 @@ class SourceCheckoutBindingTests(unittest.TestCase):
         with self._committed_source() as (source, head):
             binding = runner._bind_source_checkout(source)
             manifest = runner._source_manifest_sha256(source)
-            installed = source.parent.parent / "installed"
-
-            copied_manifest = runner._copy_bound_source(
-                source,
-                installed,
-                binding,
-                manifest,
+            install_binding = support._create_owned_private_directory_binding(
+                runner.READONLY_INSTALL_PARENT,
+                ".readonly-source-copy-",
+                require_owned_private_parent=False,
             )
+            try:
+                runner._align_created_directory_group(
+                    install_binding,
+                    source.lstat().st_gid,
+                )
+                installed = install_binding.path / "installed"
+                copied_manifest = runner._copy_bound_source(
+                    source,
+                    installed,
+                    binding,
+                    manifest,
+                )
 
-            self.assertEqual(binding.head_sha, head)
-            self.assertEqual(binding.source_relative_path, "source")
-            self.assertEqual(copied_manifest, manifest)
-            self.assertEqual(runner._source_manifest_sha256(installed), manifest)
+                self.assertEqual(binding.head_sha, head)
+                self.assertEqual(binding.source_relative_path, "source")
+                self.assertEqual(install_binding.policy.gid, source.lstat().st_gid)
+                self.assertEqual(copied_manifest, manifest)
+                self.assertEqual(
+                    runner._source_manifest_sha256(installed),
+                    manifest,
+                )
+            finally:
+                support._cleanup_created_private_directory_binding(
+                    install_binding,
+                    restore_owner_write=True,
+                )
+                install_binding.close()
 
     def test_source_binding_rejects_invalid_head_and_checkout_state(self) -> None:
         with (
@@ -243,10 +262,17 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             "_source_manifest_sha256",
             return_value="b" * 64,
         )
+        self._source_gid_patcher = mock.patch.object(
+            runner,
+            "_source_root_gid",
+            return_value=os.getgid(),
+        )
         self._binding_patcher.start()
         self._manifest_patcher.start()
+        self._source_gid_patcher.start()
         self.addCleanup(self._binding_patcher.stop)
         self.addCleanup(self._manifest_patcher.stop)
+        self.addCleanup(self._source_gid_patcher.stop)
 
     @staticmethod
     def _bind_existing_directories(
@@ -2972,7 +2998,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     summary["primary_failure"]["stage"],
-                    "install-copy" if target == "install" else "child-run",
+                    ("install-container-group" if target == "install" else "child-run"),
                 )
                 self.assertEqual(summary["cleanup_status"], "incomplete")
                 self.assertEqual(summary["retained_paths"], [str(original)])

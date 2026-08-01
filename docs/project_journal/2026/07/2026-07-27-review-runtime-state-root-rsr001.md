@@ -390,3 +390,11 @@ superseded_by:
   reviewed 652-test selected identity and SHA-256
   `ae05fcb1dac9077c4d3a477413c762664c8d9046e467d8286a4f302fa9d52b39`.
   Repository contracts passed 102/102 in 7.218 seconds.
+- The first exact-head installed run then failed closed before child launch
+  because `/private/tmp` assigned a different group to the copied tree. Git
+  does not bind ambient checkout UID/GID, so the cross-container manifest now
+  covers content and portable access policy while the installed before/after
+  snapshot continues to bind actual UID/GID. The held install container is
+  group-aligned and policy-revalidated before copying so Darwin inheritance is
+  deterministic. Focused source-binding and runner tests passed 44/44 in
+  11.018 seconds.
