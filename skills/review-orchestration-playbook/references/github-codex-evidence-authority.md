@@ -66,6 +66,17 @@ common tree ID, and all 15 path/blob pairs above, then explicitly record whether
 the baseline is retained or replaced. A branch name, tag name, partial runtime
 diff, or a later release with similar prose is not a substitute.
 
+Treat the source commit, released-Action commit, common tree ID, complete
+15-path manifest, and the result-present decision rationale below as one atomic
+anti-drift receipt. Matching only the executable files does not preserve the
+published release envelope, and matching only the prose does not preserve the
+implementation that the named regressions exercise. Any future replacement
+must pin a new source/action pair, prove their complete-tree relationship,
+publish the complete replacement path/blob manifest, and explain whether each
+result-present regression remains authoritative or why the decision changed.
+Until that comparison is recorded, this exact baseline and rationale remain
+normative.
+
 Only the provider-result authority is inherited: trustworthy provider results
 decide the outcome, while requests and run markers remain producer/audit
 evidence. The playbook's raw REST/GraphQL review-thread proof, exact whole-PR
@@ -101,7 +112,10 @@ playbook changes.
 
 Result-present acceptance is not optimistic acceptance. A newer finding or
 malformed terminal artifact, unresolved thread, incomplete page, conflicting
-same-time channel evidence, stale scope, or unstable final re-read still blocks.
+same-time channel evidence, stale scope, or unstable final provider
+artifact/thread/selection re-read still blocks. Request-sidecar-only instability
+instead closes request/reaction authority without erasing a stable terminal
+result.
 An unresolved thread finding is not superseded by a later clean artifact.
 
 ## Decision
@@ -166,6 +180,122 @@ Warnings remain visible in the final report even when the provider result is
 clean. Never silently normalise duplicate history into `compliant`, and never
 post a third request to repair it.
 
+### Parent-Owned Request-Time Scope Receipt Sidecar
+
+Reaction evidence and request-policy classification require proof of the
+immutable whole-PR scope at the time the parent created each controlled
+request. The authority for that proof is a parent-owned sidecar captured around
+the write, not a scope later attached to an issue-comment record. Its closed
+shape is:
+
+```yaml
+request_scope_receipts:
+  - kind: parent-recorded-request-scope-v1
+    request_id: <positive request-comment ID>
+    pre_request_scope_receipts:
+      pull: <closed raw response receipt>
+      compare: <closed raw response receipt>
+    request_comment_receipt: <closed raw response receipt>
+    post_request_scope_receipts:
+      pull: <closed raw response receipt>
+      compare: <closed raw response receipt>
+```
+
+Every raw response receipt has exactly these fields and no others:
+`{method, request_url, status, date_header, body_utf8, body_sha256}`.
+`date_header` is the canonical IMF-fixdate from that authenticated GitHub
+response, `body_utf8` is the bounded strict-UTF-8 JSON response body, and
+`body_sha256` is recomputed over those exact UTF-8 bytes. Self-reported
+authentication flags, normalized projections, GraphQL objects, and locally
+constructed response bodies are not receipts.
+
+For each pre-request and post-request phase:
+
+- `pull` is exact `GET` of
+  `https://api.github.com/repos/<owner>/<repo>/pulls/<pr>` with integer status
+  `200`. Its raw body supplies the canonical positive PR number plus full
+  lowercase `base.sha` and `head.sha`.
+- `compare` is exact `GET` of
+  `https://api.github.com/repos/<owner>/<repo>/compare/<base.sha>...<head.sha>`
+  with integer status `200`. Its raw body must repeat that base as
+  `base_commit.sha` and supplies `pr_merge_base` only from
+  `merge_base_commit.sha`.
+- The two independently parsed records derive one exact scope tuple
+  `(repository, pr, pr_merge_base, head)`. The pre-request and post-request
+  tuples must be type-preserving identical and must both equal the enclosing
+  historical or current scope. Preserve the individual response `Date` values;
+  do not require the two sequential GETs in one phase to share a timestamp.
+  Every pre `Date` is no later than the request semantic time or POST response,
+  every post `Date` is no earlier than the POST response, and every receipt
+  `Date` is no later than the frozen history as-of bound.
+
+`request_comment_receipt` is the exact authenticated response to parent-owned
+`POST` of `https://api.github.com/repos/<owner>/<repo>/issues/<pr>/comments`
+with integer status `201` and exact submitted body `@codex review`. Independently
+project its raw response body to the controlled request's seven-field record:
+
+```yaml
+id: <positive issue-comment ID>
+url: https://github.com/OWNER/REPO/pull/<pr>#issuecomment-<id>
+created_at: <canonical server time>
+updated_at: <same canonical server time as created_at>
+request_server_time: <created_at>
+request_server_time_field: created_at
+normalized_body: "@codex review"
+```
+
+The raw POST body must also bind the canonical REST issue-comment URL, exact
+repository/PR, and the authenticated parent actor accepted by the controlled
+request rule. Version `parent-recorded-request-scope-v1` accepts only the
+unedited creation response (`created_at == updated_at` and
+`request_server_time_field: created_at`); authority for a later edit would
+require a separately predeclared receipt version. `request_id` must equal the
+projected `id`; the projected seven fields must type-preservingly equal the
+independently fetched request record in the complete issue-comment traversal;
+and the request semantic server time must fall between every pre-read `Date`
+and the POST response `Date`.
+
+The mapping is one-to-one and onto: every accepted controlled request in a
+historical candidate or the current scope has exactly one sidecar, every
+sidecar names exactly one such request, and no duplicate, extra, cross-scope,
+or unmatched receipt is admitted. The selected request and every
+`same_scope_request_audit` entry repeat their exact sidecar. Reaction
+`source_record_sha256` binds the request projection, this sidecar, and the
+individual reaction projection together.
+
+This sidecar does **not** change `discovery_endpoint_transcript` schema version
+3. The raw transcript remains exactly the repository seed and per-PR endpoint
+fetch envelope defined below; `request_scope_receipts` is separate parent-owned
+write-time evidence and is never inserted as a transcript fetch kind, page, or
+endpoint response. A future transcript version must not be implied merely by
+adding or validating this sidecar.
+
+A missing, malformed, duplicate, extra, or mismatched sidecar closes only the
+request/reaction planes. Set `request_policy.status: unknown` with no invented
+timing or duplicate warning, forbid another POST for that observed scope, and
+do not use the affected request or any child reaction for profile history or
+`thumbs-up-clean`. It does not erase a separately complete, trustworthy
+current-scope terminal payload: terminal selection continues normally and may
+still yield clean or findings while the request-policy report remains
+`unknown`. A read failure that independently makes a provider endpoint page
+incomplete is still a separate terminal-evidence blocker.
+
+Never reattach an old-epoch request or reaction to the current scope merely
+because the PR number or head is familiar. If either receipt-derived tuple
+differs from the enclosing tuple, the request and all of its child reactions
+remain old-scope audit evidence and cannot become a current or historical
+reaction sample for another tuple. In particular, a base-only retarget cannot
+relabel an old request as belonging to the new merge-base epoch.
+
+The sidecar proves neither request/run lineage nor continuous scope stability.
+It binds one exact parent-created comment to matching authenticated scope
+observations immediately before and after the write; GitHub still exposes no
+general mapping from that request to a provider run or terminal artifact.
+Likewise, equal pre/post tuples are point-in-time observations and do not prove
+that an intermediate `A -> B -> A` scope change, close/reopen, or other ABA
+transition did not occur. Never describe the sidecar as a transaction,
+continuous lifecycle attestation, or run identifier.
+
 ## Terminal Artifact Precedence
 
 Evaluate provider artifacts independently of request count:
@@ -226,12 +356,23 @@ Evaluate provider artifacts independently of request count:
    `eyes` reaction remains audit and liveness evidence; it does not demote,
    replace, or reorder an already selected terminal payload. The newer-`eyes`
    exclusion applies only while evaluating the reaction-only fallback.
-9. Perform the final re-read. The result counts only if scope, lifecycle,
-   request history, profile inputs, provider evidence, and target-thread state
-   are unchanged. Reaction clean also requires a new independent raw final
-   current endpoint inventory plus repeated parent-owned local Git ancestry
-   receipts for every raw-derived finding commit; normalized snapshot equality
-   alone is insufficient.
+9. Perform the final re-read. Terminal clean/findings count only if scope,
+   lifecycle, the provider artifact/thread/finding projection, canonical
+   nonterminal provider audit records, and the selected artifact are unchanged,
+   and every raw channel remains completely paginated and parseable. An already
+   stable duplicate or pending request, an already stable later reaction, or raw
+   current request/reaction records that change between the initial and final
+   inventories do not veto the terminal result because they are not contrary
+   verdicts. Preserve both raw inventories and recompute request policy and any
+   reaction-only authority from the final complete evidence. Incomplete,
+   ambiguous, or malformed request/reaction pages still fail closed for every
+   plane that cannot be proved. Bounded historical profile-input drift or
+   request-scope-sidecar-only drift likewise makes request policy and reaction
+   authority `unknown`; it does not veto an independently stable terminal
+   result. Reaction clean additionally requires stable request history/profile
+   inputs, a new independent raw final current endpoint inventory, and repeated
+   parent-owned local Git ancestry receipts for every raw-derived finding
+   commit; normalized snapshot equality alone is insufficient.
 
 An exact-App check or check run is service-start evidence only. It is not a
 terminal provider artifact and never proves clean, even when its conclusion is
@@ -655,6 +796,16 @@ inferred from one convenient reaction.
 | `thumbs-up-clean` | The provider has explicitly defined `+1` as completed-clean and the bounded eligible history proves consistent reaction-only operation with no clean payload. |
 | `unknown` | The available evidence cannot establish either terminal-payload or eligible reaction-only semantics. A reaction-only outcome remains pending or inconclusive. |
 
+The bounded history is mandatory before reaction-only clean can pass and before
+reaction behaviour can upgrade a profile to `mixed`. It is not a veto over an
+independently complete current-scope terminal artifact. If historical
+request-scope sidecars are missing, malformed, or unstable but the final
+current endpoint traversal still proves a trustworthy stable terminal clean or
+findings payload, select `terminal-payload`, set the affected request policy to
+`unknown`, and reject only reaction-derived authority. Do not report `mixed`
+from unverifiable reaction history, and do not turn a strong terminal result
+into `unknown` merely because the weaker adaptation plane failed.
+
 For dynamic history, first collapse evidence to at most one final candidate
 outcome per distinct immutable scope key: repository identity, PR number,
 frozen whole-PR `base_sha` equal to `pr_merge_base`, and head OID. Never use
@@ -693,6 +844,10 @@ entries, or count, is the historical-universe authority. Store it in both the
 initial and final inventory, with each inventory produced by its own
 independent fetch traversal. Its closed top-level shape is exactly
 `{schema_version: 3, repository, scope_discovery, scopes}`.
+It has no `request_scope_receipts` member. Request-time scope receipts remain
+the independent parent-owned sidecar above and are supplied beside the
+transcript to the fixed projector; adding them neither changes this envelope
+nor authorizes another fetch kind.
 `scope_discovery` is exactly one `repository_pull_requests` REST fetch record
 for an
 independently fetched, fully paginated repository-wide
@@ -717,6 +872,28 @@ fetch is the canonical detail GET for that exact number. The fixed parser takes
 into the canonical compare request, and takes `pr_merge_base` only from
 `compare.merge_base_commit.sha`; neither `base.sha` nor
 `merge_commit_sha` substitutes for the merge base.
+
+The authenticated provider-declaration PR is not exempt from this seed/detail
+closure. Its PR number must occur in the repository-wide seed, drive the same
+complete pull/compare/comments/reviews/inline/thread traversal as every other
+seeded PR, and expose exactly one issue-comment record type-preservingly equal
+to the canonical declaration resource projected from both stable direct GET
+receipts. The direct declaration GET remains declaration authority; discovery
+proves only that the authenticated artifact also exists in its repository/PR
+context.
+
+The one exact authenticated declaration record is audit-only nonterminal
+evidence. If its seeded PR contains no other provider behaviour, that scope is
+`confirmed-non-candidate`; the declaration neither enters `entries` nor
+increases `candidate_universe_count`. A comment accepted by the exact closed
+progress-only grammar is likewise retained in `nonterminal_records` and is
+audit-only. No other exact-provider free-form issue-comment prose may be
+downgraded to a confirmed non-candidate: prose that is neither the one exact
+declaration record nor closed progress-only syntax fails the projection and
+selects `unknown`. A terminal-looking exact-provider record that misses every
+accepted terminal branch remains a `malformed` historical candidate under
+ordinary terminal precedence; it is never hidden by the declaration or
+progress exceptions.
 
 A schema-version-3 `review_threads` response stores the real GraphQL
 `comments { nodes pageInfo }` connection inside each raw thread node; it never
@@ -769,9 +946,10 @@ issue-comment channel, `+1` / `eyes` / clean / findings / malformed semantics,
 the native parent-and-ID or channel-and-ID identity, and the digest of the
 canonical policy projection. Review projection digests include the review,
 associated inline records, and joined thread nodes; issue-comment digests bind
-the projected comment; reaction digests bind the parent ID and projected
-reaction. Same time and numeric ID alone therefore cannot substitute one
-carrier, channel, or semantic result for another.
+the projected comment; reaction digests bind the seven-field parent request,
+its exact request-time scope sidecar, and the projected child reaction. Same
+time and numeric ID alone therefore cannot substitute one carrier, channel,
+scope epoch, or semantic result for another.
 
 The closed candidate evaluator independently validates each complete candidate
 array element and requires its full authority projection to equal the
@@ -803,23 +981,26 @@ semantic ordering. Any later artifact is impossible in the frozen observation
 and makes the profile `unknown`.
 
 Raw discovery includes the exact current scope and every confirmed
-non-candidate PR. The fixed parser first completes and validates every seeded
-detail traversal, derives the full classified scope inventory, and only then
-excludes the exact current scope from the historical candidate set. The
-current outcome is validated separately and never counts toward the
-three-outcome history minimum. A historical scope is a candidate when it
-contains a terminal-looking provider record, an exact-bot reaction on a
-controlled request, or a provider-like record whose identity is missing or
-ambiguous. Historical candidates exclude the exact current scope. A scope
-containing only confirmed different actors is not provider behaviour and
-becomes a confirmed non-candidate only after full parsing; its raw scope and
-bounded records remain in discovery audit evidence. They cannot cause ordinary
-human comments, reviews, inline threads, or reactions to masquerade as provider
-behaviour. A confirmed different actor is not provider behaviour. A provider
-terminal artifact may form a
-candidate even when no controlled request was observed. Reaction-only evidence
-still requires the exact controlled parent and can never arise without a
-request.
+non-candidate PR, including the PR that carries the authenticated declaration.
+The fixed parser first completes and validates every seeded detail traversal,
+derives the full classified scope inventory, and only then excludes the exact
+current scope from the historical candidate set. The current outcome is
+validated separately and never counts toward the three-outcome history
+minimum. A historical scope is a candidate when it contains a terminal-looking
+provider record (including a malformed one), an exact-bot reaction on a
+receipt-bound controlled request, or a provider-like record whose identity is
+missing or ambiguous. Historical candidates exclude the exact current scope.
+The one authenticated declaration and closed progress-only records remain
+audit-only exceptions; any other exact-provider free-form prose fails closed
+rather than silently confirming a non-candidate. A scope containing only
+confirmed different actors is not provider behaviour and becomes a confirmed
+non-candidate only after full parsing; its raw scope and bounded records remain
+in discovery audit evidence. They cannot cause ordinary human comments,
+reviews, inline threads, or reactions to masquerade as provider behaviour. A
+confirmed different actor is not provider behaviour. A provider terminal
+artifact may form a candidate even when no controlled request was observed.
+Reaction-only evidence still requires the exact controlled parent and its
+matching request-time scope sidecar.
 Complete pagination and scope inventory must prove that universe and its
 recorded count by derivation from the raw transcript. The initial and final
 enumerations must be semantically identical for the same frozen interval.
@@ -866,12 +1047,15 @@ immutable scope, plus an individual exact-bot `+1` reaction fetched from that
 request comment's fully paginated reactions endpoint. Enumerate every accepted
 same-scope controlled request parent, not just the parent selected as the
 `+1` basis, and fully paginate each parent's individual reactions. Record each
-request's ID, URL, `created_at`, `updated_at`, normalized body, and scope. Use
-`created_at` as its request semantic time only when
-`updated_at == created_at`; otherwise use `updated_at`, because that is when
-the currently observed exact request body became authoritative. Record the
-selected value and
-`request_server_time_field: created_at | updated_at`. Record every reaction's
+request's closed seven-field projection and its exact one-to-one
+`parent-recorded-request-scope-v1` sidecar. Both pre/post raw scope projections
+must equal this candidate's immutable scope, and the POST response must project
+type-preservingly to those seven request fields. This sidecar version accepts
+only the unedited creation response: require `updated_at == created_at`, use
+that value as the request semantic time, and record
+`request_server_time_field: created_at`. A later edited request remains audit
+evidence but cannot enter reaction authority without a future predeclared
+edit-receipt version. Record every reaction's
 positive ID, `parent_request_id`, the exact
 `issues/comments/<parent_request_id>/reactions?per_page=100` fetch URL,
 `created_at`, content, login, and type. GitHub's
@@ -884,9 +1068,11 @@ reaction under a request in local data is not parent evidence by itself. Prove
 strict trusted-server ordering against that fetched parent:
 `reaction.created_at > request.request_server_time`.
 Missing/contradictory edit time, a reaction that predates an edit into
-`@codex review`, or a reaction without that direct parent makes the selected
-candidate unclassifiable and the profile `unknown`, even when the reaction
-actor is the exact bot.
+`@codex review`, a missing/malformed scope sidecar, a receipt-derived old-epoch
+scope, or a reaction without that direct parent makes the selected candidate
+unclassifiable and the reaction profile `unknown`, even when the reaction actor
+is the exact bot. None of those request-plane failures invalidates an otherwise
+independent trustworthy terminal artifact.
 
 For reaction-profile classification, retain confirmed different actors in the
 complete audit but exclude them from provider semantic ordering. A confirmed
@@ -966,6 +1152,12 @@ Parent-owned code must fetch the declaration through the trusted GitHub API;
 caller-supplied fields alone never authenticate it. The declaration envelope
 and both identical snapshots use the closed, predeclared field set above;
 unknown fields and JSON type aliases are not forward-compatible authority.
+Both independent repository-wide discovery traversals must also seed and fully
+traverse the declaration's bound PR and find exactly that raw issue-comment
+record once. In discovery it is audit-only nonterminal evidence and, by itself,
+leaves that PR `confirmed-non-candidate`; this contextual check does not replace
+either direct declaration GET receipt or turn the declaration into a provider
+result.
 Expanding the declaration
 authority set later requires a predeclared source kind, authentication and
 issuer binding, closed schema, exact accepted text/digest, final re-read, and
@@ -995,17 +1187,25 @@ terminal findings, or `+1` clean.
 Before accepting any current terminal clean/findings result or current
 reaction-only clean, the parent independently fetches two complete raw current
 endpoint inventories: one initial traversal and a new final traversal
-immediately before acceptance. Each inventory uses the closed shape
-`{repository, pull_number, head, fetches}`. Its `fetches` use the same closed
-fetch/page records, pagination rules, raw bodies, and digests as discovery
-schema version 3 and cover the current pull detail, compare, issue comments,
-reviews, associated inline comments, raw GraphQL review threads/comments, and
-every controlled-request reaction endpoint. The two inventories are
-independent API traversals, not aliases, copies of one body, normalized
-snapshots, or projections supplied by the caller. Each must independently
-derive the same complete provider-artifact, request/reaction, target-thread,
-and finding-commit sets. Missing pages, over-budget traversal, projection
-drift, or initial/final semantic drift selects `unknown`.
+immediately before acceptance. Each inventory has the closed endpoint shape
+`{repository, pull_number, head, fetches}` and may additionally carry the
+separate `request_scope_receipts` sibling used by request/reaction authority;
+no other root field is accepted. Its `fetches` use the same closed fetch/page
+records, pagination rules, raw bodies, and digests as discovery schema version
+3 and cover the current pull detail, compare, issue comments, reviews,
+associated inline comments, raw GraphQL review threads/comments, and every
+controlled-request reaction endpoint. `request_scope_receipts` is
+parent-owned sidecar evidence, not a member of or new kind inside those
+fetches. The two inventories are independent API traversals, not aliases,
+copies of one body, normalized snapshots, or projections supplied by the
+caller. Both must independently derive the same complete provider-artifact,
+target-thread, and finding-commit sets. Request/reaction set equivalence and
+sidecar stability are additionally mandatory only when classifying request
+policy or reaction evidence. Missing pages, over-budget traversal, provider
+artifact/thread drift, or finding-commit drift still blocks terminal authority;
+a missing, malformed, or sidecar-only drift instead makes request policy and
+the affected reaction authority `unknown` without erasing an independently
+stable terminal payload.
 
 From each raw inventory, before applying ancestry or resolution filtering, the
 fixed projector derives every distinct lowercase full finding commit exposed
@@ -1028,12 +1228,15 @@ ancestry_return_code}`. With lazy fetching and credential prompting disabled,
   current head, so it remains audit evidence but is not a current/ancestor
   blocker.
 
-A missing receipt, missing local object, duplicate or extra receipt, a return
-code other than the exact values above, a raw-derived commit-set mismatch, or
-any initial/final inventory or receipt drift makes the current provider
-classification `unknown`. The initial and final receipt arrays must be
-type-preserving identical and must each cover exactly the full commit set
-derived from its corresponding raw inventory.
+A missing ancestry receipt, missing local object, duplicate or extra ancestry
+receipt, a return code other than the exact values above, a raw-derived
+commit-set mismatch, provider-artifact/thread drift, or ancestry-receipt drift
+makes the current terminal and reaction classification `unknown`. The initial
+and final ancestry-receipt arrays must be type-preserving identical and must
+each cover exactly the full commit set derived from its corresponding raw
+inventory. Request-scope sidecars remain a separate plane: their absence,
+malformation, or reread drift cannot veto a stable terminal payload, but it
+makes request policy and reaction authority `unknown`.
 
 For terminal completion, the complete raw projection must equal the normalized
 current record before terminal precedence is applied. A raw-only artifact or
@@ -1073,12 +1276,14 @@ normalized current snapshots do not replace them.
    inventory/count, and every pre-sort candidate basis also satisfy the window
    contract above.
 4. The parent recorded the exact accepted request comment for the exact
-   current whole-PR scope, including `created_at`, `updated_at`, normalized body,
-   selected semantic server time, and its field name, before consuming any
-   reaction.
+   current whole-PR scope, including its closed seven-field projection and
+   one-to-one `parent-recorded-request-scope-v1` sidecar. The sidecar contains
+   complete pre/post pull-detail and compare raw receipts plus the exact POST
+   response, and both scope projections equal the current immutable tuple,
+   before any reaction is consumed.
 5. The reaction has exact provider identity.
-6. The `+1` was created strictly after the request's semantic server time,
-   using `created_at` only for an unedited request and `updated_at` otherwise.
+6. The `+1` was created strictly after the unedited request's `created_at`;
+   this sidecar version admits no edited request into reaction authority.
 7. Complete pagination covers request comments, issue reactions, issue
    comments, reviews, associated inline comments, and review threads. The
    independently fetched initial and final raw current endpoint inventories
@@ -1115,7 +1320,8 @@ normalized current snapshots do not replace them.
     artifact and recomputed digest, trusted history-window anchor/count, the
     complete repository-wide seed and every seeded PR classification, every
     candidate before sorting, every ordered historical request/reaction sample,
-    the exact current request and reaction, the independently fetched raw
+    every request-time scope sidecar, the exact current request and reaction,
+    the independently fetched raw
     current endpoint inventories, both parent-owned ancestry-receipt arrays,
     all evidence pages, target-thread state, lifecycle, and whole-PR scope.
 
@@ -1250,6 +1456,18 @@ Git ancestry receipts. The raw projection must type-preservingly equal the
 normalized current selection input; a selected-artifact summary or normalized
 snapshot without that authority is not auditable evidence.
 
+For terminal authority, initial/final equality covers scope, lifecycle,
+provider artifacts, thread/finding state, and canonical nonterminal provider
+audit records. Raw request records, provider reactions, and request-scope
+sidecar metadata belong to the separate request/reaction plane. Preserve the
+exact initial and final raw inventories in the report even when those records
+differ, a sidecar is absent, or the sidecar-only projection drifts. Their
+complete pages must remain parseable, but their differences do not veto an
+identical terminal selection and artifact snapshot. Recompute
+`request_policy.status` and reaction authority from the available final
+evidence; use `unknown` whenever their own stability or binding cannot be
+proved.
+
 These evidence records use closed object schemas and JSON type identity.
 Unknown fields are rejected until a future policy version explicitly admits
 them. In particular, a JSON boolean is never a numeric ID, timestamp, or
@@ -1371,8 +1589,10 @@ evidence_basis:
                     request_after: <null for REST/first GraphQL page or prior raw endCursor>
                     body_utf8: <bounded raw JSON response body>
                     body_sha256: <recomputed lowercase SHA-256>
+      request_scope_receipts:
+        - <one closed parent-owned request-time scope sidecar for every controlled request in the seeded scopes>
       scope_classifications:
-        - pull_number: <every seeded PR, including current and confirmed non-candidates>
+        - pull_number: <every seeded PR, including current, declaration, and confirmed non-candidates>
           scope_key: [OWNER/REPO, <pr>, <pr_merge_base>, <head>]
           classification: current | historical-candidate | confirmed-non-candidate
       entries:
@@ -1401,6 +1621,8 @@ evidence_basis:
             parent_comment_id: <positive request-comment ID or null>
             pages:
               - <same closed raw page shape used by discovery schema version 3>
+        request_scope_receipts:
+          - <one closed parent-owned request-time scope sidecar for every current controlled request>
       final: <independently re-fetched complete current inventory with identical authority projection>
     finding_commits:
       initial:
@@ -1437,14 +1659,17 @@ evidence_basis:
       pr: 123
       pr_merge_base: <full lowercase SHA>
       head: <full lowercase SHA>
+    request_scope_receipts:
+      - <closed sidecar for each request below>
     request:
       id: 123456
       url: <exact issue-comment URL>
       created_at: <server time>
-      updated_at: <server time>
-      request_server_time: <created_at when unedited, otherwise updated_at>
-      request_server_time_field: created_at | updated_at
+      updated_at: <same server time as created_at>
+      request_server_time: <created_at>
+      request_server_time_field: created_at
       normalized_body: "@codex review"
+    request_scope_receipt: <the unique matching sidecar for request.id>
     reaction:
       id: 789012
       parent_request_id: 123456
@@ -1457,6 +1682,7 @@ evidence_basis:
     selected_reaction_id: 789012
     same_scope_request_audit:
       - request: <same seven request fields>
+        request_scope_receipt: <the unique matching sidecar>
         reactions:
           - <same seven reaction fields>
     candidate_basis:
@@ -1470,9 +1696,11 @@ evidence_basis:
         server_time: <trusted semantic server time after scope-local precedence>
         stable_artifact_id: <positive native numeric ID>
       request: <same seven request fields>
+      request_scope_receipt: <the unique matching sidecar>
       reaction: <same seven reaction fields>
       same_scope_request_audit:
         - request: <same seven request fields>
+          request_scope_receipt: <the unique matching sidecar>
           reactions:
             - <same seven reaction fields>
 ```
@@ -1486,24 +1714,34 @@ REST/report JSON type.
 The report embeds both independently fetched schema-version-3 raw historical
 discovery endpoint transcripts, including each complete repository-wide pull
 seed, every seeded PR traversal, and every current/candidate/non-candidate
-classification. It also embeds both raw-derived source-authority inventories
-and both independently validated complete candidate arrays, including
+classification. The seed/detail closure includes the authenticated declaration
+PR and retains its exact declaration record as audit-only nonterminal evidence.
+Each historical inventory stores the parent-owned request-time scope sidecar
+array beside—not inside—its unchanged version-3 transcript. It also embeds both
+raw-derived source-authority inventories and both independently validated
+complete candidate arrays, including
 candidates outside `samples`; a count, version-2 transcript, or external ledger
 reference is insufficient. Each complete candidate snapshot repeats these
 fields: `complete`, all six pagination results, the four
 `evidence_state` artifact arrays with stable IDs/times, lifecycle, immutable
-scope, every controlled request, every individual reaction (including
-confirmed-different-actor reactions), selected request/reaction IDs when present,
-`same_scope_request_audit`, and `candidate_basis`. The initial and final
-inventory records and candidate arrays must be structurally identical.
+scope, every controlled request, its one-to-one `request_scope_receipts`, every
+individual reaction (including confirmed-different-actor reactions), selected
+request/reaction IDs when present, `same_scope_request_audit`, and
+`candidate_basis`. The initial and final inventory records and candidate arrays
+must be structurally identical.
 
 `current.raw_endpoint_inventories.initial` and `.final` are independent,
 complete endpoint traversals and each is the authority for its corresponding
-raw finding-commit set. The parent-owned
+raw finding-commit set. Their `request_scope_receipts` siblings bind each
+controlled request to its parent-created POST and matching pre/post whole-PR
+scope without changing transcript schema version 3. The parent-owned
 `current.local_git_ancestry_receipts.initial` and `.final` cover exactly those
 sets and accept only local object-check return code `0` plus ancestry return
 code `0` or `1`. The two receipt arrays and raw authority projections must be
-type-preserving identical. `current.initial_snapshot` and `.final_snapshot`
+type-preserving identical for reaction completion. For terminal completion,
+the two ancestry-receipt arrays and terminal-decision projections must be
+identical, while request-scope-sidecar metadata is excluded and reported on
+the request/reaction plane. `current.initial_snapshot` and `.final_snapshot`
 likewise embed the complete reader-facing field set for the exact current scope
 and must be structurally identical, but neither normalized snapshot substitutes
 for the raw inventories or ancestry receipts. Every raw
@@ -1524,8 +1762,13 @@ inline and thread bundle instead of inventing a local or receipt timestamp.
 These records never enter terminal ordering or create a result, but the
 complete initial/final projection must keep them type-preserving identical.
 When comparing the raw terminal decision to the normalized current snapshot,
-only this audit-only list is excluded; any other raw/normalized difference
-fails closed.
+exclude this audit-only list plus the complete raw request and provider-reaction
+collections, including request-scope metadata and receipts. Preserve those
+excluded collections in the raw initial/final inventories and evaluate them on
+the request/reaction plane. Preserve and compare lifecycle, scope, provider
+artifact, thread, and finding fields. Any difference in that terminal-decision
+projection fails closed; a difference confined to the excluded request/reaction
+collections instead changes or closes only their own authority.
 
 `provider_declaration.asserted_text` stores the exact authenticated line, not a
 summary. `normalized_sha256` is recomputed with the recorded normalization
@@ -1539,11 +1782,13 @@ basis must satisfy
 window_end_inclusive`, and the current basis cannot be later than the same
 as-of time.
 
-Each `samples[]` entry independently proves exact parent/child identity and
-`reaction.created_at > request.request_server_time`, and its
+Each `samples[]` entry independently proves exact request/sidecar/reaction
+identity, both receipt-derived scope tuples, the seven-field POST projection,
+and `reaction.created_at > request.request_server_time`, and its
 `same_scope_request_audit` enumerates every accepted request parent plus every
-fully paginated reaction for that scope. The selected request must appear in
-that audit with the same fields. Each reaction's `parent_request_id` and
+fully paginated reaction for that scope. The selected request and its exact
+sidecar must appear in that audit with the same fields. Each reaction's
+`parent_request_id` and
 `parent_reactions_api_url` must match the request whose fully paginated endpoint
 actually returned it; relocating an R1 reaction under R2 is a parent-binding
 conflict even when its actor and timestamp remain plausible.
@@ -1562,8 +1807,11 @@ and every universe candidate before sorting, and revalidate every ordered
 `samples[]`. Independently re-fetch the final raw current endpoint inventory,
 rederive its complete finding-commit set, repeat every parent-owned local Git
 ancestry receipt, and revalidate every `current` field and cross-parent audit.
-Missing data, non-`0` object resolution, ancestry return codes outside exact
-`0`/`1`, budget overflow, or any initial/final drift selects `unknown`.
+Missing provider data, non-`0` object resolution, ancestry return codes outside
+exact `0`/`1`, budget overflow, or provider-artifact/thread/finding drift
+selects `unknown` for the provider result. Missing, malformed, or drifting
+request-scope sidecars select `unknown` only for request/reaction authority and
+do not erase an independently stable terminal result.
 When a terminal artifact is selected, record it even when its outcome is
 findings. Do not reduce the basis to prose such as “Codex completed”.
 
@@ -1627,6 +1875,20 @@ implementation mechanically:
    non-candidates, and excludes current only after full parsing. Version 2
    cannot prove the fallback, and evidence-budget overflow selects `unknown`.
    None of these discovery gates is attributed to the fixed Action baseline.
+10. **Request-time scope sidecars are a playbook extension.** The fixed Action
+    comparison does not establish the exact scope of a parent-created request.
+    This playbook separately captures closed pre/post pull-and-compare receipts
+    and the exact POST response, binds every reaction parent one-to-one to that
+    scope, and fails the request/reaction planes closed when the sidecar is
+    absent. It neither changes raw transcript schema version 3 nor creates
+    request/run lineage, and it does not veto an independently trustworthy
+    terminal payload.
+11. **Declaration discovery is a playbook extension.** The authenticated
+    declaration PR participates in the complete repository seed/detail
+    traversal. The one exact declaration and closed progress-only grammar are
+    audit-only; other exact-provider free-form prose fails closed, and
+    terminal-looking malformed artifacts remain candidates. This classification
+    is not behaviour attributed to either fixed upstream commit.
 
 ## Non-Goals
 
@@ -1635,6 +1897,11 @@ implementation mechanically:
 - Do not weaken exact bot identity or full pagination to make a profile fit.
 - Do not use a version-2 transcript, truncated repository seed, normalized
   current snapshot, or external ancestry ledger as reaction-clean authority.
+- Do not insert request-time scope receipts into raw transcript schema version
+  3, infer request/run lineage from them, or claim matching pre/post scope
+  snapshots exclude an intermediate ABA transition.
+- Do not reattach a request/reaction from one receipt-derived scope epoch to
+  another, even when the repository, PR number, or head matches.
 - Do not carry a profile across repositories or beyond the bounded 30-day
   evidence window.
 - Do not create a duplicate request, empty commit, or synthetic provider

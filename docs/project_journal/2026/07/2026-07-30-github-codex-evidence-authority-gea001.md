@@ -1,7 +1,7 @@
 ---
 id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
-status: completed
+status: active
 created: 2026-07-30
 updated: 2026-08-01
 branch: wip/github-codex-evidence-authority
@@ -46,6 +46,22 @@ superseded_by:
   Duplicate request history remains visible as `duplicate-observed`; it does
   not manufacture `triple-inconclusive`, does not require a request/run join,
   and does not authorize an agent-created third request.
+- Reaction-only authority now uses a parent-owned request-time scope receipt
+  sidecar. Its closed raw pre/post PR-detail and compare receipts plus exact
+  request-comment response bind the seven request fields to the immutable
+  repository/PR/merge-base/head scope. The raw discovery transcript remains
+  schema version 3; final PR metadata can never regenerate or relabel an older
+  request receipt. Missing or malformed receipts close only the weaker
+  request/reaction plane and make `request_policy` unknown; they do not veto an
+  independently valid terminal provider payload. Complete raw request/reaction
+  pages remain audit input, but stable or changing duplicate/pending requests
+  and reactions affect only their own policy/profile plane and never overturn
+  an independently stable terminal verdict.
+- The authenticated provider declaration PR is itself part of the complete
+  repository seed/detail traversal. Its exact receipt-bound comment is
+  audit-only and `confirmed-non-candidate`; arbitrary exact-provider prose is
+  still fail-closed, while the existing progress grammar remains nonterminal
+  audit evidence and terminal-looking malformed payloads remain candidates.
 - Terminal comments/reviews count only under the authority's fixed
   clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
   `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
@@ -407,11 +423,67 @@ and executable regressions are now present and validated:
    recorded list must equal the independently parsed transcript and the
    historical-candidate scopes must equal the complete candidate arrays;
    missing, duplicate, or relabelled seeds are `unknown`.
+10. **Request-time scope receipts.** The formal review of
+    `0f77fb7b1dd59f5eed522fa9699497aa013695fc..f64f149aa27399bdd37d99b5acf42a1b825266d9`
+    proved that deriving historical request scope from the final PR detail
+    could relabel an old request and its child `+1` onto a new head or merge
+    base. The reaction plane now requires a separate parent-owned sidecar with
+    closed raw pre/post PR-detail and compare responses, the exact POST
+    response, canonical response dates and body digests, and a one-to-one join
+    to every request field. A same-head/different-merge-base receipt remains a
+    base-only-retarget blocker; an older-head receipt is an older epoch and
+    does not count as a current duplicate. Receipt absence, drift, or malformed
+    bytes make reaction fallback and request policy unknown but do not weaken
+    or veto independently authoritative terminal evidence. The receipt proves
+    no request/run lineage, and point-in-time pre/post reads do not prove the
+    absence of an intervening ABA transition.
+11. **Declaration discovery reachability.** The same formal review found that
+    the authenticated declaration was used to select `thumbs-up-clean` but its
+    PR was absent from the supposedly complete repository traversal, while the
+    parser rejected the exact nonterminal declaration before its audit path.
+    The declaration PR is now seeded and fully traversed, its exact
+    independently authenticated raw record must appear once, and it is
+    classified `confirmed-non-candidate` without changing candidate counts.
+    Only that exact declaration and the closed progress grammar are
+    nonterminal audit exceptions; other free-form provider prose remains
+    inconclusive and terminal-looking malformed evidence keeps fail-closed
+    precedence.
 
 These are stricter playbook evidence extensions. They do not change the fixed
 `codex-review-gate` / released Action commits, common tree, 15-path manifest,
 provider-result authority, result-present acceptance rationale, request/result
 plane separation, or warning-only treatment of early/duplicate requests.
+
+## Final Consistency-Audit Corrections
+
+Two independent read-only audits then checked the request/result boundary and
+the request-time retarget proof:
+
+1. **Projection-scoped final stability.** Stable or changing duplicate,
+   pending, and reaction records remain audit-only and never contradict a
+   selected terminal verdict. Their raw pages must remain complete and
+   parseable, but the terminal decision projection excludes their complete
+   collections rather than only the request-scope sidecar. Request/reaction
+   changes, request-scope-sidecar-only drift, or bounded historical
+   profile-input drift can change or close request policy and reaction
+   authority without erasing an independently stable terminal result. The
+   strict reaction path retains the complete sidecar when comparing raw
+   endpoint authority with the normalized record.
+2. **Receipt-proved scope epochs.** The dedicated
+   `base-changed-same-head` branch is reachable only from exactly one valid
+   `parent-recorded-request-scope-v1` sidecar bound one-to-one to the request
+   being revalidated. Missing, malformed, duplicate, extra, or unmatched
+   sidecars do not prove retarget; they leave request policy unknown, forbid a
+   new POST while request history is unproved, and preserve independent local
+   and terminal gates. A valid old-head receipt is audit-only and returns the
+   new head to ordinary producer-policy evaluation. A valid same-head,
+   different-merge-base receipt proves the blocker and forbids a replacement
+   request.
+
+These clarifications preserve result-present acceptance. They keep request and
+reaction transport changes outside terminal verdict authority, and they prevent
+a derived or unbound audit record from manufacturing the base-only-retarget
+state.
 
 ## Implementation Intent
 
@@ -465,24 +537,26 @@ plane separation, or warning-only treatment of early/duplicate requests.
 
 ## Validation
 
-- Follow-up validation completed after the final-range reviewer found the
-  terminal raw-current binding, JSON-ID schema, and nested-pagination
-  inconsistencies described above.
-- The final implementation snapshot's focused contract suite:
-  `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed 102 tests in 14.179 seconds.
-- The final implementation snapshot's full review-orchestration suite ran
-  outside the filesystem sandbox because provider tests require temporary
-  Unix and loopback socket binds:
-  `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q`
-  passed 2,822 tests in 1,240.321 seconds with 6 expected skips and no failures
-  or errors. A preceding full run hit the same unrelated 5-second
-  credential-server worker-ready timeout in its `signal` and `recovery`
-  subtests; the exact test then passed alone in 4.639 seconds before the clean
-  full rerun.
-- Ruff check and format-check, the skill validator, the project-journal
-  validator, and `git diff --check` all passed on the corrected final working
-  snapshot.
+- The current corrected working snapshot passed the focused contract suite:
+  `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts -q`
+  ran 102 tests in 21.243 seconds with no failures or errors.
+- The same snapshot passed the complete review-orchestration suite outside the
+  filesystem sandbox because provider tests require temporary Unix and
+  loopback socket binds:
+  `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 /Users/hoteng/.pyenv/versions/3.13.0/bin/python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q`
+  ran 2,822 tests in 945.430 seconds with 6 expected skips and no failures or
+  errors.
+- `uv run ruff format --check`, `uv run ruff check`, the skill validator under
+  `uv run --with pyyaml`, the project-journal validator, JSON parsing, and
+  `git diff --check` all passed on this snapshot.
+- Two final read-only consistency audits returned no findings after checking
+  the complete request/reaction exclusion from terminal equality, strict
+  reaction-sidecar equality, stable and changing duplicate/pending request
+  cases, the final-reaction drift case, and the receipt-proved retarget paths.
+- The workstream remains `active` only until this exact snapshot receives its
+  signed commit and final fixed-range named-single review. Validation through
+  head `f64f149aa27399bdd37d99b5acf42a1b825266d9` and the older timings below are
+  historical evidence and do not substitute for this final gate.
 - An earlier named-single review found two P2 contract gaps: a synthesized
   reaction self URL and a self-consistency-only report classifier. Both were
   removed and replaced by parent-endpoint-plus-ID reaction identity and a

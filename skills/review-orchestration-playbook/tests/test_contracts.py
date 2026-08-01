@@ -2723,7 +2723,12 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn(
             "Unknown provider identity, malformed/stale evidence, a non-retryable "
-            "failure, or an unstable final read is immediately triple-inconclusive",
+            "failure, or an unstable lifecycle/scope/provider-artifact/thread/"
+            "selected-terminal final read is immediately triple-inconclusive",
+            interface,
+        )
+        self.assertIn(
+            "Sidecar-only instability instead makes request_policy unknown",
             interface,
         )
 
@@ -2851,7 +2856,7 @@ class RepositoryContractTest(unittest.TestCase):
             "an exact +1",
             "exact accepted request comment",
             "exact provider identity",
-            "created strictly after the request's semantic server time",
+            "created strictly after the unedited request's created_at",
             "complete pagination",
             "stable current scope",
             (
@@ -2881,7 +2886,14 @@ class RepositoryContractTest(unittest.TestCase):
             "every selected candidate must have exact provider identity",
             "stable recorded scope",
             "normalized body is exactly `@codex review`",
-            "record each request's id, url, `created_at`, `updated_at`, normalized body, and scope",
+            "parent-owned request-time scope receipt sidecar",
+            "`pre_request_scope_receipts`",
+            "`request_comment_receipt`",
+            "`post_request_scope_receipts`",
+            "this sidecar does **not** change `discovery_endpoint_transcript` schema version 3",
+            "does not erase a separately complete, trustworthy current-scope terminal payload",
+            "neither request/run lineage nor continuous scope stability",
+            "the seed/detail closure includes the authenticated declaration pr",
             "record every reaction's positive id, `parent_request_id`, the exact",
             "does not return a reaction self url, so never synthesize one",
             "stable native identity is the tuple",
@@ -2890,7 +2902,7 @@ class RepositoryContractTest(unittest.TestCase):
             "`created_at`, content, login, and type",
             "`reaction.created_at > request.request_server_time`",
             "a reaction that predates an edit into `@codex review`",
-            "`request_server_time_field: created_at | updated_at`",
+            "`request_server_time_field: created_at`",
             "de-duplicate only repeated api records with the same positive reaction id",
             "any exact-provider reaction on any same-scope parent with other content",
             "an `eyes` at or after the selected `+1`",
@@ -2931,6 +2943,16 @@ class RepositoryContractTest(unittest.TestCase):
             "selected +1 is later than every such request",
             "single selected parent's reaction page cannot prove",
             "same_scope_request_audit",
+            "an already stable duplicate or pending request",
+            (
+                "raw current request/reaction records that change between the initial "
+                "and final"
+            ),
+            "bounded historical profile-input drift or request-scope-sidecar-only drift",
+            (
+                "exclude this audit-only list plus the complete raw request and "
+                "provider-reaction collections"
+            ),
             ("every one reaction-only and none containing a clean terminal payload"),
             "final re-read is unchanged",
             "`eyes` is liveness-only",
@@ -2958,6 +2980,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "`eyes` is liveness-only: it can show that work started or "
             "restarted, but it never proves clean",
+            normalized,
+        )
+        self.assertNotIn(
+            "preserve and compare every request's seven-field raw projection",
             normalized,
         )
         for anchor in (
@@ -3238,7 +3264,8 @@ class RepositoryContractTest(unittest.TestCase):
             "skill": (
                 "schema-version-3 discovery_endpoint_transcript",
                 "seed drives exactly one complete detail traversal for every pr, "
-                "including current and confirmed non-candidates",
+                "including current, confirmed non-candidates, and the "
+                "authenticated declaration pr",
                 "exclude current only after all seeded prs are fully parsed",
                 "version 2 cannot prove the fallback",
             ),
@@ -3254,7 +3281,8 @@ class RepositoryContractTest(unittest.TestCase):
             "pr-readiness": (
                 "schema-version-3 raw discovery transcript",
                 "seed drives exactly one complete detail traversal for every pr, "
-                "including the current pr and confirmed non-candidates",
+                "including the current pr, the declaration pr, and confirmed "
+                "non-candidates",
                 "excludes current from the historical candidate set only after "
                 "full parsing",
                 "a version-2 transcript cannot prove reaction fallback",
@@ -3395,8 +3423,9 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "pr-readiness": (
                 "request history is producer/audit evidence, not verdict authority",
-                "neither duplicate count nor missing request/run lineage invalidates "
-                "a trustworthy current-head terminal artifact",
+                "neither duplicate count, missing request/run lineage, nor a "
+                "request-sidecar failure invalidates a separately trustworthy "
+                "current-head terminal artifact",
                 "an unresolved target-thread finding or malformed target join blocks "
                 "even when a later clean payload exists",
             ),
@@ -3441,14 +3470,15 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "github-pr-probes": (
                 "only provider-result authority is inherited from the fixed "
-                "codex-review-gate / released action baseline",
+                "atomic baseline",
                 "are deliberate playbook extensions, not behaviour attributed to "
                 "the fixed action",
             ),
             "pr-readiness": (
                 "only provider-result authority is inherited",
                 "raw thread proof, whole-pr lifecycle/scope, the closed "
-                "issue-comment carrier, and +1 fallback are playbook extensions",
+                "issue-comment carrier, request-time scope sidecars, declaration "
+                "discovery, and +1 fallback are playbook extensions",
             ),
             "project-journal": (
                 "the action alignment is intentionally asymmetric. provider-result "
@@ -5377,6 +5407,97 @@ class RepositoryContractTest(unittest.TestCase):
                 "user_type": user_type,
             }
 
+        def request_scope_receipt(
+            raw_request: dict[str, object],
+            scope: dict[str, object],
+        ) -> dict[str, object]:
+            repository = scope.get("repository")
+            pr = scope.get("pr")
+            merge_base = scope.get("pr_merge_base")
+            head = scope.get("head")
+            request_time = raw_request.get("request_server_time")
+            if (
+                not isinstance(repository, str)
+                or type(pr) is not int
+                or not isinstance(merge_base, str)
+                or not isinstance(head, str)
+                or type(request_time) is not int
+            ):
+                raise AssertionError("request scope fixture is malformed")
+            base_oid = f"{pr + 100_000:040x}"
+            api_root = f"https://api.github.com/repos/{repository}"
+
+            def response_receipt(
+                *,
+                method: str,
+                request_url: str,
+                status: int,
+                server_time: int,
+                body: object,
+            ) -> dict[str, object]:
+                body_utf8 = canonical_raw_body(body)
+                return {
+                    "method": method,
+                    "request_url": request_url,
+                    "status": status,
+                    "date_header": email.utils.format_datetime(
+                        datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                        usegmt=True,
+                    ),
+                    "body_utf8": body_utf8,
+                    "body_sha256": hashlib.sha256(
+                        body_utf8.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+            def scope_receipts(server_time: int) -> dict[str, object]:
+                return {
+                    "pull": response_receipt(
+                        method="GET",
+                        request_url=f"{api_root}/pulls/{pr}",
+                        status=200,
+                        server_time=server_time,
+                        body={
+                            "number": pr,
+                            "base": {"sha": base_oid},
+                            "head": {"sha": head},
+                        },
+                    ),
+                    "compare": response_receipt(
+                        method="GET",
+                        request_url=f"{api_root}/compare/{base_oid}...{head}",
+                        status=200,
+                        server_time=server_time,
+                        body={
+                            "base_commit": {"sha": base_oid},
+                            "merge_base_commit": {"sha": merge_base},
+                        },
+                    ),
+                }
+
+            return {
+                "kind": "parent-recorded-request-scope-v1",
+                "request_id": clone(raw_request.get("id")),
+                "pre_request_scope_receipts": scope_receipts(max(1, request_time - 1)),
+                "request_comment_receipt": response_receipt(
+                    method="POST",
+                    request_url=f"{api_root}/issues/{pr}/comments",
+                    status=201,
+                    server_time=request_time,
+                    body=raw_request_record(raw_request),
+                ),
+                "post_request_scope_receipts": scope_receipts(request_time + 1),
+            }
+
+        def set_response_date(
+            response: dict[str, object],
+            server_time: int,
+        ) -> None:
+            response["date_header"] = email.utils.format_datetime(
+                datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                usegmt=True,
+            )
+
         snapshot_fields = (
             "complete",
             "pagination",
@@ -5384,6 +5505,7 @@ class RepositoryContractTest(unittest.TestCase):
             "lifecycle",
             "scope",
             "requests",
+            "request_scope_receipts",
             "reactions",
             "selected_request_id",
             "selected_reaction_id",
@@ -5401,6 +5523,13 @@ class RepositoryContractTest(unittest.TestCase):
             "request_server_time",
             "request_server_time_field",
             "normalized_body",
+        }
+        request_scope_receipt_fields = {
+            "kind",
+            "request_id",
+            "pre_request_scope_receipts",
+            "request_comment_receipt",
+            "post_request_scope_receipts",
         }
         reaction_fields = {
             "id",
@@ -5427,6 +5556,7 @@ class RepositoryContractTest(unittest.TestCase):
             requests: list[dict[str, object]],
             reactions: list[dict[str, object]],
             *,
+            request_scope_receipts: list[dict[str, object]],
             selected_request_id: int,
             selected_reaction_id: int,
             merge_base: str | None = None,
@@ -5438,6 +5568,12 @@ class RepositoryContractTest(unittest.TestCase):
                 None,
             )
             resolved_merge_base = merge_base or f"{pr + 1000:040x}"
+            resolved_scope = {
+                "repository": current_repository,
+                "pr": pr,
+                "pr_merge_base": resolved_merge_base,
+                "head": head,
+            }
             record = {
                 "complete": True,
                 "pagination": clone(required_pagination),
@@ -5447,13 +5583,9 @@ class RepositoryContractTest(unittest.TestCase):
                     "merged": False,
                     "merged_at": None,
                 },
-                "scope": {
-                    "repository": current_repository,
-                    "pr": pr,
-                    "pr_merge_base": resolved_merge_base,
-                    "head": head,
-                },
+                "scope": resolved_scope,
                 "requests": requests,
+                "request_scope_receipts": clone(request_scope_receipts),
                 "reactions": reactions,
                 "selected_request_id": selected_request_id,
                 "selected_reaction_id": selected_reaction_id,
@@ -5498,6 +5630,245 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             return (repository, pr, merge_base, head)
+
+        def request_scope_receipt_mapping(
+            value: object,
+        ) -> dict[int, dict[str, object]] | None:
+            if not isinstance(value, list):
+                return None
+            mapping: dict[int, dict[str, object]] = {}
+
+            def parse_response(
+                response: object,
+                *,
+                method: str,
+                request_url: str,
+                status: int,
+            ) -> tuple[object, int] | None:
+                if (
+                    not isinstance(response, dict)
+                    or set(response)
+                    != {
+                        "method",
+                        "request_url",
+                        "status",
+                        "date_header",
+                        "body_utf8",
+                        "body_sha256",
+                    }
+                    or response.get("method") != method
+                    or response.get("request_url") != request_url
+                    or type(response.get("status")) is not int
+                    or response.get("status") != status
+                    or not isinstance(response.get("body_utf8"), str)
+                    or response.get("body_sha256")
+                    != hashlib.sha256(response["body_utf8"].encode("utf-8")).hexdigest()
+                ):
+                    return None
+                server_time = parse_http_date(response.get("date_header"))
+                if server_time is None or server_time > history_as_of_server_time:
+                    return None
+                try:
+                    body = json.loads(response["body_utf8"])
+                except (TypeError, ValueError):
+                    return None
+                return (body, server_time)
+
+            def parse_scope_responses(
+                responses: object,
+            ) -> tuple[tuple[object, ...], tuple[int, int]] | None:
+                if not isinstance(responses, dict) or set(responses) != {
+                    "pull",
+                    "compare",
+                }:
+                    return None
+                pull_response = responses["pull"]
+                if not isinstance(pull_response, dict):
+                    return None
+                try:
+                    pull_body = json.loads(str(pull_response.get("body_utf8")))
+                except (TypeError, ValueError):
+                    return None
+                if not isinstance(pull_body, dict):
+                    return None
+                pr = pull_body.get("number")
+                base = pull_body.get("base")
+                pull_head = pull_body.get("head")
+                base_oid = base.get("sha") if isinstance(base, dict) else None
+                head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                api_root = f"https://api.github.com/repos/{current_repository}"
+                parsed_pull = parse_response(
+                    pull_response,
+                    method="GET",
+                    request_url=f"{api_root}/pulls/{pr}",
+                    status=200,
+                )
+                if (
+                    parsed_pull is None
+                    or type(pr) is not int
+                    or pr <= 0
+                    or not isinstance(base_oid, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                    or not isinstance(head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                ):
+                    return None
+                parsed_compare = parse_response(
+                    responses["compare"],
+                    method="GET",
+                    request_url=f"{api_root}/compare/{base_oid}...{head}",
+                    status=200,
+                )
+                if parsed_compare is None:
+                    return None
+                compare_body, compare_time = parsed_compare
+                _, pull_time = parsed_pull
+                base_commit = (
+                    compare_body.get("base_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
+                merge_base_commit = (
+                    compare_body.get("merge_base_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
+                merge_base = (
+                    merge_base_commit.get("sha")
+                    if isinstance(merge_base_commit, dict)
+                    else None
+                )
+                candidate_scope = {
+                    "repository": current_repository,
+                    "pr": pr,
+                    "pr_merge_base": merge_base,
+                    "head": head,
+                }
+                parsed_scope = scope_key({"scope": candidate_scope})
+                if (
+                    not isinstance(base_commit, dict)
+                    or base_commit.get("sha") != base_oid
+                    or parsed_scope is None
+                ):
+                    return None
+                return (parsed_scope, (pull_time, compare_time))
+
+            for receipt in value:
+                if (
+                    not isinstance(receipt, dict)
+                    or set(receipt) != request_scope_receipt_fields
+                    or receipt.get("kind") != "parent-recorded-request-scope-v1"
+                ):
+                    return None
+                request_id = receipt.get("request_id")
+                pre_scope = parse_scope_responses(
+                    receipt.get("pre_request_scope_receipts")
+                )
+                post_scope = parse_scope_responses(
+                    receipt.get("post_request_scope_receipts")
+                )
+                if pre_scope is None or post_scope is None:
+                    return None
+                pre_scope_key, pre_times = pre_scope
+                post_scope_key, post_times = post_scope
+                pr = pre_scope_key[1]
+                comment_response = parse_response(
+                    receipt.get("request_comment_receipt"),
+                    method="POST",
+                    request_url=(
+                        f"https://api.github.com/repos/{current_repository}/"
+                        f"issues/{pr}/comments"
+                    ),
+                    status=201,
+                )
+                if comment_response is None:
+                    return None
+                raw_comment, comment_response_time = comment_response
+                projected_comment = project_raw_issue_record(raw_comment)
+                if not isinstance(projected_comment, dict):
+                    return None
+                created_at = projected_comment.get("created_at")
+                updated_at = projected_comment.get("updated_at")
+                request_server_time = (
+                    created_at if created_at == updated_at else updated_at
+                )
+                request_server_time_field = (
+                    "created_at" if created_at == updated_at else "updated_at"
+                )
+                normalized_request = {
+                    "id": projected_comment.get("id"),
+                    "url": projected_comment.get("html_url"),
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "request_server_time": request_server_time,
+                    "request_server_time_field": request_server_time_field,
+                    "normalized_body": projected_comment.get("body"),
+                }
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in mapping
+                    or pre_scope_key != post_scope_key
+                    or max(pre_times) > comment_response_time
+                    or comment_response_time > min(post_times)
+                    or type(request_server_time) is not int
+                    or request_server_time <= 0
+                    or created_at != updated_at
+                    or max(pre_times) > request_server_time
+                    or request_server_time > comment_response_time
+                    or normalized_request["id"] != request_id
+                    or normalized_request["normalized_body"] != "@codex review"
+                    or projected_comment.get("app_slug") is not None
+                    or projected_comment.get("user")
+                    != {"login": "fixture-requester", "type": "User"}
+                    or normalized_request["url"]
+                    != (
+                        f"https://github.com/{current_repository}/pull/{pr}"
+                        f"#issuecomment-{request_id}"
+                    )
+                    or projected_comment.get("url")
+                    != (
+                        "https://api.github.com/repos/OWNER/REPO/issues/"
+                        f"comments/{request_id}"
+                    )
+                ):
+                    return None
+                mapping[request_id] = {
+                    "scope": pre_scope_key,
+                    "request": normalized_request,
+                    "receipt": clone(receipt),
+                }
+            return mapping
+
+        def request_receipt_binding_matches(
+            receipt_mapping: dict[int, dict[str, object]],
+            request_id: int,
+            raw_request: object,
+            expected_scope: tuple[object, ...],
+        ) -> bool:
+            binding = receipt_mapping.get(request_id)
+            return (
+                isinstance(binding, dict)
+                and binding.get("scope") == expected_scope
+                and typed_json_equal(binding.get("request"), raw_request)
+            )
+
+        def add_scoped_request(
+            record: dict[str, object],
+            raw_request: dict[str, object],
+            receipt: dict[str, object],
+            *,
+            index: int | None = None,
+        ) -> None:
+            requests = record.get("requests")
+            receipts = record.get("request_scope_receipts")
+            if not isinstance(requests, list) or not isinstance(receipts, list):
+                raise AssertionError("record cannot accept a scoped request")
+            if index is None:
+                requests.append(raw_request)
+            else:
+                requests.insert(index, raw_request)
+            receipts.append(clone(receipt))
 
         def lifecycle_is_typed(
             record: dict[str, object],
@@ -6015,15 +6386,20 @@ class RepositoryContractTest(unittest.TestCase):
             pr = record_scope_key[1]
             raw_requests = record.get("requests")
             raw_reactions = record.get("reactions")
+            receipt_scopes = request_scope_receipt_mapping(
+                record.get("request_scope_receipts")
+            )
             if (
                 not isinstance(raw_requests, list)
                 or not raw_requests
                 or not isinstance(raw_reactions, list)
+                or receipt_scopes is None
             ):
                 return "unknown"
 
             requests_by_id: dict[int, dict[str, object]] = {}
             request_times: dict[int, int] = {}
+            current_request_ids: set[int] = set()
             for raw_request in raw_requests:
                 if (
                     not isinstance(raw_request, dict)
@@ -6059,8 +6435,25 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 ):
                     return "unknown"
+                binding = receipt_scopes.get(request_id)
+                if (
+                    not isinstance(binding, dict)
+                    or not typed_json_equal(binding.get("request"), raw_request)
+                    or not isinstance(binding.get("scope"), tuple)
+                    or binding["scope"][:2] != record_scope_key[:2]
+                    or (
+                        binding["scope"][3] == record_scope_key[3]
+                        and binding["scope"][2] != record_scope_key[2]
+                    )
+                ):
+                    return "unknown"
                 requests_by_id[request_id] = raw_request
                 request_times[request_id] = expected_request_time
+                if binding["scope"] == record_scope_key:
+                    current_request_ids.add(request_id)
+
+            if set(receipt_scopes) != set(requests_by_id) or not current_request_ids:
+                return "unknown"
 
             reactions_by_id: dict[int, dict[str, object]] = {}
             for raw_reaction in raw_reactions:
@@ -6115,7 +6508,14 @@ class RepositoryContractTest(unittest.TestCase):
                     return "unknown"
                 provider_reactions.append(item)
 
-            plus_ones = [item for item in provider_reactions if item["content"] == "+1"]
+            current_provider_reactions = [
+                item
+                for item in provider_reactions
+                if item["parent_request_id"] in current_request_ids
+            ]
+            plus_ones = [
+                item for item in current_provider_reactions if item["content"] == "+1"
+            ]
             if not plus_ones:
                 return "unknown"
             selected_plus = max(
@@ -6134,11 +6534,13 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return "unknown"
 
-            latest_request_time = max(request_times.values())
+            latest_request_time = max(
+                request_times[request_id] for request_id in current_request_ids
+            )
             latest_request_ids = [
                 request_id
-                for request_id, server_time in request_times.items()
-                if server_time == latest_request_time
+                for request_id in current_request_ids
+                if request_times[request_id] == latest_request_time
             ]
             if (
                 latest_request_ids != [selected_request_id]
@@ -6153,7 +6555,7 @@ class RepositoryContractTest(unittest.TestCase):
             if any(
                 item["content"] == "eyes"
                 and (int(item["created_at"]), int(item["id"])) >= selected_order
-                for item in provider_reactions
+                for item in current_provider_reactions
             ):
                 return "unknown"
             return "clean"
@@ -6240,6 +6642,9 @@ class RepositoryContractTest(unittest.TestCase):
             pr = record_scope_key[1]
             raw_requests = record.get("requests")
             reactions = record.get("reactions")
+            receipt_scopes = request_scope_receipt_mapping(
+                record.get("request_scope_receipts")
+            )
             if not isinstance(raw_requests, list) or not isinstance(reactions, list):
                 return None
 
@@ -6365,13 +6770,6 @@ class RepositoryContractTest(unittest.TestCase):
                     or selected_plus is None
                 ):
                     return None
-                if not artifact_bases:
-                    latest_plus = max(
-                        plus_ones,
-                        key=lambda item: (int(item["created_at"]), int(item["id"])),
-                    )
-                    if latest_plus is not selected_plus:
-                        return None
             elif selected_request_id is not None or selected_reaction_id is not None:
                 return None
 
@@ -6410,17 +6808,61 @@ class RepositoryContractTest(unittest.TestCase):
                     _,
                 ) = max(priority_artifacts, key=lambda item: item[1])
             else:
-                if not request_times or not exact_provider_reactions:
+                current_request_ids: set[int] = set()
+                if receipt_scopes is not None:
+                    for raw_request in raw_requests:
+                        request_id = raw_request["id"]
+                        binding = receipt_scopes.get(request_id)
+                        if (
+                            not isinstance(binding, dict)
+                            or not typed_json_equal(
+                                binding.get("request"),
+                                raw_request,
+                            )
+                            or not isinstance(binding.get("scope"), tuple)
+                            or binding["scope"][:2] != record_scope_key[:2]
+                            or (
+                                binding["scope"][3] == record_scope_key[3]
+                                and binding["scope"][2] != record_scope_key[2]
+                            )
+                        ):
+                            return None
+                        if binding["scope"] == record_scope_key:
+                            current_request_ids.add(request_id)
+                current_provider_reactions = [
+                    item
+                    for item in exact_provider_reactions
+                    if item["parent_request_id"] in current_request_ids
+                ]
+                selected_current_plus = next(
+                    (
+                        item
+                        for item in current_provider_reactions
+                        if item["content"] == "+1"
+                        and item["id"] == selected_reaction_id
+                        and item["parent_request_id"] == selected_request_id
+                    ),
+                    None,
+                )
+                if (
+                    not current_request_ids
+                    or not current_provider_reactions
+                    or selected_current_plus is None
+                    or receipt_scopes is None
+                    or set(receipt_scopes) != set(request_times)
+                ):
                     return None
                 scope_final_reaction = max(
-                    exact_provider_reactions,
+                    current_provider_reactions,
                     key=lambda item: (int(item["created_at"]), int(item["id"])),
                 )
-                latest_request_time = max(request_times.values())
+                latest_request_time = max(
+                    request_times[request_id] for request_id in current_request_ids
+                )
                 latest_request_ids = [
                     request_id
-                    for request_id, request_time in request_times.items()
-                    if request_time == latest_request_time
+                    for request_id in current_request_ids
+                    if request_times[request_id] == latest_request_time
                 ]
                 if (
                     len(latest_request_ids) != 1
@@ -6518,7 +6960,17 @@ class RepositoryContractTest(unittest.TestCase):
             server_time, stable_artifact_id = ordering_key
             if basis_kind == "reaction":
                 reactions = candidate.get("reactions")
-                if not isinstance(reactions, list):
+                raw_requests = candidate.get("requests")
+                receipt_mapping = request_scope_receipt_mapping(
+                    candidate.get("request_scope_receipts")
+                )
+                candidate_scope_key = scope_key(candidate)
+                if (
+                    not isinstance(reactions, list)
+                    or not isinstance(raw_requests, list)
+                    or receipt_mapping is None
+                    or candidate_scope_key is None
+                ):
                     return None
                 descriptors: list[dict[str, object]] = []
                 for raw_reaction in reactions:
@@ -6534,13 +6986,35 @@ class RepositoryContractTest(unittest.TestCase):
                         parent_api_url, str
                     ):
                         return None
+                    parent_request = next(
+                        (
+                            item
+                            for item in raw_requests
+                            if isinstance(item, dict)
+                            and item.get("id") == parent_comment_id
+                        ),
+                        None,
+                    )
+                    binding = receipt_mapping.get(parent_comment_id)
+                    if (
+                        not isinstance(parent_request, dict)
+                        or not isinstance(binding, dict)
+                        or not request_receipt_binding_matches(
+                            receipt_mapping,
+                            parent_comment_id,
+                            parent_request,
+                            candidate_scope_key,
+                        )
+                    ):
+                        return None
                     projected_reaction = project_raw_reaction_record(
                         raw_reaction_record(raw_reaction)
                     )
                     if projected_reaction is None:
                         return None
                     source_bundle = {
-                        "parent_comment_id": parent_comment_id,
+                        "request": clone(parent_request),
+                        "request_scope_receipt": clone(binding["receipt"]),
                         "reaction": projected_reaction,
                     }
                     descriptors.append(
@@ -7249,6 +7723,23 @@ class RepositoryContractTest(unittest.TestCase):
                 "scopes": scope_transcripts,
             }
 
+        def request_scope_receipts_for_scopes(
+            raw_scopes: list[dict[str, object]],
+        ) -> list[object]:
+            receipts: list[object] = []
+            for raw_scope in raw_scopes:
+                raw_receipts = raw_scope.get("request_scope_receipts")
+                raw_requests = raw_scope.get("requests")
+                if isinstance(raw_receipts, list):
+                    receipts.extend(clone(raw_receipts))
+                elif isinstance(raw_requests, list) and raw_requests:
+                    receipts.append(
+                        {
+                            "invalid_request_scope_receipts": clone(raw_receipts),
+                        }
+                    )
+            return receipts
+
         def parse_rest_pages(
             fetch: object,
             *,
@@ -7503,6 +7994,8 @@ class RepositoryContractTest(unittest.TestCase):
         def parse_discovery_endpoint_transcript(
             value: object,
             *,
+            request_scope_receipts: object = None,
+            provider_declaration: object = None,
             current_ancestry: dict[str, int] | None = None,
             require_current_ancestry_exact: bool = True,
         ) -> dict[str, object] | None:
@@ -7516,6 +8009,25 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(value.get("scopes"), list)
             ):
                 return None
+            receipt_mapping = request_scope_receipt_mapping(request_scope_receipts)
+            expected_declaration_raw: dict[str, object] | None = None
+            if provider_declaration is not None:
+                if not declaration_is_authoritative(
+                    provider_declaration
+                ) or not isinstance(provider_declaration, dict):
+                    return None
+                final_fetch = provider_declaration.get("final_fetch_receipt")
+                if not isinstance(final_fetch, dict) or not isinstance(
+                    final_fetch.get("body_utf8"), str
+                ):
+                    return None
+                try:
+                    fetched_declaration = json.loads(final_fetch["body_utf8"])
+                except (TypeError, ValueError):
+                    return None
+                if not isinstance(fetched_declaration, dict):
+                    return None
+                expected_declaration_raw = fetched_declaration
             api_root = f"https://api.github.com/repos/{current_repository}"
             scope_discovery_url = (
                 f"{api_root}/pulls?state=all&sort=created&direction=asc&per_page=100"
@@ -7560,6 +8072,9 @@ class RepositoryContractTest(unittest.TestCase):
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
+            used_receipt_ids: set[int] = set()
+            declaration_match_count = 0
+            reaction_entry_selected = False
             ancestry = current_ancestry if current_ancestry is not None else {}
             if not isinstance(ancestry, dict) or any(
                 not isinstance(candidate, str)
@@ -7732,6 +8247,8 @@ class RepositoryContractTest(unittest.TestCase):
                     return "ambiguous"
 
                 request_times: dict[int, int] = {}
+                request_records: dict[int, dict[str, object]] = {}
+                request_receipt_bindings: dict[int, dict[str, object]] = {}
                 issue_artifacts: list[dict[str, object]] = []
                 nonterminal_records: list[tuple[str, int, int | None, str]] = []
                 seen_issue_ids: set[int] = set()
@@ -7772,6 +8289,28 @@ class RepositoryContractTest(unittest.TestCase):
                         request_times[issue_id] = (
                             created_at if updated_at == created_at else updated_at
                         )
+                        normalized_request = {
+                            "id": issue_id,
+                            "url": projected_issue["html_url"],
+                            "created_at": created_at,
+                            "updated_at": updated_at,
+                            "request_server_time": request_times[issue_id],
+                            "request_server_time_field": (
+                                "created_at"
+                                if updated_at == created_at
+                                else "updated_at"
+                            ),
+                            "normalized_body": body,
+                        }
+                        request_records[issue_id] = normalized_request
+                        if receipt_mapping is not None:
+                            binding = receipt_mapping.get(issue_id)
+                            if isinstance(binding, dict) and typed_json_equal(
+                                binding.get("request"),
+                                normalized_request,
+                            ):
+                                request_receipt_bindings[issue_id] = binding
+                                used_receipt_ids.add(issue_id)
                     else:
                         normalized_issue = _normalize_github_codex_body(body)
                         if normalized_issue is None:
@@ -7780,6 +8319,16 @@ class RepositoryContractTest(unittest.TestCase):
                             normalized_issue
                         )
                         actor = raw_actor(projected_issue.get("user"))
+                        if (
+                            actor == "exact"
+                            and expected_declaration_raw is not None
+                            and typed_json_equal(
+                                raw_issue,
+                                expected_declaration_raw,
+                            )
+                        ):
+                            declaration_match_count += 1
+                            continue
                         if not terminal_looking:
                             if actor == "different":
                                 continue
@@ -8220,6 +8769,21 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     )
 
+                current_request_times = {
+                    request_id: request_time
+                    for request_id, request_time in request_times.items()
+                    if (
+                        isinstance(request_receipt_bindings.get(request_id), dict)
+                        and request_receipt_bindings[request_id].get("scope")
+                        == parsed_scope
+                    )
+                }
+                current_provider_reactions = [
+                    item
+                    for item in provider_reactions
+                    if item[2] in current_request_times
+                ]
+
                 if artifact_bases:
                     latest_time = max(item[0] for item in artifact_bases)
                     latest = [item for item in artifact_bases if item[0] == latest_time]
@@ -8240,7 +8804,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "source_record_sha256": selected[4],
                     }
                 else:
-                    if not provider_reactions:
+                    if not current_provider_reactions:
                         if request_times:
                             return None
                         scope_classifications.append(
@@ -8255,13 +8819,17 @@ class RepositoryContractTest(unittest.TestCase):
                             }
                         )
                         continue
-                    if not request_times:
+                    if (
+                        not current_request_times
+                        or receipt_mapping is None
+                        or set(request_receipt_bindings) != set(request_times)
+                    ):
                         return None
-                    selected_reaction = max(provider_reactions)
-                    latest_request_time = max(request_times.values())
+                    selected_reaction = max(current_provider_reactions)
+                    latest_request_time = max(current_request_times.values())
                     latest_request_ids = [
                         request_id
-                        for request_id, server_time in request_times.items()
+                        for request_id, server_time in current_request_times.items()
                         if server_time == latest_request_time
                     ]
                     if (
@@ -8289,8 +8857,15 @@ class RepositoryContractTest(unittest.TestCase):
                     raw_reaction_without_parent = clone(selected_raw_reaction)
                     assert isinstance(raw_reaction_without_parent, dict)
                     del raw_reaction_without_parent["parent_comment_id"]
+                    selected_request = request_records.get(parent_comment_id)
+                    selected_binding = request_receipt_bindings.get(parent_comment_id)
+                    if not isinstance(selected_request, dict) or not isinstance(
+                        selected_binding, dict
+                    ):
+                        return None
                     source_bundle = {
-                        "parent_comment_id": parent_comment_id,
+                        "request": clone(selected_request),
+                        "request_scope_receipt": clone(selected_binding["receipt"]),
                         "reaction": raw_reaction_without_parent,
                     }
                     parent_api_url = (
@@ -8309,6 +8884,7 @@ class RepositoryContractTest(unittest.TestCase):
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
                     }
+                    reaction_entry_selected = True
                 entry: dict[str, object] = {
                     "scope_key": list(parsed_scope),
                     "source_ordering_key": source_ordering_key,
@@ -8330,8 +8906,24 @@ class RepositoryContractTest(unittest.TestCase):
                         },
                         "requests": [
                             {
-                                "id": request_id,
-                                "server_time": request_times[request_id],
+                                "request": clone(request_records[request_id]),
+                                "request_scope": (
+                                    list(binding["scope"])
+                                    if isinstance(
+                                        (
+                                            binding := request_receipt_bindings.get(
+                                                request_id
+                                            )
+                                        ),
+                                        dict,
+                                    )
+                                    else None
+                                ),
+                                "request_scope_receipt": (
+                                    clone(binding["receipt"])
+                                    if isinstance(binding, dict)
+                                    else None
+                                ),
                             }
                             for request_id in sorted(request_times)
                         ],
@@ -8396,6 +8988,17 @@ class RepositoryContractTest(unittest.TestCase):
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
                 or (
+                    expected_declaration_raw is not None
+                    and declaration_match_count != 1
+                )
+                or (
+                    reaction_entry_selected
+                    and (
+                        receipt_mapping is None
+                        or set(receipt_mapping) != used_receipt_ids
+                    )
+                )
+                or (
                     current_ancestry is not None
                     and require_current_ancestry_exact
                     and set(ancestry) != observed_current_finding_heads
@@ -8447,8 +9050,11 @@ class RepositoryContractTest(unittest.TestCase):
             candidates: list[dict[str, object]],
         ) -> dict[str, object]:
             transcript = build_discovery_endpoint_transcript(raw_scopes)
+            request_scope_receipts = request_scope_receipts_for_scopes(raw_scopes)
             projection = parse_discovery_endpoint_transcript(
                 transcript,
+                request_scope_receipts=request_scope_receipts,
+                provider_declaration=declaration,
             )
             scope_classifications = (
                 clone(projection["scope_classifications"])
@@ -8461,6 +9067,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "repository": current_repository,
                 "pagination": clone(required_universe_pagination),
                 "discovery_endpoint_transcript": transcript,
+                "request_scope_receipts": request_scope_receipts,
                 "scope_classifications": scope_classifications,
                 "entries": derived_inventory_entries(candidates),
             }
@@ -8498,6 +9105,9 @@ class RepositoryContractTest(unittest.TestCase):
                 "pull_number": current_pr,
                 "head": clone(raw_scope.get("head")),
                 "fetches": fetches,
+                "request_scope_receipts": request_scope_receipts_for_scopes(
+                    [raw_current]
+                ),
             }
 
         def parse_current_endpoint_inventory(
@@ -8506,9 +9116,19 @@ class RepositoryContractTest(unittest.TestCase):
             current_ancestry: dict[str, int],
             require_current_ancestry_exact: bool = True,
         ) -> dict[str, object] | None:
+            base_inventory_fields = {
+                "repository",
+                "pull_number",
+                "head",
+                "fetches",
+            }
             if (
                 not isinstance(value, dict)
-                or set(value) != {"repository", "pull_number", "head", "fetches"}
+                or set(value)
+                not in {
+                    frozenset(base_inventory_fields),
+                    frozenset(base_inventory_fields | {"request_scope_receipts"}),
+                }
                 or value.get("repository") != current_repository
                 or value.get("pull_number") != current_pr
                 or value.get("head") != current_head
@@ -8573,6 +9193,7 @@ class RepositoryContractTest(unittest.TestCase):
             }
             parsed_transcript = parse_discovery_endpoint_transcript(
                 transcript,
+                request_scope_receipts=value.get("request_scope_receipts"),
                 current_ancestry=current_ancestry,
                 require_current_ancestry_exact=require_current_ancestry_exact,
             )
@@ -8681,6 +9302,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "repository",
                 "pagination",
                 "discovery_endpoint_transcript",
+                "request_scope_receipts",
                 "scope_classifications",
                 "entries",
             }
@@ -8696,9 +9318,13 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             transcript_projection = parse_discovery_endpoint_transcript(
                 initial_inventory.get("discovery_endpoint_transcript"),
+                request_scope_receipts=initial_inventory.get("request_scope_receipts"),
+                provider_declaration=declaration,
             )
             final_transcript_projection = parse_discovery_endpoint_transcript(
                 final_inventory.get("discovery_endpoint_transcript"),
+                request_scope_receipts=final_inventory.get("request_scope_receipts"),
+                provider_declaration=declaration,
             )
             transcript_entries = (
                 transcript_projection.get("entries")
@@ -8799,6 +9425,9 @@ class RepositoryContractTest(unittest.TestCase):
 
         def current_decision_authority_entry(
             value: object,
+            *,
+            retain_nonterminal_records: bool = False,
+            retain_request_reaction_records: bool = False,
         ) -> dict[str, object] | None:
             if not isinstance(value, dict):
                 return None
@@ -8809,12 +9438,22 @@ class RepositoryContractTest(unittest.TestCase):
                 authority.get("nonterminal_records"), list
             ):
                 return None
-            del authority["nonterminal_records"]
+            if not retain_nonterminal_records:
+                del authority["nonterminal_records"]
+            if not isinstance(authority.get("requests"), list) or not isinstance(
+                authority.get("provider_reactions"), list
+            ):
+                return None
+            if not retain_request_reaction_records:
+                del authority["requests"]
+                del authority["provider_reactions"]
             return projected
 
         def current_raw_authority_matches(
             candidate_history: dict[str, object],
             current_record: dict[str, object],
+            *,
+            require_request_reaction_stability: bool = True,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
             initial_inventory = candidate_history.get("initial_current_raw_inventory")
@@ -8833,10 +9472,63 @@ class RepositoryContractTest(unittest.TestCase):
                 final_inventory,
                 current_ancestry=ancestry,
             )
+            if initial_entry is None or final_entry is None:
+                return False
+            if require_request_reaction_stability:
+
+                def has_complete_request_receipts(
+                    inventory: dict[str, object],
+                    entry: dict[str, object],
+                ) -> bool:
+                    authority = entry.get("current_authority_projection")
+                    requests = (
+                        authority.get("requests")
+                        if isinstance(authority, dict)
+                        else None
+                    )
+                    return (
+                        "request_scope_receipts" in inventory
+                        and isinstance(requests, list)
+                        and all(
+                            isinstance(request_entry, dict)
+                            and isinstance(
+                                request_entry.get("request_scope"),
+                                list,
+                            )
+                            and isinstance(
+                                request_entry.get("request_scope_receipt"),
+                                dict,
+                            )
+                            for request_entry in requests
+                        )
+                    )
+
+                if not has_complete_request_receipts(
+                    initial_inventory,
+                    initial_entry,
+                ) or not has_complete_request_receipts(
+                    final_inventory,
+                    final_entry,
+                ):
+                    return False
+                stable_initial_entry = initial_entry
+                stable_final_entry = final_entry
+            else:
+                stable_initial_entry = current_decision_authority_entry(
+                    initial_entry,
+                    retain_nonterminal_records=True,
+                )
+                stable_final_entry = current_decision_authority_entry(
+                    final_entry,
+                    retain_nonterminal_records=True,
+                )
             if (
-                initial_entry is None
-                or final_entry is None
-                or not typed_json_equal(initial_entry, final_entry)
+                stable_initial_entry is None
+                or stable_final_entry is None
+                or not typed_json_equal(
+                    stable_initial_entry,
+                    stable_final_entry,
+                )
             ):
                 return False
             expected_initial = parse_current_endpoint_inventory(
@@ -8855,10 +9547,20 @@ class RepositoryContractTest(unittest.TestCase):
                 current_ancestry=ancestry,
                 require_current_ancestry_exact=False,
             )
-            initial_decision_entry = current_decision_authority_entry(initial_entry)
-            expected_initial_decision_entry = current_decision_authority_entry(
-                expected_initial
-            )
+            if require_request_reaction_stability:
+                initial_decision_entry = current_decision_authority_entry(
+                    initial_entry,
+                    retain_request_reaction_records=True,
+                )
+                expected_initial_decision_entry = current_decision_authority_entry(
+                    expected_initial,
+                    retain_request_reaction_records=True,
+                )
+            else:
+                initial_decision_entry = current_decision_authority_entry(initial_entry)
+                expected_initial_decision_entry = current_decision_authority_entry(
+                    expected_initial
+                )
             return (
                 expected_initial is not None
                 and expected_final is not None
@@ -8893,6 +9595,7 @@ class RepositoryContractTest(unittest.TestCase):
                     raw_noncandidate_scope = clone(noncandidate_scope)
                     assert isinstance(raw_noncandidate_scope, dict)
                     raw_scopes.append(raw_noncandidate_scope)
+            raw_scopes.append(provider_declaration_scope())
             inventory = universe_inventory(raw_scopes, candidates)
             initial_raw_current = clone(current if current_raw is None else current_raw)
             final_raw_current = clone(
@@ -8987,26 +9690,13 @@ class RepositoryContractTest(unittest.TestCase):
                 "initial_candidates",
                 "final_candidates",
             }
-            profile_as_of = history_window_is_authoritative(
-                provider_declaration,
-                candidate_history,
-            )
             if (
                 not isinstance(candidate_history, dict)
                 or set(candidate_history) != expected_history_fields
                 or candidate_history.get("complete") is not True
                 or candidate_history.get("repository") != current_repository
-                or profile_as_of is None
             ):
                 return "unknown"
-            profile_start = profile_as_of - history_window_seconds
-            final_candidates = validate_history_universe(candidate_history)
-            if final_candidates is None:
-                return "unknown"
-
-            ordering_keys: set[tuple[int, int]] = set()
-            scope_keys: set[tuple[object, ...]] = set()
-            ordered: list[tuple[tuple[int, int], str, dict[str, object]]] = []
 
             def carrier_kind(basis_kind: object) -> str | None:
                 if basis_kind == "reaction":
@@ -9019,9 +9709,50 @@ class RepositoryContractTest(unittest.TestCase):
                     return "terminal-payload"
                 return None
 
+            current_ordering_key = candidate_order_basis(current)
+            current_basis = current.get("candidate_basis")
+            current_carrier = (
+                carrier_kind(current_basis.get("kind"))
+                if isinstance(current_basis, dict)
+                else None
+            )
+            if (
+                not current_lifecycle_is_eligible(current)
+                or scope_key(current) != current_scope_key
+                or current_ordering_key is None
+                or not isinstance(current_basis, dict)
+                or current_carrier is None
+                or not current_raw_authority_matches(
+                    candidate_history,
+                    current,
+                    require_request_reaction_stability=(current_carrier == "reaction"),
+                )
+            ):
+                return "unknown"
+
+            terminal_only_fallback = (
+                "terminal-payload"
+                if current_carrier == "terminal-payload"
+                else "unknown"
+            )
+            profile_as_of = history_window_is_authoritative(
+                provider_declaration,
+                candidate_history,
+            )
+            if profile_as_of is None or current_ordering_key[0] > profile_as_of:
+                return terminal_only_fallback
+            profile_start = profile_as_of - history_window_seconds
+            final_candidates = validate_history_universe(candidate_history)
+            if final_candidates is None:
+                return terminal_only_fallback
+
+            ordering_keys: set[tuple[int, int]] = set()
+            scope_keys: set[tuple[object, ...]] = set()
+            ordered: list[tuple[tuple[int, int], str, dict[str, object]]] = []
+
             for candidate in final_candidates:
                 if not isinstance(candidate, dict):
-                    return "unknown"
+                    return terminal_only_fallback
                 candidate_scope_key = scope_key(candidate)
                 ordering_key = candidate_order_basis(candidate)
                 basis = candidate.get("candidate_basis")
@@ -9038,28 +9769,10 @@ class RepositoryContractTest(unittest.TestCase):
                     or not isinstance(basis, dict)
                     or candidate_carrier is None
                 ):
-                    return "unknown"
+                    return terminal_only_fallback
                 scope_keys.add(candidate_scope_key)
                 ordering_keys.add(ordering_key)
                 ordered.append((ordering_key, candidate_carrier, candidate))
-
-            current_ordering_key = candidate_order_basis(current)
-            current_basis = current.get("candidate_basis")
-            current_carrier = (
-                carrier_kind(current_basis.get("kind"))
-                if isinstance(current_basis, dict)
-                else None
-            )
-            if (
-                not current_lifecycle_is_eligible(current)
-                or scope_key(current) != current_scope_key
-                or current_ordering_key is None
-                or current_ordering_key[0] > profile_as_of
-                or not isinstance(current_basis, dict)
-                or current_carrier is None
-                or not current_raw_authority_matches(candidate_history, current)
-            ):
-                return "unknown"
 
             ordered.sort(key=lambda item: item[0], reverse=True)
             selected = ordered[:10]
@@ -9164,12 +9877,28 @@ class RepositoryContractTest(unittest.TestCase):
                 candidate: dict[str, object],
                 candidate_scope_key: tuple[object, ...],
             ) -> bool:
+                receipt_mapping = request_scope_receipt_mapping(
+                    candidate.get("request_scope_receipts")
+                )
+                if receipt_mapping is None:
+                    return False
+                request_scope_by_id: dict[int, tuple[object, ...]] = {}
                 for raw_request in candidate["requests"]:
                     request_id = raw_request["id"]
+                    binding = receipt_mapping.get(request_id)
+                    if (
+                        not isinstance(binding, dict)
+                        or not typed_json_equal(binding.get("request"), raw_request)
+                        or not isinstance(binding.get("scope"), tuple)
+                        or binding["scope"][:2] != candidate_scope_key[:2]
+                    ):
+                        return False
+                    request_scope = binding["scope"]
+                    request_scope_by_id[request_id] = request_scope
                     request_native_record = {
                         "kind": "controlled-request",
-                        "repository": candidate_scope_key[0],
-                        "pull_request": candidate_scope_key[1],
+                        "repository": request_scope[0],
+                        "pull_request": request_scope[1],
                         "api_url": (
                             "https://api.github.com/repos/OWNER/REPO/issues/comments/"
                             f"{request_id}"
@@ -9186,7 +9915,7 @@ class RepositoryContractTest(unittest.TestCase):
                         return False
                     global_issue_comment_records[request_id] = request_native_record
                     record = {
-                        "scope_key": list(candidate_scope_key),
+                        "scope_key": list(request_scope),
                         "record": raw_request,
                     }
                     previous = global_request_records.get(request_id)
@@ -9195,8 +9924,12 @@ class RepositoryContractTest(unittest.TestCase):
                     global_request_records[request_id] = record
                 for raw_reaction in candidate["reactions"]:
                     reaction_id = raw_reaction["id"]
+                    parent_request_id = raw_reaction["parent_request_id"]
+                    reaction_scope = request_scope_by_id.get(parent_request_id)
+                    if reaction_scope is None:
+                        return False
                     record = {
-                        "scope_key": list(candidate_scope_key),
+                        "scope_key": list(reaction_scope),
                         "record": raw_reaction,
                     }
                     previous = global_reaction_records.get(reaction_id)
@@ -9291,11 +10024,22 @@ class RepositoryContractTest(unittest.TestCase):
             reaction_id = 20_000 + pr
             request_time = 2_000_000 + (pr * 10)
             reaction_time = request_time + 1
+            sample_head = f"{pr:040x}"
+            sample_scope = {
+                "repository": current_repository,
+                "pr": pr,
+                "pr_merge_base": f"{pr + 1000:040x}",
+                "head": sample_head,
+            }
+            sample_request = request(request_id, request_time, pr=pr)
             return outcome(
                 pr,
-                f"{pr:040x}",
-                [request(request_id, request_time, pr=pr)],
+                sample_head,
+                [sample_request],
                 [reaction(reaction_id, request_id, reaction_time)],
+                request_scope_receipts=[
+                    request_scope_receipt(sample_request, sample_scope)
+                ],
                 selected_request_id=request_id,
                 selected_reaction_id=reaction_id,
             )
@@ -9303,6 +10047,7 @@ class RepositoryContractTest(unittest.TestCase):
         def confirmed_nonprovider_scope(pr: int) -> dict[str, object]:
             raw_scope = sample(pr)
             raw_scope["requests"] = []
+            raw_scope["request_scope_receipts"] = []
             raw_scope["reactions"] = []
             raw_scope["selected_request_id"] = None
             raw_scope["selected_reaction_id"] = None
@@ -9312,6 +10057,17 @@ class RepositoryContractTest(unittest.TestCase):
             )
             human_issue["body"] = "Human-only scope note."
             raw_scope["raw_issue_records"] = [human_issue]
+            return raw_scope
+
+        def provider_declaration_scope() -> dict[str, object]:
+            raw_scope = sample(declaration_pr)
+            raw_scope["requests"] = []
+            raw_scope["request_scope_receipts"] = []
+            raw_scope["reactions"] = []
+            raw_scope["selected_request_id"] = None
+            raw_scope["selected_reaction_id"] = None
+            raw_scope["candidate_basis"] = None
+            raw_scope["raw_issue_records"] = [clone(declaration_raw_record)]
             return raw_scope
 
         def retime_sample(
@@ -9324,6 +10080,12 @@ class RepositoryContractTest(unittest.TestCase):
             record["requests"][0]["updated_at"] = request_time
             record["requests"][0]["request_server_time"] = request_time
             record["requests"][0]["request_server_time_field"] = "created_at"
+            record["request_scope_receipts"] = [
+                request_scope_receipt(
+                    record["requests"][0],
+                    record["scope"],
+                )
+            ]
             record["reactions"][0]["created_at"] = reaction_time
             record["candidate_basis"]["server_time"] = reaction_time
             return restamp(record)
@@ -9333,18 +10095,47 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> list[dict[str, object]] | None:
             raw_requests = record.get("requests")
             raw_reactions = record.get("reactions")
-            if not isinstance(raw_requests, list) or not isinstance(
-                raw_reactions,
-                list,
+            raw_receipts = record.get("request_scope_receipts")
+            record_scope = scope_key(record)
+            receipt_scopes = request_scope_receipt_mapping(raw_receipts)
+            if (
+                not isinstance(raw_requests, list)
+                or not isinstance(
+                    raw_reactions,
+                    list,
+                )
+                or not isinstance(raw_receipts, list)
+                or record_scope is None
+                or receipt_scopes is None
             ):
                 return None
+            receipts_by_id = {
+                receipt.get("request_id"): receipt
+                for receipt in raw_receipts
+                if isinstance(receipt, dict)
+            }
             audit: list[dict[str, object]] = []
+            seen_request_ids: set[int] = set()
             for raw_request in raw_requests:
                 if not isinstance(raw_request, dict):
                     return None
                 request_id = raw_request.get("id")
-                if type(request_id) is not int:
+                if (
+                    type(request_id) is not int
+                    or request_id in seen_request_ids
+                    or request_id not in receipt_scopes
+                ):
                     return None
+                seen_request_ids.add(request_id)
+                binding = receipt_scopes[request_id]
+                if (
+                    not isinstance(binding, dict)
+                    or not typed_json_equal(binding.get("request"), raw_request)
+                    or not isinstance(binding.get("scope"), tuple)
+                ):
+                    return None
+                if binding["scope"] != record_scope:
+                    continue
                 returned_reactions = [
                     clone(item)
                     for item in raw_reactions
@@ -9354,23 +10145,30 @@ class RepositoryContractTest(unittest.TestCase):
                 audit.append(
                     {
                         "request": clone(raw_request),
+                        "request_scope_receipt": clone(receipts_by_id[request_id]),
                         "reactions": returned_reactions,
                     }
                 )
-            return audit
+            return audit if set(receipt_scopes) == seen_request_ids else None
 
         def selected_reaction_provenance(
             record: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]] | None:
+        ) -> tuple[dict[str, object], dict[str, object], dict[str, object]] | None:
             selected_request_id = record.get("selected_request_id")
             selected_reaction_id = record.get("selected_reaction_id")
             raw_requests = record.get("requests")
             raw_reactions = record.get("reactions")
+            raw_receipts = record.get("request_scope_receipts")
+            record_scope = scope_key(record)
+            receipt_scopes = request_scope_receipt_mapping(raw_receipts)
             if (
                 type(selected_request_id) is not int
                 or type(selected_reaction_id) is not int
                 or not isinstance(raw_requests, list)
                 or not isinstance(raw_reactions, list)
+                or not isinstance(raw_receipts, list)
+                or record_scope is None
+                or receipt_scopes is None
             ):
                 return None
             selected_request = next(
@@ -9389,13 +10187,29 @@ class RepositoryContractTest(unittest.TestCase):
                 ),
                 None,
             )
+            selected_receipt = next(
+                (
+                    item
+                    for item in raw_receipts
+                    if isinstance(item, dict)
+                    and item.get("request_id") == selected_request_id
+                ),
+                None,
+            )
             if (
                 not isinstance(selected_request, dict)
                 or not isinstance(selected_reaction, dict)
+                or not isinstance(selected_receipt, dict)
+                or not request_receipt_binding_matches(
+                    receipt_scopes,
+                    selected_request_id,
+                    selected_request,
+                    record_scope,
+                )
                 or selected_reaction.get("parent_request_id") != selected_request_id
             ):
                 return None
-            return (selected_request, selected_reaction)
+            return (selected_request, selected_receipt, selected_reaction)
 
         def ordered_selected_history(
             candidate_history: dict[str, object],
@@ -9436,6 +10250,8 @@ class RepositoryContractTest(unittest.TestCase):
 
         def current_raw_authority_basis(
             candidate_history: dict[str, object],
+            *,
+            require_request_reaction_stability: bool = True,
         ) -> dict[str, object] | None:
             ancestry = current_ancestry_mapping(candidate_history)
             if ancestry is None:
@@ -9457,13 +10273,27 @@ class RepositoryContractTest(unittest.TestCase):
 
             initial_ancestry = candidate_history.get("initial_current_ancestry")
             final_ancestry = candidate_history.get("final_current_ancestry")
+            if require_request_reaction_stability:
+                stable_initial_entry = projected_entries.get("initial")
+                stable_final_entry = projected_entries.get("final")
+            else:
+                stable_initial_entry = current_decision_authority_entry(
+                    projected_entries.get("initial"),
+                    retain_nonterminal_records=True,
+                )
+                stable_final_entry = current_decision_authority_entry(
+                    projected_entries.get("final"),
+                    retain_nonterminal_records=True,
+                )
             if (
                 not isinstance(initial_ancestry, list)
                 or not isinstance(final_ancestry, list)
                 or not typed_json_equal(initial_ancestry, final_ancestry)
+                or stable_initial_entry is None
+                or stable_final_entry is None
                 or not typed_json_equal(
-                    projected_entries["initial"],
-                    projected_entries["final"],
+                    stable_initial_entry,
+                    stable_final_entry,
                 )
             ):
                 return None
@@ -9558,7 +10388,9 @@ class RepositoryContractTest(unittest.TestCase):
                 "initial_candidates": initial_report_candidates,
                 "final_candidates": final_report_candidates,
             }
-            current_request, current_reaction = current_provenance
+            current_request, current_request_scope_receipt, current_reaction = (
+                current_provenance
+            )
             current_snapshot = {
                 **record_snapshot(current_record),
                 "same_scope_request_audit": clone(current_audit),
@@ -9569,6 +10401,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "final_snapshot": clone(current_snapshot),
                 **clone(current_snapshot),
                 "request": clone(current_request),
+                "request_scope_receipt": clone(current_request_scope_receipt),
                 "reaction": clone(current_reaction),
             }
 
@@ -9585,12 +10418,19 @@ class RepositoryContractTest(unittest.TestCase):
                     or not isinstance(historical_basis, dict)
                 ):
                     return None
-                historical_request, historical_reaction = provenance
+                (
+                    historical_request,
+                    historical_request_scope_receipt,
+                    historical_reaction,
+                ) = provenance
                 sample_bases.append(
                     {
                         "scope": clone(historical_scope),
                         "candidate_basis": clone(historical_basis),
                         "request": clone(historical_request),
+                        "request_scope_receipt": clone(
+                            historical_request_scope_receipt
+                        ),
                         "reaction": clone(historical_reaction),
                         "same_scope_request_audit": clone(audit),
                     }
@@ -9635,7 +10475,14 @@ class RepositoryContractTest(unittest.TestCase):
                 return {"status": "unknown", "warnings": []}
             raw_requests = current_record.get("requests")
             current_scope = scope_key(current_record)
-            if not isinstance(raw_requests, list) or current_scope is None:
+            receipt_scopes = request_scope_receipt_mapping(
+                current_record.get("request_scope_receipts")
+            )
+            if (
+                not isinstance(raw_requests, list)
+                or current_scope is None
+                or receipt_scopes is None
+            ):
                 return {"status": "unknown", "warnings": []}
             current_pr_number = current_scope[1]
             accepted_request_ids: set[int] = set()
@@ -9669,8 +10516,24 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return {"status": "unknown", "warnings": []}
                 accepted_request_ids.add(request_id)
-                request_times.append(item["request_server_time"])
-            warnings = ["duplicate-observed"] if len(raw_requests) > 1 else []
+                binding = receipt_scopes.get(request_id)
+                if (
+                    not isinstance(binding, dict)
+                    or not typed_json_equal(binding.get("request"), item)
+                    or not isinstance(binding.get("scope"), tuple)
+                ):
+                    return {"status": "unknown", "warnings": []}
+                binding_scope = binding["scope"]
+                if binding_scope == current_scope:
+                    request_times.append(item["request_server_time"])
+                elif binding_scope[:2] != current_scope[:2] or (
+                    binding_scope[3] == current_scope[3]
+                    and binding_scope[2] != current_scope[2]
+                ):
+                    return {"status": "unknown", "warnings": []}
+            if set(receipt_scopes) != accepted_request_ids:
+                return {"status": "unknown", "warnings": []}
+            warnings = ["duplicate-observed"] if len(request_times) > 1 else []
             if request_times:
                 if (
                     not isinstance(local_lane_timing, dict)
@@ -9770,13 +10633,17 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             selected_artifact = selected_artifacts[0]
             selected_final = selected_artifact.get("final_snapshot")
-            current_raw_authority = current_raw_authority_basis(candidate_history)
+            current_raw_authority = current_raw_authority_basis(
+                candidate_history,
+                require_request_reaction_stability=False,
+            )
             if (
                 not isinstance(selected_final, dict)
                 or current_raw_authority is None
                 or not current_raw_authority_matches(
                     candidate_history,
                     current_record,
+                    require_request_reaction_stability=False,
                 )
             ):
                 return None
@@ -9851,12 +10718,22 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                     if evidence_basis is None:
                         return None
+            request_policy = request_policy_from_inputs(
+                lane_state,
+                current_record,
+                local_lane_timing,
+            )
+            if lane_state in {
+                "accepted-terminal-clean",
+                "accepted-terminal-findings",
+            } and not current_raw_authority_matches(
+                candidate_history,
+                current_record,
+                require_request_reaction_stability=True,
+            ):
+                request_policy = {"status": "unknown", "warnings": []}
             return {
-                "request_policy": request_policy_from_inputs(
-                    lane_state,
-                    current_record,
-                    local_lane_timing,
-                ),
+                "request_policy": request_policy,
                 "provider_profile": provider_profile,
                 "evidence_basis": evidence_basis,
             }
@@ -9886,11 +10763,21 @@ class RepositoryContractTest(unittest.TestCase):
             )
 
         samples = [sample(pr) for pr in (2, 3, 4)]
+        current_request = request(10, 10, pr=current_pr)
+        current_scope = {
+            "repository": current_repository,
+            "pr": current_pr,
+            "pr_merge_base": current_merge_base,
+            "head": current_head,
+        }
         current = outcome(
             current_pr,
             current_head,
-            [request(10, 10, pr=current_pr)],
+            [current_request],
             [reaction(100, 10, 20)],
+            request_scope_receipts=[
+                request_scope_receipt(current_request, current_scope)
+            ],
             selected_request_id=10,
             selected_reaction_id=100,
             merge_base=current_merge_base,
@@ -10118,8 +11005,12 @@ class RepositoryContractTest(unittest.TestCase):
         approved_resolved_scope["evidence_state"]["terminal_payloads"] = [
             approved_resolved_artifact
         ]
+        approved_resolved_scopes = [approved_resolved_scope, current]
         approved_resolved_projection = parse_discovery_endpoint_transcript(
-            build_discovery_endpoint_transcript([approved_resolved_scope, current])
+            build_discovery_endpoint_transcript(approved_resolved_scopes),
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                approved_resolved_scopes
+            ),
         )
         self.assertIsNotNone(approved_resolved_projection)
         assert isinstance(approved_resolved_projection, dict)
@@ -10437,14 +11328,214 @@ class RepositoryContractTest(unittest.TestCase):
         assert complete_scope_roots is not None
         self.assertEqual(
             {record["number"] for record in complete_scope_roots},
-            {current_pr, 2, 3, 4, 5},
+            {current_pr, 2, 3, 4, 5, declaration_pr},
         )
-        self.assertEqual(len(complete_scope_transcript["scopes"]), 5)
+        self.assertEqual(len(complete_scope_transcript["scopes"]), 6)
         complete_scope_projection = parse_discovery_endpoint_transcript(
-            complete_scope_transcript
+            complete_scope_transcript,
+            request_scope_receipts=complete_scope_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
         )
         self.assertIsNotNone(complete_scope_projection)
         assert isinstance(complete_scope_projection, dict)
+        declaration_scope_transcript = next(
+            item
+            for item in complete_scope_transcript["scopes"]
+            if item.get("pull_number") == declaration_pr
+        )
+        declaration_issue_fetch = next(
+            fetch
+            for fetch in declaration_scope_transcript["fetches"]
+            if fetch.get("kind") == "issue_comments"
+        )
+        declaration_issue_records = parse_rest_pages(
+            declaration_issue_fetch,
+            expected_kind="issue_comments",
+            expected_url=(
+                f"https://api.github.com/repos/{current_repository}/issues/"
+                f"{declaration_pr}/comments?per_page=100"
+            ),
+        )
+        self.assertIsNotNone(declaration_issue_records)
+        assert declaration_issue_records is not None
+        self.assertEqual(
+            sum(
+                typed_json_equal(record, declaration_raw_record)
+                for record in declaration_issue_records
+            ),
+            1,
+        )
+        self.assertFalse(
+            any(
+                entry.get("scope_key")
+                == list(scope_key(provider_declaration_scope()) or ())
+                for entry in complete_scope_projection["entries"]
+            )
+        )
+
+        def mutate_scope_issue_records(
+            transcript: dict[str, object],
+            pull_number: int,
+            mutate: object,
+        ) -> None:
+            scope_transcript = next(
+                item
+                for item in transcript["scopes"]
+                if item.get("pull_number") == pull_number
+            )
+            issue_fetch = next(
+                fetch
+                for fetch in scope_transcript["fetches"]
+                if fetch.get("kind") == "issue_comments"
+            )
+            issue_page = issue_fetch["pages"][0]
+            issue_records = json.loads(issue_page["body_utf8"])
+            assert isinstance(issue_records, list)
+            if not callable(mutate):
+                raise AssertionError("issue-record mutator must be callable")
+            mutate(issue_records)
+            issue_page["body_utf8"] = canonical_raw_body(issue_records)
+            issue_page["body_sha256"] = hashlib.sha256(
+                issue_page["body_utf8"].encode("utf-8")
+            ).hexdigest()
+
+        terminal_looking_declaration_body = (
+            "Codex Review in progress.\n" + declaration_text
+        )
+        terminal_looking_declaration = clone(declaration)
+        assert isinstance(terminal_looking_declaration, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            terminal_looking_declaration[snapshot_name]["body"] = (
+                terminal_looking_declaration_body
+            )
+        for receipt_name in ("initial_fetch_receipt", "final_fetch_receipt"):
+            declaration_receipt = terminal_looking_declaration[receipt_name]
+            declaration_receipt_body = json.loads(declaration_receipt["body_utf8"])
+            declaration_receipt_body["body"] = terminal_looking_declaration_body
+            declaration_receipt["body_utf8"] = canonical_raw_body(
+                declaration_receipt_body
+            )
+            declaration_receipt["body_sha256"] = hashlib.sha256(
+                declaration_receipt["body_utf8"].encode("utf-8")
+            ).hexdigest()
+        self.assertTrue(declaration_is_authoritative(terminal_looking_declaration))
+        terminal_looking_declaration_transcript = clone(complete_scope_transcript)
+        assert isinstance(terminal_looking_declaration_transcript, dict)
+
+        def rewrite_declaration_body(records: list[object]) -> None:
+            declaration_record_in_transcript = next(
+                record
+                for record in records
+                if isinstance(record, dict)
+                and record.get("id") == declaration_artifact_id
+            )
+            declaration_record_in_transcript["body"] = terminal_looking_declaration_body
+
+        mutate_scope_issue_records(
+            terminal_looking_declaration_transcript,
+            declaration_pr,
+            rewrite_declaration_body,
+        )
+        terminal_looking_declaration_projection = parse_discovery_endpoint_transcript(
+            terminal_looking_declaration_transcript,
+            request_scope_receipts=complete_scope_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=terminal_looking_declaration,
+        )
+        self.assertIsNotNone(terminal_looking_declaration_projection)
+        assert isinstance(terminal_looking_declaration_projection, dict)
+        self.assertFalse(
+            any(
+                entry.get("scope_key")
+                == list(scope_key(provider_declaration_scope()) or ())
+                for entry in terminal_looking_declaration_projection["entries"]
+            )
+        )
+
+        def exact_provider_issue_record(
+            artifact_id: int,
+            body: str,
+        ) -> dict[str, object]:
+            record = clone(declaration_raw_record)
+            assert isinstance(record, dict)
+            record.update(
+                {
+                    "id": artifact_id,
+                    "node_id": f"IC_{artifact_id}",
+                    "url": (
+                        f"https://api.github.com/repos/{current_repository}/"
+                        f"issues/comments/{artifact_id}"
+                    ),
+                    "html_url": (
+                        f"https://github.com/{current_repository}/pull/"
+                        f"{declaration_pr}#issuecomment-{artifact_id}"
+                    ),
+                    "body": body,
+                    "created_at": _format_github_rfc3339_seconds(101),
+                    "updated_at": _format_github_rfc3339_seconds(101),
+                }
+            )
+            return record
+
+        free_form_provider_transcript = clone(complete_scope_transcript)
+        assert isinstance(free_form_provider_transcript, dict)
+        mutate_scope_issue_records(
+            free_form_provider_transcript,
+            declaration_pr,
+            lambda records: records.append(
+                exact_provider_issue_record(9_002, "Provider policy changed.")
+            ),
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                free_form_provider_transcript,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        malformed_terminal_provider_transcript = clone(complete_scope_transcript)
+        assert isinstance(malformed_terminal_provider_transcript, dict)
+        mutate_scope_issue_records(
+            malformed_terminal_provider_transcript,
+            declaration_pr,
+            lambda records: records.append(
+                exact_provider_issue_record(
+                    9_003,
+                    "Codex Review completed.\nNo findings.",
+                )
+            ),
+        )
+        malformed_terminal_provider_projection = parse_discovery_endpoint_transcript(
+            malformed_terminal_provider_transcript,
+            request_scope_receipts=complete_scope_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(malformed_terminal_provider_projection)
+        assert isinstance(malformed_terminal_provider_projection, dict)
+        declaration_scope_key = list(scope_key(provider_declaration_scope()) or ())
+        self.assertTrue(
+            any(
+                entry.get("scope_key") == declaration_scope_key
+                and entry.get("source_evidence", {}).get("semantic") == "malformed"
+                for entry in malformed_terminal_provider_projection["entries"]
+            )
+        )
+        self.assertIn(
+            {
+                "pull_number": declaration_pr,
+                "scope_key": declaration_scope_key,
+                "classification": "historical-candidate",
+            },
+            malformed_terminal_provider_projection["scope_classifications"],
+        )
         expected_scope_classifications = [
             {
                 "pull_number": int(record["scope"]["pr"]),
@@ -10455,6 +11546,7 @@ class RepositoryContractTest(unittest.TestCase):
                 (current, "current"),
                 *[(candidate, "historical-candidate") for candidate in samples],
                 (human_only_scope, "confirmed-non-candidate"),
+                (provider_declaration_scope(), "confirmed-non-candidate"),
             ]
         ]
         expected_scope_classifications.sort(key=lambda item: int(item["pull_number"]))
@@ -10644,6 +11736,7 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(requestless_terminal_history, list)
         for historical_record in requestless_terminal_history:
             historical_record["requests"] = []
+            historical_record["request_scope_receipts"] = []
             historical_record["reactions"] = []
             historical_record["selected_request_id"] = None
             historical_record["selected_reaction_id"] = None
@@ -10836,6 +11929,7 @@ class RepositoryContractTest(unittest.TestCase):
         progress_only_current = clone(current)
         assert isinstance(progress_only_current, dict)
         progress_only_current["requests"] = []
+        progress_only_current["request_scope_receipts"] = []
         progress_only_current["reactions"] = []
         progress_only_current["selected_request_id"] = None
         progress_only_current["selected_reaction_id"] = None
@@ -10849,7 +11943,6 @@ class RepositoryContractTest(unittest.TestCase):
                 current_ancestry={},
             )
         )
-
         mixed_terminal_history = clone(terminal_history)
         assert isinstance(mixed_terminal_history, list)
         with_terminal_payload(
@@ -10937,6 +12030,22 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "not-clean",
         )
+        terminal_without_request_receipt = clone(terminal_current)
+        assert isinstance(terminal_without_request_receipt, dict)
+        terminal_without_request_receipt["request_scope_receipts"] = []
+        restamp(terminal_without_request_receipt)
+        terminal_without_receipt_history = history(
+            terminal_history,
+            current_raw=terminal_without_request_receipt,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                terminal_without_receipt_history,
+                terminal_without_request_receipt,
+            ),
+            "terminal-payload",
+        )
         terminal_current_with_later_reactions: dict[str, dict[str, object]] = {}
         for offset, later_content in enumerate(("eyes", "+1"), start=1):
             with self.subTest(current_terminal_basis_with_later_reaction=later_content):
@@ -11006,6 +12115,341 @@ class RepositoryContractTest(unittest.TestCase):
             }
 
         normal_lane_timing = lane_timing(1, 2)
+        terminal_without_receipt_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_without_receipt_history,
+            terminal_without_request_receipt,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_without_receipt_report)
+        assert isinstance(terminal_without_receipt_report, dict)
+        self.assertEqual(
+            terminal_without_receipt_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        terminal_with_malformed_request_receipt = clone(terminal_current)
+        assert isinstance(terminal_with_malformed_request_receipt, dict)
+        terminal_with_malformed_request_receipt["request_scope_receipts"][0][
+            "authority_override"
+        ] = True
+        restamp(terminal_with_malformed_request_receipt)
+        terminal_with_malformed_receipt_history = history(
+            terminal_history,
+            current_raw=terminal_with_malformed_request_receipt,
+        )
+        terminal_with_malformed_receipt_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_malformed_receipt_history,
+            terminal_with_malformed_request_receipt,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_malformed_receipt_report)
+        assert isinstance(terminal_with_malformed_receipt_report, dict)
+        self.assertEqual(
+            terminal_with_malformed_receipt_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+
+        terminal_with_absent_raw_sidecar_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        for phase in ("initial", "final"):
+            terminal_with_absent_raw_sidecar_history[
+                f"{phase}_current_raw_inventory"
+            ].pop("request_scope_receipts")
+        terminal_with_absent_raw_sidecar_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_absent_raw_sidecar_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_absent_raw_sidecar_report)
+        assert isinstance(terminal_with_absent_raw_sidecar_report, dict)
+        self.assertEqual(
+            terminal_with_absent_raw_sidecar_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_with_absent_raw_sidecar_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        reaction_with_absent_raw_sidecar_history = history(samples)
+        for phase in ("initial", "final"):
+            reaction_with_absent_raw_sidecar_history[
+                f"{phase}_current_raw_inventory"
+            ].pop("request_scope_receipts")
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_with_absent_raw_sidecar_history,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_with_absent_raw_sidecar_history,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_with_final_raw_sidecar_drift = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        final_raw_receipt = terminal_with_final_raw_sidecar_drift[
+            "final_current_raw_inventory"
+        ]["request_scope_receipts"][0]
+        set_response_date(
+            final_raw_receipt["pre_request_scope_receipts"]["pull"],
+            8,
+        )
+        terminal_with_final_raw_sidecar_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_final_raw_sidecar_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_final_raw_sidecar_drift_report)
+        assert isinstance(terminal_with_final_raw_sidecar_drift_report, dict)
+        self.assertEqual(
+            terminal_with_final_raw_sidecar_drift_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_with_final_raw_sidecar_drift_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        drift_raw_inventories = terminal_with_final_raw_sidecar_drift_report[
+            "evidence_basis"
+        ]["current_raw_authority"]["raw_endpoint_inventories"]
+        self.assertFalse(
+            typed_json_equal(
+                drift_raw_inventories["initial"],
+                drift_raw_inventories["final"],
+            )
+        )
+        reaction_with_final_raw_sidecar_drift = history(samples)
+        final_reaction_receipt = reaction_with_final_raw_sidecar_drift[
+            "final_current_raw_inventory"
+        ]["request_scope_receipts"][0]
+        set_response_date(
+            final_reaction_receipt["pre_request_scope_receipts"]["pull"],
+            8,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_with_final_raw_sidecar_drift,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_with_final_raw_sidecar_drift,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_with_stable_raw_sidecar_mismatch = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        for phase in ("initial", "final"):
+            stable_raw_receipt = terminal_with_stable_raw_sidecar_mismatch[
+                f"{phase}_current_raw_inventory"
+            ]["request_scope_receipts"][0]
+            set_response_date(
+                stable_raw_receipt["pre_request_scope_receipts"]["pull"],
+                8,
+            )
+        self.assertTrue(
+            current_raw_authority_matches(
+                terminal_with_stable_raw_sidecar_mismatch,
+                terminal_current,
+                require_request_reaction_stability=False,
+            )
+        )
+        self.assertFalse(
+            current_raw_authority_matches(
+                terminal_with_stable_raw_sidecar_mismatch,
+                terminal_current,
+            )
+        )
+        terminal_with_stable_raw_sidecar_mismatch_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_stable_raw_sidecar_mismatch,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_stable_raw_sidecar_mismatch_report)
+        assert isinstance(terminal_with_stable_raw_sidecar_mismatch_report, dict)
+        self.assertEqual(
+            terminal_with_stable_raw_sidecar_mismatch_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_with_stable_raw_sidecar_mismatch_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+
+        reaction_with_stable_raw_sidecar_mismatch = history(samples)
+        for phase in ("initial", "final"):
+            stable_raw_receipt = reaction_with_stable_raw_sidecar_mismatch[
+                f"{phase}_current_raw_inventory"
+            ]["request_scope_receipts"][0]
+            set_response_date(
+                stable_raw_receipt["pre_request_scope_receipts"]["pull"],
+                8,
+            )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_with_stable_raw_sidecar_mismatch,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_with_stable_raw_sidecar_mismatch,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_with_final_raw_reaction_drift = history(
+            terminal_history,
+            current_raw=terminal_current,
+            final_current_raw=terminal_current_with_later_reactions["+1"],
+        )
+        self.assertTrue(
+            current_raw_authority_matches(
+                terminal_with_final_raw_reaction_drift,
+                terminal_current,
+                require_request_reaction_stability=False,
+            )
+        )
+        self.assertFalse(
+            current_raw_authority_matches(
+                terminal_with_final_raw_reaction_drift,
+                terminal_current,
+            )
+        )
+        terminal_with_final_raw_reaction_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_final_raw_reaction_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_final_raw_reaction_drift_report)
+        assert isinstance(terminal_with_final_raw_reaction_drift_report, dict)
+        self.assertEqual(
+            terminal_with_final_raw_reaction_drift_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_with_final_raw_reaction_drift_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        reaction_drift_raw_inventories = terminal_with_final_raw_reaction_drift_report[
+            "evidence_basis"
+        ]["current_raw_authority"]["raw_endpoint_inventories"]
+        self.assertFalse(
+            typed_json_equal(
+                reaction_drift_raw_inventories["initial"],
+                reaction_drift_raw_inventories["final"],
+            )
+        )
+
+        def history_with_malformed_historical_reaction_receipt(
+            current_raw: dict[str, object],
+            *,
+            current_ancestry: dict[str, int] | None = None,
+        ) -> dict[str, object]:
+            malformed_history = history(
+                samples,
+                current_raw=current_raw,
+                current_ancestry=current_ancestry,
+            )
+            historical_request_id = samples[0]["requests"][0]["id"]
+            for phase in ("initial", "final"):
+                candidates = malformed_history[f"{phase}_candidates"]
+                historical_candidate = next(
+                    candidate
+                    for candidate in candidates
+                    if candidate["scope"]["pr"] == samples[0]["scope"]["pr"]
+                )
+                historical_candidate["request_scope_receipts"][0][
+                    "authority_override"
+                ] = True
+                restamp(historical_candidate)
+                inventory_receipt = next(
+                    receipt
+                    for receipt in malformed_history[f"{phase}_inventory"][
+                        "request_scope_receipts"
+                    ]
+                    if receipt.get("request_id") == historical_request_id
+                )
+                inventory_receipt["authority_override"] = True
+            return malformed_history
+
+        terminal_with_bad_historical_receipt_history = (
+            history_with_malformed_historical_reaction_receipt(terminal_current)
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                terminal_with_bad_historical_receipt_history,
+                terminal_current,
+            ),
+            "terminal-payload",
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_with_bad_historical_receipt_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+        reaction_with_bad_historical_receipt_history = (
+            history_with_malformed_historical_reaction_receipt(current)
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_with_bad_historical_receipt_history,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_with_bad_historical_receipt_history,
+                current,
+                normal_lane_timing,
+            )
+        )
         terminal_report_cases = {
             "terminal-payload": (
                 history(terminal_history, current_raw=terminal_current),
@@ -11166,6 +12610,30 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(terminal_findings_report, dict)
         self.assertEqual(terminal_findings_report["provider_profile"], "mixed")
         self.assertIsNotNone(terminal_findings_report["evidence_basis"])
+        terminal_findings_with_bad_historical_receipt_history = (
+            history_with_malformed_historical_reaction_receipt(
+                terminal_findings_current,
+                current_ancestry={current_head: 0},
+            )
+        )
+        terminal_findings_with_bad_historical_receipt_report = (
+            expected_report_from_inputs(
+                "accepted-terminal-findings",
+                declaration,
+                terminal_findings_with_bad_historical_receipt_history,
+                terminal_findings_current,
+                normal_lane_timing,
+            )
+        )
+        self.assertIsNotNone(terminal_findings_with_bad_historical_receipt_report)
+        assert isinstance(
+            terminal_findings_with_bad_historical_receipt_report,
+            dict,
+        )
+        self.assertEqual(
+            terminal_findings_with_bad_historical_receipt_report["provider_profile"],
+            "terminal-payload",
+        )
         self.assertTrue(
             validate_complete_report(
                 terminal_findings_report,
@@ -11468,9 +12936,71 @@ class RepositoryContractTest(unittest.TestCase):
             )
         )
 
+        current_with_old_epoch_request = clone(current)
+        assert isinstance(current_with_old_epoch_request, dict)
+        old_epoch_request = request(8, 3, pr=current_pr)
+        old_epoch_scope = clone(current_with_old_epoch_request["scope"])
+        assert isinstance(old_epoch_scope, dict)
+        old_epoch_scope["head"] = "f" * 40
+        add_scoped_request(
+            current_with_old_epoch_request,
+            old_epoch_request,
+            request_scope_receipt(old_epoch_request, old_epoch_scope),
+            index=0,
+        )
+        current_with_old_epoch_request["reactions"].append(reaction(80, 8, 4))
+        restamp(current_with_old_epoch_request)
+        old_epoch_history = history(
+            samples,
+            current_raw=current_with_old_epoch_request,
+        )
+        self.assertEqual(
+            candidate_order_basis(current_with_old_epoch_request),
+            candidate_order_basis(current),
+        )
+        self.assertEqual(
+            classify_reaction_scope(
+                current_with_old_epoch_request,
+                expected_scope=current_scope_key,
+            ),
+            "clean",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                old_epoch_history,
+                current_with_old_epoch_request,
+            ),
+            "clean",
+        )
+        self.assertEqual(
+            request_policy_from_inputs(
+                "accepted-reaction-clean",
+                current_with_old_epoch_request,
+                normal_lane_timing,
+            ),
+            {"status": "compliant", "warnings": []},
+        )
+        old_epoch_audit = same_scope_request_audit(current_with_old_epoch_request)
+        self.assertIsNotNone(old_epoch_audit)
+        assert old_epoch_audit is not None
+        self.assertEqual(
+            [entry["request"]["id"] for entry in old_epoch_audit],
+            [current["selected_request_id"]],
+        )
+
         duplicate_current = clone(current)
         assert isinstance(duplicate_current, dict)
-        duplicate_current["requests"].insert(0, request(9, 5, pr=current_pr))
+        duplicate_request = request(9, 5, pr=current_pr)
+        add_scoped_request(
+            duplicate_current,
+            duplicate_request,
+            request_scope_receipt(
+                duplicate_request,
+                duplicate_current["scope"],
+            ),
+            index=0,
+        )
         restamp(duplicate_current)
         duplicate_history = history(samples, current_raw=duplicate_current)
         complete_report = expected_report_from_inputs(
@@ -11498,6 +13028,60 @@ class RepositoryContractTest(unittest.TestCase):
                 "status": "warning",
                 "warnings": ["duplicate-observed"],
             },
+        )
+        terminal_with_duplicate_request = clone(terminal_current)
+        assert isinstance(terminal_with_duplicate_request, dict)
+        add_scoped_request(
+            terminal_with_duplicate_request,
+            clone(duplicate_request),
+            request_scope_receipt(
+                duplicate_request,
+                terminal_with_duplicate_request["scope"],
+            ),
+            index=0,
+        )
+        restamp(terminal_with_duplicate_request)
+        stable_terminal_duplicate_history = history(
+            terminal_history,
+            current_raw=terminal_with_duplicate_request,
+        )
+        stable_terminal_duplicate_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            stable_terminal_duplicate_history,
+            terminal_with_duplicate_request,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(stable_terminal_duplicate_report)
+        assert isinstance(stable_terminal_duplicate_report, dict)
+        self.assertEqual(
+            stable_terminal_duplicate_report["request_policy"],
+            {
+                "status": "warning",
+                "warnings": ["duplicate-observed"],
+            },
+        )
+        terminal_duplicate_final_read_drift = history(
+            terminal_history,
+            current_raw=terminal_current,
+            final_current_raw=terminal_with_duplicate_request,
+        )
+        terminal_duplicate_final_read_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_duplicate_final_read_drift,
+            terminal_with_duplicate_request,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_duplicate_final_read_drift_report)
+        assert isinstance(terminal_duplicate_final_read_drift_report, dict)
+        self.assertEqual(
+            terminal_duplicate_final_read_drift_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_duplicate_final_read_drift_report["request_policy"],
+            {"status": "unknown", "warnings": []},
         )
         early_lane_timing = lane_timing(5, 15)
         early_report = expected_report_from_inputs(
@@ -12395,6 +13979,47 @@ class RepositoryContractTest(unittest.TestCase):
                 current,
             )
 
+        missing_declaration_discovery_record = history(samples)
+        mutated_declaration_discovery_record = history(samples)
+        for case_history, replacement_body in (
+            (missing_declaration_discovery_record, None),
+            (mutated_declaration_discovery_record, "Provider policy changed."),
+        ):
+            for inventory_name in ("initial_inventory", "final_inventory"):
+                transcript = case_history[inventory_name][
+                    "discovery_endpoint_transcript"
+                ]
+                declaration_scope_detail = next(
+                    item
+                    for item in transcript["scopes"]
+                    if item.get("pull_number") == declaration_pr
+                )
+                declaration_fetch = next(
+                    fetch
+                    for fetch in declaration_scope_detail["fetches"]
+                    if fetch.get("kind") == "issue_comments"
+                )
+                declaration_page = declaration_fetch["pages"][0]
+                declaration_body = json.loads(declaration_page["body_utf8"])
+                if replacement_body is None:
+                    declaration_body = []
+                else:
+                    declaration_body[0]["body"] = replacement_body
+                declaration_page["body_utf8"] = canonical_raw_body(declaration_body)
+                declaration_page["body_sha256"] = hashlib.sha256(
+                    declaration_page["body_utf8"].encode("utf-8")
+                ).hexdigest()
+        invalid_cases["provider-declaration-missing-from-complete-discovery"] = (
+            declaration,
+            missing_declaration_discovery_record,
+            current,
+        )
+        invalid_cases["provider-declaration-discovery-body-drift"] = (
+            declaration,
+            mutated_declaration_discovery_record,
+            current,
+        )
+
         wrong_history_source = history(samples)
         wrong_history_source["as_of_source"] = "local-clock"
         invalid_cases["history-untrusted-as-of-source"] = (
@@ -12880,7 +14505,10 @@ class RepositoryContractTest(unittest.TestCase):
             [*target_threads, unrelated_only_thread]
         )
         ordinary_replies_projection = parse_discovery_endpoint_transcript(
-            ordinary_replies_transcript
+            ordinary_replies_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                [ordinary_replies_candidate, current]
+            ),
         )
         self.assertIsNotNone(ordinary_replies_projection)
         assert isinstance(ordinary_replies_projection, dict)
@@ -12913,7 +14541,14 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             [*audit_shadow_records, audit_shadow_record],
         )
-        self.assertIsNone(parse_discovery_endpoint_transcript(audit_shadow_transcript))
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                audit_shadow_transcript,
+                request_scope_receipts=request_scope_receipts_for_scopes(
+                    [ordinary_replies_candidate, current]
+                ),
+            )
+        )
 
         for inventory_name in ("initial_inventory", "final_inventory"):
             transcript = background_noise_history[inventory_name][
@@ -13281,6 +14916,278 @@ class RepositoryContractTest(unittest.TestCase):
             wrong_request_url,
         )
 
+        missing_request_scope_receipt = clone(current)
+        assert isinstance(missing_request_scope_receipt, dict)
+        missing_request_scope_receipt["request_scope_receipts"] = []
+        restamp(missing_request_scope_receipt)
+        invalid_cases["missing-request-scope-receipt"] = (
+            declaration,
+            history(samples),
+            missing_request_scope_receipt,
+        )
+
+        duplicate_request_scope_receipt = clone(current)
+        assert isinstance(duplicate_request_scope_receipt, dict)
+        duplicate_request_scope_receipt["request_scope_receipts"].append(
+            clone(duplicate_request_scope_receipt["request_scope_receipts"][0])
+        )
+        restamp(duplicate_request_scope_receipt)
+        invalid_cases["duplicate-request-scope-receipt"] = (
+            declaration,
+            history(samples),
+            duplicate_request_scope_receipt,
+        )
+
+        extra_request_scope_receipt = clone(current)
+        assert isinstance(extra_request_scope_receipt, dict)
+        unobserved_request = request(999, 9, pr=current_pr)
+        extra_request_scope_receipt["request_scope_receipts"].append(
+            request_scope_receipt(
+                unobserved_request,
+                extra_request_scope_receipt["scope"],
+            )
+        )
+        restamp(extra_request_scope_receipt)
+        invalid_cases["extra-request-scope-receipt"] = (
+            declaration,
+            history(samples),
+            extra_request_scope_receipt,
+        )
+
+        cross_second_scope_receipt = clone(current)
+        assert isinstance(cross_second_scope_receipt, dict)
+        cross_second_receipt = cross_second_scope_receipt["request_scope_receipts"][0]
+        set_response_date(
+            cross_second_receipt["pre_request_scope_receipts"]["pull"],
+            8,
+        )
+        set_response_date(
+            cross_second_receipt["pre_request_scope_receipts"]["compare"],
+            9,
+        )
+        set_response_date(
+            cross_second_receipt["post_request_scope_receipts"]["pull"],
+            11,
+        )
+        set_response_date(
+            cross_second_receipt["post_request_scope_receipts"]["compare"],
+            12,
+        )
+        restamp(cross_second_scope_receipt)
+        self.assertIsNotNone(
+            request_scope_receipt_mapping(
+                cross_second_scope_receipt["request_scope_receipts"]
+            )
+        )
+        self.assertEqual(
+            classify_reaction_scope(
+                cross_second_scope_receipt,
+                expected_scope=current_scope_key,
+            ),
+            "clean",
+        )
+
+        receipt_time_near_misses: dict[str, dict[str, object]] = {}
+        pre_after_request_time = clone(current["request_scope_receipts"][0])
+        assert isinstance(pre_after_request_time, dict)
+        for phase_response in pre_after_request_time[
+            "pre_request_scope_receipts"
+        ].values():
+            set_response_date(phase_response, 11)
+        set_response_date(pre_after_request_time["request_comment_receipt"], 12)
+        for phase_response in pre_after_request_time[
+            "post_request_scope_receipts"
+        ].values():
+            set_response_date(phase_response, 13)
+        receipt_time_near_misses["pre-after-request-semantic-time"] = (
+            pre_after_request_time
+        )
+
+        post_before_response = clone(current["request_scope_receipts"][0])
+        assert isinstance(post_before_response, dict)
+        set_response_date(
+            post_before_response["post_request_scope_receipts"]["compare"],
+            9,
+        )
+        receipt_time_near_misses["post-before-comment-response"] = post_before_response
+
+        edited_creation_response = clone(current["request_scope_receipts"][0])
+        assert isinstance(edited_creation_response, dict)
+        edited_comment_response = edited_creation_response["request_comment_receipt"]
+        edited_comment_body = json.loads(edited_comment_response["body_utf8"])
+        edited_comment_body["updated_at"] = _format_github_rfc3339_seconds(11)
+        edited_comment_response["body_utf8"] = canonical_raw_body(edited_comment_body)
+        edited_comment_response["body_sha256"] = hashlib.sha256(
+            edited_comment_response["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        set_response_date(edited_comment_response, 11)
+        for phase_response in edited_creation_response[
+            "post_request_scope_receipts"
+        ].values():
+            set_response_date(phase_response, 12)
+        receipt_time_near_misses["edited-post-creation-response"] = (
+            edited_creation_response
+        )
+
+        future_response = clone(current["request_scope_receipts"][0])
+        assert isinstance(future_response, dict)
+        for response in (
+            *future_response["pre_request_scope_receipts"].values(),
+            future_response["request_comment_receipt"],
+            *future_response["post_request_scope_receipts"].values(),
+        ):
+            set_response_date(response, history_as_of_server_time + 1)
+        receipt_time_near_misses["after-history-as-of"] = future_response
+
+        for name, receipt_time_near_miss in receipt_time_near_misses.items():
+            with self.subTest(request_scope_receipt_time_near_miss=name):
+                self.assertIsNone(
+                    request_scope_receipt_mapping([receipt_time_near_miss])
+                )
+
+        old_head_request_scope_receipt = clone(current)
+        assert isinstance(old_head_request_scope_receipt, dict)
+        old_head_scope = clone(old_head_request_scope_receipt["scope"])
+        assert isinstance(old_head_scope, dict)
+        old_head_scope["head"] = "f" * 40
+        old_head_request_scope_receipt["request_scope_receipts"] = [
+            request_scope_receipt(
+                old_head_request_scope_receipt["requests"][0],
+                old_head_scope,
+            )
+        ]
+        restamp(old_head_request_scope_receipt)
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    old_head_request_scope_receipt,
+                    observation_marker="old-request-head",
+                ),
+                current_ancestry={},
+            )
+        )
+        self.assertEqual(
+            request_policy_from_inputs(
+                "accepted-reaction-clean",
+                old_head_request_scope_receipt,
+                normal_lane_timing,
+            ),
+            {"status": "compliant", "warnings": []},
+        )
+        invalid_cases["old-head-request-reaction-relabeled-current"] = (
+            declaration,
+            history(samples),
+            old_head_request_scope_receipt,
+        )
+
+        old_merge_base_request_scope_receipt = clone(current)
+        assert isinstance(old_merge_base_request_scope_receipt, dict)
+        old_merge_base_scope = clone(old_merge_base_request_scope_receipt["scope"])
+        assert isinstance(old_merge_base_scope, dict)
+        old_merge_base_scope["pr_merge_base"] = "e" * 40
+        old_merge_base_request_scope_receipt["request_scope_receipts"] = [
+            request_scope_receipt(
+                old_merge_base_request_scope_receipt["requests"][0],
+                old_merge_base_scope,
+            )
+        ]
+        restamp(old_merge_base_request_scope_receipt)
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    old_merge_base_request_scope_receipt,
+                    observation_marker="old-request-merge-base",
+                ),
+                current_ancestry={},
+            )
+        )
+        self.assertEqual(
+            request_policy_from_inputs(
+                "accepted-reaction-clean",
+                old_merge_base_request_scope_receipt,
+                normal_lane_timing,
+            ),
+            {"status": "unknown", "warnings": []},
+        )
+        invalid_cases["old-merge-base-request-reaction-relabeled-current"] = (
+            declaration,
+            history(samples),
+            old_merge_base_request_scope_receipt,
+        )
+
+        extended_request_scope_receipt = clone(current)
+        assert isinstance(extended_request_scope_receipt, dict)
+        extended_request_scope_receipt["request_scope_receipts"][0][
+            "authority_override"
+        ] = True
+        restamp(extended_request_scope_receipt)
+        invalid_cases["request-scope-receipt-unknown-key"] = (
+            declaration,
+            history(samples),
+            extended_request_scope_receipt,
+        )
+
+        request_receipt_body_drift = clone(current)
+        assert isinstance(request_receipt_body_drift, dict)
+        comment_receipt = request_receipt_body_drift["request_scope_receipts"][0][
+            "request_comment_receipt"
+        ]
+        comment_body = json.loads(comment_receipt["body_utf8"])
+        comment_body["body"] = "@codex review "
+        comment_receipt["body_utf8"] = canonical_raw_body(comment_body)
+        comment_receipt["body_sha256"] = hashlib.sha256(
+            comment_receipt["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        restamp(request_receipt_body_drift)
+        invalid_cases["request-scope-receipt-comment-body-drift"] = (
+            declaration,
+            history(samples),
+            request_receipt_body_drift,
+        )
+
+        request_receipt_scope_drift = clone(current)
+        assert isinstance(request_receipt_scope_drift, dict)
+        post_compare_receipt = request_receipt_scope_drift["request_scope_receipts"][0][
+            "post_request_scope_receipts"
+        ]["compare"]
+        post_compare_body = json.loads(post_compare_receipt["body_utf8"])
+        post_compare_body["merge_base_commit"]["sha"] = "d" * 40
+        post_compare_receipt["body_utf8"] = canonical_raw_body(post_compare_body)
+        post_compare_receipt["body_sha256"] = hashlib.sha256(
+            post_compare_receipt["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        restamp(request_receipt_scope_drift)
+        invalid_cases["request-scope-receipt-pre-post-scope-drift"] = (
+            declaration,
+            history(samples),
+            request_receipt_scope_drift,
+        )
+
+        raw_request_version_drift_history = history(samples)
+        for inventory_name in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            issue_fetch = next(
+                fetch
+                for fetch in raw_request_version_drift_history[inventory_name][
+                    "fetches"
+                ]
+                if fetch.get("kind") == "issue_comments"
+            )
+            issue_page = issue_fetch["pages"][0]
+            issue_body = json.loads(issue_page["body_utf8"])
+            issue_body[0]["created_at"] = _format_github_rfc3339_seconds(9)
+            issue_page["body_utf8"] = canonical_raw_body(issue_body)
+            issue_page["body_sha256"] = hashlib.sha256(
+                issue_page["body_utf8"].encode("utf-8")
+            ).hexdigest()
+        invalid_cases["raw-request-version-drift-with-same-semantic-time"] = (
+            declaration,
+            raw_request_version_drift_history,
+            current,
+        )
+
         extended_request_schema = clone(current)
         assert isinstance(extended_request_schema, dict)
         extended_request_schema["requests"][0]["authority_override"] = True
@@ -13329,7 +15236,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         later_duplicate = clone(current)
         assert isinstance(later_duplicate, dict)
-        later_duplicate["requests"].append(request(11, 15, pr=current_pr))
+        later_duplicate_request = request(11, 15, pr=current_pr)
+        add_scoped_request(
+            later_duplicate,
+            later_duplicate_request,
+            request_scope_receipt(
+                later_duplicate_request,
+                later_duplicate["scope"],
+            ),
+        )
         restamp(later_duplicate)
         invalid_cases["later-duplicate-request"] = (
             declaration,
@@ -13339,7 +15254,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         newer_eyes = clone(current)
         assert isinstance(newer_eyes, dict)
-        newer_eyes["requests"].append(request(9, 5, pr=current_pr))
+        earlier_eyes_request = request(9, 5, pr=current_pr)
+        add_scoped_request(
+            newer_eyes,
+            earlier_eyes_request,
+            request_scope_receipt(
+                earlier_eyes_request,
+                newer_eyes["scope"],
+            ),
+        )
         newer_eyes["reactions"].append(reaction(101, 9, 21, content="eyes"))
         restamp(newer_eyes)
         invalid_cases["cross-parent-newer-eyes"] = (
@@ -13407,7 +15330,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         relocated_reaction = clone(current)
         assert isinstance(relocated_reaction, dict)
-        relocated_reaction["requests"].append(request(11, 15, pr=current_pr))
+        relocated_parent_request = request(11, 15, pr=current_pr)
+        add_scoped_request(
+            relocated_reaction,
+            relocated_parent_request,
+            request_scope_receipt(
+                relocated_parent_request,
+                relocated_reaction["scope"],
+            ),
+        )
         relocated_reaction["selected_request_id"] = 11
         relocated_reaction["reactions"][0]["parent_request_id"] = 11
         restamp(relocated_reaction)
@@ -13682,7 +15613,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         compatible_earlier_eyes = clone(current)
         assert isinstance(compatible_earlier_eyes, dict)
-        compatible_earlier_eyes["requests"].append(request(9, 5, pr=current_pr))
+        compatible_eyes_request = request(9, 5, pr=current_pr)
+        add_scoped_request(
+            compatible_earlier_eyes,
+            compatible_eyes_request,
+            request_scope_receipt(
+                compatible_eyes_request,
+                compatible_earlier_eyes["scope"],
+            ),
+        )
         compatible_earlier_eyes["reactions"].append(reaction(99, 9, 8, content="eyes"))
         restamp(compatible_earlier_eyes)
         self.assertEqual(
@@ -13741,11 +15680,24 @@ class RepositoryContractTest(unittest.TestCase):
             "clean",
         )
 
+        different_scope_request = request(12, 2_100_000, pr=current_pr)
+        different_scope = {
+            "repository": current_repository,
+            "pr": current_pr,
+            "pr_merge_base": "3" * 40,
+            "head": "2" * 40,
+        }
         same_pr_different_scope = outcome(
             current_pr,
             "2" * 40,
-            [request(12, 2_100_000, pr=current_pr)],
+            [different_scope_request],
             [reaction(102, 12, 2_100_001)],
+            request_scope_receipts=[
+                request_scope_receipt(
+                    different_scope_request,
+                    different_scope,
+                )
+            ],
             selected_request_id=12,
             selected_reaction_id=102,
             merge_base="3" * 40,
@@ -13904,12 +15856,21 @@ class RepositoryContractTest(unittest.TestCase):
             oldest_provenance_candidate["requests"][0]["created_at"] - 2
         )
         earlier_reaction_time = earlier_request_time + 1
-        oldest_provenance_candidate["requests"].append(
+        add_scoped_request(
+            oldest_provenance_candidate,
             request(
                 earlier_request_id,
                 earlier_request_time,
                 pr=oldest_provenance_pr,
-            )
+            ),
+            request_scope_receipt(
+                request(
+                    earlier_request_id,
+                    earlier_request_time,
+                    pr=oldest_provenance_pr,
+                ),
+                oldest_provenance_candidate["scope"],
+            ),
         )
         oldest_provenance_candidate["reactions"].append(
             reaction(
@@ -14301,7 +16262,14 @@ class RepositoryContractTest(unittest.TestCase):
         original_request = oldest["requests"][0]
         original_request_time = original_request["request_server_time"]
         assert isinstance(original_request_time, int)
-        oldest["requests"].append(request(90_002, original_request_time - 1, pr=2))
+        add_scoped_request(
+            oldest,
+            request(90_002, original_request_time - 1, pr=2),
+            request_scope_receipt(
+                request(90_002, original_request_time - 1, pr=2),
+                oldest["scope"],
+            ),
+        )
         oldest["reactions"][0]["parent_request_id"] = 90_002
         restamp(oldest)
         self.assertEqual(
@@ -15292,6 +17260,64 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             machine["event"],
             "request-time-merge-base-changed-with-same-head",
+        )
+        request_scope_sidecar = machine["request_scope_receipt_sidecar"]
+        self.assertEqual(
+            set(request_scope_sidecar),
+            {
+                "required_kind_for_event",
+                "required_fields",
+                "scope_receipt_fields",
+                "response_receipt_fields",
+                "request_projection_fields",
+                "required_scope_fields",
+                "raw_transcript_schema_version",
+                "raw_transcript_unchanged",
+                "storage_relation",
+                "pre_post_scope_binding",
+                "post_response_binding",
+                "missing_or_malformed",
+                "scope_epoch_classification",
+                "old_epoch_reattachment",
+                "proves_request_run_lineage",
+                "proves_continuous_scope_stability",
+                "proves_no_intermediate_aba",
+            },
+        )
+        self.assertEqual(
+            request_scope_sidecar["pre_post_scope_binding"],
+            "type-preserving-equal-to-request-time-scope",
+        )
+        self.assertEqual(
+            request_scope_sidecar["scope_epoch_classification"],
+            {
+                "exact_current_scope": {
+                    "current_request_count": "include",
+                    "reaction_action": "eligible",
+                },
+                "valid_old_head": {
+                    "current_request_count": "exclude",
+                    "current_head_post_action": "evaluate-normal-producer-policy",
+                    "reaction_action": "audit-only",
+                },
+                "valid_same_head_different_merge_base": {
+                    "event_classification": "base-changed-same-head",
+                    "current_request_count": "exclude",
+                    "post_action": "forbid-replacement-same-head",
+                    "reaction_action": "audit-only",
+                },
+            },
+        )
+        self.assertEqual(
+            request_scope_sidecar["missing_or_malformed"],
+            {
+                "event_classification": "not-proved",
+                "request_policy": "unknown",
+                "post_action": "forbid-another-post",
+                "reaction_action": "exclude",
+                "local_lane_action": "independent-scope-gates",
+                "terminal_payload_action": "independent-result-gates",
+            },
         )
         self.assertEqual(
             machine["range_origin"],
@@ -18852,7 +20878,8 @@ class RepositoryContractTest(unittest.TestCase):
         run_lanes_anchor = "Run the requested local lanes"
         read_state_anchor = "Read required CI/check state"
         post_request_anchor = (
-            "If no same-scope request exists, producer policy permits the parent "
+            "If no receipt-bound current-scope request is observed and no unmatched "
+            "request remains, producer policy permits the parent "
             "to post one exact `@codex review` comment"
         )
         for later_anchor in (run_lanes_anchor, read_state_anchor, post_request_anchor):
@@ -18865,6 +20892,13 @@ class RepositoryContractTest(unittest.TestCase):
                 "explicit-range-only standalone single/double with no selected pr",
                 content.lower(),
             )
+        for content in (skill, readiness):
+            self.assertIn(
+                "require exactly one valid `parent-recorded-request-scope-v1` "
+                "sidecar bound one-to-one",
+                content,
+            )
+            self.assertIn("A `valid_old_head` receipt is audit-only", content)
 
     def test_early_github_request_does_not_poison_provider_evidence(self) -> None:
         documents = {
