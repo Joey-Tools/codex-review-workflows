@@ -352,5 +352,35 @@ superseded_by:
   required-mode run failed closed with one failure and two errors rather than
   skipping. A no-outer-Seatbelt Trusted Mac must rerun all 13 tests and the
   exact-head read-only installed runner after the final signed commit; neither
-  the hosted blocker-signature probe nor the 825-test deterministic result
+  the hosted blocker-signature probe nor the deterministic result
   substitutes for that evidence.
+- Fresh prior-bundle Codex review of the signed source-binding merge found that
+  `file-link` remained independently available inside writable-root Seatbelt
+  profiles and that index-aware status could hide exact-head source divergence.
+  Writable profiles now globally deny `file-link`, with a real hard-link alias
+  attack in the child suite. Source custody rejects repository-visible include,
+  filter/diff, fsmonitor, `core.fileMode=false`, assume-unchanged, and
+  skip-worktree state, then compares a descriptor-based double snapshot with
+  raw HEAD tree/blob/mode evidence from an isolated object-control view.
+- The corrected host-level deterministic gate passed 827/827 in 236.142 seconds
+  on Homebrew CPython 3.13.12. The reviewed 827-test selected identity has
+  SHA-256
+  `759eaa93eb1903347f2160532617154b5c54d910ce964cc4c77794767dfc0ba0`.
+  The read-only no-child subset remained 275/275 in 26.676 seconds with
+  selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`;
+  the complete affected modules passed 198/198 in 48.776 seconds with three
+  platform skips, and the fixed `/usr/bin/git` checkout module passed 43/43 at
+  host level. The sandboxed deterministic attempt retained the known four raw
+  Git non-passing outcomes and is not successful evidence.
+- BL's prior-bundle Claude 2.1.220 attempt passed credential-free preflight and
+  clean child supervision, but strict validation remained inconclusive with
+  `init.capabilities.mismatch`, `init.unknown-field`, and
+  `terminal.unknown-field`. No findings were accepted or classified. The
+  result records the prior-policy bootstrap need for this exact closed schema;
+  it does not complete a Claude lane or authorize candidate control execution.
+- The final host-level Python 3.13.12 full discovery passed 2,833/2,833 tests in
+  1080.124 seconds with six platform skips. Actionlint passed for the canonical
+  workflow and both generated CI fixtures; full Ruff lint, changed-file Ruff
+  formatting, source-only compilation, skill validation, project-journal
+  validation, `git diff --check`, and the zero-bytecode inventory also passed.

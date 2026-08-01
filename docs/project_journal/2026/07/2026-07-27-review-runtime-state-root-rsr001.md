@@ -344,3 +344,38 @@ superseded_by:
   nested Seatbelt evidence unavailable. This is an explicit merge-readiness
   gap: a no-outer-Seatbelt Trusted Mac must run 13/13 and the exact-head
   read-only installed runner on the final signed commit.
+- Fresh prior-bundle Codex review of the signed source-binding merge found two
+  remaining protected-property gaps. The production Seatbelt profile denied
+  writes but still allowed an independent `file-link` operation to create a
+  writable hard-link alias, and the exact-head source check trusted index-aware
+  status semantics that could hide bytes or executable-mode drift. Writable
+  profiles now globally deny `file-link` and the real child suite attempts the
+  alias attack. Exact-head binding now rejects repository-visible includes,
+  executable filters/diffs, fsmonitor, `core.fileMode=false`, assume-unchanged,
+  and skip-worktree state, then compares a descriptor-based double snapshot
+  against raw HEAD tree/blob/mode data from an isolated object-control view.
+- The hardened selection passed 827/827 deterministic tests in 236.142 seconds
+  on host-level Homebrew CPython 3.13.12. The reviewed 827-test selected identity
+  has SHA-256
+  `759eaa93eb1903347f2160532617154b5c54d910ce964cc4c77794767dfc0ba0`.
+  The read-only no-child subset remained 275/275 in 26.676 seconds with
+  selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`,
+  the complete no-child/read-only focused modules passed 198/198 in 48.776
+  seconds with three platform skips, and the fixed `/usr/bin/git` checkout
+  module passed 43/43 at host level. The sandboxed deterministic attempt
+  produced the known four raw Git non-passing outcomes and is not counted as a
+  successful gate.
+- BL's prior-bundle Claude 2.1.220 bootstrap attempt passed credential-free
+  preflight and the supervised child exited zero with complete cleanup, but the
+  trusted prior validator correctly returned inconclusive with exact reasons
+  `init.capabilities.mismatch`, `init.unknown-field`, and
+  `terminal.unknown-field`. No Claude findings were accepted or classified.
+  This is compatibility-gap evidence for the exact-version closed schema in
+  this change, not a completed Claude lane; candidate review control remains
+  inactive until a new trusted release exists.
+- The final host-level Python 3.13.12 full discovery passed 2,833/2,833 tests in
+  1080.124 seconds with six platform skips. Actionlint passed for the canonical
+  workflow and both generated CI fixtures; full Ruff lint, changed-file Ruff
+  formatting, source-only compilation, skill validation, project-journal
+  validation, `git diff --check`, and the zero-bytecode inventory also passed.

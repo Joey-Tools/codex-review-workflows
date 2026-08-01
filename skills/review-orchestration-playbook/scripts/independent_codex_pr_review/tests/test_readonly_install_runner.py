@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import dis
 import errno
+import hashlib
 import io
 import json
 import os
@@ -30,6 +31,8 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             repo_root=pathlib.Path("/synthetic/repo"),
             head_sha="a" * 40,
             source_relative_path="source",
+            source_manifest_sha256="b" * 64,
+            head_subtree_manifest_sha256="c" * 64,
         )
         patchers = (
             mock.patch.object(
@@ -8433,7 +8436,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
         with self._synthetic_repository() as (root, repo, source, head_sha):
             with self._expected_head(head_sha):
                 binding = runner._bind_source_checkout(source)
-                source_manifest = runner._source_manifest_sha256(source)
+                source_manifest = binding.source_manifest_sha256
                 installed = root / "installed"
                 copied_manifest = runner._copy_bound_source(
                     source,
@@ -8442,13 +8445,17 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     source_manifest,
                 )
 
+            expected_blob_digest = hashlib.sha256(b"original\n").hexdigest()
+            expected_head_manifest = hashlib.sha256(
+                f"100644 {expected_blob_digest}\t".encode("ascii") + b"payload.txt\0"
+            ).hexdigest()
+            self.assertEqual(binding.repo_root, repo.resolve())
+            self.assertEqual(binding.head_sha, head_sha)
+            self.assertEqual(binding.source_relative_path, "source")
+            self.assertEqual(binding.source_manifest_sha256, source_manifest)
             self.assertEqual(
-                binding,
-                runner.SourceCheckoutBinding(
-                    repo_root=repo.resolve(),
-                    head_sha=head_sha,
-                    source_relative_path="source",
-                ),
+                binding.head_subtree_manifest_sha256,
+                expected_head_manifest,
             )
             self.assertEqual(copied_manifest, source_manifest)
             self.assertEqual(
@@ -8500,7 +8507,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     "modified\n",
                     encoding="ascii",
                 ),
-                "tracked or untracked changes",
+                "does not match the exact HEAD",
             ),
             (
                 "untracked",
@@ -8508,7 +8515,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     "untracked\n",
                     encoding="ascii",
                 ),
-                "tracked or untracked changes",
+                "does not match the exact HEAD",
             ),
             (
                 "ignored",
@@ -8516,7 +8523,17 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     "ignored\n",
                     encoding="ascii",
                 ),
-                "ignored files outside exact HEAD",
+                "does not match the exact HEAD",
+            ),
+            (
+                "untracked-empty-directory",
+                lambda source: (source / "empty").mkdir(mode=0o700),
+                "does not match the exact HEAD",
+            ),
+            (
+                "tracked-mode",
+                lambda source: (source / "payload.txt").chmod(0o755),
+                "file mode does not match the exact HEAD",
             ),
         )
         for label, mutate, expected_message in cases:
@@ -8536,11 +8553,111 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 ):
                     runner._bind_source_checkout(source)
 
+    def test_binding_rejects_hidden_index_flags(self) -> None:
+        cases = (
+            ("assume-unchanged", "--assume-unchanged"),
+            ("skip-worktree", "--skip-worktree"),
+        )
+        for label, option in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    _root,
+                    repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                self._git(repo, "update-index", option, "source/payload.txt")
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "assume-unchanged or skip-worktree",
+                    ),
+                ):
+                    runner._bind_source_checkout(source)
+
+    def test_binding_rejects_unsafe_local_git_configuration(self) -> None:
+        def configure_include(root: pathlib.Path, repo: pathlib.Path) -> None:
+            included = root / "included.config"
+            included.write_text("[core]\n\tfileMode = true\n", encoding="ascii")
+            self._git(repo, "config", "include.path", str(included))
+
+        cases = (
+            (
+                "filemode",
+                lambda _root, repo: self._git(repo, "config", "core.fileMode", "false"),
+                "disables core.fileMode",
+            ),
+            (
+                "filter",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "filter.synthetic.clean",
+                    "/usr/bin/false",
+                ),
+                "executable filter or diff",
+            ),
+            (
+                "diff",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "diff.synthetic.textconv",
+                    "/usr/bin/false",
+                ),
+                "executable filter or diff",
+            ),
+            (
+                "fsmonitor",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "core.fsmonitor",
+                    "true",
+                ),
+                "enables core.fsmonitor",
+            ),
+            (
+                "alias",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "alias.synthetic",
+                    "!/usr/bin/true",
+                ),
+                "contains an alias",
+            ),
+            (
+                "include",
+                configure_include,
+                "contains an include",
+            ),
+        )
+        for label, configure, expected_message in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    root,
+                    repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                configure(root, repo)
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, expected_message),
+                ):
+                    runner._bind_source_checkout(source)
+
     def test_copy_rejects_source_mutation_during_copy(self) -> None:
         with self._synthetic_repository() as (root, _repo, source, head_sha):
             with self._expected_head(head_sha):
                 binding = runner._bind_source_checkout(source)
-                source_manifest = runner._source_manifest_sha256(source)
+                source_manifest = binding.source_manifest_sha256
                 real_copytree = runner.shutil.copytree
 
                 def copy_then_mutate(
@@ -8563,7 +8680,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     ),
                     self.assertRaisesRegex(
                         RuntimeError,
-                        "tracked or untracked changes|stable exact-head source",
+                        "does not match the exact HEAD|stable exact-head source",
                     ),
                 ):
                     runner._copy_bound_source(
@@ -8577,6 +8694,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
 class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
     SOURCE_HEAD = "a" * 40
     SOURCE_MANIFEST = "b" * 64
+    SOURCE_HEAD_MANIFEST = "c" * 64
 
     def _run_selected_path(
         self,
@@ -8606,6 +8724,8 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 repo_root=pathlib.Path("/synthetic/repo"),
                 head_sha=self.SOURCE_HEAD,
                 source_relative_path="source",
+                source_manifest_sha256=self.SOURCE_MANIFEST,
+                head_subtree_manifest_sha256=self.SOURCE_HEAD_MANIFEST,
             )
             completed = subprocess.CompletedProcess(
                 args=(sys.executable,),
@@ -8778,6 +8898,10 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
         self.assertEqual(summary["no_child_runtime_profile"], "production-current")
         self.assertIs(summary["source_head_bound"], True)
         self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(
+            summary["source_head_subtree_manifest_sha256"],
+            self.SOURCE_HEAD_MANIFEST,
+        )
         self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
         self.assertIs(summary["creation_origin_proven"], False)
         self.assertEqual(
@@ -8820,6 +8944,7 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
         self.assertEqual(summary["primary_status"], "complete")
         self.assertIs(summary["source_head_bound"], False)
         self.assertIsNone(summary["source_head_sha"])
+        self.assertIsNone(summary["source_head_subtree_manifest_sha256"])
         self.assertIsNone(summary["source_manifest_sha256"])
 
 
@@ -9334,6 +9459,8 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
         repo_root=root,
         head_sha="a" * 40,
         source_relative_path="source",
+        source_manifest_sha256="b" * 64,
+        head_subtree_manifest_sha256="c" * 64,
     )
     source_manifest = "b" * 64
 
@@ -9524,6 +9651,7 @@ class TerminalPublicationSignalIntegrationTests(unittest.TestCase):
     )
     SOURCE_HEAD = "a" * 40
     SOURCE_MANIFEST = "b" * 64
+    SOURCE_HEAD_MANIFEST = "c" * 64
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -9585,6 +9713,10 @@ class TerminalPublicationSignalIntegrationTests(unittest.TestCase):
     def _assert_source_binding_summary(self, summary: dict[str, object]) -> None:
         self.assertIs(summary["source_head_bound"], True)
         self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(
+            summary["source_head_subtree_manifest_sha256"],
+            self.SOURCE_HEAD_MANIFEST,
+        )
         self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
         self.assertIs(summary["creation_origin_proven"], False)
         self.assertEqual(

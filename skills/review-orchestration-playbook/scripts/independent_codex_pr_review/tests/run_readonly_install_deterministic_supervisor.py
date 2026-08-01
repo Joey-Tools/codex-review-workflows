@@ -20,7 +20,10 @@ from types import CodeType, FrameType, TracebackType
 from typing import Any
 
 from review_supervisor.gitraw import (
+    CatFileBatch,
     GitProcessClosureUnproven,
+    enumerate_tree,
+    inspect_repository,
     run_bounded,
     sanitized_git_environment,
 )
@@ -108,6 +111,15 @@ NO_CHILD_SUITE_CODE = (
     "require_denied(lambda:os.chmod(root,0o700),'root chmod')\n"
     "require_denied(lambda:os.chmod(probe,0o600),'file chmod')\n"
     "require_denied(lambda:os.open(probe,os.O_WRONLY),'file write-open')\n"
+    "hardlink_probe=runtime/'release-hardlink-probe'\n"
+    "try:\n"
+    " require_denied(lambda:os.link(probe,hardlink_probe),"
+    "'release hard link into runtime')\n"
+    "finally:\n"
+    " try:\n"
+    "  os.unlink(hardlink_probe)\n"
+    " except FileNotFoundError:\n"
+    "  pass\n"
     "parent_probe=root.parent/'seatbelt-parent-write-probe'\n"
     "require_denied(lambda:os.open(parent_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,"
     "0o600),'install-parent create')\n"
@@ -204,6 +216,8 @@ class SourceCheckoutBinding:
     repo_root: pathlib.Path
     head_sha: str
     source_relative_path: str
+    source_manifest_sha256: str
+    head_subtree_manifest_sha256: str
 
 
 @dataclass(frozen=True)
@@ -1616,8 +1630,9 @@ def _tree_property_unchanged(
     )
 
 
-def _source_manifest_sha256(root: pathlib.Path) -> str:
-    snapshot = _tree_snapshot(root)
+def _source_snapshot_manifest_sha256(
+    snapshot: dict[str, TreeEntrySnapshot],
+) -> str:
     records = []
     for path, entry in sorted(snapshot.items()):
         records.append(
@@ -1637,6 +1652,10 @@ def _source_manifest_sha256(root: pathlib.Path) -> str:
         "ascii"
     )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_manifest_sha256(root: pathlib.Path) -> str:
+    return _source_snapshot_manifest_sha256(_tree_snapshot(root))
 
 
 def _source_root_gid(root: pathlib.Path) -> int:
@@ -1667,6 +1686,8 @@ def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
         "core.multiPackIndex=false",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.fileMode=true",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
@@ -1699,12 +1720,167 @@ def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
     return stdout
 
 
+def _validate_source_git_configuration(source_root: pathlib.Path) -> None:
+    payload = _source_git_output(
+        source_root,
+        "config",
+        "--no-includes",
+        "--null",
+        "--list",
+    )
+    if payload and not payload.endswith(b"\0"):
+        raise RuntimeError("source checkout Git config output is malformed")
+    for record in payload[:-1].split(b"\0") if payload else ():
+        key, separator, value = record.partition(b"\n")
+        if not key or not separator:
+            raise RuntimeError("source checkout Git config output is malformed")
+        lower_key = key.lower()
+        lower_value = value.strip().lower()
+        if lower_key == b"include.path" or (
+            lower_key.startswith(b"includeif.") and lower_key.endswith(b".path")
+        ):
+            raise RuntimeError("source checkout Git config contains an include")
+        if lower_key.startswith(b"alias."):
+            raise RuntimeError("source checkout Git config contains an alias")
+        if lower_key == b"core.filemode" and lower_value not in {
+            b"true",
+            b"yes",
+            b"on",
+            b"1",
+        }:
+            raise RuntimeError("source checkout Git config disables core.fileMode")
+        if lower_key == b"core.fsmonitor" and lower_value not in {
+            b"false",
+            b"no",
+            b"off",
+            b"0",
+        }:
+            raise RuntimeError("source checkout Git config enables core.fsmonitor")
+        filter_key = lower_key.startswith(b"filter.") and lower_key.rsplit(b".", 1)[
+            -1
+        ] in {b"clean", b"process", b"smudge"}
+        diff_key = lower_key == b"diff.external" or (
+            lower_key.startswith(b"diff.")
+            and lower_key.rsplit(b".", 1)[-1] in {b"command", b"textconv"}
+        )
+        if (filter_key or diff_key) and lower_value:
+            raise RuntimeError(
+                "source checkout Git config contains an executable filter or diff"
+            )
+
+
+def _validate_source_index_flags(
+    repo_root: pathlib.Path,
+    source_relative_path: str,
+) -> None:
+    payload = _source_git_output(
+        repo_root,
+        "ls-files",
+        "--cached",
+        "--full-name",
+        "-v",
+        "-z",
+        "--",
+        source_relative_path,
+    )
+    if payload and not payload.endswith(b"\0"):
+        raise RuntimeError("source checkout index flag output is malformed")
+    valid_tags = frozenset(b"HSMRCK?hsmrck")
+    for record in payload[:-1].split(b"\0") if payload else ():
+        if len(record) < 3 or record[1:2] != b" " or record[0] not in valid_tags:
+            raise RuntimeError("source checkout index flag output is malformed")
+        tag = record[0:1]
+        if tag == b"S" or tag.islower():
+            raise RuntimeError(
+                "source checkout contains assume-unchanged or skip-worktree flags"
+            )
+
+
+def _verify_source_snapshot_matches_head(
+    *,
+    source_snapshot: dict[str, TreeEntrySnapshot],
+    repo_root: pathlib.Path,
+    source_relative_path: str,
+    head_sha: str,
+) -> str:
+    repository = inspect_repository(
+        repo=repo_root,
+        base_sha=head_sha,
+        head_sha=head_sha,
+        git_executable="/usr/bin/git",
+    )
+    tree = enumerate_tree(repository, head_sha)
+    prefix = os.fsencode(source_relative_path)
+    prefix_with_separator = b"" if prefix == b"." else prefix + b"/"
+    selected = []
+    for entry in tree.entries:
+        if prefix_with_separator:
+            if not entry.path.startswith(prefix_with_separator):
+                continue
+            relative_path = entry.path[len(prefix_with_separator) :]
+        else:
+            relative_path = entry.path
+        if not relative_path or not entry.is_regular:
+            raise RuntimeError(
+                "source checkout exact-head subtree contains an unsupported entry"
+            )
+        selected.append((relative_path, entry))
+    if not selected:
+        raise RuntimeError("source checkout exact-head subtree is empty")
+
+    actual_files = {
+        os.fsencode(path): entry
+        for path, entry in source_snapshot.items()
+        if entry.kind == "file"
+    }
+    actual_directories = {
+        os.fsencode(path)
+        for path, entry in source_snapshot.items()
+        if entry.kind == "directory"
+    }
+    expected_directories = {b"."}
+    for relative_path, _entry in selected:
+        components = relative_path.split(b"/")
+        expected_directories.update(
+            b"/".join(components[:index]) for index in range(1, len(components))
+        )
+    expected_paths = {relative_path for relative_path, _entry in selected}
+    if (
+        actual_files.keys() != expected_paths
+        or actual_directories != expected_directories
+    ):
+        raise RuntimeError("source checkout subtree does not match the exact HEAD tree")
+
+    manifest_digest = hashlib.sha256()
+    with CatFileBatch(repository) as batch:
+        for relative_path, entry in selected:
+            local_entry = actual_files[relative_path]
+            if entry.mode != (stat.S_IFREG | local_entry.mode):
+                raise RuntimeError(
+                    "source checkout file mode does not match the exact HEAD tree"
+                )
+            blob_digest = hashlib.sha256()
+            batch.read_blob(entry, consumer=blob_digest.update)
+            observed_digest = blob_digest.hexdigest()
+            if local_entry.digest != observed_digest:
+                raise RuntimeError(
+                    "source checkout file content does not match the exact HEAD blob"
+                )
+            manifest_digest.update(f"{entry.mode:06o} ".encode("ascii"))
+            manifest_digest.update(observed_digest.encode("ascii"))
+            manifest_digest.update(b"\t")
+            manifest_digest.update(relative_path)
+            manifest_digest.update(b"\0")
+    return manifest_digest.hexdigest()
+
+
 def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
     expected_head = os.environ.get(EXPECTED_HEAD_ENV, "")
     if len(expected_head) != 40 or any(
         character not in "0123456789abcdef" for character in expected_head
     ):
         raise RuntimeError(f"{EXPECTED_HEAD_ENV} must be one full lowercase SHA-1")
+    _validate_source_git_configuration(source_root)
     repo_root = pathlib.Path(
         os.fsdecode(
             _source_git_output(source_root, "rev-parse", "--show-toplevel").strip()
@@ -1724,31 +1900,23 @@ def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
         raise RuntimeError(
             "source checkout HEAD does not match the expected exact head"
         )
-    status = _source_git_output(
-        source_root,
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
+    relative_path = relative.as_posix()
+    _validate_source_index_flags(repo_root, relative_path)
+    source_snapshot = _tree_snapshot(source_root)
+    head_subtree_manifest_sha256 = _verify_source_snapshot_matches_head(
+        source_snapshot=source_snapshot,
+        repo_root=repo_root,
+        source_relative_path=relative_path,
+        head_sha=expected_head,
     )
-    if status:
-        raise RuntimeError("source checkout has tracked or untracked changes")
-    ignored = _source_git_output(
-        repo_root,
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "-z",
-        "--",
-        relative.as_posix(),
-    )
-    if ignored:
-        raise RuntimeError("source subtree contains ignored files outside exact HEAD")
+    _validate_source_git_configuration(source_root)
+    _validate_source_index_flags(repo_root, relative_path)
     return SourceCheckoutBinding(
         repo_root=repo_root,
         head_sha=observed_head,
-        source_relative_path=relative.as_posix(),
+        source_relative_path=relative_path,
+        source_manifest_sha256=_source_snapshot_manifest_sha256(source_snapshot),
+        head_subtree_manifest_sha256=head_subtree_manifest_sha256,
     )
 
 
@@ -3963,7 +4131,7 @@ def _run_main(
     try:
         if trusted_source_requested:
             source_binding = _bind_source_checkout(source_root)
-            source_manifest_before = _source_manifest_sha256(source_root)
+            source_manifest_before = source_binding.source_manifest_sha256
             source_gid = _source_root_gid(source_root)
         stage = "install-container"
         install_container_binding = _create_bound_owned_private_directory(
@@ -4661,6 +4829,11 @@ def _run_main(
             "source_head_bound": source_head_bound,
             "source_head_sha": (
                 source_binding.head_sha if source_binding is not None else None
+            ),
+            "source_head_subtree_manifest_sha256": (
+                source_binding.head_subtree_manifest_sha256
+                if source_binding is not None
+                else None
             ),
             "source_manifest_sha256": source_manifest_sha256,
             "timed_out": timeout_error is not None,

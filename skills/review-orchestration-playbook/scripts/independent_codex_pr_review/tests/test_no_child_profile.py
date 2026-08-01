@@ -1079,6 +1079,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 self.assertEqual(prepared.writable_roots, (writable,))
                 lines = prepared.seatbelt_profile.splitlines()
                 self.assertIn("(deny file-write*)", lines)
+                self.assertIn("(deny file-link)", lines)
                 self.assertIn(
                     f'(allow file-write* (subpath "{writable_path}"))',
                     lines,
@@ -1095,6 +1096,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 )
                 self.assertLess(
                     lines.index("(deny file-write*)"),
+                    lines.index(f'(allow file-write* (subpath "{writable_path}"))'),
+                )
+                self.assertLess(
+                    lines.index("(deny file-link)"),
                     lines.index(f'(allow file-write* (subpath "{writable_path}"))'),
                 )
                 with (
@@ -2862,10 +2867,14 @@ class NoChildProfileUnitTests(unittest.TestCase):
                     str(writable_path),
                 )
                 self.assertIn("(deny file-write*)", lines)
+                self.assertIn("(deny file-link)", lines)
                 self.assertIn(allow_rule, lines)
                 self.assertLess(
                     lines.index("(deny file-write*)"),
                     lines.index(allow_rule),
+                )
+                self.assertLess(
+                    lines.index("(deny file-link)"), lines.index(allow_rule)
                 )
                 with (
                     mock.patch.object(profile, "require_compatible"),

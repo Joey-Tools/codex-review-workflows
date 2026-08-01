@@ -95,7 +95,8 @@ only when all of these predicates hold:
 - `cleanup_status == "complete"` and `cleanup_failures == []`
 - `release_tree_immutable == true`
 - `source_head_bound == true`, `source_head_sha == <full-head-sha>`, and
-  `source_manifest_sha256` is one full lowercase SHA-256
+  `source_head_subtree_manifest_sha256` is one full lowercase SHA-256
+- `source_manifest_sha256` is one full lowercase SHA-256
 - `no_child_runtime_profile == "production-current"`
 - `returncode == 0`
 - `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`
@@ -112,6 +113,17 @@ the final identity-check to `unlinkat`/`rmdir` window therefore rely on a
 exists, identity/access-policy drift fails closed; custodied manifests,
 quarantine, and descriptor revalidation are used for cleanup, and a replacement
 is never removed after mismatch or unproven identity has been observed.
+
+The exact-head source proof does not trust ordinary `git status`. It rejects
+repository-visible includes, executable filter/diff configuration,
+`core.fileMode=false`, fsmonitor, assume-unchanged, and skip-worktree state.
+An isolated Git object-control view reads the raw HEAD tree, blob bytes, and
+mode, which must exactly match a descriptor-based double snapshot of the source
+path set, directory set, complete file bytes, and executable bits. The
+`source_head_subtree_manifest_sha256` binds that raw HEAD proof; the separate
+`source_manifest_sha256` binds source path/type, content, mode/flags, and access
+policy. Descriptor snapshots separately protect object identity at capture and
+revalidation boundaries.
 
 Both commands must use the same recorded interpreter and exact head.
 Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,

@@ -365,6 +365,7 @@ isolated source、`nobody` child、受监管 Python runtime 和完整 determinis
 `child_process_closure == "proven"`、`cleanup_status == "complete"`、
 `cleanup_failures == []`、`release_tree_immutable == true`、
 `source_head_bound == true`、`source_head_sha == <full-head-sha>`、
+`source_head_subtree_manifest_sha256` 是完整小写 SHA-256、
 `source_manifest_sha256` 是完整小写 SHA-256、
 `no_child_runtime_profile == "production-current"`、`returncode == 0`、
 `retained_paths == []`、`runtime_residue == []`、`secondary_failures == []`、
@@ -378,6 +379,13 @@ descriptor 的 API，也没有按 descriptor 删除目录的 API。因此 receip
 128-bit 不可预测 leaf 与 cooperative same-UID host TCB。receipt 建立后，工具绑定
 identity/access policy，使用 custodied manifest、quarantine 和 descriptor revalidation；
 一旦观察到 identity-unproven 或 mismatch，就保留对象且绝不删除当前 replacement。
+Exact-head source proof 不信任普通 `git status`。它拒绝 repository-visible include、
+executable filter/diff、`core.fileMode=false`、fsmonitor、assume-unchanged 和
+skip-worktree 状态，并通过隔离 Git object-control 视图读取 HEAD 的 raw tree/blob/mode。
+Descriptor-based 双重 source snapshot 必须在路径集合、目录集合、完整文件字节和 executable
+bit 上与该 raw subtree 精确一致；`source_head_subtree_manifest_sha256` 绑定这份 HEAD 证明，
+而 `source_manifest_sha256` 继续绑定实际 source 的 path/type、content、mode/flags 和
+access policy；descriptor snapshot 在 capture/revalidation 边界单独保护 object identity。
 GitHub Hosted `macos-26` 的独立 production-profile probe仍必须以已审阅 blocker signature
 失败关闭；hosted read-only job 的 root/nobody 隔离成功不能替代 Trusted Mac no-child proof。
 

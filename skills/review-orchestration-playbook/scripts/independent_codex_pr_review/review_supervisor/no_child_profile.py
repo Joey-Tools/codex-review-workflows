@@ -1948,6 +1948,10 @@ def _render_seatbelt_profile(
     extra = _validate_additional_seatbelt_rules(additional_rules)
     if extra:
         lines.extend(extra.splitlines())
+    if writable_root_paths:
+        # file-link is independent from file-write*. Without this denial a child
+        # can hard-link protected content into an allowed writable root.
+        lines.append("(deny file-link)")
     lines.extend(
         f"(allow file-write* (subpath {_sbpl_string(str(path))}))"
         for path in writable_root_paths

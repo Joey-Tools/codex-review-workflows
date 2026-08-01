@@ -1805,7 +1805,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 825", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 827", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1841,9 +1841,17 @@ class RepositoryContractTest(unittest.TestCase):
             '"creation_origin_proven": False',
             '"retained_paths": retained_paths',
             '"source_head_bound": source_head_bound',
+            '"source_head_subtree_manifest_sha256": (',
             '"source_manifest_sha256": source_manifest_sha256',
+            "_validate_source_git_configuration(source_root)",
+            "_validate_source_index_flags(repo_root, relative_path)",
+            "_verify_source_snapshot_matches_head(",
+            "inspect_repository(",
+            "enumerate_tree(repository, head_sha)",
+            "with CatFileBatch(repository) as batch:",
             "_bind_source_checkout(source_root)",
             "_copy_bound_source(",
+            "os.link(probe,hardlink_probe)",
             "_run_no_child_test_suite(",
             "_run_bounded_child(",
             "_freeze_lifecycle_terminal_signal(lifecycle_fence)",
@@ -1925,6 +1933,7 @@ class RepositoryContractTest(unittest.TestCase):
             "CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha>",
             "tests.run_readonly_install_deterministic_supervisor",
             "source_head_bound == true",
+            "source_head_subtree_manifest_sha256",
             "production no-child proof",
         ):
             self.assertIn(requirement, pr_readiness)
@@ -1942,6 +1951,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(hosted_profile, integration_test)
             self.assertNotIn(hosted_profile, production_profile)
         self.assertNotIn("25E246", production_profile)
+        self.assertIn("(deny file-link)", production_profile)
 
         profile_contracts = {
             "canonical": (
@@ -2219,6 +2229,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '"signal_number": None',
                     '"source_head_bound": False',
                     '"source_head_sha": None',
+                    '"source_head_subtree_manifest_sha256": None',
                     '"source_manifest_sha256": None',
                     '"timed_out": False',
                 ):
