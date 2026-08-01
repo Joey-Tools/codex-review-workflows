@@ -66,7 +66,188 @@ class _FailingFlushStream:
         return getattr(self._wrapped, name)
 
 
+class SourceCheckoutBindingTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def _committed_source(self) -> Iterator[tuple[pathlib.Path, str]]:
+        with owned_temporary_directory("readonly-source-binding-") as root:
+            source = root / "repo" / "source"
+            source.mkdir(parents=True)
+            (source / "fixture.py").write_text("VALUE = 1\n", encoding="ascii")
+            (source / ".gitignore").write_text("ignored.tmp\n", encoding="ascii")
+            for command in (
+                ("/usr/bin/git", "init", "-q", str(source.parent)),
+                (
+                    "/usr/bin/git",
+                    "-C",
+                    str(source.parent),
+                    "config",
+                    "user.name",
+                    "Synthetic Test",
+                ),
+                (
+                    "/usr/bin/git",
+                    "-C",
+                    str(source.parent),
+                    "config",
+                    "user.email",
+                    "synthetic@example.invalid",
+                ),
+                ("/usr/bin/git", "-C", str(source.parent), "add", "--", "source"),
+                (
+                    "/usr/bin/git",
+                    "-C",
+                    str(source.parent),
+                    "commit",
+                    "-q",
+                    "-m",
+                    "Create synthetic source",
+                ),
+            ):
+                subprocess.run(
+                    command,
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                )
+            head = subprocess.run(
+                ("/usr/bin/git", "-C", str(source.parent), "rev-parse", "HEAD"),
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+            with mock.patch.dict(os.environ, {runner.EXPECTED_HEAD_ENV: head}):
+                yield source, head
+
+    def test_source_binding_accepts_clean_exact_head_and_stable_copy(self) -> None:
+        with self._committed_source() as (source, head):
+            binding = runner._bind_source_checkout(source)
+            manifest = runner._source_manifest_sha256(source)
+            installed = source.parent.parent / "installed"
+
+            copied_manifest = runner._copy_bound_source(
+                source,
+                installed,
+                binding,
+                manifest,
+            )
+
+            self.assertEqual(binding.head_sha, head)
+            self.assertEqual(binding.source_relative_path, "source")
+            self.assertEqual(copied_manifest, manifest)
+            self.assertEqual(runner._source_manifest_sha256(installed), manifest)
+
+    def test_source_binding_rejects_invalid_head_and_checkout_state(self) -> None:
+        with (
+            self.subTest("missing expected head"),
+            self._committed_source() as (
+                source,
+                _head,
+            ),
+        ):
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                self.assertRaisesRegex(
+                    RuntimeError, "must be one full lowercase SHA-1"
+                ),
+            ):
+                os.environ.pop(runner.EXPECTED_HEAD_ENV, None)
+                runner._bind_source_checkout(source)
+
+        with (
+            self.subTest("mismatched expected head"),
+            self._committed_source() as (
+                source,
+                _head,
+            ),
+        ):
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {runner.EXPECTED_HEAD_ENV: "0" * 40},
+                ),
+                self.assertRaisesRegex(RuntimeError, "does not match"),
+            ):
+                runner._bind_source_checkout(source)
+
+        for state in ("tracked", "untracked", "ignored"):
+            with self.subTest(state), self._committed_source() as (source, _head):
+                if state == "tracked":
+                    (source / "fixture.py").write_text("VALUE = 2\n", encoding="ascii")
+                    expected = "tracked or untracked changes"
+                elif state == "untracked":
+                    (source / "untracked.py").write_text(
+                        "VALUE = 2\n", encoding="ascii"
+                    )
+                    expected = "tracked or untracked changes"
+                else:
+                    (source / "ignored.tmp").write_text("ignored\n", encoding="ascii")
+                    expected = "ignored files outside exact HEAD"
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    runner._bind_source_checkout(source)
+
+    def test_copy_rejects_transient_source_mutation(self) -> None:
+        with self._committed_source() as (source, _head):
+            binding = runner._bind_source_checkout(source)
+            manifest = runner._source_manifest_sha256(source)
+            installed = source.parent.parent / "installed"
+            fixture = source / "fixture.py"
+            original = fixture.read_bytes()
+            real_copytree = runner.shutil.copytree
+
+            def copy_mutated_source(
+                source_path: pathlib.Path,
+                destination: pathlib.Path,
+                **kwargs: object,
+            ) -> pathlib.Path:
+                fixture.write_text("VALUE = 2\n", encoding="ascii")
+                try:
+                    return real_copytree(source_path, destination, **kwargs)
+                finally:
+                    fixture.write_bytes(original)
+
+            with (
+                mock.patch.object(
+                    runner.shutil,
+                    "copytree",
+                    side_effect=copy_mutated_source,
+                ),
+                self.assertRaisesRegex(RuntimeError, "stable exact-head source"),
+            ):
+                runner._copy_bound_source(
+                    source,
+                    installed,
+                    binding,
+                    manifest,
+                )
+
+
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._source_binding = runner.SourceCheckoutBinding(
+            repo_root=pathlib.Path("/synthetic/repo"),
+            head_sha="a" * 40,
+            source_relative_path="source",
+        )
+        self._binding_patcher = mock.patch.object(
+            runner,
+            "_bind_source_checkout",
+            return_value=self._source_binding,
+        )
+        self._manifest_patcher = mock.patch.object(
+            runner,
+            "_source_manifest_sha256",
+            return_value="b" * 64,
+        )
+        self._binding_patcher.start()
+        self._manifest_patcher.start()
+        self.addCleanup(self._binding_patcher.stop)
+        self.addCleanup(self._manifest_patcher.stop)
+
     @staticmethod
     def _bind_existing_directories(
         *paths: pathlib.Path,
@@ -1943,7 +2124,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     runner,
                     "run_bounded_command",
                     return_value=self._no_child_result(
-                        stdout=b"selected tests passed\n",
+                        stdout=(runner.NO_CHILD_SUCCESS_RECORD + "\n").encode(),
                     ),
                 ) as run_bounded_command,
             ):
@@ -1966,7 +2147,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 writable_roots=(mock.sentinel.writable_runtime,),
             )
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "selected tests passed\n")
+            self.assertEqual(result.stdout, runner.NO_CHILD_SUCCESS_RECORD + "\n")
             self.assertEqual(result.stderr, "")
             argv = run_bounded_command.call_args.args[0]
             self.assertEqual(
@@ -1988,6 +2169,62 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 run_bounded_command.call_args.kwargs["max_stderr_bytes"],
                 1024,
             )
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=("synthetic-runtime", mock.sentinel.runtime_pin),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=self._prepared_profile(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    return_value=self._no_child_result(stdout=b""),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks its exact completion record",
+                ),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=runner.ChildProcessClosureProof(),
+                )
+
+        with owned_temporary_directory("readonly-sitecustomize-") as hook_root:
+            (hook_root / "sitecustomize.py").write_text(
+                "import os\nos._exit(0)\n",
+                encoding="ascii",
+            )
+            isolated = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    "print('isolated-startup-complete')",
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(hook_root)},
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(isolated.returncode, 0)
+            self.assertEqual(isolated.stdout, "isolated-startup-complete\n")
 
     def test_no_child_suite_rejects_process_group_only_closure(self) -> None:
         with self._bound_no_child_roots("readonly-no-child-forged-") as roots:

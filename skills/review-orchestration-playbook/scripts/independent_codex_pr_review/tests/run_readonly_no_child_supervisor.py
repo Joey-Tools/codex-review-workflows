@@ -11,6 +11,11 @@ from .run_required_deterministic_supervisor import (
     EXPECTED_TEST_COUNT as EXPECTED_DETERMINISTIC_TEST_COUNT,
 )
 from .run_required_no_child_profile import REQUIRED_TEST_KEYS
+from .readonly_no_child_contract import (
+    EXPECTED_TEST_COUNT,
+    EXPECTED_TEST_ID_SHA256,
+    SUCCESS_RECORD,
+)
 
 
 READONLY_NO_CHILD_MODULES = frozenset(
@@ -31,11 +36,6 @@ READONLY_NO_CHILD_MODULES = frozenset(
         "tests.test_settlement_state",
         "tests.test_wire",
     }
-)
-EXPECTED_TEST_COUNT = 275
-# Update both constants only after reviewing the complete selected identity.
-EXPECTED_TEST_ID_SHA256 = (
-    "c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b"
 )
 
 
@@ -137,7 +137,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    return 0 if result.wasSuccessful() else 1
+    if not result.wasSuccessful():
+        return 1
+    print(SUCCESS_RECORD, flush=True)
+    return 0
 
 
 if __name__ == "__main__":

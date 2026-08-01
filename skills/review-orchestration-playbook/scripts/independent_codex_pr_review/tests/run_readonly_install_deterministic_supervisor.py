@@ -36,6 +36,7 @@ from review_supervisor.signal_relay import (
     checkpoint_bound_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
+from .readonly_no_child_contract import SUCCESS_RECORD as NO_CHILD_SUCCESS_RECORD
 from .support import (
     CLEANUP_GUARANTEE,
     CREATION_ORIGIN_GUARANTEE,
@@ -50,6 +51,7 @@ from .support import (
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
 RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
+EXPECTED_HEAD_ENV = "CODEX_REVIEW_EXPECTED_HEAD_SHA"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -134,6 +136,13 @@ class TreeEntrySnapshot:
             self.xattrs,
             self.acl_entries,
         )
+
+
+@dataclass(frozen=True)
+class SourceCheckoutBinding:
+    repo_root: pathlib.Path
+    head_sha: str
+    source_relative_path: str
 
 
 @dataclass(frozen=True)
@@ -604,6 +613,12 @@ def _run_no_child_test_suite(
                     scope="stderr",
                     limit=stderr_limit,
                 )
+            if result.returncode == 0 and result.stdout != (
+                NO_CHILD_SUCCESS_RECORD + "\n"
+            ).encode("ascii"):
+                raise RuntimeError(
+                    "read-only installed test child lacks its exact completion record"
+                )
         finally:
             if proof_scope is not None:
                 proof_scope.finish(deliver=proof.proven or not proof.launch_attempted)
@@ -987,6 +1002,160 @@ def _tree_property_unchanged(
     )
 
 
+def _source_manifest_sha256(root: pathlib.Path) -> str:
+    snapshot = _tree_snapshot(root)
+    records = []
+    for path, entry in sorted(snapshot.items()):
+        records.append(
+            (
+                path,
+                entry.kind,
+                entry.uid,
+                entry.gid,
+                entry.mode,
+                entry.flags,
+                entry.digest,
+                tuple((name.hex(), digest) for name, digest in entry.xattrs),
+                tuple(value.hex() for value in entry.acl_entries),
+            )
+        )
+    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PAGER": "cat",
+    }
+    command = (
+        "/usr/bin/git",
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "color.ui=false",
+        "-C",
+        str(source_root),
+        *arguments,
+    )
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()[:512]
+        raise RuntimeError(f"source checkout Git validation failed: {detail}")
+    return completed.stdout
+
+
+def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
+    expected_head = os.environ.get(EXPECTED_HEAD_ENV, "")
+    if len(expected_head) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_head
+    ):
+        raise RuntimeError(f"{EXPECTED_HEAD_ENV} must be one full lowercase SHA-1")
+    repo_root = pathlib.Path(
+        os.fsdecode(
+            _source_git_output(source_root, "rev-parse", "--show-toplevel").strip()
+        )
+    ).resolve(strict=True)
+    resolved_source = source_root.resolve(strict=True)
+    try:
+        relative = resolved_source.relative_to(repo_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "runner source is outside its reported Git worktree"
+        ) from error
+    observed_head = os.fsdecode(
+        _source_git_output(source_root, "rev-parse", "HEAD").strip()
+    )
+    if observed_head != expected_head:
+        raise RuntimeError(
+            "source checkout HEAD does not match the expected exact head"
+        )
+    status = _source_git_output(
+        source_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RuntimeError("source checkout has tracked or untracked changes")
+    ignored = _source_git_output(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        relative.as_posix(),
+    )
+    if ignored:
+        raise RuntimeError("source subtree contains ignored files outside exact HEAD")
+    return SourceCheckoutBinding(
+        repo_root=repo_root,
+        head_sha=observed_head,
+        source_relative_path=relative.as_posix(),
+    )
+
+
+def _copy_bound_source(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceCheckoutBinding,
+    source_manifest_before: str,
+) -> str:
+    shutil.copytree(
+        source_root,
+        installed_root,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    installed_manifest = _source_manifest_sha256(installed_root)
+    source_manifest_after = _source_manifest_sha256(source_root)
+    source_binding_after = _bind_source_checkout(source_root)
+    if (
+        source_binding_after != source_binding
+        or source_manifest_after != source_manifest_before
+        or installed_manifest != source_manifest_before
+    ):
+        raise RuntimeError(
+            "installed test input does not match the stable exact-head source"
+        )
+    return source_manifest_before
+
+
 def _set_tree_read_only(root: pathlib.Path) -> None:
     for path in (root, *sorted(root.rglob("*"))):
         if path.is_symlink():
@@ -1349,8 +1518,15 @@ def _run_main(
     unproven_creation_failures: list[CleanupFailure] = []
     closure_proof = ChildProcessClosureProof()
     cleanup_failures: tuple[CleanupFailure, ...] = ()
+    source_binding: SourceCheckoutBinding | None = None
+    source_head_bound = False
+    source_manifest_sha256: str | None = None
     stage = "install-container-binding"
     try:
+        stage = "source-head-binding"
+        source_binding = _bind_source_checkout(source_root)
+        source_manifest_before = _source_manifest_sha256(source_root)
+        stage = "install-container-binding"
         install_container_binding = _create_owned_private_directory_binding(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
@@ -1366,13 +1542,14 @@ def _run_main(
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
         install_container_binding.revalidate()
-        shutil.copytree(
+        source_manifest_sha256 = _copy_bound_source(
             source_root,
             installed_root,
-            symlinks=True,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            source_binding,
+            source_manifest_before,
         )
         install_container_binding.revalidate()
+        source_head_bound = True
         stage = "install-read-only"
         _set_tree_read_only(installed_root)
         stage = "snapshot-before"
@@ -1533,6 +1710,11 @@ def _run_main(
             "runtime_residue": list(runtime_residue),
             "secondary_failures": [asdict(failure) for failure in secondary_failures],
             "signal_number": lifecycle_fence.terminal_selected_signal,
+            "source_head_bound": source_head_bound,
+            "source_head_sha": (
+                source_binding.head_sha if source_binding is not None else None
+            ),
+            "source_manifest_sha256": source_manifest_sha256,
             "timed_out": timeout_error is not None,
         }
 

@@ -1144,10 +1144,17 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 _close_owner_snapshot_attestation(attestation)
                 self.skipTest(f"macOS Data firmlink alias is unavailable: {error}")
             try:
-                writable = profile.attest_writable_root(
-                    data_alias,
-                    directory_fd=alias_fd,
-                )
+                try:
+                    writable = profile.attest_writable_root(
+                        data_alias,
+                        directory_fd=alias_fd,
+                    )
+                except profile.ExecutableAuthenticationError as error:
+                    self.assertRegex(
+                        str(error),
+                        "ancestor access policy|untrusted writer|untrusted owner",
+                    )
+                    return
                 with (
                     mock.patch.object(
                         profile,
@@ -2850,6 +2857,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 lines = prepared.seatbelt_profile.splitlines()
                 allow_rule = f'(allow file-write* (subpath "{writable_path}"))'
                 self.assertEqual(prepared.writable_roots, (writable,))
+                self.assertEqual(
+                    prepared.writable_roots[0].path_components[-1].path,
+                    str(writable_path),
+                )
                 self.assertIn("(deny file-write*)", lines)
                 self.assertIn(allow_rule, lines)
                 self.assertLess(
@@ -2872,8 +2883,43 @@ class NoChildProfileUnitTests(unittest.TestCase):
                         pass_fds=(writable_fd,),
                     )
                 fork.assert_not_called()
+
+                root.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(
+                        profile.ExecutableAuthenticationError,
+                        "ancestor permits an untrusted writer|access policy",
+                    ):
+                        profile._validated_sandboxed_writable_roots(
+                            (writable,),
+                            protected_component_keys=frozenset({(999, 999)}),
+                        )
+                finally:
+                    root.chmod(0o700)
             finally:
                 os.close(writable_fd)
+
+            unsafe_ancestor = root / "unsafe-ancestor"
+            unsafe_ancestor.mkdir(mode=0o700)
+            unsafe_runtime = unsafe_ancestor / "runtime"
+            unsafe_runtime.mkdir(mode=0o700)
+            unsafe_fd = os.open(
+                unsafe_runtime,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            unsafe_ancestor.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(
+                    profile.ExecutableAuthenticationError,
+                    "ancestor permits an untrusted writer",
+                ):
+                    profile.attest_writable_root(
+                        unsafe_runtime,
+                        directory_fd=unsafe_fd,
+                    )
+            finally:
+                unsafe_ancestor.chmod(0o700)
+                os.close(unsafe_fd)
 
     def test_path_executed_target_rejects_untrusted_owner_or_writer(
         self,

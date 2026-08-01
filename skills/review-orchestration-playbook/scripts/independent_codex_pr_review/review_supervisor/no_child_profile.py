@@ -350,6 +350,7 @@ class WritableRootAttestation:
     directory_fd: int
     identity: NodeIdentity
     filesystem_metadata: ExtendedMetadataEvidence
+    path_components: tuple[PathComponentEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -1303,9 +1304,15 @@ def _revalidate_writable_root(
 ) -> WritableRootAttestation:
     if not isinstance(attestation, WritableRootAttestation):
         raise ExecutableAuthenticationError("writable root attestation is malformed")
-    if not isinstance(attestation.identity, NodeIdentity) or not isinstance(
-        attestation.filesystem_metadata,
-        ExtendedMetadataEvidence,
+    if (
+        not isinstance(attestation.identity, NodeIdentity)
+        or not isinstance(attestation.filesystem_metadata, ExtendedMetadataEvidence)
+        or not isinstance(attestation.path_components, tuple)
+        or not attestation.path_components
+        or any(
+            not isinstance(component, PathComponentEvidence)
+            for component in attestation.path_components
+        )
     ):
         raise ExecutableAuthenticationError("writable root attestation is malformed")
     path = _canonical_absolute_path(attestation.path)
@@ -1325,6 +1332,7 @@ def _revalidate_writable_root(
             raise ExecutableAuthenticationError(
                 "writable root descriptor must be read-only"
             )
+        path_components = _stable_writable_root_path_components(path)
         before = NodeIdentity.from_stat(os.fstat(attestation.directory_fd))
         path_before = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
         filesystem_metadata = verify_macos_filesystem_metadata(
@@ -1350,6 +1358,8 @@ def _revalidate_writable_root(
     if (
         before.directory_object_key() != attestation.identity.directory_object_key()
         or filesystem_metadata != attestation.filesystem_metadata
+        or _writable_root_component_property_keys(path_components)
+        != _writable_root_component_property_keys(attestation.path_components)
     ):
         raise ExecutableAuthenticationError(
             "writable root no longer matches its attestation"
@@ -1382,6 +1392,7 @@ def attest_writable_root(
     if type(directory_fd) is not int or directory_fd < 0:
         raise ExecutableAuthenticationError("writable root descriptor is malformed")
     try:
+        path_components = _stable_writable_root_path_components(path)
         identity = NodeIdentity.from_stat(os.fstat(directory_fd))
         filesystem_metadata = verify_macos_filesystem_metadata(
             directory_fd,
@@ -1398,8 +1409,175 @@ def attest_writable_root(
             directory_fd=directory_fd,
             identity=identity,
             filesystem_metadata=filesystem_metadata,
+            path_components=path_components,
         )
     )
+
+
+def _require_safe_writable_root_component(
+    component: PathComponentEvidence,
+    *,
+    leaf: bool,
+) -> None:
+    identity = component.identity
+    metadata = component.extended_metadata
+    path = pathlib.Path(component.path)
+    trusted_uid = os.geteuid()
+    if component.kind != "directory" or not stat.S_ISDIR(identity.mode):
+        raise ExecutableAuthenticationError(
+            "writable root path contains a non-directory component"
+        )
+    if not isinstance(metadata, ExtendedMetadataEvidence):
+        raise ExecutableAuthenticationError(
+            "writable root ancestor access-policy evidence is malformed"
+        )
+    if path == pathlib.Path("/"):
+        if identity.uid != 0:
+            raise ExecutableAuthenticationError(
+                "writable root filesystem root has an untrusted owner"
+            )
+    elif identity.uid not in {0, trusted_uid}:
+        raise ExecutableAuthenticationError(
+            f"writable root ancestor has an untrusted owner: {path}"
+        )
+    if identity.mode & (stat.S_ISUID | stat.S_ISGID):
+        raise ExecutableAuthenticationError(
+            f"writable root ancestor has set-id permission: {path}"
+        )
+    untrusted_write = identity.mode & (stat.S_IWGRP | stat.S_IWOTH)
+    sticky_exception = bool(identity.mode & stat.S_ISVTX) and identity.uid in {
+        0,
+        trusted_uid,
+    }
+    if untrusted_write and not sticky_exception:
+        raise ExecutableAuthenticationError(
+            f"writable root ancestor permits an untrusted writer: {path}"
+        )
+    if leaf and (identity.uid != trusted_uid or stat.S_IMODE(identity.mode) != 0o700):
+        raise ExecutableAuthenticationError(
+            "writable root must be owned by the effective user with mode 0700"
+        )
+
+
+def _inspect_writable_root_component(
+    descriptor: int,
+    *,
+    path: pathlib.Path,
+    leaf: bool,
+) -> PathComponentEvidence:
+    try:
+        before = NodeIdentity.from_stat(os.fstat(descriptor))
+        path_before = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
+        filesystem_metadata = verify_macos_filesystem_metadata(
+            descriptor,
+            path,
+            "directory",
+        )
+        after = NodeIdentity.from_stat(os.fstat(descriptor))
+        path_after = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
+    except (OSError, ValueError) as error:
+        raise ExecutableAuthenticationError(
+            f"cannot inspect writable root ancestor access policy: {path}: {error}"
+        ) from error
+    identities = (before, path_before, after, path_after)
+    if len({identity.directory_object_key() for identity in identities}) != 1:
+        raise ExecutableAuthenticationError(
+            f"writable root ancestor identity changed: {path}"
+        )
+    if len({identity.access_policy_key() for identity in identities}) != 1:
+        raise ExecutableAuthenticationError(
+            f"writable root ancestor access policy changed: {path}"
+        )
+    evidence = PathComponentEvidence(
+        path=str(path),
+        kind="directory",
+        identity=after,
+        extended_metadata=filesystem_metadata,
+    )
+    _require_safe_writable_root_component(evidence, leaf=leaf)
+    return evidence
+
+
+def _writable_root_component_property_keys(
+    components: tuple[PathComponentEvidence, ...],
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            component.path,
+            component.kind,
+            component.identity.object_identity_key(),
+            component.identity.access_policy_key(),
+            component.extended_metadata,
+        )
+        for component in components
+    )
+
+
+def _writable_root_path_components_once(
+    path: pathlib.Path,
+) -> tuple[PathComponentEvidence, ...]:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    descriptors: list[int] = []
+    components: list[PathComponentEvidence] = []
+    try:
+        descriptors.append(os.open("/", directory_flags))
+        parts = path.parts[1:]
+        components.append(
+            _inspect_writable_root_component(
+                descriptors[-1],
+                path=pathlib.Path("/"),
+                leaf=not parts,
+            )
+        )
+        current = pathlib.Path("/")
+        for index, component in enumerate(parts):
+            current /= component
+            descriptors.append(
+                os.open(
+                    os.fsencode(component),
+                    directory_flags,
+                    dir_fd=descriptors[-1],
+                )
+            )
+            components.append(
+                _inspect_writable_root_component(
+                    descriptors[-1],
+                    path=current,
+                    leaf=index == len(parts) - 1,
+                )
+            )
+        return tuple(components)
+    except ExecutableAuthenticationError:
+        raise
+    except OSError as error:
+        raise ExecutableAuthenticationError(
+            f"cannot authenticate writable root ancestry: {error}"
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _stable_writable_root_path_components(
+    path: pathlib.Path,
+) -> tuple[PathComponentEvidence, ...]:
+    first = _writable_root_path_components_once(path)
+    second = _writable_root_path_components_once(path)
+    if _writable_root_component_property_keys(
+        first
+    ) != _writable_root_component_property_keys(second):
+        raise ExecutableAuthenticationError(
+            "writable root ancestry changed during authentication"
+        )
+    return second
 
 
 def _path_component_keys(path: pathlib.Path) -> tuple[tuple[int, int], ...]:
@@ -1448,13 +1626,10 @@ def _validated_writable_roots(
     root_components: list[tuple[tuple[int, int], ...]] = []
     root_keys: list[tuple[int, int]] = []
     for root in validated:
-        path = pathlib.Path(root.path)
-        first_components = _path_component_keys(path)
-        second_components = _path_component_keys(path)
-        if first_components != second_components:
-            raise ExecutableAuthenticationError(
-                "writable root path changed during authentication"
-            )
+        first_components = tuple(
+            (component.identity.device, component.identity.inode)
+            for component in root.path_components
+        )
         root_key = (root.identity.device, root.identity.inode)
         if (
             root_key in snapshot_component_keys
@@ -1494,13 +1669,10 @@ def _validated_sandboxed_writable_roots(
     root_keys: list[tuple[int, int]] = []
     root_paths: set[str] = set()
     for root in validated:
-        path = pathlib.Path(root.path)
-        first_components = _path_component_keys(path)
-        second_components = _path_component_keys(path)
-        if first_components != second_components:
-            raise ExecutableAuthenticationError(
-                "writable root path changed during authentication"
-            )
+        first_components = tuple(
+            (component.identity.device, component.identity.inode)
+            for component in root.path_components
+        )
         root_key = (root.identity.device, root.identity.inode)
         if first_components[-1] != root_key:
             raise ExecutableAuthenticationError(

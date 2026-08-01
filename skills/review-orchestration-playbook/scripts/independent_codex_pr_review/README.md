@@ -349,7 +349,7 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
-PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
+CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
@@ -359,6 +359,8 @@ read-only install runner 必须返回完整成功的 structured summary。该 su
 `primary_status == "complete"`、`primary_failure == null`、
 `child_process_closure == "proven"`、`cleanup_status == "complete"`、
 `cleanup_failures == []`、`release_tree_immutable == true`、
+`source_head_bound == true`、`source_head_sha == <full-head-sha>`、
+`source_manifest_sha256` 是完整小写 SHA-256、
 `no_child_runtime_profile == "production-current"`、`returncode == 0`、
 `retained_paths == []`、`runtime_residue == []`、`secondary_failures == []`、
 `signal_number == null`、`timed_out == false`、`creation_origin_proven == false`、

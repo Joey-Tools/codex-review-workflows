@@ -1770,8 +1770,15 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
+        no_child_profile = (
+            SCRIPTS
+            / "independent_codex_pr_review/review_supervisor/no_child_profile.py"
+        ).read_text(encoding="utf-8")
         test_support = (
             SCRIPTS / "independent_codex_pr_review/tests/support.py"
+        ).read_text(encoding="utf-8")
+        readonly_no_child_contract = (
+            SCRIPTS / "independent_codex_pr_review/tests/readonly_no_child_contract.py"
         ).read_text(encoding="utf-8")
         hosted_probe = (
             SCRIPTS / "independent_codex_pr_review/tests/"
@@ -1798,15 +1805,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 649", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 652", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 275", readonly_no_child_runner)
-        self.assertIn("EXPECTED_TEST_ID_SHA256 =", readonly_no_child_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 275", readonly_no_child_contract)
+        self.assertIn("EXPECTED_TEST_ID_SHA256 =", readonly_no_child_contract)
+        self.assertIn("SUCCESS_RECORD = json.dumps(", readonly_no_child_contract)
+        self.assertIn("SUCCESS_RECORD,", readonly_no_child_runner)
         self.assertIn("READONLY_NO_CHILD_MODULES", readonly_no_child_runner)
         self.assertIn(
             "selected_modules != READONLY_NO_CHILD_MODULES",
@@ -1833,6 +1842,8 @@ class RepositoryContractTest(unittest.TestCase):
             'os.environ.get("GITHUB_ACTIONS") == "true"',
             "forbidden under GitHub Actions",
             "prepare_sandboxed_python_no_child_profile(",
+            "NO_CHILD_SUCCESS_RECORD",
+            "lacks its exact completion record",
             "runtime_pin=runtime_pin",
             "run_bounded_command(",
             "bounded_command_process_closure(error)",
@@ -1870,6 +1881,12 @@ class RepositoryContractTest(unittest.TestCase):
             "bound cleanup entry close failed",
         ):
             self.assertIn(contract, test_support)
+        for contract in (
+            "path_components: tuple[PathComponentEvidence, ...]",
+            "_stable_writable_root_path_components(path)",
+            "writable root ancestor permits an untrusted writer",
+        ):
+            self.assertIn(contract, no_child_profile)
         for excluded_signal in (
             "link_count=metadata.st_nlink",
             "size=metadata.st_size",
@@ -1926,6 +1943,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile',
             '"$TRUSTED_PYTHON" -B -m '
             "tests.run_readonly_install_deterministic_supervisor",
+            "CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha>",
             "no-group-write/no-other-write",
             "interpreter's absolute path and digest",
             "tests.run_required_no_child_profile",
@@ -1940,6 +1958,9 @@ class RepositoryContractTest(unittest.TestCase):
             'cleanup_status == "complete"',
             "cleanup_failures == []",
             "release_tree_immutable == true",
+            "source_head_bound == true",
+            "source_head_sha == <full-head-sha>",
+            "source_manifest_sha256",
             'no_child_runtime_profile == "production-current"',
             "returncode == 0",
             "retained_paths == []",

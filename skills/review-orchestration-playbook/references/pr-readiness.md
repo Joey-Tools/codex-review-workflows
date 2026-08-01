@@ -80,7 +80,7 @@ runner:
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
-PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
+CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 ```
 
 Record the interpreter's absolute path and digest and exact `head_sha`; record
@@ -92,6 +92,8 @@ only when all of these predicates hold:
 - `child_process_closure == "proven"`
 - `cleanup_status == "complete"` and `cleanup_failures == []`
 - `release_tree_immutable == true`
+- `source_head_bound == true`, `source_head_sha == <full-head-sha>`, and
+  `source_manifest_sha256` is one full lowercase SHA-256
 - `no_child_runtime_profile == "production-current"`
 - `returncode == 0`
 - `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`

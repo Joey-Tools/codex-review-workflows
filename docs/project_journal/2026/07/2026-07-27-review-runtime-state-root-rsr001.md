@@ -368,3 +368,25 @@ superseded_by:
   deterministic gate passed 649/649 in 205.965 seconds with the reviewed 649-test selected identity
   and SHA-256
   `7be8915dfd39ff943aa782c73ea2e259c6a9c6a8a68bdd305227d85a1e712e56`.
+- The next frozen-range Fresh Codex review found that exit zero was not bound to
+  an exact no-child-suite completion record and that writable-root ancestry
+  bound only object identity, not owner/mode/ACL/xattr policy. The child now
+  emits one canonical count-and-identity success record only after all 275
+  selected tests pass without skips; the parent accepts exit zero only with
+  those exact bytes. Writable-root attestations now retain a descriptor-walked
+  component receipt for object identity and access policy, reject non-sticky
+  untrusted-writable ancestors, permit only root/current-user sticky ancestors,
+  and repeat the property-scoped receipt before launch.
+- A subsequent frozen-range Fresh Codex review found that the positive
+  installed-tree gate copied the live filesystem subtree without proving it
+  matched the recorded commit. The runner now requires an explicit full HEAD,
+  rejects tracked, untracked, or subtree-ignored input, and binds the source
+  checkout before and after copying. A stable content/access-policy manifest
+  must match the source before and after copying and the installed copy; the
+  terminal summary publishes the bound HEAD and manifest digest.
+- The completion-record, exact-source binding, and ancestor-policy repair passed
+  the affected Python 3.13 tests 103/103 in 11.082 seconds. The ordinary
+  deterministic gate passed 652/652 in 284.796 seconds with the
+  reviewed 652-test selected identity and SHA-256
+  `ae05fcb1dac9077c4d3a477413c762664c8d9046e467d8286a4f302fa9d52b39`.
+  Repository contracts passed 102/102 in 7.218 seconds.

@@ -301,3 +301,24 @@ superseded_by:
 - The affected Python 3.13 modules passed 106/106. The reviewed deterministic
   selection passed 649/649 in 205.965 seconds with identity SHA-256
   `7be8915dfd39ff943aa782c73ea2e259c6a9c6a8a68bdd305227d85a1e712e56`.
+- The next frozen-range Fresh Codex review found two remaining proof gaps. Exit
+  zero lacked a parent-verified record proving all 275 selected tests completed,
+  and writable-root ancestry retained device/inode identity without retaining
+  owner, mode, ACL, or xattr policy. A side-effect-free shared contract now owns
+  the selected count, identity digest, and canonical success JSON; the suite
+  emits it only after complete success and the parent requires exact stdout.
+  Writable-root authority now carries a descriptor-walked component receipt,
+  accepts only root/current-user-owned safe or sticky ancestors, and compares
+  object identity plus access policy on every revalidation before launch.
+- A subsequent frozen-range Fresh Codex review found that the runner copied its
+  live source subtree without binding those bytes to the recorded commit. The
+  runner now requires an explicit full HEAD, rejects dirty, untracked, and
+  subtree-ignored input, rebinds the checkout after copying, and requires one
+  stable content/access-policy manifest across the source before and after the
+  copy and the installed tree. Its terminal summary exposes the exact bound
+  HEAD and manifest digest.
+- Post-fix Python 3.13 validation passed the affected tests 103/103 in 11.082
+  seconds and the reviewed deterministic selection 652/652 in 284.796 seconds
+  with the reviewed 652-test selected identity and SHA-256
+  `ae05fcb1dac9077c4d3a477413c762664c8d9046e467d8286a4f302fa9d52b39`.
+  Repository contracts passed 102/102 in 7.218 seconds.
