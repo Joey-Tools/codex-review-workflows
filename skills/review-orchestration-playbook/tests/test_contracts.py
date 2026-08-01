@@ -1776,6 +1776,13 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
+        readonly_no_child_contract = (
+            SCRIPTS / "independent_codex_pr_review/tests/readonly_no_child_contract.py"
+        ).read_text(encoding="utf-8")
+        readonly_no_child_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_readonly_no_child_supervisor.py"
+        ).read_text(encoding="utf-8")
         hosted_probe = (
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_hosted_no_child_fail_closed.py"
@@ -1796,9 +1803,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("CodexExecutableAuthenticationTests", live_runner)
         self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
-        self.assertIn("expected_count != 9", live_runner)
+        self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 802", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 825", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1809,13 +1816,14 @@ class RepositoryContractTest(unittest.TestCase):
             'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
             "CODEX_REVIEW_TEST_RUNTIME_PARENT",
             "class TreeEntrySnapshot:",
-            "device=metadata.st_dev",
-            "inode=metadata.st_ino",
-            'flags=getattr(metadata, "st_flags", 0)',
+            "device=final_descriptor.st_dev",
+            "inode=final_descriptor.st_ino",
+            'flags=getattr(final_descriptor, "st_flags", 0)',
             "link_count=link_count",
-            "metadata.st_nlink != 1",
-            "xattrs=_xattr_snapshot(path)",
-            "acl_entries=_acl_entries(path)",
+            "initial.st_nlink != 1",
+            "_xattr_snapshot(descriptor)",
+            "_acl_entries(descriptor)",
+            "_tree_snapshot_once(root)",
             "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
             "run_bounded(",
@@ -1828,8 +1836,18 @@ class RepositoryContractTest(unittest.TestCase):
             '"release_tree_immutable": release_tree_immutable',
             '"release_tree_property": "object-identity-content-access-policy"',
             '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
+            '"cleanup_guarantee": CLEANUP_GUARANTEE',
+            '"creation_origin_guarantee": CREATION_ORIGIN_GUARANTEE',
+            '"creation_origin_proven": False',
             '"retained_paths": retained_paths',
-            "return 1 if primary_failed or cleanup_failures else 0",
+            '"source_head_bound": source_head_bound',
+            '"source_manifest_sha256": source_manifest_sha256',
+            "_bind_source_checkout(source_root)",
+            "_copy_bound_source(",
+            "_run_no_child_test_suite(",
+            "_run_bounded_child(",
+            "_freeze_lifecycle_terminal_signal(lifecycle_fence)",
+            "_publish_terminal_output(",
             '"tests.run_required_deterministic_supervisor"',
         ):
             self.assertIn(contract, readonly_install_runner)
@@ -1843,8 +1861,23 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("ignore_errors=True", readonly_install_runner)
         self.assertLess(
             readonly_install_runner.index("cleanup_failures = tuple("),
-            readonly_install_runner.index("print(json.dumps(summary"),
+            readonly_install_runner.rindex("_publish_terminal_output("),
         )
+        for completion_contract in (
+            "EXPECTED_TEST_COUNT = 275",
+            "EXPECTED_TEST_ID_SHA256 =",
+            '"status": "complete"',
+            '"tests_run": EXPECTED_TEST_COUNT',
+        ):
+            self.assertIn(completion_contract, readonly_no_child_contract)
+        for completion_contract in (
+            "SUCCESS_RECORD",
+            "selected_identity_sha256",
+            "result.wasSuccessful()",
+            "result.testsRun != EXPECTED_TEST_COUNT",
+            "result.skipped",
+        ):
+            self.assertIn(completion_contract, readonly_no_child_runner)
         for contract in (
             "return-before-ownership publisher",
             "launch `CALL`-to-caller-`STORE`",
@@ -1878,9 +1911,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("sandbox_apply", hosted_probe)
         for requirement in (
             "operator-enforced exact-head gate",
-            "nine tests run, zero skips",
+            "thirteen tests, zero skips",
             "Any push invalidates that evidence",
-            "Hosted CI's blocker-signature probe is not a substitute",
+            "neither Hosted CI's blocker-signature probe nor its "
+            "isolated-account read-only",
             "cd skills/review-orchestration-playbook/scripts/"
             "independent_codex_pr_review",
             "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
@@ -1888,6 +1922,10 @@ class RepositoryContractTest(unittest.TestCase):
             "no-group-write/no-other-write",
             "interpreter's absolute path and digest",
             "tests.run_required_no_child_profile",
+            "CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha>",
+            "tests.run_readonly_install_deterministic_supervisor",
+            "source_head_bound == true",
+            "production no-child proof",
         ):
             self.assertIn(requirement, pr_readiness)
         integration_test = (
@@ -2162,8 +2200,14 @@ class RepositoryContractTest(unittest.TestCase):
                     self.assertIn(protection, readonly_job)
                 for evidence in (
                     '"cleanup_failures": []',
+                    '"cleanup_guarantee": "custodied-manifest-quarantine-'
+                    'descriptor-revalidation-same-uid-final-rename-unlink-host-tcb"',
                     '"cleanup_status": "complete"',
+                    '"creation_origin_guarantee": "best-effort-128-bit-leaf-'
+                    'immediate-nofollow-open-same-uid-host-tcb"',
+                    '"creation_origin_proven": False',
                     '"install_parent_is_sticky_world_writable": True',
+                    '"no_child_runtime_profile": None',
                     '"primary_failure": None',
                     '"primary_status": "complete"',
                     '"release_tree_immutable": True',
@@ -2173,6 +2217,9 @@ class RepositoryContractTest(unittest.TestCase):
                     '"runtime_residue": []',
                     '"secondary_failures": []',
                     '"signal_number": None',
+                    '"source_head_bound": False',
+                    '"source_head_sha": None',
+                    '"source_manifest_sha256": None',
                     '"timed_out": False',
                 ):
                     self.assertIn(evidence, readonly_job)

@@ -25,6 +25,33 @@ from .support import owned_temporary_directory
 
 
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._source_binding = runner.SourceCheckoutBinding(
+            repo_root=pathlib.Path("/synthetic/repo"),
+            head_sha="a" * 40,
+            source_relative_path="source",
+        )
+        patchers = (
+            mock.patch.object(
+                runner,
+                "_bind_source_checkout",
+                return_value=self._source_binding,
+            ),
+            mock.patch.object(
+                runner,
+                "_source_manifest_sha256",
+                return_value="b" * 64,
+            ),
+            mock.patch.object(
+                runner,
+                "_source_root_gid",
+                return_value=os.getgid(),
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def _make_private_directory(path: pathlib.Path) -> None:
         path.mkdir(mode=0o700)
@@ -6458,26 +6485,26 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
             target.write_text("content", encoding="utf-8")
-            acl_entries: dict[pathlib.Path, tuple[bytes, ...]] = {}
-            xattrs: dict[pathlib.Path, tuple[tuple[str, str], ...]] = {}
+            acl_entries: tuple[bytes, ...] = ()
+            xattrs: tuple[tuple[bytes, str], ...] = ()
 
             with (
                 mock.patch.object(
                     runner,
                     "_acl_entries",
-                    side_effect=lambda path: acl_entries.get(path, ()),
+                    side_effect=lambda _descriptor: acl_entries,
                 ),
                 mock.patch.object(
                     runner,
                     "_xattr_snapshot",
-                    side_effect=lambda path: xattrs.get(path, ()),
+                    side_effect=lambda _descriptor: xattrs,
                 ),
             ):
                 baseline = runner._tree_snapshot(root)
-                acl_entries[target] = (b" 0: user:synthetic allow write",)
+                acl_entries = (b" 0: user:synthetic allow write",)
                 acl_changed = runner._tree_snapshot(root)
-                acl_entries.clear()
-                xattrs[target] = ((b"com.apple.synthetic", "digest"),)
+                acl_entries = ()
+                xattrs = ((b"com.apple.synthetic", "digest"),)
                 xattr_changed = runner._tree_snapshot(root)
 
             self.assertNotEqual(baseline[target.name], acl_changed[target.name])
@@ -6599,30 +6626,45 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         with owned_temporary_directory("readonly-child-descendant-") as root:
             group_file = root / "process-group"
-            result = runner._run_bounded_child(
-                (
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    child_script,
-                    str(group_file),
+            # The ordinary developer account is not the hosted isolated account.
+            # Scope this fixture's census so unrelated same-UID process churn
+            # cannot replace its real process-group settlement assertion.
+            with (
+                mock.patch.object(
+                    runner,
+                    "_stable_same_uid_processes",
+                    return_value=(),
                 ),
-                cwd=root,
-                environment={
-                    "LANG": "C",
-                    "LC_ALL": "C",
-                    "PATH": "/usr/bin:/bin",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                timeout=5,
-                stdout_limit=1024,
-                stderr_limit=1024,
-            )
+                mock.patch.object(
+                    runner,
+                    "_require_no_new_same_uid_processes",
+                ) as require_closure,
+            ):
+                result = runner._run_bounded_child(
+                    (
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        child_script,
+                        str(group_file),
+                    ),
+                    cwd=root,
+                    environment={
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                )
 
             process_group = int(group_file.read_text(encoding="ascii"))
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, "")
+            require_closure.assert_called_once_with(())
             self._require_process_group_absent(process_group)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
@@ -6997,7 +7039,20 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         with owned_temporary_directory("readonly-child-overflow-") as root:
             group_file = root / "process-group"
-            with self.assertRaisesRegex(OverflowError, "byte cap"):
+            # Keep the real overflow/process-group behavior while excluding
+            # unrelated same-UID developer-account churn from this fixture.
+            with (
+                mock.patch.object(
+                    runner,
+                    "_stable_same_uid_processes",
+                    return_value=(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_require_no_new_same_uid_processes",
+                ) as require_closure,
+                self.assertRaisesRegex(OverflowError, "byte cap"),
+            ):
                 runner._run_bounded_child(
                     (
                         sys.executable,
@@ -7019,6 +7074,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             process_group = int(group_file.read_text(encoding="ascii"))
+            require_closure.assert_called_once_with(())
             self._require_process_group_absent(process_group)
 
     def test_bounded_child_receipt_failure_does_not_skip_closure(self) -> None:
@@ -7344,10 +7400,14 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         worker_script = (
             "import os,pathlib,sys\n"
+            "from unittest import mock\n"
             "from tests import run_readonly_install_deterministic_supervisor as runner\n"
             "root=pathlib.Path(sys.argv[1])\n"
             "try:\n"
-            " runner._run_bounded_child("
+            " with mock.patch.object(runner,'_stable_same_uid_processes',"
+            "return_value=()),mock.patch.object("
+            "runner,'_require_no_new_same_uid_processes'):\n"
+            "  runner._run_bounded_child("
             "(sys.executable,'-B','-c',sys.argv[2],sys.argv[3],sys.argv[4]),"
             "cwd=root,environment={'LANG':'C','LC_ALL':'C',"
             "'PATH':'/usr/bin:/bin','PYTHONDONTWRITEBYTECODE':'1'},"
@@ -7394,7 +7454,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 worker.send_signal(signal.SIGTERM)
                 stdout, stderr = worker.communicate(timeout=10)
 
-                self.assertEqual(worker.returncode, 128 + signal.SIGTERM)
+                self.assertEqual(
+                    worker.returncode,
+                    128 + signal.SIGTERM,
+                    stderr.decode("utf-8", "replace"),
+                )
                 self.assertEqual(stdout, b"")
                 self.assertEqual(stderr, b"")
                 self._require_process_group_absent(process_group)
@@ -8031,6 +8095,1610 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(original_runtime_parent.is_dir())
             self.assertTrue(runtime_parent.is_dir())
             self.assertIn("test runtime parent path changed", stderr.getvalue())
+
+    def test_terminal_signal_publication_is_linearized_in_a_real_process(
+        self,
+    ) -> None:
+        self.assertEqual(sys.version_info[:2], (3, 13))
+        test_names = unittest.defaultTestLoader.getTestCaseNames(
+            TerminalPublicationSignalIntegrationTests
+        )
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+            TerminalPublicationSignalIntegrationTests
+        )
+        transcript = io.StringIO()
+        result = unittest.TextTestRunner(
+            stream=transcript,
+            verbosity=2,
+        ).run(suite)
+
+        detail = transcript.getvalue()
+        self.assertEqual(result.testsRun, len(test_names), detail)
+        self.assertGreater(result.testsRun, 0, detail)
+        self.assertFalse(
+            any(
+                (
+                    result.failures,
+                    result.errors,
+                    result.skipped,
+                    result.expectedFailures,
+                    result.unexpectedSuccesses,
+                )
+            ),
+            detail,
+        )
+        self.assertTrue(result.wasSuccessful(), detail)
+
+    def test_no_child_suite_python_startup_ignores_site_injection(self) -> None:
+        self.assertEqual(sys.version_info[:2], (3, 13))
+        with owned_temporary_directory("readonly-python-site-injection-") as root:
+            pythonpath_root = root / "pythonpath"
+            pythonpath_root.mkdir(mode=0o700)
+            user_base = root / "user-base"
+            user_site = (
+                user_base
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+            user_site.mkdir(mode=0o700, parents=True)
+            child_cwd = root / "child-cwd"
+            child_cwd.mkdir(mode=0o700)
+            sitecustomize_marker = root / "sitecustomize-loaded"
+            pth_marker = root / "pth-loaded"
+            (pythonpath_root / "sitecustomize.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(sitecustomize_marker)!r}).write_text("
+                "'loaded\\n', encoding='ascii')\n"
+                "raise RuntimeError('sitecustomize injection executed')\n",
+                encoding="ascii",
+            )
+            (pythonpath_root / "injected_from_pythonpath.py").write_text(
+                "VALUE = 'injected'\n",
+                encoding="ascii",
+            )
+            (user_site / "injected.pth").write_text(
+                "import pathlib; "
+                f"pathlib.Path({str(pth_marker)!r}).write_text("
+                "'loaded\\n', encoding='ascii')\n"
+                f"{pythonpath_root}\n",
+                encoding="ascii",
+            )
+            child_code = (
+                "import json,pathlib,sys\n"
+                "user_site=str(pathlib.Path(sys.argv[1]).resolve())\n"
+                "pythonpath_root=str(pathlib.Path(sys.argv[2]).resolve())\n"
+                "try:\n"
+                " import injected_from_pythonpath\n"
+                "except ModuleNotFoundError:\n"
+                " injected=False\n"
+                "else:\n"
+                " injected=True\n"
+                "record={\n"
+                " 'dont_write_bytecode':sys.flags.dont_write_bytecode==1,\n"
+                " 'isolated':sys.flags.isolated==1,\n"
+                " 'no_site':sys.flags.no_site==1,\n"
+                " 'pythonpath_imported':injected,\n"
+                " 'pythonpath_on_sys_path':pythonpath_root in sys.path,\n"
+                " 'sitecustomize_loaded':'sitecustomize' in sys.modules,\n"
+                " 'user_site_on_sys_path':user_site in sys.path,\n"
+                "}\n"
+                "print(json.dumps(record,sort_keys=True,separators=(',',':')))\n"
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["PYTHONPATH"] = str(pythonpath_root)
+            environment["PYTHONUSERBASE"] = str(user_base)
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    child_code,
+                    str(user_site),
+                    str(pythonpath_root),
+                ),
+                cwd=child_cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", "replace"),
+            )
+            self.assertEqual(completed.stderr, b"")
+            self.assertEqual(
+                json.loads(completed.stdout.decode("ascii", "strict")),
+                {
+                    "dont_write_bytecode": True,
+                    "isolated": True,
+                    "no_site": True,
+                    "pythonpath_imported": False,
+                    "pythonpath_on_sys_path": False,
+                    "sitecustomize_loaded": False,
+                    "user_site_on_sys_path": False,
+                },
+            )
+            self.assertFalse(sitecustomize_marker.exists())
+            self.assertFalse(pth_marker.exists())
+            self.assertEqual(tuple(root.rglob("*.pyc")), ())
+            self.assertEqual(tuple(root.rglob("__pycache__")), ())
+
+    def test_bound_close_failure_never_retains_lexical_replacement(self) -> None:
+        with owned_temporary_directory("readonly-bound-close-moved-") as root:
+            lexical_path = root / "bound"
+            self._make_private_directory(lexical_path)
+            (lexical_path / "sentinel").write_text("held\n", encoding="ascii")
+            moved_path = root / "moved-bound"
+            parent_result_owner = support._DirectoryParentBindingResultOwner()
+            binding = self._open_parent_binding(
+                parent_result_owner,
+                lexical_path,
+                require_owned_private_parent=True,
+            )
+            held_identity = binding.object_locator()
+            try:
+                lexical_path.rename(moved_path)
+                self._make_private_directory(lexical_path)
+                (lexical_path / "sentinel").write_text(
+                    "replacement\n",
+                    encoding="ascii",
+                )
+                evidence = runner._bound_path_evidence(binding)
+                close_error = OSError(
+                    errno.EIO,
+                    "synthetic moved binding close failure",
+                )
+                with (
+                    mock.patch.object(
+                        support._DirectoryParentBinding,
+                        "close",
+                        autospec=True,
+                        side_effect=close_error,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    binding.close()
+
+                failure = runner._bound_close_failure(
+                    binding,
+                    caught.exception,
+                    evidence=evidence,
+                    evidence_error=None,
+                )
+                descriptor_uri = (
+                    "descriptor-object://"
+                    f"{held_identity['device']}/{held_identity['inode']}"
+                )
+                self.assertIn(failure.path, {str(moved_path), descriptor_uri})
+                self.assertNotEqual(failure.path, str(lexical_path))
+                self.assertIn(failure.path_status, {"bound-moved", "descriptor-object"})
+                self.assertEqual(failure.original_path, str(lexical_path))
+                self.assertEqual(failure.replacement_path, str(lexical_path))
+                self.assertEqual(failure.held_identity, held_identity)
+                self.assertEqual(failure.error_kind, "OSError")
+                self.assertEqual(failure.error_errno, errno.EIO)
+                self.assertEqual(
+                    (moved_path / "sentinel").read_text(encoding="ascii"),
+                    "held\n",
+                )
+                self.assertEqual(
+                    (lexical_path / "sentinel").read_text(encoding="ascii"),
+                    "replacement\n",
+                )
+            finally:
+                parent_result_owner.close()
+
+
+class _RunnerFilesystemTestCase(unittest.TestCase):
+    @staticmethod
+    def _make_private_directory(path: pathlib.Path) -> None:
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+
+    @staticmethod
+    def _open_parent_binding(
+        result_owner: support._DirectoryParentBindingResultOwner,
+        path: pathlib.Path,
+        *,
+        require_owned_private_parent: bool,
+    ) -> support._DirectoryParentBinding:
+        try:
+            binding = support._open_directory_parent(
+                path,
+                require_owned_private_parent=require_owned_private_parent,
+                result_owner=result_owner,
+            )
+            result_owner.transfer(binding)
+            return binding
+        except BaseException as error:
+            preserved = (
+                support._settle_directory_parent_binding_result_preserving_trigger(
+                    result_owner,
+                    error,
+                )
+            )
+            if preserved is error:
+                raise
+            raise preserved
+
+    @classmethod
+    def _bound_directory_factory(
+        cls,
+        *paths: pathlib.Path,
+    ) -> object:
+        remaining = iter(paths)
+
+        def create(
+            _parent: pathlib.Path,
+            _prefix: str,
+            *,
+            result_owner: support._PrivateDirectoryCreationResultOwner,
+            require_owned_private_parent: bool = True,
+        ) -> support._DirectoryParentBinding:
+            parent_result_owner = support._DirectoryParentBindingResultOwner()
+            binding = cls._open_parent_binding(
+                parent_result_owner,
+                next(remaining),
+                require_owned_private_parent=require_owned_private_parent,
+            )
+            result_owner.publish(binding)
+            return binding
+
+        return create
+
+
+class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _git(repo: pathlib.Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            (
+                "/usr/bin/git",
+                "--no-pager",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex-test@example.invalid",
+                "-C",
+                str(repo),
+                *arguments,
+            ),
+            env={
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "HOME": str(repo),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace")[-2_048:]
+            raise AssertionError(
+                f"synthetic Git command failed ({completed.returncode}): {detail}"
+            )
+        return completed.stdout.decode("ascii", "strict").strip()
+
+    @classmethod
+    @contextlib.contextmanager
+    def _synthetic_repository(
+        cls,
+    ) -> object:
+        with owned_temporary_directory("readonly-source-binding-") as root:
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            source = repo / "source"
+            source.mkdir(mode=0o700)
+            (source / "payload.txt").write_text("original\n", encoding="ascii")
+            (repo / ".gitignore").write_text(
+                "source/*.ignored\n",
+                encoding="ascii",
+            )
+            cls._git(repo, "init", "-q")
+            cls._git(repo, "add", "--all")
+            cls._git(repo, "commit", "-q", "-m", "Initial synthetic tree")
+            head_sha = cls._git(repo, "rev-parse", "HEAD")
+            yield root, repo, source, head_sha
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _expected_head(value: str | None) -> object:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if value is None:
+                os.environ.pop(runner.EXPECTED_HEAD_ENV, None)
+            else:
+                os.environ[runner.EXPECTED_HEAD_ENV] = value
+            yield
+
+    def test_clean_exact_head_binding_and_stable_copy(self) -> None:
+        with self._synthetic_repository() as (root, repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = runner._source_manifest_sha256(source)
+                installed = root / "installed"
+                copied_manifest = runner._copy_bound_source(
+                    source,
+                    installed,
+                    binding,
+                    source_manifest,
+                )
+
+            self.assertEqual(
+                binding,
+                runner.SourceCheckoutBinding(
+                    repo_root=repo.resolve(),
+                    head_sha=head_sha,
+                    source_relative_path="source",
+                ),
+            )
+            self.assertEqual(copied_manifest, source_manifest)
+            self.assertEqual(
+                runner._source_manifest_sha256(installed),
+                source_manifest,
+            )
+            self.assertEqual(
+                (installed / "payload.txt").read_text(encoding="ascii"),
+                "original\n",
+            )
+
+    def test_binding_rejects_missing_invalid_and_mismatched_expected_head(
+        self,
+    ) -> None:
+        with self._synthetic_repository() as (_root, _repo, source, head_sha):
+            invalid_values = (
+                ("missing", None),
+                ("short", "a" * 39),
+                ("uppercase", "A" * 40),
+                ("non-hex", "g" * 40),
+            )
+            for label, value in invalid_values:
+                with (
+                    self.subTest(case=label),
+                    self._expected_head(value),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "must be one full lowercase SHA-1",
+                    ),
+                ):
+                    runner._bind_source_checkout(source)
+
+            mismatch = "0" * 40
+            self.assertNotEqual(mismatch, head_sha)
+            with (
+                self._expected_head(mismatch),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "HEAD does not match the expected exact head",
+                ),
+            ):
+                runner._bind_source_checkout(source)
+
+    def test_binding_rejects_tracked_untracked_and_ignored_inputs(self) -> None:
+        cases = (
+            (
+                "tracked",
+                lambda source: (source / "payload.txt").write_text(
+                    "modified\n",
+                    encoding="ascii",
+                ),
+                "tracked or untracked changes",
+            ),
+            (
+                "untracked",
+                lambda source: (source / "untracked.txt").write_text(
+                    "untracked\n",
+                    encoding="ascii",
+                ),
+                "tracked or untracked changes",
+            ),
+            (
+                "ignored",
+                lambda source: (source / "payload.ignored").write_text(
+                    "ignored\n",
+                    encoding="ascii",
+                ),
+                "ignored files outside exact HEAD",
+            ),
+        )
+        for label, mutate, expected_message in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    _root,
+                    _repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                mutate(source)
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, expected_message),
+                ):
+                    runner._bind_source_checkout(source)
+
+    def test_copy_rejects_source_mutation_during_copy(self) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = runner._source_manifest_sha256(source)
+                real_copytree = runner.shutil.copytree
+
+                def copy_then_mutate(
+                    source_path: pathlib.Path,
+                    destination: pathlib.Path,
+                    **kwargs: object,
+                ) -> pathlib.Path:
+                    copied = real_copytree(source_path, destination, **kwargs)
+                    (pathlib.Path(source_path) / "payload.txt").write_text(
+                        "mutated during copy\n",
+                        encoding="ascii",
+                    )
+                    return copied
+
+                with (
+                    mock.patch.object(
+                        runner.shutil,
+                        "copytree",
+                        side_effect=copy_then_mutate,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "tracked or untracked changes|stable exact-head source",
+                    ),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        root / "installed",
+                        binding,
+                        source_manifest,
+                    )
+
+
+class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
+    SOURCE_HEAD = "a" * 40
+    SOURCE_MANIFEST = "b" * 64
+
+    def _run_selected_path(
+        self,
+        *,
+        expected_head: str | None,
+    ) -> tuple[
+        int,
+        dict[str, object],
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+    ]:
+        with owned_temporary_directory("readonly-runner-selection-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir(mode=0o700)
+            sticky_parent.chmod(0o1777)
+            install_container = sticky_parent / "install"
+            self._make_private_directory(install_container)
+            runtime_home = root / "runtime-home"
+            self._make_private_directory(runtime_home)
+            runtime_parent = runtime_home / "runtime"
+            self._make_private_directory(runtime_parent)
+            cleanup_control = runtime_home / "cleanup-control"
+            self._make_private_directory(cleanup_control)
+            source_binding = runner.SourceCheckoutBinding(
+                repo_root=pathlib.Path("/synthetic/repo"),
+                head_sha=self.SOURCE_HEAD,
+                source_relative_path="source",
+            )
+            completed = subprocess.CompletedProcess(
+                args=(sys.executable,),
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            def fake_copytree(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                **_kwargs: object,
+            ) -> pathlib.Path:
+                destination = pathlib.Path(destination)
+                destination.mkdir(mode=0o700)
+                return destination
+
+            def fake_bound_copy(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                binding: runner.SourceCheckoutBinding,
+                source_manifest: str,
+            ) -> str:
+                self.assertEqual(binding, source_binding)
+                self.assertEqual(source_manifest, self.SOURCE_MANIFEST)
+                destination.mkdir(mode=0o700)
+                return source_manifest
+
+            def complete_no_child(**kwargs: object) -> subprocess.CompletedProcess[str]:
+                proof = kwargs["closure_proof"]
+                assert isinstance(proof, runner.ChildProcessClosureProof)
+                proof.started = True
+                proof.proven = True
+                proof.destructive_cleanup_authorized = True
+                proof.runtime_profile = "production-current"
+                return completed
+
+            def complete_hosted(
+                *_args: object,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                proof = kwargs["closure_proof"]
+                assert isinstance(proof, runner.ChildProcessClosureProof)
+                proof.started = True
+                proof.proven = True
+                proof.destructive_cleanup_authorized = True
+                return completed
+
+            bind_source = mock.Mock(return_value=source_binding)
+            source_manifest = mock.Mock(return_value=self.SOURCE_MANIFEST)
+            copy_bound_source = mock.Mock(side_effect=fake_bound_copy)
+            run_no_child = mock.Mock(side_effect=complete_no_child)
+            run_bounded_child = mock.Mock(side_effect=complete_hosted)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            lifecycle_fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+            )
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    return_value=runtime_home,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_create_bound_owned_private_directory",
+                    side_effect=self._bound_directory_factory(
+                        install_container,
+                        runtime_parent,
+                        cleanup_control,
+                    ),
+                ),
+                mock.patch.object(runner, "_bind_source_checkout", bind_source),
+                mock.patch.object(
+                    runner,
+                    "_source_manifest_sha256",
+                    source_manifest,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_source_root_gid",
+                    return_value=os.getgid(),
+                ),
+                mock.patch.object(runner, "_align_created_directory_group"),
+                mock.patch.object(
+                    runner,
+                    "_copy_bound_source",
+                    copy_bound_source,
+                ),
+                mock.patch.object(
+                    runner.shutil,
+                    "copytree",
+                    side_effect=fake_copytree,
+                ),
+                mock.patch.object(runner, "_set_tree_read_only"),
+                mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                mock.patch.object(
+                    runner,
+                    "_run_no_child_test_suite",
+                    run_no_child,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_bounded_child",
+                    run_bounded_child,
+                ),
+                mock.patch.object(runner, "_list_bound_directory", return_value=()),
+                mock.patch.object(
+                    runner,
+                    "_consume_cleanup_bound_tree_endpoint",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_consume_cleanup_empty_bound_control_endpoint",
+                    return_value=None,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                os.environ.pop("GITHUB_ACTIONS", None)
+                os.environ.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+                os.environ.pop(runner.RUNNER_ARCH_ENV, None)
+                if expected_head is None:
+                    os.environ.pop(runner.EXPECTED_HEAD_ENV, None)
+                else:
+                    os.environ[runner.EXPECTED_HEAD_ENV] = expected_head
+                returncode = runner._run_main(
+                    lifecycle_fence,
+                    terminal_process=False,
+                )
+
+            self.assertEqual(stderr.getvalue(), "")
+            summary = json.loads(stdout.getvalue())
+            return (
+                returncode,
+                summary,
+                bind_source,
+                copy_bound_source,
+                run_no_child,
+                run_bounded_child,
+            )
+
+    def test_explicit_expected_head_selects_trusted_mac_no_child_path(self) -> None:
+        (
+            returncode,
+            summary,
+            bind_source,
+            copy_bound_source,
+            run_no_child,
+            run_bounded_child,
+        ) = self._run_selected_path(expected_head=self.SOURCE_HEAD)
+
+        self.assertEqual(returncode, 0)
+        bind_source.assert_called_once()
+        copy_bound_source.assert_called_once()
+        run_no_child.assert_called_once()
+        run_bounded_child.assert_not_called()
+        self.assertEqual(summary["primary_status"], "complete")
+        self.assertEqual(summary["no_child_runtime_profile"], "production-current")
+        self.assertIs(summary["source_head_bound"], True)
+        self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
+        self.assertIs(summary["creation_origin_proven"], False)
+        self.assertEqual(
+            summary["creation_origin_guarantee"],
+            "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            summary["cleanup_guarantee"],
+            "custodied-manifest-quarantine-descriptor-revalidation-"
+            "same-uid-final-rename-unlink-host-tcb",
+        )
+
+    def test_missing_expected_head_keeps_hosted_isolated_account_path(self) -> None:
+        (
+            returncode,
+            summary,
+            bind_source,
+            copy_bound_source,
+            run_no_child,
+            run_bounded_child,
+        ) = self._run_selected_path(expected_head=None)
+
+        self.assertEqual(returncode, 0)
+        bind_source.assert_not_called()
+        copy_bound_source.assert_not_called()
+        run_no_child.assert_not_called()
+        run_bounded_child.assert_called_once()
+        call = run_bounded_child.call_args
+        self.assertEqual(
+            call.args[0],
+            (
+                sys.executable,
+                "-B",
+                "-m",
+                "tests.run_required_deterministic_supervisor",
+            ),
+        )
+        self.assertIs(call.kwargs["require_isolated_account"], True)
+        self.assertEqual(call.kwargs["environment"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(summary["primary_status"], "complete")
+        self.assertIs(summary["source_head_bound"], False)
+        self.assertIsNone(summary["source_head_sha"])
+        self.assertIsNone(summary["source_manifest_sha256"])
+
+
+class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
+    _UNSET = object()
+
+    @staticmethod
+    def _closure(
+        *,
+        authenticated: bool = True,
+        closure_proven: bool = True,
+        leader_reaped: bool = True,
+        stdio_closed: bool = True,
+        process_group_used: bool = False,
+    ) -> mock.Mock:
+        closure = mock.Mock()
+        closure.authenticated_no_child_profile = authenticated
+        closure.permitted_process_closure_proven = closure_proven
+        closure.leader_reaped = leader_reaped
+        closure.stdio_closed = stdio_closed
+        closure.process_group_emptiness_used_as_descendant_proof = process_group_used
+        return closure
+
+    @staticmethod
+    def _command_result(
+        *,
+        closure: object,
+        returncode: int = 0,
+        stdout: bytes | None = None,
+        stderr: bytes = b"",
+    ) -> mock.Mock:
+        result = mock.Mock()
+        result.process_closure = closure
+        result.returncode = returncode
+        result.stdout = (
+            (runner.NO_CHILD_SUCCESS_RECORD + "\n").encode("ascii")
+            if stdout is None
+            else stdout
+        )
+        result.stderr = stderr
+        return result
+
+    @contextlib.contextmanager
+    def _bound_roots(self) -> object:
+        with owned_temporary_directory("readonly-no-child-suite-") as root:
+            install_container = root / "install"
+            self._make_private_directory(install_container)
+            installed_root = install_container / "installed"
+            self._make_private_directory(installed_root)
+            runtime_parent = root / "runtime"
+            self._make_private_directory(runtime_parent)
+            install_owner = support._DirectoryParentBindingResultOwner()
+            runtime_owner = support._DirectoryParentBindingResultOwner()
+            install_binding = self._open_parent_binding(
+                install_owner,
+                install_container,
+                require_owned_private_parent=True,
+            )
+            runtime_binding = self._open_parent_binding(
+                runtime_owner,
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                yield (
+                    installed_root,
+                    install_binding,
+                    runtime_binding,
+                    runtime_parent,
+                )
+            finally:
+                runtime_owner.close()
+                install_owner.close()
+
+    def _invoke(
+        self,
+        outcome: object,
+        *,
+        proof: runner.ChildProcessClosureProof | None = None,
+        prepared: object | None = None,
+        error_closure: object = _UNSET,
+        timeout: float = 17,
+        stdout_limit: int = 1_024,
+        stderr_limit: int = 2_048,
+    ) -> tuple[
+        subprocess.CompletedProcess[str],
+        runner.ChildProcessClosureProof,
+        mock.Mock,
+        mock.Mock,
+        object,
+        tuple[str, ...],
+    ]:
+        closure_proof = proof or runner.ChildProcessClosureProof()
+        target = mock.Mock()
+        target.path = "/trusted/python3.13"
+        selected_prepared = prepared or mock.Mock(sandboxed_target=target)
+        writable_attestation = mock.sentinel.writable_runtime
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            runtime_parent,
+        ):
+            expected_argv = (
+                target.path,
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                runner.NO_CHILD_SUITE_CODE,
+                str(installed_root),
+                str(runtime_parent),
+            )
+            command_kwargs = (
+                {"side_effect": outcome}
+                if isinstance(outcome, BaseException)
+                else {"return_value": outcome}
+            )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {}, clear=False))
+                for name in (
+                    "GITHUB_ACTIONS",
+                    runner.RUNNER_ENVIRONMENT_ENV,
+                    runner.RUNNER_ARCH_ENV,
+                ):
+                    os.environ.pop(name, None)
+                stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "_bound_child_signals",
+                        return_value=contextlib.nullcontext(),
+                    )
+                )
+                attest = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "attest_writable_root",
+                        return_value=writable_attestation,
+                    )
+                )
+                prepare = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "prepare_sandboxed_python_no_child_profile",
+                        return_value=selected_prepared,
+                    )
+                )
+                run_command = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "run_bounded_command",
+                        **command_kwargs,
+                    )
+                )
+                if error_closure is not self._UNSET:
+                    stack.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "bounded_command_process_closure",
+                            return_value=error_closure,
+                        )
+                    )
+                completed = runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=timeout,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                    closure_proof=closure_proof,
+                )
+
+            attest.assert_called_once_with(
+                runtime_parent,
+                directory_fd=runtime_binding.fd,
+            )
+            return (
+                completed,
+                closure_proof,
+                prepare,
+                run_command,
+                selected_prepared,
+                expected_argv,
+            )
+
+    def test_exact_production_profile_argv_success_record_and_closure(self) -> None:
+        closure = self._closure()
+        result = self._command_result(closure=closure)
+        (
+            completed,
+            proof,
+            prepare,
+            run_command,
+            prepared,
+            expected_argv,
+        ) = self._invoke(result)
+
+        self.assertEqual(completed.args, expected_argv)
+        self.assertEqual(
+            completed.stdout,
+            runner.NO_CHILD_SUCCESS_RECORD + "\n",
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(proof.started)
+        self.assertTrue(proof.proven)
+        self.assertTrue(proof.destructive_cleanup_authorized)
+        self.assertEqual(proof.runtime_profile, "production-current")
+        prepare.assert_called_once_with(
+            additional_seatbelt_rules="(deny file-write*)",
+            runtime_pin=runner.no_child_profile.PINNED_RUNTIME,
+            writable_roots=(mock.sentinel.writable_runtime,),
+        )
+        run_command.assert_called_once_with(
+            expected_argv,
+            timeout_seconds=17,
+            max_output_bytes=3_072,
+            max_stdout_bytes=1_024,
+            max_stderr_bytes=2_048,
+            _prepared_no_child_profile=prepared,
+        )
+
+    def test_zero_exit_rejects_missing_and_forged_completion_records(self) -> None:
+        outputs = (
+            ("missing", b""),
+            (
+                "forged",
+                (runner.NO_CHILD_SUCCESS_RECORD + "\nforged\n").encode("ascii"),
+            ),
+        )
+        for label, stdout in outputs:
+            proof = runner.ChildProcessClosureProof()
+            result = self._command_result(
+                closure=self._closure(),
+                stdout=stdout,
+            )
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks its exact completion record",
+                ),
+            ):
+                self._invoke(result, proof=proof)
+            self.assertTrue(proof.started)
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+    def test_result_rejects_unauthenticated_or_nonclosed_closure(self) -> None:
+        closures = (
+            ("unauthenticated", self._closure(authenticated=False)),
+            ("closure-unproven", self._closure(closure_proven=False)),
+            ("leader-unreaped", self._closure(leader_reaped=False)),
+            ("stdio-open", self._closure(stdio_closed=False)),
+            ("process-group-substitute", self._closure(process_group_used=True)),
+        )
+        for label, closure in closures:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks an authenticated no-child proof",
+                ),
+            ):
+                self._invoke(
+                    self._command_result(closure=closure),
+                    proof=proof,
+                )
+            self.assertTrue(proof.started)
+            self.assertFalse(proof.proven)
+            self.assertFalse(proof.destructive_cleanup_authorized)
+
+    def test_output_limit_failures_preserve_exact_scope(self) -> None:
+        for scope, limit in (
+            ("stdout", 111),
+            ("stderr", 222),
+            ("aggregate", 333),
+        ):
+            proof = runner.ChildProcessClosureProof()
+            error = runner.BoundedCommandOutputLimitExceeded(
+                scope=scope,
+                limit=limit,
+            )
+            with (
+                self.subTest(scope=scope),
+                self.assertRaises(runner.ChildOutputLimitExceeded) as caught,
+            ):
+                self._invoke(
+                    error,
+                    proof=proof,
+                    error_closure=self._closure(stdio_closed=False),
+                )
+            self.assertEqual(caught.exception.scope, scope)
+            self.assertEqual(caught.exception.limit, limit)
+            self.assertIs(caught.exception.__cause__, error)
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+        returned_overflow = (
+            ("stdout", b"xx", b"", 1, 8),
+            ("stderr", b"", b"xx", 8, 1),
+        )
+        for scope, stdout, stderr, stdout_limit, stderr_limit in returned_overflow:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                self.subTest(returned_scope=scope),
+                self.assertRaises(runner.ChildOutputLimitExceeded) as caught,
+            ):
+                self._invoke(
+                    self._command_result(
+                        closure=self._closure(),
+                        stdout=stdout,
+                        stderr=stderr,
+                    ),
+                    proof=proof,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                )
+            self.assertEqual(caught.exception.scope, scope)
+            self.assertEqual(
+                caught.exception.limit,
+                stdout_limit if scope == "stdout" else stderr_limit,
+            )
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+    def test_timeout_propagates_and_requires_authenticated_error_closure(
+        self,
+    ) -> None:
+        for label, closure, expected_proven in (
+            (
+                "authenticated",
+                self._closure(stdio_closed=False),
+                True,
+            ),
+            ("missing", None, False),
+        ):
+            proof = runner.ChildProcessClosureProof()
+            timeout_error = TimeoutError(f"synthetic {label} timeout")
+            with (
+                self.subTest(case=label),
+                self.assertRaises(TimeoutError) as caught,
+            ):
+                self._invoke(
+                    timeout_error,
+                    proof=proof,
+                    error_closure=closure,
+                )
+            self.assertIs(caught.exception, timeout_error)
+            self.assertEqual(proof.proven, expected_proven)
+            self.assertEqual(proof.destructive_cleanup_authorized, expected_proven)
+
+    def test_signal_after_profile_preparation_precedes_target_read(self) -> None:
+        class PreparedTargetTrap:
+            accessed = False
+
+            @property
+            def sandboxed_target(self) -> object:
+                self.accessed = True
+                raise AssertionError("sandboxed target was read after pending signal")
+
+        lifecycle_fence = runner.LifecycleSignalFence(
+            signals=(),
+            previous_handlers=(),
+            previous_mask=set(),
+        )
+        proof = runner.ChildProcessClosureProof()
+        prepared = PreparedTargetTrap()
+
+        def prepare_profile(**_kwargs: object) -> PreparedTargetTrap:
+            lifecycle_fence.received_signal = signal.SIGTERM
+            return prepared
+
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            _runtime_parent,
+        ):
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(
+                    runner,
+                    "_bound_child_signals",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    side_effect=prepare_profile,
+                ) as prepare,
+                mock.patch.object(runner, "run_bounded_command") as run_command,
+                self.assertRaises(runner.ChildRunInterrupted) as caught,
+            ):
+                os.environ.pop("GITHUB_ACTIONS", None)
+                os.environ.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+                os.environ.pop(runner.RUNNER_ARCH_ENV, None)
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    closure_proof=proof,
+                    lifecycle_fence=lifecycle_fence,
+                )
+
+        self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+        self.assertFalse(prepared.accessed)
+        self.assertEqual(proof.runtime_profile, "production-current")
+        self.assertFalse(proof.started)
+        self.assertFalse(proof.proven)
+        prepare.assert_called_once()
+        run_command.assert_not_called()
+
+
+_TERMINAL_SIGNAL_WORKER = r"""
+import contextlib
+import errno
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import tempfile
+from unittest import mock
+
+from tests import run_readonly_install_deterministic_supervisor as runner
+from tests import support
+
+scenario = sys.argv[1]
+signal_number = int(sys.argv[2])
+sent = False
+
+
+def send_signal():
+    global sent
+    if signal_number and not sent:
+        sent = True
+        os.kill(os.getpid(), signal_number)
+
+
+class StreamProxy:
+    def __init__(self, stream, phase):
+        self._stream = stream
+        self._phase = phase
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def flush(self):
+        result = self._stream.flush()
+        if scenario == self._phase:
+            send_signal()
+        return result
+
+
+with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root:
+    root = pathlib.Path(raw_root)
+    sticky_parent = root / "sticky"
+    sticky_parent.mkdir(mode=0o700)
+    sticky_parent.chmod(0o1777)
+    install_container = sticky_parent / "install"
+    install_container.mkdir(mode=0o700)
+    runtime_home = root / "runtime-home"
+    runtime_home.mkdir(mode=0o700)
+    runtime_parent = runtime_home / "runtime"
+    runtime_parent.mkdir(mode=0o700)
+    cleanup_control = runtime_home / "cleanup-control"
+    cleanup_control.mkdir(mode=0o700)
+    remaining = iter(
+        (
+            (install_container, 101),
+            (runtime_parent, 102),
+            (cleanup_control, 103),
+        )
+    )
+
+    def make_binding(path, descriptor):
+        binding = mock.Mock(spec=support._DirectoryParentBinding)
+        binding.path = path
+        binding.fd = descriptor
+        binding.fd_close_outcome = "owned"
+        binding.fd_close_error = None
+
+        def close():
+            if binding.fd_close_outcome == "owned":
+                binding.fd_close_outcome = "closed"
+                binding.fd = -1
+
+        binding.close.side_effect = close
+        return binding
+
+    def create_binding(
+        _parent,
+        _prefix,
+        *,
+        result_owner,
+        require_owned_private_parent=True,
+    ):
+        del require_owned_private_parent
+        path, descriptor = next(remaining)
+        binding = make_binding(path, descriptor)
+        result_owner.publish(binding)
+        return binding
+
+    source_binding = runner.SourceCheckoutBinding(
+        repo_root=root,
+        head_sha="a" * 40,
+        source_relative_path="source",
+    )
+    source_manifest = "b" * 64
+
+    def copy_bound_source(
+        _source,
+        destination,
+        _binding,
+        _source_manifest,
+    ):
+        destination.mkdir(mode=0o700)
+        return source_manifest
+
+    snapshot_count = 0
+
+    def snapshot(_path):
+        global snapshot_count
+        snapshot_count += 1
+        if scenario == "existing-primary-late-signal" and snapshot_count == 2:
+            raise RuntimeError("existing primary remains authoritative")
+        return {}
+
+    def complete_no_child(**kwargs):
+        proof = kwargs["closure_proof"]
+        proof.started = True
+        proof.proven = True
+        proof.destructive_cleanup_authorized = True
+        proof.runtime_profile = "production-current"
+        if scenario in {
+            "pre-seal",
+            "publication-failure",
+            "publication-restore-failure",
+        }:
+            send_signal()
+        return subprocess.CompletedProcess(
+            args=(sys.executable,),
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    real_serialize = runner._serialize_terminal_json
+
+    def serialize(value, *, operation):
+        if (
+            scenario in {"publication-failure", "publication-restore-failure"}
+            and operation == "summary-serialization"
+        ):
+            raise runner.TerminalPublicationError(
+                "summary-serialization",
+                RuntimeError("synthetic serialization failure"),
+            )
+        result = real_serialize(value, operation=operation)
+        if operation == "summary-serialization" and scenario in {
+            "post-serialization",
+            "existing-primary-late-signal",
+        }:
+            send_signal()
+        return result
+
+    real_write_terminal = runner._write_terminal_stdout
+
+    def write_terminal(payload):
+        real_write_terminal(payload)
+        if scenario == "post-stdout-write":
+            send_signal()
+
+    real_os_write = os.write
+
+    def write_with_newline_failure(descriptor, payload):
+        raw = bytes(payload)
+        if descriptor == 1 and raw == b"\n":
+            raise OSError(errno.EIO, "synthetic terminal newline failure")
+        written = real_os_write(descriptor, payload)
+        if descriptor == 1 and raw.startswith(b"{"):
+            send_signal()
+        return written
+
+    stdout_proxy = StreamProxy(sys.stdout, "post-stdout-flush")
+    stderr_proxy = StreamProxy(sys.stderr, "post-stderr-flush")
+    os.environ[runner.EXPECTED_HEAD_ENV] = "a" * 40
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(runner.sys, "platform", "darwin"))
+        stack.enter_context(
+            mock.patch.object(runner, "READONLY_INSTALL_PARENT", sticky_parent)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_private_runtime_parent",
+                return_value=runtime_home,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_create_bound_owned_private_directory",
+                side_effect=create_binding,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_bind_source_checkout",
+                return_value=source_binding,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_source_manifest_sha256",
+                return_value=source_manifest,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_source_root_gid", return_value=os.getgid())
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_align_created_directory_group")
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_copy_bound_source",
+                side_effect=copy_bound_source,
+            )
+        )
+        stack.enter_context(mock.patch.object(runner, "_set_tree_read_only"))
+        stack.enter_context(
+            mock.patch.object(runner, "_tree_snapshot", side_effect=snapshot)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_run_no_child_test_suite",
+                side_effect=complete_no_child,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_list_bound_directory", return_value=())
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_consume_cleanup_bound_tree_endpoint",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_consume_cleanup_empty_bound_control_endpoint",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_serialize_terminal_json", side_effect=serialize)
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_write_terminal_stdout", side_effect=write_terminal)
+        )
+        if scenario == "post-stdout-flush":
+            stack.enter_context(mock.patch.object(runner.sys, "stdout", stdout_proxy))
+        if scenario == "post-stderr-flush":
+            stack.enter_context(mock.patch.object(runner.sys, "stderr", stderr_proxy))
+        if scenario == "newline-failure":
+            stack.enter_context(mock.patch.object(runner.os, "write", write_with_newline_failure))
+        if scenario == "publication-restore-failure":
+            stack.enter_context(
+                mock.patch.object(
+                    runner,
+                    "_restore_lifecycle_signal_fence",
+                    side_effect=OSError(errno.EIO, "synthetic restoration failure"),
+                )
+            )
+        returncode = runner.main(_terminal_process=True)
+
+raise SystemExit(returncode)
+"""
+
+
+class TerminalPublicationSignalIntegrationTests(unittest.TestCase):
+    SIGNALS = (
+        signal.SIGHUP,
+        signal.SIGINT,
+        signal.SIGQUIT,
+        signal.SIGTERM,
+    )
+    SOURCE_HEAD = "a" * 40
+    SOURCE_MANIFEST = "b" * 64
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if sys.version_info[:2] != (3, 13):
+            raise unittest.SkipTest("terminal publication matrix requires Python 3.13")
+
+    @staticmethod
+    def _run_worker(
+        scenario: str,
+        signal_number: int = 0,
+    ) -> subprocess.CompletedProcess[bytes]:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONPYCACHEPREFIX", None)
+        environment.pop("GITHUB_ACTIONS", None)
+        environment.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+        environment.pop(runner.RUNNER_ARCH_ENV, None)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        return subprocess.run(
+            (
+                sys.executable,
+                "-B",
+                "-c",
+                _TERMINAL_SIGNAL_WORKER,
+                scenario,
+                str(signal_number),
+            ),
+            cwd=pathlib.Path(__file__).resolve().parents[1],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=20,
+        )
+
+    def _single_summary(
+        self,
+        completed: subprocess.CompletedProcess[bytes],
+    ) -> dict[str, object]:
+        stdout = completed.stdout.decode("utf-8", "strict")
+        lines = stdout.splitlines()
+        self.assertEqual(lines, [stdout.rstrip("\n")])
+        self.assertEqual(len(lines), 1)
+        return json.loads(lines[0])
+
+    @staticmethod
+    def _sealed_exit_decision(summary: dict[str, object]) -> int:
+        signal_number = summary["signal_number"]
+        if isinstance(signal_number, int):
+            return 128 + signal_number
+        if (
+            summary["primary_status"] == "complete"
+            and summary["cleanup_status"] == "complete"
+        ):
+            return 0
+        return 1
+
+    def _assert_source_binding_summary(self, summary: dict[str, object]) -> None:
+        self.assertIs(summary["source_head_bound"], True)
+        self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
+        self.assertIs(summary["creation_origin_proven"], False)
+        self.assertEqual(
+            summary["creation_origin_guarantee"],
+            "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            summary["cleanup_guarantee"],
+            "custodied-manifest-quarantine-descriptor-revalidation-"
+            "same-uid-final-rename-unlink-host-tcb",
+        )
+
+    def test_preseal_signal_publishes_one_interrupted_summary(self) -> None:
+        for signal_number in self.SIGNALS:
+            with self.subTest(signal=signal_number.name):
+                completed = self._run_worker("pre-seal", signal_number)
+                self.assertEqual(completed.returncode, 128 + signal_number)
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "interrupted")
+                self.assertEqual(summary["signal_number"], signal_number)
+                self.assertEqual(
+                    summary["primary_failure"]["error_kind"],
+                    "ChildRunInterrupted",
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
+                self._assert_source_binding_summary(summary)
+
+    def test_late_signal_after_each_publication_phase_keeps_sealed_json(
+        self,
+    ) -> None:
+        phases = (
+            "post-serialization",
+            "post-stdout-write",
+            "post-stdout-flush",
+            "post-stderr-flush",
+        )
+        for phase in phases:
+            for signal_number in self.SIGNALS:
+                with self.subTest(phase=phase, signal=signal_number.name):
+                    completed = self._run_worker(phase, signal_number)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = self._single_summary(completed)
+                    self.assertEqual(summary["primary_status"], "complete")
+                    self.assertIsNone(summary["signal_number"])
+                    self.assertEqual(
+                        completed.returncode,
+                        self._sealed_exit_decision(summary),
+                    )
+                    self._assert_source_binding_summary(summary)
+
+    def test_complete_json_is_committed_when_newline_write_fails(self) -> None:
+        for signal_number in (0, *self.SIGNALS):
+            label = "none" if signal_number == 0 else signal_number.name
+            with self.subTest(signal=label):
+                completed = self._run_worker("newline-failure", signal_number)
+                self.assertEqual(completed.returncode, 0)
+                self.assertFalse(completed.stdout.endswith(b"\n"))
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "complete")
+                self.assertIsNone(summary["signal_number"])
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
+                self.assertIn(b"operation=stdout-newline", completed.stderr)
+
+    def test_publication_and_restore_failures_prefer_sealed_signal(self) -> None:
+        for scenario in ("publication-failure", "publication-restore-failure"):
+            with self.subTest(scenario=scenario, signal="none"):
+                completed = self._run_worker(scenario)
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, b"")
+                self.assertIn(b"operation=summary-serialization", completed.stderr)
+            for signal_number in self.SIGNALS:
+                with self.subTest(scenario=scenario, signal=signal_number.name):
+                    completed = self._run_worker(scenario, signal_number)
+                    self.assertEqual(completed.returncode, 128 + signal_number)
+                    self.assertEqual(completed.stdout, b"")
+                    self.assertIn(
+                        b"operation=summary-serialization",
+                        completed.stderr,
+                    )
+                    if scenario == "publication-restore-failure":
+                        self.assertIn(
+                            b"operation=signal-fence-restoration",
+                            completed.stderr,
+                        )
+
+    def test_existing_primary_is_not_replaced_by_late_signal(self) -> None:
+        for signal_number in self.SIGNALS:
+            with self.subTest(signal=signal_number.name):
+                completed = self._run_worker(
+                    "existing-primary-late-signal",
+                    signal_number,
+                )
+                self.assertEqual(completed.returncode, 1)
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "failed")
+                self.assertIsNone(summary["signal_number"])
+                self.assertEqual(
+                    summary["primary_failure"]["stage"],
+                    "snapshot-after",
+                )
+                self.assertEqual(
+                    summary["primary_failure"]["message"],
+                    "existing primary remains authoritative",
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
 
 
 if __name__ == "__main__":

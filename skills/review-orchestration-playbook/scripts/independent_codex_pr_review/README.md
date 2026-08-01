@@ -349,17 +349,41 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
-第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二条命令只允许在匹配生产 pin、
-且没有外层 Seatbelt 的受信任 Mac 上运行，九项测试必须全部执行并通过。GitHub Hosted
-`macos-26` 自身位于外层 Seatbelt 中，不能产生生产等价的 live isolation evidence；CI
-因此只验证该环境以已审阅的 blocker signature 失败关闭，并把真实九项 live suite 保留为
-涉及隔离边界变更时的本机交付门。若 Hosted 环境不再呈现该 signature，CI 会失败并要求
-重新审阅架构，不能把环境指纹相同解释为生产能力证明。
+第一条命令是确定性零跳过测试。Hosted CI 的 required read-only job 另以 root-owned
+isolated source、`nobody` child、受监管 Python runtime 和完整 deterministic suite 验证安装树；
+它保留 `source_head_bound == false` 与 `no_child_runtime_profile == null`，因为 exact Git binding
+和 production no-child proof 不属于这个 isolated copy 的证明边界。
 
-这个 live gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub check、
-branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR delivery
-evidence 必须记录对应 `head_sha`、9 tests、0 skips 和 terminal result；任何后续 push 都会
-使证据失效。缺少该证据时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。
+第二、三条命令只允许在匹配 production pin、且没有外层 Seatbelt 的受信任 Mac 上连续运行。
+十三项 live 测试必须全部执行并通过，随后 exact-head read-only install runner 必须返回完整
+成功的 structured summary。该 Trusted Mac summary 只有在
+`primary_status == "complete"`、`primary_failure == null`、
+`child_process_closure == "proven"`、`cleanup_status == "complete"`、
+`cleanup_failures == []`、`release_tree_immutable == true`、
+`source_head_bound == true`、`source_head_sha == <full-head-sha>`、
+`source_manifest_sha256` 是完整小写 SHA-256、
+`no_child_runtime_profile == "production-current"`、`returncode == 0`、
+`retained_paths == []`、`runtime_residue == []`、`secondary_failures == []`、
+`signal_number == null`、`timed_out == false`、`creation_origin_proven == false`、
+`creation_origin_guarantee == "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"`
+且
+`cleanup_guarantee == "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb"`
+时才算成功。后三项固定字段声明平台边界，不是失败：macOS 没有创建目录并原子返回
+descriptor 的 API，也没有按 descriptor 删除目录的 API。因此 receipt 建立前的
+`mkdirat`→首次 no-follow open 和最终 identity check→`unlinkat`/`rmdir` 窗口依赖
+128-bit 不可预测 leaf 与 cooperative same-UID host TCB。receipt 建立后，工具绑定
+identity/access policy，使用 custodied manifest、quarantine 和 descriptor revalidation；
+一旦观察到 identity-unproven 或 mismatch，就保留对象且绝不删除当前 replacement。
+GitHub Hosted `macos-26` 的独立 production-profile probe仍必须以已审阅 blocker signature
+失败关闭；hosted read-only job 的 root/nobody 隔离成功不能替代 Trusted Mac no-child proof。
+
+这个 Trusted Mac gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub
+check、branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR
+delivery evidence 必须记录对应 `head_sha`、Python absolute path/digest、13 tests、0 skips、
+live terminal result 和紧随其后的 read-only structured summary；该 read-only child还必须
+给出固定的 no-child test count/identity completion record。任何后续 push 都会使证据失效。
+缺少任一项时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。

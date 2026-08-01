@@ -19,8 +19,23 @@ from dataclasses import asdict, dataclass, field
 from types import CodeType, FrameType, TracebackType
 from typing import Any
 
-from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.gitraw import (
+    GitProcessClosureUnproven,
+    run_bounded,
+    sanitized_git_environment,
+)
 from review_supervisor.models import Identity
+from review_supervisor import no_child_profile
+from review_supervisor.codex_executable import (
+    BoundedCommandOutputLimitExceeded,
+    _macos_acl_entries,
+    bounded_command_process_closure,
+    run_bounded_command,
+)
+from review_supervisor.no_child_profile import (
+    attest_writable_root,
+    prepare_sandboxed_python_no_child_profile,
+)
 from review_supervisor.recovery_cleanup import (
     CustodiedDeletionResultOwner,
     CustodiedManifestResultOwner,
@@ -34,10 +49,13 @@ from review_supervisor.recovery_cleanup import (
 from review_supervisor.secureio import (
     directory_identities_match,
     identity_from_stat,
+    validate_directory_policy_fd,
 )
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
 
@@ -57,12 +75,65 @@ from .support import (
     _PrivateDirectoryCreationRetentionRequired,
     _settle_directory_parent_binding_result_preserving_trigger,
 )
+from .readonly_no_child_contract import SUCCESS_RECORD as NO_CHILD_SUCCESS_RECORD
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
+RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
+EXPECTED_HEAD_ENV = "CODEX_REVIEW_EXPECTED_HEAD_SHA"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
+NO_CHILD_SUITE_CODE = (
+    "import errno,os,pathlib,runpy,sys,tempfile\n"
+    "if not sys.flags.isolated or not sys.flags.no_site:\n"
+    " raise RuntimeError('read-only test child requires isolated no-site startup')\n"
+    "root=pathlib.Path(sys.argv[1])\n"
+    "runtime=pathlib.Path(sys.argv[2])\n"
+    f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
+    "os.environ['TMPDIR']=sys.argv[2]\n"
+    "tempfile.tempdir=sys.argv[2]\n"
+    "def require_denied(action,label):\n"
+    " try:\n"
+    "  result=action()\n"
+    " except OSError as error:\n"
+    "  if error.errno in {errno.EACCES,errno.EPERM}:\n"
+    "   return\n"
+    "  raise\n"
+    " if isinstance(result,int):\n"
+    "  os.close(result)\n"
+    " raise RuntimeError(f'read-only install policy allowed {label}')\n"
+    "probe=root/'tests'/'__init__.py'\n"
+    "require_denied(lambda:os.chmod(root,0o700),'root chmod')\n"
+    "require_denied(lambda:os.chmod(probe,0o600),'file chmod')\n"
+    "require_denied(lambda:os.open(probe,os.O_WRONLY),'file write-open')\n"
+    "parent_probe=root.parent/'seatbelt-parent-write-probe'\n"
+    "require_denied(lambda:os.open(parent_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,"
+    "0o600),'install-parent create')\n"
+    "runtime_probe=runtime/'seatbelt-write-probe'\n"
+    "try:\n"
+    " fd=os.open(runtime_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
+    " try:\n"
+    "  os.write(fd,b'allowed runtime write\\n')\n"
+    " finally:\n"
+    "  os.close(fd)\n"
+    "finally:\n"
+    " try:\n"
+    "  os.unlink(runtime_probe)\n"
+    " except FileNotFoundError:\n"
+    "  pass\n"
+    "os.chdir(root)\n"
+    "sys.path.insert(0,str(root))\n"
+    "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
+)
+CREATION_ORIGIN_GUARANTEE = (
+    "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"
+)
+CLEANUP_GUARANTEE = (
+    "custodied-manifest-quarantine-descriptor-revalidation-"
+    "same-uid-final-rename-unlink-host-tcb"
+)
 ACL_LISTING_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -129,6 +200,13 @@ class TreeEntrySnapshot:
 
 
 @dataclass(frozen=True)
+class SourceCheckoutBinding:
+    repo_root: pathlib.Path
+    head_sha: str
+    source_relative_path: str
+
+
+@dataclass(frozen=True)
 class CleanupFailure:
     path: str
     error_kind: str
@@ -174,12 +252,34 @@ class ChildSignalTeardownError(RuntimeError):
         super().__init__(f"child signal teardown failed: {operations}")
 
 
+class TerminalPublicationError(RuntimeError):
+    def __init__(self, operation: str, error: BaseException) -> None:
+        self.operation = operation
+        self.error = error
+        super().__init__(
+            f"terminal publication {operation} failed: {type(error).__name__}: {error}"
+        )
+
+
 @dataclass(frozen=True)
 class ChildSignalGuard:
     signals: tuple[signal.Signals, ...]
     previous_handlers: tuple[Any, ...]
     previous_mask: set[signal.Signals]
     interrupt: DeferredSignalInterrupt
+
+
+@dataclass
+class LifecycleSignalFence:
+    signals: tuple[signal.Signals, ...]
+    previous_handlers: tuple[Any, ...]
+    previous_mask: set[signal.Signals]
+    received_signal: int | None = None
+    terminal_signal: int | None = None
+    terminal_selected_signal: int | None = None
+    terminal_exit_code: int | None = None
+    terminal_decision_frozen: bool = False
+    terminal_output_committed: bool = False
 
 
 @dataclass
@@ -190,6 +290,16 @@ class ChildProcessClosureProof:
     started: bool = False
     proven: bool = False
     destructive_cleanup_authorized: bool = True
+    runtime_profile: str | None = None
+
+
+class ChildOutputLimitExceeded(OverflowError):
+    def __init__(self, *, scope: str, limit: int) -> None:
+        self.scope = scope
+        self.limit = limit
+        super().__init__(
+            f"bounded no-child test {scope} output exceeded its {limit}-byte cap"
+        )
 
 
 @dataclass
@@ -214,6 +324,114 @@ def _child_process_closure_status(proof: ChildProcessClosureProof) -> str:
     if proof.proven:
         return "proven"
     return "unproven" if proof.started else "not-started"
+
+
+def _select_no_child_runtime_profile() -> tuple[str, no_child_profile.RuntimePin]:
+    if os.environ.get("GITHUB_ACTIONS") == "true" or any(
+        os.environ.get(name) is not None
+        for name in (RUNNER_ENVIRONMENT_ENV, RUNNER_ARCH_ENV)
+    ):
+        raise RuntimeError(
+            "read-only installed supervisor is forbidden under GitHub Actions "
+            "and hosted runner profiles"
+        )
+    return "production-current", no_child_profile.PINNED_RUNTIME
+
+
+def _authenticated_no_child_closure(
+    closure: object | None,
+    *,
+    require_stdio_closed: bool,
+) -> bool:
+    return bool(
+        closure is not None
+        and getattr(closure, "authenticated_no_child_profile", False) is True
+        and getattr(closure, "permitted_process_closure_proven", False) is True
+        and getattr(closure, "leader_reaped", False) is True
+        and (
+            not require_stdio_closed or getattr(closure, "stdio_closed", False) is True
+        )
+        and getattr(
+            closure,
+            "process_group_emptiness_used_as_descendant_proof",
+            True,
+        )
+        is False
+    )
+
+
+def _install_lifecycle_signal_fence() -> LifecycleSignalFence:
+    handled = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers: list[Any] = []
+    fence = LifecycleSignalFence(
+        signals=handled,
+        previous_handlers=(),
+        previous_mask=previous_mask,
+    )
+
+    def retain_lifecycle_signal(
+        signal_number: int,
+        _frame: FrameType | None,
+    ) -> None:
+        if fence.received_signal is None:
+            fence.received_signal = signal_number
+
+    try:
+        for signal_number in handled:
+            previous_handlers.append(
+                signal.signal(signal_number, retain_lifecycle_signal)
+            )
+        fence.previous_handlers = tuple(previous_handlers)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        for signal_number, previous in zip(
+            handled,
+            previous_handlers,
+            strict=False,
+        ):
+            signal.signal(signal_number, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
+    return fence
+
+
+def _restore_lifecycle_signal_fence(fence: LifecycleSignalFence) -> int | None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    pending = signal.sigpending()
+    selected = fence.received_signal
+    if selected is None:
+        selected = next(
+            (int(item) for item in fence.signals if item in pending),
+            None,
+        )
+    for signal_number, previous in zip(
+        fence.signals,
+        fence.previous_handlers,
+        strict=True,
+    ):
+        signal.signal(signal_number, previous)
+    signal.pthread_sigmask(signal.SIG_SETMASK, fence.previous_mask)
+    return selected
+
+
+def _freeze_lifecycle_terminal_signal(
+    fence: LifecycleSignalFence,
+) -> int | None:
+    if fence.terminal_decision_frozen:
+        return fence.terminal_signal
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    pending = signal.sigpending()
+    selected = fence.received_signal
+    if selected is None:
+        selected = next(
+            (int(item) for item in fence.signals if item in pending),
+            None,
+        )
+    fence.terminal_signal = selected
+    fence.terminal_decision_frozen = True
+    return selected
 
 
 @dataclass(frozen=True)
@@ -432,6 +650,130 @@ def _bound_child_signals(
             if control_flow is not None:
                 raise control_flow
             raise ChildSignalTeardownError(tuple(secondary_failures))
+
+
+def _run_no_child_test_suite(
+    *,
+    installed_root: pathlib.Path,
+    install_container_binding: _DirectoryParentBinding,
+    runtime_parent_binding: _DirectoryParentBinding,
+    timeout: float = CHILD_TIMEOUT_SECONDS,
+    stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
+    stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
+    secondary_failures: list[SecondaryFailure] | None = None,
+    closure_proof: ChildProcessClosureProof | None = None,
+    lifecycle_fence: LifecycleSignalFence | None = None,
+) -> subprocess.CompletedProcess[str]:
+    diagnostics = secondary_failures if secondary_failures is not None else []
+    proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    runtime_parent = runtime_parent_binding.path
+    if installed_root.parent != install_container_binding.path:
+        raise RuntimeError(
+            "read-only installed root is outside its bound install container"
+        )
+    install_container_binding.revalidate()
+    runtime_parent_binding.revalidate()
+    if directory_identities_match(
+        install_container_binding.identity,
+        runtime_parent_binding.identity,
+    ):
+        raise RuntimeError("runtime root aliases the read-only install container")
+    install_container = str(install_container_binding.path)
+    runtime_root = str(runtime_parent)
+    common = os.path.commonpath((install_container, runtime_root))
+    if common in {install_container, runtime_root}:
+        raise RuntimeError("runtime root overlaps the read-only install container")
+    writable_runtime = attest_writable_root(
+        runtime_parent,
+        directory_fd=runtime_parent_binding.fd,
+    )
+    with _bound_child_signals(diagnostics):
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        runtime_profile, runtime_pin = _select_no_child_runtime_profile()
+        proof.runtime_profile = runtime_profile
+        prepared = prepare_sandboxed_python_no_child_profile(
+            additional_seatbelt_rules="(deny file-write*)",
+            runtime_pin=runtime_pin,
+            writable_roots=(writable_runtime,),
+        )
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        target = prepared.sandboxed_target
+        if target is None:
+            raise RuntimeError(
+                "read-only installed test profile lacks a bound Python target"
+            )
+        argv = (
+            target.path,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            NO_CHILD_SUITE_CODE,
+            str(installed_root),
+            str(runtime_parent),
+        )
+        install_container_binding.revalidate()
+        runtime_parent_binding.revalidate()
+        proof_scope = begin_bound_signal_deferral()
+        try:
+            checkpoint_bound_signal_interrupt(force=True)
+            proof.started = True
+            proof.destructive_cleanup_authorized = False
+            try:
+                result = run_bounded_command(
+                    argv,
+                    timeout_seconds=timeout,
+                    max_output_bytes=stdout_limit + stderr_limit,
+                    max_stdout_bytes=stdout_limit,
+                    max_stderr_bytes=stderr_limit,
+                    _prepared_no_child_profile=prepared,
+                )
+            except BaseException as error:
+                closure = bounded_command_process_closure(error)
+                if _authenticated_no_child_closure(
+                    closure,
+                    require_stdio_closed=False,
+                ):
+                    proof.proven = True
+                    proof.destructive_cleanup_authorized = True
+                if isinstance(error, BoundedCommandOutputLimitExceeded):
+                    raise ChildOutputLimitExceeded(
+                        scope=error.scope,
+                        limit=error.limit,
+                    ) from error
+                raise
+            closure = result.process_closure
+            if not _authenticated_no_child_closure(
+                closure,
+                require_stdio_closed=True,
+            ):
+                raise RuntimeError(
+                    "read-only installed test process closure lacks an authenticated "
+                    "no-child proof"
+                )
+            proof.proven = True
+            proof.destructive_cleanup_authorized = True
+            if len(result.stdout) > stdout_limit:
+                raise ChildOutputLimitExceeded(scope="stdout", limit=stdout_limit)
+            if len(result.stderr) > stderr_limit:
+                raise ChildOutputLimitExceeded(scope="stderr", limit=stderr_limit)
+            if result.returncode == 0 and result.stdout != (
+                NO_CHILD_SUCCESS_RECORD + "\n"
+            ).encode("ascii"):
+                raise RuntimeError(
+                    "read-only installed test child lacks its exact completion record"
+                )
+        finally:
+            if proof_scope is not None:
+                proof_scope.finish(deliver=proof.proven or not proof.started)
+    return subprocess.CompletedProcess(
+        args=argv,
+        returncode=result.returncode,
+        stdout=result.stdout.decode("utf-8", "replace"),
+        stderr=result.stderr.decode("utf-8", "replace"),
+    )
 
 
 def _process_census_deadline(deadline: float | None = None) -> float:
@@ -911,33 +1253,25 @@ def _run_bounded_child(
     return completed
 
 
-def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
-    completed = subprocess.run(
-        ("/bin/ls", "-lde", str(path)),
-        env=ACL_LISTING_ENVIRONMENT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=5,
+def _acl_entries(descriptor: int) -> tuple[bytes, ...]:
+    return tuple(
+        entry.encode("ascii", "strict") for entry in _macos_acl_entries(descriptor)
     )
-    if completed.returncode != 0:
-        raise RuntimeError("failed to snapshot extended ACL")
-    return tuple(completed.stdout.splitlines()[1:])
 
 
-def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
+def _xattr_snapshot(descriptor: int) -> tuple[tuple[bytes, str], ...]:
     libc = ctypes.CDLL(None, use_errno=True)
-    listxattr = libc.listxattr
+    listxattr = libc.flistxattr
     listxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_void_p,
         ctypes.c_size_t,
         ctypes.c_int,
     )
     listxattr.restype = ctypes.c_ssize_t
-    getxattr = libc.getxattr
+    getxattr = libc.fgetxattr
     getxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_void_p,
         ctypes.c_size_t,
@@ -945,11 +1279,10 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
         ctypes.c_int,
     )
     getxattr.restype = ctypes.c_ssize_t
-    raw_path = os.fsencode(path)
 
     def read_names() -> bytes:
         ctypes.set_errno(0)
-        size = listxattr(raw_path, None, 0, XATTR_NOFOLLOW)
+        size = listxattr(descriptor, None, 0, 0)
         if size < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -961,7 +1294,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
             return b""
         buffer = ctypes.create_string_buffer(size)
         ctypes.set_errno(0)
-        actual = listxattr(raw_path, buffer, size, XATTR_NOFOLLOW)
+        actual = listxattr(descriptor, buffer, size, 0)
         if actual < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -993,7 +1326,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
 
         def read_value() -> bytes:
             ctypes.set_errno(0)
-            size = getxattr(raw_path, name, None, 0, 0, XATTR_NOFOLLOW)
+            size = getxattr(descriptor, name, None, 0, 0, 0)
             if size < 0:
                 raise OSError(
                     ctypes.get_errno() or errno.EIO,
@@ -1005,14 +1338,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
                 return b""
             buffer = ctypes.create_string_buffer(size)
             ctypes.set_errno(0)
-            actual = getxattr(
-                raw_path,
-                name,
-                buffer,
-                size,
-                0,
-                XATTR_NOFOLLOW,
-            )
+            actual = getxattr(descriptor, name, buffer, size, 0, 0)
             if actual < 0:
                 raise OSError(
                     ctypes.get_errno() or errno.EIO,
@@ -1036,48 +1362,247 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
     return tuple(snapshot)
 
 
-def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
-    snapshot: dict[str, TreeEntrySnapshot] = {}
-    paths = (root, *sorted(root.rglob("*")))
-    for path in paths:
-        metadata = path.lstat()
-        relative = "." if path == root else path.relative_to(root).as_posix()
-        mode = stat.S_IMODE(metadata.st_mode)
-        if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_nlink != 1:
-                raise RuntimeError(
-                    f"regular file has an external hardlink alias: {relative}"
-                )
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            kind = "file"
-            link_count = metadata.st_nlink
-        elif stat.S_ISDIR(metadata.st_mode):
-            digest = None
-            kind = "directory"
-            link_count = None
-        elif stat.S_ISLNK(metadata.st_mode):
-            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
-            kind = "symlink"
-            link_count = None
-        else:
-            digest = None
-            kind = "other"
-            link_count = None
-        snapshot[relative] = TreeEntrySnapshot(
-            kind=kind,
-            device=metadata.st_dev,
-            inode=metadata.st_ino,
-            generation=getattr(metadata, "st_gen", 0),
-            uid=metadata.st_uid,
-            gid=metadata.st_gid,
-            mode=mode,
-            flags=getattr(metadata, "st_flags", 0),
-            link_count=link_count,
-            digest=digest,
-            xattrs=_xattr_snapshot(path),
-            acl_entries=_acl_entries(path),
+def _snapshot_binding_key(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+        metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None,
+    )
+
+
+def _open_snapshot_entry(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    if not name or name in {".", ".."} or "/" in name or "\0" in name:
+        raise ValueError("snapshot entry name is malformed")
+    initial = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if stat.S_ISREG(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISDIR(initial.st_mode):
+        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISLNK(initial.st_mode):
+        raise OSError(
+            errno.EPERM,
+            "symlinks are unsupported in immutable install snapshots",
         )
-    return snapshot
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot entry changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_snapshot_root(root: pathlib.Path) -> tuple[int, os.stat_result]:
+    initial = root.lstat()
+    if not stat.S_ISDIR(initial.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "snapshot root is not a directory")
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot root changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _descriptor_digest(descriptor: int) -> str:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError(errno.EINVAL, "snapshot digest requires a regular file")
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        _snapshot_binding_key(before) != _snapshot_binding_key(after)
+        or before.st_size != after.st_size
+        or offset != after.st_size
+    ):
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest.hexdigest()
+
+
+def _access_policy_snapshot(
+    descriptor: int,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    return _xattr_snapshot(descriptor), _acl_entries(descriptor)
+
+
+def _stable_access_policy_snapshot(
+    descriptor: int,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    first = _access_policy_snapshot(descriptor)
+    second = _access_policy_snapshot(descriptor)
+    if first != second:
+        raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    return second
+
+
+def _regular_entry_sample(
+    descriptor: int,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    digest_before = _descriptor_digest(descriptor)
+    access_policy = _stable_access_policy_snapshot(descriptor)
+    digest_after = _descriptor_digest(descriptor)
+    if digest_before != digest_after:
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest_after, access_policy
+
+
+def _stable_regular_entry_sample(
+    descriptor: int,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    first = _regular_entry_sample(descriptor)
+    second = _regular_entry_sample(descriptor)
+    if first != second:
+        raise OSError(
+            errno.ESTALE,
+            "regular file content or access policy changed during snapshot",
+        )
+    return second
+
+
+def _snapshot_opened_entry(
+    descriptor: int,
+    initial: os.stat_result,
+    *,
+    relative: str,
+    snapshot: dict[str, TreeEntrySnapshot],
+) -> TreeEntrySnapshot:
+    if stat.S_ISREG(initial.st_mode):
+        if initial.st_nlink != 1:
+            raise RuntimeError(
+                f"regular file has an external hardlink alias: {relative}"
+            )
+        digest, access_policy = _stable_regular_entry_sample(descriptor)
+        kind = "file"
+        link_count = initial.st_nlink
+    elif stat.S_ISDIR(initial.st_mode):
+        digest = None
+        kind = "directory"
+        link_count = None
+        access_before = _stable_access_policy_snapshot(descriptor)
+        names = tuple(sorted(os.listdir(descriptor)))
+        for name in names:
+            child_relative = name if relative == "." else f"{relative}/{name}"
+            child_descriptor, child_initial = _open_snapshot_entry(descriptor, name)
+            try:
+                child_snapshot = _snapshot_opened_entry(
+                    child_descriptor,
+                    child_initial,
+                    relative=child_relative,
+                    snapshot=snapshot,
+                )
+                final_child = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if _snapshot_binding_key(child_initial) != _snapshot_binding_key(
+                    final_child
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "snapshot path no longer names the bound object: "
+                        f"{child_relative}",
+                    )
+                snapshot[child_relative] = child_snapshot
+            finally:
+                os.close(child_descriptor)
+        if names != tuple(sorted(os.listdir(descriptor))):
+            raise OSError(
+                errno.ESTALE,
+                f"directory changed during snapshot: {relative}",
+            )
+        access_policy = _stable_access_policy_snapshot(descriptor)
+        if access_before != access_policy:
+            raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    final_descriptor = os.fstat(descriptor)
+    if _snapshot_binding_key(initial) != _snapshot_binding_key(final_descriptor):
+        raise OSError(
+            errno.ESTALE,
+            f"snapshot object changed during capture: {relative}",
+        )
+    if stat.S_ISREG(initial.st_mode) and initial.st_size != final_descriptor.st_size:
+        raise OSError(errno.ESTALE, f"regular file changed during snapshot: {relative}")
+    xattrs, acl_entries = access_policy
+    return TreeEntrySnapshot(
+        kind=kind,
+        device=final_descriptor.st_dev,
+        inode=final_descriptor.st_ino,
+        generation=getattr(final_descriptor, "st_gen", 0),
+        uid=final_descriptor.st_uid,
+        gid=final_descriptor.st_gid,
+        mode=stat.S_IMODE(final_descriptor.st_mode),
+        flags=getattr(final_descriptor, "st_flags", 0),
+        link_count=link_count,
+        digest=digest,
+        xattrs=xattrs,
+        acl_entries=acl_entries,
+    )
+
+
+def _tree_snapshot_once(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
+    snapshot: dict[str, TreeEntrySnapshot] = {}
+    descriptor, initial = _open_snapshot_root(root)
+    try:
+        root_snapshot = _snapshot_opened_entry(
+            descriptor,
+            initial,
+            relative=".",
+            snapshot=snapshot,
+        )
+        final_descriptor = os.fstat(descriptor)
+        final_path = root.lstat()
+        if _snapshot_binding_key(final_descriptor) != _snapshot_binding_key(final_path):
+            raise OSError(
+                errno.ESTALE,
+                "snapshot root path no longer names the bound object",
+            )
+        snapshot["."] = root_snapshot
+        return snapshot
+    finally:
+        os.close(descriptor)
+
+
+def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
+    first = _tree_snapshot_once(root)
+    second = _tree_snapshot_once(root)
+    if not _tree_property_unchanged(first, second):
+        raise OSError(errno.ESTALE, "install tree changed during snapshot")
+    return second
 
 
 def _tree_property_unchanged(
@@ -1089,6 +1614,168 @@ def _tree_property_unchanged(
     return all(
         before[path].protected_key() == after[path].protected_key() for path in before
     )
+
+
+def _source_manifest_sha256(root: pathlib.Path) -> str:
+    snapshot = _tree_snapshot(root)
+    records = []
+    for path, entry in sorted(snapshot.items()):
+        records.append(
+            (
+                path,
+                entry.kind,
+                entry.uid,
+                entry.gid,
+                entry.mode,
+                entry.flags,
+                entry.digest,
+                tuple((name.hex(), digest) for name, digest in entry.xattrs),
+                tuple(value.hex() for value in entry.acl_entries),
+            )
+        )
+    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_root_gid(root: pathlib.Path) -> int:
+    return _tree_snapshot(root)["."].gid
+
+
+def _align_created_directory_group(
+    binding: _DirectoryParentBinding,
+    expected_gid: int,
+) -> None:
+    binding.revalidate()
+    os.fchown(binding.fd, -1, expected_gid)
+    binding.policy = validate_directory_policy_fd(
+        binding.fd,
+        binding.path,
+        private=True,
+    )
+    binding.revalidate()
+
+
+def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
+    command = (
+        "/usr/bin/git",
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "color.ui=false",
+        "-C",
+        str(source_root),
+        *arguments,
+    )
+    returncode, stdout, stderr = run_bounded(
+        command,
+        cwd=source_root,
+        environment=sanitized_git_environment(
+            {
+                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_PAGER": "cat",
+                "PAGER": "cat",
+            }
+        ),
+        timeout=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    if returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[:512]
+        raise RuntimeError(f"source checkout Git validation failed: {detail}")
+    return stdout
+
+
+def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
+    expected_head = os.environ.get(EXPECTED_HEAD_ENV, "")
+    if len(expected_head) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_head
+    ):
+        raise RuntimeError(f"{EXPECTED_HEAD_ENV} must be one full lowercase SHA-1")
+    repo_root = pathlib.Path(
+        os.fsdecode(
+            _source_git_output(source_root, "rev-parse", "--show-toplevel").strip()
+        )
+    ).resolve(strict=True)
+    resolved_source = source_root.resolve(strict=True)
+    try:
+        relative = resolved_source.relative_to(repo_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "runner source is outside its reported Git worktree"
+        ) from error
+    observed_head = os.fsdecode(
+        _source_git_output(source_root, "rev-parse", "HEAD").strip()
+    )
+    if observed_head != expected_head:
+        raise RuntimeError(
+            "source checkout HEAD does not match the expected exact head"
+        )
+    status = _source_git_output(
+        source_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RuntimeError("source checkout has tracked or untracked changes")
+    ignored = _source_git_output(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        relative.as_posix(),
+    )
+    if ignored:
+        raise RuntimeError("source subtree contains ignored files outside exact HEAD")
+    return SourceCheckoutBinding(
+        repo_root=repo_root,
+        head_sha=observed_head,
+        source_relative_path=relative.as_posix(),
+    )
+
+
+def _copy_bound_source(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceCheckoutBinding,
+    source_manifest_before: str,
+) -> str:
+    shutil.copytree(
+        source_root,
+        installed_root,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    installed_manifest = _source_manifest_sha256(installed_root)
+    source_manifest_after = _source_manifest_sha256(source_root)
+    source_binding_after = _bind_source_checkout(source_root)
+    if (
+        source_binding_after != source_binding
+        or source_manifest_after != source_manifest_before
+        or installed_manifest != source_manifest_before
+    ):
+        raise RuntimeError(
+            "installed test input does not match the stable exact-head source"
+        )
+    return source_manifest_before
 
 
 def _set_tree_read_only(root: pathlib.Path) -> None:
@@ -1295,6 +1982,85 @@ def _bounded_failure_text(value: str, *, limit: int = 16_384) -> str:
     return value[-limit:]
 
 
+def _serialize_terminal_json(value: object, *, operation: str) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except BaseException as error:
+        raise TerminalPublicationError(operation, error) from error
+
+
+def _write_terminal_stdout(payload: bytes) -> None:
+    try:
+        descriptor = sys.stdout.fileno()
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "terminal stdout write made no progress")
+            remaining = remaining[written:]
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+    try:
+        written = os.write(descriptor, b"\n")
+        if written != 1:
+            raise OSError(
+                errno.EIO,
+                "terminal stdout newline write made no progress",
+            )
+    except BaseException as error:
+        _report_terminal_publication_failure(
+            TerminalPublicationError("stdout-newline", error)
+        )
+
+
+def _publish_terminal_output(
+    summary: dict[str, object],
+    diagnostics: str,
+    *,
+    terminal_process: bool,
+) -> None:
+    summary_text = _serialize_terminal_json(
+        summary,
+        operation="summary-serialization",
+    )
+    try:
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-flush", error) from error
+    try:
+        if diagnostics:
+            sys.stderr.write(diagnostics)
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-write", error) from error
+    try:
+        sys.stderr.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-flush", error) from error
+
+    payload = summary_text.encode("utf-8")
+    if terminal_process:
+        _write_terminal_stdout(payload)
+        return
+    try:
+        sys.stdout.write(payload.decode("utf-8") + "\n")
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+
+
+def _report_terminal_publication_failure(error: TerminalPublicationError) -> None:
+    message = (
+        "read-only installed supervisor terminal publication failed: "
+        f"operation={error.operation}; "
+        f"error={type(error.error).__name__}: "
+        f"{_bounded_failure_text(str(error.error), limit=1_024)}\n"
+    )
+    try:
+        os.write(2, message.encode("utf-8", errors="backslashreplace"))
+    except BaseException:
+        pass
+
+
 def _primary_failure(stage: str, error: BaseException) -> PrimaryFailure:
     error_errno = getattr(error, "errno", None)
     return PrimaryFailure(
@@ -1352,7 +2118,7 @@ def _cleanup_tree(
 
 
 def _cleanup_failure_from_error(
-    path: pathlib.Path,
+    path: pathlib.Path | str,
     error: BaseException,
     *,
     retained: bool | None,
@@ -1469,6 +2235,57 @@ def _bound_cleanup_failure(
         original_path_status=evidence.original_path_status,
         access_policy_status=evidence.access_policy_status,
         recovery_evidence=recovery_evidence,
+    )
+
+
+def _bound_close_failure(
+    binding: _DirectoryParentBinding,
+    error: BaseException,
+    *,
+    evidence: BoundPathEvidence | None,
+    evidence_error: BaseException | None,
+) -> CleanupFailure:
+    """Report the held object, never a replacement at its lexical path."""
+
+    held_identity = binding.object_locator()
+    if evidence_error is not None:
+        try:
+            error.add_note(
+                "pre-close retention evidence failed: "
+                f"{type(evidence_error).__name__}: {evidence_error}"
+            )
+        except BaseException:
+            pass
+    if evidence is None or evidence.path_status == "bound-unresolved":
+        path: pathlib.Path | str = (
+            f"descriptor-object://{held_identity['device']}/{held_identity['inode']}"
+        )
+        retained = evidence.retained if evidence is not None else None
+        replacement_path = evidence.replacement_path if evidence is not None else None
+        original_path_status = (
+            evidence.original_path_status if evidence is not None else "unreadable"
+        )
+        access_policy_status = (
+            evidence.access_policy_status if evidence is not None else "unreadable"
+        )
+        path_status = "descriptor-object"
+    else:
+        path = evidence.path
+        retained = evidence.retained
+        replacement_path = evidence.replacement_path
+        original_path_status = evidence.original_path_status
+        access_policy_status = evidence.access_policy_status
+        path_status = evidence.path_status
+    return _cleanup_failure_from_error(
+        path,
+        error,
+        retained=retained,
+        original_path=binding.path,
+        path_status=path_status,
+        replacement_path=replacement_path,
+        held_identity=held_identity,
+        original_path_status=original_path_status,
+        access_policy_status=access_policy_status,
     )
 
 
@@ -3104,21 +3921,11 @@ def _retained_for_unproven_child_closure(
     )
 
 
-def main() -> int:
-    if sys.platform != "darwin":
-        print(
-            "read-only installed supervisor regression requires Darwin", file=sys.stderr
-        )
-        return 2
-    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(parent_metadata.st_mode)
-        or not parent_metadata.st_mode & stat.S_ISVTX
-        or not parent_metadata.st_mode & stat.S_IWOTH
-    ):
-        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
-        return 2
-
+def _run_main(
+    lifecycle_fence: LifecycleSignalFence,
+    *,
+    terminal_process: bool,
+) -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
     install_container_binding: _DirectoryParentBinding | None = None
@@ -3137,6 +3944,7 @@ def main() -> int:
     timeout_error: TimeoutError | None = None
     output_limit_error: OverflowError | None = None
     signal_error: ChildRunInterrupted | None = None
+    signal_is_primary = False
     closure_error: GitProcessClosureUnproven | None = None
     child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
@@ -3145,8 +3953,19 @@ def main() -> int:
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     creation_cleanup_failures: list[CleanupFailure] = []
     deferred_control_flow_error: BaseException | None = None
-    stage = "install-container"
+    source_binding: SourceCheckoutBinding | None = None
+    source_head_bound = False
+    source_manifest_sha256: str | None = None
+    trusted_source_requested = bool(os.environ.get(EXPECTED_HEAD_ENV))
+    source_manifest_before: str | None = None
+    source_gid: int | None = None
+    stage = "source-head-binding" if trusted_source_requested else "install-container"
     try:
+        if trusted_source_requested:
+            source_binding = _bind_source_checkout(source_root)
+            source_manifest_before = _source_manifest_sha256(source_root)
+            source_gid = _source_root_gid(source_root)
+        stage = "install-container"
         install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
@@ -3157,6 +3976,9 @@ def main() -> int:
             install_container_binding
         )
         install_container = install_container_binding.path
+        if source_gid is not None:
+            stage = "install-container-group"
+            _align_created_directory_group(install_container_binding, source_gid)
         stage = "runtime-parent"
         runtime_parent_binding = _create_bound_owned_private_directory(
             _private_runtime_parent(),
@@ -3168,49 +3990,77 @@ def main() -> int:
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
-        shutil.copytree(
-            source_root,
-            installed_root,
-            symlinks=True,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-        )
+        install_container_binding.revalidate()
+        if source_binding is not None and source_manifest_before is not None:
+            source_manifest_sha256 = _copy_bound_source(
+                source_root,
+                installed_root,
+                source_binding,
+                source_manifest_before,
+            )
+        else:
+            shutil.copytree(
+                source_root,
+                installed_root,
+                symlinks=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+        install_container_binding.revalidate()
+        source_head_bound = source_binding is not None
         stage = "install-read-only"
         _set_tree_read_only(installed_root)
         stage = "snapshot-before"
+        install_container_binding.revalidate()
         before = _tree_snapshot(installed_root)
         stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment.pop("PYTHONPYCACHEPREFIX", None)
-        environment.update(
-            {
-                "PYTHONDONTWRITEBYTECODE": "1",
-                EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
-                "TMPDIR": str(runtime_parent),
-            }
-        )
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "child-run"
-        completed = _run_bounded_child(
-            (
-                sys.executable,
-                "-B",
-                "-m",
-                "tests.run_required_deterministic_supervisor",
-            ),
-            cwd=installed_root,
-            environment=environment,
-            secondary_failures=secondary_failures,
-            closure_proof=closure_proof,
-            outcome_receipt=child_outcome_receipt,
-            require_isolated_account=True,
-        )
+        if trusted_source_requested:
+            child_process_closure = "pending"
+            completed = _run_no_child_test_suite(
+                installed_root=installed_root,
+                install_container_binding=install_container_binding,
+                runtime_parent_binding=runtime_parent_binding,
+                secondary_failures=secondary_failures,
+                closure_proof=closure_proof,
+                lifecycle_fence=lifecycle_fence,
+            )
+        else:
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.update(
+                {
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
+                    "TMPDIR": str(runtime_parent),
+                }
+            )
+            completed = _run_bounded_child(
+                (
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "tests.run_required_deterministic_supervisor",
+                ),
+                cwd=installed_root,
+                environment=environment,
+                secondary_failures=secondary_failures,
+                closure_proof=closure_proof,
+                outcome_receipt=child_outcome_receipt,
+                require_isolated_account=True,
+            )
         child_process_closure = "proven"
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "install-container-revalidation"
         install_container_binding.revalidate()
         stage = "snapshot-after"
         after = _tree_snapshot(installed_root)
+        install_container_binding.revalidate()
         stage = "runtime-residue"
         runtime_residue = _list_bound_directory(runtime_parent_binding)
         stage = "complete"
@@ -3238,6 +4088,7 @@ def main() -> int:
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
+        signal_is_primary = True
         child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
@@ -3634,13 +4485,23 @@ def main() -> int:
                     ):
                         deferred_control_flow_error = inspection_error
         finally:
-            for binding_role, binding, include_held_identity in (
-                ("install-container", install_container_binding, False),
-                ("runtime-parent", runtime_parent_binding, False),
-                ("cleanup-control", cleanup_control_binding, True),
+            for binding_role, binding in (
+                ("install-container", install_container_binding),
+                ("runtime-parent", runtime_parent_binding),
+                ("cleanup-control", cleanup_control_binding),
             ):
                 if binding is None:
                     continue
+                close_evidence: BoundPathEvidence | None = None
+                close_evidence_error: BaseException | None = None
+                try:
+                    close_evidence = _bound_path_evidence(binding)
+                except BaseException as evidence_error:
+                    close_evidence_error = evidence_error
+                    if deferred_control_flow_error is None and not isinstance(
+                        evidence_error, Exception
+                    ):
+                        deferred_control_flow_error = evidence_error
                 try:
                     binding.close()
                 except BaseException as close_error:
@@ -3661,22 +4522,11 @@ def main() -> int:
                         deferred_control_flow_error = close_error
                     try:
                         cleanup_results.append(
-                            _cleanup_failure_from_error(
-                                binding.path,
+                            _bound_close_failure(
+                                binding,
                                 close_error,
-                                retained=None,
-                                original_path=binding.path,
-                                path_status="close-unresolved",
-                                replacement_path=(
-                                    binding.path
-                                    if os.path.lexists(binding.path)
-                                    else None
-                                ),
-                                held_identity=(
-                                    binding.object_locator()
-                                    if include_held_identity
-                                    else None
-                                ),
+                                evidence=close_evidence,
+                                evidence_error=close_evidence_error,
                             )
                         )
                     except BaseException as evidence_error:
@@ -3742,102 +4592,197 @@ def main() -> int:
             pass
         raise propagated_control_flow
 
-    release_tree_immutable = (
-        before is not None
-        and after is not None
-        and _tree_property_unchanged(before, after)
+    terminal_signal = _freeze_lifecycle_terminal_signal(lifecycle_fence)
+    if terminal_signal is not None and signal_error is None:
+        signal_error = ChildRunInterrupted(terminal_signal)
+        if primary_failure is None:
+            signal_is_primary = True
+            primary_failure = _primary_failure(stage, signal_error)
+    lifecycle_fence.terminal_selected_signal = (
+        signal_error.signal_number if signal_error is not None else terminal_signal
     )
-    retained_paths = [
-        failure.path for failure in cleanup_failures if failure.retained is not False
-    ]
-    if primary_failure is not None:
-        if timeout_error is not None:
-            primary_status = "timed-out"
-        elif output_limit_error is not None:
-            primary_status = "output-limit"
-        elif signal_error is not None:
-            primary_status = "interrupted"
-        elif (
-            closure_error is not None
-            or not closure_proof.destructive_cleanup_authorized
-        ):
-            primary_status = "closure-unproven"
+    try:
+        release_tree_immutable = (
+            before is not None
+            and after is not None
+            and _tree_property_unchanged(before, after)
+        )
+        retained_paths = list(
+            dict.fromkeys(
+                failure.path
+                for failure in cleanup_failures
+                if failure.retained is not False
+            )
+        )
+        if primary_failure is not None:
+            if timeout_error is not None:
+                primary_status = "timed-out"
+            elif output_limit_error is not None:
+                primary_status = "output-limit"
+            elif signal_is_primary:
+                primary_status = "interrupted"
+            elif (
+                closure_error is not None
+                or not closure_proof.destructive_cleanup_authorized
+            ):
+                primary_status = "closure-unproven"
+            else:
+                primary_status = "failed"
+        elif completed is None:
+            primary_status = "not-completed"
+        elif completed.returncode != 0:
+            primary_status = "child-failed"
+        elif not release_tree_immutable:
+            primary_status = "property-mismatch"
+        elif runtime_residue:
+            primary_status = "runtime-residue"
         else:
-            primary_status = "failed"
-    elif completed is None:
-        primary_status = "not-completed"
-    elif completed.returncode != 0:
-        primary_status = "child-failed"
-    elif not release_tree_immutable:
-        primary_status = "property-mismatch"
-    elif runtime_residue:
-        primary_status = "runtime-residue"
-    else:
-        primary_status = "complete"
-    summary = {
-        "child_process_closure": child_process_closure,
-        "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
-        "cleanup_status": "incomplete" if cleanup_failures else "complete",
-        "install_parent_is_sticky_world_writable": True,
-        "primary_failure": (
-            asdict(primary_failure) if primary_failure is not None else None
-        ),
-        "primary_status": primary_status,
-        "release_tree_immutable": release_tree_immutable,
-        "release_tree_property": "object-identity-content-access-policy",
-        "retained_paths": retained_paths,
-        "returncode": completed.returncode if completed is not None else None,
-        "runtime_residue": list(runtime_residue),
-        "secondary_failures": [asdict(failure) for failure in secondary_failures],
-        "signal_number": (
-            signal_error.signal_number if signal_error is not None else None
-        ),
-        "timed_out": timeout_error is not None,
-    }
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+            primary_status = "complete"
+        summary: dict[str, object] = {
+            "child_process_closure": child_process_closure,
+            "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
+            "cleanup_guarantee": CLEANUP_GUARANTEE,
+            "cleanup_status": "incomplete" if cleanup_failures else "complete",
+            "creation_origin_guarantee": CREATION_ORIGIN_GUARANTEE,
+            "creation_origin_proven": False,
+            "install_parent_is_sticky_world_writable": True,
+            "no_child_runtime_profile": closure_proof.runtime_profile,
+            "primary_failure": (
+                asdict(primary_failure) if primary_failure is not None else None
+            ),
+            "primary_status": primary_status,
+            "release_tree_immutable": release_tree_immutable,
+            "release_tree_property": "object-identity-content-access-policy",
+            "retained_paths": retained_paths,
+            "returncode": completed.returncode if completed is not None else None,
+            "runtime_residue": list(runtime_residue),
+            "secondary_failures": [asdict(failure) for failure in secondary_failures],
+            "signal_number": lifecycle_fence.terminal_selected_signal,
+            "source_head_bound": source_head_bound,
+            "source_head_sha": (
+                source_binding.head_sha if source_binding is not None else None
+            ),
+            "source_manifest_sha256": source_manifest_sha256,
+            "timed_out": timeout_error is not None,
+        }
 
-    primary_failed = primary_status != "complete"
-    if primary_failure is not None:
+        primary_failed = primary_status != "complete"
+        diagnostic_lines: list[str] = []
+        if primary_failure is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor primary failure: "
+                + _serialize_terminal_json(
+                    asdict(primary_failure),
+                    operation="primary-diagnostic-serialization",
+                )
+            )
+        if secondary_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor secondary failures: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in secondary_failures],
+                    operation="secondary-diagnostic-serialization",
+                )
+            )
+        if completed is not None and primary_failed:
+            if completed.stdout:
+                diagnostic_lines.append(_bounded_failure_text(completed.stdout))
+            if completed.stderr:
+                diagnostic_lines.append(_bounded_failure_text(completed.stderr))
+        if timeout_error is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor regression timed out"
+            )
+        if cleanup_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor cleanup incomplete: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in cleanup_failures],
+                    operation="cleanup-diagnostic-serialization",
+                )
+            )
+        diagnostics = "".join(line + "\n" for line in diagnostic_lines)
+    except TerminalPublicationError:
+        raise
+    except BaseException as error:
+        raise TerminalPublicationError("summary-construction", error) from error
+
+    if lifecycle_fence.terminal_selected_signal is not None:
+        returncode = 128 + lifecycle_fence.terminal_selected_signal
+    else:
+        returncode = 1 if primary_failed or cleanup_failures else 0
+    lifecycle_fence.terminal_exit_code = returncode
+    _publish_terminal_output(
+        summary,
+        diagnostics,
+        terminal_process=terminal_process,
+    )
+    lifecycle_fence.terminal_output_committed = True
+    return returncode
+
+
+def main(*, _terminal_process: bool = False) -> int:
+    if sys.platform != "darwin":
         print(
-            "read-only installed supervisor primary failure: "
-            + json.dumps(
-                asdict(primary_failure),
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
+            "read-only installed supervisor regression requires Darwin", file=sys.stderr
         )
-    if secondary_failures:
-        print(
-            "read-only installed supervisor secondary failures: "
-            + json.dumps(
-                [asdict(failure) for failure in secondary_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
+        return 2
+    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or not parent_metadata.st_mode & stat.S_ISVTX
+        or not parent_metadata.st_mode & stat.S_IWOTH
+    ):
+        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
+        return 2
+    lifecycle_fence = _install_lifecycle_signal_fence()
+    try:
+        returncode = _run_main(
+            lifecycle_fence,
+            terminal_process=_terminal_process,
         )
-    if completed is not None and primary_failed:
-        if completed.stdout:
-            print(_bounded_failure_text(completed.stdout), file=sys.stderr)
-        if completed.stderr:
-            print(_bounded_failure_text(completed.stderr), file=sys.stderr)
-    if timeout_error is not None:
-        print("read-only installed supervisor regression timed out", file=sys.stderr)
-    if cleanup_failures:
-        print(
-            "read-only installed supervisor cleanup incomplete: "
-            + json.dumps(
-                [asdict(failure) for failure in cleanup_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-    if signal_error is not None:
-        return 128 + signal_error.signal_number
-    return 1 if primary_failed or cleanup_failures else 0
+    except TerminalPublicationError as publication_error:
+        _report_terminal_publication_failure(publication_error)
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            publication_error.add_note(
+                "lifecycle signal restoration failed after publication error: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+            _report_terminal_publication_failure(
+                TerminalPublicationError(
+                    "signal-fence-restoration",
+                    restore_error,
+                )
+            )
+            if lifecycle_fence.terminal_selected_signal is not None:
+                if lifecycle_fence.terminal_exit_code is not None:
+                    return lifecycle_fence.terminal_exit_code
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return 1
+        if lifecycle_fence.terminal_selected_signal is not None:
+            if lifecycle_fence.terminal_exit_code is None:
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return lifecycle_fence.terminal_exit_code
+        return 1
+    except BaseException as primary_error:
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            primary_error.add_note(
+                "lifecycle signal restoration failed: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+        raise
+    # The CLI exits with the sealed decision while lifecycle signals stay blocked.
+    if _terminal_process and lifecycle_fence.terminal_output_committed:
+        return returncode
+    received_signal = _restore_lifecycle_signal_fence(lifecycle_fence)
+    if not lifecycle_fence.terminal_output_committed and received_signal is not None:
+        return 128 + received_signal
+    return returncode
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(_terminal_process=True))

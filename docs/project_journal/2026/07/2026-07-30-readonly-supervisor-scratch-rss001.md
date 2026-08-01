@@ -3,7 +3,7 @@ id: 20260730-rss001
 title: Read-Only Supervisor Scratch
 status: completed
 created: 2026-07-30
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -334,3 +334,23 @@ superseded_by:
   ordered normal/failure-injection double-fork rounds passed 20/20 in 67.488
   seconds. The repository contracts passed 105/105 under the same uv-managed
   CPython 3.13.13 runtime.
+- The exact follow-up working tree passed 825/825 deterministic tests in
+  397.034 seconds on host-level Homebrew CPython 3.13.12. The reviewed
+  825-test selected identity has SHA-256
+  `44716a7919f53dc79897cb7426ccca293c8f4a0a3d879003cc3b346cf17eb3cd`.
+  The read-only no-child subset independently passed 275/275 in 28.783 seconds
+  with selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+  The fixed `/usr/bin/git` checkout module passed 43/43 at host level. Inside
+  the Codex outer sandbox, Apple Git 2.53 emitted a `confstr()` diagnostic while
+  resolving `DARWIN_USER_TEMP_DIR`; the unchanged stderr-empty contract rejected
+  all four affected reachability paths. Setting `TMPDIR` inside the private Git
+  control was rejected because `xcrun` created an unmanifested `xcrun_db`; no
+  such workaround or stderr relaxation entered the source.
+- The positive thirteen-test production no-child gate remains blocked in this
+  Codex Desktop context because the process inherits an outer Seatbelt. The
+  required-mode run failed closed with one failure and two errors rather than
+  skipping. A no-outer-Seatbelt Trusted Mac must rerun all 13 tests and the
+  exact-head read-only installed runner after the final signed commit; neither
+  the hosted blocker-signature probe nor the 825-test deterministic result
+  substitutes for that evidence.

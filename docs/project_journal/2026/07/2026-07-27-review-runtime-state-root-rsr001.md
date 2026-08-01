@@ -3,7 +3,7 @@ id: 20260727-rsr001
 title: Review Runtime State Root
 status: completed
 created: 2026-07-27
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/review-runtime-state-no-bytecode
 pr:
 supersedes: []
@@ -322,3 +322,25 @@ superseded_by:
   publication fails, the unreaped direct-child relationship prevents PID reuse
   while the parent sends SIGKILL and then reaps that child; an independent
   custody receipt and exact-identity absence proof exercise that failure path.
+- The source-binding and terminal-publication follow-up passed 825/825
+  deterministic tests in 397.034 seconds on host-level Homebrew CPython 3.13.12.
+  The reviewed 825-test selected identity has SHA-256
+  `44716a7919f53dc79897cb7426ccca293c8f4a0a3d879003cc3b346cf17eb3cd`.
+  Its read-only no-child subset passed 275/275 with selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`,
+  and the fixed `/usr/bin/git` checkout module passed 43/43 at host level.
+  The same Git tests fail closed inside the Codex outer sandbox when Apple Git
+  2.53 emits a `DARWIN_USER_TEMP_DIR` diagnostic; the source retains the strict
+  empty-stderr requirement and does not set `TMPDIR` inside private Git control.
+- Claude Code 2.1.220 compatibility is exact-version and closed-schema only.
+  The reviewed profile admits only the ordered additional
+  `interrupt_cancel_queued_v1` capability and the exact
+  `fast_mode_disabled_reason == "sdk_opt_in_required"` field where the audited
+  init and terminal records permit it. Adjacent versions, unknown fields,
+  reordered or extra capabilities, and stale aggregate evidence remain
+  rejected. The complete validator module passed 109/109 on Python 3.13.
+- The required thirteen-test positive no-child profile is still
+  `sandbox-blocked` in Codex Desktop because the inherited outer Seatbelt makes
+  nested Seatbelt evidence unavailable. This is an explicit merge-readiness
+  gap: a no-outer-Seatbelt Trusted Mac must run 13/13 and the exact-head
+  read-only installed runner on the final signed commit.

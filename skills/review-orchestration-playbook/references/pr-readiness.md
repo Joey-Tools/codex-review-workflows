@@ -61,11 +61,13 @@ For issue-comment-only terminal or no-start evidence, apply the request-ledger a
 
 ## Trusted Mac Isolation Gate
 
-The pinned GitHub Hosted `macos-26` profile produces only a reviewed fail-closed
-signature, not production-equivalent no-child or snapshot-Seatbelt evidence.
-Its RLIMIT probes exit before post-exec leader binding, while its Seatbelt and
-combined probes bind the leader and then terminate with `SIGKILL` before probe
-evidence. When the frozen range changes the independent supervisor's Darwin
+The pinned GitHub Hosted `macos-26` production-profile probe produces only a
+reviewed fail-closed signature, not production-equivalent no-child evidence.
+The separate required hosted read-only job remains valuable: it runs the full
+deterministic suite from a root-owned isolated source as `nobody`, with bound
+runtime custody and an exact terminal summary. Its isolated-account closure is
+not the authenticated production no-child proof below. When the frozen range
+changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
 tests, the delivery operator must run this command on a trusted Mac that
 matches the production runtime pin after the final commit exists. First resolve
@@ -80,13 +82,42 @@ runner:
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
 ```
 
 Record the interpreter's absolute path and digest and exact `head_sha`; record
-nine tests run, zero skips, and the terminal result in the PR delivery evidence.
+the live runner's thirteen tests, zero skips, and terminal result, followed by the
+read-only install runner's complete structured summary. Accept that summary
+only when all of these predicates hold:
+
+- `primary_status == "complete"` and `primary_failure == null`
+- `child_process_closure == "proven"`
+- `cleanup_status == "complete"` and `cleanup_failures == []`
+- `release_tree_immutable == true`
+- `source_head_bound == true`, `source_head_sha == <full-head-sha>`, and
+  `source_manifest_sha256` is one full lowercase SHA-256
+- `no_child_runtime_profile == "production-current"`
+- `returncode == 0`
+- `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`
+- `signal_number == null` and `timed_out == false`
+- `creation_origin_proven == false`
+- `creation_origin_guarantee == "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"`
+- `cleanup_guarantee == "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb"`
+
+The last three predicates are mandatory platform-boundary evidence, not a
+failed run. macOS provides neither an atomic create-directory-and-return-FD
+operation nor unlink-by-FD. The `mkdirat` to first no-follow open window and
+the final identity-check to `unlinkat`/`rmdir` window therefore rely on a
+128-bit unguessable leaf and cooperative same-UID host TCB. After the receipt
+exists, identity/access-policy drift fails closed; custodied manifests,
+quarantine, and descriptor revalidation are used for cleanup, and a replacement
+is never removed after mismatch or unproven identity has been observed.
+
+Both commands must use the same recorded interpreter and exact head.
 Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,
 or nonmatching-host evidence blocks merge-readiness;
-Hosted CI's blocker-signature probe is not a substitute.
+neither Hosted CI's blocker-signature probe nor its isolated-account read-only
+job substitutes for the production no-child proof.
 
 This is an operator-enforced exact-head gate, not a GitHub check run, branch
 protection status, cryptographic attestation, or named review lane. Do not claim
