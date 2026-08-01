@@ -94,7 +94,8 @@ superseded_by:
   both the installed and runtime trees.
 - CI runs the ordinary deterministic suite and the read-only installed
   regression in separate macOS Python 3.13 jobs. The read-only job copies the
-  tracked source into an owner-private `/Users` root and executes the runner as
+  tracked source from the checkout into a root-owned, read-only
+  `/private/codex-review-readonly.*` isolation tree and executes the runner as
   `nobody` with an empty environment inside an inherited Seatbelt profile.
   Before starting the child, the runner proves real/effective UID equality,
   non-root and non-admin membership, kernel-visible `job-creation` denial,
