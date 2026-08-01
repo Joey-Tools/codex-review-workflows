@@ -159,7 +159,8 @@ def _normalize_github_codex_body(value: object) -> str | None:
         .replace("\u2029", "\n")
     )
     if any(
-        codepoint == 0
+        0xD800 <= codepoint <= 0xDFFF
+        or codepoint == 0
         or (
             (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F)
             and codepoint not in (0x09, 0x0A)
@@ -212,7 +213,8 @@ def _github_codex_issue_body_semantic(
                 detail
                 and len(detail) <= 160
                 and all(
-                    not unicodedata.category(char).startswith("C") for char in detail
+                    not (ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F)
+                    for char in detail
                 )
             ):
                 progress_only = True
@@ -3339,6 +3341,42 @@ class RepositoryContractTest(unittest.TestCase):
             normalized_github_pr_probes_text,
         )
         normalized_authority_text = " ".join(authority.lower().replace("`", "").split())
+        strict_json_contracts = {
+            "authority": (
+                normalized_authority_text,
+                (
+                    "every body_utf8 receipt or page is decoded before projection "
+                    "by one strict json decoder",
+                    "it rejects duplicate object member names at every depth, nan, "
+                    "infinity, -infinity, any decoded non-finite number, and any "
+                    "string or member name containing u+d800 through u+dfff",
+                ),
+            ),
+            "github-pr-probes": (
+                normalized_github_pr_probes_text,
+                (
+                    "before any projection, pass the provider declaration, every "
+                    "request-scope receipt body, every rest page, and every graphql "
+                    "page through the same strict json decoder",
+                    "a digest paired with a permissive decoder is not sufficient "
+                    "authority",
+                ),
+            ),
+        }
+        for document_name, (document, anchors) in strict_json_contracts.items():
+            for anchor in anchors:
+                with self.subTest(strict_json_document=document_name, anchor=anchor):
+                    self.assertIn(anchor, document)
+        for document_name, document in (
+            ("authority", normalized_authority_text),
+            ("github-pr-probes", normalized_github_pr_probes_text),
+        ):
+            with self.subTest(unresolved_blocker_projection=document_name):
+                self.assertIn("blocker-specific projection", document)
+                self.assertIn(
+                    "equal-time clean or malformed artifact on another channel",
+                    document,
+                )
         self.assertIn(
             "this finding classification is independent of isresolved; "
             "resolution is applied only when deciding whether a later clean "
@@ -4252,6 +4290,29 @@ class RepositoryContractTest(unittest.TestCase):
         disclosed["body"] = f"{clean_issue['body']}\n\n{disclosure}"
         self.assertEqual(classify(disclosed), "clean")
 
+        for detail in ("checking linked\u200dfiles", chr(0xD7FF), chr(0xE000), "👩‍💻"):
+            progress_with_scalar_detail = clone(clean_issue)
+            progress_with_scalar_detail["body"] = f"Codex Review in progress: {detail}"
+            with self.subTest(progress_unicode_scalar=repr(detail)):
+                self.assertEqual(
+                    classify(progress_with_scalar_detail),
+                    "nonterminal",
+                )
+
+        progress_with_ht = clone(clean_issue)
+        progress_with_ht["body"] = "Codex Review in progress: bad\tdetail"
+        self.assertEqual(classify(progress_with_ht), "malformed")
+
+        for surrogate in (0xD800, 0xDBFF, 0xDC00, 0xDFFF):
+            surrogate_finding = clone(finding)
+            surrogate_finding["body"] = str(surrogate_finding["body"]).replace(
+                "Example finding",
+                f"Invalid {chr(surrogate)} finding",
+            )
+            with self.subTest(rejected_surrogate=f"U+{surrogate:04X}"):
+                self.assertEqual(classify(surrogate_finding), "malformed")
+                self.assertIsNone(normalize_body(surrogate_finding["body"]))
+
         selection_pagination = {
             "issue_comments": True,
             "reviews": True,
@@ -4978,6 +5039,16 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "references/github-codex-evidence-authority.md"
         ).read_text(encoding="utf-8")
         exact_login = "chatgpt-codex-connector[bot]"
+        github_reaction_contents = {
+            "+1",
+            "-1",
+            "laugh",
+            "confused",
+            "heart",
+            "hooray",
+            "rocket",
+            "eyes",
+        }
         current_repository = "OWNER/REPO"
         current_pr = 1
         current_head = "0123456789abcdef0123456789abcdef01234567"
@@ -5108,6 +5179,88 @@ class RepositoryContractTest(unittest.TestCase):
         def clone(value: object) -> object:
             return json.loads(json.dumps(value))
 
+        def strict_utf8_sha256(value: object) -> str | None:
+            if not isinstance(value, str):
+                return None
+            try:
+                encoded = value.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return None
+            return hashlib.sha256(encoded).hexdigest()
+
+        def strict_json_loads(value: object) -> object:
+            if not isinstance(value, str):
+                raise TypeError("strict JSON input must be text")
+            value.encode("utf-8", errors="strict")
+
+            def object_without_duplicate_keys(
+                pairs: list[tuple[str, object]],
+            ) -> dict[str, object]:
+                result: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in result:
+                        raise ValueError(f"duplicate JSON object key: {key}")
+                    result[key] = item
+                return result
+
+            def reject_nonstandard_constant(value: str) -> object:
+                raise ValueError(f"nonstandard JSON constant: {value}")
+
+            try:
+                decoded = json.loads(
+                    value,
+                    object_pairs_hook=object_without_duplicate_keys,
+                    parse_constant=reject_nonstandard_constant,
+                )
+            except RecursionError as exc:
+                raise ValueError("JSON nesting exceeds the decoder limit") from exc
+
+            def is_scalar_tree(item: object) -> bool:
+                if isinstance(item, str):
+                    return not any(0xD800 <= ord(char) <= 0xDFFF for char in item)
+                if isinstance(item, float):
+                    return math.isfinite(item)
+                if isinstance(item, list):
+                    return all(is_scalar_tree(child) for child in item)
+                if isinstance(item, dict):
+                    return all(
+                        is_scalar_tree(key) and is_scalar_tree(child)
+                        for key, child in item.items()
+                    )
+                return True
+
+            try:
+                scalar_tree = is_scalar_tree(decoded)
+            except RecursionError as exc:
+                raise ValueError("JSON scalar traversal exceeds the limit") from exc
+            if not scalar_tree:
+                raise ValueError("JSON contains a non-scalar string or number")
+            return decoded
+
+        def replace_raw_json_body(
+            response_or_page: dict[str, object],
+            body_utf8: str,
+        ) -> None:
+            response_or_page["body_utf8"] = body_utf8
+            response_or_page["body_sha256"] = hashlib.sha256(
+                body_utf8.encode("utf-8")
+            ).hexdigest()
+
+        invalid_strict_json = {
+            "recursive-duplicate-key": '{"outer":{"key":1,"key":1}}',
+            "nan": '{"value":NaN}',
+            "positive-infinity": '{"value":Infinity}',
+            "negative-infinity": '{"value":-Infinity}',
+            "overflowing-number": '{"value":1e9999}',
+            "escaped-surrogate": r'{"value":"\ud800"}',
+            "direct-surrogate": '{"value":"' + chr(0xD800) + '"}',
+            "deep-tree": ("[" * 600) + "0" + ("]" * 600),
+        }
+        for case_name, body_utf8 in invalid_strict_json.items():
+            with self.subTest(strict_json_decoder=case_name):
+                with self.assertRaises((TypeError, ValueError)):
+                    strict_json_loads(body_utf8)
+
         def typed_json_equal(left: object, right: object) -> bool:
             if type(left) is not type(right):
                 return False
@@ -5165,15 +5318,14 @@ class RepositoryContractTest(unittest.TestCase):
                 or type(value.get("status")) is not int
                 or value.get("status") != 200
                 or not isinstance(value.get("body_utf8"), str)
-                or value.get("body_sha256")
-                != hashlib.sha256(value["body_utf8"].encode("utf-8")).hexdigest()
+                or value.get("body_sha256") != strict_utf8_sha256(value["body_utf8"])
             ):
                 return None
             response_server_time = parse_http_date(value.get("date_header"))
             if response_server_time is None:
                 return None
             try:
-                raw_record = json.loads(value["body_utf8"])
+                raw_record = strict_json_loads(value["body_utf8"])
             except (TypeError, ValueError):
                 return None
             if not isinstance(raw_record, dict):
@@ -5359,6 +5511,28 @@ class RepositoryContractTest(unittest.TestCase):
                 and final.get("normalized_sha256")
                 == hashlib.sha256(normalized_bytes).hexdigest()
             )
+
+        for case_name, suffix in {
+            "duplicate-key": (
+                f',"body":{json.dumps(declaration_text, ensure_ascii=False)}'
+            ),
+            "nonstandard-constant": ',"ignored":NaN',
+        }.items():
+            malformed_declaration_json = clone(declaration)
+            assert isinstance(malformed_declaration_json, dict)
+            for receipt_name in (
+                "initial_fetch_receipt",
+                "final_fetch_receipt",
+            ):
+                receipt = malformed_declaration_json[receipt_name]
+                assert isinstance(receipt, dict)
+                body_utf8 = receipt.get("body_utf8")
+                assert isinstance(body_utf8, str) and body_utf8.endswith("}")
+                replace_raw_json_body(receipt, f"{body_utf8[:-1]}{suffix}}}")
+            with self.subTest(strict_declaration_json=case_name):
+                self.assertFalse(
+                    declaration_is_authoritative(malformed_declaration_json)
+                )
 
         def request(
             request_id: int,
@@ -5662,14 +5836,14 @@ class RepositoryContractTest(unittest.TestCase):
                     or response.get("status") != status
                     or not isinstance(response.get("body_utf8"), str)
                     or response.get("body_sha256")
-                    != hashlib.sha256(response["body_utf8"].encode("utf-8")).hexdigest()
+                    != strict_utf8_sha256(response["body_utf8"])
                 ):
                     return None
                 server_time = parse_http_date(response.get("date_header"))
                 if server_time is None or server_time > history_as_of_server_time:
                     return None
                 try:
-                    body = json.loads(response["body_utf8"])
+                    body = strict_json_loads(response["body_utf8"])
                 except (TypeError, ValueError):
                     return None
                 return (body, server_time)
@@ -5686,7 +5860,7 @@ class RepositoryContractTest(unittest.TestCase):
                 if not isinstance(pull_response, dict):
                     return None
                 try:
-                    pull_body = json.loads(str(pull_response.get("body_utf8")))
+                    pull_body = strict_json_loads(pull_response.get("body_utf8"))
                 except (TypeError, ValueError):
                     return None
                 if not isinstance(pull_body, dict):
@@ -6504,7 +6678,10 @@ class RepositoryContractTest(unittest.TestCase):
                     ):
                         continue
                     return "unknown"
-                if user_type != "Bot" or item["content"] not in ("+1", "eyes"):
+                if (
+                    user_type != "Bot"
+                    or item["content"] not in github_reaction_contents
+                ):
                     return "unknown"
                 provider_reactions.append(item)
 
@@ -6513,6 +6690,11 @@ class RepositoryContractTest(unittest.TestCase):
                 for item in provider_reactions
                 if item["parent_request_id"] in current_request_ids
             ]
+            if any(
+                item["content"] not in ("+1", "eyes")
+                for item in current_provider_reactions
+            ):
+                return "unknown"
             plus_ones = [
                 item for item in current_provider_reactions if item["content"] == "+1"
             ]
@@ -6562,6 +6744,8 @@ class RepositoryContractTest(unittest.TestCase):
 
         def candidate_order_basis(
             record: dict[str, object],
+            *,
+            prefer_unresolved_thread_blocker: bool = False,
         ) -> tuple[int, int] | None:
             initial_snapshot = record.get("initial_snapshot")
             final_snapshot = record.get("final_snapshot")
@@ -6638,6 +6822,67 @@ class RepositoryContractTest(unittest.TestCase):
                         artifacts_by_native_id[native_key] = final_artifact_snapshot
                         artifact_semantics_by_time_id[semantics_key] = semantics
                         artifact_bases.append(validated_artifact)
+
+            if artifact_bases:
+                if prefer_unresolved_thread_blocker:
+                    unresolved_artifact_bases = [
+                        item
+                        for item in artifact_bases
+                        if item[2] == "unresolved-thread-finding"
+                    ]
+                    if unresolved_artifact_bases:
+                        server_time, stable_artifact_id, _, _, _ = max(
+                            unresolved_artifact_bases,
+                            key=lambda item: (item[0], item[1]),
+                        )
+                        return (server_time, stable_artifact_id)
+                latest_artifact_time = max(item[0] for item in artifact_bases)
+                latest_artifacts = [
+                    item for item in artifact_bases if item[0] == latest_artifact_time
+                ]
+                if len({item[4] for item in latest_artifacts}) != 1:
+                    return None
+
+                def artifact_precedence(
+                    item: tuple[int, int, str, str, str],
+                ) -> int:
+                    _, _, artifact_kind, outcome, _ = item
+                    if artifact_kind == "malformed-terminal-artifact":
+                        return 3
+                    if outcome == "findings":
+                        return 2
+                    return 1
+
+                highest_priority = max(
+                    artifact_precedence(item) for item in latest_artifacts
+                )
+                priority_artifacts = [
+                    item
+                    for item in latest_artifacts
+                    if artifact_precedence(item) == highest_priority
+                ]
+                server_time, stable_artifact_id, kind, _, _ = max(
+                    priority_artifacts,
+                    key=lambda item: item[1],
+                )
+                expected_basis = {
+                    "kind": kind,
+                    "server_time": server_time,
+                    "stable_artifact_id": stable_artifact_id,
+                }
+                actual_basis = record.get("candidate_basis")
+                if (
+                    not isinstance(actual_basis, dict)
+                    or set(actual_basis) != set(expected_basis)
+                    or not isinstance(actual_basis.get("kind"), str)
+                    or type(actual_basis.get("server_time")) is not int
+                    or actual_basis["server_time"] <= 0
+                    or type(actual_basis.get("stable_artifact_id")) is not int
+                    or actual_basis["stable_artifact_id"] <= 0
+                    or not typed_json_equal(actual_basis, expected_basis)
+                ):
+                    return None
+                return (server_time, stable_artifact_id)
 
             pr = record_scope_key[1]
             raw_requests = record.get("requests")
@@ -6742,7 +6987,7 @@ class RepositoryContractTest(unittest.TestCase):
                 if (
                     user_login != exact_login
                     or user_type != "Bot"
-                    or content not in ("+1", "eyes")
+                    or content not in github_reaction_contents
                 ):
                     return None
                 exact_provider_reactions.append(item)
@@ -6773,41 +7018,7 @@ class RepositoryContractTest(unittest.TestCase):
             elif selected_request_id is not None or selected_reaction_id is not None:
                 return None
 
-            if artifact_bases:
-                latest_artifact_time = max(item[0] for item in artifact_bases)
-                latest_artifacts = [
-                    item for item in artifact_bases if item[0] == latest_artifact_time
-                ]
-                if len({item[4] for item in latest_artifacts}) != 1:
-                    return None
-
-                def artifact_precedence(
-                    item: tuple[int, int, str, str, str],
-                ) -> int:
-                    _, _, artifact_kind, outcome, _ = item
-                    if artifact_kind == "malformed-terminal-artifact":
-                        return 3
-                    elif outcome == "findings":
-                        return 2
-                    return 1
-
-                highest_priority = max(
-                    artifact_precedence(item) for item in latest_artifacts
-                )
-                priority_artifacts = [
-                    item
-                    for item in latest_artifacts
-                    if artifact_precedence(item) == highest_priority
-                ]
-
-                (
-                    server_time,
-                    stable_artifact_id,
-                    kind,
-                    _,
-                    _,
-                ) = max(priority_artifacts, key=lambda item: item[1])
-            else:
+            if not artifact_bases:
                 current_request_ids: set[int] = set()
                 if receipt_scopes is not None:
                     for raw_request in raw_requests:
@@ -6834,6 +7045,11 @@ class RepositoryContractTest(unittest.TestCase):
                     for item in exact_provider_reactions
                     if item["parent_request_id"] in current_request_ids
                 ]
+                if any(
+                    item["content"] not in ("+1", "eyes")
+                    for item in current_provider_reactions
+                ):
+                    return None
                 selected_current_plus = next(
                     (
                         item
@@ -7797,8 +8013,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or page.get("status") != 200
                     or page.get("request_after") is not None
                     or not isinstance(page.get("body_utf8"), str)
-                    or page.get("body_sha256")
-                    != hashlib.sha256(page["body_utf8"].encode("utf-8")).hexdigest()
+                    or page.get("body_sha256") != strict_utf8_sha256(page["body_utf8"])
                 ):
                     return None
                 seen_page_urls.add(page_url)
@@ -7810,7 +8025,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return None
                 try:
-                    body = json.loads(page["body_utf8"])
+                    body = strict_json_loads(page["body_utf8"])
                 except (TypeError, ValueError):
                     return None
                 if isinstance(body, list):
@@ -7822,6 +8037,45 @@ class RepositoryContractTest(unittest.TestCase):
                 if isinstance(next_url, str):
                     page_url = next_url
             return records
+
+        strict_rest_url = "https://api.github.com/repos/OWNER/REPO/strict?per_page=100"
+        for case_name, body_utf8 in {
+            "duplicate-key": '[{"id":1,"id":1}]',
+            "nonstandard-constant": '[{"id":1,"ignored":NaN}]',
+            "escaped-surrogate": r'[{"id":"\ud800"}]',
+        }.items():
+            malformed_rest_fetch = rest_fetch(
+                "strict_fixture",
+                strict_rest_url,
+                [{"id": 1}],
+            )
+            replace_raw_json_body(
+                malformed_rest_fetch["pages"][0],
+                body_utf8,
+            )
+            with self.subTest(strict_rest_page_json=case_name):
+                self.assertIsNone(
+                    parse_rest_pages(
+                        malformed_rest_fetch,
+                        expected_kind="strict_fixture",
+                        expected_url=strict_rest_url,
+                    )
+                )
+        direct_surrogate_rest = rest_fetch(
+            "strict_fixture",
+            strict_rest_url,
+            [{"id": 1}],
+        )
+        direct_surrogate_page = direct_surrogate_rest["pages"][0]
+        direct_surrogate_page["body_utf8"] = '["' + chr(0xD800) + '"]'
+        direct_surrogate_page["body_sha256"] = "0" * 64
+        self.assertIsNone(
+            parse_rest_pages(
+                direct_surrogate_rest,
+                expected_kind="strict_fixture",
+                expected_url=strict_rest_url,
+            )
+        )
 
         def parse_graphql_thread_pages(
             fetch: object,
@@ -7857,12 +8111,17 @@ class RepositoryContractTest(unittest.TestCase):
                     or page.get("link_header") is not None
                     or page.get("request_after") != expected_after
                     or not isinstance(page.get("body_utf8"), str)
-                    or page.get("body_sha256")
-                    != hashlib.sha256(page["body_utf8"].encode("utf-8")).hexdigest()
+                    or page.get("body_sha256") != strict_utf8_sha256(page["body_utf8"])
                 ):
                     return None
                 try:
-                    body = json.loads(page["body_utf8"])
+                    body = strict_json_loads(page["body_utf8"])
+                    if not isinstance(body, dict):
+                        return None
+                    if "errors" in body and (
+                        not isinstance(body["errors"], list) or body["errors"]
+                    ):
+                        return None
                     connection = body["data"]["repository"]["pullRequest"][
                         "reviewThreads"
                     ]
@@ -7870,10 +8129,10 @@ class RepositoryContractTest(unittest.TestCase):
                     return None
                 if (
                     not isinstance(connection, dict)
-                    or set(connection) != {"nodes", "pageInfo"}
+                    or not {"nodes", "pageInfo"} <= set(connection)
                     or not isinstance(connection.get("nodes"), list)
                     or not isinstance(connection.get("pageInfo"), dict)
-                    or set(connection["pageInfo"]) != {"hasNextPage", "endCursor"}
+                    or not {"hasNextPage", "endCursor"} <= set(connection["pageInfo"])
                     or type(connection["pageInfo"].get("hasNextPage")) is not bool
                 ):
                     return None
@@ -7894,8 +8153,8 @@ class RepositoryContractTest(unittest.TestCase):
                 for raw_node in connection["nodes"]:
                     if (
                         not isinstance(raw_node, dict)
-                        or set(raw_node)
-                        != {"id", "isResolved", "isOutdated", "comments"}
+                        or not {"id", "isResolved", "isOutdated", "comments"}
+                        <= set(raw_node)
                         or type(raw_node.get("isResolved")) is not bool
                         or type(raw_node.get("isOutdated")) is not bool
                     ):
@@ -7903,14 +8162,49 @@ class RepositoryContractTest(unittest.TestCase):
                     raw_comments = raw_node.get("comments")
                     if (
                         not isinstance(raw_comments, dict)
-                        or set(raw_comments) != {"nodes", "pageInfo"}
+                        or not {"nodes", "pageInfo"} <= set(raw_comments)
                         or not isinstance(raw_comments.get("nodes"), list)
                         or not isinstance(raw_comments.get("pageInfo"), dict)
-                        or set(raw_comments["pageInfo"]) != {"hasNextPage", "endCursor"}
+                        or not {"hasNextPage", "endCursor"}
+                        <= set(raw_comments["pageInfo"])
                         or raw_comments["pageInfo"].get("hasNextPage") is not False
                         or raw_comments["pageInfo"].get("endCursor") is not None
                     ):
                         return None
+                    projected_comments: list[dict[str, object]] = []
+                    for raw_comment in raw_comments["nodes"]:
+                        if not isinstance(raw_comment, dict) or not {
+                            "id",
+                            "fullDatabaseId",
+                            "url",
+                            "pullRequestReview",
+                        } <= set(raw_comment):
+                            return None
+                        raw_parent = raw_comment.get("pullRequestReview")
+                        if raw_parent is None:
+                            projected_parent: dict[str, object] | None = None
+                        elif isinstance(raw_parent, dict) and {
+                            "id",
+                            "fullDatabaseId",
+                        } <= set(raw_parent):
+                            projected_parent = {
+                                "id": clone(raw_parent.get("id")),
+                                "fullDatabaseId": clone(
+                                    raw_parent.get("fullDatabaseId")
+                                ),
+                            }
+                        else:
+                            return None
+                        projected_comments.append(
+                            {
+                                "id": clone(raw_comment.get("id")),
+                                "fullDatabaseId": clone(
+                                    raw_comment.get("fullDatabaseId")
+                                ),
+                                "url": clone(raw_comment.get("url")),
+                                "pullRequestReview": projected_parent,
+                            }
+                        )
                     nodes.append(
                         {
                             "id": clone(raw_node.get("id")),
@@ -7921,8 +8215,11 @@ class RepositoryContractTest(unittest.TestCase):
                                 "pages": [
                                     {
                                         "after": None,
-                                        "nodes": clone(raw_comments["nodes"]),
-                                        "pageInfo": clone(raw_comments["pageInfo"]),
+                                        "nodes": projected_comments,
+                                        "pageInfo": {
+                                            "hasNextPage": False,
+                                            "endCursor": None,
+                                        },
                                     }
                                 ],
                             },
@@ -7959,6 +8256,85 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertTrue(
             typed_json_equal(parsed_graphql_shape, [graphql_shape_internal])
         )
+
+        for case_name, mutate_body in {
+            "duplicate-key": lambda body: body.replace(
+                '"isResolved":false',
+                '"isResolved":false,"isResolved":false',
+                1,
+            ),
+            "nonstandard-constant": lambda body: (f'{body[:-1]},"ignored":NaN}}'),
+        }.items():
+            malformed_graphql_json = clone(graphql_shape_fetch)
+            assert isinstance(malformed_graphql_json, dict)
+            page = malformed_graphql_json["pages"][0]
+            assert isinstance(page, dict)
+            raw_body = page.get("body_utf8")
+            assert isinstance(raw_body, str)
+            replace_raw_json_body(page, mutate_body(raw_body))
+            with self.subTest(strict_graphql_page_json=case_name):
+                self.assertIsNone(parse_graphql_thread_pages(malformed_graphql_json))
+
+        for case_name, errors in {
+            "partial-data": [{"message": "partial response"}],
+            "field-error": [
+                {
+                    "message": "reviewThreads unavailable",
+                    "path": ["repository", "pullRequest", "reviewThreads"],
+                    "locations": [{"line": 1, "column": 1}],
+                }
+            ],
+            "malformed-errors": {"message": "errors must be an array"},
+            "null-errors": None,
+        }.items():
+            partial_graphql = clone(graphql_shape_fetch)
+            assert isinstance(partial_graphql, dict)
+            page = partial_graphql["pages"][0]
+            assert isinstance(page, dict)
+            body = json.loads(page["body_utf8"])
+            body["errors"] = errors
+            replace_raw_json_body(page, canonical_raw_body(body))
+            with self.subTest(graphql_partial_error=case_name):
+                self.assertIsNone(parse_graphql_thread_pages(partial_graphql))
+
+        forward_compatible_graphql = clone(graphql_shape_fetch)
+        assert isinstance(forward_compatible_graphql, dict)
+        forward_page = forward_compatible_graphql["pages"][0]
+        forward_body = json.loads(forward_page["body_utf8"])
+        forward_body["errors"] = []
+        forward_body["extensions"] = {"requestId": "fixture-request"}
+        forward_connection = forward_body["data"]["repository"]["pullRequest"][
+            "reviewThreads"
+        ]
+        forward_connection["futureConnectionField"] = "ignored"
+        forward_connection["pageInfo"]["futurePageInfoField"] = "ignored"
+        forward_node = forward_connection["nodes"][0]
+        forward_node["futureThreadField"] = "ignored"
+        forward_comments = forward_node["comments"]
+        forward_comments["futureCommentsField"] = "ignored"
+        forward_comments["pageInfo"]["futureCommentPageInfoField"] = "ignored"
+        forward_comment = forward_comments["nodes"][0]
+        forward_comment["futureCommentField"] = "ignored"
+        forward_comment["pullRequestReview"]["futureParentField"] = "ignored"
+        replace_raw_json_body(forward_page, canonical_raw_body(forward_body))
+        parsed_forward_graphql = parse_graphql_thread_pages(forward_compatible_graphql)
+        self.assertIsNotNone(parsed_forward_graphql)
+        self.assertTrue(
+            typed_json_equal(parsed_forward_graphql, [graphql_shape_internal])
+        )
+
+        second_graphql_node = clone(graphql_shape_internal)
+        assert isinstance(second_graphql_node, dict)
+        second_graphql_node["id"] = "THREAD_990_002"
+        partial_later_page = graphql_thread_fetch(
+            [graphql_shape_internal, second_graphql_node]
+        )
+        self.assertEqual(len(partial_later_page["pages"]), 2)
+        later_page = partial_later_page["pages"][1]
+        later_body = json.loads(later_page["body_utf8"])
+        later_body["errors"] = [{"message": "second page partial failure"}]
+        replace_raw_json_body(later_page, canonical_raw_body(later_body))
+        self.assertIsNone(parse_graphql_thread_pages(partial_later_page))
 
         legacy_graphql_shape = clone(graphql_shape_fetch)
         assert isinstance(legacy_graphql_shape, dict)
@@ -7998,6 +8374,7 @@ class RepositoryContractTest(unittest.TestCase):
             provider_declaration: object = None,
             current_ancestry: dict[str, int] | None = None,
             require_current_ancestry_exact: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
         ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
@@ -8007,6 +8384,7 @@ class RepositoryContractTest(unittest.TestCase):
                 or value.get("schema_version") != 3
                 or value.get("repository") != current_repository
                 or not isinstance(value.get("scopes"), list)
+                or type(prefer_unresolved_thread_blocker) is not bool
             ):
                 return None
             receipt_mapping = request_scope_receipt_mapping(request_scope_receipts)
@@ -8022,7 +8400,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return None
                 try:
-                    fetched_declaration = json.loads(final_fetch["body_utf8"])
+                    fetched_declaration = strict_json_loads(final_fetch["body_utf8"])
                 except (TypeError, ValueError):
                     return None
                 if not isinstance(fetched_declaration, dict):
@@ -8573,6 +8951,7 @@ class RepositoryContractTest(unittest.TestCase):
                     )
 
                 artifact_bases: list[tuple[int, int, str, str, str]] = []
+                unresolved_artifact_bases: list[tuple[int, int, str, str, str]] = []
                 for review_id, raw_review in review_by_id.items():
                     user = raw_review.get("user")
                     submitted_at = raw_review.get("submitted_at")
@@ -8650,17 +9029,18 @@ class RepositoryContractTest(unittest.TestCase):
                         "inline_comments": clone(inline_by_review[review_id]),
                         "review_threads": clone(thread_nodes_by_review[review_id]),
                     }
-                    artifact_bases.append(
-                        (
-                            submitted_at,
-                            review_id,
-                            "pull-request-review",
-                            semantic,
-                            hashlib.sha256(
-                                canonical_raw_body(source_bundle).encode("utf-8")
-                            ).hexdigest(),
-                        )
+                    artifact_basis = (
+                        submitted_at,
+                        review_id,
+                        "pull-request-review",
+                        semantic,
+                        hashlib.sha256(
+                            canonical_raw_body(source_bundle).encode("utf-8")
+                        ).hexdigest(),
                     )
+                    artifact_bases.append(artifact_basis)
+                    if any(finding.get("is_resolved") is False for finding in joined):
+                        unresolved_artifact_bases.append(artifact_basis)
 
                 for raw_issue in issue_artifacts:
                     issue_id = raw_issue["id"]
@@ -8756,8 +9136,7 @@ class RepositoryContractTest(unittest.TestCase):
                         continue
                     if (
                         actor != "exact"
-                        or created_at <= request_times[parent_comment_id]
-                        or raw_reaction.get("content") not in {"+1", "eyes"}
+                        or raw_reaction.get("content") not in github_reaction_contents
                     ):
                         return None
                     provider_reactions.append(
@@ -8785,16 +9164,24 @@ class RepositoryContractTest(unittest.TestCase):
                 ]
 
                 if artifact_bases:
-                    latest_time = max(item[0] for item in artifact_bases)
-                    latest = [item for item in artifact_bases if item[0] == latest_time]
-                    if len({item[2] for item in latest}) != 1:
-                        return None
-                    priority = {"clean": 1, "findings": 2, "malformed": 3}
-                    highest = max(priority[item[3]] for item in latest)
-                    selected = max(
-                        (item for item in latest if priority[item[3]] == highest),
-                        key=lambda item: item[1],
-                    )
+                    if prefer_unresolved_thread_blocker and unresolved_artifact_bases:
+                        selected = max(
+                            unresolved_artifact_bases,
+                            key=lambda item: (item[0], item[1]),
+                        )
+                    else:
+                        latest_time = max(item[0] for item in artifact_bases)
+                        latest = [
+                            item for item in artifact_bases if item[0] == latest_time
+                        ]
+                        if len({item[2] for item in latest}) != 1:
+                            return None
+                        priority = {"clean": 1, "findings": 2, "malformed": 3}
+                        highest = max(priority[item[3]] for item in latest)
+                        selected = max(
+                            (item for item in latest if priority[item[3]] == highest),
+                            key=lambda item: item[1],
+                        )
                     source_ordering_key = [selected[0], selected[1]]
                     source_evidence = {
                         "carrier": "terminal-artifact",
@@ -8819,6 +9206,16 @@ class RepositoryContractTest(unittest.TestCase):
                             }
                         )
                         continue
+                    if any(
+                        item[0] <= request_times[item[2]]
+                        for item in current_provider_reactions
+                    ):
+                        return None
+                    if any(
+                        item[3] not in ("+1", "eyes")
+                        for item in current_provider_reactions
+                    ):
+                        return None
                     if (
                         not current_request_times
                         or receipt_mapping is None
@@ -9115,6 +9512,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             current_ancestry: dict[str, int],
             require_current_ancestry_exact: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
         ) -> dict[str, object] | None:
             base_inventory_fields = {
                 "repository",
@@ -9196,6 +9594,7 @@ class RepositoryContractTest(unittest.TestCase):
                 request_scope_receipts=value.get("request_scope_receipts"),
                 current_ancestry=current_ancestry,
                 require_current_ancestry_exact=require_current_ancestry_exact,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
             )
             entries = (
                 parsed_transcript.get("entries")
@@ -9454,6 +9853,7 @@ class RepositoryContractTest(unittest.TestCase):
             current_record: dict[str, object],
             *,
             require_request_reaction_stability: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
             initial_inventory = candidate_history.get("initial_current_raw_inventory")
@@ -9467,10 +9867,12 @@ class RepositoryContractTest(unittest.TestCase):
             initial_entry = parse_current_endpoint_inventory(
                 initial_inventory,
                 current_ancestry=ancestry,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
             )
             final_entry = parse_current_endpoint_inventory(
                 final_inventory,
                 current_ancestry=ancestry,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
             )
             if initial_entry is None or final_entry is None:
                 return False
@@ -9538,6 +9940,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ),
                 current_ancestry=ancestry,
                 require_current_ancestry_exact=False,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
             )
             expected_final = parse_current_endpoint_inventory(
                 current_endpoint_inventory(
@@ -9546,6 +9949,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ),
                 current_ancestry=ancestry,
                 require_current_ancestry_exact=False,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
             )
             if require_request_reaction_stability:
                 initial_decision_entry = current_decision_authority_entry(
@@ -10252,6 +10656,7 @@ class RepositoryContractTest(unittest.TestCase):
             candidate_history: dict[str, object],
             *,
             require_request_reaction_stability: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
         ) -> dict[str, object] | None:
             ancestry = current_ancestry_mapping(candidate_history)
             if ancestry is None:
@@ -10265,6 +10670,7 @@ class RepositoryContractTest(unittest.TestCase):
                 projected_entry = parse_current_endpoint_inventory(
                     inventory,
                     current_ancestry=ancestry,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 )
                 if projected_entry is None:
                     return None
@@ -10657,6 +11063,120 @@ class RepositoryContractTest(unittest.TestCase):
                 "current_raw_authority": current_raw_authority,
             }
 
+        def stable_blocking_evidence_basis_from_inputs(
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+        ) -> dict[str, object] | None:
+            evidence_state = current_record.get("evidence_state")
+            current_scope = scope_key(current_record)
+            initial_snapshot = current_record.get("initial_snapshot")
+            final_snapshot = current_record.get("final_snapshot")
+            if (
+                not current_lifecycle_is_eligible(current_record)
+                or not isinstance(evidence_state, dict)
+                or current_scope is None
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or not typed_json_equal(initial_snapshot, final_snapshot)
+            ):
+                return None
+
+            unresolved = evidence_state.get("unresolved_thread_findings")
+            if not isinstance(unresolved, list):
+                return None
+            selected_artifact: dict[str, object] | None = None
+            prefer_unresolved_thread_blocker = bool(unresolved)
+            if unresolved:
+                ordering_key = candidate_order_basis(
+                    current_record,
+                    prefer_unresolved_thread_blocker=True,
+                )
+                if ordering_key is None:
+                    return None
+                validated_unresolved: list[
+                    tuple[tuple[int, int], dict[str, object]]
+                ] = []
+                for artifact in unresolved:
+                    validated = validate_candidate_artifact(
+                        artifact,
+                        expected_kind="unresolved-thread-finding",
+                        expected_scope=current_scope,
+                    )
+                    if (
+                        validated is None
+                        or validated[2] != "unresolved-thread-finding"
+                        or validated[3] != "findings"
+                        or not isinstance(artifact, dict)
+                    ):
+                        return None
+                    validated_unresolved.append(
+                        ((validated[0], validated[1]), artifact)
+                    )
+                selected_ordering_key, selected_artifact = max(
+                    validated_unresolved,
+                    key=lambda item: item[0],
+                )
+                if ordering_key != selected_ordering_key:
+                    return None
+            else:
+                ordering_key = candidate_order_basis(current_record)
+                candidate_basis = current_record.get("candidate_basis")
+                malformed = evidence_state.get("malformed_terminal_artifacts")
+                if (
+                    ordering_key is None
+                    or not isinstance(candidate_basis, dict)
+                    or candidate_basis.get("kind") != "malformed-terminal-artifact"
+                    or not isinstance(malformed, list)
+                ):
+                    return None
+                matching_malformed: list[dict[str, object]] = []
+                for artifact in malformed:
+                    validated = validate_candidate_artifact(
+                        artifact,
+                        expected_kind="malformed-terminal-artifact",
+                        expected_scope=current_scope,
+                    )
+                    if (
+                        validated is not None
+                        and (validated[0], validated[1]) == ordering_key
+                        and validated[2] == "malformed-terminal-artifact"
+                        and validated[3] == "malformed"
+                        and isinstance(artifact, dict)
+                    ):
+                        matching_malformed.append(artifact)
+                if len(matching_malformed) != 1:
+                    return None
+                selected_artifact = matching_malformed[0]
+
+            if not isinstance(selected_artifact, dict):
+                return None
+            selected_final = selected_artifact.get("final_snapshot")
+            current_raw_authority = current_raw_authority_basis(
+                candidate_history,
+                require_request_reaction_stability=False,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+            )
+            if (
+                not isinstance(selected_final, dict)
+                or current_raw_authority is None
+                or not current_raw_authority_matches(
+                    candidate_history,
+                    current_record,
+                    require_request_reaction_stability=False,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                )
+            ):
+                return None
+            return {
+                "kind": selected_final["channel"],
+                "selection_snapshots": {
+                    "initial": clone(initial_snapshot),
+                    "final": clone(final_snapshot),
+                },
+                "artifact": clone(selected_artifact),
+                "current_raw_authority": current_raw_authority,
+            }
+
         def expected_report_from_inputs(
             lane_state: str,
             provider_declaration: dict[str, object] | None,
@@ -10718,6 +11238,11 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                     if evidence_basis is None:
                         return None
+                elif lane_state == "inconclusive":
+                    evidence_basis = stable_blocking_evidence_basis_from_inputs(
+                        candidate_history,
+                        current_record,
+                    )
             request_policy = request_policy_from_inputs(
                 lane_state,
                 current_record,
@@ -10782,6 +11307,24 @@ class RepositoryContractTest(unittest.TestCase):
             selected_reaction_id=100,
             merge_base=current_merge_base,
         )
+
+        for case_name in ("duplicate-key", "nonstandard-constant"):
+            malformed_scope_receipt = clone(current["request_scope_receipts"][0])
+            assert isinstance(malformed_scope_receipt, dict)
+            if case_name == "duplicate-key":
+                response = malformed_scope_receipt["request_comment_receipt"]
+                suffix = ',"body":"@codex review"'
+            else:
+                response = malformed_scope_receipt["pre_request_scope_receipts"]["pull"]
+                suffix = ',"ignored":Infinity'
+            assert isinstance(response, dict)
+            body_utf8 = response.get("body_utf8")
+            assert isinstance(body_utf8, str) and body_utf8.endswith("}")
+            replace_raw_json_body(response, f"{body_utf8[:-1]}{suffix}}}")
+            with self.subTest(strict_request_scope_receipt_json=case_name):
+                self.assertIsNone(
+                    request_scope_receipt_mapping([malformed_scope_receipt])
+                )
 
         string_id_records: dict[str, dict[str, object]] = {}
         string_request_id = clone(current)
@@ -12047,7 +12590,10 @@ class RepositoryContractTest(unittest.TestCase):
             "terminal-payload",
         )
         terminal_current_with_later_reactions: dict[str, dict[str, object]] = {}
-        for offset, later_content in enumerate(("eyes", "+1"), start=1):
+        for offset, later_content in enumerate(
+            ("eyes", "+1", "heart", "confused"),
+            start=1,
+        ):
             with self.subTest(current_terminal_basis_with_later_reaction=later_content):
                 terminal_current_with_later_reaction = clone(terminal_current)
                 assert isinstance(terminal_current_with_later_reaction, dict)
@@ -12075,13 +12621,14 @@ class RepositoryContractTest(unittest.TestCase):
                         terminal_basis["stable_artifact_id"],
                     ),
                 )
+                terminal_later_history = history(
+                    samples,
+                    current_raw=terminal_current_with_later_reaction,
+                )
                 self.assertEqual(
                     compute_provider_profile(
                         declaration,
-                        history(
-                            samples,
-                            current_raw=terminal_current_with_later_reaction,
-                        ),
+                        terminal_later_history,
                         terminal_current_with_later_reaction,
                     ),
                     "mixed",
@@ -12089,16 +12636,72 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertEqual(
                     classify_fallback(
                         declaration,
-                        history(
-                            samples,
-                            current_raw=terminal_current_with_later_reaction,
-                        ),
+                        terminal_later_history,
                         terminal_current_with_later_reaction,
                     ),
                     "not-clean",
                 )
+                parsed_terminal_later = parse_current_endpoint_inventory(
+                    terminal_later_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                self.assertIsNotNone(parsed_terminal_later)
+                assert isinstance(parsed_terminal_later, dict)
+                raw_reaction_contents = {
+                    item["content"]
+                    for item in parsed_terminal_later["current_authority_projection"][
+                        "provider_reactions"
+                    ]
+                }
+                self.assertIn(later_content, raw_reaction_contents)
                 terminal_current_with_later_reactions[later_content] = (
                     terminal_current_with_later_reaction
+                )
+
+        terminal_request_plane_variants: dict[str, dict[str, object]] = {}
+        same_time_reaction = clone(terminal_current)
+        assert isinstance(same_time_reaction, dict)
+        same_time_reaction["reactions"][0]["created_at"] = same_time_reaction[
+            "requests"
+        ][0]["request_server_time"]
+        terminal_request_plane_variants["same-time-reaction"] = same_time_reaction
+
+        reaction_before_request_edit = clone(terminal_current)
+        assert isinstance(reaction_before_request_edit, dict)
+        reaction_before_request_edit["requests"][0]["updated_at"] = 25
+        reaction_before_request_edit["requests"][0]["request_server_time"] = 25
+        reaction_before_request_edit["requests"][0]["request_server_time_field"] = (
+            "updated_at"
+        )
+        terminal_request_plane_variants["reaction-before-request-edit"] = (
+            reaction_before_request_edit
+        )
+
+        unselected_audit_plus = clone(terminal_current)
+        assert isinstance(unselected_audit_plus, dict)
+        unselected_audit_plus["selected_reaction_id"] = 999_999
+        terminal_request_plane_variants["unselected-audit-plus"] = unselected_audit_plus
+
+        for (
+            case_name,
+            terminal_request_plane_variant,
+        ) in terminal_request_plane_variants.items():
+            restamp(terminal_request_plane_variant)
+            with self.subTest(terminal_ignores_reaction_authority=case_name):
+                self.assertEqual(
+                    candidate_order_basis(terminal_request_plane_variant),
+                    candidate_order_basis(terminal_current),
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        history(
+                            samples,
+                            current_raw=terminal_request_plane_variant,
+                        ),
+                        terminal_request_plane_variant,
+                    ),
+                    "mixed",
                 )
 
         def lane_timing(
@@ -12484,7 +13087,38 @@ class RepositoryContractTest(unittest.TestCase):
                 "mixed",
                 "pull-request-review",
             ),
+            "mixed-later-heart": (
+                history(
+                    samples,
+                    current_raw=terminal_current_with_later_reactions["heart"],
+                ),
+                terminal_current_with_later_reactions["heart"],
+                "mixed",
+                "pull-request-review",
+            ),
+            "mixed-later-confused": (
+                history(
+                    samples,
+                    current_raw=terminal_current_with_later_reactions["confused"],
+                ),
+                terminal_current_with_later_reactions["confused"],
+                "mixed",
+                "pull-request-review",
+            ),
         }
+        for (
+            case_name,
+            terminal_request_plane_variant,
+        ) in terminal_request_plane_variants.items():
+            terminal_report_cases[f"mixed-{case_name}"] = (
+                history(
+                    samples,
+                    current_raw=terminal_request_plane_variant,
+                ),
+                terminal_request_plane_variant,
+                "mixed",
+                "pull-request-review",
+            )
         for (
             case_name,
             (
@@ -12887,6 +13521,277 @@ class RepositoryContractTest(unittest.TestCase):
                 local_lane_timing=normal_lane_timing,
             )
         )
+        unresolved_history = history(
+            samples,
+            current_raw=terminal_current_with_unresolved,
+            current_ancestry={current_head: 0},
+        )
+        unresolved_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            unresolved_history,
+            terminal_current_with_unresolved,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(unresolved_report)
+        assert isinstance(unresolved_report, dict)
+        unresolved_basis = unresolved_report["evidence_basis"]
+        self.assertIsInstance(unresolved_basis, dict)
+        assert isinstance(unresolved_basis, dict)
+        self.assertEqual(unresolved_basis["kind"], "pull-request-review")
+        self.assertEqual(
+            unresolved_basis["artifact"]["final_snapshot"]["artifact_kind"],
+            "unresolved-thread-finding",
+        )
+        self.assertEqual(
+            unresolved_basis["artifact"]["final_snapshot"]["id"],
+            unresolved_thread_id,
+        )
+        self.assertTrue(
+            validate_complete_report(
+                unresolved_report,
+                lane_state="inconclusive",
+                provider_declaration=declaration,
+                candidate_history=unresolved_history,
+                current_record=terminal_current_with_unresolved,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        malformed_current = clone(terminal_current)
+        assert isinstance(malformed_current, dict)
+        malformed_time = terminal_time + 1
+        malformed_id = 80_310
+        malformed_current["evidence_state"]["malformed_terminal_artifacts"] = [
+            complete_review_artifact(
+                malformed_current,
+                malformed_id,
+                malformed_time,
+                artifact_kind="malformed-terminal-artifact",
+                outcome="malformed",
+            )
+        ]
+        malformed_current["candidate_basis"] = {
+            "kind": "malformed-terminal-artifact",
+            "server_time": malformed_time,
+            "stable_artifact_id": malformed_id,
+        }
+        restamp(malformed_current)
+        malformed_history = history(samples, current_raw=malformed_current)
+        malformed_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            malformed_history,
+            malformed_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(malformed_report)
+        assert isinstance(malformed_report, dict)
+        malformed_basis = malformed_report["evidence_basis"]
+        self.assertIsInstance(malformed_basis, dict)
+        assert isinstance(malformed_basis, dict)
+        self.assertEqual(
+            malformed_basis["artifact"]["final_snapshot"]["artifact_kind"],
+            "malformed-terminal-artifact",
+        )
+        self.assertEqual(
+            malformed_basis["artifact"]["final_snapshot"]["id"],
+            malformed_id,
+        )
+        self.assertTrue(
+            validate_complete_report(
+                malformed_report,
+                lane_state="inconclusive",
+                provider_declaration=declaration,
+                candidate_history=malformed_history,
+                current_record=malformed_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        issue_terminal_basis = issue_terminal_current["candidate_basis"]
+        assert isinstance(issue_terminal_basis, dict)
+        cross_channel_blocker_time = issue_terminal_basis["server_time"]
+        assert isinstance(cross_channel_blocker_time, int)
+        cross_channel_blocker_cases: dict[str, dict[str, object]] = {}
+
+        equal_time_clean_issue = clone(issue_terminal_current)
+        assert isinstance(equal_time_clean_issue, dict)
+        equal_time_clean_issue["evidence_state"]["unresolved_thread_findings"] = [
+            complete_review_artifact(
+                equal_time_clean_issue,
+                80_320,
+                cross_channel_blocker_time,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+        ]
+        restamp(equal_time_clean_issue)
+        cross_channel_blocker_cases["equal-time-clean-issue-comment"] = (
+            equal_time_clean_issue
+        )
+
+        equal_time_malformed_issue = clone(issue_terminal_current)
+        assert isinstance(equal_time_malformed_issue, dict)
+        malformed_issue_id = 80_321
+        equal_time_malformed_issue["evidence_state"]["malformed_terminal_artifacts"] = [
+            complete_issue_comment_artifact(
+                equal_time_malformed_issue,
+                malformed_issue_id,
+                cross_channel_blocker_time,
+                artifact_kind="malformed-terminal-artifact",
+                outcome="malformed",
+            )
+        ]
+        equal_time_malformed_issue["evidence_state"]["unresolved_thread_findings"] = [
+            complete_review_artifact(
+                equal_time_malformed_issue,
+                80_322,
+                cross_channel_blocker_time,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+        ]
+        equal_time_malformed_issue["candidate_basis"] = {
+            "kind": "malformed-terminal-artifact",
+            "server_time": cross_channel_blocker_time,
+            "stable_artifact_id": malformed_issue_id,
+        }
+        restamp(equal_time_malformed_issue)
+        cross_channel_blocker_cases["equal-time-malformed-issue-comment"] = (
+            equal_time_malformed_issue
+        )
+
+        for case_name, cross_channel_blocker in cross_channel_blocker_cases.items():
+            with self.subTest(unresolved_blocker_cross_channel=case_name):
+                unresolved_artifact = cross_channel_blocker["evidence_state"][
+                    "unresolved_thread_findings"
+                ][0]
+                unresolved_final = unresolved_artifact["final_snapshot"]
+                unresolved_id = unresolved_final["id"]
+                self.assertIsNone(candidate_order_basis(cross_channel_blocker))
+                self.assertEqual(
+                    candidate_order_basis(
+                        cross_channel_blocker,
+                        prefer_unresolved_thread_blocker=True,
+                    ),
+                    (cross_channel_blocker_time, unresolved_id),
+                )
+                cross_channel_history = history(
+                    samples,
+                    current_raw=cross_channel_blocker,
+                    current_ancestry={current_head: 0},
+                )
+                self.assertIsNone(
+                    current_raw_authority_basis(
+                        cross_channel_history,
+                        require_request_reaction_stability=False,
+                    )
+                )
+                self.assertIsNotNone(
+                    current_raw_authority_basis(
+                        cross_channel_history,
+                        require_request_reaction_stability=False,
+                        prefer_unresolved_thread_blocker=True,
+                    )
+                )
+                cross_channel_report = expected_report_from_inputs(
+                    "inconclusive",
+                    declaration,
+                    cross_channel_history,
+                    cross_channel_blocker,
+                    normal_lane_timing,
+                )
+                self.assertIsNotNone(cross_channel_report)
+                assert isinstance(cross_channel_report, dict)
+                cross_channel_basis = cross_channel_report["evidence_basis"]
+                self.assertIsInstance(cross_channel_basis, dict)
+                assert isinstance(cross_channel_basis, dict)
+                self.assertEqual(
+                    cross_channel_basis["artifact"]["final_snapshot"]["id"],
+                    unresolved_id,
+                )
+                self.assertTrue(
+                    validate_complete_report(
+                        cross_channel_report,
+                        lane_state="inconclusive",
+                        provider_declaration=declaration,
+                        candidate_history=cross_channel_history,
+                        current_record=cross_channel_blocker,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
+
+        multiple_blockers = clone(malformed_current)
+        assert isinstance(multiple_blockers, dict)
+        multiple_blockers["evidence_state"]["unresolved_thread_findings"] = [
+            complete_review_artifact(
+                multiple_blockers,
+                blocker_id,
+                terminal_time - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+            for blocker_id in (80_311, 80_312)
+        ]
+        restamp(multiple_blockers)
+        multiple_blocker_history = history(
+            samples,
+            current_raw=multiple_blockers,
+            current_ancestry={current_head: 0},
+        )
+        multiple_blocker_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            multiple_blocker_history,
+            multiple_blockers,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(multiple_blocker_report)
+        assert isinstance(multiple_blocker_report, dict)
+        multiple_blocker_basis = multiple_blocker_report["evidence_basis"]
+        self.assertIsInstance(multiple_blocker_basis, dict)
+        assert isinstance(multiple_blocker_basis, dict)
+        self.assertEqual(
+            multiple_blocker_basis["artifact"]["final_snapshot"]["id"],
+            80_312,
+        )
+        self.assertTrue(
+            validate_complete_report(
+                multiple_blocker_report,
+                lane_state="inconclusive",
+                provider_declaration=declaration,
+                candidate_history=multiple_blocker_history,
+                current_record=multiple_blockers,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        reordered_blockers = clone(multiple_blockers)
+        assert isinstance(reordered_blockers, dict)
+        reordered_blockers["evidence_state"]["unresolved_thread_findings"].reverse()
+        restamp(reordered_blockers)
+        reordered_blocker_history = history(
+            samples,
+            current_raw=reordered_blockers,
+            current_ancestry={current_head: 0},
+        )
+        reordered_blocker_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            reordered_blocker_history,
+            reordered_blockers,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(reordered_blocker_report)
+        assert isinstance(reordered_blocker_report, dict)
+        self.assertEqual(
+            reordered_blocker_report["evidence_basis"]["artifact"]["final_snapshot"][
+                "id"
+            ],
+            80_312,
+        )
+
         raw_only_unresolved_current = clone(terminal_current)
         assert isinstance(raw_only_unresolved_current, dict)
         raw_only_terminal_basis = raw_only_unresolved_current["candidate_basis"]
@@ -16196,7 +17101,7 @@ class RepositoryContractTest(unittest.TestCase):
             terminal_basis_with_same_id_conflict
         )
 
-        for later_content in ("eyes", "+1"):
+        for later_content in ("eyes", "+1", "heart", "confused"):
             with self.subTest(
                 terminal_basis_preserved_with_later_reaction=later_content
             ):
@@ -16278,7 +17183,7 @@ class RepositoryContractTest(unittest.TestCase):
                 history(terminal_basis_with_relocated_reaction),
                 current,
             ),
-            "unknown",
+            "clean",
         )
 
         terminal_basis_with_ambiguous_reaction = (

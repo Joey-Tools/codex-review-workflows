@@ -33,7 +33,9 @@ superseded_by:
   `early-request-observed` and `duplicate-observed`. A lone compliant pending
   request is not a warning. `provider_profile` is `null` only before an
   eligible provider plane exists. `evidence_basis` may also be `null` for an
-  eligible waiting or inconclusive lane when no stable artifact is selected.
+  eligible waiting or inconclusive lane when no stable artifact is selected;
+  an inconclusive lane with a stable unresolved-thread or selected malformed
+  blocker records that complete blocker basis instead.
 - Existing duplicate requests do not require request/run attribution before a
   complete, independently ordered provider result can count. The orchestrator
   still does not create another same-scope request.
@@ -109,9 +111,11 @@ superseded_by:
   completeness, ordering, and audit inputs, but do not themselves select the
   provider profile. A newer terminal/finding artifact, later `eyes`, or
   incomplete page therefore cannot be hidden by an older reaction-only basis.
-  Once terminal precedence selects a terminal/finding artifact, a later `+1`
-  or `eyes` remains visible audit/liveness evidence but does not replace or
-  reorder that stronger basis. Current initial/final snapshots bind exact
+  Once terminal precedence selects a terminal/finding artifact, every later
+  legal exact-provider reaction remains visible audit evidence but does not
+  replace or reorder that stronger basis. Only reaction-only classification
+  restricts content to `+1` plus compatible earlier `eyes`. Current
+  initial/final snapshots bind exact
   open/unmerged lifecycle, complete
   pagination, stable whole-PR scope, no trustworthy current-scope terminal
   payload or conflicting finding/thread evidence, and an unchanged final
@@ -277,7 +281,18 @@ superseded_by:
   later schema version can bind that separate request instead of fabricating
   normalized pages inside a raw response. Version 3 additionally roots
   discovery in the independent repository-wide PR inventory above; version 2
-  is no longer sufficient for `thumbs-up-clean`.
+  is no longer sufficient for `thumbs-up-clean`. A missing top-level GraphQL
+  `errors` member or `errors: []` is admissible; `null`, a non-array value, or
+  a nonempty array fails closed. A nonempty array makes each affected page
+  partial even when usable-looking `data` is also present.
+- Every raw declaration, request-scope receipt, REST page, and GraphQL page
+  crosses one strict JSON decoder before projection. Duplicate object keys at
+  any depth, nonstandard or decoded non-finite numbers, and surrogate code
+  points fail closed. Endpoint objects remain forward compatible only after
+  this syntax/scalar gate. Terminal body normalization separately accepts
+  Unicode scalar format characters such as ZWJ, maps the grammar's declared
+  line separators, and rejects other disallowed remaining controls. Progress
+  detail separately rejects every C0/C1 control, including HT.
 - The reaction-history as-of is frozen from the closed receipt of the initial
   direct REST GET of the exact provider declaration issue comment.
   `as_of_receipt` is that exact receipt, `as_of_api_url` is its request URL, and
@@ -485,6 +500,58 @@ reaction transport changes outside terminal verdict authority, and they prevent
 a derived or unbound audit record from manufacturing the base-only-retarget
 state.
 
+## Exact-Head Named-Single Regression Corrections
+
+The formal named-single review of
+`0f77fb7b1dd59f5eed522fa9699497aa013695fc..284b6ace42ffa4d53d1b1b2cf6932a50ad466cb0`
+found the first five final contract-model gaps below. Three follow-up
+adversarial audits added items 6–8. All eight fixes preserve the same
+provider-result authority decision while making its failure boundaries
+executable and auditable:
+
+1. **Terminal/reaction plane separation.** Every legal exact-provider GitHub
+   reaction remains in the raw terminal audit projection. `heart`, `confused`,
+   and other legal content no longer invalidate a stable terminal payload;
+   non-`+1`/`eyes` content still makes reaction-only fallback `unknown`.
+2. **GraphQL partial responses.** Every outer thread page rejects a nonempty
+   top-level `errors` array even when `data` is present, including failures on
+   later cursor pages. Unrelated valid response extensions remain forward
+   compatible.
+3. **Stable inconclusive basis.** An unresolved exact-provider target thread
+   supplies the blocking basis ahead of clean or malformed terminal artifacts;
+   multiple stable unresolved blockers select the greatest server-time/ID pair
+   independently of input order. Without an unresolved thread, only the
+   ordinarily selected malformed terminal artifact supplies a blocker basis.
+4. **Strict JSON authority boundary.** Declaration and request-scope receipts,
+   REST pages, GraphQL pages, and the declaration rediscovery join use one
+   decoder that rejects recursive duplicate keys, nonstandard/non-finite
+   numbers, and surrogate-containing strings or member names before policy
+   projection.
+5. **Unicode scalar/control distinction.** Terminal normalization rejects all
+   surrogate code points. Progress detail rejects C0/C1 controls, including
+   HT, while retaining legitimate format scalars such as ZWJ and astral emoji.
+6. **Terminal/request-plane isolation.** Complete terminal carriers are
+   selected before reaction-only timing and selected-ID constraints. Legal
+   request/reaction records remain raw audit context, but a same-time reaction,
+   a reaction before a later request edit, or an unselected audit `+1` cannot
+   veto the terminal result.
+7. **Blocker-specific unresolved projection.** A stable unresolved target
+   thread is selected by greatest server-time/ID from the same complete raw
+   inventories before ordinary terminal channel arbitration. Equal-time
+   cross-channel clean or malformed evidence keeps the verdict inconclusive
+   while preserving that unresolved blocker in `evidence_basis`; ordinary
+   terminal acceptance remains fail-closed.
+8. **Operational decoder parity.** The PR probe procedure now requires the
+   same strict recursive JSON decoder as the authority reference before any
+   declaration, receipt, REST, or GraphQL projection. A raw-body digest does
+   not make permissive duplicate-key, non-finite-number, or surrogate parsing
+   acceptable.
+
+These corrections were discovered by reviewing the exact signed candidate
+head rather than by changing the decision baseline. The immutable
+`codex-review-gate` source commit, released Action commit, common tree, complete
+15-path manifest, and result-present acceptance rationale remain unchanged.
+
 ## Implementation Intent
 
 - Use
@@ -537,26 +604,30 @@ state.
 
 ## Validation
 
-- The current corrected working snapshot passed the focused contract suite:
-  `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts -q`
-  ran 102 tests in 21.243 seconds with no failures or errors.
-- The same snapshot passed the complete review-orchestration suite outside the
-  filesystem sandbox because provider tests require temporary Unix and
-  loopback socket binds:
+- The final candidate gate reruns the focused 102-test contract module, the
+  complete review-orchestration suite, Ruff format/lint, the skill validator,
+  the project-journal validator, JSON parsing when changed JSON exists, and
+  `git diff --check` after the candidate bytes stop changing. The focused
+  command is
+  `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts -q`.
+- The complete suite runs outside the filesystem sandbox because provider tests
+  require temporary Unix and loopback socket binds:
   `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 /Users/hoteng/.pyenv/versions/3.13.0/bin/python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q`
-  ran 2,822 tests in 945.430 seconds with 6 expected skips and no failures or
-  errors.
-- `uv run ruff format --check`, `uv run ruff check`, the skill validator under
-  `uv run --with pyyaml`, the project-journal validator, JSON parsing, and
-  `git diff --check` all passed on this snapshot.
-- Two final read-only consistency audits returned no findings after checking
-  the complete request/reaction exclusion from terminal equality, strict
-  reaction-sidecar equality, stable and changing duplicate/pending request
-  cases, the final-reaction drift case, and the receipt-proved retarget paths.
+  The exact final command results and final named-single receipt remain
+  parent-owned outside the candidate head: writing observed durations or the
+  review result back here would move the byte range they attest. A historical
+  pre-correction run completed 2,822 tests with 6 expected skips; it is useful
+  regression evidence but does not substitute for the final frozen-byte run.
+- Read-only consistency audits covered request/reaction exclusion from terminal
+  equality, strict reaction-sidecar equality, duplicate/pending requests,
+  final-reaction drift, receipt-proved retarget paths, terminal reaction-plane
+  isolation, strict JSON/GraphQL/Unicode parsing, and blocker-specific
+  unresolved projection. Their corrections are recorded above; the final
+  exact-head named-single result remains parent-owned for the same reason.
 - The workstream remains `active` only until this exact snapshot receives its
   signed commit and final fixed-range named-single review. Validation through
-  head `f64f149aa27399bdd37d99b5acf42a1b825266d9` and the older timings below are
-  historical evidence and do not substitute for this final gate.
+  head `f64f149aa27399bdd37d99b5acf42a1b825266d9` and all earlier per-head timing
+  receipts are historical evidence and do not substitute for this final gate.
 - An earlier named-single review found two P2 contract gaps: a synthesized
   reaction self URL and a self-consistency-only report classifier. Both were
   removed and replaced by parent-endpoint-plus-ID reaction identity and a

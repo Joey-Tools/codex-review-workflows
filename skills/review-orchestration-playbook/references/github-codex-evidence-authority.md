@@ -115,7 +115,10 @@ malformed terminal artifact, unresolved thread, incomplete page, conflicting
 same-time channel evidence, stale scope, or unstable final provider
 artifact/thread/selection re-read still blocks. Request-sidecar-only instability
 instead closes request/reaction authority without erasing a stable terminal
-result.
+result. Likewise, request edits, request/reaction relative ordering, selected
+reaction IDs, and legal reaction contents remain audited but cannot invalidate
+a complete terminal carrier; those constraints become result authority only
+for the reaction-only fallback.
 An unresolved thread finding is not superseded by a later clean artifact.
 
 ## Decision
@@ -208,6 +211,13 @@ response, `body_utf8` is the bounded strict-UTF-8 JSON response body, and
 `body_sha256` is recomputed over those exact UTF-8 bytes. Self-reported
 authentication flags, normalized projections, GraphQL objects, and locally
 constructed response bodies are not receipts.
+
+Every `body_utf8` receipt or page is decoded before projection by one strict
+JSON decoder. It rejects duplicate object member names at every depth,
+`NaN`, `Infinity`, `-Infinity`, any decoded non-finite number, and any string
+or member name containing `U+D800` through `U+DFFF`. Endpoint forward
+compatibility permits unknown fields only after this syntax and scalar-value
+gate succeeds.
 
 For each pre-request and post-request phase:
 
@@ -352,10 +362,12 @@ Evaluate provider artifacts independently of request count:
    below.
 8. If no trustworthy current-scope terminal payload exists, apply the selected
    provider profile. Only `thumbs-up-clean` can reach the weak `+1` fallback;
-   `mixed` still requires terminal payload for a clean result. A later `+1` or
-   `eyes` reaction remains audit and liveness evidence; it does not demote,
-   replace, or reorder an already selected terminal payload. The newer-`eyes`
-   exclusion applies only while evaluating the reaction-only fallback.
+   `mixed` still requires terminal payload for a clean result. Any later legal
+   exact-provider reaction—including `+1`, `eyes`, `heart`, or `confused`—
+   remains audit evidence; it does not demote, replace, or reorder an already
+   selected terminal payload. Only the reaction-only fallback restricts
+   semantic content to `+1` plus compatible earlier `eyes`; every other
+   exact-provider reaction content makes that weaker candidate `unknown`.
 9. Perform the final re-read. Terminal clean/findings count only if scope,
    lifecycle, the provider artifact/thread/finding projection, canonical
    nonterminal provider audit records, and the selected artifact are unchanged,
@@ -382,7 +394,8 @@ terminal provider artifact and never proves clean, even when its conclusion is
 
 The accepted grammar is deliberately narrower than arbitrary provider prose.
 Treat an API body as a well-formed Unicode scalar-value sequence, then normalize
-it in this exact order:
+it in this exact order. `U+D800` through `U+DFFF` are not Unicode scalar values
+and are rejected before normalization:
 
 1. Replace CRLF, bare CR, vertical tab (`U+000B`), form feed (`U+000C`), NEL
    (`U+0085`), line separator (`U+2028`), and paragraph separator (`U+2029`)
@@ -405,7 +418,9 @@ exactly `Codex Review in progress`, `Codex Review still in progress`, either
 exact form plus `.`, or either exact form plus `: ` and 1 to 160 Unicode scalar
 values containing no LF or control. A progress-only comment must have no later
 nonempty line. Every other terminal-looking issue comment is evaluated by the
-closed branches below.
+closed branches below. Here `control` means a C0/C1 `General_Category=Cc`
+value; format characters such as `U+200D` ZERO WIDTH JOINER remain admissible
+Unicode scalar values.
 
 For a pull-request review, state admissibility and terminal-looking detection
 are separate:
@@ -924,7 +939,11 @@ body/digest; the fixed parser reads raw `pageInfo.hasNextPage` and
 `Link rel=next` until none remains.
 GraphQL traversal starts at null, requires each next `request_after` to equal
 the prior raw `endCursor`, and terminates only at typed
-`hasNextPage == false`.
+`hasNextPage == false`. A top-level GraphQL `errors` member, when present,
+must be an array. An empty array is admissible; `null`, a non-array value, or a
+nonempty array fails closed. A nonempty array is partial evidence even when the
+same response also contains apparently usable `data`; this rule applies
+independently to every outer pagination page.
 
 The transcript envelope is closed, but endpoint JSON objects are forward
 compatible: the versioned fixed projector reads and type-checks every field
@@ -1436,6 +1455,26 @@ evidence_basis:
 | Accepted weak reaction clean | `thumbs-up-clean` | Exact accepted `+1` reaction plus its controlled request and scope; provider declaration identity/digest and every ordered historical request/reaction sample |
 | Future accepted authenticated no-start rejection after an explicit grammar policy activates it | Actually recomputed profile, normally `terminal-payload` or `mixed` | Exact `no-start-rejection` issue comment plus its controlled request and scope |
 | Inconclusive evidence | Computed profile or `unknown` | Stable blocking artifact when one exists; otherwise `null` |
+
+An inconclusive blocking basis reuses the terminal basis shape above: `kind`
+is the carrier channel and the complete selected artifact, identical selection
+snapshots, and current raw authority remain embedded. An unresolved exact-
+provider target-thread finding has blocking-basis priority regardless of an
+otherwise newer clean or malformed artifact; choose the greatest
+`(server_time, stable_artifact_id)` only among fully validated unresolved
+target-thread artifacts. When no such thread blocker exists, a malformed
+artifact supplies a basis only when it is the selected terminal blocker under
+the ordinary channel/time/precedence rules. Input list order never selects a
+blocker, and an unstable, incomplete, or ambiguous blocker has no stable basis
+and therefore reports `null` rather than a guessed summary.
+Selecting an unresolved blocker uses a blocker-specific projection of the same
+fully validated raw endpoint inventories: it chooses the greatest validated
+unresolved target-thread `(server_time, stable_artifact_id)` before ordinary
+terminal channel arbitration. Therefore an equal-time clean or malformed
+artifact on another channel can keep the overall verdict inconclusive without
+erasing the independently stable unresolved blocker basis. This exception
+changes only the reported blocker selection; ordinary terminal acceptance
+continues to fail closed on equal-time cross-channel ambiguity.
 
 For a pull-request review, `server_time` is the exact REST `submitted_at` and
 `server_time_field` is `submitted_at`. For an unedited issue comment, use exact

@@ -197,6 +197,11 @@ as profile `unknown`; schema version 3 cannot encode a child-cursor fetch. A
 future schema version must define and bind that fetch instead of flattening
 multiple normalized pages into one fabricated raw response.
 
+When a top-level GraphQL `errors` member is present, accept only an empty
+array. Reject `null`, every non-array value, and every nonempty array on every
+page; a nonempty array is partial evidence even when the response also
+contains usable-looking `data`.
+
 Normalize each non-null GraphQL BigInt and positive-integer REST JSON ID to
 canonical positive decimal text before comparison; reject booleans, floats,
 zero, signs, and leading zeros. For the selected review, derive join targets
@@ -317,6 +322,14 @@ therefore makes the current profile `unknown`. Endpoint JSON may gain
 unrelated GitHub fields; a fixed projector type-checks every policy field while
 the page digest binds all raw bytes.
 
+Before any projection, pass the provider declaration, every request-scope
+receipt body, every REST page, and every GraphQL page through the same strict
+JSON decoder. At every recursive depth reject duplicate object keys,
+nonstandard or decoded non-finite numbers (including overflow to infinity),
+and surrogate code points in values or member names. Only after that syntax and
+scalar gate may endpoint objects retain unrelated forward-compatible GitHub
+fields; a digest paired with a permissive decoder is not sufficient authority.
+
 The parser independently proves seed-to-detail one-to-one coverage, classifies
 every seeded PR as current, historical candidate, or confirmed non-candidate,
 and derives every candidate entry's scope/order plus carrier, channel,
@@ -331,6 +344,12 @@ provider-like identity fails closed. A terminal artifact needs no observed
 request; reaction-only evidence still does. The parent GitHub fetch path is
 trusted; the offline transcript and digest preserve its inputs but do not
 cryptographically attest GitHub's TLS origin.
+
+Every legal exact-provider reaction remains in a terminal carrier's complete
+audit projection, including content other than `+1` and `eyes`; none can
+replace or invalidate the terminal basis. Only reaction-only classification
+restricts semantic content to `+1` plus compatible earlier `eyes`, and any
+other exact-provider content makes that weaker candidate `unknown`.
 
 The current outcome is validated separately and never counts toward the history minimum. Before sorting, bind every candidate's time/ID basis to its scope-final outcome after terminal precedence and validate the candidate's complete pagination, provider-like reaction sequence, and stable initial/final snapshot even when it will fall outside the selected newest 10. A terminal/finding artifact or incomplete page cannot be hidden behind an older reaction timestamp. Later `+1`/`eyes` records remain audited but cannot replace a terminal basis; when the basis is reaction-only, a later provider-like reaction changes or invalidates it. Require every raw historical/current request, reaction, and artifact server time to be no later than the same as-of time before filtering confirmed different actors. When 10 or more historical candidates exist, select exactly the newest 10; otherwise select the complete historical candidate set. Never skip an incomplete, conflicting, ambiguous, or unfavourable candidate. Every selected candidate must be eligible; otherwise the profile is `unknown`. At least three selected historical outcomes must remain, all reaction-only and with no clean comment/review. Every sampled outcome must record one selected parent issue comment whose normalized body is `@codex review`, its seven fields, exact matching request-time scope sidecar, and the individual child exact-bot `+1` reaction's positive ID/`parent_request_id`/exact parent reactions endpoint/`created_at`/actor/content, with strict server ordering `reaction.created_at > request.request_server_time`. Both receipt-derived tuples must equal the sample scope and the POST response must project type-preservingly to the request; an old-epoch request or reaction cannot be relocated into another scope. The endpoint-and-ID tuple is the native reaction identity; no standalone reaction resource URL is synthesized. It must also enumerate every accepted same-scope request parent, repeat each matching sidecar, and fully paginate every parent's individual reactions. An edited request uses `updated_at`; a reaction that predates an edit into `@codex review` cannot count. A reaction's parent ID and endpoint must match its enclosing audited request, so an R1 reaction cannot be relocated under R2 by local nesting. Across all parents, de-duplicate only identical endpoint-and-ID reaction identities and order exact-provider reactions globally by `(created_at, positive numeric ID)`: only duplicate `+1` plus strictly earlier `eyes` are compatible. The selected `+1` parent must be the unique latest request by semantic time. Any other reaction content, nonpositive/missing ordering ID, `eyes` at or after the selected `+1`, or request whose `request_server_time >= selected_reaction.created_at` makes the candidate `unknown`. Require the same binding and cross-parent audit for the separate current outcome. Its normalized initial/final snapshots include exact lifecycle `state == open`, `merged == false`, and `merged_at == null`, stable scope, all evidence pages, and no active top-level finding on the current or an ancestor head, unresolved target-thread finding, malformed terminal artifact, terminal payload, or reaction conflict. The current basis cannot be later than the same trusted as-of time. A changed `baseRefOid` does not create another outcome when `pr_merge_base` and head are unchanged. `eyes` is liveness only. A clean-looking `APPROVED` review requires a fully paginated, present, empty exact-provider selected-review target-child set; a valid target child is findings and an unread/malformed target join is inconclusive. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. If payload and reaction carriers coexist, use `mixed` and keep the payload authoritative.
 
@@ -374,6 +393,16 @@ raw-derived applicable top-level finding blocks reaction clean. Any unresolved
 applicable exact-provider selected-review target-thread finding blocks every
 clean path; terminal precedence may supersede an older top-level finding only
 when that finding remains present in the compared projection.
+
+For an inconclusive report, derive a stable unresolved-thread blocker from a
+blocker-specific projection of those same complete raw inventories before
+ordinary terminal channel arbitration. Select only among fully validated
+unresolved exact-provider target threads by greatest server time and positive
+native ID. An equal-time clean or malformed artifact on another channel still
+makes ordinary terminal selection ambiguous, but it does not erase that stable
+blocker basis. Without an unresolved target thread, use the ordinary terminal
+selection rules and report only a selected malformed artifact; never relax the
+cross-channel ambiguity rule for terminal acceptance.
 
 For a terminal payload, retain identical initial/final selection and selected
 artifact snapshots plus the complete raw-current authority above in
