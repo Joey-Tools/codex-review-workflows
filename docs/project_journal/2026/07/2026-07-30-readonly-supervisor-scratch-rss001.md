@@ -255,7 +255,8 @@ superseded_by:
   a benign ancestor alias and rejects a symlink executable leaf. The pinned uv
   0.11.18 managed-Python staging inventory also validates its one architecture
   alias as a symlink to the exact versioned runtime before unlinking that alias.
-- The root-owned hosted isolation tree is allocated below `/private/var` so the
+- The root-owned hosted isolation tree is allocated directly below `/private`
+  and has inherited ACLs removed before any child is created, so the
   explicit nobody-owned mode-`0700` runtime parent has a root-owned,
   non-group/world-writable ancestor chain. This preserves the runtime-parent
   trust policy instead of weakening it for runner-specific `/Users` metadata.

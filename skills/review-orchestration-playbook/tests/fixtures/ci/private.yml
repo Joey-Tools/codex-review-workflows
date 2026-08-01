@@ -183,12 +183,13 @@ jobs:
           REVIEW_SOURCE_RELATIVE: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
           UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
         run: |
-          isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/var/codex-review-readonly.XXXXXX)"
+          isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/codex-review-readonly.XXXXXX)"
           echo "Read-only isolation recovery root: $isolated_root"
-          if [[ ! "$isolated_root" =~ ^/private/var/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
+          if [[ ! "$isolated_root" =~ ^/private/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
             echo "::error::Refusing an unexpected isolation root; retained at $isolated_root"
             exit 1
           fi
+          /usr/bin/sudo /bin/chmod -N "$isolated_root"
           /usr/bin/sudo /bin/test -d "$isolated_root"
           /usr/bin/sudo /bin/test ! -L "$isolated_root"
           isolated_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")"
@@ -541,7 +542,7 @@ jobs:
           /usr/bin/sudo /bin/chmod 0711 "$isolated_root"
           /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
           /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
-          /usr/bin/sudo -u nobody /bin/test ! -w /private/var
+          /usr/bin/sudo -u nobody /bin/test ! -w /private
           /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"
           /usr/bin/sudo -u nobody /bin/test -x "$isolated_python"
           /usr/bin/sudo -u nobody /bin/test ! -w "$managed_python_dir"

@@ -1986,7 +1986,8 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 for requirement in (
                     "/usr/bin/sudo /usr/bin/mktemp -d "
-                    "/private/var/codex-review-readonly.XXXXXX",
+                    "/private/codex-review-readonly.XXXXXX",
+                    '/usr/bin/sudo /bin/chmod -N "$isolated_root"',
                     "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
                     '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
                     '"$isolated_source"',
@@ -2012,14 +2013,17 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 create_index = readonly_job.index(
                     'isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d '
-                    '/private/var/codex-review-readonly.XXXXXX)"'
+                    '/private/codex-review-readonly.XXXXXX)"'
                 )
                 recovery_index = readonly_job.index(
                     'echo "Read-only isolation recovery root: $isolated_root"'
                 )
                 path_guard_index = readonly_job.index(
                     '[[ ! "$isolated_root" =~ '
-                    "^/private/var/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
+                    "^/private/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
+                )
+                acl_clear_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -N "$isolated_root"'
                 )
                 identity_index = readonly_job.index(
                     'isolated_object_id="$(/usr/bin/sudo /usr/bin/stat '
@@ -2077,7 +2081,8 @@ class RepositoryContractTest(unittest.TestCase):
 
                 self.assertLess(create_index, recovery_index)
                 self.assertLess(recovery_index, path_guard_index)
-                self.assertLess(path_guard_index, identity_index)
+                self.assertLess(path_guard_index, acl_clear_index)
+                self.assertLess(acl_clear_index, identity_index)
                 self.assertLess(identity_index, payload_index)
                 self.assertLess(payload_index, immutable_index)
                 self.assertLess(immutable_index, summary_create_index)
@@ -2129,7 +2134,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/sudo /bin/test ! -L "$isolated_root"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u' "
                     '"$isolated_root")" = "0"',
-                    "/usr/bin/sudo -u nobody /bin/test ! -w /private/var",
+                    "/usr/bin/sudo -u nobody /bin/test ! -w /private",
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
                     "(( (isolated_flags & 2) == 2 ))",
