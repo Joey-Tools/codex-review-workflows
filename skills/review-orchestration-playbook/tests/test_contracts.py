@@ -2465,6 +2465,58 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     self.assertNotIn(removed_inventory_contract, readonly_job)
 
+    def test_readonly_uv_resolution_accepts_only_a_physical_leaf(self) -> None:
+        resolution_script = r"""
+trusted_uv_candidate="$UV_EXECUTABLE"
+trusted_uv=""
+if [[ "$trusted_uv_candidate" == /* ]] \
+  && ! /bin/test -L "$trusted_uv_candidate"; then
+  trusted_uv="$(cd "$(/usr/bin/dirname "$trusted_uv_candidate")" && pwd -P)/$(/usr/bin/basename "$trusted_uv_candidate")" \
+    || trusted_uv=""
+fi
+if [[ -z "$trusted_uv" ]] \
+  || ! /bin/test -f "$trusted_uv" \
+  || /bin/test -L "$trusted_uv" \
+  || [[ "$("$trusted_uv" self version --short)" != "0.11.18" ]]; then
+  exit 1
+fi
+printf '%s\n' "$trusted_uv"
+"""
+        with tempfile.TemporaryDirectory(prefix="physical-uv-") as raw_root:
+            root = pathlib.Path(raw_root)
+            physical_parent = root / "physical"
+            physical_bin = physical_parent / "bin"
+            physical_bin.mkdir(parents=True)
+            physical_uv = physical_bin / "uv"
+            physical_uv.write_text(
+                "#!/bin/sh\nprintf '0.11.18\\n'\n",
+                encoding="utf-8",
+            )
+            physical_uv.chmod(0o700)
+            logical_parent = root / "logical"
+            logical_parent.symlink_to(physical_parent, target_is_directory=True)
+
+            accepted = subprocess.run(
+                ["/bin/bash", "-c", resolution_script],
+                check=False,
+                capture_output=True,
+                env={"UV_EXECUTABLE": str(logical_parent / "bin" / "uv")},
+                text=True,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout, f"{physical_uv.resolve()}\n")
+
+            symlinked_leaf = physical_bin / "uv-link"
+            symlinked_leaf.symlink_to(physical_uv)
+            rejected = subprocess.run(
+                ["/bin/bash", "-c", resolution_script],
+                check=False,
+                capture_output=True,
+                env={"UV_EXECUTABLE": str(symlinked_leaf)},
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
     def _assert_readonly_ci_uses_a_sealed_uv_managed_runtime(self) -> None:
         profile_contracts = {
             "canonical": "test",
@@ -2598,6 +2650,12 @@ class RepositoryContractTest(unittest.TestCase):
                     'version: "0.11.18"',
                     "enable-cache: false",
                     "UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}",
+                    'trusted_uv_candidate="$UV_EXECUTABLE"',
+                    '[[ "$trusted_uv_candidate" == /* ]]',
+                    '! /bin/test -L "$trusted_uv_candidate"',
+                    'dirname "$trusted_uv_candidate"',
+                    'basename "$trusted_uv_candidate"',
+                    '[[ -z "$trusted_uv" ]]',
                     'uv_root_home="$isolated_root/uv-home"',
                     '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"',
                     'stat -f \'%u\' "$uv_root_home")" = "0"',
@@ -2614,7 +2672,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "PATH=/usr/bin:/bin",
                     'TMPDIR="$uv_root_tmp"',
                     '"$trusted_uv" "$@"',
-                    '[[ "$(run_trusted_uv --version)" != "uv 0.11.18" ]]',
+                    '[[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]',
                     'trusted_uv_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"',
                     'uv_staging_dir="$isolated_root/uv-managed-staging"',
                     "run_trusted_uv python install 3.13.13",
@@ -6696,6 +6754,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("render_success_envelope", cli_source)
 
     def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
+        independent_entrypoint = (
+            SCRIPTS / "independent_codex_pr_review" / "independent-codex-pr-review"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            independent_entrypoint.index("if sys.version_info[:2] != (3, 13):"),
+            independent_entrypoint.index("from review_supervisor.cli import main"),
+        )
         with tempfile.TemporaryDirectory(
             prefix="review-installed-no-bytecode-"
         ) as temporary:

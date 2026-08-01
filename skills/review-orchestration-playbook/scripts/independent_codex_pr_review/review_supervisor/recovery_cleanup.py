@@ -13,7 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Self
+from typing import Any
 
 from .models import Identity
 from .secureio import (
@@ -2123,7 +2123,7 @@ class _SupportedLeafDeletionCriticalSection:
         self._signal_scope: DeferredSignalScope | None = None
         self._entered = False
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> _SupportedLeafDeletionCriticalSection:
         if self._entered:
             raise RuntimeError("leaf deletion critical section is not reusable")
         pthread_sigmask = getattr(signal, "pthread_sigmask", None)

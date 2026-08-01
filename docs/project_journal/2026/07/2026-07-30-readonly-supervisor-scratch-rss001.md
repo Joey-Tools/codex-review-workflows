@@ -239,7 +239,7 @@ superseded_by:
   `/usr/bin/write` were rejected at `exec` with `EPERM` (sandbox exit 71). The
   hosted runner still must prove the same inherited policy before CI can pass.
 - The final async cleanup-boundary and recovery directory-FD custody
-  hardening passed 776/776 deterministic independent-supervisor tests in 90.820
+  hardening passed 776/776 deterministic independent-supervisor tests in 90.357
   seconds on the uv-managed CPython 3.13.13 runtime, with reviewed
   selected-identity SHA-256
   `e7a7ac91c591d27a82b26f6e7a412364c171ee5832913aed5d8fcef05f70fc02`.
@@ -249,3 +249,7 @@ superseded_by:
   before manifest publication. These checks protect exact object identity and
   the selected access policy; benign child-entry churn remains distinct from
   replacement, content mutation, or an access-policy change.
+- Hosted setup-uv paths are now resolved through physical parent ancestry to a
+  regular non-symlink executable leaf before identity and digest binding. Exact
+  version admission uses `uv self version --short`, while a regression accepts
+  a benign ancestor alias and rejects a symlink executable leaf.

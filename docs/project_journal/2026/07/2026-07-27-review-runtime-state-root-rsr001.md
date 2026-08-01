@@ -276,7 +276,7 @@ superseded_by:
   signals.
 - The final runtime-root reentry, parent-publication, recovery-admission,
   child-FD settlement, and recovery directory-FD custody changes passed 776/776
-  deterministic tests in 90.820 seconds on the same uv-managed
+  deterministic tests in 90.357 seconds on the same uv-managed
   CPython 3.13.13 runtime. The reviewed 776-test selected identity has
   SHA-256
   `e7a7ac91c591d27a82b26f6e7a412364c171ee5832913aed5d8fcef05f70fc02`.
@@ -284,3 +284,7 @@ superseded_by:
   access-policy evidence: directory child churn is benign, while pathname
   replacement, content mutation, unreadable revalidation, and policy drift
   remain distinct fail-closed outcomes.
+- The post-CI correction rejects non-3.13 interpreters before importing the
+  supervisor package, so unsupported runtimes cannot replace the stable version
+  diagnostic with an import failure. The complete contract module passed
+  105/105 on the uv-managed CPython 3.13.13 runtime.

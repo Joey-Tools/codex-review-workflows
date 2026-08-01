@@ -162,8 +162,13 @@ jobs:
           /usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$uv_root_tmp")" = "0"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$uv_root_tmp")" = "700"
-          trusted_uv="$UV_EXECUTABLE"
-          trusted_uv_physical="$(cd "$(/usr/bin/dirname "$trusted_uv")" && pwd -P)/$(/usr/bin/basename "$trusted_uv")"
+          trusted_uv_candidate="$UV_EXECUTABLE"
+          trusted_uv=""
+          if [[ "$trusted_uv_candidate" == /* ]] \
+            && ! /bin/test -L "$trusted_uv_candidate"; then
+            trusted_uv="$(cd "$(/usr/bin/dirname "$trusted_uv_candidate")" && pwd -P)/$(/usr/bin/basename "$trusted_uv_candidate")" \
+              || trusted_uv=""
+          fi
           run_trusted_uv() {
             /usr/bin/sudo /usr/bin/env -i \
               HOME="$uv_root_home" \
@@ -173,10 +178,10 @@ jobs:
               TMPDIR="$uv_root_tmp" \
               "$trusted_uv" "$@"
           }
-          if [[ "$trusted_uv_physical" != "$trusted_uv" ]] \
+          if [[ -z "$trusted_uv" ]] \
             || ! /bin/test -f "$trusted_uv" \
             || /bin/test -L "$trusted_uv" \
-            || [[ "$(run_trusted_uv --version)" != "uv 0.11.18" ]]; then
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
             echo "::error::Pinned setup-uv executable is not the expected physical uv 0.11.18; retained at $isolated_root"
             exit 1
           fi
@@ -201,7 +206,7 @@ jobs:
           trusted_uv_postinstall_digest="${trusted_uv_postinstall_digest%% *}"
           if [[ "$trusted_uv_postinstall_binding" != "$trusted_uv_binding" ]] \
             || [[ "$trusted_uv_postinstall_digest" != "$trusted_uv_digest" ]] \
-            || [[ "$(run_trusted_uv --version)" != "uv 0.11.18" ]]; then
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
             echo "::error::Pinned setup-uv executable changed while installing Python; retained at $isolated_root"
             exit 1
           fi
