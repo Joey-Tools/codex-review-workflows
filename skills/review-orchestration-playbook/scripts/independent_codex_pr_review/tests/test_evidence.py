@@ -16,7 +16,11 @@ from review_supervisor.evidence import (
 )
 from review_supervisor.secureio import sha256_bytes
 
-from tests.support import owned_temporary_directory
+from tests.support import (
+    _remove_exact_test_entry,
+    _test_entry_object_identity,
+    owned_temporary_directory,
+)
 
 
 class EvidenceBundleTests(unittest.TestCase):
@@ -255,6 +259,13 @@ class EvidenceBundleTests(unittest.TestCase):
                 self._entry(root, "context.txt"),
             ]
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            alias_object = _test_entry_object_identity(
+                os.stat(
+                    b"alias.txt",
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            )
             try:
                 with self.assertRaises(EvidenceError):
                     build_evidence_bundle(
@@ -263,7 +274,14 @@ class EvidenceBundleTests(unittest.TestCase):
                         nearby_paths=("context.txt",),
                     )
             finally:
-                os.close(root_fd)
+                try:
+                    _remove_exact_test_entry(
+                        root_fd,
+                        b"alias.txt",
+                        alias_object,
+                    )
+                finally:
+                    os.close(root_fd)
 
     def test_rejects_binary_data_and_unsafe_path_syntax(self) -> None:
         for path in ("/absolute", "../escape", "a/../b", "a/*", "a\\b", "a//b"):

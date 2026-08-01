@@ -32,7 +32,11 @@ from review_supervisor.secureio import (
     require_private_directory,
 )
 
-from tests.support import owned_temporary_directory
+from tests.support import (
+    _remove_exact_test_entry,
+    _test_entry_object_identity,
+    owned_temporary_directory,
+)
 
 
 class StrictJsonTests(unittest.TestCase):
@@ -124,12 +128,24 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
                             if fifo.exists():
                                 fifo.unlink()
                             os.mkfifo(fifo, 0o600)
-                            signal.setitimer(signal.ITIMER_REAL, 1.0)
+                            fifo_object = _test_entry_object_identity(
+                                os.stat(
+                                    b"control.fifo",
+                                    dir_fd=parent_fd,
+                                    follow_symlinks=False,
+                                )
+                            )
                             try:
+                                signal.setitimer(signal.ITIMER_REAL, 1.0)
                                 with self.assertRaises(OSError) as caught:
                                     opener()
                             finally:
                                 signal.setitimer(signal.ITIMER_REAL, 0.0)
+                                _remove_exact_test_entry(
+                                    parent_fd,
+                                    b"control.fifo",
+                                    fifo_object,
+                                )
                             self.assertEqual(caught.exception.errno, errno.EINVAL)
                 finally:
                     os.close(parent_fd)

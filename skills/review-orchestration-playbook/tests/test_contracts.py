@@ -1720,6 +1720,8 @@ class RepositoryContractTest(unittest.TestCase):
     def test_hosted_codesign_pin_journal_records_both_runner_generations(
         self,
     ) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
         journal = (
             REPO_ROOT
             / "docs/project_journal/2026/07/"
@@ -1736,6 +1738,8 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(evidence, journal)
 
     def test_readonly_supervisor_journal_is_recovery_pointer(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
         project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
             encoding="utf-8"
         )
@@ -1794,7 +1798,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 646", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 776", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2596,9 +2600,12 @@ class RepositoryContractTest(unittest.TestCase):
                     "UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}",
                     'uv_root_home="$isolated_root/uv-home"',
                     '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"',
+                    'stat -f \'%u\' "$uv_root_home")" = "0"',
+                    'stat -f \'%Lp\' "$uv_root_home")" = "700"',
                     'uv_root_tmp="$uv_root_home/tmp"',
                     '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"',
-                    'stat -f \'%u:%g:%Lp\' "$uv_root_tmp")" = "0:0:700"',
+                    'stat -f \'%u\' "$uv_root_tmp")" = "0"',
+                    'stat -f \'%Lp\' "$uv_root_tmp")" = "700"',
                     "run_trusted_uv() {",
                     "/usr/bin/sudo /usr/bin/env -i",
                     'HOME="$uv_root_home"',
@@ -2717,6 +2724,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/rsync",
                     '/usr/bin/sudo "$trusted_uv"',
                     '"$trusted_uv" --version',
+                    "stat -f '%u:%g:%Lp' \"$uv_root_home\"",
+                    "stat -f '%u:%g:%Lp' \"$uv_root_tmp\"",
                     '/bin/rm -rf "$uv_staging_dir"',
                     '"$isolated_python" -B -m '
                     "tests.run_readonly_install_deterministic_supervisor",

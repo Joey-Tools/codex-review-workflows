@@ -15,13 +15,15 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
-from types import FrameType
+from dataclasses import asdict, dataclass, field
+from types import CodeType, FrameType, TracebackType
 from typing import Any
 
 from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.models import Identity
 from review_supervisor.recovery_cleanup import (
     CustodiedDeletionResultOwner,
+    CustodiedManifestResultOwner,
     RootSpec,
     build_custodied_manifest,
     delete_custodied_roots,
@@ -39,11 +41,21 @@ from review_supervisor.signal_relay import (
     deactivate_deferred_signal_interrupt,
 )
 
+from .async_fd_custody import (
+    FdCloseSettlement,
+    RawFdCustody,
+    acquire_raw_fd,
+    supported_async_publication,
+)
 from .support import (
     _create_bound_owned_private_directory,
     _DirectoryParentBinding,
+    _DirectoryParentBindingResultOwner,
     _open_directory_parent,
     _private_runtime_parent,
+    _PrivateDirectoryCreationResultOwner,
+    _PrivateDirectoryCreationRetentionRequired,
+    _settle_directory_parent_binding_result_preserving_trigger,
 )
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
@@ -78,6 +90,8 @@ CHILD_ACCOUNT_PROBE_TIMEOUT_SECONDS = 5.0
 BOUND_CLEANUP_ENTRY_CAP = 8192
 BOUND_CLEANUP_MANIFEST_BYTES = 4 * 1024 * 1024
 BOUND_CLEANUP_TIMEOUT_SECONDS = 60.0
+_CLEANUP_BODY_CONTEXT_SCAN_LIMIT = 64
+_CLEANUP_BODY_TRACEBACK_SCAN_LIMIT = 256
 _CLEANUP_RECOVERY_EVIDENCE_ATTR = "_readonly_cleanup_recovery_evidence"
 
 
@@ -171,6 +185,13 @@ class ChildSignalGuard:
 class ChildProcessClosureProof:
     started: bool = False
     proven: bool = False
+    destructive_cleanup_authorized: bool = True
+
+
+def _child_process_closure_status(proof: ChildProcessClosureProof) -> str:
+    if proof.proven:
+        return "proven"
+    return "unproven" if proof.started else "not-started"
 
 
 @dataclass(frozen=True)
@@ -323,6 +344,15 @@ def _secondary_failure(
         error_errno=error_errno if isinstance(error_errno, int) else None,
         message=message,
     )
+
+
+def _prefer_control_flow_error(
+    earlier: BaseException,
+    later: BaseException,
+) -> tuple[BaseException, BaseException]:
+    if isinstance(earlier, Exception) and not isinstance(later, Exception):
+        return later, earlier
+    return earlier, later
 
 
 @contextmanager
@@ -662,6 +692,7 @@ def _run_bounded_child(
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    proof.destructive_cleanup_authorized = False
     with _bound_child_signals(diagnostics):
         baseline = (
             _require_isolated_child_account()
@@ -702,6 +733,7 @@ def _run_bounded_child(
         if isinstance(pending_error, GitProcessClosureUnproven):
             raise pending_error
         proof.proven = True
+        proof.destructive_cleanup_authorized = True
         if pending_error is not None:
             raise pending_error
         assert result is not None
@@ -925,6 +957,32 @@ def _filesystem_object_key(metadata: os.stat_result) -> tuple[int, int, int, int
     )
 
 
+def _settle_bound_cleanup_child(
+    child_owner: RawFdCustody,
+    close_settlement: FdCloseSettlement,
+) -> None:
+    while child_owner.state in {"empty", "owned"}:
+        try:
+            close_settlement.settle()
+        except BaseException as close_boundary_error:
+            close_settlement.capture(
+                close_boundary_error,
+                "bound cleanup child close caller boundary",
+            )
+    while True:
+        try:
+            close_settlement.raise_first()
+        except BaseException as raise_boundary_error:
+            if raise_boundary_error is close_settlement.first_error:
+                raise
+            close_settlement.capture(
+                raise_boundary_error,
+                "bound cleanup final raise caller boundary",
+            )
+        else:
+            break
+
+
 def _restore_owner_write_below_bound_root(root_fd: int) -> None:
     deadline = time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS
     remaining = BOUND_CLEANUP_ENTRY_CAP
@@ -946,32 +1004,122 @@ def _restore_owner_write_below_bound_root(root_fd: int) -> None:
             metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if not stat.S_ISDIR(metadata.st_mode):
                 continue
-            child_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
+            # Identity alone is insufficient: a local path may re-raise the
+            # exact exception already handled by this function's caller.
+            invocation_ambient_error = sys.exception()
+            invocation_ambient_traceback = (
+                invocation_ambient_error.__traceback__
+                if invocation_ambient_error is not None
+                else None
             )
+            child_owner = RawFdCustody()
+            close_settlement = FdCloseSettlement(child_owner)
+
+            def process_child() -> None:
+                try:
+                    child_fd = acquire_raw_fd(
+                        child_owner,
+                        lambda: os.open(
+                            name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            dir_fd=directory_fd,
+                        ),
+                    )
+                    before = os.fstat(child_fd)
+                    if _filesystem_object_key(before) != _filesystem_object_key(
+                        metadata
+                    ):
+                        raise OSError(
+                            errno.ESTALE,
+                            "bound cleanup directory changed before write restoration",
+                        )
+                    visit(child_fd, depth + 1)
+                    os.fchmod(
+                        child_fd,
+                        stat.S_IMODE(before.st_mode) | stat.S_IWUSR | stat.S_IXUSR,
+                    )
+                    if _filesystem_object_key(
+                        os.fstat(child_fd)
+                    ) != _filesystem_object_key(before):
+                        raise OSError(
+                            errno.ESTALE,
+                            "bound cleanup directory changed during write restoration",
+                        )
+                except BaseException as error:
+                    capture_boundary_errors: tuple[BaseException, ...] = ()
+                    while True:
+                        try:
+                            if close_settlement.first_error is not None:
+                                break
+                            close_settlement.capture(
+                                error,
+                                "bound cleanup child traversal",
+                            )
+                        except BaseException as capture_boundary_error:
+                            capture_boundary_errors = (
+                                *capture_boundary_errors,
+                                capture_boundary_error,
+                            )
+                    for capture_boundary_error in capture_boundary_errors:
+                        primary, secondary = _prefer_control_flow_error(
+                            close_settlement.first_error,
+                            capture_boundary_error,
+                        )
+                        if primary is close_settlement.first_error:
+                            close_settlement.secondary_errors = (
+                                *close_settlement.secondary_errors,
+                                (
+                                    "bound cleanup child traversal caller boundary",
+                                    secondary,
+                                ),
+                            )
+                        else:
+                            close_settlement.secondary_errors = (
+                                *close_settlement.secondary_errors,
+                                ("bound cleanup child traversal", secondary),
+                            )
+                            close_settlement.first_error = primary
+                    raise
+                finally:
+                    _settle_bound_cleanup_child(child_owner, close_settlement)
+
             try:
-                before = os.fstat(child_fd)
-                if _filesystem_object_key(before) != _filesystem_object_key(metadata):
-                    raise OSError(
-                        errno.ESTALE,
-                        "bound cleanup directory changed before write restoration",
+                process_child()
+            except BaseException as boundary_error:
+                if close_settlement.first_error is None:
+                    earlier_error = boundary_error.__context__
+                    if earlier_error is invocation_ambient_error and (
+                        earlier_error is None
+                        or earlier_error.__traceback__ is invocation_ambient_traceback
+                    ):
+                        earlier_error = None
+                    if earlier_error is None:
+                        close_settlement.first_error = boundary_error
+                    else:
+                        primary, secondary = _prefer_control_flow_error(
+                            earlier_error,
+                            boundary_error,
+                        )
+                        close_settlement.first_error = primary
+                        close_settlement.secondary_errors = (
+                            *close_settlement.secondary_errors,
+                            (
+                                "bound cleanup child traversal caller boundary",
+                                secondary,
+                            ),
+                        )
+                elif boundary_error is not close_settlement.first_error:
+                    primary, secondary = _prefer_control_flow_error(
+                        close_settlement.first_error,
+                        boundary_error,
                     )
-                visit(child_fd, depth + 1)
-                os.fchmod(
-                    child_fd,
-                    stat.S_IMODE(before.st_mode) | stat.S_IWUSR | stat.S_IXUSR,
-                )
-                if _filesystem_object_key(os.fstat(child_fd)) != _filesystem_object_key(
-                    before
-                ):
-                    raise OSError(
-                        errno.ESTALE,
-                        "bound cleanup directory changed during write restoration",
+                    close_settlement.first_error = primary
+                    close_settlement.secondary_errors = (
+                        *close_settlement.secondary_errors,
+                        ("bound cleanup child outer caller boundary", secondary),
                     )
-            finally:
-                os.close(child_fd)
+                _settle_bound_cleanup_child(child_owner, close_settlement)
+                raise AssertionError("bound cleanup child settlement returned")
 
     visit(root_fd, 1)
 
@@ -1133,6 +1281,17 @@ def _bound_cleanup_failure(
     evidence = _bound_path_evidence(binding)
     recovery_evidence = getattr(error, _CLEANUP_RECOVERY_EVIDENCE_ATTR, None)
     if not isinstance(recovery_evidence, dict):
+        recovery_evidence = {}
+    else:
+        recovery_evidence = dict(recovery_evidence)
+    removal_evidence = getattr(
+        error,
+        "_readonly_manifest_removal_evidence",
+        None,
+    )
+    if isinstance(removal_evidence, dict):
+        recovery_evidence["manifest_removal"] = dict(removal_evidence)
+    if not recovery_evidence:
         recovery_evidence = None
     return _cleanup_failure_from_error(
         evidence.path,
@@ -1157,12 +1316,475 @@ def _stat_object_locator(value: os.stat_result) -> dict[str, int]:
     }
 
 
+def _creation_object_locator(value: tuple[int, ...] | None) -> dict[str, int] | None:
+    if value is None:
+        return None
+    device, inode, file_type, generation = value
+    return {
+        "device": device,
+        "inode": inode,
+        "file_type": file_type,
+        "generation": generation,
+    }
+
+
+def _private_directory_creation_source_evidence(
+    error: _PrivateDirectoryCreationRetentionRequired,
+) -> dict[str, Any]:
+    evidence = error.evidence
+    return {
+        "stage": evidence.stage,
+        "parent_path": evidence.parent_path,
+        "entry_name": evidence.entry_name,
+        "parent_fd": evidence.parent_fd,
+        "directory_fd": evidence.directory_fd,
+        "parent_identity": evidence.parent_identity.to_json(),
+        "directory_identity": (
+            evidence.directory_identity.to_json()
+            if evidence.directory_identity is not None
+            else None
+        ),
+        "directory_object_identity": _creation_object_locator(
+            evidence.directory_object_identity
+        ),
+        "observed_identity": (
+            evidence.observed_identity.to_json()
+            if evidence.observed_identity is not None
+            else None
+        ),
+        "entry_state": evidence.entry_state,
+        "trigger_kind": evidence.trigger_kind,
+        "trigger_message": _bounded_failure_text(
+            evidence.trigger_message,
+            limit=2_048,
+        ),
+        "observation_kind": evidence.observation_kind,
+        "observation_message": (
+            _bounded_failure_text(evidence.observation_message, limit=2_048)
+            if evidence.observation_message is not None
+            else None
+        ),
+        "rollback_kind": evidence.rollback_kind,
+        "rollback_message": (
+            _bounded_failure_text(evidence.rollback_message, limit=2_048)
+            if evidence.rollback_message is not None
+            else None
+        ),
+        "protected_property": evidence.protected_property,
+        "access_policy_gate": evidence.access_policy_gate,
+    }
+
+
+def _private_directory_creation_entry_evidence(
+    *,
+    parent_fd: int,
+    name: bytes,
+    expected_object: tuple[int, ...] | None,
+    expected_unbound_identity: Identity | None,
+) -> dict[str, Any]:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {"status": "missing", "identity": None}
+    except OSError as error:
+        return {
+            "status": "unreadable",
+            "identity": None,
+            "error_kind": type(error).__name__,
+            "error_errno": error.errno,
+        }
+    observed_object = (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+    )
+    if expected_object is None:
+        expected_unbound_object = (
+            (
+                expected_unbound_identity.device,
+                expected_unbound_identity.inode,
+                stat.S_IFMT(expected_unbound_identity.mode),
+            )
+            if expected_unbound_identity is not None
+            else None
+        )
+        observed_unbound_object = observed_object[:3]
+        status = (
+            "present-unbound"
+            if expected_unbound_object is None
+            or observed_unbound_object == expected_unbound_object
+            else "different-object"
+        )
+    elif observed_object == expected_object:
+        status = "expected-object"
+    else:
+        status = "different-object"
+    return {
+        "status": status,
+        "identity": _stat_object_locator(metadata),
+    }
+
+
+def _private_directory_creation_lexical_evidence(
+    path: pathlib.Path,
+    *,
+    expected_object: tuple[int, ...] | None,
+    expected_unbound_identity: Identity | None,
+) -> dict[str, Any]:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return {"status": "missing", "identity": None}
+    except OSError as error:
+        return {
+            "status": "unreadable",
+            "identity": None,
+            "error_kind": type(error).__name__,
+            "error_errno": error.errno,
+        }
+    observed_object = (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+    )
+    if expected_object is not None:
+        status = (
+            "expected-object"
+            if observed_object == expected_object
+            else "different-object"
+        )
+    elif expected_unbound_identity is None:
+        status = "present-unbound"
+    else:
+        expected_unbound_object = (
+            expected_unbound_identity.device,
+            expected_unbound_identity.inode,
+            stat.S_IFMT(expected_unbound_identity.mode),
+        )
+        status = (
+            "present-unbound"
+            if observed_object[:3] == expected_unbound_object
+            else "different-object"
+        )
+    return {"status": status, "identity": _stat_object_locator(metadata)}
+
+
+def _private_directory_creation_quarantine_evidence(
+    error: _PrivateDirectoryCreationRetentionRequired,
+    *,
+    parent_path: pathlib.Path,
+    expected_object: tuple[int, ...] | None,
+) -> list[dict[str, Any]]:
+    quarantined: list[dict[str, Any]] = []
+    for evidence in error.quarantined_root_recovery_evidence:
+        try:
+            observed_metadata = os.stat(
+                evidence.quarantine_name,
+                dir_fd=evidence.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            quarantine_status = "missing"
+            observed_identity = None
+        except OSError as observation_error:
+            quarantine_status = "unreadable"
+            observed_identity = None
+            observation_kind: str | None = type(observation_error).__name__
+            observation_errno: int | None = observation_error.errno
+        else:
+            observed_identity = _stat_object_locator(observed_metadata)
+            observed_object = (
+                observed_metadata.st_dev,
+                observed_metadata.st_ino,
+                stat.S_IFMT(observed_metadata.st_mode),
+                getattr(observed_metadata, "st_gen", 0),
+            )
+            quarantine_status = (
+                "present-unbound"
+                if expected_object is None
+                else "expected-object"
+                if observed_object == expected_object
+                else "different-object"
+            )
+            observation_kind = None
+            observation_errno = None
+        try:
+            held_identity = _stat_object_locator(os.fstat(evidence.root_fd))
+        except OSError:
+            held_identity = None
+        record: dict[str, Any] = {
+            "label": evidence.label,
+            "stage": evidence.stage,
+            "protected_property": evidence.protected_property,
+            "original_name_hex": evidence.original_name.hex(),
+            "quarantine_name_hex": evidence.quarantine_name.hex(),
+            "original_path": str(parent_path / os.fsdecode(evidence.original_name)),
+            "quarantine_path": str(parent_path / os.fsdecode(evidence.quarantine_name)),
+            "parent_identity": evidence.parent_identity.to_json(),
+            "expected_root_identity": evidence.expected_identity.to_json(),
+            "held_root_identity": held_identity,
+            "observed_quarantine_identity": observed_identity,
+            "quarantine_status": quarantine_status,
+            "access_policy_status": "unproven",
+        }
+        if quarantine_status == "unreadable":
+            record["observation_kind"] = observation_kind
+            record["observation_errno"] = observation_errno
+        quarantined.append(record)
+    return quarantined
+
+
+def _snapshot_private_directory_creation_recovery(
+    error: _PrivateDirectoryCreationRetentionRequired,
+) -> CleanupFailure:
+    recovery = error.recovery
+    expected_object = recovery.directory_object_identity
+    bound_parent_entry = _private_directory_creation_entry_evidence(
+        parent_fd=recovery.parent_fd,
+        name=recovery.name,
+        expected_object=expected_object,
+        expected_unbound_identity=recovery.observed_identity,
+    )
+    original_lexical_entry = _private_directory_creation_lexical_evidence(
+        recovery.path,
+        expected_object=expected_object,
+        expected_unbound_identity=recovery.observed_identity,
+    )
+    try:
+        current_parent = recovery.parent_binding.current_path()
+    except (OSError, ValueError):
+        current_parent = recovery.parent_binding.path
+        parent_path_status = "bound-unresolved"
+    else:
+        parent_path_status = (
+            "bound-original"
+            if current_parent == recovery.parent_binding.path
+            else "bound-moved"
+        )
+
+    selected_path = recovery.path
+    path_status = "unbound-original"
+    retained: bool | None
+    held_identity: dict[str, int] | None = None
+    held_link_count: int | None = None
+    current_path_error: dict[str, Any] | None = None
+    if recovery.directory_fd is None or expected_object is None:
+        if parent_path_status != "bound-unresolved":
+            selected_path = current_parent / os.fsdecode(recovery.name)
+        retained = {
+            # A missing original name is not proof that an unbound object was
+            # never created or was not moved elsewhere before this snapshot.
+            "missing": None,
+            "present-unbound": True,
+        }.get(bound_parent_entry["status"])
+        path_status = (
+            "unbound-parent-unresolved"
+            if parent_path_status == "bound-unresolved"
+            else "unbound-missing"
+            if bound_parent_entry["status"] == "missing"
+            else (
+                "unbound-parent-moved"
+                if parent_path_status == "bound-moved"
+                else "unbound-original"
+            )
+            if bound_parent_entry["status"] == "present-unbound"
+            else "unbound-unresolved"
+        )
+    else:
+        held_metadata = os.fstat(recovery.directory_fd)
+        held_identity = _stat_object_locator(held_metadata)
+        held_link_count = held_metadata.st_nlink
+        held_object = (
+            held_metadata.st_dev,
+            held_metadata.st_ino,
+            stat.S_IFMT(held_metadata.st_mode),
+            getattr(held_metadata, "st_gen", 0),
+        )
+        if held_object != expected_object:
+            retained = None
+            path_status = "bound-identity-mismatch"
+        elif held_metadata.st_nlink == 0:
+            retained = False
+            path_status = "bound-unlinked"
+        else:
+            try:
+                selected_path = recovery.current_directory_path()
+            except (OSError, ValueError) as path_error:
+                retained = None
+                path_status = "bound-unresolved"
+                current_path_error = {
+                    "error_kind": type(path_error).__name__,
+                    "error_errno": (
+                        path_error.errno if isinstance(path_error, OSError) else None
+                    ),
+                    "message": _bounded_failure_text(str(path_error), limit=2_048),
+                }
+            else:
+                retained = True
+                path_status = (
+                    "bound-original"
+                    if selected_path == recovery.path
+                    else "bound-moved"
+                )
+
+    original_status = str(original_lexical_entry["status"])
+    bound_entry_status = str(bound_parent_entry["status"])
+    replacement_path = (
+        recovery.path
+        if original_status == "different-object"
+        else selected_path
+        if bound_entry_status == "different-object"
+        else None
+    )
+    cleanup_error = error.rollback_error if error.rollback_error is not None else error
+    recovery_evidence = {
+        "protected_property": "object-identity",
+        "access_policy_gate": "private-fail-closed",
+        "creation": _private_directory_creation_source_evidence(error),
+        "parent_current_path": str(current_parent),
+        "parent_path_status": parent_path_status,
+        "held_directory_identity": held_identity,
+        "held_directory_link_count": held_link_count,
+        "current_path_error": current_path_error,
+        "bound_parent_entry": bound_parent_entry,
+        "original_lexical_entry": original_lexical_entry,
+        "quarantined_roots": _private_directory_creation_quarantine_evidence(
+            error,
+            parent_path=current_parent,
+            expected_object=expected_object,
+        ),
+    }
+    return _cleanup_failure_from_error(
+        selected_path,
+        cleanup_error,
+        retained=retained,
+        original_path=recovery.path,
+        path_status=path_status,
+        replacement_path=replacement_path,
+        held_identity=held_identity,
+        original_path_status=original_status,
+        access_policy_status="unproven",
+        recovery_evidence=recovery_evidence,
+    )
+
+
+def _private_directory_creation_control_flow_error(
+    error: _PrivateDirectoryCreationRetentionRequired,
+) -> BaseException | None:
+    for candidate in (
+        error.trigger_error,
+        error.observation_error,
+        error.rollback_error,
+    ):
+        if candidate is not None and not isinstance(candidate, Exception):
+            return candidate
+    return None
+
+
+def _fail_closed_deferred_control_flow(error: BaseException) -> BaseException:
+    if isinstance(error, SystemExit) and (
+        error.code is None or (isinstance(error.code, int) and error.code == 0)
+    ):
+        hardened = SystemExit(1)
+        hardened.add_note(
+            "a successful SystemExit was converted to status 1 because "
+            "private-directory recovery remained incomplete"
+        )
+        return hardened
+    return error
+
+
+def _consume_private_directory_creation_retention(
+    error: _PrivateDirectoryCreationRetentionRequired,
+    *,
+    secondary_failures: list[SecondaryFailure],
+) -> tuple[CleanupFailure, BaseException | None]:
+    deferred = _private_directory_creation_control_flow_error(error)
+    if error.observation_error is not None:
+        secondary_failures.append(
+            _secondary_failure(
+                "observe-private-directory-creation-result",
+                error.observation_error,
+            )
+        )
+    try:
+        failure = _snapshot_private_directory_creation_recovery(error)
+    except BaseException as snapshot_error:
+        secondary_failures.append(
+            _secondary_failure(
+                "snapshot-private-directory-creation-recovery",
+                snapshot_error,
+            )
+        )
+        if deferred is None and not isinstance(snapshot_error, Exception):
+            deferred = snapshot_error
+        failure = _cleanup_failure_from_error(
+            error.retained_path,
+            error.rollback_error if error.rollback_error is not None else error,
+            retained=None,
+            original_path=error.retained_path,
+            path_status="creation-recovery-unresolved",
+            original_path_status=error.evidence.entry_state,
+            access_policy_status="unproven",
+            recovery_evidence={
+                "protected_property": "object-identity",
+                "access_policy_gate": "private-fail-closed",
+                "creation": _private_directory_creation_source_evidence(error),
+                "snapshot_error": {
+                    "error_kind": type(snapshot_error).__name__,
+                    "message": _bounded_failure_text(
+                        str(snapshot_error),
+                        limit=2_048,
+                    ),
+                },
+            },
+        )
+    try:
+        error.close_descriptors_for_recovery()
+    except BaseException as close_error:
+        secondary_failures.append(
+            _secondary_failure(
+                "close-private-directory-creation-recovery",
+                close_error,
+            )
+        )
+        if deferred is None and not isinstance(close_error, Exception):
+            deferred = close_error
+    return failure, deferred
+
+
+def _claim_private_directory_creation_result(
+    owner: _PrivateDirectoryCreationResultOwner,
+    binding: _DirectoryParentBinding | None,
+) -> _DirectoryParentBinding | None:
+    published = owner.binding
+    if published is None:
+        return binding
+    if binding is not None and binding is not published:
+        raise RuntimeError("private-directory creation result owner is inconsistent")
+    if not owner.transferred:
+        owner.transfer(published)
+    return published
+
+
+def _retained_private_directory_creation_from_owner(
+    owner: _PrivateDirectoryCreationResultOwner,
+    trigger_error: BaseException,
+) -> _PrivateDirectoryCreationRetentionRequired | None:
+    if owner.retention is not None:
+        return owner.retention
+    return owner.retained_creation_for(trigger_error)
+
+
 def _snapshot_bound_cleanup_recovery(
     error: BaseException,
     *,
     parent_binding: _DirectoryParentBinding,
     manifest_path: pathlib.Path,
     manifest_seal: dict[str, Any] | None,
+    manifest_result_owner: CustodiedManifestResultOwner,
     deletion_owner: CustodiedDeletionResultOwner,
 ) -> None:
     try:
@@ -1237,12 +1859,19 @@ def _snapshot_bound_cleanup_recovery(
             }
         )
 
+    published_manifest = manifest_result_owner.manifest
+    published_seal = (
+        published_manifest.seal if published_manifest is not None else manifest_seal
+    )
     manifest_evidence = {
         "path": str(manifest_path),
-        "state": "published" if manifest_seal is not None else "not-published",
-        "sha256": (manifest_seal.get("sha256") if manifest_seal is not None else None),
+        "state": "published" if published_manifest is not None else "not-published",
+        "result_owner_transferred": manifest_result_owner.transferred,
+        "sha256": (
+            published_seal.get("sha256") if published_seal is not None else None
+        ),
         "record_count": (
-            manifest_seal.get("record_count") if manifest_seal is not None else None
+            published_seal.get("record_count") if published_seal is not None else None
         ),
     }
     setattr(
@@ -1259,83 +1888,758 @@ def _snapshot_bound_cleanup_recovery(
     )
 
 
+@dataclass(slots=True)
+class _CleanupBodyErrorSettlement:
+    """Publish one local body error across supported async handler gaps."""
+
+    invocation_ambient_error: BaseException | None
+    invocation_ambient_traceback: TracebackType | None
+    invocation_ambient_context: BaseException | None = None
+    invocation_ambient_context_traceback: TracebackType | None = None
+    invocation_code: CodeType | None = None
+    active_error: BaseException | None = None
+    active_error_replaced: bool = False
+    publication_error: BaseException | None = None
+    publication_observations: list[tuple[str, BaseException]] = field(
+        default_factory=list
+    )
+    publication_observation_ids: set[int] = field(default_factory=set)
+
+    def _is_invocation_ambient(self, error: BaseException) -> bool:
+        return (
+            error is self.invocation_ambient_error
+            and error.__traceback__ is self.invocation_ambient_traceback
+        )
+
+    def _traceback_belongs_to_invocation(self, error: BaseException) -> bool:
+        invocation_code = self.invocation_code
+        if invocation_code is None:
+            return False
+        seen: set[int] = set()
+        cursor = error.__traceback__
+        for _ in range(_CLEANUP_BODY_TRACEBACK_SCAN_LIMIT):
+            if not isinstance(cursor, TracebackType):
+                return False
+            cursor_id = id(cursor)
+            if cursor_id in seen:
+                return False
+            seen.add(cursor_id)
+            frame = cursor.tb_frame
+            if frame.f_code is invocation_code:
+                try:
+                    settlement = frame.f_locals.get("body_error_settlement")
+                except BaseException:  # noqa: BLE001 - fail closed
+                    return False
+                if settlement is self:
+                    return True
+            cursor = cursor.tb_next
+        return False
+
+    def _capture_publication_error(
+        self,
+        error: BaseException,
+        operation: str,
+    ) -> None:
+        error_id = id(error)
+        secondary: BaseException | None = None
+        with supported_async_publication():
+            if (
+                error is self.active_error
+                or error_id in self.publication_observation_ids
+            ):
+                return
+            # The id, strong observation reference, and selected publication
+            # primary are one transaction. A restored hook can observe all of
+            # them or none of them, never a seen-but-unpublished error.
+            self.publication_observation_ids.add(error_id)
+            self.publication_observations.append((operation, error))
+            if self.publication_error is None:
+                self.publication_error = error
+            else:
+                primary, secondary = _prefer_control_flow_error(
+                    self.publication_error,
+                    error,
+                )
+                self.publication_error = primary
+        if secondary is None:
+            return
+        try:
+            primary.add_note(
+                f"{operation} also failed: {type(secondary).__name__}: {secondary}"
+            )
+        except BaseException:  # noqa: BLE001, S110 - notes are best effort
+            pass
+
+    def publish_local_active_error(self, error: BaseException) -> None:
+        with supported_async_publication():
+            self.active_error = error
+
+    def recover_current_exception(self) -> None:
+        """Recover a bounded, invocation-local body error after replacement."""
+
+        with supported_async_publication():
+            current_error = sys.exception()
+            if (
+                not isinstance(current_error, BaseException)
+                or self._is_invocation_ambient(current_error)
+                or current_error is self.active_error
+            ):
+                return
+
+            if self.active_error is not None:
+                active_error = self.active_error
+                invocation_candidates: list[BaseException] = []
+                seen: set[int] = set()
+                cursor: BaseException | None = current_error
+                scan_complete = False
+                for _ in range(_CLEANUP_BODY_CONTEXT_SCAN_LIMIT):
+                    if not isinstance(cursor, BaseException):
+                        scan_complete = True
+                        break
+                    cursor_id = id(cursor)
+                    if cursor_id in seen:
+                        break
+                    seen.add(cursor_id)
+                    if cursor is active_error or self._is_invocation_ambient(cursor):
+                        scan_complete = True
+                        break
+                    if self._traceback_belongs_to_invocation(cursor):
+                        invocation_candidates.append(cursor)
+                    try:
+                        context = cursor.__context__
+                    except BaseException:  # noqa: BLE001 - fail closed
+                        break
+                    if not isinstance(context, BaseException):
+                        scan_complete = True
+                        break
+                    cursor = context
+
+                if scan_complete:
+                    for candidate in reversed(invocation_candidates):
+                        active_error, _secondary = _prefer_control_flow_error(
+                            active_error,
+                            candidate,
+                        )
+                    self.active_error = active_error
+                self.active_error_replaced = current_error is not self.active_error
+                if current_error is not self.active_error:
+                    self._capture_publication_error(
+                        current_error,
+                        "cleanup body publication boundary",
+                    )
+                return
+
+            seen: set[int] = set()
+            candidate: BaseException | None = None
+            cursor: BaseException | None = current_error
+            scan_complete = False
+            for _ in range(_CLEANUP_BODY_CONTEXT_SCAN_LIMIT):
+                if not isinstance(cursor, BaseException):
+                    scan_complete = True
+                    break
+                cursor_id = id(cursor)
+                if cursor_id in seen:
+                    break
+                seen.add(cursor_id)
+
+                if cursor is self.invocation_ambient_error:
+                    if cursor.__traceback__ is self.invocation_ambient_traceback:
+                        scan_complete = True
+                        break
+                    if self._traceback_belongs_to_invocation(cursor):
+                        candidate = cursor
+                        scan_complete = True
+                        break
+                    try:
+                        context = cursor.__context__
+                    except BaseException:  # noqa: BLE001 - fail closed
+                        break
+                    if cursor is current_error:
+                        candidate = cursor
+                        scan_complete = True
+                        break
+                    if context is self.invocation_ambient_context:
+                        if (
+                            not isinstance(context, BaseException)
+                            or context.__traceback__
+                            is self.invocation_ambient_context_traceback
+                        ):
+                            # The body locally reraised the ambient object and
+                            # retained its exact pre-invocation context.
+                            candidate = cursor
+                            scan_complete = True
+                        # A mutated pre-invocation context is ambiguous. Do not
+                        # enter it or select the ambient control-flow object.
+                        break
+                    if not isinstance(context, BaseException):
+                        break
+                    # A changed context proves that this ambient object is an
+                    # intermediate callback error. Skip it and continue toward
+                    # the invocation-local cleanup body.
+                    cursor = context
+                    continue
+
+                candidate = cursor
+                try:
+                    context = cursor.__context__
+                except BaseException:  # noqa: BLE001 - fail closed on hostile errors
+                    break
+                if not isinstance(context, BaseException):
+                    scan_complete = True
+                    break
+                cursor = context
+
+            if not scan_complete or candidate is None:
+                self._capture_publication_error(
+                    current_error,
+                    "cleanup body publication boundary",
+                )
+                return
+
+            self.active_error = candidate
+            self.active_error_replaced = current_error is not candidate
+            if current_error is not candidate:
+                # Intermediate context nodes may be callback-internal errors
+                # that were already caught. Only the uncaught outer boundary
+                # is a settlement observation.
+                self._capture_publication_error(
+                    current_error,
+                    "cleanup body publication boundary",
+                )
+
+    def capture_recovery_boundary(self, error: BaseException) -> None:
+        self._capture_publication_error(
+            error,
+            "cleanup body publication recovery boundary",
+        )
+
+    def capture_delivery_boundary(
+        self,
+        error: BaseException,
+        operation: str,
+    ) -> None:
+        """Publish one owner-bound settlement or delivery failure."""
+
+        self._capture_publication_error(error, operation)
+
+    def settle_current_exception(self) -> None:
+        """Retry restoration deliveries until recovery returns from its try."""
+
+        while True:
+            try:
+                self.recover_current_exception()
+                return
+            except BaseException as recovery_boundary_error:  # noqa: BLE001
+                self.capture_recovery_boundary(recovery_boundary_error)
+
+    def attach_publication_notes(self, primary: BaseException) -> None:
+        for operation, observed in self.publication_observations:
+            if observed is primary:
+                continue
+            try:
+                primary.add_note(
+                    f"{operation} also failed: {type(observed).__name__}: {observed}"
+                )
+            except BaseException:  # noqa: BLE001, S110 - notes are best effort
+                pass
+
+
+@dataclass(slots=True)
+class _PublishedManifestRemovalOwner:
+    """Own one non-repeatable published-manifest removal outcome.
+
+    The protected property is the exact manifest object's validated content
+    and durable name absence. Once removal is armed, an interruption may have
+    occurred before or after ``unlink`` and the operation is never retried.
+    """
+
+    state: str = "unstarted"
+    seal: dict[str, Any] | None = None
+    proof: dict[str, Any] | None = None
+
+    def remove(self, seal: dict[str, Any]) -> None:
+        if self.state == "complete":
+            if self.seal is not seal:
+                raise ValueError("published manifest removal owner was rebound")
+            return
+        if self.state == "remove-outcome-unproven":
+            raise RuntimeError("published manifest removal outcome is unproven")
+        if self.state != "unstarted" or self.seal is not None:
+            raise RuntimeError("published manifest removal owner is invalid")
+
+        # Publish ambiguity before entering a helper that may already have
+        # completed unlink and parent fsync when a caller boundary interrupts.
+        with supported_async_publication():
+            self.seal = seal
+            self.state = "remove-outcome-unproven"
+        remove_published_manifest(seal)
+        proof = {
+            "protected_property": (
+                "manifest-object-identity-content-and-durable-name-absence"
+            ),
+            "state": "complete",
+            "path": seal.get("path"),
+            "identity": seal.get("identity"),
+            "sha256": seal.get("sha256"),
+            "length": seal.get("length"),
+            "remove_returned": True,
+            "parent_fsync_complete": True,
+            "exact_name_absent": True,
+        }
+        with supported_async_publication():
+            self.proof = proof
+            self.state = "complete"
+
+    def attach_evidence(self, error: BaseException) -> None:
+        try:
+            setattr(
+                error,
+                "_readonly_manifest_removal_evidence",
+                {
+                    "protected_property": (
+                        "manifest-object-identity-content-and-durable-name-absence"
+                    ),
+                    "state": self.state,
+                    "proof": self.proof,
+                },
+            )
+        except BaseException:  # noqa: BLE001, S110 - evidence is best effort
+            pass
+
+
+class _BoundCleanupDeliveryOwner:
+    """Long-lived owner for terminal custody and exact error delivery.
+
+    Resource progress is derived only from the manifest and parent owners. A
+    restored supported hook becomes pending delivery state; it cannot skip
+    descriptor settlement, repeat an ambiguous unlink, or replace the selected
+    invocation-local body/control-flow object.
+    """
+
+    __slots__ = (
+        "_armed_error",
+        "_complete",
+        "_manifest_close_complete",
+        "_pending_errors",
+        "_raise_in_progress",
+        "body_error_settlement",
+        "manifest",
+        "manifest_result_owner",
+        "manifest_removal_owner",
+        "parent_result_owner",
+        "remove_manifest_on_success",
+        "seal",
+        "settlement_note",
+    )
+
+    def __init__(
+        self,
+        *,
+        remove_manifest_on_success: bool,
+        settlement_note: str,
+    ) -> None:
+        self.body_error_settlement: _CleanupBodyErrorSettlement | None = None
+        self.parent_result_owner: _DirectoryParentBindingResultOwner | None = None
+        self.manifest_result_owner: CustodiedManifestResultOwner | None = None
+        self.manifest: Any = None
+        self.seal: dict[str, Any] | None = None
+        self.remove_manifest_on_success = remove_manifest_on_success
+        self.settlement_note = settlement_note
+        self.manifest_removal_owner = _PublishedManifestRemovalOwner()
+        self._manifest_close_complete = False
+        self._pending_errors: tuple[tuple[str, BaseException], ...] = ()
+        self._armed_error: BaseException | None = None
+        self._raise_in_progress = False
+        self._complete = False
+
+    @property
+    def complete(self) -> bool:
+        return self._complete
+
+    @property
+    def bound(self) -> bool:
+        """Report whether the complete pre-resource settlement tuple is live."""
+
+        return (
+            self.body_error_settlement is not None
+            and self.parent_result_owner is not None
+        )
+
+    @property
+    def authoritative_error(self) -> BaseException | None:
+        settlement = self.body_error_settlement
+        if settlement is None:
+            return None
+        active_error = settlement.active_error
+        publication_error = settlement.publication_error
+        if active_error is None:
+            return publication_error
+        if publication_error is None:
+            return active_error
+        primary, _secondary = _prefer_control_flow_error(
+            active_error,
+            publication_error,
+        )
+        return primary
+
+    def bind(
+        self,
+        *,
+        body_error_settlement: _CleanupBodyErrorSettlement,
+        parent_result_owner: _DirectoryParentBindingResultOwner,
+        manifest_result_owner: CustodiedManifestResultOwner | None = None,
+    ) -> None:
+        if (
+            self.body_error_settlement is not None
+            or self.parent_result_owner is not None
+        ):
+            raise ValueError("bound cleanup delivery owner was rebound")
+        with supported_async_publication():
+            self.body_error_settlement = body_error_settlement
+            self.parent_result_owner = parent_result_owner
+            self.manifest_result_owner = manifest_result_owner
+
+    def publish_manifest(
+        self,
+        manifest: Any,
+        seal: dict[str, Any] | None,
+    ) -> None:
+        result_owner = self.manifest_result_owner
+        if result_owner is not None:
+            published_manifest = result_owner.manifest
+            if manifest is None:
+                manifest = published_manifest
+            elif published_manifest is not None and published_manifest is not manifest:
+                raise ValueError("bound cleanup manifest result owner is inconsistent")
+            if seal is None and published_manifest is not None:
+                seal = published_manifest.seal
+        with supported_async_publication():
+            self.manifest = manifest
+            self.seal = seal
+
+    def enqueue(self, operation: str, error: BaseException) -> None:
+        if not isinstance(operation, str) or not operation:
+            raise ValueError("bound cleanup delivery operation is invalid")
+        if not isinstance(error, BaseException):
+            raise TypeError("bound cleanup delivery error is invalid")
+        with supported_async_publication():
+            self._pending_errors = (*self._pending_errors, (operation, error))
+            self._armed_error = None
+            self._raise_in_progress = False
+            self._complete = False
+        self.manifest_removal_owner.attach_evidence(error)
+
+    def _manifest_close_is_terminal(self) -> bool:
+        if self.manifest is None or self._manifest_close_complete:
+            return True
+        closed = getattr(self.manifest, "_closed", None)
+        blocked = getattr(self.manifest, "_close_blocked", None)
+        return closed is True or blocked is True
+
+    def observe_manifest_close_boundary(self) -> None:
+        if self._manifest_close_is_terminal():
+            with supported_async_publication():
+                self._manifest_close_complete = True
+
+    def _capture_next_pending(self) -> bool:
+        if not self._pending_errors:
+            return False
+        settlement = self.body_error_settlement
+        if settlement is None:
+            raise RuntimeError("bound cleanup delivery owner is unbound")
+        operation, pending_error = self._pending_errors[0]
+        settlement.capture_delivery_boundary(pending_error, operation)
+        with supported_async_publication():
+            if (
+                self._pending_errors
+                and self._pending_errors[0][0] == operation
+                and self._pending_errors[0][1] is pending_error
+            ):
+                self._pending_errors = self._pending_errors[1:]
+        return True
+
+    def _prepare_authoritative_error(self) -> BaseException | None:
+        settlement = self.body_error_settlement
+        if settlement is None:
+            raise RuntimeError("bound cleanup delivery owner is unbound")
+        active_error = settlement.active_error
+        publication_error = settlement.publication_error
+        if publication_error is None:
+            authoritative = active_error
+        elif active_error is None:
+            authoritative = publication_error
+        else:
+            authoritative, secondary = _prefer_control_flow_error(
+                active_error,
+                publication_error,
+            )
+            try:
+                authoritative.add_note(
+                    f"{self.settlement_note} also failed: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
+            except BaseException:  # noqa: BLE001, S110 - notes are best effort
+                pass
+        if authoritative is not None:
+            settlement.attach_publication_notes(authoritative)
+            self.manifest_removal_owner.attach_evidence(authoritative)
+        return authoritative
+
+    def step(self) -> None:
+        # This loop-head local is deliberately inside a callee whose complete
+        # boundary is consumed by _drive_bound_cleanup_delivery's caller.
+        authoritative: BaseException | None = None
+        self._armed_error = None
+        self._raise_in_progress = False
+        settlement = self.body_error_settlement
+        parent_result_owner = self.parent_result_owner
+        if settlement is None or parent_result_owner is None:
+            raise RuntimeError("bound cleanup delivery owner is unbound")
+
+        settlement.settle_current_exception()
+
+        if not self._manifest_close_is_terminal():
+            self.manifest.close()
+            with supported_async_publication():
+                self._manifest_close_complete = True
+            return
+        if not self._manifest_close_complete:
+            with supported_async_publication():
+                self._manifest_close_complete = True
+            return
+
+        if not parent_result_owner.settled:
+            parent_result_owner.close()
+            return
+
+        if self._capture_next_pending():
+            return
+
+        authoritative = self._prepare_authoritative_error()
+        if authoritative is not None:
+            with supported_async_publication():
+                self._armed_error = authoritative
+                self._raise_in_progress = True
+            raise authoritative
+
+        if self.remove_manifest_on_success:
+            seal = self.seal
+            if seal is None:
+                raise RuntimeError("published cleanup manifest seal is unavailable")
+            if self.manifest_removal_owner.state != "complete":
+                self.manifest_removal_owner.remove(seal)
+                return
+
+        with supported_async_publication():
+            self._complete = True
+
+
+def _drive_bound_cleanup_delivery(owner: _BoundCleanupDeliveryOwner) -> None:
+    """Drive owner state under a separate caller-owned delivery boundary."""
+
+    while not owner.complete:
+        try:
+            owner.step()
+        except BaseException as delivery_error:  # noqa: BLE001 - owner boundary
+            if owner._raise_in_progress and delivery_error is owner._armed_error:
+                # The caller owns this exact armed raise. A hook at this bare
+                # raise is therefore reconciled against the same live owner.
+                raise
+            owner.observe_manifest_close_boundary()
+            owner.enqueue(
+                "bound cleanup owner delivery boundary",
+                delivery_error,
+            )
+
+
+def _reconcile_bound_cleanup_delivery(
+    owner: _BoundCleanupDeliveryOwner,
+    boundary_error: BaseException,
+) -> BaseException:
+    """Consume a function boundary without losing the authoritative identity."""
+
+    # bind() is the first operation in either cleanup body. An interruption at
+    # its caller-side CALL opcode therefore precedes every resource acquisition
+    # and leaves no owner state to settle. Preserve that exact boundary object
+    # instead of feeding an unbound owner into the delivery loop indefinitely.
+    if not owner.bound:
+        return boundary_error
+
+    owner.enqueue("bound cleanup function caller boundary", boundary_error)
+    while True:
+        try:
+            _drive_bound_cleanup_delivery(owner)
+        except BaseException as delivery_error:  # noqa: BLE001 - caller handoff
+            if owner._raise_in_progress and delivery_error is owner._armed_error:
+                return delivery_error
+            owner.enqueue(
+                "bound cleanup caller reconciliation boundary",
+                delivery_error,
+            )
+        else:
+            authoritative = owner.authoritative_error
+            return boundary_error if authoritative is None else authoritative
+
+
 def _delete_bound_tree(
     binding: _DirectoryParentBinding,
     *,
     restore_owner_write: bool,
     manifest_path: pathlib.Path,
+    _delivery_owner: _BoundCleanupDeliveryOwner | None = None,
 ) -> None:
+    invocation_ambient_error = sys.exception()
+    invocation_ambient_context = (
+        invocation_ambient_error.__context__
+        if isinstance(invocation_ambient_error, BaseException)
+        else None
+    )
+    body_error_settlement = _CleanupBodyErrorSettlement(
+        invocation_ambient_error=invocation_ambient_error,
+        invocation_ambient_traceback=(
+            invocation_ambient_error.__traceback__
+            if isinstance(invocation_ambient_error, BaseException)
+            else None
+        ),
+        invocation_ambient_context=invocation_ambient_context,
+        invocation_ambient_context_traceback=(
+            invocation_ambient_context.__traceback__
+            if isinstance(invocation_ambient_context, BaseException)
+            else None
+        ),
+        invocation_code=_delete_bound_tree.__code__,
+    )
+    delivery_owner = _delivery_owner or _BoundCleanupDeliveryOwner(
+        remove_manifest_on_success=True,
+        settlement_note="bound-tree cleanup settlement",
+    )
+    parent_result_owner = _DirectoryParentBindingResultOwner()
+    manifest_result_owner = CustodiedManifestResultOwner()
+    delivery_owner.bind(
+        body_error_settlement=body_error_settlement,
+        parent_result_owner=parent_result_owner,
+        manifest_result_owner=manifest_result_owner,
+    )
     binding.revalidate()
     if restore_owner_write:
         _restore_owner_write_below_bound_root(binding.fd)
         binding.revalidate()
-    parent_binding = _open_directory_parent(
-        binding.path.parent,
-        require_owned_private_parent=binding.require_owned_private_parent,
-    )
+    try:
+        parent_binding = _open_directory_parent(
+            binding.path.parent,
+            require_owned_private_parent=binding.require_owned_private_parent,
+            result_owner=parent_result_owner,
+        )
+        parent_result_owner.transfer(parent_binding)
+    except BaseException as error:
+        preserved = _settle_directory_parent_binding_result_preserving_trigger(
+            parent_result_owner,
+            error,
+        )
+        if preserved is error:
+            raise
+        raise preserved
     manifest = None
     seal: dict[str, Any] | None = None
     deletion_owner = CustodiedDeletionResultOwner()
+    # sys.exception() in the finally block would expose a caller's ambient
+    # handler even when this invocation completed its body successfully.
+    local_active_error: BaseException | None = None
     try:
-        deadline = time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS
-        manifest = build_custodied_manifest(
-            roots=(
-                RootSpec(
-                    label="read-only-installed-test-tree",
-                    parent_fd=parent_binding.fd,
-                    parent_identity=parent_binding.identity,
-                    name=os.fsencode(binding.path.name),
-                    expected_identity=binding.identity,
-                    private_metadata=True,
-                ),
-            ),
-            manifest_path=manifest_path,
-            entry_cap=BOUND_CLEANUP_ENTRY_CAP,
-            payload_cap=BOUND_CLEANUP_MANIFEST_BYTES,
-            deadline=deadline,
-        )
-        seal = manifest.seal
-        delete_custodied_roots(
-            manifest,
-            deadline=deadline,
-            result_owner=deletion_owner,
-        )
-    except BaseException as error:
-        attached_owner = getattr(
-            error,
-            "custodied_deletion_result_owner",
-            deletion_owner,
-        )
-        if not isinstance(attached_owner, CustodiedDeletionResultOwner):
-            attached_owner = deletion_owner
         try:
-            _snapshot_bound_cleanup_recovery(
-                error,
-                parent_binding=parent_binding,
+            deadline = time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS
+            manifest = build_custodied_manifest(
+                roots=(
+                    RootSpec(
+                        label="read-only-installed-test-tree",
+                        parent_fd=parent_binding.fd,
+                        parent_identity=parent_binding.identity,
+                        name=os.fsencode(binding.path.name),
+                        expected_identity=binding.identity,
+                        private_metadata=True,
+                    ),
+                ),
                 manifest_path=manifest_path,
-                manifest_seal=seal,
-                deletion_owner=attached_owner,
+                entry_cap=BOUND_CLEANUP_ENTRY_CAP,
+                payload_cap=BOUND_CLEANUP_MANIFEST_BYTES,
+                deadline=deadline,
+                result_owner=manifest_result_owner,
             )
-        except BaseException as recovery_error:
-            error.add_note(
-                "cleanup recovery evidence capture failed: "
-                f"{type(recovery_error).__name__}: {recovery_error}"
+            if manifest_result_owner.manifest is None:
+                manifest_result_owner.publish(manifest)
+            manifest_result_owner.transfer(manifest)
+            seal = manifest.seal
+            delete_custodied_roots(
+                manifest,
+                deadline=deadline,
+                result_owner=deletion_owner,
             )
+        except BaseException as error:
+            body_error_settlement.publish_local_active_error(error)
+            attached_owner = getattr(
+                error,
+                "custodied_deletion_result_owner",
+                deletion_owner,
+            )
+            if not isinstance(attached_owner, CustodiedDeletionResultOwner):
+                attached_owner = deletion_owner
+            try:
+                _snapshot_bound_cleanup_recovery(
+                    error,
+                    parent_binding=parent_binding,
+                    manifest_path=manifest_path,
+                    manifest_seal=seal,
+                    manifest_result_owner=manifest_result_owner,
+                    deletion_owner=attached_owner,
+                )
+            except BaseException as recovery_error:
+                primary, secondary = _prefer_control_flow_error(
+                    error,
+                    recovery_error,
+                )
+                try:
+                    primary.add_note(
+                        "cleanup recovery evidence capture also observed: "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+                except BaseException:
+                    pass
+                body_error_settlement.publish_local_active_error(primary)
+                if primary is recovery_error:
+                    raise recovery_error from error
+            body_error_settlement.publish_local_active_error(error)
+            raise
+    except BaseException as error:
+        local_active_error = error
+        assert local_active_error is error
+        body_error_settlement.recover_current_exception()
         raise
     finally:
-        try:
-            if manifest is not None:
-                manifest.close()
-        finally:
-            parent_binding.close()
-    assert seal is not None
-    remove_published_manifest(seal)
+        while True:
+            try:
+                delivery_owner.publish_manifest(manifest, seal)
+                _drive_bound_cleanup_delivery(delivery_owner)
+            except BaseException as caller_error:  # noqa: BLE001 - owner handoff
+                if (
+                    delivery_owner._raise_in_progress
+                    and caller_error is delivery_owner._armed_error
+                ):
+                    # _cleanup_bound_tree owns the next boundary when this
+                    # function is used through its production caller.
+                    raise
+                delivery_owner.enqueue(
+                    "bound-tree cleanup recursive-caller boundary",
+                    caller_error,
+                )
+            else:
+                break
 
 
-def _cleanup_bound_tree(
+def _cleanup_bound_tree_operation(
     binding: _DirectoryParentBinding | None,
     *,
     restore_owner_write: bool,
+    delivery_owner: _BoundCleanupDeliveryOwner,
     manifest_path: pathlib.Path | None = None,
 ) -> CleanupFailure | None:
     if binding is None:
@@ -1354,39 +2658,243 @@ def _cleanup_bound_tree(
             binding,
             restore_owner_write=restore_owner_write,
             manifest_path=manifest_path,
+            _delivery_owner=delivery_owner,
         )
-    except Exception as error:
-        return _bound_cleanup_failure(binding, error)
+    except BaseException as error:  # noqa: BLE001 - owner handoff
+        selected = _reconcile_bound_cleanup_delivery(delivery_owner, error)
+        if isinstance(selected, Exception):
+            return _bound_cleanup_failure(binding, selected)
+        if selected is error:
+            raise
+        raise selected
+    return None
+
+
+def _cleanup_bound_tree(
+    binding: _DirectoryParentBinding | None,
+    *,
+    restore_owner_write: bool,
+    manifest_path: pathlib.Path | None = None,
+    _delivery_owner: _BoundCleanupDeliveryOwner | None = None,
+) -> CleanupFailure | None:
+    delivery_owner = _delivery_owner or _BoundCleanupDeliveryOwner(
+        remove_manifest_on_success=True,
+        settlement_note="bound-tree cleanup settlement",
+    )
+    try:
+        return _cleanup_bound_tree_operation(
+            binding,
+            restore_owner_write=restore_owner_write,
+            delivery_owner=delivery_owner,
+            manifest_path=manifest_path,
+        )
+    except BaseException as boundary_error:  # noqa: BLE001 - public handoff
+        selected = _reconcile_bound_cleanup_delivery(
+            delivery_owner,
+            boundary_error,
+        )
+        if isinstance(selected, Exception):
+            assert binding is not None
+            return _bound_cleanup_failure(binding, selected)
+        if selected is boundary_error:
+            raise
+        raise selected
+
+
+def _consume_cleanup_bound_tree_endpoint(
+    binding: _DirectoryParentBinding | None,
+    *,
+    restore_owner_write: bool,
+    manifest_path: pathlib.Path | None = None,
+    _delivery_owner: _BoundCleanupDeliveryOwner | None = None,
+) -> CleanupFailure | None:
+    """Own one explicit caller handoff across the public cleanup endpoint.
+
+    The public endpoint's terminal return and raise opcodes are inside this
+    finite boundary. This caller's own terminal opcodes are the next contract
+    boundary; the handoff is deliberately not a transparent self-contained
+    guarantee across an unbounded stack of Python frames.
+    """
+
+    delivery_owner = _delivery_owner or _BoundCleanupDeliveryOwner(
+        remove_manifest_on_success=True,
+        settlement_note="bound-tree cleanup settlement",
+    )
+    try:
+        return _cleanup_bound_tree(
+            binding,
+            restore_owner_write=restore_owner_write,
+            manifest_path=manifest_path,
+            _delivery_owner=delivery_owner,
+        )
+    except BaseException as boundary_error:  # noqa: BLE001 - one-caller handoff
+        if delivery_owner.body_error_settlement is None:
+            raise
+        selected = _reconcile_bound_cleanup_delivery(
+            delivery_owner,
+            boundary_error,
+        )
+        if isinstance(selected, Exception):
+            assert binding is not None
+            return _bound_cleanup_failure(binding, selected)
+        if selected is boundary_error:
+            raise
+        raise selected
+
+
+def _cleanup_empty_bound_control_operation(
+    binding: _DirectoryParentBinding,
+    *,
+    delivery_owner: _BoundCleanupDeliveryOwner,
+) -> CleanupFailure | None:
+    invocation_ambient_error = sys.exception()
+    invocation_ambient_context = (
+        invocation_ambient_error.__context__
+        if isinstance(invocation_ambient_error, BaseException)
+        else None
+    )
+    body_error_settlement = _CleanupBodyErrorSettlement(
+        invocation_ambient_error=invocation_ambient_error,
+        invocation_ambient_traceback=(
+            invocation_ambient_error.__traceback__
+            if isinstance(invocation_ambient_error, BaseException)
+            else None
+        ),
+        invocation_ambient_context=invocation_ambient_context,
+        invocation_ambient_context_traceback=(
+            invocation_ambient_context.__traceback__
+            if isinstance(invocation_ambient_context, BaseException)
+            else None
+        ),
+        invocation_code=_cleanup_empty_bound_control_operation.__code__,
+    )
+    parent_result_owner = _DirectoryParentBindingResultOwner()
+    delivery_owner.bind(
+        body_error_settlement=body_error_settlement,
+        parent_result_owner=parent_result_owner,
+    )
+    try:
+        binding.revalidate()
+        try:
+            parent_binding = _open_directory_parent(
+                binding.path.parent,
+                require_owned_private_parent=binding.require_owned_private_parent,
+                result_owner=parent_result_owner,
+            )
+            parent_result_owner.transfer(parent_binding)
+        except BaseException as error:
+            preserved = _settle_directory_parent_binding_result_preserving_trigger(
+                parent_result_owner,
+                error,
+            )
+            if preserved is error:
+                raise
+            raise preserved
+        # Bind only an exception propagating out of this local body; the
+        # caller's ambient handler must not participate in close precedence.
+        local_active_error: BaseException | None = None
+        try:
+            try:
+                quarantine_and_remove_empty_root(
+                    RootSpec(
+                        label="read-only-cleanup-control",
+                        parent_fd=parent_binding.fd,
+                        parent_identity=parent_binding.identity,
+                        name=os.fsencode(binding.path.name),
+                        expected_identity=binding.identity,
+                        private_metadata=True,
+                    ),
+                    binding.fd,
+                    deadline=time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except BaseException as error:
+                local_active_error = error
+                body_error_settlement.publish_local_active_error(local_active_error)
+                raise
+        finally:
+            while True:
+                try:
+                    _drive_bound_cleanup_delivery(delivery_owner)
+                except BaseException as caller_error:  # noqa: BLE001 - handoff
+                    if (
+                        delivery_owner._raise_in_progress
+                        and caller_error is delivery_owner._armed_error
+                    ):
+                        raise
+                    delivery_owner.enqueue(
+                        "cleanup-control recursive-caller boundary",
+                        caller_error,
+                    )
+                else:
+                    break
+    except BaseException as error:  # noqa: BLE001 - final owner consumer
+        selected = _reconcile_bound_cleanup_delivery(delivery_owner, error)
+        if isinstance(selected, Exception):
+            return _bound_cleanup_failure(binding, selected)
+        if selected is error:
+            raise
+        raise selected
     return None
 
 
 def _cleanup_empty_bound_control(
     binding: _DirectoryParentBinding,
+    *,
+    _delivery_owner: _BoundCleanupDeliveryOwner | None = None,
 ) -> CleanupFailure | None:
+    delivery_owner = _delivery_owner or _BoundCleanupDeliveryOwner(
+        remove_manifest_on_success=False,
+        settlement_note="cleanup-control parent settlement",
+    )
     try:
-        binding.revalidate()
-        parent_binding = _open_directory_parent(
-            binding.path.parent,
-            require_owned_private_parent=binding.require_owned_private_parent,
+        return _cleanup_empty_bound_control_operation(
+            binding,
+            delivery_owner=delivery_owner,
         )
-        try:
-            quarantine_and_remove_empty_root(
-                RootSpec(
-                    label="read-only-cleanup-control",
-                    parent_fd=parent_binding.fd,
-                    parent_identity=parent_binding.identity,
-                    name=os.fsencode(binding.path.name),
-                    expected_identity=binding.identity,
-                    private_metadata=True,
-                ),
-                binding.fd,
-                deadline=time.monotonic() + BOUND_CLEANUP_TIMEOUT_SECONDS,
-            )
-        finally:
-            parent_binding.close()
-    except Exception as error:
-        return _bound_cleanup_failure(binding, error)
-    return None
+    except BaseException as boundary_error:  # noqa: BLE001 - public handoff
+        selected = _reconcile_bound_cleanup_delivery(
+            delivery_owner,
+            boundary_error,
+        )
+        if isinstance(selected, Exception):
+            return _bound_cleanup_failure(binding, selected)
+        if selected is boundary_error:
+            raise
+        raise selected
+
+
+def _consume_cleanup_empty_bound_control_endpoint(
+    binding: _DirectoryParentBinding,
+    *,
+    _delivery_owner: _BoundCleanupDeliveryOwner | None = None,
+) -> CleanupFailure | None:
+    """Own one explicit caller handoff across the public control endpoint.
+
+    This consumes the public endpoint's terminal return and raise opcodes. Its
+    own terminal opcodes remain the documented finite contract boundary.
+    """
+
+    delivery_owner = _delivery_owner or _BoundCleanupDeliveryOwner(
+        remove_manifest_on_success=False,
+        settlement_note="cleanup-control parent settlement",
+    )
+    try:
+        return _cleanup_empty_bound_control(
+            binding,
+            _delivery_owner=delivery_owner,
+        )
+    except BaseException as boundary_error:  # noqa: BLE001 - one-caller handoff
+        if delivery_owner.body_error_settlement is None:
+            raise
+        selected = _reconcile_bound_cleanup_delivery(
+            delivery_owner,
+            boundary_error,
+        )
+        if isinstance(selected, Exception):
+            return _bound_cleanup_failure(binding, selected)
+        if selected is boundary_error:
+            raise
+        raise selected
 
 
 def _retained_bound_for_unproven_child_closure(
@@ -1449,9 +2957,12 @@ def main() -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
     install_container_binding: _DirectoryParentBinding | None = None
+    install_container_owner = _PrivateDirectoryCreationResultOwner()
     runtime_parent: pathlib.Path | None = None
     runtime_parent_binding: _DirectoryParentBinding | None = None
+    runtime_parent_owner = _PrivateDirectoryCreationResultOwner()
     cleanup_control_binding: _DirectoryParentBinding | None = None
+    cleanup_control_owner = _PrivateDirectoryCreationResultOwner()
     installed_root: pathlib.Path | None = None
     completed: subprocess.CompletedProcess[str] | None = None
     before: dict[str, TreeEntrySnapshot] | None = None
@@ -1466,19 +2977,27 @@ def main() -> int:
     secondary_failures: list[SecondaryFailure] = []
     closure_proof = ChildProcessClosureProof()
     cleanup_failures: tuple[CleanupFailure, ...] = ()
+    creation_cleanup_failures: list[CleanupFailure] = []
+    deferred_control_flow_error: BaseException | None = None
     stage = "install-container"
     try:
         install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
+            result_owner=install_container_owner,
             require_owned_private_parent=False,
+        )
+        install_container_binding = install_container_owner.transfer(
+            install_container_binding
         )
         install_container = install_container_binding.path
         stage = "runtime-parent"
         runtime_parent_binding = _create_bound_owned_private_directory(
             _private_runtime_parent(),
             ".codex-review-readonly-runtime-",
+            result_owner=runtime_parent_owner,
         )
+        runtime_parent_binding = runtime_parent_owner.transfer(runtime_parent_binding)
         runtime_parent = runtime_parent_binding.path
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
@@ -1527,191 +3046,529 @@ def main() -> int:
         stage = "runtime-residue"
         runtime_residue = _list_bound_directory(runtime_parent_binding)
         stage = "complete"
+    except _PrivateDirectoryCreationRetentionRequired as error:
+        child_process_closure = _child_process_closure_status(closure_proof)
+        primary_failure = _primary_failure(stage, error.trigger_error)
+        creation_failure, deferred_control_flow_error = (
+            _consume_private_directory_creation_retention(
+                error,
+                secondary_failures=secondary_failures,
+            )
+        )
+        creation_cleanup_failures.append(creation_failure)
     except GitProcessClosureUnproven as error:
         closure_error = error
         child_process_closure = "unproven"
         primary_failure = _primary_failure(stage, error)
     except TimeoutError as error:
         timeout_error = error
-        child_process_closure = (
-            "proven"
-            if closure_proof.proven
-            else "unproven"
-            if closure_proof.started
-            else "not-started"
-        )
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except OverflowError as error:
         output_limit_error = error
-        child_process_closure = (
-            "proven"
-            if closure_proof.proven
-            else "unproven"
-            if closure_proof.started
-            else "not-started"
-        )
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
-        child_process_closure = (
-            "proven"
-            if closure_proof.proven
-            else "unproven"
-            if closure_proof.started
-            else "not-started"
-        )
+        child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
-        child_process_closure = (
-            "proven"
-            if closure_proof.proven
-            else "unproven"
-            if closure_proof.started
-            else "not-started"
+        child_process_closure = _child_process_closure_status(closure_proof)
+        creation_owner = (
+            install_container_owner
+            if stage == "install-container"
+            else runtime_parent_owner
+            if stage == "runtime-parent"
+            else None
         )
-        primary_failure = _primary_failure(stage, error)
-    finally:
-        cleanup_results: list[CleanupFailure | None]
-        if child_process_closure == "unproven":
-            cleanup_results = [
-                _retained_bound_for_unproven_child_closure(
-                    install_container_binding,
-                    install_container,
-                ),
-                _retained_bound_for_unproven_child_closure(
-                    runtime_parent_binding,
-                    runtime_parent,
-                ),
-            ]
+        retained = (
+            _retained_private_directory_creation_from_owner(
+                creation_owner,
+                error,
+            )
+            if creation_owner is not None
+            else None
+        )
+        if retained is None:
+            primary_failure = _primary_failure(stage, error)
         else:
-            try:
-                cleanup_control_binding = _create_bound_owned_private_directory(
-                    _private_runtime_parent(),
-                    ".codex-review-readonly-cleanup-",
+            primary_failure = _primary_failure(stage, retained.trigger_error)
+            creation_failure, control_flow_error = (
+                _consume_private_directory_creation_retention(
+                    retained,
+                    secondary_failures=secondary_failures,
                 )
-            except Exception as error:
-                secondary_failures.append(
-                    _secondary_failure("create-bound-cleanup-control", error)
+            )
+            creation_cleanup_failures.append(creation_failure)
+            deferred_control_flow_error = control_flow_error
+    except BaseException as error:
+        child_process_closure = _child_process_closure_status(closure_proof)
+        creation_owner = (
+            install_container_owner
+            if stage == "install-container"
+            else runtime_parent_owner
+            if stage == "runtime-parent"
+            else None
+        )
+        retained = (
+            _retained_private_directory_creation_from_owner(
+                creation_owner,
+                error,
+            )
+            if creation_owner is not None
+            else None
+        )
+        primary_failure = _primary_failure(
+            stage,
+            retained.trigger_error if retained is not None else error,
+        )
+        retained_control_flow_error: BaseException | None = None
+        if retained is not None:
+            creation_failure, retained_control_flow_error = (
+                _consume_private_directory_creation_retention(
+                    retained,
+                    secondary_failures=secondary_failures,
                 )
-            cleanup_results = [
-                _cleanup_bound_tree(
-                    install_container_binding,
-                    restore_owner_write=True,
-                    manifest_path=(
-                        cleanup_control_binding.path / "install.manifest"
-                        if cleanup_control_binding is not None
-                        else None
-                    ),
-                ),
-                _cleanup_bound_tree(
-                    runtime_parent_binding,
-                    restore_owner_write=False,
-                    manifest_path=(
-                        cleanup_control_binding.path / "runtime.manifest"
-                        if cleanup_control_binding is not None
-                        else None
-                    ),
-                ),
-            ]
+            )
+            creation_cleanup_failures.append(creation_failure)
+        deferred_control_flow_error = retained_control_flow_error or error
+    finally:
+        try:
+            install_container_binding = _claim_private_directory_creation_result(
+                install_container_owner,
+                install_container_binding,
+            )
+        except BaseException as claim_error:
+            secondary_failures.append(
+                _secondary_failure(
+                    "claim-install-container-creation-result",
+                    claim_error,
+                )
+            )
+            if deferred_control_flow_error is None and not isinstance(
+                claim_error, Exception
+            ):
+                deferred_control_flow_error = claim_error
             if install_container_binding is None:
-                cleanup_results.append(
-                    _cleanup_tree(install_container, restore_owner_write=True)
+                install_container_binding = install_container_owner.binding
+        try:
+            runtime_parent_binding = _claim_private_directory_creation_result(
+                runtime_parent_owner,
+                runtime_parent_binding,
+            )
+        except BaseException as claim_error:
+            secondary_failures.append(
+                _secondary_failure(
+                    "claim-runtime-parent-creation-result",
+                    claim_error,
                 )
+            )
+            if deferred_control_flow_error is None and not isinstance(
+                claim_error, Exception
+            ):
+                deferred_control_flow_error = claim_error
             if runtime_parent_binding is None:
+                runtime_parent_binding = runtime_parent_owner.binding
+
+        cleanup_results: list[CleanupFailure | None] = list(creation_cleanup_failures)
+        cleanup_phase_operation = "prepare-private-directory-cleanup"
+        cleanup_phase_path: pathlib.Path | None = None
+        try:
+            if not closure_proof.destructive_cleanup_authorized:
+                cleanup_phase_operation = "retain-install-container-after-child-closure"
+                cleanup_phase_path = install_container
                 cleanup_results.append(
-                    _cleanup_tree(runtime_parent, restore_owner_write=False)
+                    _retained_bound_for_unproven_child_closure(
+                        install_container_binding,
+                        install_container,
+                    )
                 )
+                cleanup_phase_operation = "retain-runtime-parent-after-child-closure"
+                cleanup_phase_path = runtime_parent
+                cleanup_results.append(
+                    _retained_bound_for_unproven_child_closure(
+                        runtime_parent_binding,
+                        runtime_parent,
+                    )
+                )
+            else:
+                cleanup_phase_operation = "create-bound-cleanup-control"
+                cleanup_phase_path = (
+                    runtime_parent or install_container or READONLY_INSTALL_PARENT
+                )
+                try:
+                    cleanup_control_binding = _create_bound_owned_private_directory(
+                        _private_runtime_parent(),
+                        ".codex-review-readonly-cleanup-",
+                        result_owner=cleanup_control_owner,
+                    )
+                    cleanup_control_binding = cleanup_control_owner.transfer(
+                        cleanup_control_binding
+                    )
+                except _PrivateDirectoryCreationRetentionRequired as error:
+                    secondary_failures.append(
+                        _secondary_failure(
+                            "create-bound-cleanup-control",
+                            error.trigger_error,
+                        )
+                    )
+                    creation_failure, control_flow_error = (
+                        _consume_private_directory_creation_retention(
+                            error,
+                            secondary_failures=secondary_failures,
+                        )
+                    )
+                    cleanup_results.append(creation_failure)
+                    if deferred_control_flow_error is None:
+                        deferred_control_flow_error = control_flow_error
+                except Exception as error:
+                    retained = _retained_private_directory_creation_from_owner(
+                        cleanup_control_owner,
+                        error,
+                    )
+                    if retained is None:
+                        secondary_failures.append(
+                            _secondary_failure("create-bound-cleanup-control", error)
+                        )
+                    else:
+                        secondary_failures.append(
+                            _secondary_failure(
+                                "create-bound-cleanup-control",
+                                retained.trigger_error,
+                            )
+                        )
+                        creation_failure, control_flow_error = (
+                            _consume_private_directory_creation_retention(
+                                retained,
+                                secondary_failures=secondary_failures,
+                            )
+                        )
+                        cleanup_results.append(creation_failure)
+                        if deferred_control_flow_error is None:
+                            deferred_control_flow_error = control_flow_error
+                except BaseException as error:
+                    retained = _retained_private_directory_creation_from_owner(
+                        cleanup_control_owner,
+                        error,
+                    )
+                    secondary_failures.append(
+                        _secondary_failure(
+                            "create-bound-cleanup-control",
+                            retained.trigger_error if retained is not None else error,
+                        )
+                    )
+                    retained_control_flow_error: BaseException | None = None
+                    if retained is not None:
+                        creation_failure, retained_control_flow_error = (
+                            _consume_private_directory_creation_retention(
+                                retained,
+                                secondary_failures=secondary_failures,
+                            )
+                        )
+                        cleanup_results.append(creation_failure)
+                    if deferred_control_flow_error is None:
+                        deferred_control_flow_error = (
+                            retained_control_flow_error
+                            if retained is not None
+                            and retained_control_flow_error is not None
+                            else error
+                        )
+                try:
+                    cleanup_control_binding = _claim_private_directory_creation_result(
+                        cleanup_control_owner,
+                        cleanup_control_binding,
+                    )
+                except BaseException as claim_error:
+                    secondary_failures.append(
+                        _secondary_failure(
+                            "claim-cleanup-control-creation-result",
+                            claim_error,
+                        )
+                    )
+                    if deferred_control_flow_error is None and not isinstance(
+                        claim_error, Exception
+                    ):
+                        deferred_control_flow_error = claim_error
+                    if cleanup_control_binding is None:
+                        cleanup_control_binding = cleanup_control_owner.binding
+
+                cleanup_phase_operation = "cleanup-install-container"
+                cleanup_phase_path = install_container
+                cleanup_results.append(
+                    _consume_cleanup_bound_tree_endpoint(
+                        install_container_binding,
+                        restore_owner_write=True,
+                        manifest_path=(
+                            cleanup_control_binding.path / "install.manifest"
+                            if cleanup_control_binding is not None
+                            else None
+                        ),
+                    )
+                )
+                cleanup_phase_operation = "cleanup-runtime-parent"
+                cleanup_phase_path = runtime_parent
+                cleanup_results.append(
+                    _consume_cleanup_bound_tree_endpoint(
+                        runtime_parent_binding,
+                        restore_owner_write=False,
+                        manifest_path=(
+                            cleanup_control_binding.path / "runtime.manifest"
+                            if cleanup_control_binding is not None
+                            else None
+                        ),
+                    )
+                )
+                if install_container_binding is None:
+                    cleanup_phase_operation = "cleanup-install-container-fallback"
+                    cleanup_phase_path = install_container
+                    cleanup_results.append(
+                        _cleanup_tree(install_container, restore_owner_write=True)
+                    )
+                if runtime_parent_binding is None:
+                    cleanup_phase_operation = "cleanup-runtime-parent-fallback"
+                    cleanup_phase_path = runtime_parent
+                    cleanup_results.append(
+                        _cleanup_tree(runtime_parent, restore_owner_write=False)
+                    )
+                if cleanup_control_binding is not None:
+                    cleanup_phase_operation = "inspect-cleanup-control"
+                    cleanup_phase_path = cleanup_control_binding.path
+                    try:
+                        cleanup_control_entries = _list_bound_directory(
+                            cleanup_control_binding
+                        )
+                    except Exception:
+                        cleanup_control_entries = ("<unreadable>",)
+                    if cleanup_control_entries:
+                        evidence = _bound_path_evidence(cleanup_control_binding)
+                        cleanup_results.append(
+                            CleanupFailure(
+                                path=str(evidence.path),
+                                error_kind="CleanupControlRetained",
+                                error_errno=None,
+                                retained=evidence.retained,
+                                restore_error_kind=None,
+                                restore_error_errno=None,
+                                original_path=str(cleanup_control_binding.path),
+                                path_status=evidence.path_status,
+                                replacement_path=(
+                                    str(evidence.replacement_path)
+                                    if evidence.replacement_path is not None
+                                    else None
+                                ),
+                                held_identity=cleanup_control_binding.object_locator(),
+                                original_path_status=evidence.original_path_status,
+                                access_policy_status=evidence.access_policy_status,
+                            )
+                        )
+                    else:
+                        cleanup_phase_operation = "cleanup-empty-bound-control"
+                        cleanup_results.append(
+                            _consume_cleanup_empty_bound_control_endpoint(
+                                cleanup_control_binding
+                            )
+                        )
+        except BaseException as cleanup_error:
+            secondary_failures.append(
+                _secondary_failure(cleanup_phase_operation, cleanup_error)
+            )
+            cleanup_recovery_evidence = getattr(
+                cleanup_error,
+                _CLEANUP_RECOVERY_EVIDENCE_ATTR,
+                None,
+            )
+            if not isinstance(cleanup_recovery_evidence, dict):
+                cleanup_recovery_evidence = None
+            if deferred_control_flow_error is None and not isinstance(
+                cleanup_error, Exception
+            ):
+                deferred_control_flow_error = cleanup_error
+            if cleanup_phase_path is not None:
+                try:
+                    cleanup_results.append(
+                        _cleanup_failure_from_error(
+                            cleanup_phase_path,
+                            cleanup_error,
+                            retained=None,
+                            original_path=cleanup_phase_path,
+                            path_status="cleanup-control-flow-unresolved",
+                            replacement_path=(
+                                cleanup_phase_path
+                                if os.path.lexists(cleanup_phase_path)
+                                else None
+                            ),
+                            recovery_evidence=cleanup_recovery_evidence,
+                        )
+                    )
+                except BaseException as evidence_error:
+                    secondary_failures.append(
+                        _secondary_failure(
+                            f"record-{cleanup_phase_operation}-failure",
+                            evidence_error,
+                        )
+                    )
+                    if deferred_control_flow_error is None and not isinstance(
+                        evidence_error, Exception
+                    ):
+                        deferred_control_flow_error = evidence_error
             if cleanup_control_binding is not None:
                 try:
                     cleanup_control_entries = _list_bound_directory(
                         cleanup_control_binding
                     )
-                except Exception:
-                    cleanup_control_entries = ("<unreadable>",)
-                if cleanup_control_entries:
-                    evidence = _bound_path_evidence(cleanup_control_binding)
+                    control_evidence = _bound_path_evidence(cleanup_control_binding)
                     cleanup_results.append(
                         CleanupFailure(
-                            path=str(evidence.path),
+                            path=str(control_evidence.path),
                             error_kind="CleanupControlRetained",
                             error_errno=None,
-                            retained=evidence.retained,
+                            retained=control_evidence.retained,
                             restore_error_kind=None,
                             restore_error_errno=None,
                             original_path=str(cleanup_control_binding.path),
-                            path_status=evidence.path_status,
+                            path_status=control_evidence.path_status,
                             replacement_path=(
-                                str(evidence.replacement_path)
-                                if evidence.replacement_path is not None
+                                str(control_evidence.replacement_path)
+                                if control_evidence.replacement_path is not None
                                 else None
                             ),
                             held_identity=cleanup_control_binding.object_locator(),
-                            original_path_status=evidence.original_path_status,
-                            access_policy_status=evidence.access_policy_status,
+                            original_path_status=(
+                                control_evidence.original_path_status
+                            ),
+                            access_policy_status=(
+                                control_evidence.access_policy_status
+                            ),
+                            recovery_evidence={
+                                "protected_property": (
+                                    "cleanup-control-object-identity"
+                                ),
+                                "reason": (
+                                    "cleanup-control-retained-after-control-flow"
+                                ),
+                                "entries": list(cleanup_control_entries),
+                            },
                         )
                     )
-                else:
-                    cleanup_results.append(
-                        _cleanup_empty_bound_control(cleanup_control_binding)
+                except BaseException as inspection_error:
+                    secondary_failures.append(
+                        _secondary_failure(
+                            "inspect-cleanup-control-after-control-flow",
+                            inspection_error,
+                        )
                     )
-        if install_container_binding is not None:
-            try:
-                install_container_binding.close()
-            except Exception as error:
-                cleanup_results.append(
-                    _cleanup_failure_from_error(
-                        install_container_binding.path,
-                        error,
-                        retained=None,
-                        original_path=install_container_binding.path,
-                        path_status="close-unresolved",
-                        replacement_path=(
-                            install_container_binding.path
-                            if os.path.lexists(install_container_binding.path)
-                            else None
-                        ),
+                    if deferred_control_flow_error is None and not isinstance(
+                        inspection_error, Exception
+                    ):
+                        deferred_control_flow_error = inspection_error
+        finally:
+            for binding_role, binding, include_held_identity in (
+                ("install-container", install_container_binding, False),
+                ("runtime-parent", runtime_parent_binding, False),
+                ("cleanup-control", cleanup_control_binding, True),
+            ):
+                if binding is None:
+                    continue
+                try:
+                    binding.close()
+                except BaseException as close_error:
+                    if binding.fd_close_outcome == "owned":
+                        try:
+                            binding.close()
+                        except BaseException as retry_error:
+                            try:
+                                close_error.add_note(
+                                    "binding close caller-boundary retry also failed: "
+                                    f"{type(retry_error).__name__}: {retry_error}"
+                                )
+                            except BaseException:
+                                pass
+                    if deferred_control_flow_error is None and not isinstance(
+                        close_error, Exception
+                    ):
+                        deferred_control_flow_error = close_error
+                    try:
+                        cleanup_results.append(
+                            _cleanup_failure_from_error(
+                                binding.path,
+                                close_error,
+                                retained=None,
+                                original_path=binding.path,
+                                path_status="close-unresolved",
+                                replacement_path=(
+                                    binding.path
+                                    if os.path.lexists(binding.path)
+                                    else None
+                                ),
+                                held_identity=(
+                                    binding.object_locator()
+                                    if include_held_identity
+                                    else None
+                                ),
+                            )
+                        )
+                    except BaseException as evidence_error:
+                        secondary_failures.append(
+                            _secondary_failure(
+                                f"record-{binding_role}-binding-close-failure",
+                                evidence_error,
+                            )
+                        )
+                        if deferred_control_flow_error is None and not isinstance(
+                            evidence_error, Exception
+                        ):
+                            deferred_control_flow_error = evidence_error
+            for operation, owner in (
+                ("close-install-container-result-owner", install_container_owner),
+                ("close-runtime-parent-result-owner", runtime_parent_owner),
+                ("close-cleanup-control-result-owner", cleanup_control_owner),
+            ):
+                try:
+                    owner.close_descriptors_for_recovery()
+                except BaseException as close_error:
+                    if not owner.settled:
+                        try:
+                            owner.close_descriptors_for_recovery()
+                        except BaseException as retry_error:
+                            try:
+                                close_error.add_note(
+                                    "result-owner close caller-boundary retry also "
+                                    "failed: "
+                                    f"{type(retry_error).__name__}: {retry_error}"
+                                )
+                            except BaseException:
+                                pass
+                    secondary_failures.append(
+                        _secondary_failure(operation, close_error)
                     )
-                )
-        if runtime_parent_binding is not None:
-            try:
-                runtime_parent_binding.close()
-            except Exception as error:
-                cleanup_results.append(
-                    _cleanup_failure_from_error(
-                        runtime_parent_binding.path,
-                        error,
-                        retained=None,
-                        original_path=runtime_parent_binding.path,
-                        path_status="close-unresolved",
-                        replacement_path=(
-                            runtime_parent_binding.path
-                            if os.path.lexists(runtime_parent_binding.path)
-                            else None
-                        ),
-                    )
-                )
-        if cleanup_control_binding is not None:
-            try:
-                cleanup_control_binding.close()
-            except Exception as error:
-                cleanup_results.append(
-                    _cleanup_failure_from_error(
-                        cleanup_control_binding.path,
-                        error,
-                        retained=None,
-                        original_path=cleanup_control_binding.path,
-                        path_status="close-unresolved",
-                        replacement_path=(
-                            cleanup_control_binding.path
-                            if os.path.lexists(cleanup_control_binding.path)
-                            else None
-                        ),
-                        held_identity=cleanup_control_binding.object_locator(),
-                    )
-                )
+                    if deferred_control_flow_error is None and not isinstance(
+                        close_error, Exception
+                    ):
+                        deferred_control_flow_error = close_error
         cleanup_failures = tuple(
             failure for failure in cleanup_results if failure is not None
         )
+
+    if deferred_control_flow_error is not None:
+        propagated_control_flow = (
+            _fail_closed_deferred_control_flow(deferred_control_flow_error)
+            if cleanup_failures
+            else deferred_control_flow_error
+        )
+        try:
+            setattr(
+                propagated_control_flow,
+                "readonly_cleanup_failures",
+                tuple(asdict(failure) for failure in cleanup_failures),
+            )
+            setattr(
+                propagated_control_flow,
+                "readonly_secondary_failures",
+                tuple(asdict(failure) for failure in secondary_failures),
+            )
+        except BaseException:
+            pass
+        raise propagated_control_flow
 
     release_tree_immutable = (
         before is not None
@@ -1728,7 +3585,10 @@ def main() -> int:
             primary_status = "output-limit"
         elif signal_error is not None:
             primary_status = "interrupted"
-        elif closure_error is not None or child_process_closure == "unproven":
+        elif (
+            closure_error is not None
+            or not closure_proof.destructive_cleanup_authorized
+        ):
             primary_status = "closure-unproven"
         else:
             primary_status = "failed"
