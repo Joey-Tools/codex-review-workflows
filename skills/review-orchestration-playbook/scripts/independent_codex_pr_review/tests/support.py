@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +13,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,7 +36,41 @@ from review_supervisor.secureio import (
 
 _RUNTIME_ROOT: pathlib.Path | None = None
 _RUNTIME_ROOT_PID: int | None = None
+_RUNTIME_ROOT_BINDING: _CreatedPrivateDirectoryBinding | None = None
 _EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+CREATION_ORIGIN_GUARANTEE = (
+    "best-effort-256-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"
+)
+CLEANUP_GUARANTEE = (
+    "receipt-bound-exclusive-stage-fd-traversal-same-uid-final-unlink-host-tcb"
+)
+F_GETPATH = 50
+DARWIN_MAXPATHLEN = 1024
+DARWIN_RENAME_EXCL = 0x00000004
+LINUX_RENAME_NOREPLACE = 0x00000001
+
+
+class UnprovenCreatedDirectoryError(RuntimeError):
+    def __init__(
+        self,
+        error: BaseException,
+        *,
+        recovery_locator: str,
+        untrusted_path_hint: pathlib.Path,
+    ) -> None:
+        self.error = error
+        self.recovery_locator = recovery_locator
+        self.untrusted_path_hint = untrusted_path_hint
+        error_errno = getattr(error, "errno", None)
+        self.errno = error_errno if isinstance(error_errno, int) else None
+        super().__init__(
+            "created-directory ownership receipt was not established: "
+            f"{type(error).__name__}: {error}"
+        )
+        self.add_note(f"recovery_locator={recovery_locator}")
+        self.add_note(f"untrusted_path_hint={untrusted_path_hint}")
+        for note in getattr(error, "__notes__", ()):
+            self.add_note(str(note))
 
 
 def _canonical_ascii_directory(raw_path: str | pathlib.Path) -> pathlib.Path:
@@ -119,8 +156,99 @@ class _DirectoryParentBinding:
                     errno.ESTALE,
                     f"test runtime parent path changed: {self.path}",
                 )
-        finally:
+        except BaseException as error:
+            try:
+                os.close(reopened_fd)
+            except BaseException as close_error:
+                error.add_note(
+                    "test runtime parent revalidation close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
             os.close(reopened_fd)
+
+
+@dataclass(slots=True)
+class _CreatedPrivateDirectoryBinding:
+    path: pathlib.Path
+    parent_binding: _DirectoryParentBinding
+    leaf_name: bytes
+    fd: int
+    identity: Identity
+    policy: DirectoryPolicyBinding
+    require_owned_private_parent: bool
+    creation_origin_guarantee: str = CREATION_ORIGIN_GUARANTEE
+    creation_origin_proven: bool = False
+    cleanup_guarantee: str = CLEANUP_GUARANTEE
+
+    def revalidate(self) -> None:
+        self.parent_binding.revalidate()
+        held_policy = validate_directory_policy_fd(
+            self.fd,
+            self.path,
+            private=True,
+        )
+        held_identity = identity_from_stat(os.fstat(self.fd))
+        if (
+            not directory_identities_match(self.identity, held_identity)
+            or held_policy != self.policy
+        ):
+            raise OSError(
+                errno.ESTALE,
+                f"created private directory identity or access policy changed: "
+                f"{self.path}",
+            )
+
+        reopened_fd, reopened_identity = open_directory_at(
+            self.parent_binding.fd,
+            self.leaf_name,
+            path_hint=self.path,
+            private=True,
+        )
+        try:
+            reopened_policy = validate_directory_policy_fd(
+                reopened_fd,
+                self.path,
+                private=True,
+            )
+            if (
+                not directory_identities_match(self.identity, reopened_identity)
+                or reopened_policy != self.policy
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"created private directory parent-relative binding changed: "
+                    f"{self.path}",
+                )
+        except BaseException as error:
+            try:
+                os.close(reopened_fd)
+            except BaseException as close_error:
+                error.add_note(
+                    "created-directory revalidation close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
+            os.close(reopened_fd)
+        self.parent_binding.revalidate()
+
+    def close(self) -> None:
+        failures: list[BaseException] = []
+        for descriptor in (self.fd, self.parent_binding.fd):
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            primary = failures[0]
+            for secondary in failures[1:]:
+                primary.add_note(
+                    "additional created-directory binding close failure: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
+            raise primary
 
 
 def _open_directory_parent(
@@ -165,67 +293,101 @@ def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
         binding.close()
 
 
-def _directory_object_key(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        stat.S_IFMT(metadata.st_mode),
-        getattr(metadata, "st_gen", 0),
-        metadata.st_uid,
-        metadata.st_gid,
-        getattr(metadata, "st_flags", 0),
-    )
-
-
 def _normalize_created_private_directory_mode(
     parent_binding: _DirectoryParentBinding,
     name: bytes,
     child_path: pathlib.Path,
-) -> None:
-    created_metadata = os.stat(
-        name,
-        dir_fd=parent_binding.fd,
-        follow_symlinks=False,
-    )
-    created_key = _directory_object_key(created_metadata)
-    if (
-        not stat.S_ISDIR(created_metadata.st_mode)
-        or created_metadata.st_uid != os.getuid()
+    child_fd: int,
+    first_open_identity: Identity,
+) -> tuple[Identity, DirectoryPolicyBinding]:
+    first_open_metadata = os.fstat(child_fd)
+    if not stat.S_ISDIR(first_open_metadata.st_mode) or (
+        first_open_metadata.st_uid != os.getuid()
     ):
         raise OSError(
             errno.EPERM,
             f"new temporary directory has an unsafe identity: {child_path}",
         )
-
-    os.chmod(
-        name,
-        0o700,
-        dir_fd=parent_binding.fd,
-        follow_symlinks=False,
+    if os.listdir(child_fd):
+        raise OSError(
+            errno.ESTALE,
+            f"new temporary directory was not empty at first open: {child_path}",
+        )
+    os.fchmod(child_fd, 0o700)
+    normalized_identity = identity_from_stat(os.fstat(child_fd))
+    normalized_policy = validate_directory_policy_fd(
+        child_fd,
+        child_path,
+        private=True,
     )
-    normalized_metadata = os.stat(
-        name,
-        dir_fd=parent_binding.fd,
-        follow_symlinks=False,
-    )
-    if _directory_object_key(normalized_metadata) != created_key:
+    if (
+        first_open_identity.device,
+        first_open_identity.inode,
+        stat.S_IFMT(first_open_identity.mode),
+        first_open_identity.uid,
+    ) != (
+        normalized_identity.device,
+        normalized_identity.inode,
+        stat.S_IFMT(normalized_identity.mode),
+        normalized_identity.uid,
+    ):
         raise OSError(
             errno.ESTALE,
             f"new temporary directory changed during mode normalization: {child_path}",
         )
-    if stat.S_IMODE(normalized_metadata.st_mode) != 0o700:
-        raise OSError(
-            errno.EPERM,
-            f"new temporary directory mode was not normalized: {child_path}",
+
+    reopened_fd, reopened_identity = open_directory_at(
+        parent_binding.fd,
+        name,
+        path_hint=child_path,
+        private=True,
+    )
+    try:
+        reopened_policy = validate_directory_policy_fd(
+            reopened_fd,
+            child_path,
+            private=True,
         )
+        if (
+            not directory_identities_match(normalized_identity, reopened_identity)
+            or normalized_policy != reopened_policy
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "new temporary directory parent-relative binding changed "
+                "during mode normalization",
+            )
+    except BaseException as error:
+        try:
+            os.close(reopened_fd)
+        except BaseException as close_error:
+            error.add_note(
+                "normalized-directory reopen close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
+    else:
+        os.close(reopened_fd)
+    return normalized_identity, normalized_policy
 
 
-def _create_owned_private_directory(
+def _unproven_created_directory_locator(
+    parent_binding: _DirectoryParentBinding,
+    name: bytes,
+) -> str:
+    return (
+        "parent-directory://"
+        f"{parent_binding.identity.device}/{parent_binding.identity.inode}/"
+        f"leaf/{name.hex()}"
+    )
+
+
+def _create_owned_private_directory_binding(
     parent: pathlib.Path,
     prefix: str,
     *,
     require_owned_private_parent: bool = True,
-) -> pathlib.Path:
+) -> _CreatedPrivateDirectoryBinding:
     try:
         raw_prefix = prefix.encode("ascii")
     except UnicodeEncodeError as error:
@@ -245,33 +407,44 @@ def _create_owned_private_directory(
     )
     try:
         for _ in range(128):
-            name = raw_prefix + secrets.token_hex(16).encode("ascii")
+            name = raw_prefix + secrets.token_hex(32).encode("ascii")
             child_path = parent_binding.path / os.fsdecode(name)
             parent_binding.revalidate()
             try:
                 os.mkdir(name, 0o700, dir_fd=parent_binding.fd)
             except FileExistsError:
                 continue
+            child_fd: int | None = None
             try:
-                os.fsync(parent_binding.fd)
-                _normalize_created_private_directory_mode(
-                    parent_binding,
-                    name,
-                    child_path,
-                )
-                parent_binding.revalidate()
-                child_fd, child_identity = open_directory_at(
+                child_fd, first_open_identity = open_directory_at(
                     parent_binding.fd,
                     name,
                     path_hint=child_path,
-                    private=True,
+                    private=False,
                 )
                 try:
-                    child_policy = validate_directory_policy_fd(
+                    child_identity, child_policy = (
+                        _normalize_created_private_directory_mode(
+                            parent_binding,
+                            name,
+                            child_path,
+                            child_fd,
+                            first_open_identity,
+                        )
+                    )
+                    os.fsync(child_fd)
+                    os.fsync(parent_binding.fd)
+                    parent_binding.revalidate()
+                    held_policy = validate_directory_policy_fd(
                         child_fd,
                         child_path,
                         private=True,
                     )
+                    if held_policy != child_policy:
+                        raise OSError(
+                            errno.ESTALE,
+                            "temporary-directory access policy changed after fsync",
+                        )
                     parent_binding.revalidate()
                     path_fd, path_identity = open_absolute_directory_chain(
                         child_path,
@@ -298,24 +471,58 @@ def _create_owned_private_directory(
                                 "temporary-directory path identity or access "
                                 "policy changed",
                             )
-                    finally:
+                    except BaseException as error:
+                        try:
+                            os.close(path_fd)
+                        except BaseException as close_error:
+                            error.add_note(
+                                "temporary-directory path binding close failed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            )
+                        raise
+                    else:
                         os.close(path_fd)
-                finally:
-                    os.close(child_fd)
-                return child_path
-            except BaseException as error:
-                try:
-                    os.rmdir(name, dir_fd=parent_binding.fd)
-                    os.fsync(parent_binding.fd)
-                except BaseException as cleanup_error:
-                    error.add_note(
-                        "temporary-directory rollback failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    created_binding = _CreatedPrivateDirectoryBinding(
+                        path=child_path,
+                        parent_binding=parent_binding,
+                        leaf_name=name,
+                        fd=child_fd,
+                        identity=child_identity,
+                        policy=child_policy,
+                        require_owned_private_parent=require_owned_private_parent,
                     )
-                raise
+                    created_binding.revalidate()
+                    child_fd = None
+                    return created_binding
+                except BaseException as error:
+                    if child_fd is not None:
+                        try:
+                            os.close(child_fd)
+                        except BaseException as close_error:
+                            error.add_note(
+                                "created-directory child binding close failed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            )
+                    raise
+            except BaseException as error:
+                raise UnprovenCreatedDirectoryError(
+                    error,
+                    recovery_locator=_unproven_created_directory_locator(
+                        parent_binding,
+                        name,
+                    ),
+                    untrusted_path_hint=child_path,
+                ) from error
         raise FileExistsError("temporary-directory name collision limit reached")
-    finally:
-        parent_binding.close()
+    except BaseException as error:
+        try:
+            parent_binding.close()
+        except BaseException as close_error:
+            error.add_note(
+                "created-directory parent binding close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
 
 
 def _private_runtime_parent() -> pathlib.Path:
@@ -390,38 +597,411 @@ def _repository_runtime_candidates() -> tuple[str, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
-def _cleanup_process_runtime_root(path: pathlib.Path, owner_pid: int) -> None:
-    if os.getpid() == owner_pid:
-        shutil.rmtree(path, ignore_errors=True)
+def _cleanup_node_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        getattr(metadata, "st_flags", 0),
+    )
+
+
+def _descriptor_path(descriptor: int) -> pathlib.Path:
+    if sys.platform == "darwin":
+        payload = fcntl.fcntl(
+            descriptor,
+            F_GETPATH,
+            b"\0" * DARWIN_MAXPATHLEN,
+        )
+        raw_path = payload.split(b"\0", 1)[0]
+        if not raw_path or not raw_path.startswith(b"/"):
+            raise OSError(errno.ESTALE, "bound cleanup path is unavailable")
+        return pathlib.Path(os.fsdecode(raw_path))
+    if sys.platform.startswith("linux"):
+        raw_path = os.readlink(f"/proc/self/fd/{descriptor}")
+        if not raw_path.startswith("/"):
+            raise OSError(errno.ESTALE, "bound cleanup path is unavailable")
+        return pathlib.Path(raw_path.removesuffix(" (deleted)"))
+    raise OSError(errno.ENOTSUP, "descriptor path lookup is unavailable")
+
+
+def _rename_exclusive(
+    source_parent_fd: int,
+    source_name: str | bytes,
+    target_parent_fd: int,
+    target_name: str | bytes,
+) -> None:
+    source = source_name if isinstance(source_name, bytes) else os.fsencode(source_name)
+    target = target_name if isinstance(target_name, bytes) else os.fsencode(target_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renameatx_np
+        flags = DARWIN_RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        rename = libc.renameat2
+        flags = LINUX_RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOTSUP, "exclusive directory rename is unavailable")
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(
+        source_parent_fd,
+        source,
+        target_parent_fd,
+        target,
+        flags,
+    )
+    if result != 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot exclusively stage a bound cleanup entry",
+        )
+
+
+def _entry_absent(parent_fd: int, name: str | bytes) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _exclusive_cleanup_stage(
+    parent_fd: int,
+    source_name: str | bytes,
+) -> bytes:
+    for _ in range(128):
+        staged_name = b".cr-" + secrets.token_hex(16).encode("ascii")
+        try:
+            _rename_exclusive(
+                parent_fd,
+                source_name,
+                parent_fd,
+                staged_name,
+            )
+        except FileExistsError:
+            continue
+        return staged_name
+    raise FileExistsError(
+        errno.EEXIST,
+        "temporary cleanup name collision limit reached",
+    )
+
+
+def _open_cleanup_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    restore_owner_write: bool,
+) -> tuple[int, os.stat_result]:
+    initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if restore_owner_write and not stat.S_ISLNK(initial.st_mode):
+        required_mode = stat.S_IRUSR
+        if stat.S_ISDIR(initial.st_mode):
+            required_mode |= stat.S_IWUSR | stat.S_IXUSR
+        if stat.S_IMODE(initial.st_mode) & required_mode != required_mode:
+            if initial.st_uid != os.getuid():
+                raise OSError(
+                    errno.EPERM,
+                    "cannot restore cleanup access for an unowned entry",
+                )
+            os.chmod(
+                name,
+                stat.S_IMODE(initial.st_mode) | required_mode,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            normalized = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if _cleanup_node_key(normalized) != _cleanup_node_key(initial):
+                raise OSError(
+                    errno.ESTALE,
+                    "cleanup entry changed during access restoration",
+                )
+            initial = normalized
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if stat.S_ISDIR(initial.st_mode):
+        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISREG(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISFIFO(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISLNK(initial.st_mode):
+        if sys.platform == "darwin":
+            flags = common_flags | os.O_SYMLINK
+        elif sys.platform.startswith("linux"):
+            flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+        else:
+            raise OSError(
+                errno.ENOTSUP,
+                "symlink descriptor opens are unavailable",
+            )
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in bound cleanup tree")
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if _cleanup_node_key(opened) != _cleanup_node_key(initial):
+            raise OSError(errno.ESTALE, "cleanup entry changed while opening")
+        return descriptor, opened
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except BaseException as close_error:
+            error.add_note(
+                "cleanup entry descriptor close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
+
+
+def _verify_staged_cleanup_entry(
+    parent_fd: int,
+    staged_name: str | bytes,
+    descriptor: int,
+    expected_path: pathlib.Path,
+) -> None:
+    staged = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
+    if _cleanup_node_key(staged) != _cleanup_node_key(os.fstat(descriptor)):
+        raise OSError(errno.ESTALE, "cleanup staging moved a different object")
+    if _descriptor_path(descriptor) != expected_path:
+        raise OSError(errno.ESTALE, "cleanup staging path changed")
+
+
+def _remove_bound_directory_contents(
+    descriptor: int,
+    expected_path: pathlib.Path,
+    *,
+    restore_owner_write: bool,
+) -> None:
+    if restore_owner_write:
+        metadata = os.fstat(descriptor)
+        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR)
+    for name in tuple(sorted(os.listdir(descriptor))):
+        entry_fd, initial = _open_cleanup_entry(
+            descriptor,
+            name,
+            restore_owner_write=restore_owner_write,
+        )
+        try:
+            staged_name = _exclusive_cleanup_stage(descriptor, name)
+            staged_path = expected_path / os.fsdecode(staged_name)
+            _verify_staged_cleanup_entry(
+                descriptor,
+                staged_name,
+                entry_fd,
+                staged_path,
+            )
+            if not _entry_absent(descriptor, name):
+                raise OSError(
+                    errno.ESTALE,
+                    "cleanup source name was repopulated after staging",
+                )
+            if stat.S_ISDIR(initial.st_mode):
+                _remove_bound_directory_contents(
+                    entry_fd,
+                    staged_path,
+                    restore_owner_write=restore_owner_write,
+                )
+                _verify_staged_cleanup_entry(
+                    descriptor,
+                    staged_name,
+                    entry_fd,
+                    staged_path,
+                )
+                os.rmdir(staged_name, dir_fd=descriptor)
+            else:
+                _verify_staged_cleanup_entry(
+                    descriptor,
+                    staged_name,
+                    entry_fd,
+                    staged_path,
+                )
+                os.unlink(staged_name, dir_fd=descriptor)
+            final_metadata = os.fstat(entry_fd)
+            if _cleanup_node_key(final_metadata) != _cleanup_node_key(
+                initial
+            ) or not _entry_absent(descriptor, staged_name):
+                raise OSError(
+                    errno.ESTALE,
+                    "bound cleanup entry survived final removal",
+                )
+        except BaseException as error:
+            try:
+                os.close(entry_fd)
+            except BaseException as close_error:
+                error.add_note(
+                    "bound cleanup entry close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
+            os.close(entry_fd)
+    if os.listdir(descriptor):
+        raise OSError(errno.ESTALE, "bound cleanup directory gained new entries")
+
+
+def _cleanup_created_private_directory_binding(
+    binding: _CreatedPrivateDirectoryBinding,
+    *,
+    restore_owner_write: bool = False,
+) -> None:
+    binding.revalidate()
+    staged_name = _exclusive_cleanup_stage(
+        binding.parent_binding.fd,
+        binding.leaf_name,
+    )
+    staged_path = binding.parent_binding.path / os.fsdecode(staged_name)
+    _verify_staged_cleanup_entry(
+        binding.parent_binding.fd,
+        staged_name,
+        binding.fd,
+        staged_path,
+    )
+    if not _entry_absent(binding.parent_binding.fd, binding.leaf_name):
+        raise OSError(
+            errno.ESTALE,
+            "temporary cleanup source leaf was repopulated",
+        )
+    _remove_bound_directory_contents(
+        binding.fd,
+        staged_path,
+        restore_owner_write=restore_owner_write,
+    )
+    _verify_staged_cleanup_entry(
+        binding.parent_binding.fd,
+        staged_name,
+        binding.fd,
+        staged_path,
+    )
+    os.rmdir(staged_name, dir_fd=binding.parent_binding.fd)
+    final_metadata = os.fstat(binding.fd)
+    if not directory_identities_match(
+        binding.identity,
+        identity_from_stat(final_metadata),
+    ) or not _entry_absent(binding.parent_binding.fd, staged_name):
+        raise OSError(
+            errno.ESTALE,
+            "temporary cleanup root survived final removal",
+        )
+    if not _entry_absent(binding.parent_binding.fd, binding.leaf_name):
+        raise OSError(
+            errno.ESTALE,
+            "temporary cleanup source leaf was repopulated before completion",
+        )
+    os.fsync(binding.parent_binding.fd)
+    binding.parent_binding.revalidate()
+
+
+def _cleanup_process_runtime_root(
+    binding: _CreatedPrivateDirectoryBinding,
+    owner_pid: int,
+) -> None:
+    if os.getpid() != owner_pid:
+        return
+    cleanup_error: BaseException | None = None
+    try:
+        _cleanup_created_private_directory_binding(
+            binding,
+            restore_owner_write=True,
+        )
+    except BaseException as error:
+        cleanup_error = error
+    try:
+        binding.close()
+    except BaseException as close_error:
+        if cleanup_error is not None:
+            cleanup_error.add_note(
+                "process runtime binding close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        else:
+            cleanup_error = close_error
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _process_runtime_root() -> pathlib.Path:
-    global _RUNTIME_ROOT, _RUNTIME_ROOT_PID
+    global _RUNTIME_ROOT, _RUNTIME_ROOT_BINDING, _RUNTIME_ROOT_PID
 
     current_pid = os.getpid()
     if _RUNTIME_ROOT is not None and _RUNTIME_ROOT_PID == current_pid:
         return _RUNTIME_ROOT
 
-    root = _create_owned_private_directory(
+    binding = _create_owned_private_directory_binding(
         _private_runtime_parent(),
         ".codex-review-tests-",
     )
+    root = binding.path
     _RUNTIME_ROOT = root
+    _RUNTIME_ROOT_BINDING = binding
     _RUNTIME_ROOT_PID = current_pid
-    atexit.register(_cleanup_process_runtime_root, root, current_pid)
+    atexit.register(_cleanup_process_runtime_root, binding, current_pid)
     return root
 
 
 @contextmanager
 def owned_temporary_directory(prefix: str) -> Iterator[pathlib.Path]:
-    path = _create_owned_private_directory(
+    binding = _create_owned_private_directory_binding(
         _process_runtime_root(),
         f".codex-review-{prefix}",
     )
+    path = binding.path
     try:
         yield path
-    finally:
-        shutil.rmtree(path)
+    except BaseException as primary_error:
+        try:
+            _cleanup_created_private_directory_binding(
+                binding,
+                restore_owner_write=True,
+            )
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "owned temporary directory cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        try:
+            binding.close()
+        except BaseException as close_error:
+            primary_error.add_note(
+                "owned temporary directory binding close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise
+    else:
+        cleanup_error: BaseException | None = None
+        try:
+            _cleanup_created_private_directory_binding(
+                binding,
+                restore_owner_write=True,
+            )
+        except BaseException as error:
+            cleanup_error = error
+        try:
+            binding.close()
+        except BaseException as close_error:
+            if cleanup_error is not None:
+                cleanup_error.add_note(
+                    "owned temporary directory binding close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            else:
+                cleanup_error = close_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _write(path: pathlib.Path, content: bytes) -> None:

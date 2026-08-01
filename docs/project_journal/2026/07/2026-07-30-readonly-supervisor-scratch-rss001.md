@@ -53,16 +53,23 @@ superseded_by:
   compared with a fresh path-bound descriptor before use, independent of the
   process umask. The install container remains a separate explicit sticky-parent
   case.
-- The read-only runner keeps a descriptor and policy binding for the exact
-  runtime directory before the child starts. Residue is enumerated from that
-  descriptor between full path revalidations; cleanup is attempted only after
-  proven child-process closure and only when the path still maps to the held
-  object. Persistent replacement is a primary failure plus an explicit cleanup
-  gap, while completed child-entry churn remains benign.
+- The read-only runner keeps parent and child descriptors plus an identity and
+  policy receipt for the exact runtime directory before the child starts.
+  Residue is enumerated from that descriptor between full path revalidations;
+  cleanup is attempted only after proven child-process closure and only while
+  the receipt still maps to the held object. Persistent replacement is a primary
+  failure plus an explicit cleanup gap, while completed child-entry churn
+  remains benign. The machine-visible contract explicitly records the macOS
+  same-UID host-TCB boundary for the non-atomic mkdir-to-first-open and final
+  path-unlink windows.
 - Cleanup completes before success output. Every ordinary primary exception is
   reported in the structured summary; a concurrent cleanup error returns
-  nonzero, preserves the primary failure and child return code, and reports the
-  exact retained path as secondary evidence.
+  nonzero, preserves the primary failure and child return code, and reports a
+  descriptor-verified retained path or descriptor-object locator as secondary
+  evidence. Terminal JSON bytes and the process exit consume one sealed signal
+  decision; late lifecycle signals remain blocked through actual process exit,
+  and an optional newline failure cannot contradict an already complete JSON
+  record.
 - The child suite runs in a fresh process group with 8 MiB caps for stdout and
   stderr. Normal leader exit, output overflow, timeout, and SIGTERM settle the
   leader and same-group descendants before cleanup. Unproven process closure
@@ -274,3 +281,12 @@ superseded_by:
   nested-Seatbelt broker regression failed under the parent sandbox, and that
   exact test passed 1/1 outside it in 2.469 seconds. Repository contracts passed
   102/102 in 7.404 seconds.
+- The current receipt-bound cleanup and terminal-publication implementation
+  passed the focused read-only runner module 40/40 in 4.795 seconds and the
+  ordinary deterministic gate 648/648 in 196.449 seconds on Python 3.13. The
+  reviewed 648-test selected identity is SHA-256
+  `5956350e0995ae84ad17dfee413a6cde547d2649b06e51d7d6b98e757a20d69d`.
+  The added real-process matrix covers SIGHUP, SIGINT, SIGQUIT, and SIGTERM at
+  the pre-seal, serialization, write, stdout-flush, stderr-flush, and pending
+  restore boundaries, and requires the sole JSON record and OS return code to
+  reflect the same sealed outcome.

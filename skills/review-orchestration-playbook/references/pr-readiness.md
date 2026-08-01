@@ -84,7 +84,7 @@ PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_det
 ```
 
 Record the interpreter's absolute path and digest and exact `head_sha`; record
-the live runner's eleven tests, zero skips, and terminal result, followed by the
+the live runner's twelve tests, zero skips, and terminal result, followed by the
 read-only install runner's complete structured summary. Accept that summary
 only when all of these predicates hold:
 
@@ -96,6 +96,18 @@ only when all of these predicates hold:
 - `returncode == 0`
 - `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`
 - `signal_number == null` and `timed_out == false`
+- `creation_origin_proven == false`
+- `creation_origin_guarantee == "best-effort-256-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"`
+- `cleanup_guarantee == "receipt-bound-exclusive-stage-fd-traversal-same-uid-final-unlink-host-tcb"`
+
+The last three predicates are mandatory platform-boundary evidence, not a
+failed run. macOS provides neither an atomic create-directory-and-return-FD
+operation nor unlink-by-FD. The `mkdirat` to first no-follow open window and
+the final identity-check to `unlinkat`/`rmdir` window therefore rely on a
+256-bit unguessable leaf and cooperative same-UID host TCB. After the receipt
+exists, identity/access-policy drift fails closed; exclusive staging and
+descriptor traversal are used for cleanup, and a replacement is never removed
+after mismatch or unproven identity has been observed.
 
 Both commands must use the same recorded interpreter and exact head.
 Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,

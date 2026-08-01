@@ -10,6 +10,7 @@ from .test_no_child_profile import (
     REQUIRE_LIVE_NO_CHILD_PROFILE_ENV,
 )
 from .test_direct_gate import SnapshotMutationProbeTests
+from .test_readonly_install_runner import ReadOnlyInstallRunnerTests
 
 REQUIRED_NO_CHILD_TEST_METHODS = (
     "test_every_probe_preserves_the_ordered_launch_binding",
@@ -43,6 +44,10 @@ REQUIRED_TEST_CASES = tuple(
         SnapshotMutationProbeTests,
         "test_live_probe_denies_every_snapshot_mutation",
     ),
+    (
+        ReadOnlyInstallRunnerTests,
+        "test_terminal_signal_publication_is_linearized_in_a_real_process",
+    ),
 )
 REQUIRED_TEST_KEYS = frozenset(
     (test_class.__module__, test_class.__name__, method)
@@ -62,7 +67,7 @@ def main() -> int:
     )
     expected_count = len(REQUIRED_TEST_CASES)
     if (
-        expected_count != 11
+        expected_count != 12
         or len(REQUIRED_TEST_KEYS) != expected_count
         or suite.countTestCases() != expected_count
     ):

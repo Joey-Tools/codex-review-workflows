@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import unittest
 from collections.abc import Iterator
 from unittest import mock
@@ -19,7 +20,460 @@ from . import run_readonly_install_deterministic_supervisor as runner
 from .support import owned_temporary_directory
 
 
+class _SignalInjectingStream:
+    def __init__(
+        self,
+        wrapped: io.TextIOBase,
+        *,
+        inject_on: str,
+    ) -> None:
+        self._wrapped = wrapped
+        self._inject_on = inject_on
+        self._injected = False
+
+    def write(self, value: str) -> int:
+        if (
+            self._inject_on == "output"
+            and not self._injected
+            and '"primary_status"' in value
+        ):
+            os.kill(os.getpid(), signal.SIGTERM)
+            self._injected = True
+        return self._wrapped.write(value)
+
+    def flush(self) -> None:
+        if self._inject_on == "flush" and not self._injected:
+            os.kill(os.getpid(), signal.SIGTERM)
+            self._injected = True
+        self._wrapped.flush()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wrapped, name)
+
+
+class _FailingFlushStream:
+    def __init__(self, wrapped: io.TextIOBase, error: OSError) -> None:
+        self._wrapped = wrapped
+        self._error = error
+
+    def write(self, value: str) -> int:
+        return self._wrapped.write(value)
+
+    def flush(self) -> None:
+        raise self._error
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wrapped, name)
+
+
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
+    @staticmethod
+    def _bind_existing_directories(
+        *paths: pathlib.Path,
+    ) -> object:
+        remaining = iter(paths)
+
+        def create_binding(
+            parent: pathlib.Path,
+            _prefix: str,
+            *,
+            require_owned_private_parent: bool = True,
+        ) -> support._CreatedPrivateDirectoryBinding:
+            path = next(remaining)
+            if path.parent.resolve(strict=True) != pathlib.Path(parent).resolve(
+                strict=True
+            ):
+                raise AssertionError("synthetic binding parent mismatch")
+            path.chmod(0o700)
+            parent_binding = support._open_directory_parent(
+                parent,
+                require_owned_private_parent=require_owned_private_parent,
+            )
+            child_fd: int | None = None
+            try:
+                leaf_name = os.fsencode(path.name)
+                child_fd, child_identity = support.open_directory_at(
+                    parent_binding.fd,
+                    leaf_name,
+                    path_hint=path,
+                    private=True,
+                )
+                child_policy = support.validate_directory_policy_fd(
+                    child_fd,
+                    path,
+                    private=True,
+                )
+                binding = support._CreatedPrivateDirectoryBinding(
+                    path=path,
+                    parent_binding=parent_binding,
+                    leaf_name=leaf_name,
+                    fd=child_fd,
+                    identity=child_identity,
+                    policy=child_policy,
+                    require_owned_private_parent=require_owned_private_parent,
+                )
+                binding.revalidate()
+                child_fd = None
+                return binding
+            except BaseException:
+                if child_fd is not None:
+                    os.close(child_fd)
+                parent_binding.close()
+                raise
+
+        return create_binding
+
+    def _run_terminal_signal_scenario(
+        self,
+        root: pathlib.Path,
+        *,
+        inject_at: str,
+        signal_number: signal.Signals | None,
+        existing_primary: bool = False,
+        terminal_process: bool = True,
+    ) -> tuple[int, tuple[dict[str, object], ...], str]:
+        sticky_parent = root / "sticky"
+        sticky_parent.mkdir(mode=0o700)
+        sticky_parent.chmod(0o1777)
+        runtime_parent = root / "runtime"
+        runtime_parent.mkdir(mode=0o700)
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        child_pid = os.fork()
+        if child_pid == 0:
+            real_os_write = os.write
+            try:
+                os.close(stdout_read)
+                os.close(stderr_read)
+                os.dup2(stdout_write, 1)
+                os.dup2(stderr_write, 2)
+                os.close(stdout_write)
+                os.close(stderr_write)
+                child_stdout = os.fdopen(
+                    os.dup(1),
+                    "w",
+                    encoding="utf-8",
+                    buffering=1,
+                )
+                child_stderr = os.fdopen(
+                    os.dup(2),
+                    "w",
+                    encoding="utf-8",
+                    buffering=1,
+                )
+                terminal_stdout_fd = child_stdout.fileno()
+
+                def inject_signal() -> None:
+                    if signal_number is None:
+                        return
+                    os.kill(os.getpid(), signal_number)
+
+                def copy_minimal_tree(
+                    _source: pathlib.Path,
+                    destination: pathlib.Path,
+                    **_kwargs: object,
+                ) -> pathlib.Path:
+                    destination.mkdir(mode=0o700)
+                    (destination / "fixture").write_text(
+                        "fixture",
+                        encoding="utf-8",
+                    )
+                    return destination
+
+                snapshot_calls = 0
+
+                def snapshot_tree(
+                    _path: pathlib.Path,
+                ) -> dict[str, runner.TreeEntrySnapshot]:
+                    nonlocal snapshot_calls
+                    snapshot_calls += 1
+                    if existing_primary and snapshot_calls == 2:
+                        raise OSError(
+                            errno.EIO,
+                            "synthetic existing primary failure",
+                        )
+                    return {}
+
+                def run_no_child_suite(
+                    *,
+                    closure_proof: runner.ChildProcessClosureProof,
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    closure_proof.launch_attempted = True
+                    closure_proof.proven = True
+                    closure_proof.runtime_profile = "production-current"
+                    return subprocess.CompletedProcess(
+                        args=("synthetic-no-child-suite",),
+                        returncode=0,
+                        stdout="",
+                        stderr="",
+                    )
+
+                cleanup_calls = 0
+                real_cleanup_created_tree = runner._cleanup_created_tree
+
+                def cleanup_created_tree(
+                    binding: support._CreatedPrivateDirectoryBinding | None,
+                    *,
+                    restore_owner_write: bool,
+                ) -> runner.CleanupFailure | None:
+                    nonlocal cleanup_calls
+                    result = real_cleanup_created_tree(
+                        binding,
+                        restore_owner_write=restore_owner_write,
+                    )
+                    cleanup_calls += 1
+                    if (
+                        inject_at
+                        in {
+                            "pre-seal",
+                            "pre-seal-existing-primary",
+                            "signal-publication-failure",
+                        }
+                        and cleanup_calls == 2
+                    ):
+                        inject_signal()
+                    return result
+
+                def compare_tree_property(
+                    _before: dict[str, runner.TreeEntrySnapshot],
+                    _after: dict[str, runner.TreeEntrySnapshot],
+                ) -> bool:
+                    if inject_at in {"summary", "restore-pending"}:
+                        inject_signal()
+                    return True
+
+                real_json_dumps = runner.json.dumps
+                json_signal_injected = False
+
+                def serialize_with_signal(
+                    value: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> str:
+                    nonlocal json_signal_injected
+                    if (
+                        inject_at == "json"
+                        and not json_signal_injected
+                        and isinstance(value, dict)
+                        and "primary_status" in value
+                    ):
+                        json_signal_injected = True
+                        inject_signal()
+                    return real_json_dumps(value, *args, **kwargs)
+
+                stdout_write_injected = False
+
+                def write_with_signal(
+                    descriptor: int,
+                    payload: bytes | bytearray | memoryview,
+                ) -> int:
+                    nonlocal stdout_write_injected
+                    if (
+                        inject_at == "newline-write-failure"
+                        and descriptor == terminal_stdout_fd
+                        and bytes(payload) == b"\n"
+                    ):
+                        raise OSError(
+                            errno.EIO,
+                            "synthetic terminal newline failure",
+                        )
+                    if (
+                        inject_at == "stdout-write"
+                        and descriptor == terminal_stdout_fd
+                        and not stdout_write_injected
+                        and len(payload) > 1
+                    ):
+                        partial = max(1, len(payload) // 2)
+                        written = real_os_write(descriptor, payload[:partial])
+                        stdout_write_injected = True
+                        inject_signal()
+                        return written
+                    return real_os_write(descriptor, payload)
+
+                def fail_terminal_stdout(_payload: bytes) -> None:
+                    raise runner.TerminalPublicationError(
+                        "stdout-write",
+                        OSError(errno.EIO, "synthetic terminal write failure"),
+                    )
+
+                if inject_at == "stdout-flush":
+                    child_stdout = _SignalInjectingStream(
+                        child_stdout,
+                        inject_on="flush",
+                    )
+                elif inject_at == "stdout-flush-failure":
+                    child_stdout = _FailingFlushStream(
+                        child_stdout,
+                        OSError(errno.EIO, "synthetic stdout flush failure"),
+                    )
+                if inject_at == "stderr-flush":
+                    child_stderr = _SignalInjectingStream(
+                        child_stderr,
+                        inject_on="flush",
+                    )
+                elif inject_at == "stderr-flush-failure":
+                    child_stderr = _FailingFlushStream(
+                        child_stderr,
+                        OSError(errno.EIO, "synthetic stderr flush failure"),
+                    )
+
+                with contextlib.ExitStack() as patches:
+                    patches.enter_context(
+                        mock.patch.object(runner.sys, "platform", "darwin")
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner.sys,
+                            "stdout",
+                            child_stdout,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner.sys,
+                            "stderr",
+                            child_stderr,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "READONLY_INSTALL_PARENT",
+                            sticky_parent,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_private_runtime_parent",
+                            return_value=runtime_parent,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner.shutil,
+                            "copytree",
+                            side_effect=copy_minimal_tree,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_set_tree_read_only",
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_tree_snapshot",
+                            side_effect=snapshot_tree,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_run_no_child_test_suite",
+                            side_effect=run_no_child_suite,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_cleanup_created_tree",
+                            side_effect=cleanup_created_tree,
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "_tree_property_unchanged",
+                            side_effect=compare_tree_property,
+                        )
+                    )
+                    if inject_at == "json":
+                        patches.enter_context(
+                            mock.patch.object(
+                                runner.json,
+                                "dumps",
+                                side_effect=serialize_with_signal,
+                            )
+                        )
+                    if inject_at in {"stdout-write", "newline-write-failure"}:
+                        patches.enter_context(
+                            mock.patch.object(
+                                runner.os,
+                                "write",
+                                side_effect=write_with_signal,
+                            )
+                        )
+                    if inject_at in {
+                        "stdout-write-failure",
+                        "signal-publication-failure",
+                    }:
+                        patches.enter_context(
+                            mock.patch.object(
+                                runner,
+                                "_write_terminal_stdout",
+                                side_effect=fail_terminal_stdout,
+                            )
+                        )
+                    exit_code = runner.main(
+                        _terminal_process=terminal_process,
+                    )
+                os._exit(exit_code)
+            except BaseException as error:
+                diagnostic = (
+                    "terminal signal scenario child failed: "
+                    f"{type(error).__name__}: {error}\n"
+                )
+                try:
+                    real_os_write(2, diagnostic.encode("utf-8"))
+                finally:
+                    os._exit(250)
+
+        os.close(stdout_write)
+        os.close(stderr_write)
+        deadline = time.monotonic() + 10
+        child_status: int | None = None
+        while time.monotonic() < deadline:
+            waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if waited_pid == child_pid:
+                child_status = status
+                break
+            time.sleep(0.01)
+        if child_status is None:
+            os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+            self.fail(f"terminal signal scenario timed out: {inject_at}")
+
+        def read_all(descriptor: int) -> bytes:
+            chunks: list[bytes] = []
+            try:
+                while chunk := os.read(descriptor, 65_536):
+                    chunks.append(chunk)
+            finally:
+                os.close(descriptor)
+            return b"".join(chunks)
+
+        stdout = read_all(stdout_read).decode("utf-8", errors="replace")
+        stderr = read_all(stderr_read).decode("utf-8", errors="replace")
+        summaries: list[dict[str, object]] = []
+        for line in stdout.splitlines():
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "primary_status" in candidate:
+                summaries.append(candidate)
+        self.assertEqual(tuple(sticky_parent.iterdir()), ())
+        self.assertEqual(tuple(runtime_parent.iterdir()), ())
+        return (
+            os.waitstatus_to_exitcode(child_status),
+            tuple(summaries),
+            stderr,
+        )
+
     def test_runtime_parent_rejects_extended_ancestor_acl(self) -> None:
         with owned_temporary_directory("runtime-parent-acl-") as root:
             ancestor = root / "ancestor"
@@ -153,39 +607,486 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             with (
                 validation_patch,
-                self.assertRaisesRegex(
-                    ValueError,
-                    "extended metadata",
-                ),
+                self.assertRaises(
+                    support.UnprovenCreatedDirectoryError,
+                ) as caught,
             ):
-                support._create_owned_private_directory(
+                support._create_owned_private_directory_binding(
                     parent,
                     ".new-child-",
                 )
 
-            self.assertEqual(tuple(parent.iterdir()), ())
+            self.assertIsInstance(caught.exception.error, ValueError)
+            self.assertIn("extended", str(caught.exception.error))
+            self.assertIn("forbidden", str(caught.exception.error))
+            retained = tuple(parent.iterdir())
+            self.assertEqual(len(retained), 1)
+            self.assertTrue(retained[0].is_dir())
+            self.assertTrue(
+                caught.exception.recovery_locator.startswith("parent-directory://")
+            )
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ("/bin/chmod", "-N", str(retained[0])),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=5,
+                )
+            retained[0].rmdir()
 
     def test_private_directory_creation_normalizes_restrictive_umask(self) -> None:
         with owned_temporary_directory("runtime-child-umask-") as root:
             parent = root / "parent"
             parent.mkdir(mode=0o700)
 
-            for restrictive_umask in (0o177, 0o777):
-                with self.subTest(umask=oct(restrictive_umask)):
-                    previous_umask = os.umask(restrictive_umask)
-                    try:
-                        child = support._create_owned_private_directory(
-                            parent,
-                            ".new-child-",
-                        )
-                    finally:
-                        os.umask(previous_umask)
+            previous_umask = os.umask(0o177)
+            try:
+                binding = support._create_owned_private_directory_binding(
+                    parent,
+                    ".new-child-",
+                )
+            finally:
+                os.umask(previous_umask)
 
-                    self.assertEqual(
-                        stat.S_IMODE(child.stat(follow_symlinks=False).st_mode),
-                        0o700,
+            try:
+                self.assertEqual(
+                    stat.S_IMODE(binding.path.stat(follow_symlinks=False).st_mode),
+                    0o700,
+                )
+            finally:
+                support._cleanup_created_private_directory_binding(binding)
+                binding.close()
+
+            previous_umask = os.umask(0o777)
+            try:
+                with self.assertRaises(
+                    support.UnprovenCreatedDirectoryError,
+                ) as caught:
+                    support._create_owned_private_directory_binding(
+                        parent,
+                        ".new-child-",
                     )
-                    child.rmdir()
+            finally:
+                os.umask(previous_umask)
+
+            self.assertIsInstance(caught.exception.error, PermissionError)
+            self.assertEqual(caught.exception.errno, errno.EACCES)
+            self.assertTrue(
+                caught.exception.recovery_locator.startswith("parent-directory://")
+            )
+            retained = caught.exception.untrusted_path_hint
+            self.assertEqual(retained.parent, parent)
+            retained.chmod(0o700)
+            retained.rmdir()
+
+    def test_private_directory_binding_rejects_replacement_before_open(self) -> None:
+        with owned_temporary_directory("runtime-child-bind-race-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            original = parent / "original-created-directory"
+            replacement: pathlib.Path | None = None
+            real_open_directory_at = support.open_directory_at
+            replaced = False
+
+            def replace_before_open(
+                parent_fd: int,
+                name: bytes,
+                *,
+                path_hint: pathlib.Path,
+                private: bool,
+            ) -> tuple[int, object]:
+                nonlocal replaced, replacement
+                if replaced:
+                    return real_open_directory_at(
+                        parent_fd,
+                        name,
+                        path_hint=path_hint,
+                        private=private,
+                    )
+                replaced = True
+                replacement = parent / os.fsdecode(name)
+                replacement.rename(original)
+                replacement.mkdir(mode=0o700)
+                (replacement / "sentinel").write_text(
+                    "replacement",
+                    encoding="utf-8",
+                )
+                return real_open_directory_at(
+                    parent_fd,
+                    name,
+                    path_hint=path_hint,
+                    private=private,
+                )
+
+            with (
+                mock.patch.object(
+                    support,
+                    "open_directory_at",
+                    side_effect=replace_before_open,
+                ),
+                self.assertRaises(
+                    support.UnprovenCreatedDirectoryError,
+                ) as caught,
+            ):
+                support._create_owned_private_directory_binding(
+                    parent,
+                    ".new-child-",
+                )
+
+            self.assertIsInstance(caught.exception.error, OSError)
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertIn("not empty at first open", str(caught.exception.error))
+            self.assertIsNotNone(replacement)
+            assert replacement is not None
+            self.assertTrue(original.is_dir())
+            self.assertTrue(replacement.is_dir())
+            self.assertEqual(
+                (replacement / "sentinel").read_text(encoding="utf-8"),
+                "replacement",
+            )
+            notes = getattr(caught.exception, "__notes__", ())
+            self.assertTrue(
+                any("recovery_locator=parent-directory://" in note for note in notes)
+            )
+            self.assertTrue(any("untrusted_path_hint=" in note for note in notes))
+            (replacement / "sentinel").unlink()
+            replacement.rmdir()
+            original.rmdir()
+
+    def test_unproven_creation_preserves_close_secondary_evidence(self) -> None:
+        with owned_temporary_directory("runtime-child-close-evidence-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            child_fd: int | None = None
+            close_failure_injected = False
+            real_close = support.os.close
+
+            def reject_origin(
+                _parent_binding: support._DirectoryParentBinding,
+                _name: bytes,
+                _child_path: pathlib.Path,
+                descriptor: int,
+                _first_open_identity: object,
+            ) -> tuple[object, object]:
+                nonlocal child_fd
+                child_fd = descriptor
+                raise OSError(errno.ESTALE, "synthetic origin failure")
+
+            def close_then_fail(descriptor: int) -> None:
+                nonlocal close_failure_injected
+                real_close(descriptor)
+                if descriptor == child_fd and not close_failure_injected:
+                    close_failure_injected = True
+                    raise OSError(errno.EIO, "synthetic child close failure")
+
+            with (
+                mock.patch.object(
+                    support,
+                    "_normalize_created_private_directory_mode",
+                    side_effect=reject_origin,
+                ),
+                mock.patch.object(
+                    support.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaises(
+                    support.UnprovenCreatedDirectoryError,
+                ) as caught,
+            ):
+                support._create_owned_private_directory_binding(
+                    parent,
+                    ".new-child-",
+                )
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+            self.assertTrue(close_failure_injected)
+            self.assertTrue(
+                any(
+                    "created-directory child binding close failed" in note
+                    and "synthetic child close failure" in note
+                    for note in getattr(caught.exception, "__notes__", ())
+                )
+            )
+            retained = caught.exception.untrusted_path_hint
+            self.assertTrue(retained.is_dir())
+            retained.rmdir()
+
+    def test_retention_locators_preserve_primary_when_probes_fail(self) -> None:
+        with owned_temporary_directory("runtime-locator-primary-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            parent_binding = support._open_directory_parent(
+                parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                with mock.patch.object(
+                    support.os,
+                    "fstat",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "synthetic locator fstat failure",
+                    ),
+                ) as fstat:
+                    locator = support._unproven_created_directory_locator(
+                        parent_binding,
+                        b"synthetic-leaf",
+                    )
+                fstat.assert_not_called()
+                self.assertEqual(
+                    locator,
+                    "parent-directory://"
+                    f"{parent_binding.identity.device}/"
+                    f"{parent_binding.identity.inode}/"
+                    f"leaf/{b'synthetic-leaf'.hex()}",
+                )
+            finally:
+                parent_binding.close()
+
+            binding = support._create_owned_private_directory_binding(
+                parent,
+                ".new-child-",
+            )
+            primary = OSError(errno.ESTALE, "synthetic cleanup mismatch")
+            try:
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_cleanup_created_private_directory_binding",
+                        side_effect=primary,
+                    ),
+                    mock.patch.object(
+                        runner.os,
+                        "fstat",
+                        side_effect=OSError(
+                            errno.EIO,
+                            "synthetic retention probe failure",
+                        ),
+                    ),
+                ):
+                    failure = runner._cleanup_created_tree(
+                        binding,
+                        restore_owner_write=False,
+                    )
+
+                self.assertIsNotNone(failure)
+                assert failure is not None
+                self.assertEqual(failure.error_errno, errno.ESTALE)
+                self.assertEqual(
+                    failure.path,
+                    "descriptor-object://"
+                    f"{binding.identity.device}/{binding.identity.inode}",
+                )
+                self.assertTrue(failure.retained)
+                self.assertTrue(
+                    any(
+                        "retention locator fell back to recorded identity" in note
+                        and "synthetic retention probe failure" in note
+                        for note in getattr(primary, "__notes__", ())
+                    )
+                )
+                support._cleanup_created_private_directory_binding(binding)
+            finally:
+                binding.close()
+
+            rebound_parent = root / "rebound-parent"
+            rebound_parent.mkdir(mode=0o700)
+            original_parent = root / "original-parent"
+            rebound_binding = support._open_directory_parent(
+                rebound_parent,
+                require_owned_private_parent=True,
+            )
+            reopened_fd: int | None = None
+            real_open = support.open_absolute_directory_chain
+            real_close = support.os.close
+
+            def capture_reopened(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, object]:
+                nonlocal reopened_fd
+                result = real_open(*args, **kwargs)
+                reopened_fd = result[0]
+                return result
+
+            def close_then_fail(descriptor: int) -> None:
+                real_close(descriptor)
+                if descriptor == reopened_fd:
+                    raise OSError(
+                        errno.EIO,
+                        "synthetic parent revalidation close failure",
+                    )
+
+            rebound_parent.rename(original_parent)
+            rebound_parent.mkdir(mode=0o700)
+            try:
+                with (
+                    mock.patch.object(
+                        support,
+                        "open_absolute_directory_chain",
+                        side_effect=capture_reopened,
+                    ),
+                    mock.patch.object(
+                        support.os,
+                        "close",
+                        side_effect=close_then_fail,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    rebound_binding.revalidate()
+                self.assertEqual(caught.exception.errno, errno.ESTALE)
+                self.assertTrue(
+                    any(
+                        "test runtime parent revalidation close failed" in note
+                        and "synthetic parent revalidation close failure" in note
+                        for note in getattr(caught.exception, "__notes__", ())
+                    )
+                )
+            finally:
+                rebound_binding.close()
+                rebound_parent.rmdir()
+                original_parent.rmdir()
+
+    def test_created_cleanup_retains_observed_root_replacement(self) -> None:
+        with owned_temporary_directory("runtime-created-cleanup-race-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            binding = support._create_owned_private_directory_binding(
+                parent,
+                ".new-child-",
+            )
+            escaped = parent / "escaped-created-directory"
+            replacement: pathlib.Path | None = None
+            real_verify = support._verify_staged_cleanup_entry
+            replacement_injected = False
+
+            def replace_after_first_verification(
+                parent_fd: int,
+                staged_name: str | bytes,
+                descriptor: int,
+                expected_path: pathlib.Path,
+            ) -> None:
+                nonlocal replacement, replacement_injected
+                real_verify(
+                    parent_fd,
+                    staged_name,
+                    descriptor,
+                    expected_path,
+                )
+                if replacement_injected:
+                    return
+                replacement_injected = True
+                os.rename(
+                    staged_name,
+                    escaped.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.mkdir(staged_name, mode=0o700, dir_fd=parent_fd)
+                replacement = parent / os.fsdecode(staged_name)
+                (replacement / "sentinel").write_text(
+                    "replacement",
+                    encoding="utf-8",
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        support,
+                        "_verify_staged_cleanup_entry",
+                        side_effect=replace_after_first_verification,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    support._cleanup_created_private_directory_binding(binding)
+
+                self.assertEqual(caught.exception.errno, errno.ESTALE)
+                self.assertTrue(replacement_injected)
+                self.assertTrue(escaped.is_dir())
+                self.assertIsNotNone(replacement)
+                assert replacement is not None
+                self.assertEqual(
+                    (replacement / "sentinel").read_text(encoding="utf-8"),
+                    "replacement",
+                )
+            finally:
+                binding.close()
+                if replacement is not None and replacement.exists():
+                    (replacement / "sentinel").unlink()
+                    replacement.rmdir()
+                if escaped.exists():
+                    escaped.rmdir()
+
+    def test_bound_cleanup_preserves_nested_estale_over_close_failure(self) -> None:
+        with owned_temporary_directory("runtime-created-nested-close-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            binding = support._create_owned_private_directory_binding(
+                parent,
+                ".new-child-",
+            )
+            (binding.path / "nested").mkdir(mode=0o700)
+            entry_fd: int | None = None
+            close_failure_injected = False
+            real_close = support.os.close
+
+            def reject_staged_entry(
+                _parent_fd: int,
+                _staged_name: str | bytes,
+                descriptor: int,
+                _expected_path: pathlib.Path,
+            ) -> None:
+                nonlocal entry_fd
+                entry_fd = descriptor
+                raise OSError(errno.ESTALE, "synthetic nested entry mismatch")
+
+            def close_then_fail(descriptor: int) -> None:
+                nonlocal close_failure_injected
+                real_close(descriptor)
+                if descriptor == entry_fd and not close_failure_injected:
+                    close_failure_injected = True
+                    raise OSError(errno.EIO, "synthetic nested close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        support,
+                        "_verify_staged_cleanup_entry",
+                        side_effect=reject_staged_entry,
+                    ),
+                    mock.patch.object(
+                        support.os,
+                        "close",
+                        side_effect=close_then_fail,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    support._remove_bound_directory_contents(
+                        binding.fd,
+                        binding.path,
+                        restore_owner_write=False,
+                    )
+
+                self.assertEqual(caught.exception.errno, errno.ESTALE)
+                self.assertTrue(close_failure_injected)
+                self.assertTrue(
+                    any(
+                        "bound cleanup entry close failed" in note
+                        and "synthetic nested close failure" in note
+                        for note in getattr(caught.exception, "__notes__", ())
+                    )
+                )
+                support._remove_bound_directory_contents(
+                    binding.fd,
+                    binding.path,
+                    restore_owner_write=False,
+                )
+                support._cleanup_created_private_directory_binding(binding)
+            finally:
+                binding.close()
 
     def test_bound_runtime_directory_allows_benign_child_churn(self) -> None:
         with owned_temporary_directory("runtime-binding-churn-") as root:
@@ -221,175 +1122,6 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     runner._list_bound_directory(binding)
             finally:
                 binding.close()
-
-    def test_bound_runtime_cleanup_rejects_path_replacement(self) -> None:
-        with owned_temporary_directory("runtime-cleanup-replace-") as root:
-            runtime_parent = root / "runtime"
-            runtime_parent.mkdir(mode=0o700)
-            original = root / "original"
-            binding = support._open_directory_parent(
-                runtime_parent,
-                require_owned_private_parent=True,
-            )
-            try:
-                runtime_parent.rename(original)
-                runtime_parent.mkdir(mode=0o700)
-
-                failure = runner._cleanup_bound_tree(
-                    binding,
-                    restore_owner_write=False,
-                )
-
-                self.assertIsNotNone(failure)
-                assert failure is not None
-                self.assertEqual(failure.path, str(original))
-                self.assertEqual(failure.error_kind, "OSError")
-                self.assertEqual(failure.error_errno, errno.ESTALE)
-                self.assertTrue(failure.retained)
-                self.assertTrue(original.is_dir())
-                self.assertTrue(runtime_parent.is_dir())
-            finally:
-                binding.close()
-
-    def test_bound_cleanup_retains_renamed_object_when_path_is_absent(self) -> None:
-        with owned_temporary_directory("runtime-cleanup-rename-") as root:
-            runtime_parent = root / "runtime"
-            runtime_parent.mkdir(mode=0o700)
-            original = root / "original"
-            binding = support._open_directory_parent(
-                runtime_parent,
-                require_owned_private_parent=True,
-            )
-            try:
-                runtime_parent.rename(original)
-
-                failure = runner._cleanup_bound_tree(
-                    binding,
-                    restore_owner_write=False,
-                )
-
-                self.assertIsNotNone(failure)
-                assert failure is not None
-                self.assertEqual(failure.path, str(original))
-                self.assertEqual(failure.error_kind, "FileNotFoundError")
-                self.assertTrue(failure.retained)
-                self.assertTrue(original.is_dir())
-                self.assertFalse(runtime_parent.exists())
-            finally:
-                binding.close()
-
-    def test_bound_cleanup_uses_descriptor_locator_when_path_is_unverifiable(
-        self,
-    ) -> None:
-        with owned_temporary_directory("runtime-cleanup-locator-") as root:
-            runtime_parent = root / "runtime"
-            runtime_parent.mkdir(mode=0o700)
-            original = root / "original"
-            binding = support._open_directory_parent(
-                runtime_parent,
-                require_owned_private_parent=True,
-            )
-            try:
-                runtime_parent.rename(original)
-                with mock.patch.object(
-                    runner,
-                    "_descriptor_path",
-                    side_effect=OSError(
-                        errno.ESTALE,
-                        "synthetic descriptor path failure",
-                    ),
-                ):
-                    failure = runner._cleanup_bound_tree(
-                        binding,
-                        restore_owner_write=False,
-                    )
-
-                self.assertIsNotNone(failure)
-                assert failure is not None
-                self.assertTrue(
-                    failure.path.startswith("descriptor-object://"),
-                    failure.path,
-                )
-                self.assertNotEqual(failure.path, str(runtime_parent))
-                self.assertTrue(failure.retained)
-                self.assertTrue(original.is_dir())
-            finally:
-                binding.close()
-
-    def test_bound_cleanup_removes_the_staged_descriptor_tree(self) -> None:
-        with owned_temporary_directory("runtime-cleanup-bound-") as root:
-            runtime_parent = root / "runtime"
-            runtime_parent.mkdir(mode=0o700)
-            nested = runtime_parent / "nested"
-            nested.mkdir(mode=0o700)
-            payload = nested / "payload"
-            payload.write_text("content", encoding="utf-8")
-            nested.chmod(0o500)
-            binding = support._open_directory_parent(
-                runtime_parent,
-                require_owned_private_parent=True,
-            )
-            try:
-                failure = runner._cleanup_bound_tree(
-                    binding,
-                    restore_owner_write=True,
-                )
-
-                self.assertIsNone(failure)
-                self.assertFalse(runtime_parent.exists())
-                self.assertFalse(tuple(root.glob(".codex-cleanup-*")))
-            finally:
-                binding.close()
-
-    def test_bound_cleanup_detects_final_root_replacement(self) -> None:
-        with owned_temporary_directory("runtime-cleanup-final-race-") as root:
-            runtime_parent = root / "runtime"
-            runtime_parent.mkdir(mode=0o700)
-            escaped = root / "escaped"
-            binding = support._open_directory_parent(
-                runtime_parent,
-                require_owned_private_parent=True,
-            )
-            real_rmdir = runner.os.rmdir
-
-            def replace_before_final_rmdir(
-                name: str,
-                *,
-                dir_fd: int | None = None,
-            ) -> None:
-                assert dir_fd is not None
-                os.rename(
-                    name,
-                    escaped.name,
-                    src_dir_fd=dir_fd,
-                    dst_dir_fd=dir_fd,
-                )
-                os.mkdir(name, mode=0o700, dir_fd=dir_fd)
-                real_rmdir(name, dir_fd=dir_fd)
-
-            try:
-                with mock.patch.object(
-                    runner.os,
-                    "rmdir",
-                    side_effect=replace_before_final_rmdir,
-                ):
-                    failure = runner._cleanup_bound_tree(
-                        binding,
-                        restore_owner_write=False,
-                    )
-
-                self.assertIsNotNone(failure)
-                assert failure is not None
-                self.assertEqual(failure.path, str(escaped))
-                self.assertEqual(failure.error_kind, "OSError")
-                self.assertEqual(failure.error_errno, errno.ESTALE)
-                self.assertTrue(failure.retained)
-                self.assertTrue(escaped.is_dir())
-                self.assertFalse(runtime_parent.exists())
-            finally:
-                binding.close()
-                if escaped.exists():
-                    escaped.rmdir()
 
     def test_lifecycle_signal_fence_records_without_interrupting(self) -> None:
         fence = runner._install_lifecycle_signal_fence()
@@ -429,6 +1161,198 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(runner.main(), 128 + signal.SIGTERM)
+
+            sealed_fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                terminal_signal=signal.SIGTERM,
+                terminal_selected_signal=signal.SIGTERM,
+                terminal_exit_code=128 + signal.SIGTERM,
+                terminal_decision_frozen=True,
+            )
+            publication_error = runner.TerminalPublicationError(
+                "stdout-write",
+                OSError(errno.EIO, "synthetic publication failure"),
+            )
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_install_lifecycle_signal_fence",
+                    return_value=sealed_fence,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_main",
+                    side_effect=publication_error,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_restore_lifecycle_signal_fence",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "synthetic restore failure",
+                    ),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_report_terminal_publication_failure",
+                ) as report_failure,
+            ):
+                self.assertEqual(runner.main(), 128 + signal.SIGTERM)
+            self.assertEqual(report_failure.call_count, 2)
+
+            no_signal_fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+                terminal_exit_code=0,
+                terminal_decision_frozen=True,
+            )
+            with (
+                mock.patch.object(runner.sys, "platform", "darwin"),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_install_lifecycle_signal_fence",
+                    return_value=no_signal_fence,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_main",
+                    side_effect=publication_error,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_restore_lifecycle_signal_fence",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "synthetic restore failure",
+                    ),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_report_terminal_publication_failure",
+                ),
+            ):
+                self.assertEqual(runner.main(), 1)
+
+    def test_terminal_signal_publication_is_linearized_in_a_real_process(
+        self,
+    ) -> None:
+        success_scenarios = (
+            (
+                "pre-seal",
+                signal.SIGTERM,
+                False,
+                True,
+                "interrupted",
+                signal.SIGTERM,
+                128 + signal.SIGTERM,
+            ),
+            (
+                "pre-seal-existing-primary",
+                signal.SIGHUP,
+                True,
+                True,
+                "failed",
+                signal.SIGHUP,
+                128 + signal.SIGHUP,
+            ),
+            ("summary", signal.SIGINT, False, True, "complete", None, 0),
+            ("json", signal.SIGQUIT, False, True, "complete", None, 0),
+            ("stdout-write", signal.SIGTERM, False, True, "complete", None, 0),
+            ("stdout-flush", signal.SIGHUP, False, True, "complete", None, 0),
+            ("stderr-flush", signal.SIGINT, False, True, "complete", None, 0),
+            (
+                "newline-write-failure",
+                None,
+                False,
+                True,
+                "complete",
+                None,
+                0,
+            ),
+            ("restore-pending", signal.SIGQUIT, False, False, "complete", None, 0),
+        )
+        for (
+            inject_at,
+            signal_number,
+            existing_primary,
+            terminal_process,
+            primary_status,
+            sealed_signal,
+            expected_exit,
+        ) in success_scenarios:
+            with (
+                self.subTest(inject_at=inject_at),
+                owned_temporary_directory(f"terminal-signal-{inject_at}-") as root,
+            ):
+                exit_code, summaries, stderr = self._run_terminal_signal_scenario(
+                    root,
+                    inject_at=inject_at,
+                    signal_number=signal_number,
+                    existing_primary=existing_primary,
+                    terminal_process=terminal_process,
+                )
+                self.assertEqual(exit_code, expected_exit, stderr)
+                self.assertEqual(len(summaries), 1, (summaries, stderr))
+                summary = summaries[0]
+                self.assertEqual(summary["primary_status"], primary_status)
+                self.assertEqual(summary["signal_number"], sealed_signal)
+                self.assertEqual(summary["cleanup_status"], "complete")
+                self.assertEqual(summary["retained_paths"], [])
+                self.assertEqual(summary["runtime_residue"], [])
+                self.assertEqual(summary["secondary_failures"], [])
+                self.assertFalse(summary["creation_origin_proven"])
+                self.assertEqual(
+                    summary["creation_origin_guarantee"],
+                    support.CREATION_ORIGIN_GUARANTEE,
+                )
+                self.assertEqual(
+                    summary["cleanup_guarantee"],
+                    support.CLEANUP_GUARANTEE,
+                )
+                if sealed_signal is None:
+                    self.assertEqual(exit_code, 0)
+                else:
+                    self.assertEqual(exit_code, 128 + sealed_signal)
+                if inject_at == "newline-write-failure":
+                    self.assertIn("operation=stdout-newline", stderr)
+
+        failure_scenarios = (
+            ("stdout-write-failure", None, 1),
+            ("stdout-flush-failure", None, 1),
+            ("stderr-flush-failure", None, 1),
+            (
+                "signal-publication-failure",
+                signal.SIGTERM,
+                128 + signal.SIGTERM,
+            ),
+        )
+        for inject_at, signal_number, expected_exit in failure_scenarios:
+            with (
+                self.subTest(inject_at=inject_at),
+                owned_temporary_directory(f"terminal-failure-{inject_at}-") as root,
+            ):
+                exit_code, summaries, stderr = self._run_terminal_signal_scenario(
+                    root,
+                    inject_at=inject_at,
+                    signal_number=signal_number,
+                )
+                self.assertEqual(exit_code, expected_exit, stderr)
+                self.assertEqual(summaries, ())
+                self.assertIn("terminal publication failed", stderr)
 
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
@@ -1418,8 +2342,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     runner,
-                    "_create_owned_private_directory",
-                    side_effect=(install_container, runtime_parent),
+                    "_create_owned_private_directory_binding",
+                    side_effect=self._bind_existing_directories(
+                        install_container,
+                        runtime_parent,
+                    ),
                 ),
                 mock.patch.object(
                     runner.shutil,
@@ -1559,8 +2486,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     runner,
-                    "_create_owned_private_directory",
-                    side_effect=(install_container, runtime_parent),
+                    "_create_owned_private_directory_binding",
+                    side_effect=self._bind_existing_directories(
+                        install_container,
+                        runtime_parent,
+                    ),
                 ),
                 mock.patch.object(
                     runner.shutil,
@@ -1583,7 +2513,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     runner,
-                    "_cleanup_bound_tree",
+                    "_cleanup_created_tree",
                     side_effect=(cleanup_failure, None),
                 ),
                 contextlib.redirect_stdout(stdout),
@@ -1611,6 +2541,173 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 error_text.index("primary failure"),
                 error_text.index("cleanup incomplete"),
             )
+
+    def test_main_retains_post_create_replacements_without_touching_them(
+        self,
+    ) -> None:
+        for target in ("install", "runtime"):
+            with (
+                self.subTest(target=target),
+                owned_temporary_directory(
+                    f"readonly-main-post-create-{target}-"
+                ) as root,
+            ):
+                sticky_parent = root / "sticky"
+                sticky_parent.mkdir(mode=0o700)
+                sticky_parent.chmod(0o1777)
+                install_container = sticky_parent / "install"
+                install_container.mkdir(mode=0o700)
+                runtime_home = root / "runtime-home"
+                runtime_home.mkdir(mode=0o700)
+                runtime_parent = runtime_home / "runtime"
+                runtime_parent.mkdir(mode=0o700)
+                target_path = (
+                    install_container if target == "install" else runtime_parent
+                )
+                original = target_path.parent / f"original-{target}"
+                replacement_sentinel = b"replacement must survive"
+                factory = self._bind_existing_directories(
+                    install_container,
+                    runtime_parent,
+                )
+                creation_index = 0
+                real_binding_close = support._CreatedPrivateDirectoryBinding.close
+
+                def create_then_replace(
+                    parent: pathlib.Path,
+                    prefix: str,
+                    *,
+                    require_owned_private_parent: bool = True,
+                ) -> support._CreatedPrivateDirectoryBinding:
+                    nonlocal creation_index
+                    binding = factory(
+                        parent,
+                        prefix,
+                        require_owned_private_parent=require_owned_private_parent,
+                    )
+                    current = "install" if creation_index == 0 else "runtime"
+                    creation_index += 1
+                    if current == target:
+                        binding.path.rename(original)
+                        binding.path.mkdir(mode=0o700)
+                        (binding.path / "sentinel").write_bytes(replacement_sentinel)
+                    return binding
+
+                def fake_copytree(
+                    _source: pathlib.Path,
+                    destination: pathlib.Path,
+                    **_kwargs: object,
+                ) -> pathlib.Path:
+                    pathlib.Path(destination).mkdir()
+                    return pathlib.Path(destination)
+
+                def close_with_target_failure(
+                    binding: support._CreatedPrivateDirectoryBinding,
+                ) -> None:
+                    real_binding_close(binding)
+                    if binding.path == target_path:
+                        raise OSError(
+                            errno.EIO,
+                            "synthetic target binding close failure",
+                        )
+
+                completed = subprocess.CompletedProcess(
+                    args=("python3",),
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+
+                def validate_before_completion(
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    install_binding = kwargs["install_container_binding"]
+                    runtime_binding = kwargs["runtime_parent_binding"]
+                    assert isinstance(
+                        install_binding,
+                        support._CreatedPrivateDirectoryBinding,
+                    )
+                    assert isinstance(
+                        runtime_binding,
+                        support._CreatedPrivateDirectoryBinding,
+                    )
+                    install_binding.revalidate()
+                    runtime_binding.revalidate()
+                    return completed
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(runner.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        runner,
+                        "READONLY_INSTALL_PARENT",
+                        sticky_parent,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_private_runtime_parent",
+                        return_value=runtime_home,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_create_owned_private_directory_binding",
+                        side_effect=create_then_replace,
+                    ),
+                    mock.patch.object(
+                        runner.shutil,
+                        "copytree",
+                        side_effect=fake_copytree,
+                    ),
+                    mock.patch.object(runner, "_set_tree_read_only"),
+                    mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                    mock.patch.object(
+                        runner,
+                        "_run_no_child_test_suite",
+                        side_effect=validate_before_completion,
+                    ),
+                    mock.patch.object(
+                        support._CreatedPrivateDirectoryBinding,
+                        "close",
+                        autospec=True,
+                        side_effect=close_with_target_failure,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = runner.main()
+
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(returncode, 1)
+                self.assertEqual(summary["primary_status"], "failed")
+                self.assertEqual(
+                    summary["primary_failure"]["error_errno"],
+                    errno.ESTALE,
+                )
+                self.assertEqual(
+                    summary["primary_failure"]["stage"],
+                    "install-copy" if target == "install" else "child-run",
+                )
+                self.assertEqual(summary["cleanup_status"], "incomplete")
+                self.assertEqual(summary["retained_paths"], [str(original)])
+                self.assertNotIn(str(target_path), summary["retained_paths"])
+                self.assertTrue(
+                    any(
+                        failure["error_kind"] == "OSError"
+                        and failure["error_errno"] == errno.EIO
+                        and failure["path"] == str(original)
+                        for failure in summary["cleanup_failures"]
+                    )
+                )
+                self.assertTrue(original.is_dir())
+                self.assertEqual(
+                    (target_path / "sentinel").read_bytes(),
+                    replacement_sentinel,
+                )
+                self.assertIn(
+                    "parent-relative binding changed",
+                    stderr.getvalue(),
+                )
 
     def test_main_rejects_replaced_install_container(self) -> None:
         with owned_temporary_directory("readonly-main-install-replace-") as root:
@@ -1663,8 +2760,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     runner,
-                    "_create_owned_private_directory",
-                    side_effect=(install_container, runtime_parent),
+                    "_create_owned_private_directory_binding",
+                    side_effect=self._bind_existing_directories(
+                        install_container,
+                        runtime_parent,
+                    ),
                 ),
                 mock.patch.object(
                     runner.shutil,
@@ -1697,7 +2797,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
             self.assertTrue(original_install_container.is_dir())
             self.assertTrue(install_container.is_dir())
-            self.assertIn("test runtime parent path changed", stderr.getvalue())
+            self.assertIn(
+                "created private directory parent-relative binding changed",
+                stderr.getvalue(),
+            )
 
     def test_main_rejects_replaced_runtime_parent(self) -> None:
         with owned_temporary_directory("readonly-main-runtime-replace-") as root:
@@ -1750,8 +2853,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     runner,
-                    "_create_owned_private_directory",
-                    side_effect=(install_container, runtime_parent),
+                    "_create_owned_private_directory_binding",
+                    side_effect=self._bind_existing_directories(
+                        install_container,
+                        runtime_parent,
+                    ),
                 ),
                 mock.patch.object(
                     runner.shutil,
@@ -1784,7 +2890,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
             self.assertTrue(original_runtime_parent.is_dir())
             self.assertTrue(runtime_parent.is_dir())
-            self.assertIn("test runtime parent path changed", stderr.getvalue())
+            self.assertIn(
+                "created private directory parent-relative binding changed",
+                stderr.getvalue(),
+            )
 
 
 if __name__ == "__main__":

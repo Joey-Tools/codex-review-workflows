@@ -114,12 +114,17 @@ superseded_by:
   descriptor and revalidated for the same object before use, so restrictive
   process umasks cannot make valid scratch allocation fail. The read-only
   installed runner retains exact descriptors for both the sticky-parent install
-  container and the runtime directory through child closure. Cleanup exclusively
-  stages each bound object, walks and removes descendants relative to held
-  descriptors, and verifies final unlink state; replacement or path drift is an
-  explicit retained failure. A lifecycle signal fence spans allocation, child
-  settlement, cleanup, and receipt emission. The no-child subprocess also binds
-  both `TMPDIR` and Python's `tempfile` cache to the external runtime parent.
+  container and the runtime directory through child closure. Once the immediate
+  no-follow open establishes a creation receipt, cleanup exclusively stages the
+  bound object and walks descendants relative to held descriptors; an observed
+  replacement or unproven identity is retained without path cleanup. macOS does
+  not provide an atomic create-directory-and-return-FD primitive or unlink by
+  FD, so the mkdir-to-first-open and final-unlink windows explicitly treat a
+  concurrent same-UID writer as part of the host TCB rather than claiming a
+  stronger kernel guarantee. A lifecycle signal fence spans allocation, child
+  settlement, cleanup, terminal JSON publication, and the sealed exit decision.
+  The no-child subprocess also binds both `TMPDIR` and Python's `tempfile` cache
+  to the external runtime parent.
 - The ordinary deterministic gate retains full behavior coverage, including
   tests that intentionally fork and exercise `setsid`/double-fork rejection.
   The installed-release immutability gate separately runs a fixed-identity
@@ -342,3 +347,12 @@ superseded_by:
   was the known parent-sandbox denial of nested `sandbox-exec`. That exact
   broker regression passed 1/1 outside the parent sandbox in 2.469 seconds.
   Repository contracts passed 102/102 in 7.404 seconds.
+- The receipt-bound cleanup and linearized terminal-publication repair passed 648/648
+  in 196.449 seconds on Python 3.13 with the reviewed 648-test selected identity
+  and SHA-256
+  `5956350e0995ae84ad17dfee413a6cde547d2649b06e51d7d6b98e757a20d69d`.
+  The focused read-only runner module passed 40/40 in 4.795 seconds. These
+  regressions cover typed unproven-creation retention, descriptor-derived
+  cleanup locators, replacement-safe cleanup decisions, close-error priority,
+  all four lifecycle signals in real child processes, and JSON/exit agreement
+  across serialization, partial write, newline, and flush failures.

@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import pathlib
-import secrets
 import signal
 import shutil
 import stat
@@ -38,9 +37,13 @@ from review_supervisor.signal_relay import (
     deactivate_deferred_signal_interrupt,
 )
 from .support import (
+    CLEANUP_GUARANTEE,
+    CREATION_ORIGIN_GUARANTEE,
+    UnprovenCreatedDirectoryError,
+    _CreatedPrivateDirectoryBinding,
     _DirectoryParentBinding,
-    _create_owned_private_directory,
-    _open_directory_parent,
+    _cleanup_created_private_directory_binding,
+    _create_owned_private_directory_binding,
     _private_runtime_parent,
 )
 
@@ -96,7 +99,7 @@ XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
 F_GETPATH = 50
 DARWIN_MAXPATHLEN = 1024
-RENAME_EXCL = 0x00000004
+_BoundDirectory = _DirectoryParentBinding | _CreatedPrivateDirectoryBinding
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,15 @@ class ChildSignalTeardownError(RuntimeError):
         super().__init__(f"child signal teardown failed: {operations}")
 
 
+class TerminalPublicationError(RuntimeError):
+    def __init__(self, operation: str, error: BaseException) -> None:
+        self.operation = operation
+        self.error = error
+        super().__init__(
+            f"terminal publication {operation} failed: {type(error).__name__}: {error}"
+        )
+
+
 @dataclass(frozen=True)
 class ChildSignalGuard:
     signals: tuple[signal.Signals, ...]
@@ -184,6 +196,11 @@ class LifecycleSignalFence:
     previous_handlers: tuple[Any, ...]
     previous_mask: set[signal.Signals]
     received_signal: int | None = None
+    terminal_signal: int | None = None
+    terminal_selected_signal: int | None = None
+    terminal_exit_code: int | None = None
+    terminal_decision_frozen: bool = False
+    terminal_output_committed: bool = False
 
 
 @dataclass
@@ -281,8 +298,34 @@ def _install_lifecycle_signal_fence() -> LifecycleSignalFence:
 
 def _restore_lifecycle_signal_fence(fence: LifecycleSignalFence) -> int | None:
     signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    if fence.terminal_decision_frozen:
+        try:
+            for signal_number in fence.signals:
+                signal.signal(signal_number, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_SETMASK, fence.previous_mask)
+            for signal_number, previous in zip(
+                fence.signals,
+                fence.previous_handlers,
+                strict=True,
+            ):
+                signal.signal(signal_number, previous)
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+            raise
+        return fence.terminal_signal
+
     try:
         received_signal = fence.received_signal
+        if received_signal is None:
+            pending = signal.sigpending()
+            received_signal = next(
+                (
+                    signal_number
+                    for signal_number in fence.signals
+                    if signal_number in pending
+                ),
+                None,
+            )
         for signal_number, previous in zip(
             fence.signals,
             fence.previous_handlers,
@@ -292,6 +335,28 @@ def _restore_lifecycle_signal_fence(fence: LifecycleSignalFence) -> int | None:
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, fence.previous_mask)
     return received_signal
+
+
+def _freeze_lifecycle_terminal_signal(
+    fence: LifecycleSignalFence,
+) -> int | None:
+    if fence.terminal_decision_frozen:
+        raise RuntimeError("lifecycle terminal decision is already frozen")
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    pending = signal.sigpending()
+    terminal_signal = fence.received_signal
+    if terminal_signal is None:
+        terminal_signal = next(
+            (
+                signal_number
+                for signal_number in fence.signals
+                if signal_number in pending
+            ),
+            None,
+        )
+    fence.terminal_signal = terminal_signal
+    fence.terminal_decision_frozen = True
+    return terminal_signal
 
 
 @contextmanager
@@ -431,8 +496,8 @@ def _bound_child_signals(
 def _run_no_child_test_suite(
     *,
     installed_root: pathlib.Path,
-    install_container_binding: _DirectoryParentBinding,
-    runtime_parent_binding: _DirectoryParentBinding,
+    install_container_binding: _BoundDirectory,
+    runtime_parent_binding: _BoundDirectory,
     timeout: float = CHILD_TIMEOUT_SECONDS,
     stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
@@ -946,13 +1011,96 @@ def _bounded_failure_text(value: str, *, limit: int = 16_384) -> str:
     return value[-limit:]
 
 
+def _serialize_terminal_json(value: object, *, operation: str) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except BaseException as error:
+        raise TerminalPublicationError(operation, error) from error
+
+
+def _write_terminal_stdout(payload: bytes) -> None:
+    try:
+        descriptor = sys.stdout.fileno()
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "terminal stdout write made no progress")
+            remaining = remaining[written:]
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+    try:
+        written = os.write(descriptor, b"\n")
+        if written != 1:
+            raise OSError(
+                errno.EIO,
+                "terminal stdout newline write made no progress",
+            )
+    except BaseException as error:
+        _report_terminal_publication_failure(
+            TerminalPublicationError("stdout-newline", error)
+        )
+
+
+def _publish_terminal_output(
+    summary: dict[str, object],
+    diagnostics: str,
+    *,
+    terminal_process: bool,
+) -> None:
+    summary_text = _serialize_terminal_json(
+        summary,
+        operation="summary-serialization",
+    )
+    try:
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-flush", error) from error
+    try:
+        if diagnostics:
+            sys.stderr.write(diagnostics)
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-write", error) from error
+    try:
+        sys.stderr.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-flush", error) from error
+
+    payload = summary_text.encode("utf-8")
+    if terminal_process:
+        _write_terminal_stdout(payload)
+        return
+    try:
+        sys.stdout.write(payload.decode("utf-8") + "\n")
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+
+
+def _report_terminal_publication_failure(error: TerminalPublicationError) -> None:
+    message = (
+        "read-only installed supervisor terminal publication failed: "
+        f"operation={error.operation}; "
+        f"error={type(error.error).__name__}: "
+        f"{_bounded_failure_text(str(error.error), limit=1_024)}\n"
+    )
+    try:
+        os.write(2, message.encode("utf-8", errors="backslashreplace"))
+    except BaseException:
+        pass
+
+
 def _primary_failure(stage: str, error: BaseException) -> PrimaryFailure:
     error_errno = getattr(error, "errno", None)
+    message = str(error)
+    notes = getattr(error, "__notes__", ())
+    if notes:
+        message += "; " + "; ".join(str(note) for note in notes)
     return PrimaryFailure(
         stage=stage,
         error_kind=type(error).__name__,
         error_errno=error_errno if isinstance(error_errno, int) else None,
-        message=_bounded_failure_text(str(error), limit=2_048),
+        message=_bounded_failure_text(message, limit=2_048),
     )
 
 
@@ -1020,7 +1168,7 @@ def _cleanup_failure_from_error(
 
 
 def _list_bound_directory(
-    binding: _DirectoryParentBinding,
+    binding: _BoundDirectory,
 ) -> tuple[str, ...]:
     binding.revalidate()
     entries = tuple(sorted(os.listdir(binding.fd)))
@@ -1037,7 +1185,7 @@ def _node_key(metadata: os.stat_result) -> tuple[int, int, int, int]:
     )
 
 
-def _binding_node_key(binding: _DirectoryParentBinding) -> tuple[int, int, int, int]:
+def _binding_node_key(binding: _BoundDirectory) -> tuple[int, int, int, int]:
     return (
         binding.identity.device,
         binding.identity.inode,
@@ -1059,13 +1207,18 @@ def _descriptor_object_locator(metadata: os.stat_result) -> str:
 
 
 def _bound_tree_retention_locator(
-    binding: _DirectoryParentBinding,
+    binding: _BoundDirectory,
+    *,
+    primary_error: BaseException | None = None,
 ) -> tuple[str, bool]:
-    metadata = os.fstat(binding.fd)
-    descriptor_locator = _descriptor_object_locator(metadata)
-    if metadata.st_nlink == 0:
-        return descriptor_locator, False
+    fallback_locator = (
+        f"descriptor-object://{binding.identity.device}/{binding.identity.inode}"
+    )
     try:
+        metadata = os.fstat(binding.fd)
+        descriptor_locator = _descriptor_object_locator(metadata)
+        if metadata.st_nlink == 0:
+            return descriptor_locator, False
         candidate = _descriptor_path(binding.fd)
         candidate_fd, _candidate_identity = open_absolute_directory_chain(
             candidate,
@@ -1077,251 +1230,83 @@ def _bound_tree_retention_locator(
                     errno.ESTALE,
                     "descriptor path resolves to a different retained object",
                 )
-        finally:
+        except BaseException as error:
+            try:
+                os.close(candidate_fd)
+            except BaseException as close_error:
+                error.add_note(
+                    "retention-locator candidate close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
             os.close(candidate_fd)
-    except Exception:
-        return descriptor_locator, True
+    except BaseException as locator_error:
+        if primary_error is not None:
+            primary_error.add_note(
+                "retention locator fell back to recorded identity: "
+                f"{type(locator_error).__name__}: {locator_error}"
+            )
+            for note in getattr(locator_error, "__notes__", ()):
+                primary_error.add_note(str(note))
+        return fallback_locator, True
     return str(candidate), True
 
 
-def _rename_exclusive(
-    source_parent_fd: int,
-    source_name: str,
-    target_parent_fd: int,
-    target_name: str,
-) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameatx_np = libc.renameatx_np
-    renameatx_np.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameatx_np.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameatx_np(
-        source_parent_fd,
-        os.fsencode(source_name),
-        target_parent_fd,
-        os.fsencode(target_name),
-        RENAME_EXCL,
-    )
-    if result != 0:
-        raise OSError(
-            ctypes.get_errno() or errno.EIO,
-            "cannot exclusively stage a bound cleanup entry",
-        )
-
-
-def _exclusive_stage_name(parent_fd: int, source_name: str) -> str:
-    for _attempt in range(8):
-        staged_name = f".codex-cleanup-{secrets.token_hex(16)}"
-        try:
-            _rename_exclusive(
-                parent_fd,
-                source_name,
-                parent_fd,
-                staged_name,
-            )
-        except FileExistsError:
-            continue
-        return staged_name
-    raise FileExistsError(errno.EEXIST, "cannot allocate a cleanup staging name")
-
-
-def _path_entry_absent(parent_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return True
-    return False
-
-
-def _open_bound_cleanup_entry(
-    parent_fd: int,
-    name: str,
-) -> tuple[int, os.stat_result]:
-    initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-    if stat.S_ISDIR(initial.st_mode):
-        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
-    elif stat.S_ISREG(initial.st_mode):
-        flags = common_flags | os.O_NOFOLLOW
-    elif stat.S_ISLNK(initial.st_mode):
-        symlink_flag = getattr(os, "O_SYMLINK", None)
-        if symlink_flag is None:
-            raise OSError(errno.ENOTSUP, "symlink descriptor opens are unavailable")
-        flags = common_flags | symlink_flag
-    else:
-        raise OSError(errno.EPERM, "unsupported entry in bound cleanup tree")
-    descriptor = os.open(name, flags, dir_fd=parent_fd)
-    try:
-        opened = os.fstat(descriptor)
-        if _node_key(opened) != _node_key(initial):
-            raise OSError(errno.ESTALE, "cleanup entry changed while opening")
-        return descriptor, opened
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _verify_staged_entry(
-    parent_fd: int,
-    staged_name: str,
-    descriptor: int,
-    expected_path: pathlib.Path,
-) -> None:
-    staged = os.stat(staged_name, dir_fd=parent_fd, follow_symlinks=False)
-    if _node_key(staged) != _node_key(os.fstat(descriptor)):
-        raise OSError(errno.ESTALE, "cleanup staging moved a different object")
-    if _descriptor_path(descriptor) != expected_path:
-        raise OSError(errno.ESTALE, "cleanup staging path changed")
-
-
-def _remove_bound_directory_contents(
-    descriptor: int,
-    expected_path: pathlib.Path,
-    *,
-    restore_owner_write: bool,
-) -> None:
-    if restore_owner_write:
-        metadata = os.fstat(descriptor)
-        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWUSR)
-    names = tuple(sorted(os.listdir(descriptor)))
-    for name in names:
-        entry_fd, initial = _open_bound_cleanup_entry(descriptor, name)
-        try:
-            staged_name = _exclusive_stage_name(descriptor, name)
-            staged_path = expected_path / staged_name
-            _verify_staged_entry(
-                descriptor,
-                staged_name,
-                entry_fd,
-                staged_path,
-            )
-            if not _path_entry_absent(descriptor, name):
-                raise OSError(
-                    errno.ESTALE,
-                    "cleanup source name was repopulated after staging",
-                )
-            if stat.S_ISDIR(initial.st_mode):
-                _remove_bound_directory_contents(
-                    entry_fd,
-                    staged_path,
-                    restore_owner_write=restore_owner_write,
-                )
-                os.rmdir(staged_name, dir_fd=descriptor)
-                if _descriptor_path(entry_fd) != staged_path or not _path_entry_absent(
-                    descriptor, staged_name
-                ):
-                    raise OSError(
-                        errno.ESTALE,
-                        "bound cleanup directory survived final removal",
-                    )
-            else:
-                os.unlink(staged_name, dir_fd=descriptor)
-                if os.fstat(entry_fd).st_nlink != 0 or not _path_entry_absent(
-                    descriptor, staged_name
-                ):
-                    raise OSError(
-                        errno.ESTALE,
-                        "bound cleanup entry survived final removal",
-                    )
-        finally:
-            os.close(entry_fd)
-    if os.listdir(descriptor):
-        raise OSError(errno.ESTALE, "bound cleanup directory gained new entries")
-
-
-def _cleanup_bound_tree(
-    binding: _DirectoryParentBinding | None,
+def _cleanup_created_tree(
+    binding: _CreatedPrivateDirectoryBinding | None,
     *,
     restore_owner_write: bool,
 ) -> CleanupFailure | None:
     if binding is None:
         return None
     try:
-        binding.revalidate()
-    except Exception as error:
-        retained_locator, retained = _bound_tree_retention_locator(binding)
-        return _cleanup_failure_from_error(
-            retained_locator,
-            error,
-            retained=retained,
-        )
-    parent_fd: int | None = None
-    staged_path = binding.path
-    try:
-        parent_fd, _parent_identity = open_absolute_directory_chain(
-            binding.path.parent,
-            allow_sticky_writable_ancestors=(not binding.require_owned_private_parent),
-        )
-        staged_name = _exclusive_stage_name(parent_fd, binding.path.name)
-        staged_path = binding.path.parent / staged_name
-        staged = os.stat(
-            staged_name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        if _node_key(staged) != _binding_node_key(binding):
-            raise OSError(errno.ESTALE, "cleanup staged a different root object")
-        if _descriptor_path(binding.fd) != staged_path:
-            raise OSError(errno.ESTALE, "bound cleanup root staging path changed")
-        if not _path_entry_absent(parent_fd, binding.path.name):
-            raise OSError(
-                errno.ESTALE,
-                "cleanup root name was repopulated after staging",
-            )
-        _remove_bound_directory_contents(
-            binding.fd,
-            staged_path,
+        _cleanup_created_private_directory_binding(
+            binding,
             restore_owner_write=restore_owner_write,
         )
-        os.rmdir(staged_name, dir_fd=parent_fd)
-        if _descriptor_path(binding.fd) != staged_path or not _path_entry_absent(
-            parent_fd, staged_name
-        ):
-            raise OSError(
-                errno.ESTALE,
-                "bound cleanup root survived final removal",
-            )
-        if not _path_entry_absent(parent_fd, binding.path.name):
-            raise OSError(
-                errno.ESTALE,
-                "cleanup root path was repopulated before completion",
-            )
         return None
     except Exception as error:
-        retained_locator, retained = _bound_tree_retention_locator(binding)
+        retained_locator, retained = _bound_tree_retention_locator(
+            binding,
+            primary_error=error,
+        )
         return _cleanup_failure_from_error(
             retained_locator,
             error,
             retained=retained,
         )
-    finally:
-        if parent_fd is not None:
-            os.close(parent_fd)
 
 
-def _retained_for_unproven_child_closure(
-    path: pathlib.Path | None,
+def _close_created_directory_binding(
+    binding: _CreatedPrivateDirectoryBinding,
+    prior_cleanup_failure: CleanupFailure | None,
 ) -> CleanupFailure | None:
-    if path is None or not os.path.lexists(path):
-        return None
-    return CleanupFailure(
-        path=str(path),
-        error_kind="ChildProcessClosureUnproven",
-        error_errno=None,
-        retained=True,
-        restore_error_kind=None,
-        restore_error_errno=None,
-    )
+    if prior_cleanup_failure is not None:
+        retained_locator = prior_cleanup_failure.path
+        retained = prior_cleanup_failure.retained
+    else:
+        try:
+            retained_locator, retained = _bound_tree_retention_locator(binding)
+        except Exception:
+            retained_locator = (
+                "descriptor-object://"
+                f"{binding.identity.device}/{binding.identity.inode}"
+            )
+            retained = True
+    try:
+        binding.close()
+    except Exception as error:
+        return _cleanup_failure_from_error(
+            retained_locator,
+            error,
+            retained=retained,
+        )
+    return None
 
 
 def _retained_bound_tree_for_unproven_child_closure(
-    binding: _DirectoryParentBinding | None,
+    binding: _BoundDirectory | None,
 ) -> CleanupFailure | None:
     if binding is None:
         return None
@@ -1336,12 +1321,15 @@ def _retained_bound_tree_for_unproven_child_closure(
     )
 
 
-def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
+def _run_main(
+    lifecycle_fence: LifecycleSignalFence,
+    *,
+    terminal_process: bool,
+) -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
-    install_container_binding: _DirectoryParentBinding | None = None
-    runtime_parent: pathlib.Path | None = None
-    runtime_parent_binding: _DirectoryParentBinding | None = None
+    install_container_binding: _CreatedPrivateDirectoryBinding | None = None
+    runtime_parent_binding: _CreatedPrivateDirectoryBinding | None = None
     installed_root: pathlib.Path | None = None
     completed: subprocess.CompletedProcess[str] | None = None
     before: dict[str, TreeEntrySnapshot] | None = None
@@ -1350,32 +1338,25 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
     timeout_error: TimeoutError | None = None
     output_limit_error: OverflowError | None = None
     signal_error: ChildRunInterrupted | None = None
+    signal_is_primary = False
     child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
     secondary_failures: list[SecondaryFailure] = []
+    unproven_creation_failures: list[CleanupFailure] = []
     closure_proof = ChildProcessClosureProof()
     cleanup_failures: tuple[CleanupFailure, ...] = ()
-    stage = "install-container"
+    stage = "install-container-binding"
     try:
-        install_container = _create_owned_private_directory(
+        install_container_binding = _create_owned_private_directory_binding(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
             require_owned_private_parent=False,
         )
-        stage = "install-container-binding"
-        install_container_binding = _open_directory_parent(
-            install_container,
-            require_owned_private_parent=False,
-        )
-        stage = "runtime-parent"
-        runtime_parent = _create_owned_private_directory(
+        install_container = install_container_binding.path
+        stage = "runtime-parent-binding"
+        runtime_parent_binding = _create_owned_private_directory_binding(
             _private_runtime_parent(),
             ".codex-review-readonly-runtime-",
-        )
-        stage = "runtime-parent-binding"
-        runtime_parent_binding = _open_directory_parent(
-            runtime_parent,
-            require_owned_private_parent=True,
         )
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
@@ -1428,11 +1409,23 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
+        signal_is_primary = True
         child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
         if child_process_closure == "pending":
             child_process_closure = _child_process_closure_status(closure_proof)
+        if isinstance(error, UnprovenCreatedDirectoryError):
+            unproven_creation_failures.append(
+                CleanupFailure(
+                    path=error.recovery_locator,
+                    error_kind=type(error).__name__,
+                    error_errno=error.errno,
+                    retained=True,
+                    restore_error_kind=None,
+                    restore_error_errno=None,
+                )
+            )
         primary_failure = _primary_failure(stage, error)
     finally:
         if child_process_closure == "pending":
@@ -1445,158 +1438,156 @@ def _run_main(lifecycle_fence: LifecycleSignalFence) -> int:
                 ),
                 _retained_bound_tree_for_unproven_child_closure(runtime_parent_binding),
             ]
-            if install_container_binding is None:
-                cleanup_results.append(
-                    _retained_for_unproven_child_closure(install_container)
-                )
-            if runtime_parent_binding is None:
-                cleanup_results.append(
-                    _retained_for_unproven_child_closure(runtime_parent)
-                )
         else:
             cleanup_results = [
-                _cleanup_bound_tree(
+                _cleanup_created_tree(
                     install_container_binding,
                     restore_owner_write=True,
                 ),
-                _cleanup_bound_tree(
+                _cleanup_created_tree(
                     runtime_parent_binding,
                     restore_owner_write=False,
                 ),
             ]
-            if install_container_binding is None:
-                cleanup_results.append(
-                    _cleanup_tree(install_container, restore_owner_write=True)
-                )
-            if runtime_parent_binding is None:
-                cleanup_results.append(
-                    _cleanup_tree(runtime_parent, restore_owner_write=False)
-                )
         if install_container_binding is not None:
-            try:
-                install_container_binding.close()
-            except Exception as error:
-                cleanup_results.append(
-                    _cleanup_failure_from_error(
-                        install_container_binding.path,
-                        error,
-                    )
+            cleanup_results.append(
+                _close_created_directory_binding(
+                    install_container_binding,
+                    cleanup_results[0],
                 )
+            )
         if runtime_parent_binding is not None:
-            try:
-                runtime_parent_binding.close()
-            except Exception as error:
-                cleanup_results.append(
-                    _cleanup_failure_from_error(runtime_parent_binding.path, error)
+            cleanup_results.append(
+                _close_created_directory_binding(
+                    runtime_parent_binding,
+                    cleanup_results[1],
                 )
-        cleanup_failures = tuple(
-            failure for failure in cleanup_results if failure is not None
+            )
+        cleanup_failures = (
+            *unproven_creation_failures,
+            *(failure for failure in cleanup_results if failure is not None),
         )
 
-    if lifecycle_fence.received_signal is not None and signal_error is None:
-        signal_error = ChildRunInterrupted(lifecycle_fence.received_signal)
+    terminal_signal = _freeze_lifecycle_terminal_signal(lifecycle_fence)
+    if terminal_signal is not None and signal_error is None:
+        signal_error = ChildRunInterrupted(terminal_signal)
         if primary_failure is None:
+            signal_is_primary = True
             primary_failure = _primary_failure(stage, signal_error)
-    release_tree_immutable = (
-        before is not None
-        and after is not None
-        and _tree_property_unchanged(before, after)
+    lifecycle_fence.terminal_selected_signal = (
+        signal_error.signal_number if signal_error is not None else terminal_signal
     )
-    retained_paths = [failure.path for failure in cleanup_failures if failure.retained]
-    if primary_failure is not None:
-        if timeout_error is not None:
-            primary_status = "timed-out"
-        elif output_limit_error is not None:
-            primary_status = "output-limit"
-        elif signal_error is not None:
-            primary_status = "interrupted"
-        elif child_process_closure == "unproven":
-            primary_status = "closure-unproven"
+    try:
+        release_tree_immutable = (
+            before is not None
+            and after is not None
+            and _tree_property_unchanged(before, after)
+        )
+        retained_paths = list(
+            dict.fromkeys(
+                failure.path for failure in cleanup_failures if failure.retained
+            )
+        )
+        if primary_failure is not None:
+            if timeout_error is not None:
+                primary_status = "timed-out"
+            elif output_limit_error is not None:
+                primary_status = "output-limit"
+            elif signal_is_primary:
+                primary_status = "interrupted"
+            elif child_process_closure == "unproven":
+                primary_status = "closure-unproven"
+            else:
+                primary_status = "failed"
+        elif completed is None:
+            primary_status = "not-completed"
+        elif completed.returncode != 0:
+            primary_status = "child-failed"
+        elif not release_tree_immutable:
+            primary_status = "property-mismatch"
+        elif runtime_residue:
+            primary_status = "runtime-residue"
         else:
-            primary_status = "failed"
-    elif completed is None:
-        primary_status = "not-completed"
-    elif completed.returncode != 0:
-        primary_status = "child-failed"
-    elif not release_tree_immutable:
-        primary_status = "property-mismatch"
-    elif runtime_residue:
-        primary_status = "runtime-residue"
-    else:
-        primary_status = "complete"
-    summary = {
-        "child_process_closure": child_process_closure,
-        "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
-        "cleanup_status": "incomplete" if cleanup_failures else "complete",
-        "install_parent_is_sticky_world_writable": True,
-        "no_child_runtime_profile": closure_proof.runtime_profile,
-        "primary_failure": (
-            asdict(primary_failure) if primary_failure is not None else None
-        ),
-        "primary_status": primary_status,
-        "release_tree_immutable": release_tree_immutable,
-        "release_tree_property": "object-identity-content-access-policy",
-        "retained_paths": retained_paths,
-        "returncode": completed.returncode if completed is not None else None,
-        "runtime_residue": list(runtime_residue),
-        "secondary_failures": [asdict(failure) for failure in secondary_failures],
-        "signal_number": (
-            signal_error.signal_number if signal_error is not None else None
-        ),
-        "timed_out": timeout_error is not None,
-    }
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+            primary_status = "complete"
+        summary: dict[str, object] = {
+            "child_process_closure": child_process_closure,
+            "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
+            "cleanup_guarantee": CLEANUP_GUARANTEE,
+            "cleanup_status": "incomplete" if cleanup_failures else "complete",
+            "creation_origin_guarantee": CREATION_ORIGIN_GUARANTEE,
+            "creation_origin_proven": False,
+            "install_parent_is_sticky_world_writable": True,
+            "no_child_runtime_profile": closure_proof.runtime_profile,
+            "primary_failure": (
+                asdict(primary_failure) if primary_failure is not None else None
+            ),
+            "primary_status": primary_status,
+            "release_tree_immutable": release_tree_immutable,
+            "release_tree_property": "object-identity-content-access-policy",
+            "retained_paths": retained_paths,
+            "returncode": completed.returncode if completed is not None else None,
+            "runtime_residue": list(runtime_residue),
+            "secondary_failures": [asdict(failure) for failure in secondary_failures],
+            "signal_number": lifecycle_fence.terminal_selected_signal,
+            "timed_out": timeout_error is not None,
+        }
 
-    primary_failed = primary_status != "complete"
-    if primary_failure is not None:
-        print(
-            "read-only installed supervisor primary failure: "
-            + json.dumps(
-                asdict(primary_failure),
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-    if secondary_failures:
-        print(
-            "read-only installed supervisor secondary failures: "
-            + json.dumps(
-                [asdict(failure) for failure in secondary_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-    if completed is not None and primary_failed:
-        if completed.stdout:
-            print(_bounded_failure_text(completed.stdout), file=sys.stderr)
-        if completed.stderr:
-            print(_bounded_failure_text(completed.stderr), file=sys.stderr)
-    if timeout_error is not None:
-        print("read-only installed supervisor regression timed out", file=sys.stderr)
-    if cleanup_failures:
-        print(
-            "read-only installed supervisor cleanup incomplete: "
-            + json.dumps(
-                [asdict(failure) for failure in cleanup_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-    if signal_error is not None:
-        returncode = 128 + signal_error.signal_number
+        primary_failed = primary_status != "complete"
+        diagnostic_lines: list[str] = []
+        if primary_failure is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor primary failure: "
+                + _serialize_terminal_json(
+                    asdict(primary_failure),
+                    operation="primary-diagnostic-serialization",
+                )
+            )
+        if secondary_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor secondary failures: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in secondary_failures],
+                    operation="secondary-diagnostic-serialization",
+                )
+            )
+        if completed is not None and primary_failed:
+            if completed.stdout:
+                diagnostic_lines.append(_bounded_failure_text(completed.stdout))
+            if completed.stderr:
+                diagnostic_lines.append(_bounded_failure_text(completed.stderr))
+        if timeout_error is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor regression timed out"
+            )
+        if cleanup_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor cleanup incomplete: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in cleanup_failures],
+                    operation="cleanup-diagnostic-serialization",
+                )
+            )
+        diagnostics = "".join(line + "\n" for line in diagnostic_lines)
+    except TerminalPublicationError:
+        raise
+    except BaseException as error:
+        raise TerminalPublicationError("summary-construction", error) from error
+
+    if lifecycle_fence.terminal_selected_signal is not None:
+        returncode = 128 + lifecycle_fence.terminal_selected_signal
     else:
         returncode = 1 if primary_failed or cleanup_failures else 0
-    sys.stdout.flush()
-    sys.stderr.flush()
-    if lifecycle_fence.received_signal is not None:
-        return 128 + lifecycle_fence.received_signal
+    lifecycle_fence.terminal_exit_code = returncode
+    _publish_terminal_output(
+        summary,
+        diagnostics,
+        terminal_process=terminal_process,
+    )
+    lifecycle_fence.terminal_output_committed = True
     return returncode
 
 
-def main() -> int:
+def main(*, _terminal_process: bool = False) -> int:
     if sys.platform != "darwin":
         print(
             "read-only installed supervisor regression requires Darwin", file=sys.stderr
@@ -1612,7 +1603,35 @@ def main() -> int:
         return 2
     lifecycle_fence = _install_lifecycle_signal_fence()
     try:
-        returncode = _run_main(lifecycle_fence)
+        returncode = _run_main(
+            lifecycle_fence,
+            terminal_process=_terminal_process,
+        )
+    except TerminalPublicationError as publication_error:
+        _report_terminal_publication_failure(publication_error)
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            publication_error.add_note(
+                "lifecycle signal restoration failed after publication error: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+            _report_terminal_publication_failure(
+                TerminalPublicationError(
+                    "signal-fence-restoration",
+                    restore_error,
+                )
+            )
+            if lifecycle_fence.terminal_selected_signal is not None:
+                if lifecycle_fence.terminal_exit_code is not None:
+                    return lifecycle_fence.terminal_exit_code
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return 1
+        if lifecycle_fence.terminal_selected_signal is not None:
+            if lifecycle_fence.terminal_exit_code is None:
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return lifecycle_fence.terminal_exit_code
+        return 1
     except BaseException as primary_error:
         try:
             _restore_lifecycle_signal_fence(lifecycle_fence)
@@ -1622,11 +1641,14 @@ def main() -> int:
                 f"{type(restore_error).__name__}: {restore_error}"
             )
         raise
+    # The CLI exits with the sealed decision while lifecycle signals stay blocked.
+    if _terminal_process and lifecycle_fence.terminal_output_committed:
+        return returncode
     received_signal = _restore_lifecycle_signal_fence(lifecycle_fence)
-    if received_signal is not None:
+    if not lifecycle_fence.terminal_output_committed and received_signal is not None:
         return 128 + received_signal
     return returncode
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(_terminal_process=True))
