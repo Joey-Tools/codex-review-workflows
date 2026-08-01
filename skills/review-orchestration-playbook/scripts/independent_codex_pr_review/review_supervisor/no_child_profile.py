@@ -3241,6 +3241,10 @@ def require_compatible(evidence: CompatibilityEvidence) -> None:
 
 
 def _require_live_runtime(evidence: CompatibilityEvidence) -> None:
+    if not evidence.production_capable:
+        raise NoChildProfileError(
+            "no-child launch requires the exact production runtime pin"
+        )
     blockers: list[str] = []
     if _runtime_fingerprint() != evidence.runtime:
         blockers.append("runtime-changed-after-probe")
@@ -3325,6 +3329,10 @@ def prepare_sandboxed_python_no_child_profile(
     through launch.
     """
 
+    if runtime_pin != PINNED_RUNTIME:
+        raise NoChildProfileError(
+            "custom no-child runtime pins are probe-only and cannot authorize launch"
+        )
     evidence = probe_compatibility(pin=runtime_pin)
     require_compatible(evidence)
     sandbox_exec = authenticate_executable(

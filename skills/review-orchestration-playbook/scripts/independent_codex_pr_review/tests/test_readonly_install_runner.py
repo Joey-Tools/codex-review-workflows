@@ -1354,6 +1354,49 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertEqual(summaries, ())
                 self.assertIn("terminal publication failed", stderr)
 
+    def test_no_child_suite_python_startup_ignores_site_injection(self) -> None:
+        with owned_temporary_directory("readonly-startup-isolation-") as root:
+            path_payload = root / "python-path"
+            path_payload.mkdir(mode=0o700)
+            site_marker = root / "sitecustomize-ran"
+            (path_payload / "sitecustomize.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(site_marker)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+
+            user_base = root / "user-base"
+            user_site = user_base / "lib" / "python3.13" / "site-packages"
+            user_site.mkdir(parents=True, mode=0o700)
+            pth_marker = root / "pth-ran"
+            (user_site / "startup-injection.pth").write_text(
+                f"import pathlib; pathlib.Path({str(pth_marker)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(path_payload)
+            environment["PYTHONUSERBASE"] = str(user_base)
+            result = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    "import sys; assert sys.flags.isolated and sys.flags.no_site",
+                ),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(site_marker.exists())
+            self.assertFalse(pth_marker.exists())
+
     def test_snapshot_binds_acl_and_xattr_evidence(self) -> None:
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
@@ -1932,8 +1975,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 "Resources/Python.app/Contents/MacOS/Python",
             )
             self.assertNotEqual(argv[0], sys.executable)
-            self.assertIn("os.environ['TMPDIR']=sys.argv[2]", argv[3])
-            self.assertIn("tempfile.tempdir=sys.argv[2]", argv[3])
+            self.assertEqual(argv[1:5], ("-I", "-S", "-B", "-c"))
+            self.assertIn("not sys.flags.isolated", argv[5])
+            self.assertIn("not sys.flags.no_site", argv[5])
+            self.assertIn("os.environ['TMPDIR']=sys.argv[2]", argv[5])
+            self.assertIn("tempfile.tempdir=sys.argv[2]", argv[5])
             self.assertEqual(
                 run_bounded_command.call_args.kwargs["max_stdout_bytes"],
                 1024,

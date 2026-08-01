@@ -48,6 +48,10 @@ REQUIRED_TEST_CASES = tuple(
         ReadOnlyInstallRunnerTests,
         "test_terminal_signal_publication_is_linearized_in_a_real_process",
     ),
+    (
+        ReadOnlyInstallRunnerTests,
+        "test_no_child_suite_python_startup_ignores_site_injection",
+    ),
 )
 REQUIRED_TEST_KEYS = frozenset(
     (test_class.__module__, test_class.__name__, method)
@@ -67,7 +71,7 @@ def main() -> int:
     )
     expected_count = len(REQUIRED_TEST_CASES)
     if (
-        expected_count != 12
+        expected_count != 13
         or len(REQUIRED_TEST_KEYS) != expected_count
         or suite.countTestCases() != expected_count
     ):

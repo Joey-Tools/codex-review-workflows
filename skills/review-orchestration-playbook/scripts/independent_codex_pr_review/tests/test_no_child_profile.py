@@ -2611,6 +2611,41 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 {"DYLD_INSERT_LIBRARIES": "/synthetic/injected.dylib"}
             )
 
+    def test_custom_runtime_pin_cannot_prepare_or_launch(self) -> None:
+        custom_pin = replace(
+            profile.PINNED_RUNTIME,
+            macos_product_version="synthetic-probe-only-runtime",
+        )
+        with (
+            mock.patch.object(profile, "probe_compatibility") as probe,
+            mock.patch.object(profile, "authenticate_executable") as authenticate,
+            self.assertRaisesRegex(profile.NoChildProfileError, "probe-only"),
+        ):
+            profile.prepare_sandboxed_python_no_child_profile(
+                runtime_pin=custom_pin,
+            )
+        probe.assert_not_called()
+        authenticate.assert_not_called()
+
+        prepared = replace(
+            _synthetic_prepared_launch(),
+            evidence=mock.Mock(production_capable=False),
+        )
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_fork_with_launch_error_pipe") as fork,
+            self.assertRaisesRegex(
+                profile.NoChildProfileError,
+                "exact production runtime pin",
+            ),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [prepared.executable.path],
+                cwd="/",
+            )
+        fork.assert_not_called()
+
     def test_sandboxed_python_preparation_binds_path_execution_attestation(
         self,
     ) -> None:
@@ -2639,10 +2674,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
         evidence = mock.Mock()
         evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
-        runtime_pin = replace(
-            profile.PINNED_RUNTIME,
-            macos_product_version="synthetic-reviewed-runtime",
-        )
+        runtime_pin = profile.PINNED_RUNTIME
         with (
             mock.patch.object(
                 profile,
@@ -2729,10 +2761,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
         evidence = mock.Mock()
         evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
-        runtime_pin = replace(
-            profile.PINNED_RUNTIME,
-            macos_product_version="synthetic-reviewed-runtime",
-        )
+        runtime_pin = profile.PINNED_RUNTIME
         with owned_temporary_directory("sandboxed-python-writable-root-") as root:
             writable_path = root / "runtime"
             writable_path.mkdir(mode=0o700)

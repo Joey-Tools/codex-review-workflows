@@ -84,7 +84,7 @@ PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_det
 ```
 
 Record the interpreter's absolute path and digest and exact `head_sha`; record
-the live runner's twelve tests, zero skips, and terminal result, followed by the
+the live runner's thirteen tests, zero skips, and terminal result, followed by the
 read-only install runner's complete structured summary. Accept that summary
 only when all of these predicates hold:
 

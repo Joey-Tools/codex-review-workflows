@@ -56,6 +56,8 @@ CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
 NO_CHILD_SUITE_CODE = (
     "import errno,os,pathlib,runpy,sys,tempfile\n"
+    "if not sys.flags.isolated or not sys.flags.no_site:\n"
+    " raise RuntimeError('read-only test child requires isolated no-site startup')\n"
     "root=pathlib.Path(sys.argv[1])\n"
     "runtime=pathlib.Path(sys.argv[2])\n"
     f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
@@ -546,6 +548,8 @@ def _run_no_child_test_suite(
             )
         argv = (
             target.path,
+            "-I",
+            "-S",
             "-B",
             "-c",
             NO_CHILD_SUITE_CODE,

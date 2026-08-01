@@ -3,7 +3,7 @@ id: 20260730-rss001
 title: Read-Only Supervisor Scratch
 status: completed
 created: 2026-07-30
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -290,3 +290,14 @@ superseded_by:
   the pre-seal, serialization, write, stdout-flush, stderr-flush, and pending
   restore boundaries, and requires the sole JSON record and OS return code to
   reflect the same sealed outcome.
+- Fresh frozen-range Codex review found two launch-authority gaps. A custom
+  runtime pin could pass behavior probes and reach a real launch despite being
+  non-production, and the read-only child used `-B -c`, allowing ambient
+  `sitecustomize` or `.pth` startup code to run before the selected suite.
+  Custom pins are now probe-only, preparation rejects them before probe or
+  executable authentication, and launch requires exact production-capable
+  evidence. The child uses and self-checks `-I -S -B`; a live real-process test
+  injects both startup mechanisms and proves neither marker is created.
+- The affected Python 3.13 modules passed 106/106. The reviewed deterministic
+  selection passed 649/649 in 205.965 seconds with identity SHA-256
+  `7be8915dfd39ff943aa782c73ea2e259c6a9c6a8a68bdd305227d85a1e712e56`.

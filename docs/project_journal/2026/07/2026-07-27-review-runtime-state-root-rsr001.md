@@ -3,7 +3,7 @@ id: 20260727-rsr001
 title: Review Runtime State Root
 status: completed
 created: 2026-07-27
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/review-runtime-state-no-bytecode
 pr:
 supersedes: []
@@ -356,3 +356,15 @@ superseded_by:
   cleanup locators, replacement-safe cleanup decisions, close-error priority,
   all four lifecycle signals in real child processes, and JSON/exit agreement
   across serialization, partial write, newline, and flush failures.
+- Fresh frozen-range Codex review then found that a custom diagnostic runtime
+  pin could authorize a real sandboxed launch and that the read-only Python
+  child still admitted global `site` initialization. Custom pins are now
+  probe-only: sandboxed preparation rejects them before any probe, and launch
+  requires `production_capable` evidence from the exact `PINNED_RUNTIME`.
+  The read-only child starts with `-I -S -B`, verifies both startup flags in its
+  payload, and has a live regression proving injected `sitecustomize` and user
+  `.pth` payloads do not execute.
+- The post-review Python 3.13 focused modules passed 106/106. The ordinary
+  deterministic gate passed 649/649 in 205.965 seconds with the reviewed 649-test selected identity
+  and SHA-256
+  `7be8915dfd39ff943aa782c73ea2e259c6a9c6a8a68bdd305227d85a1e712e56`.

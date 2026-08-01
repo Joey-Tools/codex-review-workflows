@@ -1796,9 +1796,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("CodexExecutableAuthenticationTests", live_runner)
         self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
-        self.assertIn("expected_count != 12", live_runner)
+        self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 648", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 649", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1917,7 +1917,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("sandbox_apply", hosted_probe)
         for requirement in (
             "operator-enforced exact-head gate",
-            "live runner's twelve tests, zero skips",
+            "live runner's thirteen tests, zero skips",
             "Any push invalidates that evidence",
             "Hosted CI's blocker-signature probe is not a substitute",
             "cd skills/review-orchestration-playbook/scripts/"

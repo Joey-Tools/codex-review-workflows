@@ -354,7 +354,7 @@ PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --hel
 ```
 
 第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二、三条命令只允许在匹配生产 pin、
-且没有外层 Seatbelt 的受信任 Mac 上连续运行。十二项 live 测试必须全部执行并通过，随后
+且没有外层 Seatbelt 的受信任 Mac 上连续运行。十三项 live 测试必须全部执行并通过，随后
 read-only install runner 必须返回完整成功的 structured summary。该 summary 只有在
 `primary_status == "complete"`、`primary_failure == null`、
 `child_process_closure == "proven"`、`cleanup_status == "complete"`、
@@ -377,6 +377,6 @@ identity-unproven 或 mismatch，就保留对象且绝不删除当前 replacemen
 
 这个 Trusted Mac gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub
 check、branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR
-delivery evidence 必须记录对应 `head_sha`、Python absolute path/digest、12 tests、0 skips、
+delivery evidence 必须记录对应 `head_sha`、Python absolute path/digest、13 tests、0 skips、
 live terminal result 和紧随其后的 read-only structured summary；任何后续 push 都会使证据
 失效。缺少任一项时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。
