@@ -318,6 +318,25 @@ def _kill_verified_process(pid: int, start_identity: str) -> None:
 
 
 class RawGitProtocolTests(unittest.TestCase):
+    def test_group_cleanup_requires_stable_empty_observations(self) -> None:
+        anchor = SimpleNamespace(pid=101, pgid=101)
+        with (
+            mock.patch.object(
+                gitraw,
+                "anchored_group_members",
+                side_effect=((101,), (101, 202), (101,), (101,)),
+            ) as group_members,
+            mock.patch.object(gitraw, "signal_anchored_group") as signal_group,
+            mock.patch.object(gitraw.time, "sleep"),
+        ):
+            gitraw._wait_anchored_group_without_other_members(
+                anchor,
+                deadline=time.monotonic() + 1.0,
+            )
+
+        self.assertEqual(group_members.call_count, 4)
+        signal_group.assert_called_once_with(anchor, signal.SIGKILL)
+
     def test_repository_inspection_preserves_unproven_git_closure(self) -> None:
         process = SimpleNamespace(
             pid=123,

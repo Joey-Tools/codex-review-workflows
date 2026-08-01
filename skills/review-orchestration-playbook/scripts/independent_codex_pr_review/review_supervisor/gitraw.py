@@ -64,6 +64,7 @@ CAT_FILE_READ_TIMEOUT_SECONDS = 30.0
 CAT_FILE_STDERR_LIMIT_BYTES = 8192
 PROCESS_GROUP_TERMINATE_GRACE_SECONDS = 0.1
 PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+PROCESS_GROUP_EMPTY_CONFIRMATIONS = 2
 LOCAL_CONFIG_BYTES_LIMIT = 1024 * 1024
 GITDIR_POINTER_BYTES_LIMIT = 64 * 1024
 _CONFIG_SECTION_PATTERN = re.compile(rb"^\[\s*([A-Za-z0-9][A-Za-z0-9-]*)")
@@ -296,11 +297,16 @@ def _wait_anchored_group_without_other_members(
     *,
     deadline: float,
 ) -> None:
+    empty_confirmations = 0
     while True:
         members = anchored_group_members(group_anchor, deadline=deadline)
-        if not any(pid != group_anchor.pid for pid in members):
-            return
-        signal_anchored_group(group_anchor, signal.SIGKILL)
+        if any(pid != group_anchor.pid for pid in members):
+            empty_confirmations = 0
+            signal_anchored_group(group_anchor, signal.SIGKILL)
+        else:
+            empty_confirmations += 1
+            if empty_confirmations >= PROCESS_GROUP_EMPTY_CONFIRMATIONS:
+                return
         if time.monotonic() >= deadline:
             raise TimeoutError("process-group members survived cleanup")
         time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))

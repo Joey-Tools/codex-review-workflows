@@ -275,16 +275,21 @@ superseded_by:
   reuse, and mutable state or credential fields are intentionally not identity
   signals.
 - The final runtime-root reentry, parent-publication, recovery-admission,
-  child-FD settlement, and recovery directory-FD custody changes passed 776/776
-  deterministic tests in 90.357 seconds on the same uv-managed
-  CPython 3.13.13 runtime. The reviewed 776-test selected identity has
-  SHA-256
-  `e7a7ac91c591d27a82b26f6e7a412364c171ee5832913aed5d8fcef05f70fc02`.
+  child-FD settlement, recovery directory-FD custody, and delayed Darwin
+  process-visibility changes passed 781/781 deterministic tests in 102.218
+  seconds on the same uv-managed CPython 3.13.13 runtime. The
+  reviewed 781-test selected identity has SHA-256
+  `3cd1f96fb56e1ba396da7f1cb0a384d2cefaf8c7458c019e1be5a5cd1e8a5333`.
   Runtime-root custody continues to bind object identity independently from
   access-policy evidence: directory child churn is benign, while pathname
   replacement, content mutation, unreadable revalidation, and policy drift
-  remain distinct fail-closed outcomes.
+  remain distinct fail-closed outcomes. Process closure likewise retains exact
+  `(PID, start seconds, start microseconds)` identity; the numeric Darwin state
+  is diagnostic only. Empty process-group and exact-identity absence results
+  must remain stable across bounded observation windows, and terminal direct
+  children are reaped before closure can be proven. Zombies and persistent live
+  identities continue to block cleanup until exact absence is observed.
 - The post-CI correction rejects non-3.13 interpreters before importing the
   supervisor package, so unsupported runtimes cannot replace the stable version
-  diagnostic with an import failure. The complete contract module passed
-  105/105 on the uv-managed CPython 3.13.13 runtime.
+  diagnostic with an import failure. The current complete contract module
+  passed 105/105 in 3.945 seconds on the uv-managed CPython 3.13.13 runtime.

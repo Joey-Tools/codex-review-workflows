@@ -80,6 +80,7 @@ DARWIN_KERN_PROC_PID = 1
 DARWIN_KINFO_PROC_BYTES = 648
 DARWIN_PROCESS_CENSUS_CAP = 4096
 DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS = 5.0
+DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS = 0.25
 SANDBOX_FILTER_NONE = 0
 CHILD_ACCOUNT_PROBE_ENVIRONMENT = {
     "LANG": "C",
@@ -213,6 +214,9 @@ class DarwinProcessIdentity:
     pid: int
     start_seconds: int
     start_microseconds: int
+    # Process state is diagnostic/scope evidence, not object identity. A live
+    # process can become terminal without occupying a new process-table slot.
+    process_state: bytes = field(default=b"?", compare=False)
 
 
 class ChildProcessTreeClosureUnproven(RuntimeError):
@@ -225,6 +229,7 @@ class ChildProcessTreeClosureUnproven(RuntimeError):
         self.cause = cause
         identities = ",".join(
             f"{item.pid}:{item.start_seconds}.{item.start_microseconds:06d}"
+            f"/state={item.process_state[0] if len(item.process_state) == 1 else -1}"
             for item in processes[:16]
         )
         if len(processes) > 16:
@@ -561,6 +566,7 @@ def _darwin_same_uid_processes(
                     pid=pid,
                     start_seconds=value.identity.p_starttime.tv_sec,
                     start_microseconds=value.identity.p_starttime.tv_usec,
+                    process_state=bytes(value.identity.p_stat),
                 )
             )
         if not retry_census:
@@ -595,22 +601,92 @@ def _require_no_new_same_uid_processes(
 ) -> None:
     operation_deadline = _process_census_deadline(deadline)
     baseline_set = set(baseline)
-    for pause in (0.0, 0.01):
-        if pause:
-            remaining = operation_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("same-UID Darwin process census deadline expired")
-            time.sleep(min(pause, remaining))
-            _require_process_census_time(operation_deadline)
+    last_escaped: tuple[DarwinProcessIdentity, ...] = ()
+    absent_since: float | None = None
+    while True:
+        if time.monotonic() >= operation_deadline:
+            if last_escaped:
+                raise ChildProcessTreeClosureUnproven(last_escaped)
+            raise ChildProcessTreeClosureUnproven(
+                (),
+                TimeoutError("same-UID Darwin process census deadline expired"),
+            )
         observed = _darwin_same_uid_processes(deadline=operation_deadline)
         escaped = tuple(item for item in observed if item not in baseline_set)
         if escaped:
-            raise ChildProcessTreeClosureUnproven(escaped)
+            last_escaped = escaped
+            absent_since = None
+            _reap_terminal_same_uid_children(escaped)
+        else:
+            now = time.monotonic()
+            if absent_since is None:
+                absent_since = now
+            elif now - absent_since >= DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS:
+                return
         if not any(item.pid == os.getpid() for item in observed):
             raise ChildProcessTreeClosureUnproven(
                 (),
                 OSError(errno.ESTALE, "process census omitted the supervisor"),
             )
+        remaining = operation_deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        time.sleep(min(0.01, remaining))
+
+
+def _reap_terminal_same_uid_children(
+    processes: tuple[DarwinProcessIdentity, ...],
+) -> None:
+    for process in processes:
+        try:
+            terminal = os.waitid(
+                os.P_PID,
+                process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            # A same-UID process that is not our child remains census-visible
+            # and therefore cannot be promoted to proven closure here.
+            continue
+        except ProcessLookupError:
+            continue
+        if terminal is None:
+            continue
+        if terminal.si_pid != process.pid:
+            raise ChildProcessError("terminal child status returned a different PID")
+        waited, _ = os.waitpid(process.pid, os.WNOHANG)
+        if waited not in (0, process.pid):
+            raise ChildProcessError("terminal child reap returned a different PID")
+
+
+def _require_process_identities_absent(
+    processes: tuple[DarwinProcessIdentity, ...],
+    *,
+    deadline: float | None = None,
+) -> None:
+    operation_deadline = _process_census_deadline(deadline)
+    required_absent = set(processes)
+    absent_since: float | None = None
+    last_present = processes
+    while True:
+        if time.monotonic() >= operation_deadline:
+            raise ChildProcessTreeClosureUnproven(last_present)
+        observed = set(_darwin_same_uid_processes(deadline=operation_deadline))
+        present = tuple(sorted(required_absent & observed))
+        if present:
+            last_present = present
+            absent_since = None
+            _reap_terminal_same_uid_children(present)
+        else:
+            now = time.monotonic()
+            if absent_since is None:
+                absent_since = now
+            elif now - absent_since >= DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS:
+                return
+        remaining = operation_deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        time.sleep(min(0.01, remaining))
 
 
 def _require_sudo_exec_denied() -> None:

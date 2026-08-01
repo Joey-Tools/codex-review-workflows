@@ -17,6 +17,7 @@ from dataclasses import asdict
 from unittest import mock
 
 from review_supervisor import recovery_cleanup
+from review_supervisor.process import process_start_identity
 
 from . import run_readonly_install_deterministic_supervisor as runner
 from . import support
@@ -191,7 +192,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         pid: int,
         start_seconds: int = 1_700_000_000,
         start_microseconds: int = 123_456,
-        process_state: bytes = b"S",
+        process_state: bytes = b"\x03",
         returned_size: int = 648,
         real_uid: int | None = None,
         effective_uid: int | None = None,
@@ -374,7 +375,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     pid=pid,
                     start_seconds=1_700_000_002,
                     start_microseconds=123_456,
-                    process_state=b"Z",
+                    process_state=b"\x05",
                     real_uid=502,
                     effective_uid=501,
                 )
@@ -562,6 +563,168 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(baseline, (existing, departing, arriving))
+
+    def test_same_uid_closure_reaps_terminal_child_then_proves_absence(
+        self,
+    ) -> None:
+        supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
+        terminal_child = runner.DarwinProcessIdentity(
+            90_005,
+            1_700_000_005,
+            5_005,
+            process_state=b"\x05",
+        )
+        clock = {"now": 0.0}
+        observations = {"count": 0}
+
+        def census(*, deadline: float | None = None) -> tuple[object, ...]:
+            del deadline
+            observations["count"] += 1
+            return (
+                (supervisor, terminal_child)
+                if observations["count"] in {1, 3}
+                else (supervisor,)
+            )
+
+        def advance(duration: float) -> None:
+            clock["now"] += duration
+
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=census,
+            ) as census,
+            mock.patch.object(
+                runner,
+                "_reap_terminal_same_uid_children",
+            ) as reap_terminal,
+            mock.patch.object(
+                runner.time,
+                "monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            mock.patch.object(runner.time, "sleep", side_effect=advance),
+        ):
+            runner._require_no_new_same_uid_processes(
+                (supervisor,),
+                deadline=1.0,
+            )
+
+        self.assertGreaterEqual(census.call_count, 3)
+        self.assertEqual(
+            reap_terminal.call_args_list,
+            [mock.call((terminal_child,)), mock.call((terminal_child,))],
+        )
+
+    def test_same_uid_closure_rejects_persistent_exact_identity(self) -> None:
+        supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
+        escaped = runner.DarwinProcessIdentity(
+            90_006,
+            1_700_000_006,
+            6_006,
+            process_state=b"\x03",
+        )
+        clock = {"now": 0.0}
+
+        def advance(duration: float) -> None:
+            clock["now"] += duration
+
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(supervisor, escaped),
+            ),
+            mock.patch.object(
+                runner,
+                "_reap_terminal_same_uid_children",
+            ),
+            mock.patch.object(
+                runner.time,
+                "monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            mock.patch.object(runner.time, "sleep", side_effect=advance),
+            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
+        ):
+            runner._require_no_new_same_uid_processes(
+                (supervisor,),
+                deadline=0.02,
+            )
+
+        self.assertEqual(closure.exception.processes, (escaped,))
+
+    def test_terminal_same_uid_child_is_reaped_by_exact_pid(self) -> None:
+        terminal_child = runner.DarwinProcessIdentity(
+            90_007,
+            1_700_000_007,
+            7_007,
+            process_state=b"\x05",
+        )
+        with (
+            mock.patch.object(
+                runner.os,
+                "waitid",
+                return_value=mock.Mock(si_pid=terminal_child.pid),
+            ) as waitid,
+            mock.patch.object(
+                runner.os,
+                "waitpid",
+                return_value=(terminal_child.pid, 0),
+            ) as waitpid,
+        ):
+            runner._reap_terminal_same_uid_children((terminal_child,))
+
+        waitid.assert_called_once_with(
+            os.P_PID,
+            terminal_child.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        waitpid.assert_called_once_with(terminal_child.pid, os.WNOHANG)
+
+    def test_exact_identity_absence_accepts_same_pid_reuse(self) -> None:
+        old_process = runner.DarwinProcessIdentity(
+            90_008,
+            1_700_000_008,
+            8_008,
+            process_state=b"\x05",
+        )
+        replacement = runner.DarwinProcessIdentity(
+            old_process.pid,
+            old_process.start_seconds + 1,
+            old_process.start_microseconds,
+            process_state=b"\x02",
+        )
+        clock = {"now": 0.0}
+
+        def advance(duration: float) -> None:
+            clock["now"] += duration
+
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(replacement,),
+            ) as census,
+            mock.patch.object(
+                runner,
+                "_reap_terminal_same_uid_children",
+            ) as reap_terminal,
+            mock.patch.object(
+                runner.time,
+                "monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            mock.patch.object(runner.time, "sleep", side_effect=advance),
+        ):
+            runner._require_process_identities_absent(
+                (old_process,),
+                deadline=1.0,
+            )
+
+        self.assertGreaterEqual(census.call_count, 2)
+        reap_terminal.assert_not_called()
 
     def test_isolated_child_account_rejects_admin_membership(self) -> None:
         with (
@@ -6259,7 +6422,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
     def test_bounded_child_rejects_setsid_double_fork_escape(self) -> None:
         child_script = (
-            "import os,pathlib,sys,time\n"
+            "import os,pathlib,signal,sys,time\n"
             "marker=pathlib.Path(sys.argv[1])\n"
             "first=os.fork()\n"
             "if first==0:\n"
@@ -6267,6 +6430,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             " second=os.fork()\n"
             " if second==0:\n"
             "  os.closerange(0,3)\n"
+            "  signal.signal(signal.SIGHUP,signal.SIG_IGN)\n"
             "  marker.write_text(str(os.getpid()),encoding='ascii')\n"
             "  time.sleep(300)\n"
             "  os._exit(0)\n"
@@ -6278,39 +6442,103 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         with owned_temporary_directory("readonly-child-session-escape-") as root:
             marker = root / "escaped-process"
             escaped_pid: int | None = None
-            try:
-                started = time.monotonic()
-                with self.assertRaises(
-                    runner.ChildProcessTreeClosureUnproven
-                ) as escaped:
-                    runner._run_bounded_child(
-                        (
-                            sys.executable,
-                            "-B",
-                            "-c",
-                            child_script,
-                            str(marker),
-                        ),
-                        cwd=root,
-                        environment={
-                            "LANG": "C",
-                            "LC_ALL": "C",
-                            "PATH": "/usr/bin:/bin",
-                            "PYTHONDONTWRITEBYTECODE": "1",
-                        },
-                        timeout=10,
-                        stdout_limit=1024,
-                        stderr_limit=1024,
-                    )
-                self.assertLess(time.monotonic() - started, 5)
-                self.assertIsNone(escaped.exception.__cause__)
-                escaped_pid = int(marker.read_text(encoding="ascii"))
-            finally:
-                if escaped_pid is not None:
+            escaped_identity: runner.DarwinProcessIdentity | None = None
+
+            def bind_identity(pid: int) -> runner.DarwinProcessIdentity:
+                raw_identity = process_start_identity(pid)
+                prefix = "darwin-proc-start:"
+                if not raw_identity.startswith(prefix):
+                    raise AssertionError("fixture process identity is not Darwin")
+                seconds, microseconds = raw_identity.removeprefix(prefix).split(":")
+                return runner.DarwinProcessIdentity(
+                    pid,
+                    int(seconds),
+                    int(microseconds),
+                )
+
+            supervisor_identity = bind_identity(os.getpid())
+
+            def fixture_census(
+                *,
+                deadline: float | None = None,
+            ) -> tuple[runner.DarwinProcessIdentity, ...]:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("fixture process census deadline expired")
+                observed = [supervisor_identity]
+                try:
+                    raw_pid = marker.read_bytes()
+                except FileNotFoundError:
+                    raw_pid = b""
+                if 1 <= len(raw_pid) <= 20 and raw_pid.isdigit():
                     try:
-                        os.kill(escaped_pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                        observed.append(bind_identity(int(raw_pid)))
+                    except (ProcessLookupError, ValueError):
                         pass
+                return tuple(observed)
+
+            # The ordinary developer account can have unrelated same-UID
+            # process churn. Keep this live integration on real per-PID Darwin
+            # start identities scoped to its exact fixture process; the hosted
+            # isolated-account gate runs the unfiltered production census
+            # around the complete child suite.
+            with mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=fixture_census,
+            ):
+                try:
+                    started = time.monotonic()
+                    with self.assertRaises(
+                        runner.ChildProcessTreeClosureUnproven
+                    ) as escaped:
+                        runner._run_bounded_child(
+                            (
+                                sys.executable,
+                                "-B",
+                                "-c",
+                                child_script,
+                                str(marker),
+                            ),
+                            cwd=root,
+                            environment={
+                                "LANG": "C",
+                                "LC_ALL": "C",
+                                "PATH": "/usr/bin:/bin",
+                                "PYTHONDONTWRITEBYTECODE": "1",
+                            },
+                            timeout=10,
+                            stdout_limit=1024,
+                            stderr_limit=1024,
+                        )
+                    escaped_pid = int(marker.read_text(encoding="ascii"))
+                    escaped_identity = next(
+                        (
+                            process
+                            for process in escaped.exception.processes
+                            if process.pid == escaped_pid
+                        ),
+                        None,
+                    )
+                    self.assertLess(
+                        time.monotonic() - started,
+                        runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS + 1.0,
+                    )
+                    self.assertIsNone(escaped.exception.__cause__)
+                    self.assertIsNone(escaped.exception.cause)
+                    self.assertIsNotNone(
+                        escaped_identity,
+                        f"escaped PID {escaped_pid} absent from "
+                        f"closure evidence {escaped.exception.processes!r}; "
+                        f"cause={escaped.exception.cause!r}",
+                    )
+                finally:
+                    if escaped_pid is not None:
+                        try:
+                            os.kill(escaped_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    if escaped_identity is not None:
+                        runner._require_process_identities_absent((escaped_identity,))
 
     def test_bounded_child_output_overflow_settles_same_group_descendant(
         self,

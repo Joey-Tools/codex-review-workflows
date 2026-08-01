@@ -238,17 +238,36 @@ superseded_by:
   ordinary `/usr/bin/true`, while both root-setuid `/usr/bin/sudo` and setgid
   `/usr/bin/write` were rejected at `exec` with `EPERM` (sandbox exit 71). The
   hosted runner still must prove the same inherited policy before CI can pass.
-- The final async cleanup-boundary and recovery directory-FD custody
-  hardening passed 776/776 deterministic independent-supervisor tests in 90.357
-  seconds on the uv-managed CPython 3.13.13 runtime, with reviewed
-  selected-identity SHA-256
-  `e7a7ac91c591d27a82b26f6e7a412364c171ee5832913aed5d8fcef05f70fc02`.
+- The final async cleanup-boundary, recovery directory-FD custody, and delayed
+  Darwin process-visibility hardening passed 781/781 deterministic
+  independent-supervisor tests in 102.218 seconds on the uv-managed CPython
+  3.13.13 runtime, with reviewed selected-identity SHA-256
+  `3cd1f96fb56e1ba396da7f1cb0a384d2cefaf8c7458c019e1be5a5cd1e8a5333`.
   Caller-owned runtime-root and child-descriptor settlement now survives the
   remaining call/return interruption windows without retrying an ambiguous
   close. Recovery admission also rejects multiply linked non-directory objects
   before manifest publication. These checks protect exact object identity and
   the selected access policy; benign child-entry churn remains distinct from
   replacement, content mutation, or an access-policy change.
+- The remote failure after `f4f3198` exposed delayed same-group and terminal
+  child visibility after output-overflow settlement. Process-group emptiness
+  now requires stable observations, and the unfiltered same-UID closure census
+  requires 250 milliseconds of stable exact-identity absence within its
+  existing five-second deadline. It opportunistically reaps only terminal
+  direct children and never treats process state as identity: PID plus start
+  seconds and microseconds remain the protected process-table object. Zombies,
+  live descendants, unreadable census results, and identities that reappear
+  before the stability window still fail closed.
+- The live double-fork regression ignores `SIGHUP`, settles its escaped marker
+  PID to stable exact absence after cleanup, and uses real Darwin start identity
+  for only the supervisor and fixture process on an ordinary developer account.
+  This test-only scope avoids unrelated account process churn; the hosted
+  isolated-account gate continues to run the complete production census without
+  filtering. The read-only runner module passed 104/104 in 8.649 seconds, and
+  ten ordered output-overflow/double-fork stress rounds passed 20/20 in 58.9
+  seconds under the same uv-managed CPython 3.13.13 runtime. The complete
+  repository contract module passed 105/105 in 3.945 seconds with every helper
+  subprocess resolving that same uv-managed interpreter.
 - Hosted setup-uv paths are now resolved through physical parent ancestry to a
   regular non-symlink executable leaf before identity and digest binding. Exact
   version admission uses `uv self version --short`, while a regression accepts
