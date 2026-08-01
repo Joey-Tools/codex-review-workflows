@@ -2,20 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import platform
 import shutil
 import sys
-import tempfile
 
 from review_supervisor import no_child_profile as profile
 
+from .support import owned_temporary_directory
 from .test_no_child_profile import (
-    GITHUB_HOSTED_RUNTIME_PIN,
-    GITHUB_HOSTED_RUNTIME_PROFILE,
+    GITHUB_HOSTED_RUNTIME_PINS,
 )
 
-LIVE_RUNTIME_PROFILE_ENV = "CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE"
 RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
 RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
 PROBE_ACTIONS = (
@@ -29,6 +26,22 @@ PROBE_ACTIONS = (
     "exec",
 )
 CREATION_ACTIONS = ("fork", "posix_spawn", "popen", "double_fork")
+
+
+def _select_hosted_runtime_profile(
+    runtime: profile.RuntimeFingerprint,
+) -> tuple[str, profile.RuntimePin] | None:
+    matches = [
+        (name, pin)
+        for name, pin in GITHUB_HOSTED_RUNTIME_PINS.items()
+        if (
+            runtime.macos_product_version == pin.macos_product_version
+            and runtime.macos_build_version == pin.macos_build_version
+            and runtime.darwin_release == pin.darwin_release
+            and runtime.python_version[:2] == (pin.python_major, pin.python_minor)
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _expected_hosted_fail_closed_blockers(
@@ -171,7 +184,6 @@ def _signature_diagnostics(
 
 def main() -> int:
     required_environment = {
-        LIVE_RUNTIME_PROFILE_ENV: GITHUB_HOSTED_RUNTIME_PROFILE,
         RUNNER_ENVIRONMENT_ENV: "github-hosted",
         RUNNER_ARCH_ENV: "ARM64",
     }
@@ -186,13 +198,21 @@ def main() -> int:
     if platform.machine() != "arm64":
         print("hosted no-child probe requires an actual arm64 process", file=sys.stderr)
         return 2
+    observed_runtime = profile._runtime_fingerprint()
+    selected = _select_hosted_runtime_profile(observed_runtime)
+    if selected is None:
+        print(
+            "GitHub hosted no-child runtime is not in the reviewed profile catalog: "
+            f"product={observed_runtime.macos_product_version!r} "
+            f"build={observed_runtime.macos_build_version!r} "
+            f"darwin={observed_runtime.darwin_release!r} "
+            f"python={observed_runtime.python_version[:2]!r}",
+            file=sys.stderr,
+        )
+        return 2
+    runtime_profile, runtime_pin = selected
 
-    tests_directory = pathlib.Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(
-        prefix=".hosted-no-child-probe-",
-        dir=tests_directory,
-    ) as temporary:
-        root = pathlib.Path(temporary)
+    with owned_temporary_directory("hosted-no-child-probe-") as root:
         root.chmod(0o700)
         synthetic_python = root / "synthetic-python3.13"
         synthetic_alternate = root / "synthetic-alternate"
@@ -201,7 +221,7 @@ def main() -> int:
         synthetic_python.chmod(0o755)
         synthetic_alternate.chmod(0o755)
         evidence = profile.probe_compatibility(
-            pin=GITHUB_HOSTED_RUNTIME_PIN,
+            pin=runtime_pin,
             probe_executable_path=synthetic_python,
             alternate_executable_path=synthetic_alternate,
             python_home=sys.base_prefix,
@@ -210,23 +230,21 @@ def main() -> int:
     blockers = set(evidence.blockers)
     runtime = evidence.runtime
     runtime_matches = (
-        evidence.runtime_pin == GITHUB_HOSTED_RUNTIME_PIN
+        evidence.runtime_pin == runtime_pin
         and runtime.platform == "darwin"
         and runtime.system == "Darwin"
-        and runtime.macos_product_version
-        == GITHUB_HOSTED_RUNTIME_PIN.macos_product_version
-        and runtime.macos_build_version == GITHUB_HOSTED_RUNTIME_PIN.macos_build_version
-        and runtime.darwin_release == GITHUB_HOSTED_RUNTIME_PIN.darwin_release
+        and runtime.macos_product_version == runtime_pin.macos_product_version
+        and runtime.macos_build_version == runtime_pin.macos_build_version
+        and runtime.darwin_release == runtime_pin.darwin_release
         and runtime.python_version[:2]
         == (
-            GITHUB_HOSTED_RUNTIME_PIN.python_major,
-            GITHUB_HOSTED_RUNTIME_PIN.python_minor,
+            runtime_pin.python_major,
+            runtime_pin.python_minor,
         )
         and runtime.effective_uid not in {None, 0}
         and evidence.sandbox_exec is not None
         and evidence.sandbox_exec.path == str(profile.SANDBOX_EXEC)
-        and evidence.sandbox_exec.sha256
-        == GITHUB_HOSTED_RUNTIME_PIN.sandbox_exec_sha256
+        and evidence.sandbox_exec.sha256 == runtime_pin.sandbox_exec_sha256
     )
     observation_signature_matches = _matches_hosted_fail_closed_observations(evidence)
     signature_matches = (
@@ -243,6 +261,7 @@ def main() -> int:
         "compatible": evidence.compatible,
         "production_capable": evidence.production_capable,
         "reviewed_fail_closed_signature": signature_matches,
+        "runtime_profile": runtime_profile,
     }
     if not signature_matches:
         summary["signature_diagnostics"] = _signature_diagnostics(

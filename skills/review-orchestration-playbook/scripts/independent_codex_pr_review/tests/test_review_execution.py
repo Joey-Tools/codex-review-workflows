@@ -370,26 +370,23 @@ class ReviewExecutionTests(unittest.TestCase):
                 payload = lease.root / name
                 payload.write_text(name, encoding="ascii")
                 payload.chmod(0o600)
-            real_unlink = recovery_cleanup.os.unlink
+            real_unlink = recovery_cleanup._unlink_quarantined_leaf_critical
             unlink_calls = 0
             injected = OSError("synthetic runtime recursive deletion failure")
 
-            def fail_second_unlink(name: bytes, *, dir_fd: int) -> None:
+            def fail_second_unlink(**arguments: object) -> None:
                 nonlocal unlink_calls
-                if name not in {b"first.txt", b"second.txt"}:
-                    real_unlink(name, dir_fd=dir_fd)
-                    return
                 unlink_calls += 1
                 if unlink_calls == 2:
                     raise injected
-                real_unlink(name, dir_fd=dir_fd)
+                real_unlink(**arguments)
 
             retained_manifests: tuple[CustodiedManifest, ...] = ()
             try:
                 with (
                     patch.object(
-                        recovery_cleanup.os,
-                        "unlink",
+                        recovery_cleanup,
+                        "_unlink_quarantined_leaf_critical",
                         side_effect=fail_second_unlink,
                     ),
                     self.assertRaises(

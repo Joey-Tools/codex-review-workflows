@@ -1504,7 +1504,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
     def test_reviewed_ci_snapshots_use_source_only_python_checks(self) -> None:
-        expected_cache_guards = {"canonical": 2, "private": 4}
+        expected_cache_guards = {"canonical": 3, "private": 5}
         for profile, guard_count in expected_cache_guards.items():
             with self.subTest(profile=profile):
                 workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
@@ -1571,6 +1571,7 @@ class RepositoryContractTest(unittest.TestCase):
       - platform_tests
       - broker_reproducibility
       - independent_supervisor_tests
+      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1578,10 +1579,12 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             canonical,
         )
@@ -1595,6 +1598,7 @@ class RepositoryContractTest(unittest.TestCase):
       - platform-safety
       - broker_reproducibility
       - independent_supervisor_tests
+      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1604,12 +1608,14 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
             private,
         )
@@ -1653,9 +1659,6 @@ class RepositoryContractTest(unittest.TestCase):
             / "docs/project_journal/2026/07/"
             / "2026-07-27-review-runtime-state-root-rsr001.md"
         ).read_text(encoding="utf-8")
-        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
-            encoding="utf-8"
-        )
         self.assertIn(
             f"passed {expected_count}/{expected_count}",
             journal,
@@ -1665,12 +1668,6 @@ class RepositoryContractTest(unittest.TestCase):
             journal,
         )
         self.assertIn(f"`{expected_sha256}`", journal)
-        self.assertIn(
-            "Latest workstream: "
-            "`docs/project_journal/2026/07/"
-            "2026-07-27-review-runtime-state-root-rsr001.md`",
-            project_state,
-        )
 
     def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
@@ -1692,6 +1689,21 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--output", script)
         self.assertIn("not a security boundary", script)
         self.assertIn("byte-reproducible", script)
+        self.assertIn(
+            "digest does not match the reviewed pin "
+            "(expected=$expected actual=$actual)",
+            script,
+        )
+        self.assertIn("verified %s sha256=%s", script)
+        self.assertIn("select_hosted_codesign_sha256", script)
+        self.assertIn('EXPECTED_HOSTED_OS_VERSION="26.5.2"', script)
+        self.assertIn('EXPECTED_HOSTED_OS_BUILD="25F84"', script)
+        self.assertIn('EXPECTED_HOSTED_LEGACY_OS_VERSION="26.4"', script)
+        self.assertIn('EXPECTED_HOSTED_LEGACY_OS_BUILD="25E246"', script)
+        self.assertIn(
+            "hosted runner OS version/build is not reviewed",
+            script,
+        )
         for mode in ("DEVELOPER", "HOSTED"):
             for tool in (
                 "CLANG",
@@ -1705,6 +1717,52 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
         self.assertIn("initialize_expected_tool_digests", script)
 
+    def test_hosted_codesign_pin_journal_records_both_runner_generations(
+        self,
+    ) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-30-hosted-broker-codesign-pin-hbp001.md"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "macOS 26.4 build `25E246`",
+            "06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337",
+            "macOS 26.5.2 build `25F84`",
+            "214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7",
+            "90814780194",
+            "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
+        ):
+            self.assertIn(evidence, journal)
+
+    def test_readonly_supervisor_journal_is_recovery_pointer(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
+        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
+            encoding="utf-8"
+        )
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-30-readonly-supervisor-scratch-rss001.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Latest workstream: "
+            "`docs/project_journal/2026/07/"
+            "2026-07-30-readonly-supervisor-scratch-rss001.md`",
+            project_state,
+        )
+        for evidence in (
+            "read-only installed releases",
+            "untrusted `01777` ancestors",
+            "ordinary deterministic suite passed 619/619",
+            '"release_tree_immutable":true',
+            '"runtime_residue":[]',
+        ):
+            self.assertIn(evidence, journal)
+
     def test_independent_supervisor_ci_separates_hosted_and_live_gates(self) -> None:
         live_runner = (
             SCRIPTS
@@ -1713,6 +1771,10 @@ class RepositoryContractTest(unittest.TestCase):
         deterministic_runner = (
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_required_deterministic_supervisor.py"
+        ).read_text(encoding="utf-8")
+        readonly_install_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
         hosted_probe = (
             SCRIPTS / "independent_codex_pr_review/tests/"
@@ -1736,13 +1798,53 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 604", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 802", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
+        for contract in (
+            'READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")',
+            "CODEX_REVIEW_TEST_RUNTIME_PARENT",
+            "class TreeEntrySnapshot:",
+            "device=metadata.st_dev",
+            "inode=metadata.st_ino",
+            'flags=getattr(metadata, "st_flags", 0)',
+            "link_count=link_count",
+            "metadata.st_nlink != 1",
+            "xattrs=_xattr_snapshot(path)",
+            "acl_entries=_acl_entries(path)",
+            "_tree_property_unchanged(before, after)",
+            "_set_tree_read_only(installed_root)",
+            "run_bounded(",
+            "CHILD_STDOUT_LIMIT_BYTES",
+            "CHILD_STDERR_LIMIT_BYTES",
+            "ChildProcessClosureUnproven",
+            '"child_process_closure": child_process_closure',
+            '"primary_failure": (',
+            '"primary_status": primary_status',
+            '"release_tree_immutable": release_tree_immutable',
+            '"release_tree_property": "object-identity-content-access-policy"',
+            '"cleanup_status": "incomplete" if cleanup_failures else "complete"',
+            '"retained_paths": retained_paths',
+            "return 1 if primary_failed or cleanup_failures else 0",
+            '"tests.run_required_deterministic_supervisor"',
+        ):
+            self.assertIn(contract, readonly_install_runner)
+        for excluded_signal in (
+            "link_count=metadata.st_nlink",
+            "size=metadata.st_size",
+            "mtime_ns=metadata.st_mtime_ns",
+            "ctime_ns=metadata.st_ctime_ns",
+        ):
+            self.assertNotIn(excluded_signal, readonly_install_runner)
+        self.assertNotIn("ignore_errors=True", readonly_install_runner)
+        self.assertLess(
+            readonly_install_runner.index("cleanup_failures = tuple("),
+            readonly_install_runner.index("print(json.dumps(summary"),
+        )
         for contract in (
             "return-before-ownership publisher",
             "launch `CALL`-to-caller-`STORE`",
@@ -1764,10 +1866,12 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(contract, helper_contract)
         for contract in (
             'platform.machine() != "arm64"',
+            "_select_hosted_runtime_profile(observed_runtime)",
             "_matches_hosted_fail_closed_observations(evidence)",
             "blockers == expected_blockers",
             "len(blockers) == len(evidence.blockers)",
             '"reviewed_fail_closed_signature": signature_matches',
+            '"runtime_profile": runtime_profile',
             "if evidence.compatible or evidence.production_capable",
         ):
             self.assertIn(contract, hosted_probe)
@@ -1793,9 +1897,12 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS
             / "independent_codex_pr_review/review_supervisor/no_child_profile.py"
         ).read_text(encoding="utf-8")
-        hosted_profile = "github-macos-26-arm64-26.4-25E246"
-        self.assertIn(hosted_profile, integration_test)
-        self.assertNotIn(hosted_profile, production_profile)
+        for hosted_profile in (
+            "github-macos-26-arm64-26.4-25E246",
+            "github-macos-26-arm64-26.5.2-25F84",
+        ):
+            self.assertIn(hosted_profile, integration_test)
+            self.assertNotIn(hosted_profile, production_profile)
         self.assertNotIn("25E246", production_profile)
 
         profile_contracts = {
@@ -1811,8 +1918,13 @@ class RepositoryContractTest(unittest.TestCase):
         for profile, (next_job, skill_root) in profile_contracts.items():
             workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
             start = workflow.index("  independent_supervisor_tests:")
-            end = workflow.index(f"\n  {next_job}:", start)
-            supervisor_job = workflow[start:end]
+            readonly_start = workflow.index(
+                "\n  readonly_install_supervisor_tests:",
+                start,
+            )
+            end = workflow.index(f"\n  {next_job}:", readonly_start)
+            supervisor_job = workflow[start:readonly_start]
+            readonly_job = workflow[readonly_start + 1 : end]
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
                 self.assertIn("timeout-minutes: 15", supervisor_job)
@@ -1831,13 +1943,14 @@ class RepositoryContractTest(unittest.TestCase):
                     f"""      - name: Match hosted no-child blocker signature
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
           CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
         run: |
           python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
         working-directory: {skill_root}/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{{{ runner.temp }}}}
         run: |
           python3 -m tests.run_required_deterministic_supervisor
 """,
@@ -1851,11 +1964,855 @@ class RepositoryContractTest(unittest.TestCase):
 """,
                     supervisor_job,
                 )
+                self.assertNotIn(
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    supervisor_job,
+                )
                 self.assertNotIn("tests.run_required_no_child_profile", supervisor_job)
                 self.assertNotIn(
                     "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE",
                     supervisor_job,
                 )
+                self.assertIn("runs-on: macos-26", readonly_job)
+                self.assertIn("timeout-minutes: 20", readonly_job)
+                self.assertIn(
+                    "Run deterministic supervisor from read-only install",
+                    readonly_job,
+                )
+                self.assertIn(
+                    f"REVIEW_SOURCE_RELATIVE: "
+                    f"{skill_root}/scripts/independent_codex_pr_review",
+                    readonly_job,
+                )
+                for requirement in (
+                    "/usr/bin/sudo /usr/bin/mktemp -d "
+                    "/private/codex-review-readonly.XXXXXX",
+                    '/usr/bin/sudo /bin/chmod -N "$isolated_root"',
+                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"',
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
+                    "CODEX_REVIEW_TEST_RUNTIME_PARENT=",
+                    "LOGNAME=nobody",
+                    "USER=nobody",
+                    "tests.run_readonly_install_deterministic_supervisor",
+                ):
+                    self.assertIn(requirement, readonly_job)
+                self.assertIn("if: always()", readonly_job)
+
+    def test_readonly_ci_deletes_only_a_proven_root_owned_outer_root(self) -> None:
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                create_index = readonly_job.index(
+                    'isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d '
+                    '/private/codex-review-readonly.XXXXXX)"'
+                )
+                recovery_index = readonly_job.index(
+                    'echo "Read-only isolation recovery root: $isolated_root"'
+                )
+                path_guard_index = readonly_job.index(
+                    '[[ ! "$isolated_root" =~ '
+                    "^/private/codex-review-readonly\\.[[:alnum:]]{6}$ ]]"
+                )
+                acl_clear_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -N "$isolated_root"'
+                )
+                identity_index = readonly_job.index(
+                    'isolated_object_id="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i\' "$isolated_root")"'
+                )
+                payload_index = readonly_job.index(
+                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody "
+                    '"$isolated_root/payload"'
+                )
+                immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"'
+                )
+                summary_create_index = readonly_job.index(
+                    'summary_file="$(/usr/bin/mktemp '
+                    '"$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"'
+                )
+                summary_recovery_index = readonly_job.index(
+                    'echo "Read-only supervisor summary file '
+                    '(retained on failure): $summary_file"'
+                )
+                summary_validation_index = readonly_job.index(
+                    '/bin/test -f "$summary_file"'
+                )
+                launch_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f"
+                )
+                runner_failure_index = readonly_job.index(
+                    "if (( runner_status != 0 )); then"
+                )
+                isolated_parser = (
+                    '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;'
+                )
+                parser_index = readonly_job.index(isolated_parser)
+                evidence_index = readonly_job.index(
+                    'expected = {"child_process_closure": "proven"'
+                )
+                evidence_failure_index = readonly_job.index(
+                    "if (( summary_status != 0 )); then"
+                )
+                revalidation_index = readonly_job.index(
+                    'current_object_id="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i\' "$isolated_root")"'
+                )
+                clear_immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags nouchg "$isolated_root"'
+                )
+                deletion = '/usr/bin/sudo /bin/rm -rf "$isolated_root"'
+                delete_index = readonly_job.index(deletion)
+                final_summary_index = readonly_job.index(
+                    'final_summary_object_id="$(/usr/bin/stat -f '
+                    '\'%d:%i\' "$summary_file")"'
+                )
+                summary_deletion = '/bin/rm "$summary_file"'
+                summary_delete_index = readonly_job.index(summary_deletion)
+
+                self.assertLess(create_index, recovery_index)
+                self.assertLess(recovery_index, path_guard_index)
+                self.assertLess(path_guard_index, acl_clear_index)
+                self.assertLess(acl_clear_index, identity_index)
+                self.assertLess(identity_index, payload_index)
+                self.assertLess(payload_index, immutable_index)
+                self.assertLess(immutable_index, summary_create_index)
+                self.assertLess(summary_create_index, summary_recovery_index)
+                self.assertLess(summary_recovery_index, summary_validation_index)
+                self.assertLess(summary_validation_index, launch_index)
+                self.assertLess(launch_index, runner_failure_index)
+                self.assertLess(runner_failure_index, parser_index)
+                self.assertLess(parser_index, evidence_index)
+                self.assertLess(evidence_index, evidence_failure_index)
+                self.assertLess(evidence_failure_index, revalidation_index)
+                self.assertLess(revalidation_index, clear_immutable_index)
+                self.assertLess(clear_immutable_index, delete_index)
+                self.assertLess(delete_index, final_summary_index)
+                self.assertLess(final_summary_index, summary_delete_index)
+                self.assertEqual(readonly_job.count(deletion), 1)
+                self.assertEqual(readonly_job.count(summary_deletion), 1)
+                self.assertEqual(readonly_job.count(isolated_parser), 1)
+                self.assertIn(
+                    'summary_file="$(/usr/bin/mktemp '
+                    '"$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"\n'
+                    '          echo "Read-only supervisor summary file '
+                    '(retained on failure): $summary_file"\n'
+                    '          /bin/test -f "$summary_file"',
+                    readonly_job,
+                )
+                self.assertNotIn(
+                    '"$isolated_python" -B -c \'import json, pathlib, sys;',
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test -f "$summary_file"'),
+                    2,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test ! -L "$summary_file"'),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count('/bin/test -L "$summary_file"'),
+                    2,
+                )
+
+                self.assertNotIn(
+                    '/usr/sbin/chown nobody:nobody "$isolated_root"\n',
+                    readonly_job,
+                )
+                for protection in (
+                    '/usr/bin/sudo /bin/test ! -L "$isolated_root"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u' "
+                    '"$isolated_root")" = "0"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "
+                    '"$isolated_root")" = "0:755"',
+                    "/usr/bin/sudo -u nobody /bin/test ! -w /private",
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
+                    "(( (isolated_flags & 2) == 2 ))",
+                    "set -o pipefail",
+                    '| /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?',
+                    '[[ "$current_summary_object_id" != "$summary_object_id" ]]',
+                    '[[ "$current_object_id" != "$isolated_object_id" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "
+                    '"$isolated_root")" != "755" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%f' "
+                    '"$isolated_root")" != "$isolated_flags" ]]',
+                    '[[ "$post_clear_object_id" != "$isolated_object_id" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "
+                    '"$isolated_root")" != "0:755" ]]',
+                    "if (( root_cleanup_status != 0 ))",
+                    '[[ "$final_summary_object_id" != "$summary_object_id" ]]',
+                    "if (( summary_cleanup_status != 0 ))",
+                    "object_pairs_hook=reject_duplicates",
+                    'ValueError("duplicate JSON key")',
+                    "set(payload) == set(expected)",
+                    "type(payload[key]) is not type(value)",
+                ):
+                    self.assertIn(protection, readonly_job)
+                for evidence in (
+                    '"cleanup_failures": []',
+                    '"cleanup_status": "complete"',
+                    '"install_parent_is_sticky_world_writable": True',
+                    '"primary_failure": None',
+                    '"primary_status": "complete"',
+                    '"release_tree_immutable": True',
+                    '"release_tree_property": "object-identity-content-access-policy"',
+                    '"retained_paths": []',
+                    '"returncode": 0',
+                    '"runtime_residue": []',
+                    '"secondary_failures": []',
+                    '"signal_number": None',
+                    '"timed_out": False',
+                ):
+                    self.assertIn(evidence, readonly_job)
+                self.assertGreaterEqual(
+                    readonly_job.count("retained at $isolated_root"), 3
+                )
+
+    def test_readonly_ci_binds_profile_and_denies_executable_setid_modes(
+        self,
+    ) -> None:
+        self._assert_readonly_ci_uses_a_sealed_uv_managed_runtime()
+        sandbox_profile = (
+            SCRIPTS / "independent_codex_pr_review/tests/readonly_child_isolation.sb"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            sandbox_profile.splitlines(),
+            [
+                "(version 1)",
+                "(allow default)",
+                "(deny job-creation)",
+                "(deny process-exec*",
+                "  (file-mode #o4000 #o2000))",
+            ],
+        )
+        self.assertNotIn("(literal ", sandbox_profile)
+
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                runtime_postinstall_custody_index = readonly_job.index(
+                    "verify_runtime_custody post-install"
+                )
+                source_root_path_index = readonly_job.index(
+                    'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"'
+                )
+                source_root_binding_index = readonly_job.index(
+                    'source_root_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%p:%u:%g\' "$source_review_root")"'
+                )
+                source_profile_path_index = readonly_job.index(
+                    'source_review_profile="$source_review_root/tests/'
+                    'readonly_child_isolation.sb"'
+                )
+                source_copy_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"'
+                )
+                source_postcopy_symlink_index = readonly_job.index(
+                    'source_tree_postcopy_symlink="$(/usr/bin/find '
+                    '"$source_review_root" -type l -print -quit)"'
+                )
+                isolated_postcopy_symlink_index = readonly_job.index(
+                    'isolated_tree_postcopy_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"'
+                )
+                source_custody_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"'
+                )
+                source_readonly_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"'
+                )
+                isolated_source_binding_index = readonly_job.index(
+                    'isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"'
+                )
+                isolated_root_traversal_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
+                )
+                nobody_source_probe_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/'
+                    'run_readonly_install_deterministic_supervisor.py"'
+                )
+                isolated_profile_path_index = readonly_job.index(
+                    'review_profile="$isolated_root/readonly_child_isolation.sb"'
+                )
+                profile_copy_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/cp "$isolated_source_profile" "$review_profile"'
+                )
+                profile_binding_index = readonly_job.index(
+                    'profile_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$review_profile")"'
+                )
+                immutable_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"'
+                )
+                policy_index = readonly_job.index(
+                    "/usr/bin/grep -Fqx '(deny job-creation)'"
+                )
+                source_prelaunch_index = readonly_job.index(
+                    'source_profile_prelaunch_binding="$(/usr/bin/stat'
+                )
+                prelaunch_index = readonly_job.index(
+                    'profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat'
+                )
+                sandbox_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    '-f "$review_profile" /usr/bin/env -i'
+                )
+                postrun_index = readonly_job.index(
+                    'profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat'
+                )
+
+                self.assertLess(
+                    runtime_postinstall_custody_index,
+                    source_root_path_index,
+                )
+                self.assertLess(source_root_path_index, source_root_binding_index)
+                self.assertLess(source_root_binding_index, source_profile_path_index)
+                self.assertLess(source_profile_path_index, source_copy_index)
+                self.assertLess(source_copy_index, source_postcopy_symlink_index)
+                self.assertLess(
+                    source_postcopy_symlink_index, isolated_postcopy_symlink_index
+                )
+                self.assertLess(isolated_postcopy_symlink_index, source_custody_index)
+                self.assertLess(source_custody_index, source_readonly_index)
+                self.assertLess(source_readonly_index, isolated_source_binding_index)
+                self.assertLess(
+                    isolated_source_binding_index, isolated_root_traversal_index
+                )
+                self.assertLess(
+                    isolated_root_traversal_index, nobody_source_probe_index
+                )
+                self.assertLess(nobody_source_probe_index, isolated_profile_path_index)
+                self.assertLess(isolated_profile_path_index, profile_copy_index)
+                self.assertLess(profile_copy_index, profile_binding_index)
+                self.assertLess(profile_binding_index, immutable_index)
+                self.assertLess(immutable_index, policy_index)
+                self.assertLess(policy_index, source_prelaunch_index)
+                self.assertLess(source_prelaunch_index, prelaunch_index)
+                self.assertLess(prelaunch_index, sandbox_index)
+                self.assertLess(sandbox_index, postrun_index)
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo -u nobody /usr/bin/sandbox-exec"),
+                    1,
+                )
+                self.assertNotIn(
+                    "/usr/bin/sudo -u nobody /usr/bin/env -i",
+                    readonly_job,
+                )
+                self.assertNotIn(
+                    "/usr/bin/sudo -u nobody /usr/bin/ditto",
+                    readonly_job,
+                )
+                self.assertNotIn(
+                    '/usr/bin/ditto "$REVIEW_SOURCE_RELATIVE"',
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    1,
+                )
+                self.assertNotIn(
+                    "/usr/bin/sudo /usr/sbin/chown -R nobody:nobody",
+                    readonly_job,
+                )
+                self.assertEqual(
+                    readonly_job.count("'%d:%i:%p:%u:%g' \"$source_review_root\")"),
+                    4,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        "/usr/bin/sudo /usr/bin/diff -qr "
+                        '"$source_review_root" "$isolated_source" >/dev/null'
+                    ),
+                    3,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '$(/usr/bin/find "$source_review_root" -type l -print -quit)'
+                    ),
+                    2,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '$(/usr/bin/sudo /usr/bin/find "$isolated_source" '
+                        "-type l -print -quit)"
+                    ),
+                    3,
+                )
+                for binding in (
+                    "verify_runtime_custody post-install",
+                    'source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"',
+                    'source_review_root_physical="$(cd "$source_review_root" '
+                    '&& pwd -P)"',
+                    '[[ "$source_review_root_physical" != "$source_review_root" ]]',
+                    '/bin/test -d "$source_review_root"',
+                    '/bin/test -L "$source_review_root"',
+                    "# Bind source object identity/access policy separately "
+                    "from copied content.",
+                    'source_root_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%p:%u:%g\' "$source_review_root")"',
+                    'source_tree_symlink="$(/usr/bin/find "$source_review_root" '
+                    '-type l -print -quit)"',
+                    'isolated_source="$isolated_root/source"',
+                    '/usr/bin/sudo /bin/test ! -e "$isolated_source"',
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"',
+                    'source_tree_postcopy_symlink="$(/usr/bin/find '
+                    '"$source_review_root" -type l -print -quit)"',
+                    'isolated_tree_postcopy_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$source_tree_postcopy_symlink" ]]',
+                    '[[ -n "$isolated_tree_postcopy_symlink" ]]',
+                    '[[ "$source_root_postcopy_binding" != "$source_root_binding" ]]',
+                    '[[ "$source_review_root_postcopy_physical" '
+                    '!= "$source_review_root" ]]',
+                    '/usr/bin/sudo /usr/bin/diff -qr "$source_review_root" '
+                    '"$isolated_source" >/dev/null',
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod -RN "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"',
+                    'isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat '
+                    '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
+                    '"$isolated_source")" = "0:0:555"',
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/'
+                    'run_readonly_install_deterministic_supervisor.py"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
+                    '"$isolated_python" -P -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    '/bin/test -f "$source_review_profile"',
+                    '/bin/test ! -L "$source_review_profile"',
+                    'source_profile_binding="$(/usr/bin/stat -f '
+                    '\'%d:%i:%u:%g:%Lp:%z:%m\' "$source_review_profile")"',
+                    'review_profile="$isolated_root/readonly_child_isolation.sb"',
+                    '/usr/bin/sudo /bin/test ! -e "$review_profile"',
+                    '/usr/bin/sudo /bin/test ! -L "$review_profile"',
+                    'isolated_source_profile="$isolated_source/tests/'
+                    'readonly_child_isolation.sb"',
+                    '/usr/bin/sudo /bin/cp "$isolated_source_profile" '
+                    '"$review_profile"',
+                    '/usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"',
+                    '/usr/bin/sudo /bin/chmod -N "$review_profile"',
+                    '/usr/bin/sudo /bin/chmod 0444 "$review_profile"',
+                    '/usr/bin/sudo /bin/test -f "$review_profile"',
+                    '/usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" '
+                    '"$review_profile"',
+                    '/usr/bin/sudo /usr/bin/cmp -s "$isolated_source_profile" '
+                    '"$review_profile"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
+                    '"$review_profile")" = "0:0:444"',
+                    '/bin/test ! -w "$review_profile"',
+                    '/usr/bin/sudo -u nobody /bin/test -r "$review_profile"',
+                    '/usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"',
+                    '[[ "$source_profile_postcopy_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$source_profile_prelaunch_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$source_profile_postrun_binding" '
+                    '!= "$source_profile_binding" ]]',
+                    '[[ "$source_root_prelaunch_binding" != "$source_root_binding" ]]',
+                    '[[ "$source_root_postrun_binding" != "$source_root_binding" ]]',
+                    '[[ "$isolated_source_prelaunch_binding" '
+                    '!= "$isolated_source_binding" ]]',
+                    '[[ "$isolated_source_postrun_binding" '
+                    '!= "$isolated_source_binding" ]]',
+                    'isolated_tree_prelaunch_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$isolated_tree_prelaunch_symlink" ]]',
+                    'isolated_tree_postrun_symlink="$(/usr/bin/sudo '
+                    '/usr/bin/find "$isolated_source" -type l -print -quit)"',
+                    '[[ -n "$isolated_tree_postrun_symlink" ]]',
+                    '[[ "$profile_prelaunch_binding" != "$profile_binding" ]]',
+                    '[[ "$profile_postrun_binding" != "$profile_binding" ]]',
+                ):
+                    self.assertIn(binding, readonly_job)
+                for prohibited_checkout_mutation in (
+                    '\n          review_profile="$checkout_root/',
+                    '/usr/sbin/chown root:wheel "$source_review_profile"',
+                    '/bin/chmod -N "$source_review_profile"',
+                    '/bin/chmod 0444 "$source_review_profile"',
+                    '/usr/bin/chflags uchg "$source_review_profile"',
+                    '/usr/bin/chflags uchg "$review_profile"',
+                    "profile_flags",
+                    "'%d:%i:%u:%g:%Lp:%f' \"$review_profile\"",
+                ):
+                    self.assertNotIn(prohibited_checkout_mutation, readonly_job)
+                for policy_contract in (
+                    "/usr/bin/grep -Fqx '(deny job-creation)'",
+                    "/usr/bin/grep -Fqx '(deny process-exec*'",
+                    "/usr/bin/grep -Fqx '  (file-mode #o4000 #o2000))'",
+                    "/usr/bin/grep -Fq '(literal '",
+                    "(( literal_profile_status != 1 ))",
+                ):
+                    self.assertIn(policy_contract, readonly_job)
+                for removed_inventory_contract in (
+                    "setuid_inventory",
+                    "setuid_find_status",
+                    "probe_nobody_executable",
+                    "access_probe_stderr",
+                    "profile_literal",
+                ):
+                    self.assertNotIn(removed_inventory_contract, readonly_job)
+
+    def test_readonly_uv_resolution_accepts_only_a_physical_leaf(self) -> None:
+        resolution_script = r"""
+trusted_uv_candidate="$UV_EXECUTABLE"
+trusted_uv=""
+if [[ "$trusted_uv_candidate" == /* ]] \
+  && ! /bin/test -L "$trusted_uv_candidate"; then
+  trusted_uv="$(cd "$(/usr/bin/dirname "$trusted_uv_candidate")" && pwd -P)/$(/usr/bin/basename "$trusted_uv_candidate")" \
+    || trusted_uv=""
+fi
+if [[ -z "$trusted_uv" ]] \
+  || ! /bin/test -f "$trusted_uv" \
+  || /bin/test -L "$trusted_uv" \
+  || [[ "$("$trusted_uv" self version --short)" != "0.11.18" ]]; then
+  exit 1
+fi
+printf '%s\n' "$trusted_uv"
+"""
+        with tempfile.TemporaryDirectory(prefix="physical-uv-") as raw_root:
+            root = pathlib.Path(raw_root)
+            physical_parent = root / "physical"
+            physical_bin = physical_parent / "bin"
+            physical_bin.mkdir(parents=True)
+            physical_uv = physical_bin / "uv"
+            physical_uv.write_text(
+                "#!/bin/sh\nprintf '0.11.18\\n'\n",
+                encoding="utf-8",
+            )
+            physical_uv.chmod(0o700)
+            logical_parent = root / "logical"
+            logical_parent.symlink_to(physical_parent, target_is_directory=True)
+
+            accepted = subprocess.run(
+                ["/bin/bash", "-c", resolution_script],
+                check=False,
+                capture_output=True,
+                env={"UV_EXECUTABLE": str(logical_parent / "bin" / "uv")},
+                text=True,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout, f"{physical_uv.resolve()}\n")
+
+            symlinked_leaf = physical_bin / "uv-link"
+            symlinked_leaf.symlink_to(physical_uv)
+            rejected = subprocess.run(
+                ["/bin/bash", "-c", resolution_script],
+                check=False,
+                capture_output=True,
+                env={"UV_EXECUTABLE": str(symlinked_leaf)},
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+    def _assert_readonly_ci_uses_a_sealed_uv_managed_runtime(self) -> None:
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                action_index = readonly_job.index(
+                    "uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+                )
+                root_mode_index = readonly_job.index(
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "
+                    '"$isolated_root")" = "700"'
+                )
+                minimal_uv_environment_index = readonly_job.index(
+                    "/usr/bin/sudo /usr/bin/env -i"
+                )
+                uv_install_index = readonly_job.index(
+                    "run_trusted_uv python install 3.13.13"
+                )
+                staging_inventory_index = readonly_job.index(
+                    'staging_unexpected_entry="$(/usr/bin/sudo '
+                    '/usr/bin/find "$uv_staging_dir"'
+                )
+                relocation_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"'
+                )
+                staging_cleanup_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" "$uv_staging_dir"'
+                )
+                unique_root_index = readonly_job.index(
+                    'managed_python_unexpected_entry="$(/usr/bin/sudo '
+                    '/usr/bin/find "$managed_python_dir"'
+                )
+                interpreter_index = readonly_job.index(
+                    'isolated_python="$runtime_root/bin/python3.13"'
+                )
+                hardlink_index = readonly_job.index(
+                    'runtime_hardlink="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" -type f -links +1 -print -quit)"'
+                )
+                loader_index = readonly_job.index(
+                    'runtime_libraries="$(/usr/bin/sudo /usr/bin/otool -L '
+                )
+                symlink_index = readonly_job.index(
+                    'runtime_symlink_binding="$(compute_runtime_symlink_binding)"'
+                )
+                runtime_custody_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"'
+                )
+                runtime_acl_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -RN "$managed_python_dir"'
+                )
+                runtime_xattr_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"'
+                )
+                runtime_readonly_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"'
+                )
+                tree_binding_index = readonly_job.index(
+                    'runtime_tree_binding="$(compute_runtime_tree_binding)"'
+                )
+                postinstall_index = readonly_job.index(
+                    "verify_runtime_custody post-install"
+                )
+                source_copy_index = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
+                    '"$isolated_source"'
+                )
+                root_traversal_index = readonly_job.index(
+                    '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
+                )
+                nobody_runtime_index = readonly_job.index(
+                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"'
+                )
+                prelaunch_index = readonly_job.index("verify_runtime_custody prelaunch")
+                sandbox_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    '-f "$review_profile" /usr/bin/env -i'
+                )
+                postrun_index = readonly_job.index("verify_runtime_custody postrun")
+                source_postrun_index = readonly_job.index(
+                    'source_profile_postrun_binding="$(/usr/bin/stat'
+                )
+
+                self.assertLess(action_index, root_mode_index)
+                self.assertLess(root_mode_index, minimal_uv_environment_index)
+                self.assertLess(minimal_uv_environment_index, uv_install_index)
+                self.assertLess(uv_install_index, staging_inventory_index)
+                self.assertLess(staging_inventory_index, relocation_index)
+                self.assertLess(relocation_index, staging_cleanup_index)
+                self.assertLess(staging_cleanup_index, unique_root_index)
+                self.assertLess(unique_root_index, interpreter_index)
+                self.assertLess(interpreter_index, hardlink_index)
+                self.assertLess(hardlink_index, loader_index)
+                self.assertLess(loader_index, symlink_index)
+                self.assertLess(symlink_index, runtime_custody_index)
+                self.assertLess(runtime_custody_index, runtime_acl_index)
+                self.assertLess(runtime_acl_index, runtime_xattr_index)
+                self.assertLess(runtime_xattr_index, runtime_readonly_index)
+                self.assertLess(runtime_readonly_index, tree_binding_index)
+                self.assertLess(tree_binding_index, postinstall_index)
+                self.assertLess(postinstall_index, source_copy_index)
+                self.assertLess(source_copy_index, root_traversal_index)
+                self.assertLess(root_traversal_index, nobody_runtime_index)
+                self.assertLess(nobody_runtime_index, prelaunch_index)
+                self.assertLess(prelaunch_index, sandbox_index)
+                self.assertLess(sandbox_index, postrun_index)
+                self.assertLess(postrun_index, source_postrun_index)
+                self.assertIn(
+                    "          run_trusted_uv() {\n"
+                    "            /usr/bin/sudo /usr/bin/env -i \\\n"
+                    '              HOME="$uv_root_home" \\\n'
+                    "              LANG=C \\\n"
+                    "              LC_ALL=C \\\n"
+                    "              PATH=/usr/bin:/bin \\\n"
+                    '              TMPDIR="$uv_root_tmp" \\\n'
+                    '              "$trusted_uv" "$@"\n'
+                    "          }\n",
+                    readonly_job,
+                )
+
+                for contract in (
+                    "id: setup-uv",
+                    "uses: astral-sh/setup-uv@"
+                    "08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0",
+                    'version: "0.11.18"',
+                    "enable-cache: false",
+                    "UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}",
+                    'trusted_uv_candidate="$UV_EXECUTABLE"',
+                    '[[ "$trusted_uv_candidate" == /* ]]',
+                    '! /bin/test -L "$trusted_uv_candidate"',
+                    'dirname "$trusted_uv_candidate"',
+                    'basename "$trusted_uv_candidate"',
+                    '[[ -z "$trusted_uv" ]]',
+                    'uv_root_home="$isolated_root/uv-home"',
+                    '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"',
+                    'stat -f \'%u\' "$uv_root_home")" = "0"',
+                    'stat -f \'%Lp\' "$uv_root_home")" = "700"',
+                    'uv_root_tmp="$uv_root_home/tmp"',
+                    '/usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"',
+                    'stat -f \'%u\' "$uv_root_tmp")" = "0"',
+                    'stat -f \'%Lp\' "$uv_root_tmp")" = "700"',
+                    "run_trusted_uv() {",
+                    "/usr/bin/sudo /usr/bin/env -i",
+                    'HOME="$uv_root_home"',
+                    "LANG=C",
+                    "LC_ALL=C",
+                    "PATH=/usr/bin:/bin",
+                    'TMPDIR="$uv_root_tmp"',
+                    '"$trusted_uv" "$@"',
+                    '[[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]',
+                    'trusted_uv_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"',
+                    'uv_staging_dir="$isolated_root/uv-managed-staging"',
+                    "run_trusted_uv python install 3.13.13",
+                    "--managed-python",
+                    '--install-dir "$uv_staging_dir"',
+                    "--no-bin",
+                    "--no-cache",
+                    "--no-progress",
+                    "--no-config",
+                    "staged_runtime_count != 1",
+                    "staged_runtime_alias_count != 1",
+                    "cpython-3.13-macos-aarch64-none",
+                    "cpython-3.13-macos-x86_64-none",
+                    "cpython-3.13.13-macos-aarch64-none",
+                    "cpython-3.13.13-macos-x86_64-none",
+                    'staged_runtime_alias_target="$(/usr/bin/sudo '
+                    '/usr/bin/readlink "$staged_runtime_alias")"',
+                    '! /usr/bin/sudo /bin/test -L "$staged_runtime_alias"',
+                    '[[ "$staged_runtime_alias_target" != "$staged_runtime_root" ]]',
+                    "staging_unexpected_entry",
+                    'staging_unexpected_entry="<unreadable>"',
+                    "staging_temp_entry",
+                    'staging_temp_entry="<unreadable>"',
+                    '"$uv_staging_dir/.lock"',
+                    'stat -f \'%z\' "$uv_staging_dir/.lock")" != "0"',
+                    '"$uv_staging_dir/.temp"',
+                    '"$uv_staging_dir/.gitignore"',
+                    'stat -f \'%z\' "$uv_staging_dir/.gitignore")" != "1"',
+                    'cat "$uv_staging_dir/.gitignore")" != "*"',
+                    '/usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"',
+                    '/usr/bin/sudo /bin/rm "$staged_runtime_alias"',
+                    '"$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"',
+                    '/usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" '
+                    '"$uv_staging_dir"',
+                    '/usr/bin/sudo /bin/test -e "$uv_staging_dir"',
+                    '/usr/bin/sudo /bin/test -L "$uv_staging_dir"',
+                    "managed_python_unexpected_entry",
+                    'managed_python_unexpected_entry="<unreadable>"',
+                    '! /usr/bin/sudo /bin/test -d "$runtime_root"',
+                    '/usr/bin/sudo /bin/test -L "$runtime_root"',
+                    "^cpython-3\\.13\\.13-macos-(aarch64|x86_64)-none$",
+                    'isolated_python="$runtime_root/bin/python3.13"',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%HT:%l' "
+                    '"$isolated_python")" != "Regular File:1" ]]',
+                    'runtime_hardlink="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" -type f -links +1 -print -quit)"',
+                    'runtime_special="$(/usr/bin/sudo /usr/bin/find '
+                    '"$runtime_root" ! -type d ! -type f ! -type l '
+                    '-print -quit)"',
+                    '/usr/bin/sudo /usr/bin/otool -L "$isolated_python"',
+                    '$0 !~ "^/System/" && $0 !~ "^/usr/lib/"',
+                    'runtime_rpaths" != "@executable_path/../lib"',
+                    "path.resolve(strict=True)",
+                    "root not in target.parents",
+                    "os.readlink(path)",
+                    'runtime_identity" != "3.13.13|$isolated_python|'
+                    '$runtime_root|$runtime_root"',
+                    '/usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"',
+                    '/usr/bin/sudo /bin/chmod -RN "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"',
+                    '/usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"',
+                    "metadata.st_dev",
+                    "metadata.st_ino",
+                    "stat.S_IMODE(metadata.st_mode)",
+                    'getattr(metadata, "st_flags", 0)',
+                    "metadata.st_nlink",
+                    "hashlib.sha256(path.read_bytes()).digest()",
+                    "current_runtime_owner_violation",
+                    "current_runtime_write_violation",
+                    "current_runtime_read_violation",
+                    "current_runtime_traverse_violation",
+                    "current_runtime_xattr_violation",
+                    "current_runtime_acl_violation",
+                    "/usr/bin/sudo /usr/bin/codesign --verify --strict "
+                    '"$isolated_python"',
+                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"',
+                    "PYTHONDONTWRITEBYTECODE=1 \\\n"
+                    '            PYTHONPATH="$isolated_source"',
+                    '"$isolated_python" -P -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;',
+                    'if ! bytecode_artifact="$(/usr/bin/find .',
+                    "\\( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \\)",
+                    "-name '*.pyc'",
+                    "-name '*.pyo'",
+                    "-print -quit",
+                    "Unable to inspect the checkout for Python bytecode artifacts",
+                    "Python bytecode artifact: $bytecode_artifact",
+                ):
+                    self.assertIn(contract, readonly_job)
+
+                for phase in ("post-install", "prelaunch", "postrun"):
+                    self.assertEqual(
+                        readonly_job.count(f"verify_runtime_custody {phase}"),
+                        1,
+                    )
+                self.assertEqual(
+                    readonly_job.count(
+                        '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    1,
+                )
+                for prohibited in (
+                    "actions/setup-python",
+                    "trusted_python",
+                    "command -v python3",
+                    "/usr/bin/python",
+                    "python3 -B -c",
+                    "PYTHONHOME",
+                    "/usr/bin/rsync",
+                    '/usr/bin/sudo "$trusted_uv"',
+                    '"$trusted_uv" --version',
+                    "stat -f '%u:%g:%Lp' \"$uv_root_home\"",
+                    "stat -f '%u:%g:%Lp' \"$uv_root_tmp\"",
+                    '/bin/rm -rf "$uv_staging_dir"',
+                    '"$isolated_python" -B -m '
+                    "tests.run_readonly_install_deterministic_supervisor",
+                    "-type d -name __pycache__",
+                    "-type f \\( -name '*.pyc'",
+                    'sh "$isolated_source"',
+                    '/usr/bin/sudo /bin/chmod 0711 "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/sbin/chown nobody:nobody "$managed_python_dir"',
+                    '/usr/bin/sudo /usr/sbin/chown -R nobody:nobody "$runtime_root"',
+                ):
+                    self.assertNotIn(prohibited, readonly_job)
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"
@@ -5815,6 +6772,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("render_success_envelope", cli_source)
 
     def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
+        independent_entrypoint = (
+            SCRIPTS / "independent_codex_pr_review" / "independent-codex-pr-review"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            independent_entrypoint.index("if sys.version_info[:2] != (3, 13):"),
+            independent_entrypoint.index("from review_supervisor.cli import main"),
+        )
         with tempfile.TemporaryDirectory(
             prefix="review-installed-no-bytecode-"
         ) as temporary:
