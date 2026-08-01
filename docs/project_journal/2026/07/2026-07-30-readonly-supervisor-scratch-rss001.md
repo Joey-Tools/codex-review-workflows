@@ -329,3 +329,10 @@ superseded_by:
   still binds actual UID/GID. The held install container is group-aligned and
   policy-revalidated before copying so Darwin inheritance is deterministic.
   Focused source-binding and runner tests passed 44/44 in 11.018 seconds.
+- The portable-ownership relaxation was superseded before final freeze. Once
+  the descriptor-bound install container is group-aligned, the copied tree can
+  and must match the source UID/GID as part of the exact access-policy
+  manifest. Final Python 3.13 validation passed the affected modules 109/109,
+  the deterministic selection 652/652 in 237.512 seconds with identity SHA-256
+  `ae05fcb1dac9077c4d3a477413c762664c8d9046e467d8286a4f302fa9d52b39`,
+  and repository contracts 102/102 in 9.312 seconds.

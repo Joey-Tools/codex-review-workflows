@@ -1013,8 +1013,8 @@ def _source_manifest_sha256(root: pathlib.Path) -> str:
             (
                 path,
                 entry.kind,
-                # Allocation ownership is container-local. The complete
-                # installed snapshot separately binds its actual UID/GID.
+                entry.uid,
+                entry.gid,
                 entry.mode,
                 entry.flags,
                 entry.digest,
