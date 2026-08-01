@@ -1495,6 +1495,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertEqual(summary["retained_paths"], [])
                 self.assertEqual(summary["runtime_residue"], [])
                 self.assertEqual(summary["secondary_failures"], [])
+                self.assertTrue(summary["source_head_bound"])
+                self.assertEqual(summary["source_head_sha"], "a" * 40)
+                self.assertEqual(summary["source_manifest_sha256"], "b" * 64)
                 self.assertFalse(summary["creation_origin_proven"])
                 self.assertEqual(
                     summary["creation_origin_guarantee"],
