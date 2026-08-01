@@ -260,3 +260,8 @@ superseded_by:
   explicit nobody-owned mode-`0700` runtime parent has a root-owned,
   non-group/world-writable ancestor chain. This preserves the runtime-parent
   trust policy instead of weakening it for runner-specific `/Users` metadata.
+- The outer root remains root-owned mode `0700` while uv and source custody are
+  prepared, then transitions to exact root-owned mode `0755` for the sandboxed
+  nobody run. Full descriptor-based ACL/xattr policy validation requires read
+  and search access on every ancestor; the outer root remains non-writable and
+  the nobody-owned payload and runtime parent remain exact mode `0700`.

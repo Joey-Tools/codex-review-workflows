@@ -539,7 +539,8 @@ jobs:
           /usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"
           isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
-          /usr/bin/sudo /bin/chmod 0711 "$isolated_root"
+          /usr/bin/sudo /bin/chmod 0755 "$isolated_root"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" = "0:755"
           /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
           /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
           /usr/bin/sudo -u nobody /bin/test ! -w /private
@@ -713,6 +714,7 @@ jobs:
             || ! /usr/bin/sudo /bin/test -d "$isolated_root" \
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_root" \
             || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" != "0" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$isolated_root")" != "755" ]] \
             || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")" != "$isolated_flags" ]]; then
             echo "::error::Isolation root identity changed; retained at $isolated_root"
             exit 1
@@ -721,7 +723,8 @@ jobs:
           post_clear_object_id=""
           post_clear_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
             || post_clear_object_id="<unreadable>"
-          if [[ "$post_clear_object_id" != "$isolated_object_id" ]]; then
+          if [[ "$post_clear_object_id" != "$isolated_object_id" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" != "0:755" ]]; then
             if /usr/bin/sudo /bin/test -d "$isolated_root" \
               && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
               /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true

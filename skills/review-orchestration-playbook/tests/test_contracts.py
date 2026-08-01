@@ -2134,6 +2134,8 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/sudo /bin/test ! -L "$isolated_root"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u' "
                     '"$isolated_root")" = "0"',
+                    "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "
+                    '"$isolated_root")" = "0:755"',
                     "/usr/bin/sudo -u nobody /bin/test ! -w /private",
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
@@ -2142,9 +2144,13 @@ class RepositoryContractTest(unittest.TestCase):
                     '| /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?',
                     '[[ "$current_summary_object_id" != "$summary_object_id" ]]',
                     '[[ "$current_object_id" != "$isolated_object_id" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "
+                    '"$isolated_root")" != "755" ]]',
                     "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%f' "
                     '"$isolated_root")" != "$isolated_flags" ]]',
                     '[[ "$post_clear_object_id" != "$isolated_object_id" ]]',
+                    "[[ \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "
+                    '"$isolated_root")" != "0:755" ]]',
                     "if (( root_cleanup_status != 0 ))",
                     '[[ "$final_summary_object_id" != "$summary_object_id" ]]',
                     "if (( summary_cleanup_status != 0 ))",
@@ -2240,7 +2246,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"'
                 )
                 isolated_root_traversal_index = readonly_job.index(
-                    '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                    '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
                 )
                 nobody_source_probe_index = readonly_job.index(
                     "/usr/bin/sudo -u nobody /bin/test -r "
@@ -2596,7 +2602,7 @@ printf '%s\n' "$trusted_uv"
                     '"$isolated_source"'
                 )
                 root_traversal_index = readonly_job.index(
-                    '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                    '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
                 )
                 nobody_runtime_index = readonly_job.index(
                     '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"'
@@ -2776,7 +2782,7 @@ printf '%s\n' "$trusted_uv"
                     )
                 self.assertEqual(
                     readonly_job.count(
-                        '/usr/bin/sudo /bin/chmod 0711 "$isolated_root"'
+                        '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
                     ),
                     1,
                 )
