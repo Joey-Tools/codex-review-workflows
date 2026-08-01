@@ -261,12 +261,31 @@ jobs:
               (( staged_runtime_count += 1 ))
             fi
           done
+          staged_runtime_alias=""
+          staged_runtime_alias_count=0
+          for runtime_alias_candidate in \
+            "$uv_staging_dir/cpython-3.13-macos-aarch64-none" \
+            "$uv_staging_dir/cpython-3.13-macos-x86_64-none"; do
+            if /usr/bin/sudo /bin/test -e "$runtime_alias_candidate" \
+              || /usr/bin/sudo /bin/test -L "$runtime_alias_candidate"; then
+              staged_runtime_alias="$runtime_alias_candidate"
+              (( staged_runtime_alias_count += 1 ))
+            fi
+          done
+          staged_runtime_alias_target=""
+          if (( staged_runtime_alias_count == 1 )) \
+            && /usr/bin/sudo /bin/test -L "$staged_runtime_alias"; then
+            staged_runtime_alias_target="$(/usr/bin/sudo /usr/bin/readlink "$staged_runtime_alias")" \
+              || staged_runtime_alias_target="<unreadable>"
+          fi
           staging_unexpected_entry=""
           staging_unexpected_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir" \
             -mindepth 1 -maxdepth 1 \
             ! -name '.lock' \
             ! -name '.temp' \
             ! -name '.gitignore' \
+            ! -name 'cpython-3.13-macos-aarch64-none' \
+            ! -name 'cpython-3.13-macos-x86_64-none' \
             ! -name 'cpython-3.13.13-macos-aarch64-none' \
             ! -name 'cpython-3.13.13-macos-x86_64-none' \
             -print -quit)" || staging_unexpected_entry="<unreadable>"
@@ -274,6 +293,9 @@ jobs:
           staging_temp_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir/.temp" \
             -mindepth 1 -print -quit)" || staging_temp_entry="<unreadable>"
           if (( staged_runtime_count != 1 )) \
+            || (( staged_runtime_alias_count != 1 )) \
+            || ! /usr/bin/sudo /bin/test -L "$staged_runtime_alias" \
+            || [[ "$staged_runtime_alias_target" != "$staged_runtime_root" ]] \
             || [[ -n "$staging_unexpected_entry" ]] \
             || ! /usr/bin/sudo /bin/test -f "$uv_staging_dir/.lock" \
             || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.lock" \
@@ -301,7 +323,8 @@ jobs:
           /usr/bin/sudo /bin/mkdir -m 0700 "$managed_python_dir"
           runtime_root="$managed_python_dir/$staged_runtime_root_name"
           /usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"
-          /usr/bin/sudo /bin/rm "$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"
+          /usr/bin/sudo /bin/rm "$staged_runtime_alias" \
+            "$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"
           /usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" "$uv_staging_dir"
           if /usr/bin/sudo /bin/test -e "$uv_staging_dir" \
             || /usr/bin/sudo /bin/test -L "$uv_staging_dir"; then

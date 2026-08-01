@@ -252,4 +252,6 @@ superseded_by:
 - Hosted setup-uv paths are now resolved through physical parent ancestry to a
   regular non-symlink executable leaf before identity and digest binding. Exact
   version admission uses `uv self version --short`, while a regression accepts
-  a benign ancestor alias and rejects a symlink executable leaf.
+  a benign ancestor alias and rejects a symlink executable leaf. The pinned uv
+  0.11.18 managed-Python staging inventory also validates its one architecture
+  alias as a symlink to the exact versioned runtime before unlinking that alias.

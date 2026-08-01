@@ -2683,8 +2683,15 @@ printf '%s\n' "$trusted_uv"
                     "--no-progress",
                     "--no-config",
                     "staged_runtime_count != 1",
+                    "staged_runtime_alias_count != 1",
+                    "cpython-3.13-macos-aarch64-none",
+                    "cpython-3.13-macos-x86_64-none",
                     "cpython-3.13.13-macos-aarch64-none",
                     "cpython-3.13.13-macos-x86_64-none",
+                    'staged_runtime_alias_target="$(/usr/bin/sudo '
+                    '/usr/bin/readlink "$staged_runtime_alias")"',
+                    '! /usr/bin/sudo /bin/test -L "$staged_runtime_alias"',
+                    '[[ "$staged_runtime_alias_target" != "$staged_runtime_root" ]]',
                     "staging_unexpected_entry",
                     'staging_unexpected_entry="<unreadable>"',
                     "staging_temp_entry",
@@ -2696,8 +2703,8 @@ printf '%s\n' "$trusted_uv"
                     'stat -f \'%z\' "$uv_staging_dir/.gitignore")" != "1"',
                     'cat "$uv_staging_dir/.gitignore")" != "*"',
                     '/usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"',
-                    '/usr/bin/sudo /bin/rm "$uv_staging_dir/.lock" '
-                    '"$uv_staging_dir/.gitignore"',
+                    '/usr/bin/sudo /bin/rm "$staged_runtime_alias"',
+                    '"$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"',
                     '/usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" '
                     '"$uv_staging_dir"',
                     '/usr/bin/sudo /bin/test -e "$uv_staging_dir"',
