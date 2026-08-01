@@ -350,9 +350,11 @@ Only the following terminal payloads are accepted:
    A valid target child is a finding and therefore takes precedence over the
    clean-looking parent; an unread, incomplete, malformed, orphaned,
    duplicate, or conflicting target join is inconclusive or malformed, never
-   clean. An `APPROVED` / `No findings.` review with zero children is the only
-   clean review shape in this branch. Fully fetched human or unrelated-bot
-   comments, null-parent replies,
+   clean. This finding classification is independent of `isResolved`;
+   resolution is applied only when deciding whether a later clean outcome
+   remains blocked. An `APPROVED` / `No findings.` review with zero children
+   is the only clean review shape in this branch. Fully fetched human or
+   unrelated-bot comments, null-parent replies,
    and threads containing no target child remain audit context. They neither
    create a selected-review finding nor supply resolution for one. Empty
    bodies, `Looks good.`, coverage summaries, alternative punctuation,
@@ -752,8 +754,14 @@ compatible: the versioned fixed projector reads and type-checks every field
 used by policy while ignoring unrelated GitHub response additions. The raw page
 digest still binds all response bytes. A versioned fixed parser independently
 derives the complete set of candidate scope keys and scope-final bases from the
-projected records, then derives `entries` in the closed shape
-`{scope_key, source_ordering_key, source_evidence}` and
+projected records. It also derives the closed `scope_classifications` list in
+positive pull-number order, with exactly one
+`{pull_number, scope_key, classification}` item for every discovery-seeded PR.
+The classification is exact `current`, `historical-candidate`, or
+`confirmed-non-candidate`; a pending controlled request, ambiguous identity,
+incomplete traversal, or unparseable record cannot be downgraded to
+`confirmed-non-candidate`. The parser then derives `entries` in the closed
+shape `{scope_key, source_ordering_key, source_evidence}` and
 `candidate_universe_count`. `source_evidence` is exactly
 `{carrier, channel, semantic, native_identity, source_record_sha256}`. It binds
 reaction versus terminal-artifact carrier, request-reaction versus review or
@@ -1505,6 +1513,19 @@ selection. This lets a reader distinguish a valid
 11-candidate universe from one whose unselected candidate was truncated,
 incompletely paginated, changed on final reread, or contained a future
 confirmed-human reaction.
+
+The current raw authority projection retains every exact-provider
+`PENDING` review and progress-only issue comment in a canonical
+`nonterminal_records` audit list. Each item binds its channel, positive native
+ID, and canonical source digest. A progress comment also binds its semantic
+server time. A `PENDING` review requires the REST `submitted_at` value to be
+absent or null, records exact `server_time: null`, and binds its exact-provider
+inline and thread bundle instead of inventing a local or receipt timestamp.
+These records never enter terminal ordering or create a result, but the
+complete initial/final projection must keep them type-preserving identical.
+When comparing the raw terminal decision to the normalized current snapshot,
+only this audit-only list is excluded; any other raw/normalized difference
+fails closed.
 
 `provider_declaration.asserted_text` stores the exact authenticated line, not a
 summary. `normalized_sha256` is recomputed with the recorded normalization

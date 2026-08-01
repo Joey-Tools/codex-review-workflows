@@ -3,7 +3,7 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/github-codex-evidence-authority
 pr:
 supersedes: []
@@ -391,6 +391,22 @@ and executable regressions are now present and validated:
    `reviewThreads` connection only. A nested comments connection must be
    complete in its first response; `hasNextPage == true` is `unknown` until a
    future schema version defines a bound child-cursor fetch.
+7. **Resolved-child semantic stability.** A valid exact-provider target child
+   keeps its parent review classified as findings even after the thread is
+   resolved. Resolution controls only whether that finding still blocks a
+   later clean result; it cannot rewrite the immutable provider artifact into
+   clean.
+8. **Nonterminal audit stability.** Exact-provider `PENDING` reviews and
+   progress-only issue comments remain in a canonical initial/final raw
+   authority audit projection while staying outside terminal ordering. Their
+   presence does not negate a valid terminal result, but any final-reread
+   change in their bound source projection fails closed.
+9. **Raw-derived scope classification.** Every repository-wide discovery seed
+   now has exactly one closed, raw-derived `scope_classifications` item:
+   `current`, `historical-candidate`, or `confirmed-non-candidate`. The
+   recorded list must equal the independently parsed transcript and the
+   historical-candidate scopes must equal the complete candidate arrays;
+   missing, duplicate, or relabelled seeds are `unknown`.
 
 These are stricter playbook evidence extensions. They do not change the fixed
 `codex-review-gate` / released Action commits, common tree, 15-path manifest,
@@ -452,15 +468,18 @@ plane separation, or warning-only treatment of early/duplicate requests.
 - Follow-up validation completed after the final-range reviewer found the
   terminal raw-current binding, JSON-ID schema, and nested-pagination
   inconsistencies described above.
-- The corrected final working snapshot's focused contract suite:
+- The final implementation snapshot's focused contract suite:
   `python3 -B -m unittest skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed 102 tests in 12.707 seconds.
-- The corrected final working snapshot's full review-orchestration suite ran
+  passed 102 tests in 14.179 seconds.
+- The final implementation snapshot's full review-orchestration suite ran
   outside the filesystem sandbox because provider tests require temporary
   Unix and loopback socket binds:
-  `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`
-  passed 2,822 tests in 1,023.213 seconds with 6 expected skips and no failures
-  or errors.
+  `/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q`
+  passed 2,822 tests in 1,240.321 seconds with 6 expected skips and no failures
+  or errors. A preceding full run hit the same unrelated 5-second
+  credential-server worker-ready timeout in its `signal` and `recovery`
+  subtests; the exact test then passed alone in 4.639 seconds before the clean
+  full rerun.
 - Ruff check and format-check, the skill validator, the project-journal
   validator, and `git diff --check` all passed on the corrected final working
   snapshot.
@@ -489,6 +508,16 @@ plane separation, or warning-only treatment of early/duplicate requests.
   parent-owned evidence. The corrected exact-head review will likewise remain
   outside the candidate head because writing it back would change the reviewed
   range.
+- The later named-single review of
+  `0f77fb7b1dd59f5eed522fa9699497aa013695fc..a1403a4f3b0bd63603591dc33c09583f8a8a69e0`
+  found three P2 authority gaps: resolved target children could be
+  reclassified as clean, nonterminal provider records could reject an
+  otherwise valid terminal inventory instead of remaining audited, and the
+  historical inventory lacked a closed raw-derived classification for every
+  seeded PR. Items 7–9 in “Final Formal-Review Authority Hardening” record the
+  fixes. Independent follow-up audits of resolved-child semantics, nonterminal
+  coexistence and final-reread drift, and raw-derived scope classification all
+  returned no findings.
 - Two final targeted audits then checked the corrective diff. The raw-current
   authority projection audit returned no findings. The ID/pagination audit
   found one remaining P2: the issue-comment schema example still quoted

@@ -3312,6 +3312,23 @@ class RepositoryContractTest(unittest.TestCase):
         )
         normalized_authority_text = " ".join(authority.lower().replace("`", "").split())
         self.assertIn(
+            "this finding classification is independent of isresolved; "
+            "resolution is applied only when deciding whether a later clean "
+            "outcome remains blocked",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "the current raw authority projection retains every exact-provider "
+            "pending review and progress-only issue comment in a canonical "
+            "nonterminal_records audit list",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "the classification is exact current, historical-candidate, or "
+            "confirmed-non-candidate",
+            normalized_authority_text,
+        )
+        self.assertIn(
             "every rest request id, reaction id, reaction parent id, and "
             "selected request/reaction id in this report is an exact positive "
             "json integer",
@@ -6797,6 +6814,8 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             review_id = value.get("id")
             user = value.get("user")
+            state = value.get("state")
+            raw_submitted_at = value.get("submitted_at")
             submitted_at = _parse_github_rfc3339_seconds(value.get("submitted_at"))
             if (
                 type(review_id) is not int
@@ -6805,9 +6824,10 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(user, dict)
                 or not isinstance(user.get("login"), str)
                 or not isinstance(user.get("type"), str)
-                or not isinstance(value.get("state"), str)
+                or not isinstance(state, str)
                 or not isinstance(value.get("body"), str)
-                or submitted_at is None
+                or (state == "PENDING" and raw_submitted_at is not None)
+                or (state != "PENDING" and submitted_at is None)
                 or not isinstance(value.get("commit_id"), str)
             ):
                 return None
@@ -6818,7 +6838,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "login": user["login"],
                     "type": user["type"],
                 },
-                "state": value["state"],
+                "state": state,
                 "body": value["body"],
                 "submitted_at": submitted_at,
                 "commit_id": value["commit_id"],
@@ -7089,8 +7109,17 @@ class RepositoryContractTest(unittest.TestCase):
                 if isinstance(extra_issue_records, list):
                     issue_records.extend(clone(extra_issue_records))
                 review_records: list[dict[str, object]] = []
+                extra_review_records = raw_scope_record.get("raw_review_records")
+                if isinstance(extra_review_records, list):
+                    review_records.extend(clone(extra_review_records))
                 inline_records: list[object] = []
                 thread_nodes: list[dict[str, object]] = []
+                extra_inline_records = raw_scope_record.get("raw_inline_records")
+                if isinstance(extra_inline_records, list):
+                    inline_records.extend(clone(extra_inline_records))
+                extra_thread_nodes = raw_scope_record.get("raw_thread_nodes")
+                if isinstance(extra_thread_nodes, list):
+                    thread_nodes.extend(clone(extra_thread_nodes))
                 evidence_state = raw_scope_record.get("evidence_state")
                 if isinstance(evidence_state, dict):
                     for field in (
@@ -7476,7 +7505,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             current_ancestry: dict[str, int] | None = None,
             require_current_ancestry_exact: bool = True,
-        ) -> list[dict[str, object]] | None:
+        ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
                 or set(value)
@@ -7527,6 +7556,7 @@ class RepositoryContractTest(unittest.TestCase):
                 discovered_pulls[pr] = (base_oid, head)
 
             entries: list[dict[str, object]] = []
+            scope_classifications: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
@@ -7703,6 +7733,7 @@ class RepositoryContractTest(unittest.TestCase):
 
                 request_times: dict[int, int] = {}
                 issue_artifacts: list[dict[str, object]] = []
+                nonterminal_records: list[tuple[str, int, int | None, str]] = []
                 seen_issue_ids: set[int] = set()
                 for raw_issue in issue_records:
                     projected_issue = project_raw_issue_record(raw_issue)
@@ -7803,6 +7834,7 @@ class RepositoryContractTest(unittest.TestCase):
 
                 review_by_id: dict[int, dict[str, object]] = {}
                 other_review_ids: set[int] = set()
+                nonterminal_review_by_id: dict[int, dict[str, object]] = {}
                 seen_review_ids: set[int] = set()
                 for raw_review in review_records:
                     projected_review = project_raw_review_record(raw_review)
@@ -7813,9 +7845,6 @@ class RepositoryContractTest(unittest.TestCase):
                         type(review_id) is not int
                         or review_id <= 0
                         or review_id in seen_review_ids
-                        or type(projected_review.get("submitted_at")) is not int
-                        or projected_review["submitted_at"] <= 0
-                        or projected_review["submitted_at"] > history_as_of_server_time
                     ):
                         return None
                     seen_review_ids.add(review_id)
@@ -7826,13 +7855,38 @@ class RepositoryContractTest(unittest.TestCase):
                     if actor != "exact":
                         return None
                     if projected_review.get("state") == "PENDING":
+                        if (
+                            projected_review.get("submitted_at") is not None
+                            or projected_review.get("html_url")
+                            != (
+                                f"https://github.com/{repository}/pull/{pr}"
+                                f"#pullrequestreview-{review_id}"
+                            )
+                            or re.fullmatch(
+                                r"[0-9a-f]{40}",
+                                str(projected_review.get("commit_id")),
+                            )
+                            is None
+                        ):
+                            return None
+                        nonterminal_review_by_id[review_id] = projected_review
+                        continue
+                    if (
+                        type(projected_review.get("submitted_at")) is not int
+                        or projected_review["submitted_at"] <= 0
+                        or projected_review["submitted_at"] > history_as_of_server_time
+                    ):
                         return None
                     review_by_id[review_id] = projected_review
 
                 inline_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
+                nonterminal_inline_by_review: dict[int, list[dict[str, object]]] = {
+                    review_id: [] for review_id in nonterminal_review_by_id
+                }
                 target_review_by_child_id: dict[str, int] = {}
+                nonterminal_review_by_child_id: dict[str, int] = {}
                 seen_inline_ids: set[int] = set()
                 for raw_inline in inline_records:
                     if not isinstance(raw_inline, dict):
@@ -7859,6 +7913,13 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     if parent_id in other_review_ids:
                         continue
+                    if parent_id in nonterminal_inline_by_review:
+                        child_id = str(projected_inline["id"])
+                        if child_id in nonterminal_review_by_child_id:
+                            return None
+                        nonterminal_review_by_child_id[child_id] = parent_id
+                        nonterminal_inline_by_review[parent_id].append(projected_inline)
+                        continue
                     if parent_id not in inline_by_review:
                         return None
                     child_id = str(projected_inline["id"])
@@ -7870,6 +7931,9 @@ class RepositoryContractTest(unittest.TestCase):
                 thread_nodes_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
+                nonterminal_thread_nodes_by_review: dict[
+                    int, list[dict[str, object]]
+                ] = {review_id: [] for review_id in nonterminal_review_by_id}
                 seen_graphql_comment_ids: set[str] = set()
                 seen_graphql_database_ids: set[str] = set()
                 for thread in thread_nodes:
@@ -7880,6 +7944,7 @@ class RepositoryContractTest(unittest.TestCase):
                         comments.get("pages") if isinstance(comments, dict) else None
                     )
                     target_review_ids: set[int] = set()
+                    nonterminal_review_ids: set[int] = set()
                     if not isinstance(pages, list):
                         return None
                     for page in pages:
@@ -7925,8 +7990,38 @@ class RepositoryContractTest(unittest.TestCase):
                             target_review_id = target_review_by_child_id.get(child_id)
                             if target_review_id is not None:
                                 target_review_ids.add(target_review_id)
+                            nonterminal_review_id = nonterminal_review_by_child_id.get(
+                                child_id
+                            )
+                            if nonterminal_review_id is not None:
+                                nonterminal_review_ids.add(nonterminal_review_id)
                     for target_review_id in target_review_ids:
                         thread_nodes_by_review[target_review_id].append(thread)
+                    for nonterminal_review_id in nonterminal_review_ids:
+                        nonterminal_thread_nodes_by_review[
+                            nonterminal_review_id
+                        ].append(thread)
+
+                for review_id, raw_review in nonterminal_review_by_id.items():
+                    source_bundle = {
+                        "artifact": clone(raw_review),
+                        "inline_comments": clone(
+                            nonterminal_inline_by_review[review_id]
+                        ),
+                        "review_threads": clone(
+                            nonterminal_thread_nodes_by_review[review_id]
+                        ),
+                    }
+                    nonterminal_records.append(
+                        (
+                            "pull-request-review",
+                            review_id,
+                            None,
+                            hashlib.sha256(
+                                canonical_raw_body(source_bundle).encode("utf-8")
+                            ).hexdigest(),
+                        )
+                    )
 
                 artifact_bases: list[tuple[int, int, str, str, str]] = []
                 for review_id, raw_review in review_by_id.items():
@@ -7972,7 +8067,7 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     body = raw_review.get("body")
                     state = raw_review.get("state")
-                    if any(finding.get("is_resolved") is False for finding in joined):
+                    if joined:
                         semantic = "findings"
                     elif body == "No findings." and state == "APPROVED":
                         semantic = "clean"
@@ -8049,7 +8144,17 @@ class RepositoryContractTest(unittest.TestCase):
                         allow_foreign_finding_sha=(parsed_scope == current_scope_key),
                     )
                     if semantic == "nonterminal":
-                        return None
+                        nonterminal_records.append(
+                            (
+                                "issue-comment",
+                                issue_id,
+                                server_time,
+                                hashlib.sha256(
+                                    canonical_raw_body(raw_issue).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
+                        continue
                     if (
                         semantic == "findings"
                         and parsed_scope == current_scope_key
@@ -8138,6 +8243,17 @@ class RepositoryContractTest(unittest.TestCase):
                     if not provider_reactions:
                         if request_times:
                             return None
+                        scope_classifications.append(
+                            {
+                                "pull_number": pr,
+                                "scope_key": list(parsed_scope),
+                                "classification": (
+                                    "current"
+                                    if parsed_scope == current_scope_key
+                                    else "confirmed-non-candidate"
+                                ),
+                            }
+                        )
                         continue
                     if not request_times:
                         return None
@@ -8249,8 +8365,33 @@ class RepositoryContractTest(unittest.TestCase):
                                 content,
                             ) in sorted(provider_reactions)
                         ],
+                        "nonterminal_records": [
+                            {
+                                "channel": channel,
+                                "id": record_id,
+                                "server_time": server_time,
+                                "source_record_sha256": source_digest,
+                            }
+                            for (
+                                channel,
+                                record_id,
+                                server_time,
+                                source_digest,
+                            ) in sorted(nonterminal_records)
+                        ],
                     }
                 entries.append(entry)
+                scope_classifications.append(
+                    {
+                        "pull_number": pr,
+                        "scope_key": list(parsed_scope),
+                        "classification": (
+                            "current"
+                            if parsed_scope == current_scope_key
+                            else "historical-candidate"
+                        ),
+                    }
+                )
             if (
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
@@ -8261,19 +8402,66 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
-            return entries
+            return {
+                "entries": entries,
+                "scope_classifications": sorted(
+                    scope_classifications,
+                    key=lambda item: int(item["pull_number"]),
+                ),
+            }
+
+        def fixture_scope_classifications(
+            raw_scopes: list[dict[str, object]],
+            candidates: list[dict[str, object]],
+        ) -> list[dict[str, object]]:
+            candidate_scope_keys = {
+                candidate_scope_key
+                for candidate in candidates
+                if (candidate_scope_key := scope_key(candidate)) is not None
+            }
+            classifications: list[dict[str, object]] = []
+            for raw_scope in raw_scopes:
+                raw_scope_key = scope_key(raw_scope)
+                if raw_scope_key is None:
+                    continue
+                if raw_scope_key == current_scope_key:
+                    classification = "current"
+                elif raw_scope_key in candidate_scope_keys:
+                    classification = "historical-candidate"
+                else:
+                    classification = "confirmed-non-candidate"
+                classifications.append(
+                    {
+                        "pull_number": raw_scope_key[1],
+                        "scope_key": list(raw_scope_key),
+                        "classification": classification,
+                    }
+                )
+            return sorted(
+                classifications,
+                key=lambda item: int(item["pull_number"]),
+            )
 
         def universe_inventory(
             raw_scopes: list[dict[str, object]],
             candidates: list[dict[str, object]],
         ) -> dict[str, object]:
+            transcript = build_discovery_endpoint_transcript(raw_scopes)
+            projection = parse_discovery_endpoint_transcript(
+                transcript,
+            )
+            scope_classifications = (
+                clone(projection["scope_classifications"])
+                if isinstance(projection, dict)
+                and isinstance(projection.get("scope_classifications"), list)
+                else fixture_scope_classifications(raw_scopes, candidates)
+            )
             return {
                 "complete": True,
                 "repository": current_repository,
                 "pagination": clone(required_universe_pagination),
-                "discovery_endpoint_transcript": (
-                    build_discovery_endpoint_transcript(raw_scopes)
-                ),
+                "discovery_endpoint_transcript": transcript,
+                "scope_classifications": scope_classifications,
                 "entries": derived_inventory_entries(candidates),
             }
 
@@ -8383,14 +8571,34 @@ class RepositoryContractTest(unittest.TestCase):
                     }
                 ],
             }
-            entries = parse_discovery_endpoint_transcript(
+            parsed_transcript = parse_discovery_endpoint_transcript(
                 transcript,
                 current_ancestry=current_ancestry,
                 require_current_ancestry_exact=require_current_ancestry_exact,
             )
+            entries = (
+                parsed_transcript.get("entries")
+                if isinstance(parsed_transcript, dict)
+                else None
+            )
+            scope_classifications = (
+                parsed_transcript.get("scope_classifications")
+                if isinstance(parsed_transcript, dict)
+                else None
+            )
             if (
-                entries is None
+                not isinstance(entries, list)
                 or len(entries) != 1
+                or not typed_json_equal(
+                    scope_classifications,
+                    [
+                        {
+                            "pull_number": current_pr,
+                            "scope_key": list(current_scope_key),
+                            "classification": "current",
+                        }
+                    ],
+                )
                 or not typed_json_equal(
                     entries[0].get("scope_key"),
                     list(current_scope_key),
@@ -8473,6 +8681,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "repository",
                 "pagination",
                 "discovery_endpoint_transcript",
+                "scope_classifications",
                 "entries",
             }
             if (
@@ -8485,11 +8694,21 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
-            transcript_entries = parse_discovery_endpoint_transcript(
+            transcript_projection = parse_discovery_endpoint_transcript(
                 initial_inventory.get("discovery_endpoint_transcript"),
             )
-            final_transcript_entries = parse_discovery_endpoint_transcript(
+            final_transcript_projection = parse_discovery_endpoint_transcript(
                 final_inventory.get("discovery_endpoint_transcript"),
+            )
+            transcript_entries = (
+                transcript_projection.get("entries")
+                if isinstance(transcript_projection, dict)
+                else None
+            )
+            raw_scope_classifications = (
+                transcript_projection.get("scope_classifications")
+                if isinstance(transcript_projection, dict)
+                else None
             )
             historical_transcript_entries = (
                 [
@@ -8504,14 +8723,64 @@ class RepositoryContractTest(unittest.TestCase):
                 else None
             )
             candidate_entries = derived_inventory_entries(final_candidates)
+            historical_classification_scope_keys = (
+                sorted(
+                    tuple(classification["scope_key"])
+                    for classification in raw_scope_classifications
+                    if isinstance(classification, dict)
+                    and classification.get("classification") == "historical-candidate"
+                    and isinstance(classification.get("scope_key"), list)
+                )
+                if isinstance(raw_scope_classifications, list)
+                else None
+            )
+            current_classifications = (
+                [
+                    classification
+                    for classification in raw_scope_classifications
+                    if isinstance(classification, dict)
+                    and classification.get("classification") == "current"
+                ]
+                if isinstance(raw_scope_classifications, list)
+                else None
+            )
+            historical_entry_scope_keys = (
+                sorted(
+                    tuple(entry["scope_key"])
+                    for entry in historical_transcript_entries
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("scope_key"), list)
+                )
+                if historical_transcript_entries is not None
+                else None
+            )
             if (
-                transcript_entries is None
-                or final_transcript_entries is None
+                not isinstance(transcript_entries, list)
+                or final_transcript_projection is None
                 or not typed_json_equal(
-                    transcript_entries,
-                    final_transcript_entries,
+                    transcript_projection,
+                    final_transcript_projection,
                 )
                 or historical_transcript_entries is None
+                or not isinstance(raw_scope_classifications, list)
+                or not typed_json_equal(
+                    initial_inventory.get("scope_classifications"),
+                    raw_scope_classifications,
+                )
+                or not typed_json_equal(
+                    historical_classification_scope_keys,
+                    historical_entry_scope_keys,
+                )
+                or not typed_json_equal(
+                    current_classifications,
+                    [
+                        {
+                            "pull_number": current_pr,
+                            "scope_key": list(current_scope_key),
+                            "classification": "current",
+                        }
+                    ],
+                )
                 or not typed_json_equal(
                     initial_inventory.get("entries"),
                     historical_transcript_entries,
@@ -8527,6 +8796,21 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             return final_candidates
+
+        def current_decision_authority_entry(
+            value: object,
+        ) -> dict[str, object] | None:
+            if not isinstance(value, dict):
+                return None
+            projected = clone(value)
+            assert isinstance(projected, dict)
+            authority = projected.get("current_authority_projection")
+            if not isinstance(authority, dict) or not isinstance(
+                authority.get("nonterminal_records"), list
+            ):
+                return None
+            del authority["nonterminal_records"]
+            return projected
 
         def current_raw_authority_matches(
             candidate_history: dict[str, object],
@@ -8571,11 +8855,20 @@ class RepositoryContractTest(unittest.TestCase):
                 current_ancestry=ancestry,
                 require_current_ancestry_exact=False,
             )
+            initial_decision_entry = current_decision_authority_entry(initial_entry)
+            expected_initial_decision_entry = current_decision_authority_entry(
+                expected_initial
+            )
             return (
                 expected_initial is not None
                 and expected_final is not None
                 and typed_json_equal(expected_initial, expected_final)
-                and typed_json_equal(initial_entry, expected_initial)
+                and initial_decision_entry is not None
+                and expected_initial_decision_entry is not None
+                and typed_json_equal(
+                    initial_decision_entry,
+                    expected_initial_decision_entry,
+                )
             )
 
         def history(
@@ -9793,6 +10086,53 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 )
 
+        approved_resolved_scope = clone(samples[0])
+        assert isinstance(approved_resolved_scope, dict)
+        approved_resolved_artifact = complete_review_artifact(
+            approved_resolved_scope,
+            77_101,
+            2_700_002,
+        )
+        resolved_child_source = complete_review_artifact(
+            approved_resolved_scope,
+            77_101,
+            2_700_002,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            approved_snapshot = approved_resolved_artifact[snapshot_name]
+            resolved_source_snapshot = resolved_child_source[snapshot_name]
+            assert isinstance(approved_snapshot, dict)
+            assert isinstance(resolved_source_snapshot, dict)
+            approved_snapshot["associated_inline_comments"] = clone(
+                resolved_source_snapshot["associated_inline_comments"]
+            )
+            approved_snapshot["review_thread_pages"] = clone(
+                resolved_source_snapshot["review_thread_pages"]
+            )
+            approved_snapshot["review_thread_pages"]["pages"][0]["nodes"][0][
+                "isResolved"
+            ] = True
+        approved_resolved_scope["evidence_state"] = clone(empty_evidence_state)
+        approved_resolved_scope["evidence_state"]["terminal_payloads"] = [
+            approved_resolved_artifact
+        ]
+        approved_resolved_projection = parse_discovery_endpoint_transcript(
+            build_discovery_endpoint_transcript([approved_resolved_scope, current])
+        )
+        self.assertIsNotNone(approved_resolved_projection)
+        assert isinstance(approved_resolved_projection, dict)
+        approved_resolved_entry = next(
+            entry
+            for entry in approved_resolved_projection["entries"]
+            if entry.get("scope_key") == list(thread_scope)
+        )
+        self.assertEqual(
+            approved_resolved_entry["source_evidence"]["semantic"],
+            "findings",
+        )
+
         baseline_history = history(samples)
         baseline_transcript = baseline_history["initial_inventory"][
             "discovery_endpoint_transcript"
@@ -10100,9 +10440,39 @@ class RepositoryContractTest(unittest.TestCase):
             {current_pr, 2, 3, 4, 5},
         )
         self.assertEqual(len(complete_scope_transcript["scopes"]), 5)
+        complete_scope_projection = parse_discovery_endpoint_transcript(
+            complete_scope_transcript
+        )
+        self.assertIsNotNone(complete_scope_projection)
+        assert isinstance(complete_scope_projection, dict)
+        expected_scope_classifications = [
+            {
+                "pull_number": int(record["scope"]["pr"]),
+                "scope_key": list(scope_key(record) or ()),
+                "classification": classification,
+            }
+            for record, classification in [
+                (current, "current"),
+                *[(candidate, "historical-candidate") for candidate in samples],
+                (human_only_scope, "confirmed-non-candidate"),
+            ]
+        ]
+        expected_scope_classifications.sort(key=lambda item: int(item["pull_number"]))
         self.assertTrue(
             typed_json_equal(
-                parse_discovery_endpoint_transcript(complete_scope_transcript),
+                complete_scope_history["initial_inventory"]["scope_classifications"],
+                expected_scope_classifications,
+            )
+        )
+        self.assertTrue(
+            typed_json_equal(
+                complete_scope_projection["scope_classifications"],
+                expected_scope_classifications,
+            )
+        )
+        self.assertTrue(
+            typed_json_equal(
+                complete_scope_projection["entries"],
                 derived_inventory_entries([*samples, current]),
             )
         )
@@ -10123,6 +10493,70 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "clean",
         )
+        invalid_scope_classification_histories: dict[str, dict[str, object]] = {}
+        missing_classification_field = clone(complete_scope_history)
+        assert isinstance(missing_classification_field, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            missing_classification_field[inventory_name].pop("scope_classifications")
+        invalid_scope_classification_histories["missing-field"] = (
+            missing_classification_field
+        )
+
+        unclassified_seeded_pr = clone(complete_scope_history)
+        assert isinstance(unclassified_seeded_pr, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            classifications = unclassified_seeded_pr[inventory_name][
+                "scope_classifications"
+            ]
+            unclassified_seeded_pr[inventory_name]["scope_classifications"] = [
+                item for item in classifications if item.get("pull_number") != 5
+            ]
+        invalid_scope_classification_histories["unclassified-seeded-pr"] = (
+            unclassified_seeded_pr
+        )
+
+        duplicate_scope_classification = clone(complete_scope_history)
+        assert isinstance(duplicate_scope_classification, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            classifications = duplicate_scope_classification[inventory_name][
+                "scope_classifications"
+            ]
+            classifications.append(clone(classifications[0]))
+        invalid_scope_classification_histories["duplicate"] = (
+            duplicate_scope_classification
+        )
+
+        wrong_scope_classification = clone(complete_scope_history)
+        assert isinstance(wrong_scope_classification, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            classifications = wrong_scope_classification[inventory_name][
+                "scope_classifications"
+            ]
+            historical_classification = next(
+                item
+                for item in classifications
+                if item.get("classification") == "historical-candidate"
+            )
+            historical_classification["classification"] = "confirmed-non-candidate"
+        invalid_scope_classification_histories["wrong-classification"] = (
+            wrong_scope_classification
+        )
+
+        for (
+            classification_near_miss,
+            invalid_scope_history,
+        ) in invalid_scope_classification_histories.items():
+            with self.subTest(
+                history_scope_classification_near_miss=classification_near_miss
+            ):
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        invalid_scope_history,
+                        current,
+                    ),
+                    "unknown",
+                )
         unrelated_raw_fields = history(samples)
         for inventory_name in ("initial_inventory", "final_inventory"):
             transcript = unrelated_raw_fields[inventory_name][
@@ -10222,6 +10656,200 @@ class RepositoryContractTest(unittest.TestCase):
             channel="issue-comment",
             edited=True,
         )
+        terminal_basis = terminal_current["candidate_basis"]
+        assert isinstance(terminal_basis, dict)
+        terminal_server_time = terminal_basis["server_time"]
+        assert isinstance(terminal_server_time, int)
+        pending_review_records: list[dict[str, object]] = []
+        progress_issue_records: list[dict[str, object]] = []
+        for offset, record_id in ((-1, 82_001), (2, 82_002)):
+            pending_artifact = complete_review_artifact(
+                terminal_current,
+                record_id,
+                terminal_server_time + offset,
+            )
+            pending_snapshot = pending_artifact["final_snapshot"]
+            assert isinstance(pending_snapshot, dict)
+            pending_snapshot["state"] = "PENDING"
+            pending_snapshot["submitted_at"] = None
+            pending_review_records.append(raw_review_record(pending_snapshot))
+
+            progress_artifact = complete_issue_comment_artifact(
+                terminal_current,
+                record_id + 100,
+                terminal_server_time + offset,
+            )
+            progress_snapshot = progress_artifact["final_snapshot"]
+            assert isinstance(progress_snapshot, dict)
+            progress_snapshot["body"] = "Codex Review in progress."
+            progress_issue_records.append(raw_issue_artifact_record(progress_snapshot))
+        self.assertTrue(
+            all(
+                pending_record.get("submitted_at") is None
+                for pending_record in pending_review_records
+            )
+        )
+        pending_bundle_source = complete_review_artifact(
+            terminal_current,
+            82_002,
+            terminal_server_time + 2,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+        )["final_snapshot"]
+        assert isinstance(pending_bundle_source, dict)
+        pending_bundle_associated = pending_bundle_source["associated_inline_comments"]
+        pending_bundle_threads = pending_bundle_source["review_thread_pages"]
+        assert isinstance(pending_bundle_associated, dict)
+        assert isinstance(pending_bundle_threads, dict)
+        pending_bundle_inline_records = [
+            raw_inline_record(item) for item in pending_bundle_associated["records"]
+        ]
+        pending_bundle_thread_nodes: list[dict[str, object]] = []
+        for thread_page in pending_bundle_threads["pages"]:
+            pending_bundle_thread_nodes.extend(clone(thread_page["nodes"]))
+
+        nonterminal_current_variants: dict[str, dict[str, object]] = {}
+        current_with_pending_reviews = clone(terminal_current)
+        assert isinstance(current_with_pending_reviews, dict)
+        current_with_pending_reviews["raw_review_records"] = pending_review_records
+        current_with_pending_reviews["raw_inline_records"] = (
+            pending_bundle_inline_records
+        )
+        current_with_pending_reviews["raw_thread_nodes"] = pending_bundle_thread_nodes
+        nonterminal_current_variants["pending-review"] = current_with_pending_reviews
+        current_with_progress_comments = clone(terminal_current)
+        assert isinstance(current_with_progress_comments, dict)
+        current_with_progress_comments["raw_issue_records"] = progress_issue_records
+        nonterminal_current_variants["progress-comment"] = (
+            current_with_progress_comments
+        )
+        for (
+            nonterminal_kind,
+            raw_current_with_nonterminal,
+        ) in nonterminal_current_variants.items():
+            with self.subTest(terminal_with_nonterminal_record=nonterminal_kind):
+                nonterminal_history = history(
+                    samples,
+                    current_raw=raw_current_with_nonterminal,
+                )
+                self.assertTrue(
+                    current_raw_authority_matches(
+                        nonterminal_history,
+                        terminal_current,
+                    )
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        nonterminal_history,
+                        terminal_current,
+                    ),
+                    "mixed",
+                )
+                parsed_nonterminal_current = parse_current_endpoint_inventory(
+                    nonterminal_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                self.assertIsNotNone(parsed_nonterminal_current)
+                assert isinstance(parsed_nonterminal_current, dict)
+                nonterminal_records = parsed_nonterminal_current[
+                    "current_authority_projection"
+                ]["nonterminal_records"]
+                self.assertEqual(len(nonterminal_records), 2)
+
+        nonterminal_drift_cases: dict[
+            str, tuple[dict[str, object], dict[str, object]]
+        ] = {}
+        final_pending_parent_drift = clone(current_with_pending_reviews)
+        assert isinstance(final_pending_parent_drift, dict)
+        final_pending_parent_drift["raw_review_records"][1]["body"] = (
+            "Draft state changed"
+        )
+        nonterminal_drift_cases["pending-parent-body"] = (
+            current_with_pending_reviews,
+            final_pending_parent_drift,
+        )
+
+        final_pending_child_drift = clone(current_with_pending_reviews)
+        assert isinstance(final_pending_child_drift, dict)
+        final_pending_child_drift["raw_inline_records"][0]["body"] = (
+            "[P1] Changed pending inline finding"
+        )
+        nonterminal_drift_cases["pending-inline-body"] = (
+            current_with_pending_reviews,
+            final_pending_child_drift,
+        )
+
+        final_pending_thread_drift = clone(current_with_pending_reviews)
+        assert isinstance(final_pending_thread_drift, dict)
+        final_pending_thread_drift["raw_thread_nodes"][0]["isResolved"] = True
+        nonterminal_drift_cases["pending-thread-resolution"] = (
+            current_with_pending_reviews,
+            final_pending_thread_drift,
+        )
+
+        final_progress_body_drift = clone(current_with_progress_comments)
+        assert isinstance(final_progress_body_drift, dict)
+        final_progress_body_drift["raw_issue_records"][1]["body"] = (
+            "Codex Review in progress: phase two"
+        )
+        nonterminal_drift_cases["progress-body"] = (
+            current_with_progress_comments,
+            final_progress_body_drift,
+        )
+
+        final_progress_time_drift = clone(current_with_progress_comments)
+        assert isinstance(final_progress_time_drift, dict)
+        final_progress_time_drift["raw_issue_records"][1]["updated_at"] = (
+            _format_github_rfc3339_seconds(terminal_server_time + 3)
+        )
+        nonterminal_drift_cases["progress-time"] = (
+            current_with_progress_comments,
+            final_progress_time_drift,
+        )
+
+        for (
+            nonterminal_drift_name,
+            (initial_nonterminal_current, final_nonterminal_current),
+        ) in nonterminal_drift_cases.items():
+            with self.subTest(nonterminal_final_reread_drift=nonterminal_drift_name):
+                nonterminal_drift_history = history(
+                    samples,
+                    current_raw=initial_nonterminal_current,
+                    final_current_raw=final_nonterminal_current,
+                )
+                self.assertFalse(
+                    current_raw_authority_matches(
+                        nonterminal_drift_history,
+                        terminal_current,
+                    )
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        nonterminal_drift_history,
+                        terminal_current,
+                    ),
+                    "unknown",
+                )
+
+        progress_only_current = clone(current)
+        assert isinstance(progress_only_current, dict)
+        progress_only_current["requests"] = []
+        progress_only_current["reactions"] = []
+        progress_only_current["selected_request_id"] = None
+        progress_only_current["selected_reaction_id"] = None
+        progress_only_current["raw_issue_records"] = progress_issue_records
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    progress_only_current,
+                    observation_marker="progress-only",
+                ),
+                current_ancestry={},
+            )
+        )
+
         mixed_terminal_history = clone(terminal_history)
         assert isinstance(mixed_terminal_history, list)
         with_terminal_payload(
@@ -12251,9 +12879,14 @@ class RepositoryContractTest(unittest.TestCase):
         ordinary_reply_fetches[thread_index] = graphql_thread_fetch(
             [*target_threads, unrelated_only_thread]
         )
+        ordinary_replies_projection = parse_discovery_endpoint_transcript(
+            ordinary_replies_transcript
+        )
+        self.assertIsNotNone(ordinary_replies_projection)
+        assert isinstance(ordinary_replies_projection, dict)
         self.assertTrue(
             typed_json_equal(
-                parse_discovery_endpoint_transcript(ordinary_replies_transcript),
+                ordinary_replies_projection["entries"],
                 derived_inventory_entries([ordinary_replies_candidate, current]),
             )
         )
