@@ -708,9 +708,27 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
             ancestor.chmod(0o1777)
             try:
+                rejection_errors: list[BaseException] = []
                 self.assertIsNone(
-                    support._validated_private_runtime_parent(str(parent))
+                    support._validated_private_runtime_parent(
+                        str(parent),
+                        rejection_errors=rejection_errors,
+                    )
                 )
+                self.assertEqual(len(rejection_errors), 1)
+                self.assertIsInstance(rejection_errors[0], OSError)
+                self.assertEqual(rejection_errors[0].errno, errno.EPERM)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {support._EXPLICIT_RUNTIME_PARENT_ENV: str(parent)},
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        r"errno=1: .*group- or world-writable",
+                    ),
+                ):
+                    support._private_runtime_parent()
             finally:
                 ancestor.chmod(0o700)
 

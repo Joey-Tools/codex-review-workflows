@@ -538,7 +538,11 @@ def _duplicate_directory_parent(
     return binding
 
 
-def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
+def _validated_private_runtime_parent(
+    raw_path: str,
+    *,
+    rejection_errors: list[BaseException] | None = None,
+) -> pathlib.Path | None:
     result_owner = _DirectoryParentBindingResultOwner()
     try:
         binding = _open_directory_parent(
@@ -553,6 +557,8 @@ def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
             error,
         )
         if preserved is error:
+            if rejection_errors is not None:
+                rejection_errors.append(error)
             return None
         raise preserved
     except BaseException as error:
@@ -1701,11 +1707,23 @@ def _rollback_unstored_owned_private_directory(
 def _private_runtime_parent() -> pathlib.Path:
     explicit_parent = os.environ.get(_EXPLICIT_RUNTIME_PARENT_ENV)
     if explicit_parent is not None:
-        validated = _validated_private_runtime_parent(explicit_parent)
+        rejection_errors: list[BaseException] = []
+        validated = _validated_private_runtime_parent(
+            explicit_parent,
+            rejection_errors=rejection_errors,
+        )
         if validated is None:
+            rejection = rejection_errors[0] if rejection_errors else None
+            rejection_detail = ""
+            if rejection is not None:
+                rejection_errno = getattr(rejection, "errno", None)
+                rejection_detail = (
+                    f" ({type(rejection).__name__}, errno={rejection_errno}: "
+                    f"{rejection})"
+                )
             raise RuntimeError(
                 f"{_EXPLICIT_RUNTIME_PARENT_ENV} is not a trusted private "
-                "test runtime parent"
+                f"test runtime parent{rejection_detail}"
             )
         return validated
 
