@@ -405,6 +405,16 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 ),
             ),
         )
+        self.assertEqual(observed[0].process_state, b"\x05")
+        self.assertEqual(
+            observed[0],
+            runner.DarwinProcessIdentity(
+                pid=pid,
+                start_seconds=1_700_000_002,
+                start_microseconds=123_456,
+                process_state=b"\x03",
+            ),
+        )
 
     def test_darwin_process_census_rejects_malformed_sysctl_identity(self) -> None:
         pid = 90_002
@@ -614,7 +624,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(census.call_count, 3)
         self.assertEqual(
             reap_terminal.call_args_list,
-            [mock.call((terminal_child,)), mock.call((terminal_child,))],
+            [
+                mock.call((terminal_child,), deadline=1.0),
+                mock.call((terminal_child,), deadline=1.0),
+            ],
         )
 
     def test_same_uid_closure_rejects_persistent_exact_identity(self) -> None:
@@ -655,11 +668,90 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
         self.assertEqual(closure.exception.processes, (escaped,))
 
-    def test_terminal_same_uid_child_is_reaped_by_exact_pid(self) -> None:
+    def test_terminal_same_uid_child_reap_binds_exact_identity_under_deadline(
+        self,
+    ) -> None:
         terminal_child = runner.DarwinProcessIdentity(
             90_007,
             1_700_000_007,
             7_007,
+            process_state=b"\x05",
+        )
+        rebound_child = runner.DarwinProcessIdentity(
+            terminal_child.pid,
+            terminal_child.start_seconds,
+            terminal_child.start_microseconds,
+            process_state=b"\x03",
+        )
+        deadline = 123.0
+        events: list[tuple[object, ...]] = []
+
+        def require_time(observed_deadline: float) -> None:
+            events.append(("deadline", observed_deadline))
+
+        def waitid(*arguments: object) -> object:
+            events.append(("waitid", *arguments))
+            return mock.Mock(si_pid=terminal_child.pid)
+
+        def census(*, deadline: float | None = None) -> tuple[object, ...]:
+            events.append(("identity", deadline))
+            return (rebound_child,)
+
+        def waitpid(*arguments: object) -> tuple[int, int]:
+            events.append(("waitpid", *arguments))
+            return (terminal_child.pid, 0)
+
+        with (
+            mock.patch.object(
+                runner.os,
+                "waitid",
+                side_effect=waitid,
+            ),
+            mock.patch.object(
+                runner.os,
+                "waitpid",
+                side_effect=waitpid,
+            ),
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=census,
+            ),
+            mock.patch.object(
+                runner,
+                "_require_process_census_time",
+                side_effect=require_time,
+            ),
+        ):
+            runner._reap_terminal_same_uid_children(
+                (terminal_child,),
+                deadline=deadline,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("deadline", deadline),
+                (
+                    "waitid",
+                    os.P_PID,
+                    terminal_child.pid,
+                    os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                ),
+                ("deadline", deadline),
+                ("identity", deadline),
+                ("deadline", deadline),
+                ("deadline", deadline),
+                ("waitpid", terminal_child.pid, os.WNOHANG),
+                ("deadline", deadline),
+            ],
+        )
+
+    def test_terminal_same_uid_child_reap_rejects_missing_identity(self) -> None:
+        terminal_child = runner.DarwinProcessIdentity(
+            90_009,
+            1_700_000_009,
+            9_009,
             process_state=b"\x05",
         )
         with (
@@ -667,21 +759,102 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 runner.os,
                 "waitid",
                 return_value=mock.Mock(si_pid=terminal_child.pid),
-            ) as waitid,
+            ),
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(),
+            ),
+            mock.patch.object(runner.os, "waitpid") as waitpid,
+            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
+        ):
+            runner._reap_terminal_same_uid_children(
+                (terminal_child,),
+                deadline=runner.time.monotonic() + 1.0,
+            )
+
+        self.assertEqual(closure.exception.processes, (terminal_child,))
+        self.assertIsInstance(closure.exception.cause, ProcessLookupError)
+        self.assertEqual(closure.exception.cause.errno, errno.ESRCH)
+        waitpid.assert_not_called()
+
+    def test_terminal_same_uid_child_reap_rejects_reused_pid_identity(self) -> None:
+        terminal_child = runner.DarwinProcessIdentity(
+            90_010,
+            1_700_000_010,
+            10_010,
+            process_state=b"\x05",
+        )
+        mismatches = (
+            runner.DarwinProcessIdentity(
+                terminal_child.pid,
+                terminal_child.start_seconds + 1,
+                terminal_child.start_microseconds,
+            ),
+            runner.DarwinProcessIdentity(
+                terminal_child.pid,
+                terminal_child.start_seconds,
+                terminal_child.start_microseconds + 1,
+            ),
+        )
+        for rebound_child in mismatches:
+            with self.subTest(rebound_child=rebound_child):
+                with (
+                    mock.patch.object(
+                        runner.os,
+                        "waitid",
+                        return_value=mock.Mock(si_pid=terminal_child.pid),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_darwin_same_uid_processes",
+                        return_value=(rebound_child,),
+                    ),
+                    mock.patch.object(runner.os, "waitpid") as waitpid,
+                    self.assertRaises(
+                        runner.ChildProcessTreeClosureUnproven
+                    ) as closure,
+                ):
+                    runner._reap_terminal_same_uid_children(
+                        (terminal_child,),
+                        deadline=runner.time.monotonic() + 1.0,
+                    )
+
+                self.assertEqual(closure.exception.processes, (terminal_child,))
+                self.assertIsInstance(closure.exception.cause, OSError)
+                self.assertEqual(closure.exception.cause.errno, errno.ESTALE)
+                waitpid.assert_not_called()
+
+    def test_terminal_same_uid_child_reap_rejects_unreadable_identity(self) -> None:
+        terminal_child = runner.DarwinProcessIdentity(
+            90_011,
+            1_700_000_011,
+            11_011,
+            process_state=b"\x05",
+        )
+        identity_error = OSError(errno.EACCES, "identity inspection denied")
+        with (
             mock.patch.object(
                 runner.os,
-                "waitpid",
-                return_value=(terminal_child.pid, 0),
-            ) as waitpid,
+                "waitid",
+                return_value=mock.Mock(si_pid=terminal_child.pid),
+            ),
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=identity_error,
+            ),
+            mock.patch.object(runner.os, "waitpid") as waitpid,
+            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
         ):
-            runner._reap_terminal_same_uid_children((terminal_child,))
+            runner._reap_terminal_same_uid_children(
+                (terminal_child,),
+                deadline=runner.time.monotonic() + 1.0,
+            )
 
-        waitid.assert_called_once_with(
-            os.P_PID,
-            terminal_child.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-        waitpid.assert_called_once_with(terminal_child.pid, os.WNOHANG)
+        self.assertEqual(closure.exception.processes, (terminal_child,))
+        self.assertIs(closure.exception.cause, identity_error)
+        waitpid.assert_not_called()
 
     def test_exact_identity_absence_accepts_same_pid_reuse(self) -> None:
         old_process = runner.DarwinProcessIdentity(
@@ -725,6 +898,39 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
         self.assertGreaterEqual(census.call_count, 2)
         reap_terminal.assert_not_called()
+
+    def test_exact_identity_absence_passes_same_deadline_to_reaper(self) -> None:
+        terminal_child = runner.DarwinProcessIdentity(
+            90_012,
+            1_700_000_012,
+            12_012,
+            process_state=b"\x05",
+        )
+        stop = RuntimeError("stop after observing reaper arguments")
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(terminal_child,),
+            ),
+            mock.patch.object(
+                runner,
+                "_reap_terminal_same_uid_children",
+                side_effect=stop,
+            ) as reap_terminal,
+            mock.patch.object(runner.time, "monotonic", return_value=0.0),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            runner._require_process_identities_absent(
+                (terminal_child,),
+                deadline=1.0,
+            )
+
+        self.assertIs(raised.exception, stop)
+        reap_terminal.assert_called_once_with(
+            (terminal_child,),
+            deadline=1.0,
+        )
 
     def test_isolated_child_account_rejects_admin_membership(self) -> None:
         with (
@@ -6468,12 +6674,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 try:
                     raw_pid = marker.read_bytes()
                 except FileNotFoundError:
-                    raw_pid = b""
-                if 1 <= len(raw_pid) <= 20 and raw_pid.isdigit():
-                    try:
-                        observed.append(bind_identity(int(raw_pid)))
-                    except (ProcessLookupError, ValueError):
-                        pass
+                    return tuple(observed)
+                if not 1 <= len(raw_pid) <= 20 or not raw_pid.isdigit():
+                    raise ValueError("fixture process marker is not a valid PID")
+                observed.append(bind_identity(int(raw_pid)))
                 return tuple(observed)
 
             # The ordinary developer account can have unrelated same-UID
@@ -6481,12 +6685,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             # start identities scoped to its exact fixture process; the hosted
             # isolated-account gate runs the unfiltered production census
             # around the complete child suite.
-            with mock.patch.object(
-                runner,
-                "_darwin_same_uid_processes",
-                side_effect=fixture_census,
-            ):
-                try:
+            try:
+                with mock.patch.object(
+                    runner,
+                    "_darwin_same_uid_processes",
+                    side_effect=fixture_census,
+                ):
                     started = time.monotonic()
                     with self.assertRaises(
                         runner.ChildProcessTreeClosureUnproven
@@ -6531,14 +6735,14 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         f"closure evidence {escaped.exception.processes!r}; "
                         f"cause={escaped.exception.cause!r}",
                     )
-                finally:
-                    if escaped_pid is not None:
-                        try:
-                            os.kill(escaped_pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    if escaped_identity is not None:
-                        runner._require_process_identities_absent((escaped_identity,))
+            finally:
+                if escaped_pid is not None:
+                    try:
+                        os.kill(escaped_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            if escaped_identity is not None:
+                runner._require_process_identities_absent((escaped_identity,))
 
     def test_bounded_child_output_overflow_settles_same_group_descendant(
         self,

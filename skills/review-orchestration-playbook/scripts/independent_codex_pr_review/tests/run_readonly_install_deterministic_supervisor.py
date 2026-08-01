@@ -616,7 +616,10 @@ def _require_no_new_same_uid_processes(
         if escaped:
             last_escaped = escaped
             absent_since = None
-            _reap_terminal_same_uid_children(escaped)
+            _reap_terminal_same_uid_children(
+                escaped,
+                deadline=operation_deadline,
+            )
         else:
             now = time.monotonic()
             if absent_since is None:
@@ -636,8 +639,14 @@ def _require_no_new_same_uid_processes(
 
 def _reap_terminal_same_uid_children(
     processes: tuple[DarwinProcessIdentity, ...],
+    *,
+    deadline: float,
 ) -> None:
     for process in processes:
+        try:
+            _require_process_census_time(deadline)
+        except TimeoutError as error:
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
         try:
             terminal = os.waitid(
                 os.P_PID,
@@ -653,10 +662,52 @@ def _reap_terminal_same_uid_children(
         if terminal is None:
             continue
         if terminal.si_pid != process.pid:
-            raise ChildProcessError("terminal child status returned a different PID")
-        waited, _ = os.waitpid(process.pid, os.WNOHANG)
+            error = ChildProcessError("terminal child status returned a different PID")
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
+        # WNOWAIT keeps this terminal process-table object present. Rebind its
+        # exact start timeval before the numeric-PID reap: PID selects the slot,
+        # while the start timeval proves that the slot still contains the
+        # census object. Mutable state remains diagnostic and is not compared.
+        try:
+            _require_process_census_time(deadline)
+            rebound = tuple(
+                candidate
+                for candidate in _darwin_same_uid_processes(deadline=deadline)
+                if candidate.pid == process.pid
+            )
+            _require_process_census_time(deadline)
+        except Exception as error:
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
+        if not rebound:
+            error = ProcessLookupError(
+                errno.ESRCH,
+                "terminal child identity disappeared before reap",
+                process.pid,
+            )
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
+        if len(rebound) != 1:
+            error = OSError(
+                errno.EIO,
+                "terminal child PID has ambiguous process identities",
+                process.pid,
+            )
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
+        if rebound[0] != process:
+            error = OSError(
+                errno.ESTALE,
+                "terminal child identity changed before reap",
+                process.pid,
+            )
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
+        try:
+            _require_process_census_time(deadline)
+            waited, _ = os.waitpid(process.pid, os.WNOHANG)
+            _require_process_census_time(deadline)
+        except Exception as error:
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
         if waited not in (0, process.pid):
-            raise ChildProcessError("terminal child reap returned a different PID")
+            error = ChildProcessError("terminal child reap returned a different PID")
+            raise ChildProcessTreeClosureUnproven((process,), error) from error
 
 
 def _require_process_identities_absent(
@@ -676,7 +727,10 @@ def _require_process_identities_absent(
         if present:
             last_present = present
             absent_since = None
-            _reap_terminal_same_uid_children(present)
+            _reap_terminal_same_uid_children(
+                present,
+                deadline=operation_deadline,
+            )
         else:
             now = time.monotonic()
             if absent_since is None:

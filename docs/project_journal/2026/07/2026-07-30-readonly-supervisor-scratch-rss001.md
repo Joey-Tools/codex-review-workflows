@@ -239,10 +239,10 @@ superseded_by:
   `/usr/bin/write` were rejected at `exec` with `EPERM` (sandbox exit 71). The
   hosted runner still must prove the same inherited policy before CI can pass.
 - The final async cleanup-boundary, recovery directory-FD custody, and delayed
-  Darwin process-visibility hardening passed 781/781 deterministic
-  independent-supervisor tests in 102.218 seconds on the uv-managed CPython
+  Darwin process-visibility hardening passed 785/785 deterministic
+  independent-supervisor tests in 101.433 seconds on the uv-managed CPython
   3.13.13 runtime, with reviewed selected-identity SHA-256
-  `3cd1f96fb56e1ba396da7f1cb0a384d2cefaf8c7458c019e1be5a5cd1e8a5333`.
+  `d5c05be333956ec17a9190f79044d730eab639328d1ec4e5aec5a74c903b05ef`.
   Caller-owned runtime-root and child-descriptor settlement now survives the
   remaining call/return interruption windows without retrying an ambiguous
   close. Recovery admission also rejects multiply linked non-directory objects
@@ -255,18 +255,22 @@ superseded_by:
   requires 250 milliseconds of stable exact-identity absence within its
   existing five-second deadline. It opportunistically reaps only terminal
   direct children and never treats process state as identity: PID plus start
-  seconds and microseconds remain the protected process-table object. Zombies,
-  live descendants, unreadable census results, and identities that reappear
-  before the stability window still fail closed.
+  seconds and microseconds remain the protected process-table object. After
+  `waitid(WNOWAIT)` exposes a terminal direct child, a fresh bounded census must
+  bind that exact start-time identity before `waitpid`; missing, unreadable, or
+  reused PID identity evidence fails closed. Every identity and reap operation
+  shares the original five-second absolute deadline. Zombies, live descendants,
+  unreadable census results, and identities that reappear before the stability
+  window still fail closed.
 - The live double-fork regression ignores `SIGHUP`, settles its escaped marker
   PID to stable exact absence after cleanup, and uses real Darwin start identity
   for only the supervisor and fixture process on an ordinary developer account.
   This test-only scope avoids unrelated account process churn; the hosted
   isolated-account gate continues to run the complete production census without
-  filtering. The read-only runner module passed 104/104 in 8.649 seconds, and
+  filtering. The read-only runner module passed 108/108 in 8.661 seconds, and
   ten ordered output-overflow/double-fork stress rounds passed 20/20 in 58.9
   seconds under the same uv-managed CPython 3.13.13 runtime. The complete
-  repository contract module passed 105/105 in 3.945 seconds with every helper
+  repository contract module passed 105/105 with every helper
   subprocess resolving that same uv-managed interpreter.
 - Hosted setup-uv paths are now resolved through physical parent ancestry to a
   regular non-symlink executable leaf before identity and digest binding. Exact
