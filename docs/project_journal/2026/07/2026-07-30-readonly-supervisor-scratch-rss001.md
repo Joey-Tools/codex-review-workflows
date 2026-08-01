@@ -292,12 +292,15 @@ superseded_by:
   private runtime parent. The outer runner still creates the read-only install
   container below sticky `/private/tmp`, while nested unittest temporary roots
   no longer fall back to that intentionally rejected ancestor.
-- The complete host-level deterministic gate now passes 794/794 in 102.367
+- The complete host-level deterministic gate now passes 799/799 in 102.251
   seconds on the uv-managed CPython 3.13.13 runtime, with selected-identity
   SHA-256
-  `0155f4bf21c0fc12e5ffaf9ff9757f1503a099f07905702a45bda238359f16ff`.
+  `306ce4d6bcdacd57b555f5e1eecefe59c4033c853e7e8c939a527dce05c10377`.
   Recovery manifests bind complete bounded leaf access-policy evidence,
-  including ACL state and canonical xattr names and values, and the final leaf
-  unlink starts only while the original absolute cleanup deadline remains
-  live. Policy drift, unreadable metadata, and deadline expiry retain the
+  including ACL state and canonical xattr names and values, plus exact bounded
+  regular-file bytes through a domain-separated double-observed digest. Raw
+  content is read with one fixed cleared buffer and never enters manifest
+  state; non-regular leaves are never stream-read. The final leaf unlink starts
+  only while the original absolute cleanup deadline remains live. Policy or
+  content drift, unreadable evidence, and deadline expiry retain the
   descriptor-bound quarantine instead of weakening cleanup admission.

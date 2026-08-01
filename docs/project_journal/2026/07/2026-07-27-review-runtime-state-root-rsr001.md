@@ -297,19 +297,20 @@ superseded_by:
   supervisor package, so unsupported runtimes cannot replace the stable version
   diagnostic with an import failure. The current complete contract module
   passed 105/105 on the uv-managed CPython 3.13.13 runtime.
-- The final leaf-cleanup policy hardening passed 794/794 deterministic tests in
-  102.367 seconds on the host-level uv-managed CPython 3.13.13 runtime. The
-  reviewed 794-test selected identity has SHA-256
-  `0155f4bf21c0fc12e5ffaf9ff9757f1503a099f07905702a45bda238359f16ff`.
-  Manifest v2 now binds each leaf's object identity, content length, owner,
-  group, mode, flags, generation, normalized ACL state, and every canonical
-  xattr name plus its complete bounded value. Raw xattr values are hashed
-  during two stable descriptor observations and never enter the manifest.
-  Aggregate limits are enforced before raw buffer allocation or reads; each
-  bounded value is hashed directly from a transient buffer that is cleared on
-  every exit. Oversized or unstable observations fail closed as unreadable,
-  while the destructive unlink boundary rechecks the original absolute
-  deadline after metadata validation and retains the quarantined leaf when
-  that deadline has expired. The focused recovery and secure-I/O modules
-  passed 71/71 and 30/30,
+- The final leaf-cleanup policy hardening passed 799/799 deterministic tests in
+  102.251 seconds on the host-level uv-managed CPython 3.13.13 runtime. The
+  reviewed 799-test selected identity has SHA-256
+  `306ce4d6bcdacd57b555f5e1eecefe59c4033c853e7e8c939a527dce05c10377`.
+  Manifest v3 now binds each leaf's object identity, owner, group, mode, flags,
+  generation, normalized ACL state, and every canonical xattr name plus its
+  complete bounded value. It also binds the exact bytes of each readable
+  regular leaf with a domain-separated SHA-256 digest. Regular content is read
+  twice from the same descriptor through a fixed, cleared 64 KiB buffer under
+  one absolute deadline and a dedicated 512 MiB per-leaf cap; FIFO, symlink,
+  and other non-regular leaves use domain-separated canonical states without
+  consuming stream or target data. Raw content and xattr values never enter the
+  manifest. Oversized, unreadable, unstable, or equal-length rewritten content
+  fails closed, while the destructive unlink boundary rechecks the original
+  absolute deadline and retains the quarantined leaf when it has expired. The
+  focused recovery and secure-I/O modules passed 76/76 and 30/30,
   respectively, under the same runtime.

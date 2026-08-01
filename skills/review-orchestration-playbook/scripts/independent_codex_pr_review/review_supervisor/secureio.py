@@ -149,6 +149,32 @@ def _macos_directory_metadata_binding(
 _LEAF_METADATA_DIGEST_DOMAIN = b"targeted-cleanup-leaf-metadata-v2\0"
 MAX_LEAF_XATTR_VALUE_BYTES = 64 * 1024
 MAX_LEAF_XATTR_TOTAL_BYTES = 1024 * 1024
+_LEAF_CONTENT_DIGEST_DOMAIN = b"targeted-cleanup-leaf-content-v1\0"
+LEAF_CONTENT_STATE_REGULAR = 1
+LEAF_CONTENT_STATE_SYMLINK = 2
+LEAF_CONTENT_STATE_FIFO = 3
+LEAF_CONTENT_STATE_SOCKET = 4
+LEAF_CONTENT_STATE_CHARACTER_DEVICE = 5
+LEAF_CONTENT_STATE_BLOCK_DEVICE = 6
+LEAF_CONTENT_STATE_OTHER = 7
+LEAF_CONTENT_STATES = frozenset(
+    {
+        LEAF_CONTENT_STATE_REGULAR,
+        LEAF_CONTENT_STATE_SYMLINK,
+        LEAF_CONTENT_STATE_FIFO,
+        LEAF_CONTENT_STATE_SOCKET,
+        LEAF_CONTENT_STATE_CHARACTER_DEVICE,
+        LEAF_CONTENT_STATE_BLOCK_DEVICE,
+        LEAF_CONTENT_STATE_OTHER,
+    }
+)
+MAX_LEAF_CONTENT_BYTES = 512 * 1024 * 1024
+_LEAF_CONTENT_READ_BYTES = 64 * 1024
+_LEAF_CONTENT_ZEROES = bytes(_LEAF_CONTENT_READ_BYTES)
+
+
+class LeafContentDeadlineExpired(TimeoutError):
+    """The cleanup's own monotonic deadline expired between content reads."""
 
 
 def _update_digest_string(
@@ -387,6 +413,143 @@ def inspect_macos_leaf_metadata_digest(fd: int) -> tuple[int, bytes]:
         or first != second
     ):
         raise OSError(errno.ESTALE, "leaf metadata changed during inspection")
+    return second
+
+
+def leaf_content_state_for_file_type(file_type: int) -> int:
+    if stat.S_ISREG(file_type):
+        return LEAF_CONTENT_STATE_REGULAR
+    if stat.S_ISLNK(file_type):
+        return LEAF_CONTENT_STATE_SYMLINK
+    if stat.S_ISFIFO(file_type):
+        return LEAF_CONTENT_STATE_FIFO
+    if stat.S_ISSOCK(file_type):
+        return LEAF_CONTENT_STATE_SOCKET
+    if stat.S_ISCHR(file_type):
+        return LEAF_CONTENT_STATE_CHARACTER_DEVICE
+    if stat.S_ISBLK(file_type):
+        return LEAF_CONTENT_STATE_BLOCK_DEVICE
+    if stat.S_ISDIR(file_type):
+        raise ValueError("directory content cannot be bound as a leaf")
+    return LEAF_CONTENT_STATE_OTHER
+
+
+def _leaf_content_stat_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_size,
+    )
+
+
+def _leaf_content_digest_once(
+    fd: int,
+    metadata: os.stat_result,
+    *,
+    deadline: float,
+) -> tuple[int, bytes]:
+    """Hash one bounded leaf-content observation without retaining raw chunks."""
+
+    if time.monotonic() >= deadline:
+        raise LeafContentDeadlineExpired("targeted cleanup monotonic deadline expired")
+    file_type = stat.S_IFMT(metadata.st_mode)
+    state = leaf_content_state_for_file_type(file_type)
+    digest = hashlib.sha256()
+    digest.update(_LEAF_CONTENT_DIGEST_DOMAIN)
+    digest.update(bytes((state,)))
+    digest.update(file_type.to_bytes(4, "big"))
+    size = metadata.st_size
+    if type(size) is not int or size < 0:
+        raise ValueError("leaf content size is invalid")
+    digest.update(size.to_bytes(8, "big"))
+    if state != LEAF_CONTENT_STATE_REGULAR:
+        return state, digest.digest()
+    if size > MAX_LEAF_CONTENT_BYTES:
+        raise ValueError("regular leaf content exceeds its byte bound")
+    preadv = getattr(os, "preadv", None)
+    if preadv is None:
+        raise OSError(errno.ENOSYS, "descriptor-relative content reads are unavailable")
+    offset = 0
+    buffer: bytearray | None = bytearray(_LEAF_CONTENT_READ_BYTES)
+    view: memoryview | None = memoryview(buffer)
+    read_view: memoryview | None = None
+    digest_view: memoryview | None = None
+    try:
+        while offset < size:
+            if time.monotonic() >= deadline:
+                raise LeafContentDeadlineExpired(
+                    "targeted cleanup monotonic deadline expired"
+                )
+            remaining = size - offset
+            assert view is not None
+            requested = min(_LEAF_CONTENT_READ_BYTES, remaining)
+            read_view = view[:requested]
+            try:
+                read_size = preadv(fd, [read_view], offset)
+            finally:
+                read_view.release()
+                read_view = None
+            if type(read_size) is not int or read_size <= 0:
+                raise OSError(
+                    errno.ESTALE,
+                    "regular leaf content ended during inspection",
+                )
+            if read_size > requested:
+                raise OSError(
+                    errno.ESTALE,
+                    "regular leaf content read exceeded its observed size",
+                )
+            digest_view = view[:read_size]
+            try:
+                digest.update(digest_view)
+            finally:
+                digest_view.release()
+                digest_view = None
+            offset += read_size
+        return state, digest.digest()
+    finally:
+        try:
+            if digest_view is not None:
+                digest_view.release()
+        finally:
+            digest_view = None
+            try:
+                if read_view is not None:
+                    read_view.release()
+            finally:
+                read_view = None
+                try:
+                    if view is not None:
+                        view.release()
+                finally:
+                    view = None
+                    if buffer is not None:
+                        try:
+                            buffer[:] = _LEAF_CONTENT_ZEROES
+                        finally:
+                            buffer = None
+
+
+def inspect_leaf_content_digest(
+    fd: int,
+    *,
+    deadline: float,
+) -> tuple[int, bytes]:
+    """Double-observe the complete bounded content property of one leaf FD."""
+
+    before = os.fstat(fd)
+    first = _leaf_content_digest_once(fd, before, deadline=deadline)
+    middle = os.fstat(fd)
+    second = _leaf_content_digest_once(fd, middle, deadline=deadline)
+    after = os.fstat(fd)
+    if (
+        _leaf_content_stat_binding(before) != _leaf_content_stat_binding(middle)
+        or _leaf_content_stat_binding(middle) != _leaf_content_stat_binding(after)
+        or first != second
+    ):
+        raise OSError(errno.ESTALE, "leaf content changed during inspection")
     return second
 
 

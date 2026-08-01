@@ -18,9 +18,14 @@ from typing import Any
 from .constants import TARGETED_MANIFEST_RECORD_BYTES
 from .models import Identity
 from .secureio import (
+    LEAF_CONTENT_STATES,
+    MAX_LEAF_CONTENT_BYTES,
+    LeafContentDeadlineExpired,
     directory_identities_match,
     identity_from_stat,
+    inspect_leaf_content_digest,
     inspect_macos_leaf_metadata_digest,
+    leaf_content_state_for_file_type,
     open_absolute_directory_chain,
     open_regular_at,
     publish_bytes,
@@ -35,9 +40,9 @@ from .signal_relay import (
     checkpoint_bound_signal_interrupt,
 )
 
-_MANIFEST_MAGIC = b"targeted-cleanup-manifest-v2\0"
+_MANIFEST_MAGIC = b"targeted-cleanup-manifest-v3\0"
 _RECORD = struct.Struct(">BBIIQQQQQ")
-_LEAF_POLICY_RECORD = struct.Struct(">QQQB32s")
+_LEAF_POLICY_RECORD = struct.Struct(">QQQB32sB32s")
 if _RECORD.size + _LEAF_POLICY_RECORD.size > TARGETED_MANIFEST_RECORD_BYTES:
     raise RuntimeError("targeted cleanup leaf record exceeds its admission bound")
 _KIND_DIRECTORY = 1
@@ -238,6 +243,8 @@ class LeafAccessPolicyBinding:
     size: int
     metadata_state: int
     metadata_sha256: bytes
+    content_state: int
+    content_sha256: bytes
 
     @property
     def object_key(self) -> tuple[int, int, int, int]:
@@ -249,8 +256,8 @@ class LeafAccessPolicyBinding:
         )
 
     @property
-    def content_key(self) -> tuple[int]:
-        return (self.size,)
+    def content_key(self) -> tuple[int, int, bytes]:
+        return self.size, self.content_state, self.content_sha256
 
     @property
     def access_policy_key(
@@ -277,6 +284,8 @@ def _leaf_snapshot_from_stat(
     *,
     metadata_state: int,
     metadata_sha256: bytes,
+    content_state: int,
+    content_sha256: bytes,
 ) -> LeafSnapshot:
     return LeafSnapshot(
         policy=LeafAccessPolicyBinding(
@@ -291,6 +300,8 @@ def _leaf_snapshot_from_stat(
             size=metadata.st_size,
             metadata_state=metadata_state,
             metadata_sha256=metadata_sha256,
+            content_state=content_state,
+            content_sha256=content_sha256,
         ),
         link_count=metadata.st_nlink,
     )
@@ -328,6 +339,17 @@ def _validate_manifest_leaf_policy(record: ManifestRecord) -> None:
         or len(policy.metadata_sha256) != hashlib.sha256().digest_size
     ):
         raise ValueError("targeted cleanup leaf metadata binding is invalid")
+    if (
+        type(policy.content_state) is not int
+        or policy.content_state not in LEAF_CONTENT_STATES
+        or not isinstance(policy.content_sha256, bytes)
+        or len(policy.content_sha256) != hashlib.sha256().digest_size
+    ):
+        raise ValueError("targeted cleanup leaf content binding is invalid")
+    if policy.content_state != leaf_content_state_for_file_type(policy.file_type):
+        raise ValueError("targeted cleanup leaf content state is inconsistent")
+    if stat.S_ISREG(policy.file_type) and policy.size > MAX_LEAF_CONTENT_BYTES:
+        raise ValueError("targeted cleanup regular leaf exceeds its content cap")
 
 
 def _leaf_policy_matches_identity(
@@ -352,6 +374,8 @@ def _encode_leaf_policy(binding: LeafAccessPolicyBinding) -> bytes:
         binding.generation,
         binding.metadata_state,
         binding.metadata_sha256,
+        binding.content_state,
+        binding.content_sha256,
     )
 
 
@@ -1525,6 +1549,7 @@ def _enumerate_directory(
                     name=name,
                     expected=identity,
                     path_metadata=metadata,
+                    deadline=budget.deadline,
                     delivery_owner=delivery_owner,
                     policy_result_owner=policy_result_owner,
                 )
@@ -1743,7 +1768,7 @@ def build_custodied_manifest(
             raise TimeoutError("targeted cleanup monotonic deadline expired")
         manifest_identity = publish_bytes(manifest_path, payload, mode=0o600)
         seal = {
-            "version": 2,
+            "version": 3,
             "path": str(manifest_path),
             "identity": manifest_identity.to_json(),
             "length": len(payload),
@@ -1889,6 +1914,8 @@ def _require_leaf_stat_matches_binding(
         metadata,
         metadata_state=expected.metadata_state,
         metadata_sha256=expected.metadata_sha256,
+        content_state=expected.content_state,
+        content_sha256=expected.content_sha256,
     )
     _require_leaf_snapshot_matches(
         observed,
@@ -1903,6 +1930,7 @@ def _observe_leaf_policy_fd(
     descriptor: int,
     *,
     stage: str,
+    deadline: float,
 ) -> LeafSnapshot:
     try:
         metadata_before = os.fstat(descriptor)
@@ -1924,6 +1952,23 @@ def _observe_leaf_policy_fd(
             missing=False,
         ) from error
     try:
+        content_state, content_sha256 = inspect_leaf_content_digest(
+            descriptor,
+            deadline=deadline,
+        )
+    except LeafContentDeadlineExpired:
+        raise
+    except OSError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=False,
+        ) from error
+    except ValueError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=False,
+        ) from error
+    try:
         metadata_after = os.fstat(descriptor)
     except OSError as error:
         raise _leaf_observation_failure(
@@ -1934,11 +1979,15 @@ def _observe_leaf_policy_fd(
         metadata_before,
         metadata_state=metadata_state,
         metadata_sha256=metadata_sha256,
+        content_state=content_state,
+        content_sha256=content_sha256,
     )
     after = _leaf_snapshot_from_stat(
         metadata_after,
         metadata_state=metadata_state,
         metadata_sha256=metadata_sha256,
+        content_state=content_state,
+        content_sha256=content_sha256,
     )
     _require_leaf_snapshot_matches(
         after,
@@ -2072,14 +2121,17 @@ def _open_leaf_descriptor(
     expected: Identity,
     *,
     owner: _LeafDescriptorCustodyOwner,
+    deadline: float,
     expected_policy: LeafAccessPolicyBinding | None = None,
     policy_result_owner: _LeafPolicyResultOwner | None = None,
 ) -> int:
     if owner.state != "empty":
         raise ValueError("leaf descriptor publication owner is already used")
     path_only = getattr(os, "O_PATH", 0)
-    if path_only:
-        flags = path_only | os.O_CLOEXEC | os.O_NOFOLLOW
+    if stat.S_ISREG(expected.mode):
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+    elif stat.S_ISLNK(expected.mode) and path_only:
+        flags = path_only | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
     elif stat.S_ISLNK(expected.mode):
         symlink_only = getattr(os, "O_SYMLINK", 0)
         if not symlink_only:
@@ -2092,6 +2144,8 @@ def _open_leaf_descriptor(
             | os.O_NONBLOCK
             | os.O_CLOEXEC
         )
+    elif path_only:
+        flags = path_only | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
     else:
         flags = (
             getattr(os, "O_EVTONLY", os.O_RDONLY)
@@ -2113,6 +2167,7 @@ def _open_leaf_descriptor(
     observed = _observe_leaf_policy_fd(
         descriptor,
         stage="while opening its descriptor",
+        deadline=deadline,
     )
     if expected_policy is None:
         _require_leaf_identity_matches(
@@ -2178,6 +2233,7 @@ def _unlink_quarantined_leaf_critical(
     descriptor_policy = _observe_leaf_policy_fd(
         descriptor,
         stage="after quarantine rename and before unlink",
+        deadline=deadline,
     )
     _require_leaf_snapshot_matches(
         descriptor_policy,
@@ -2228,6 +2284,7 @@ def _unlink_quarantined_leaf_critical(
     unlinked_policy = _observe_leaf_policy_fd(
         descriptor,
         stage="after unlink",
+        deadline=deadline,
     )
     _require_leaf_snapshot_matches(
         unlinked_policy,
@@ -2607,6 +2664,7 @@ def _capture_manifest_leaf_policy(
     name: bytes,
     expected: Identity,
     path_metadata: os.stat_result,
+    deadline: float,
     delivery_owner: _LeafCleanupDeliveryOwner,
     policy_result_owner: _LeafPolicyResultOwner,
 ) -> None:
@@ -2626,6 +2684,7 @@ def _capture_manifest_leaf_policy(
                     name,
                     expected,
                     owner=descriptor_owner,
+                    deadline=deadline,
                     policy_result_owner=policy_result_owner,
                 )
                 binding = policy_result_owner.binding
@@ -2693,6 +2752,7 @@ def _delete_manifest_leaf(
                     name,
                     expected,
                     owner=descriptor_owner,
+                    deadline=deadline,
                     expected_policy=expected_policy,
                     policy_result_owner=policy_result_owner,
                 )

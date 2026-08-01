@@ -11,6 +11,7 @@ import stat
 import sys
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import review_supervisor.gitraw as gitraw
@@ -1060,23 +1061,79 @@ class ManifestTraversalTests(unittest.TestCase):
             (target / "regular.txt").write_bytes(b"regular\n")
             os.mkfifo(target / "transport.fifo", 0o600)
             os.symlink("regular.txt", target / "regular.link")
-            manifest, parent_fd = self._build_target_manifest(
-                root,
-                target,
-                label="leaf-types",
-            )
-            try:
-                with manifest:
-                    proof = delete_custodied_roots(manifest)
-                self.assertEqual(proof["removed_entries"], 4)
-                self.assertEqual(
-                    proof["removed_entries"],
-                    proof["manifest_record_count"],
+            real_preadv = os.preadv
+            read_file_types: list[int] = []
+
+            def tracked_preadv(
+                descriptor: int,
+                buffers: object,
+                offset: int,
+            ) -> int:
+                file_type = stat.S_IFMT(os.fstat(descriptor).st_mode)
+                read_file_types.append(file_type)
+                self.assertTrue(stat.S_ISREG(file_type))
+                return real_preadv(descriptor, buffers, offset)
+
+            with mock.patch.object(
+                secureio.os,
+                "preadv",
+                side_effect=tracked_preadv,
+            ):
+                manifest, parent_fd = self._build_target_manifest(
+                    root,
+                    target,
+                    label="leaf-types",
                 )
-                self.assertTrue(proof["exact_names_absent"])
-                self.assertFalse(target.exists())
-            finally:
-                os.close(parent_fd)
+                policies = {
+                    record.path: record.leaf_policy
+                    for record in manifest.records
+                    if record.leaf_policy is not None
+                }
+                self.assertEqual(
+                    policies[b"regular.txt"].content_state,
+                    secureio.LEAF_CONTENT_STATE_REGULAR,
+                )
+                self.assertEqual(
+                    policies[b"transport.fifo"].content_state,
+                    secureio.LEAF_CONTENT_STATE_FIFO,
+                )
+                self.assertEqual(
+                    policies[b"regular.link"].content_state,
+                    secureio.LEAF_CONTENT_STATE_SYMLINK,
+                )
+                records = {record.path: record for record in manifest.records}
+                for path, wrong_state in (
+                    (b"regular.txt", secureio.LEAF_CONTENT_STATE_FIFO),
+                    (b"transport.fifo", secureio.LEAF_CONTENT_STATE_REGULAR),
+                ):
+                    record = records[path]
+                    assert record.leaf_policy is not None
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "content state is inconsistent",
+                    ):
+                        recovery_cleanup._validate_manifest_leaf_policy(
+                            replace(
+                                record,
+                                leaf_policy=replace(
+                                    record.leaf_policy,
+                                    content_state=wrong_state,
+                                ),
+                            )
+                        )
+                try:
+                    with manifest:
+                        proof = delete_custodied_roots(manifest)
+                    self.assertEqual(proof["removed_entries"], 4)
+                    self.assertEqual(
+                        proof["removed_entries"],
+                        proof["manifest_record_count"],
+                    )
+                    self.assertTrue(proof["exact_names_absent"])
+                    self.assertFalse(target.exists())
+                    self.assertTrue(read_file_types)
+                finally:
+                    os.close(parent_fd)
 
     def test_manifest_leaf_metadata_digest_is_persisted_without_raw_values(
         self,
@@ -1117,14 +1174,17 @@ class ManifestTraversalTests(unittest.TestCase):
                 self.assertIsNotNone(record.leaf_policy)
                 assert record.leaf_policy is not None
                 payload = pathlib.Path(manifest.seal["path"]).read_bytes()
-                self.assertEqual(manifest.seal["version"], 2)
+                self.assertEqual(manifest.seal["version"], 3)
                 self.assertIn(record.leaf_policy.metadata_sha256, payload)
+                self.assertIn(record.leaf_policy.content_sha256, payload)
                 self.assertNotIn(
                     b"com.example.synthetic-leaf-policy",
                     payload,
                 )
                 self.assertNotIn(b"synthetic-value", payload)
+                self.assertNotIn(b"policy payload\n", payload)
                 self.assertFalse(hasattr(record.leaf_policy, "macos_metadata"))
+                self.assertFalse(hasattr(record.leaf_policy, "content_bytes"))
                 none_binding = macos_leaf_metadata_digest(None)
                 empty_binding = macos_leaf_metadata_digest(
                     MacOSDirectoryMetadataBinding(
@@ -1171,6 +1231,242 @@ class ManifestTraversalTests(unittest.TestCase):
             finally:
                 manifest.close()
                 os.close(parent_fd)
+
+    def test_leaf_equal_size_rewrite_through_existing_fd_is_retained(self) -> None:
+        original = b"A" * 32
+        changed = b"B" * len(original)
+        with owned_temporary_directory("manifest-leaf-content-rewrite-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(original)
+            writer_fd = os.open(payload, os.O_RDWR | os.O_CLOEXEC)
+            manifest, parent_fd = self._build_target_manifest(
+                root,
+                target,
+                label="leaf-content-rewrite",
+            )
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                self.assertEqual(os.pwrite(writer_fd, changed, 0), len(changed))
+                os.fsync(writer_fd)
+                self.assertEqual(os.fstat(writer_fd).st_size, len(original))
+                with self.assertRaisesRegex(
+                    CustodyLostError,
+                    "leaf content stability changed",
+                ) as caught:
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertEqual(
+                    (retained_root / "payload.txt").read_bytes(),
+                    changed,
+                )
+            finally:
+                os.close(writer_fd)
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_content_cap_fails_before_first_read(self) -> None:
+        with owned_temporary_directory("manifest-leaf-content-cap-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(b"cap-bound")
+            with (
+                mock.patch.object(secureio, "MAX_LEAF_CONTENT_BYTES", 8),
+                mock.patch.object(secureio.os, "preadv") as preadv,
+                self.assertRaisesRegex(
+                    CustodyLostError,
+                    "policy revalidation is unreadable",
+                ),
+            ):
+                self._build_target_manifest(
+                    root,
+                    target,
+                    label="leaf-content-cap",
+                )
+            preadv.assert_not_called()
+            self.assertEqual(payload.read_bytes(), b"cap-bound")
+
+    def test_leaf_content_read_failure_retains_no_raw_runtime_buffer(self) -> None:
+        raw_chunk = b"raw!"
+        with owned_temporary_directory("manifest-leaf-content-read-error-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(b"abcdefgh")
+            reads = 0
+
+            def uncertain_preadv(
+                _descriptor: int,
+                buffers: list[memoryview],
+                offset: int,
+            ) -> int:
+                nonlocal reads
+                reads += 1
+                if offset:
+                    raise OSError(errno.EIO, "synthetic content read failure")
+                buffers[0][: len(raw_chunk)] = raw_chunk
+                return len(raw_chunk)
+
+            with (
+                mock.patch.object(
+                    secureio.os,
+                    "preadv",
+                    side_effect=uncertain_preadv,
+                ),
+                self.assertRaisesRegex(
+                    CustodyLostError,
+                    "policy revalidation is unreadable",
+                ) as caught,
+            ):
+                self._build_target_manifest(
+                    root,
+                    target,
+                    label="leaf-content-read-error",
+                )
+            self.assertEqual(reads, 2)
+            self.assertEqual(payload.read_bytes(), b"abcdefgh")
+            pending: list[BaseException] = [caught.exception]
+            seen: set[int] = set()
+            while pending:
+                error = pending.pop()
+                if id(error) in seen:
+                    continue
+                seen.add(id(error))
+                traceback_item = error.__traceback__
+                while traceback_item is not None:
+                    frame = traceback_item.tb_frame
+                    if frame.f_globals.get("__name__") == secureio.__name__:
+                        for name in (
+                            "buffer",
+                            "view",
+                            "read_view",
+                            "digest_view",
+                        ):
+                            self.assertIsNone(frame.f_locals.get(name))
+                        self.assertNotIn(raw_chunk, frame.f_locals.values())
+                    traceback_item = traceback_item.tb_next
+                if error.__context__ is not None:
+                    pending.append(error.__context__)
+                if error.__cause__ is not None:
+                    pending.append(error.__cause__)
+
+    def test_leaf_content_deadline_stops_before_next_chunk(self) -> None:
+        with owned_temporary_directory("manifest-leaf-content-deadline-") as root:
+            payload = root / "payload.txt"
+            payload.write_bytes(b"abcdefgh")
+            descriptor = os.open(
+                payload,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            reads = 0
+
+            def short_preadv(
+                _descriptor: int,
+                buffers: list[memoryview],
+                _offset: int,
+            ) -> int:
+                nonlocal reads
+                reads += 1
+                buffers[0][:4] = b"abcd"
+                return 4
+
+            try:
+                with (
+                    mock.patch.object(
+                        secureio.os,
+                        "preadv",
+                        side_effect=short_preadv,
+                    ),
+                    mock.patch.object(
+                        secureio.time,
+                        "monotonic",
+                        side_effect=(0.0, 0.0, 1.0),
+                    ),
+                    self.assertRaisesRegex(
+                        TimeoutError,
+                        "monotonic deadline expired",
+                    ),
+                ):
+                    secureio.inspect_leaf_content_digest(
+                        descriptor,
+                        deadline=1.0,
+                    )
+                self.assertEqual(reads, 1)
+            finally:
+                os.close(descriptor)
+
+    def test_leaf_content_timeout_propagates_unchanged(self) -> None:
+        with owned_temporary_directory("manifest-leaf-content-timeout-") as root:
+            payload = root / "payload.txt"
+            payload.write_bytes(b"timeout")
+            descriptor = os.open(
+                payload,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            timeout = secureio.LeafContentDeadlineExpired("synthetic content deadline")
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "inspect_macos_leaf_metadata_digest",
+                        return_value=macos_leaf_metadata_digest(None),
+                    ),
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "inspect_leaf_content_digest",
+                        side_effect=timeout,
+                    ),
+                    self.assertRaises(TimeoutError) as caught,
+                ):
+                    recovery_cleanup._observe_leaf_policy_fd(
+                        descriptor,
+                        stage="during timeout propagation test",
+                        deadline=time.monotonic() + 1.0,
+                    )
+                self.assertIs(caught.exception, timeout)
+
+                for error in (
+                    TimeoutError(errno.ETIMEDOUT, "synthetic filesystem timeout"),
+                    OSError(errno.EBADF, "synthetic unreadable content descriptor"),
+                ):
+                    with (
+                        mock.patch.object(
+                            recovery_cleanup,
+                            "inspect_macos_leaf_metadata_digest",
+                            return_value=macos_leaf_metadata_digest(None),
+                        ),
+                        mock.patch.object(
+                            recovery_cleanup,
+                            "inspect_leaf_content_digest",
+                            side_effect=error,
+                        ),
+                        self.assertRaisesRegex(
+                            CustodyLostError,
+                            "policy revalidation is unreadable",
+                        ) as classified,
+                    ):
+                        recovery_cleanup._observe_leaf_policy_fd(
+                            descriptor,
+                            stage="during content I/O classification test",
+                            deadline=time.monotonic() + 1.0,
+                        )
+                    self.assertIs(classified.exception.__cause__, error)
+            finally:
+                os.close(descriptor)
 
     def test_leaf_xattr_producer_stops_before_aggregate_overflow_read(
         self,
@@ -1473,7 +1769,7 @@ class ManifestTraversalTests(unittest.TestCase):
                 manifest.close()
                 os.close(parent_fd)
 
-    def test_leaf_deadline_rechecked_after_metadata_before_unlink(self) -> None:
+    def test_leaf_deadline_rechecked_after_content_before_unlink(self) -> None:
         with owned_temporary_directory("manifest-leaf-unlink-deadline-") as root:
             parent = root / "parent"
             parent.mkdir(mode=0o700)
@@ -1485,16 +1781,18 @@ class ManifestTraversalTests(unittest.TestCase):
                 target,
                 label="leaf-unlink-deadline",
             )
-            real_inspect = recovery_cleanup.inspect_macos_leaf_metadata_digest
+            real_inspect = recovery_cleanup.inspect_leaf_content_digest
             real_monotonic = time.monotonic
             inspections = 0
             expired = False
 
             def expire_after_pre_unlink_inspection(
                 descriptor: int,
+                *,
+                deadline: float,
             ) -> tuple[int, bytes]:
                 nonlocal expired, inspections
-                result = real_inspect(descriptor)
+                result = real_inspect(descriptor, deadline=deadline)
                 inspections += 1
                 if inspections == 2:
                     expired = True
@@ -1508,7 +1806,7 @@ class ManifestTraversalTests(unittest.TestCase):
                 with (
                     mock.patch.object(
                         recovery_cleanup,
-                        "inspect_macos_leaf_metadata_digest",
+                        "inspect_leaf_content_digest",
                         side_effect=expire_after_pre_unlink_inspection,
                     ),
                     mock.patch.object(
