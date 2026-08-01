@@ -15,10 +15,12 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .constants import TARGETED_MANIFEST_RECORD_BYTES
 from .models import Identity
 from .secureio import (
     directory_identities_match,
     identity_from_stat,
+    inspect_macos_leaf_metadata_digest,
     open_absolute_directory_chain,
     open_regular_at,
     publish_bytes,
@@ -33,8 +35,11 @@ from .signal_relay import (
     checkpoint_bound_signal_interrupt,
 )
 
-_MANIFEST_MAGIC = b"targeted-cleanup-manifest-v1\0"
+_MANIFEST_MAGIC = b"targeted-cleanup-manifest-v2\0"
 _RECORD = struct.Struct(">BBIIQQQQQ")
+_LEAF_POLICY_RECORD = struct.Struct(">QQQB32s")
+if _RECORD.size + _LEAF_POLICY_RECORD.size > TARGETED_MANIFEST_RECORD_BYTES:
+    raise RuntimeError("targeted cleanup leaf record exceeds its admission bound")
 _KIND_DIRECTORY = 1
 _KIND_ENTRY = 2
 _DEFAULT_TARGETED_CLEANUP_SECONDS = 30.0
@@ -215,6 +220,139 @@ class ManifestRecord:
     path: bytes
     kind: int
     identity: Identity
+    leaf_policy: LeafAccessPolicyBinding | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LeafAccessPolicyBinding:
+    """Manifest-bound leaf identity, content shape, and access policy."""
+
+    device: int
+    inode: int
+    file_type: int
+    generation: int
+    uid: int
+    gid: int
+    mode: int
+    flags: int
+    size: int
+    metadata_state: int
+    metadata_sha256: bytes
+
+    @property
+    def object_key(self) -> tuple[int, int, int, int]:
+        return (
+            self.device,
+            self.inode,
+            self.file_type,
+            self.generation,
+        )
+
+    @property
+    def content_key(self) -> tuple[int]:
+        return (self.size,)
+
+    @property
+    def access_policy_key(
+        self,
+    ) -> tuple[int, int, int, int, int, bytes]:
+        return (
+            self.uid,
+            self.gid,
+            self.mode,
+            self.flags,
+            self.metadata_state,
+            self.metadata_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LeafSnapshot:
+    policy: LeafAccessPolicyBinding
+    link_count: int
+
+
+def _leaf_snapshot_from_stat(
+    metadata: os.stat_result,
+    *,
+    metadata_state: int,
+    metadata_sha256: bytes,
+) -> LeafSnapshot:
+    return LeafSnapshot(
+        policy=LeafAccessPolicyBinding(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            file_type=stat.S_IFMT(metadata.st_mode),
+            generation=getattr(metadata, "st_gen", 0),
+            uid=metadata.st_uid,
+            gid=metadata.st_gid,
+            mode=stat.S_IMODE(metadata.st_mode),
+            flags=getattr(metadata, "st_flags", 0),
+            size=metadata.st_size,
+            metadata_state=metadata_state,
+            metadata_sha256=metadata_sha256,
+        ),
+        link_count=metadata.st_nlink,
+    )
+
+
+def _validate_manifest_leaf_policy(record: ManifestRecord) -> None:
+    policy = record.leaf_policy
+    if record.kind == _KIND_DIRECTORY:
+        if policy is not None:
+            raise ValueError(
+                "targeted cleanup directory record has a leaf policy binding"
+            )
+        return
+    if not isinstance(policy, LeafAccessPolicyBinding):
+        raise ValueError("targeted cleanup leaf policy binding is missing")
+    if not _leaf_policy_matches_identity(policy, record.identity):
+        raise ValueError("targeted cleanup leaf policy binding is inconsistent")
+    for value in (
+        policy.device,
+        policy.inode,
+        policy.file_type,
+        policy.generation,
+        policy.uid,
+        policy.gid,
+        policy.mode,
+        policy.flags,
+        policy.size,
+    ):
+        if type(value) is not int or not 0 <= value < 2**64:
+            raise ValueError("targeted cleanup leaf policy binding is invalid")
+    if (
+        type(policy.metadata_state) is not int
+        or policy.metadata_state not in {0, 1}
+        or not isinstance(policy.metadata_sha256, bytes)
+        or len(policy.metadata_sha256) != hashlib.sha256().digest_size
+    ):
+        raise ValueError("targeted cleanup leaf metadata binding is invalid")
+
+
+def _leaf_policy_matches_identity(
+    policy: LeafAccessPolicyBinding,
+    identity: Identity,
+) -> bool:
+    return (
+        identity.link_count == 1
+        and policy.device == identity.device
+        and policy.inode == identity.inode
+        and policy.file_type == stat.S_IFMT(identity.mode)
+        and policy.uid == identity.uid
+        and policy.mode == stat.S_IMODE(identity.mode)
+        and policy.size == identity.size
+    )
+
+
+def _encode_leaf_policy(binding: LeafAccessPolicyBinding) -> bytes:
+    return _LEAF_POLICY_RECORD.pack(
+        binding.gid,
+        binding.flags,
+        binding.generation,
+        binding.metadata_state,
+        binding.metadata_sha256,
+    )
 
 
 @dataclass
@@ -1340,6 +1478,7 @@ def _enumerate_directory(
     prefix: bytes,
     records: list[ManifestRecord],
     descriptor_owners: list[_CustodiedManifestDescriptorSlot],
+    leaf_delivery_owners: list[_LeafCleanupDeliveryOwner],
     budget: _TraversalBudget,
     depth: int,
 ) -> None:
@@ -1363,12 +1502,70 @@ def _enumerate_directory(
         kind = _entry_kind(metadata.st_mode)
         if kind != _KIND_DIRECTORY and identity.link_count != 1:
             raise ValueError("targeted cleanup tree contains a non-unique leaf entry")
+        leaf_policy: LeafAccessPolicyBinding | None = None
+        if kind != _KIND_DIRECTORY:
+            descriptor_owner = _LeafDescriptorCustodyOwner()
+            error_owner = _LeafCleanupErrorOwner()
+            settlement = _LeafDescriptorCloseSettlement(
+                descriptor_owner,
+                error_owner,
+            )
+            delivery_owner = _LeafCleanupDeliveryOwner(
+                descriptor_owner,
+                error_owner,
+                settlement,
+            )
+            policy_result_owner = _LeafPolicyResultOwner()
+            # Register the complete delivery owner in the build-level outer
+            # frame before the first descriptor-bearing call.
+            leaf_delivery_owners.append(delivery_owner)
+            try:
+                _capture_manifest_leaf_policy(
+                    directory_fd=directory_fd,
+                    name=name,
+                    expected=identity,
+                    path_metadata=metadata,
+                    delivery_owner=delivery_owner,
+                    policy_result_owner=policy_result_owner,
+                )
+            except BaseException as leaf_boundary:  # noqa: BLE001 - handoff
+                delivery_owner.enqueue(
+                    "manifest leaf policy caller boundary",
+                    leaf_boundary,
+                )
+            while True:
+                try:
+                    _drive_leaf_cleanup_delivery(delivery_owner)
+                except BaseException as caller_error:
+                    if (
+                        delivery_owner._raise_in_progress
+                        and caller_error is delivery_owner._armed_error
+                    ):
+                        raise
+                    delivery_owner.enqueue(
+                        "manifest leaf policy outer delivery boundary",
+                        caller_error,
+                    )
+                else:
+                    break
+            if (
+                not leaf_delivery_owners
+                or leaf_delivery_owners[-1] is not delivery_owner
+            ):
+                raise RuntimeError("manifest leaf delivery registry is inconsistent")
+            leaf_delivery_owners.pop()
+            leaf_policy = policy_result_owner.binding
+            if leaf_policy is None:
+                raise CustodyLostError(
+                    "targeted cleanup leaf policy result was not published"
+                )
         records.append(
             ManifestRecord(
                 root_index=root_index,
                 path=relative,
                 kind=kind,
                 identity=identity,
+                leaf_policy=leaf_policy,
             )
         )
         if kind != _KIND_DIRECTORY:
@@ -1398,6 +1595,7 @@ def _enumerate_directory(
                 prefix=relative,
                 records=records,
                 descriptor_owners=descriptor_owners,
+                leaf_delivery_owners=leaf_delivery_owners,
                 budget=budget,
                 depth=depth + 1,
             )
@@ -1425,6 +1623,7 @@ def _encode_manifest(
             raise TimeoutError("targeted cleanup monotonic deadline expired")
         path = record.path
         identity = record.identity
+        _validate_manifest_leaf_policy(record)
         value.extend(
             _RECORD.pack(
                 record.root_index,
@@ -1438,6 +1637,8 @@ def _encode_manifest(
                 identity.size,
             )
         )
+        if record.leaf_policy is not None:
+            value.extend(_encode_leaf_policy(record.leaf_policy))
         value.extend(path)
         if len(value) > payload_cap:
             raise ValueError("targeted cleanup manifest exceeds its payload cap")
@@ -1461,6 +1662,7 @@ def build_custodied_manifest(
     budget = _TraversalBudget(deadline=operation_deadline, remaining=entry_cap)
     root_fd_slots: list[_CustodiedManifestDescriptorSlot] = []
     build_descriptor_owners: list[_CustodiedManifestDescriptorSlot] = []
+    build_leaf_delivery_owners: list[_LeafCleanupDeliveryOwner] = []
     records: list[ManifestRecord] = []
     manifest: CustodiedManifest | None = None
     try:
@@ -1520,6 +1722,7 @@ def build_custodied_manifest(
                 prefix=b"",
                 records=records,
                 descriptor_owners=build_descriptor_owners,
+                leaf_delivery_owners=build_leaf_delivery_owners,
                 budget=budget,
                 depth=1,
             )
@@ -1540,7 +1743,7 @@ def build_custodied_manifest(
             raise TimeoutError("targeted cleanup monotonic deadline expired")
         manifest_identity = publish_bytes(manifest_path, payload, mode=0o600)
         seal = {
-            "version": 1,
+            "version": 2,
             "path": str(manifest_path),
             "identity": manifest_identity.to_json(),
             "length": len(payload),
@@ -1612,6 +1815,138 @@ def _same_entry(left: Identity, right: Identity, *, directory: bool) -> bool:
     if directory:
         return directory_identities_match(left, right)
     return left == right
+
+
+def _leaf_observation_failure(
+    *,
+    stage: str,
+    missing: bool,
+) -> CustodyLostError:
+    state = "missing" if missing else "unreadable"
+    return CustodyLostError(
+        f"targeted cleanup leaf policy revalidation is {state} {stage}"
+    )
+
+
+def _require_leaf_snapshot_matches(
+    observed: LeafSnapshot,
+    expected: LeafAccessPolicyBinding,
+    *,
+    expected_link_count: int,
+    stage: str,
+    identity_error: str | None = None,
+) -> None:
+    if observed.policy.object_key != expected.object_key:
+        raise CustodyLostError(
+            identity_error or f"targeted cleanup leaf object identity mismatch {stage}"
+        )
+    if observed.policy.content_key != expected.content_key:
+        raise CustodyLostError(
+            f"targeted cleanup leaf content stability changed {stage}"
+        )
+    if observed.policy.access_policy_key != expected.access_policy_key:
+        raise CustodyLostError(f"targeted cleanup leaf access policy drift {stage}")
+    if observed.link_count != expected_link_count:
+        raise CustodyLostError(f"targeted cleanup leaf link count mismatch {stage}")
+
+
+def _require_leaf_identity_matches(
+    observed: LeafSnapshot,
+    expected: Identity,
+    *,
+    stage: str,
+) -> None:
+    expected_object_key = (
+        expected.device,
+        expected.inode,
+        stat.S_IFMT(expected.mode),
+    )
+    if observed.policy.object_key[:3] != expected_object_key:
+        raise CustodyLostError(
+            f"targeted cleanup leaf object identity mismatch {stage}"
+        )
+    if observed.policy.size != expected.size:
+        raise CustodyLostError(
+            f"targeted cleanup leaf content stability changed {stage}"
+        )
+    if observed.policy.uid != expected.uid or observed.policy.mode != stat.S_IMODE(
+        expected.mode
+    ):
+        raise CustodyLostError(f"targeted cleanup leaf access policy drift {stage}")
+    if expected.link_count != 1 or observed.link_count != 1:
+        raise CustodyLostError(f"targeted cleanup leaf link count mismatch {stage}")
+
+
+def _require_leaf_stat_matches_binding(
+    metadata: os.stat_result,
+    expected: LeafAccessPolicyBinding,
+    *,
+    expected_link_count: int,
+    stage: str,
+    identity_error: str | None = None,
+) -> None:
+    observed = _leaf_snapshot_from_stat(
+        metadata,
+        metadata_state=expected.metadata_state,
+        metadata_sha256=expected.metadata_sha256,
+    )
+    _require_leaf_snapshot_matches(
+        observed,
+        expected,
+        expected_link_count=expected_link_count,
+        stage=stage,
+        identity_error=identity_error,
+    )
+
+
+def _observe_leaf_policy_fd(
+    descriptor: int,
+    *,
+    stage: str,
+) -> LeafSnapshot:
+    try:
+        metadata_before = os.fstat(descriptor)
+    except OSError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=error.errno == errno.EBADF,
+        ) from error
+    try:
+        metadata_state, metadata_sha256 = inspect_macos_leaf_metadata_digest(descriptor)
+    except OSError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=error.errno == errno.EBADF,
+        ) from error
+    except ValueError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=False,
+        ) from error
+    try:
+        metadata_after = os.fstat(descriptor)
+    except OSError as error:
+        raise _leaf_observation_failure(
+            stage=stage,
+            missing=error.errno == errno.EBADF,
+        ) from error
+    before = _leaf_snapshot_from_stat(
+        metadata_before,
+        metadata_state=metadata_state,
+        metadata_sha256=metadata_sha256,
+    )
+    after = _leaf_snapshot_from_stat(
+        metadata_after,
+        metadata_state=metadata_state,
+        metadata_sha256=metadata_sha256,
+    )
+    _require_leaf_snapshot_matches(
+        after,
+        before.policy,
+        expected_link_count=before.link_count,
+        stage=f"during {stage}",
+    )
+    return after
 
 
 class _LeafDescriptorCustodyOwner:
@@ -1721,12 +2056,24 @@ def leaf_descriptor_custody_owners(
     return tuple(collected)
 
 
+@dataclass(slots=True)
+class _LeafPolicyResultOwner:
+    binding: LeafAccessPolicyBinding | None = None
+
+    def publish(self, binding: LeafAccessPolicyBinding) -> None:
+        if self.binding is not None:
+            raise ValueError("leaf policy result was published more than once")
+        self.binding = binding
+
+
 def _open_leaf_descriptor(
     directory_fd: int,
     name: bytes,
     expected: Identity,
     *,
     owner: _LeafDescriptorCustodyOwner,
+    expected_policy: LeafAccessPolicyBinding | None = None,
+    policy_result_owner: _LeafPolicyResultOwner | None = None,
 ) -> int:
     if owner.state != "empty":
         raise ValueError("leaf descriptor publication owner is already used")
@@ -1755,23 +2102,35 @@ def _open_leaf_descriptor(
     try:
         descriptor = os.open(name, flags, dir_fd=directory_fd)
     except OSError as error:
-        raise CustodyLostError(
-            "targeted cleanup leaf descriptor could not be acquired"
+        raise _leaf_observation_failure(
+            stage="while opening its descriptor",
+            missing=error.errno == errno.ENOENT,
         ) from error
     # The caller enters the supported critical section before this function.
     # Publish the sole resource-bearing value before fstat or companion
     # validation so no supported live-FD interruption can precede custody.
     owner.publish(descriptor)
-    try:
-        observed = identity_from_stat(os.fstat(descriptor))
-    except OSError as error:
-        raise CustodyLostError(
-            "targeted cleanup leaf descriptor could not be revalidated"
-        ) from error
-    if observed != expected or observed.link_count != 1:
-        raise CustodyLostError(
-            "targeted cleanup leaf changed while its descriptor was opened"
+    observed = _observe_leaf_policy_fd(
+        descriptor,
+        stage="while opening its descriptor",
+    )
+    if expected_policy is None:
+        _require_leaf_identity_matches(
+            observed,
+            expected,
+            stage="while opening its descriptor",
         )
+    else:
+        if not _leaf_policy_matches_identity(expected_policy, expected):
+            raise ValueError("leaf descriptor policy and identity disagree")
+        _require_leaf_snapshot_matches(
+            observed,
+            expected_policy,
+            expected_link_count=1,
+            stage="while opening its descriptor",
+        )
+    if policy_result_owner is not None:
+        policy_result_owner.publish(observed.policy)
     return descriptor
 
 
@@ -1802,22 +2161,6 @@ def _quarantine_leaf(
     raise FileExistsError("cannot allocate a fresh leaf cleanup quarantine name")
 
 
-def _unlinked_leaf_identity(expected: Identity) -> Identity:
-    # The protected property is the manifest-bound object identity, content
-    # shape, and access policy.  Only st_nlink may transition: 1 proves unique
-    # admission immediately before unlink, and 0 proves that exact open object
-    # has no surviving filesystem name afterwards.  Directory-entry churn and
-    # timestamp changes are deliberately not treated as object mutation.
-    return Identity(
-        device=expected.device,
-        inode=expected.inode,
-        mode=expected.mode,
-        link_count=0,
-        uid=expected.uid,
-        size=expected.size,
-    )
-
-
 def _unlink_quarantined_leaf_critical(
     *,
     directory_fd: int,
@@ -1825,24 +2168,28 @@ def _unlink_quarantined_leaf_critical(
     quarantine_name: bytes,
     descriptor: int,
     expected: Identity,
+    expected_policy: LeafAccessPolicyBinding,
     deadline: float,
 ) -> None:
     if time.monotonic() >= deadline:
         raise TimeoutError("targeted cleanup monotonic deadline expired")
+    if not _leaf_policy_matches_identity(expected_policy, expected):
+        raise ValueError("leaf unlink policy and identity disagree")
+    descriptor_policy = _observe_leaf_policy_fd(
+        descriptor,
+        stage="after quarantine rename and before unlink",
+    )
+    _require_leaf_snapshot_matches(
+        descriptor_policy,
+        expected_policy,
+        expected_link_count=1,
+        stage="after quarantine rename and before unlink",
+    )
     try:
-        descriptor_identity = identity_from_stat(os.fstat(descriptor))
-    except OSError as error:
-        state = "missing" if error.errno == errno.EBADF else "unreadable"
-        raise CustodyLostError(
-            f"targeted cleanup leaf descriptor is {state} before unlink"
-        ) from error
-    try:
-        quarantine_identity = identity_from_stat(
-            os.stat(
-                quarantine_name,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
+        quarantine_metadata = os.stat(
+            quarantine_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
         )
     except FileNotFoundError as error:
         raise CustodyLostError(
@@ -1852,14 +2199,16 @@ def _unlink_quarantined_leaf_critical(
         raise CustodyLostError(
             "targeted cleanup quarantined leaf is unreadable before unlink"
         ) from error
-    if (
-        expected.link_count != 1
-        or descriptor_identity != expected
-        or quarantine_identity != descriptor_identity
-    ):
-        raise CustodyLostError(
-            "targeted cleanup quarantined leaf identity changed before unlink"
-        )
+    _require_leaf_stat_matches_binding(
+        quarantine_metadata,
+        expected_policy,
+        expected_link_count=1,
+        stage="at its quarantine name before unlink",
+        identity_error=(
+            "targeted cleanup quarantined leaf identity changed before unlink: "
+            "object identity mismatch"
+        ),
+    )
     _require_name_absent(
         parent_fd=directory_fd,
         name=original_name,
@@ -1869,16 +2218,24 @@ def _unlink_quarantined_leaf_critical(
         ),
     )
 
+    if time.monotonic() >= deadline:
+        raise TimeoutError(
+            "targeted cleanup deadline expired before leaf unlink; "
+            "original quarantine retained"
+        )
     os.unlink(quarantine_name, dir_fd=directory_fd)
 
-    try:
-        unlinked_identity = identity_from_stat(os.fstat(descriptor))
-    except OSError as error:
-        state = "missing" if error.errno == errno.EBADF else "unreadable"
-        raise CustodyLostError(
-            f"targeted cleanup unlinked leaf descriptor is {state}"
-        ) from error
-    if unlinked_identity != _unlinked_leaf_identity(expected):
+    unlinked_policy = _observe_leaf_policy_fd(
+        descriptor,
+        stage="after unlink",
+    )
+    _require_leaf_snapshot_matches(
+        unlinked_policy,
+        expected_policy,
+        expected_link_count=unlinked_policy.link_count,
+        stage="after unlink",
+    )
+    if unlinked_policy.link_count != 0:
         raise CustodyLostError(
             "targeted cleanup exact leaf deletion is unproven; a link remains"
         )
@@ -2244,17 +2601,87 @@ class _SupportedLeafDeletionCriticalSection:
         checkpoint_bound_signal_interrupt()
 
 
+def _capture_manifest_leaf_policy(
+    *,
+    directory_fd: int,
+    name: bytes,
+    expected: Identity,
+    path_metadata: os.stat_result,
+    delivery_owner: _LeafCleanupDeliveryOwner,
+    policy_result_owner: _LeafPolicyResultOwner,
+) -> None:
+    """Bind one manifest leaf without exposing a live descriptor to its caller."""
+
+    descriptor_owner = delivery_owner.descriptor_owner
+    error_owner = delivery_owner.error_owner
+    settlement = delivery_owner.settlement
+    try:
+        with _SupportedLeafDeletionCriticalSection(
+            error_owner,
+            defer_delivery=True,
+        ):
+            try:
+                _open_leaf_descriptor(
+                    directory_fd,
+                    name,
+                    expected,
+                    owner=descriptor_owner,
+                    policy_result_owner=policy_result_owner,
+                )
+                binding = policy_result_owner.binding
+                if binding is None:
+                    raise CustodyLostError(
+                        "targeted cleanup leaf policy result was not published"
+                    )
+                _require_leaf_stat_matches_binding(
+                    path_metadata,
+                    binding,
+                    expected_link_count=1,
+                    stage="during manifest construction",
+                )
+            except BaseException as active_error:  # noqa: BLE001 - live custody
+                error_owner.capture(
+                    "manifest leaf policy binding transaction",
+                    active_error,
+                )
+            finally:
+                settlement.settle()
+                if descriptor_owner.state not in {
+                    "closed",
+                    "close-outcome-unproven",
+                }:
+                    error_owner.capture(
+                        "manifest leaf descriptor terminal-state publication",
+                        CustodyLostError(
+                            "targeted cleanup manifest leaf descriptor was not settled"
+                        ),
+                    )
+                authoritative = error_owner._authoritative_error
+                if authoritative is not None:
+                    _attach_leaf_descriptor_custody(
+                        authoritative,
+                        descriptor_owner,
+                    )
+    except BaseException as publication_error:  # noqa: BLE001 - restored boundary
+        delivery_owner.enqueue(
+            "manifest leaf critical-section restoration boundary",
+            publication_error,
+        )
+
+
 def _delete_manifest_leaf(
     *,
     directory_fd: int,
     name: bytes,
     expected: Identity,
+    expected_policy: LeafAccessPolicyBinding | None = None,
     deadline: float,
     delivery_owner: _LeafCleanupDeliveryOwner,
 ) -> None:
     descriptor_owner = delivery_owner.descriptor_owner
     error_owner = delivery_owner.error_owner
     settlement = delivery_owner.settlement
+    policy_result_owner = _LeafPolicyResultOwner()
     try:
         with _SupportedLeafDeletionCriticalSection(
             error_owner,
@@ -2266,7 +2693,18 @@ def _delete_manifest_leaf(
                     name,
                     expected,
                     owner=descriptor_owner,
+                    expected_policy=expected_policy,
+                    policy_result_owner=policy_result_owner,
                 )
+                active_policy = (
+                    expected_policy
+                    if expected_policy is not None
+                    else policy_result_owner.binding
+                )
+                if active_policy is None:
+                    raise CustodyLostError(
+                        "targeted cleanup leaf policy result was not published"
+                    )
                 quarantine_name = _quarantine_leaf(
                     directory_fd,
                     name,
@@ -2279,6 +2717,7 @@ def _delete_manifest_leaf(
                         quarantine_name=quarantine_name,
                         descriptor=descriptor,
                         expected=expected,
+                        expected_policy=active_policy,
                         deadline=deadline,
                     )
                 except BaseException as error:  # noqa: BLE001 - control flow
@@ -2367,12 +2806,39 @@ def _delete_directory_contents(
         for name in actual_names:
             budget.consume()
             record = expected[name]
-            metadata = identity_from_stat(
-                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            )
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as error:
+                raise CustodyLostError(
+                    "targeted cleanup manifest entry is missing before deletion"
+                ) from error
+            except OSError as error:
+                raise CustodyLostError(
+                    "targeted cleanup manifest entry is unreadable before deletion"
+                ) from error
             directory = record.kind == _KIND_DIRECTORY
-            if not _same_entry(metadata, record.identity, directory=directory):
-                raise CustodyLostError("targeted cleanup entry identity changed")
+            if directory:
+                if not _same_entry(
+                    identity_from_stat(metadata),
+                    record.identity,
+                    directory=True,
+                ):
+                    raise CustodyLostError(
+                        "targeted cleanup directory identity changed"
+                    )
+            else:
+                _validate_manifest_leaf_policy(record)
+                assert record.leaf_policy is not None
+                _require_leaf_stat_matches_binding(
+                    metadata,
+                    record.leaf_policy,
+                    expected_link_count=1,
+                    stage="before descriptor open",
+                )
             relative = name if not prefix else prefix + b"/" + name
             if directory:
                 child_owner = _CustodiedManifestDescriptorSlot(
@@ -2442,6 +2908,7 @@ def _delete_directory_contents(
                         directory_fd=directory_fd,
                         name=name,
                         expected=record.identity,
+                        expected_policy=record.leaf_policy,
                         deadline=budget.deadline,
                         delivery_owner=delivery_owner,
                     )

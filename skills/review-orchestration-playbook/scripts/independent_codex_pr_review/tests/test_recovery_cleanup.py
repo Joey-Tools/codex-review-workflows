@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dis
+import ctypes
 import errno
 import os
 import pathlib
@@ -15,6 +16,7 @@ from unittest import mock
 import review_supervisor.gitraw as gitraw
 import review_supervisor.recovery_cleanup as recovery_cleanup
 import review_supervisor.runtime as runtime
+import review_supervisor.secureio as secureio
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     NAMED_LANE_ELIGIBLE,
@@ -49,9 +51,13 @@ from review_supervisor.recovery_cleanup import (
 )
 from review_supervisor.runtime import _cleanup_worktree, _registration_json
 from review_supervisor.secureio import (
+    MAX_LEAF_XATTR_TOTAL_BYTES,
+    MAX_LEAF_XATTR_VALUE_BYTES,
+    MacOSDirectoryMetadataBinding,
     canonical_json,
     directory_identities_match,
     identity_from_stat,
+    macos_leaf_metadata_digest,
 )
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
@@ -74,6 +80,35 @@ ENTRYPOINT = (
 
 class _DeferredLeafSignal(BaseException):
     pass
+
+
+class _StatOverride:
+    def __init__(self, original: os.stat_result, **overrides: int) -> None:
+        self._original = original
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> object:
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._original, name)
+
+
+def _set_macos_fd_xattr(fd: int, name: str, value: bytes) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    fsetxattr = libc.fsetxattr
+    fsetxattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    ]
+    fsetxattr.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(value)
+    ctypes.set_errno(0)
+    if fsetxattr(fd, name.encode("utf-8"), buffer, len(value), 0, 0) != 0:
+        raise OSError(ctypes.get_errno() or errno.EIO, "cannot set test xattr")
 
 
 def _call_followup_offset(
@@ -1041,6 +1076,521 @@ class ManifestTraversalTests(unittest.TestCase):
                 self.assertTrue(proof["exact_names_absent"])
                 self.assertFalse(target.exists())
             finally:
+                os.close(parent_fd)
+
+    def test_manifest_leaf_metadata_digest_is_persisted_without_raw_values(
+        self,
+    ) -> None:
+        metadata = MacOSDirectoryMetadataBinding(
+            acl_entry_count=0,
+            acl_entries=(),
+            xattrs=("com.example.synthetic-leaf-policy",),
+            quarantine_present=False,
+        )
+        metadata_binding = macos_leaf_metadata_digest(
+            metadata,
+            xattr_values=((metadata.xattrs[0], b"synthetic-value"),),
+        )
+        changed_value_binding = macos_leaf_metadata_digest(
+            metadata,
+            xattr_values=((metadata.xattrs[0], b"changed-value"),),
+        )
+        self.assertNotEqual(metadata_binding, changed_value_binding)
+        with owned_temporary_directory("manifest-leaf-policy-payload-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            (target / "payload.txt").write_bytes(b"policy payload\n")
+            with mock.patch.object(
+                recovery_cleanup,
+                "inspect_macos_leaf_metadata_digest",
+                return_value=metadata_binding,
+            ):
+                manifest, parent_fd = self._build_target_manifest(
+                    root,
+                    target,
+                    label="leaf-policy-payload",
+                )
+            try:
+                record = next(record for record in manifest.records if record.path)
+                self.assertIsNotNone(record.leaf_policy)
+                assert record.leaf_policy is not None
+                payload = pathlib.Path(manifest.seal["path"]).read_bytes()
+                self.assertEqual(manifest.seal["version"], 2)
+                self.assertIn(record.leaf_policy.metadata_sha256, payload)
+                self.assertNotIn(
+                    b"com.example.synthetic-leaf-policy",
+                    payload,
+                )
+                self.assertNotIn(b"synthetic-value", payload)
+                self.assertFalse(hasattr(record.leaf_policy, "macos_metadata"))
+                none_binding = macos_leaf_metadata_digest(None)
+                empty_binding = macos_leaf_metadata_digest(
+                    MacOSDirectoryMetadataBinding(
+                        acl_entry_count=0,
+                        acl_entries=(),
+                        xattrs=(),
+                        quarantine_present=False,
+                    )
+                )
+                self.assertNotEqual(none_binding, empty_binding)
+                self.assertLessEqual(
+                    recovery_cleanup._RECORD.size
+                    + recovery_cleanup._LEAF_POLICY_RECORD.size,
+                    recovery_cleanup.TARGETED_MANIFEST_RECORD_BYTES,
+                )
+                with self.assertRaisesRegex(ValueError, "value exceeds"):
+                    macos_leaf_metadata_digest(
+                        metadata,
+                        xattr_values=(
+                            (
+                                metadata.xattrs[0],
+                                b"x" * (MAX_LEAF_XATTR_VALUE_BYTES + 1),
+                            ),
+                        ),
+                    )
+                aggregate_names = tuple(
+                    f"com.example.aggregate-{index:02d}" for index in range(17)
+                )
+                aggregate_metadata = MacOSDirectoryMetadataBinding(
+                    acl_entry_count=0,
+                    acl_entries=(),
+                    xattrs=aggregate_names,
+                    quarantine_present=False,
+                )
+                aggregate_value_size = MAX_LEAF_XATTR_TOTAL_BYTES // 16
+                with self.assertRaisesRegex(ValueError, "aggregate byte bound"):
+                    macos_leaf_metadata_digest(
+                        aggregate_metadata,
+                        xattr_values=tuple(
+                            (name, b"x" * aggregate_value_size)
+                            for name in aggregate_names
+                        ),
+                    )
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_xattr_producer_stops_before_aggregate_overflow_read(
+        self,
+    ) -> None:
+        names = tuple(f"com.example.aggregate-{index:02d}" for index in range(17))
+        sizes = {
+            name: MAX_LEAF_XATTR_VALUE_BYTES if index < 16 else 1
+            for index, name in enumerate(names)
+        }
+
+        class FakeFGetXattr:
+            argtypes: object = None
+            restype: object = None
+
+            def __init__(self) -> None:
+                self.size_queries: list[str] = []
+                self.data_reads: list[str] = []
+                self.buffers: list[object] = []
+
+            def __call__(
+                self,
+                _fd: int,
+                raw_name: bytes,
+                value: object | None,
+                size: int,
+                _position: int,
+                _options: int,
+            ) -> int:
+                name = raw_name.decode("utf-8")
+                expected_size = sizes[name]
+                if value is None:
+                    self.size_queries.append(name)
+                    return expected_size
+                self.data_reads.append(name)
+                self.buffers.append(value)
+                self.assert_size(size, expected_size)
+                ctypes.memset(value, 0xA5, size)
+                return size
+
+            @staticmethod
+            def assert_size(observed: int, expected: int) -> None:
+                if observed != expected:
+                    raise AssertionError(
+                        f"unexpected fake fgetxattr size: {observed} != {expected}"
+                    )
+
+        fake_fgetxattr = FakeFGetXattr()
+        fake_libc = type("FakeLibC", (), {"fgetxattr": fake_fgetxattr})()
+        metadata = MacOSDirectoryMetadataBinding(
+            acl_entry_count=0,
+            acl_entries=(),
+            xattrs=names,
+            quarantine_present=False,
+        )
+        with (
+            mock.patch.object(secureio.ctypes, "CDLL", return_value=fake_libc),
+            self.assertRaisesRegex(ValueError, "aggregate byte bound") as caught,
+        ):
+            secureio._macos_leaf_metadata_digest_from_fd(41, metadata)
+
+        self.assertEqual(fake_fgetxattr.data_reads, list(names[:16]))
+        self.assertEqual(fake_fgetxattr.size_queries[-1], names[-1])
+        self.assertEqual(fake_fgetxattr.size_queries.count(names[-1]), 1)
+        for buffer in fake_fgetxattr.buffers:
+            self.assertEqual(bytes(buffer), bytes(len(buffer)))
+        traceback_item = caught.exception.__traceback__
+        while traceback_item is not None:
+            frame = traceback_item.tb_frame
+            if frame.f_globals.get("__name__") == secureio.__name__:
+                self.assertIsNone(frame.f_locals.get("buffer"))
+                self.assertFalse(
+                    any(
+                        isinstance(value, bytes)
+                        and len(value) >= MAX_LEAF_XATTR_VALUE_BYTES
+                        for value in frame.f_locals.values()
+                    )
+                )
+            traceback_item = traceback_item.tb_next
+
+    def _assert_leaf_stat_policy_drift_is_retained(self, field: str) -> None:
+        with owned_temporary_directory(f"manifest-leaf-{field}-drift-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(b"retained policy object\n")
+            leaf_inode = os.stat(payload).st_ino
+            manifest, parent_fd = self._build_target_manifest(
+                root,
+                target,
+                label=f"leaf-{field}-drift",
+            )
+            real_fstat = os.fstat
+
+            def drift_leaf_policy(descriptor: int) -> object:
+                metadata = real_fstat(descriptor)
+                if metadata.st_ino != leaf_inode or stat.S_ISDIR(metadata.st_mode):
+                    return metadata
+                original = getattr(metadata, field, 0)
+                return _StatOverride(metadata, **{field: original + 1})
+
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "fstat",
+                        side_effect=drift_leaf_policy,
+                    ),
+                    self.assertRaisesRegex(
+                        CustodyLostError,
+                        "leaf access policy drift",
+                    ) as caught,
+                ):
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertEqual(
+                    (retained_root / "payload.txt").read_bytes(),
+                    b"retained policy object\n",
+                )
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_gid_policy_only_drift_is_retained(self) -> None:
+        self._assert_leaf_stat_policy_drift_is_retained("st_gid")
+
+    def test_leaf_flags_policy_only_drift_is_retained(self) -> None:
+        self._assert_leaf_stat_policy_drift_is_retained("st_flags")
+
+    def _assert_leaf_extended_metadata_drift_is_detected(
+        self,
+        changed: MacOSDirectoryMetadataBinding,
+        *,
+        label: str,
+        mutation_inspection: int = 2,
+    ) -> None:
+        initial = MacOSDirectoryMetadataBinding(
+            acl_entry_count=0,
+            acl_entries=(),
+            xattrs=(),
+            quarantine_present=False,
+        )
+        initial_binding = macos_leaf_metadata_digest(initial)
+        changed_binding = macos_leaf_metadata_digest(
+            changed,
+            xattr_values=tuple((name, b"changed") for name in changed.xattrs),
+        )
+        with owned_temporary_directory(f"manifest-leaf-{label}-drift-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            (target / "payload.txt").write_bytes(b"retained metadata object\n")
+            with mock.patch.object(
+                recovery_cleanup,
+                "inspect_macos_leaf_metadata_digest",
+                return_value=initial_binding,
+            ):
+                manifest, parent_fd = self._build_target_manifest(
+                    root,
+                    target,
+                    label=f"leaf-{label}-drift",
+                )
+            inspections = 0
+
+            def drift_after_rename(
+                _descriptor: int,
+            ) -> tuple[int, bytes]:
+                nonlocal inspections
+                inspections += 1
+                return (
+                    initial_binding
+                    if inspections < mutation_inspection
+                    else changed_binding
+                )
+
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "inspect_macos_leaf_metadata_digest",
+                        side_effect=drift_after_rename,
+                    ),
+                    self.assertRaisesRegex(
+                        CustodyLostError,
+                        "leaf access policy drift",
+                    ) as caught,
+                ):
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                self.assertEqual(inspections, mutation_inspection)
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                leaf_quarantines = tuple(
+                    child
+                    for child in retained_root.iterdir()
+                    if os.fsencode(child.name).startswith(
+                        recovery_cleanup._LEAF_QUARANTINE_PREFIX
+                    )
+                )
+                if mutation_inspection == 2:
+                    self.assertEqual(len(leaf_quarantines), 1)
+                    self.assertEqual(
+                        leaf_quarantines[0].read_bytes(),
+                        b"retained metadata object\n",
+                    )
+                else:
+                    self.assertEqual(leaf_quarantines, ())
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_acl_policy_only_drift_after_rename_is_retained(self) -> None:
+        self._assert_leaf_extended_metadata_drift_is_detected(
+            MacOSDirectoryMetadataBinding(
+                acl_entry_count=1,
+                acl_entries=("synthetic-user:allow:read",),
+                xattrs=(),
+                quarantine_present=False,
+            ),
+            label="acl",
+        )
+
+    def test_leaf_xattr_policy_only_drift_after_unlink_is_detected(self) -> None:
+        self._assert_leaf_extended_metadata_drift_is_detected(
+            MacOSDirectoryMetadataBinding(
+                acl_entry_count=0,
+                acl_entries=(),
+                xattrs=("com.example.synthetic-policy",),
+                quarantine_present=False,
+            ),
+            label="xattr",
+            mutation_inspection=3,
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS xattrs")
+    def test_leaf_same_name_xattr_value_drift_is_retained(self) -> None:
+        with owned_temporary_directory("manifest-leaf-xattr-value-drift-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(b"retained xattr value object\n")
+            xattr_name = "com.example.codex-leaf-policy"
+            payload_fd = os.open(
+                payload,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                _set_macos_fd_xattr(payload_fd, xattr_name, b"value-before")
+            finally:
+                os.close(payload_fd)
+            manifest, parent_fd = self._build_target_manifest(
+                root,
+                target,
+                label="leaf-xattr-value-drift",
+            )
+            payload_fd = os.open(
+                payload,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                _set_macos_fd_xattr(payload_fd, xattr_name, b"value-after")
+            finally:
+                os.close(payload_fd)
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                with self.assertRaisesRegex(
+                    CustodyLostError,
+                    "leaf access policy drift",
+                ) as caught:
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                retained_leaf = retained_root / "payload.txt"
+                self.assertEqual(
+                    retained_leaf.read_bytes(),
+                    b"retained xattr value object\n",
+                )
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_deadline_rechecked_after_metadata_before_unlink(self) -> None:
+        with owned_temporary_directory("manifest-leaf-unlink-deadline-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            (target / "payload.txt").write_bytes(b"retained at deadline\n")
+            manifest, parent_fd = self._build_target_manifest(
+                root,
+                target,
+                label="leaf-unlink-deadline",
+            )
+            real_inspect = recovery_cleanup.inspect_macos_leaf_metadata_digest
+            real_monotonic = time.monotonic
+            inspections = 0
+            expired = False
+
+            def expire_after_pre_unlink_inspection(
+                descriptor: int,
+            ) -> tuple[int, bytes]:
+                nonlocal expired, inspections
+                result = real_inspect(descriptor)
+                inspections += 1
+                if inspections == 2:
+                    expired = True
+                return result
+
+            def controlled_monotonic() -> float:
+                return manifest.deadline if expired else real_monotonic()
+
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "inspect_macos_leaf_metadata_digest",
+                        side_effect=expire_after_pre_unlink_inspection,
+                    ),
+                    mock.patch.object(
+                        recovery_cleanup.time,
+                        "monotonic",
+                        side_effect=controlled_monotonic,
+                    ),
+                    mock.patch.object(recovery_cleanup.os, "unlink") as unlink,
+                    self.assertRaisesRegex(
+                        TimeoutError,
+                        "deadline expired before leaf unlink",
+                    ) as caught,
+                ):
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                unlink.assert_not_called()
+                self.assertEqual(inspections, 2)
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                leaf_quarantines = tuple(
+                    child
+                    for child in retained_root.iterdir()
+                    if os.fsencode(child.name).startswith(
+                        recovery_cleanup._LEAF_QUARANTINE_PREFIX
+                    )
+                )
+                self.assertEqual(len(leaf_quarantines), 1)
+                self.assertEqual(
+                    leaf_quarantines[0].read_bytes(),
+                    b"retained at deadline\n",
+                )
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_leaf_oversized_xattr_observation_is_unreadable_and_retained(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-leaf-xattr-oversized-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            (target / "payload.txt").write_bytes(b"retained oversized xattr\n")
+            manifest, parent_fd = self._build_target_manifest(
+                root,
+                target,
+                label="leaf-xattr-oversized",
+            )
+            result_owner = CustodiedDeletionResultOwner()
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "inspect_macos_leaf_metadata_digest",
+                        side_effect=ValueError(
+                            "leaf xattr value exceeds its byte bound"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        CustodyLostError,
+                        "policy revalidation is unreadable",
+                    ) as caught,
+                ):
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+                self.assertIsNone(result_owner.proof)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                retained_root = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertEqual(
+                    (retained_root / "payload.txt").read_bytes(),
+                    b"retained oversized xattr\n",
+                )
+            finally:
+                manifest.close()
                 os.close(parent_fd)
 
     def test_leaf_descriptor_open_store_boundary_is_quiescent(self) -> None:

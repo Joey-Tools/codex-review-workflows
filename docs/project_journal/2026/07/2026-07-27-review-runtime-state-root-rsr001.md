@@ -297,3 +297,19 @@ superseded_by:
   supervisor package, so unsupported runtimes cannot replace the stable version
   diagnostic with an import failure. The current complete contract module
   passed 105/105 on the uv-managed CPython 3.13.13 runtime.
+- The final leaf-cleanup policy hardening passed 794/794 deterministic tests in
+  102.367 seconds on the host-level uv-managed CPython 3.13.13 runtime. The
+  reviewed 794-test selected identity has SHA-256
+  `0155f4bf21c0fc12e5ffaf9ff9757f1503a099f07905702a45bda238359f16ff`.
+  Manifest v2 now binds each leaf's object identity, content length, owner,
+  group, mode, flags, generation, normalized ACL state, and every canonical
+  xattr name plus its complete bounded value. Raw xattr values are hashed
+  during two stable descriptor observations and never enter the manifest.
+  Aggregate limits are enforced before raw buffer allocation or reads; each
+  bounded value is hashed directly from a transient buffer that is cleared on
+  every exit. Oversized or unstable observations fail closed as unreadable,
+  while the destructive unlink boundary rechecks the original absolute
+  deadline after metadata validation and retains the quarantined leaf when
+  that deadline has expired. The focused recovery and secure-I/O modules
+  passed 71/71 and 30/30,
+  respectively, under the same runtime.
