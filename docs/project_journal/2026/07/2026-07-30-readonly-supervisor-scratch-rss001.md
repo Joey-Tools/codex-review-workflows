@@ -92,6 +92,13 @@ superseded_by:
   retained as ordered secondary diagnostics, while cleanup is authorized only
   by an explicit process-closure proof; a still-pending or unproven child keeps
   both the installed and runtime trees.
+- A returned bounded-child outcome is published into a separate caller-owned
+  receipt before the same-UID closure census. The receipt preserves only the
+  already bounded return code, stdout, and stderr for failure diagnosis; it is
+  not process-closure evidence and cannot authorize destructive cleanup. A
+  later closure failure therefore remains primary and retains both protected
+  trees while the terminal summary and stderr still expose the inner suite's
+  bounded outcome.
 - CI runs the ordinary deterministic suite and the read-only installed
   regression in separate macOS Python 3.13 jobs. The read-only job copies the
   tracked source from the checkout into a root-owned, read-only
@@ -305,3 +312,25 @@ superseded_by:
   only while the original absolute cleanup deadline remains live. Policy or
   content drift, unreadable evidence, and deadline expiry retain the
   descriptor-bound quarantine instead of weakening cleanup admission.
+- Hosted read-only job `91367316563` failed closed on one long-lived post-baseline
+  same-UID process while retaining both protected trees; an unchanged-head
+  failed-job rerun passed the complete gate. The first summary could not report
+  whether the already bounded inner suite had passed or failed because closure
+  failure interrupted `CompletedProcess` publication. The outcome receipt now
+  keeps that diagnostic evidence independent of the still mandatory process
+  closure proof. Timing makes the read-only runner's live double-fork fixture
+  the highest-probability source, not a proven attribution. Its normal cleanup
+  now publishes and revalidates the exact PID/start-time identity before
+  writing a task-private cooperative stop marker and proves stable absence even
+  when the assertion path exits unexpectedly. If marker publication fails, the
+  still-unreaped direct-child relationship prevents PID reuse while the parent
+  sends SIGKILL and reaps that child; a separate custody receipt and
+  exact-identity absence proof verify that failure path before another fixture
+  process starts.
+- The final exact working tree passed 802/802 deterministic tests in 103.447
+  seconds with selected-identity SHA-256
+  `d937a349ec87ffbd440be7e73734f5ea7533331c7212d5977c7661481b0a3516`.
+  The complete read-only runner module passed 111/111 in 10.548 seconds, and ten
+  ordered normal/failure-injection double-fork rounds passed 20/20 in 67.488
+  seconds. The repository contracts passed 105/105 under the same uv-managed
+  CPython 3.13.13 runtime.

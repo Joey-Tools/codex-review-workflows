@@ -297,10 +297,10 @@ superseded_by:
   supervisor package, so unsupported runtimes cannot replace the stable version
   diagnostic with an import failure. The current complete contract module
   passed 105/105 on the uv-managed CPython 3.13.13 runtime.
-- The final leaf-cleanup policy hardening passed 799/799 deterministic tests in
-  102.251 seconds on the host-level uv-managed CPython 3.13.13 runtime. The
-  reviewed 799-test selected identity has SHA-256
-  `306ce4d6bcdacd57b555f5e1eecefe59c4033c853e7e8c939a527dce05c10377`.
+- The final leaf-cleanup and child-outcome diagnostic hardening passed 802/802
+  deterministic tests in 103.447 seconds on the host-level uv-managed CPython
+  3.13.13 runtime. The reviewed 802-test selected identity has SHA-256
+  `d937a349ec87ffbd440be7e73734f5ea7533331c7212d5977c7661481b0a3516`.
   Manifest v3 now binds each leaf's object identity, owner, group, mode, flags,
   generation, normalized ACL state, and every canonical xattr name plus its
   complete bounded value. It also binds the exact bytes of each readable
@@ -313,4 +313,12 @@ superseded_by:
   fails closed, while the destructive unlink boundary rechecks the original
   absolute deadline and retains the quarantined leaf when it has expired. The
   focused recovery and secure-I/O modules passed 76/76 and 30/30,
-  respectively, under the same runtime.
+  respectively, under the same runtime. A separate caller-owned receipt now
+  preserves an already bounded child return code and output before same-UID
+  closure without authorizing cleanup. On the live double-fork fixture's normal
+  path, a custody receipt binds the exact PID/start-time identity before marker
+  publication, cleanup rebinds that identity before writing a task-private
+  cooperative stop, and one deadline covers stable absence proof. If marker
+  publication fails, the unreaped direct-child relationship prevents PID reuse
+  while the parent sends SIGKILL and then reaps that child; an independent
+  custody receipt and exact-identity absence proof exercise that failure path.

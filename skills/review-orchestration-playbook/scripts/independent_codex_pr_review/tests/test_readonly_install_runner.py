@@ -6629,7 +6629,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
     def test_bounded_child_rejects_setsid_double_fork_escape(self) -> None:
         child_script = (
             "import os,pathlib,signal,sys,time\n"
+            "from review_supervisor.process import process_start_identity\n"
             "marker=pathlib.Path(sys.argv[1])\n"
+            "stop=pathlib.Path(sys.argv[2])\n"
+            "custody=pathlib.Path(sys.argv[3])\n"
+            "marker_delay=float(sys.argv[4])\n"
             "first=os.fork()\n"
             "if first==0:\n"
             " os.setsid()\n"
@@ -6637,30 +6641,81 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             " if second==0:\n"
             "  os.closerange(0,3)\n"
             "  signal.signal(signal.SIGHUP,signal.SIG_IGN)\n"
-            "  marker.write_text(str(os.getpid()),encoding='ascii')\n"
-            "  time.sleep(300)\n"
+            "  deadline=time.monotonic()+300\n"
+            "  while not stop.is_file() and time.monotonic()<deadline: time.sleep(0.01)\n"
             "  os._exit(0)\n"
-            " deadline=time.monotonic()+5\n"
-            " while not marker.is_file() and time.monotonic()<deadline: time.sleep(0.01)\n"
+            " try:\n"
+            "  identity=process_start_identity(second)\n"
+            "  custody_temporary=custody.with_name(custody.name+'.tmp')\n"
+            "  custody_temporary.write_text(f'{second}\\n{identity}\\n',encoding='ascii')\n"
+            "  os.replace(custody_temporary,custody)\n"
+            "  time.sleep(marker_delay)\n"
+            "  temporary=marker.with_name(marker.name+'.tmp')\n"
+            "  temporary.write_text(f'{second}\\n{identity}\\n',encoding='ascii')\n"
+            "  os.replace(temporary,marker)\n"
+            " except BaseException:\n"
+            "  try: os.kill(second,signal.SIGKILL)\n"
+            "  except ProcessLookupError: pass\n"
+            "  try: os.waitpid(second,0)\n"
+            "  except ChildProcessError: pass\n"
+            "  os._exit(1)\n"
             " os._exit(0)\n"
-            "os.waitpid(first,0)\n"
+            "_,status=os.waitpid(first,0)\n"
+            "if os.WIFEXITED(status): os._exit(os.WEXITSTATUS(status))\n"
+            "if os.WIFSIGNALED(status): os._exit(128+os.WTERMSIG(status))\n"
+            "os._exit(1)\n"
         )
         with owned_temporary_directory("readonly-child-session-escape-") as root:
             marker = root / "escaped-process"
-            escaped_pid: int | None = None
+            stop_marker = root / "stop-escaped-process"
+            custody_receipt = root / "escaped-process-custody"
+            marker_delay_seconds = 0.2
             escaped_identity: runner.DarwinProcessIdentity | None = None
 
-            def bind_identity(pid: int) -> runner.DarwinProcessIdentity:
-                raw_identity = process_start_identity(pid)
+            def parse_identity(
+                pid: int,
+                raw_identity: str,
+            ) -> runner.DarwinProcessIdentity:
                 prefix = "darwin-proc-start:"
                 if not raw_identity.startswith(prefix):
                     raise AssertionError("fixture process identity is not Darwin")
-                seconds, microseconds = raw_identity.removeprefix(prefix).split(":")
+                identity_fields = raw_identity.removeprefix(prefix).split(":")
+                if len(identity_fields) != 2 or not all(
+                    field.isdecimal() for field in identity_fields
+                ):
+                    raise AssertionError("fixture process identity is malformed")
+                seconds, microseconds = map(int, identity_fields)
+                if seconds <= 0 or not 0 <= microseconds < 1_000_000:
+                    raise AssertionError("fixture process identity is out of range")
                 return runner.DarwinProcessIdentity(
                     pid,
-                    int(seconds),
-                    int(microseconds),
+                    seconds,
+                    microseconds,
                 )
+
+            def bind_identity(pid: int) -> runner.DarwinProcessIdentity:
+                return parse_identity(pid, process_start_identity(pid))
+
+            def read_identity_receipt(
+                receipt: pathlib.Path,
+            ) -> runner.DarwinProcessIdentity:
+                with receipt.open("rb") as receipt_stream:
+                    raw_marker = receipt_stream.read(257)
+                if not 1 <= len(raw_marker) <= 256:
+                    raise ValueError("fixture process marker has an invalid size")
+                fields = raw_marker.decode("ascii", "strict").splitlines()
+                if len(fields) != 2 or not fields[0].isdecimal():
+                    raise ValueError("fixture process marker is malformed")
+                pid = int(fields[0])
+                if pid <= 0:
+                    raise ValueError("fixture process marker has an invalid PID")
+                return parse_identity(pid, fields[1])
+
+            def read_marker_identity() -> runner.DarwinProcessIdentity:
+                return read_identity_receipt(marker)
+
+            def read_custody_identity() -> runner.DarwinProcessIdentity:
+                return read_identity_receipt(custody_receipt)
 
             supervisor_identity = bind_identity(os.getpid())
 
@@ -6668,16 +6723,27 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 *,
                 deadline: float | None = None,
             ) -> tuple[runner.DarwinProcessIdentity, ...]:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("fixture process census deadline expired")
+                nonlocal escaped_identity
+                # The production caller owns the absolute census deadline.
+                # This fixture stays scoped to returning its real bound process
+                # identity so crossing the deadline inside the test double cannot
+                # replace already observed escape evidence with a synthetic timeout.
+                del deadline
                 observed = [supervisor_identity]
                 try:
-                    raw_pid = marker.read_bytes()
+                    marked_identity = read_marker_identity()
                 except FileNotFoundError:
                     return tuple(observed)
-                if not 1 <= len(raw_pid) <= 20 or not raw_pid.isdigit():
-                    raise ValueError("fixture process marker is not a valid PID")
-                observed.append(bind_identity(int(raw_pid)))
+                try:
+                    rebound_identity = bind_identity(marked_identity.pid)
+                except ProcessLookupError:
+                    return tuple(observed)
+                if rebound_identity == marked_identity:
+                    if escaped_identity is None:
+                        escaped_identity = rebound_identity
+                    elif escaped_identity != rebound_identity:
+                        raise AssertionError("fixture process identity changed")
+                    observed.append(rebound_identity)
                 return tuple(observed)
 
             # The ordinary developer account can have unrelated same-UID
@@ -6702,8 +6768,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                                 "-c",
                                 child_script,
                                 str(marker),
+                                str(stop_marker),
+                                str(custody_receipt),
+                                str(marker_delay_seconds),
                             ),
-                            cwd=root,
+                            cwd=pathlib.Path(__file__).resolve().parents[1],
                             environment={
                                 "LANG": "C",
                                 "LC_ALL": "C",
@@ -6714,12 +6783,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                             stdout_limit=1024,
                             stderr_limit=1024,
                         )
-                    escaped_pid = int(marker.read_text(encoding="ascii"))
-                    escaped_identity = next(
+                    marked_identity = read_marker_identity()
+                    evidence_identity = next(
                         (
                             process
                             for process in escaped.exception.processes
-                            if process.pid == escaped_pid
+                            if process == marked_identity
                         ),
                         None,
                     )
@@ -6728,21 +6797,190 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS + 1.0,
                     )
                     self.assertIsNone(escaped.exception.__cause__)
-                    self.assertIsNone(escaped.exception.cause)
+                    if escaped.exception.cause is not None:
+                        self.assertIsInstance(escaped.exception.cause, TimeoutError)
+                        self.assertIn(
+                            "process census deadline expired",
+                            str(escaped.exception.cause),
+                        )
                     self.assertIsNotNone(
-                        escaped_identity,
-                        f"escaped PID {escaped_pid} absent from "
+                        evidence_identity,
+                        f"escaped identity {marked_identity!r} absent from "
                         f"closure evidence {escaped.exception.processes!r}; "
                         f"cause={escaped.exception.cause!r}",
                     )
+                    self.assertEqual(evidence_identity, escaped_identity)
             finally:
-                if escaped_pid is not None:
+                cleanup_deadline = (
+                    time.monotonic() + runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS
+                )
+                cleanup_identity: runner.DarwinProcessIdentity | None = None
+                receipt_error: BaseException | None = None
+                while cleanup_identity is None:
                     try:
-                        os.kill(escaped_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            if escaped_identity is not None:
-                runner._require_process_identities_absent((escaped_identity,))
+                        cleanup_identity = read_custody_identity()
+                    except FileNotFoundError:
+                        remaining = cleanup_deadline - time.monotonic()
+                        if remaining <= 0:
+                            receipt_error = TimeoutError(
+                                "fixture custody receipt deadline expired"
+                            )
+                            break
+                        time.sleep(min(0.01, remaining))
+                    except BaseException as error:
+                        receipt_error = error
+                        break
+                if cleanup_identity is None:
+                    closure_error = runner.ChildProcessTreeClosureUnproven(
+                        (),
+                        receipt_error,
+                    )
+                    raise closure_error from receipt_error
+                identity_mismatch = (
+                    escaped_identity is not None
+                    and escaped_identity != cleanup_identity
+                )
+                try:
+                    runner._require_process_census_time(cleanup_deadline)
+                    rebound_identity = bind_identity(cleanup_identity.pid)
+                    runner._require_process_census_time(cleanup_deadline)
+                except ProcessLookupError:
+                    rebound_identity = None
+                except BaseException as error:
+                    closure_error = runner.ChildProcessTreeClosureUnproven(
+                        (cleanup_identity,),
+                        error,
+                    )
+                    raise closure_error from error
+                # The custody receipt binds the protected process-object
+                # identity. Only an exact rebind may publish the task-private
+                # cooperative stop; the same absolute deadline covers rebind,
+                # stop publication, and stable exact-identity absence proof.
+                if rebound_identity == cleanup_identity:
+                    stop_marker.write_text("stop\n", encoding="ascii")
+                    runner._require_process_census_time(cleanup_deadline)
+                runner._require_process_identities_absent(
+                    (cleanup_identity,),
+                    deadline=cleanup_deadline,
+                )
+                if identity_mismatch:
+                    raise AssertionError("fixture marker and custody identities differ")
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
+    def test_double_fork_fixture_recovers_marker_after_unexpected_failure(
+        self,
+    ) -> None:
+        real_absence_proof = runner._require_process_identities_absent
+        real_process_census = runner._darwin_same_uid_processes
+
+        def read_exact_receipt(
+            receipt: pathlib.Path,
+        ) -> runner.DarwinProcessIdentity:
+            with receipt.open("rb") as receipt_stream:
+                raw_receipt = receipt_stream.read(257)
+            self.assertLessEqual(len(raw_receipt), 256)
+            fields = raw_receipt.decode("ascii", "strict").splitlines()
+            self.assertEqual(len(fields), 2)
+            pid = int(fields[0])
+            prefix = "darwin-proc-start:"
+            self.assertTrue(fields[1].startswith(prefix))
+            seconds, microseconds = fields[1].removeprefix(prefix).split(":")
+            return runner.DarwinProcessIdentity(
+                pid,
+                int(seconds),
+                int(microseconds),
+            )
+
+        def fail_after_marker(
+            argv: tuple[str, ...],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            marker_path = pathlib.Path(argv[-4])
+            stop_path = pathlib.Path(argv[-3])
+            custody_path = pathlib.Path(argv[-2])
+            marker_delay = float(argv[-1])
+            failed_marker = marker_path.with_name("unpublishable-marker")
+            failed_stop = stop_path.with_name("failed-stop-escaped-process")
+            failed_custody = custody_path.with_name("failed-escaped-process-custody")
+            failed_marker.mkdir()
+            failed_argv = (
+                *argv[:-4],
+                str(failed_marker),
+                str(failed_stop),
+                str(failed_custody),
+                argv[-1],
+            )
+            failed_returncode, failed_stdout, failed_stderr = runner.run_bounded(
+                failed_argv,
+                cwd=kwargs["cwd"],
+                environment=kwargs["environment"],
+                timeout=kwargs["timeout"],
+                stdout_limit=kwargs["stdout_limit"],
+                stderr_limit=kwargs["stderr_limit"],
+            )
+            self.assertEqual(failed_returncode, 1)
+            self.assertEqual((failed_stdout, failed_stderr), (b"", b""))
+            failed_identity = read_exact_receipt(failed_custody)
+            self.assertFalse(failed_stop.exists())
+            failed_cleanup_deadline = (
+                time.monotonic() + runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS
+            )
+            with mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                side_effect=real_process_census,
+            ):
+                real_absence_proof(
+                    (failed_identity,),
+                    deadline=failed_cleanup_deadline,
+                )
+
+            started = time.monotonic()
+            returncode, stdout, stderr = runner.run_bounded(
+                argv,
+                cwd=kwargs["cwd"],
+                environment=kwargs["environment"],
+                timeout=kwargs["timeout"],
+                stdout_limit=kwargs["stdout_limit"],
+                stderr_limit=kwargs["stderr_limit"],
+            )
+            self.assertEqual((returncode, stdout, stderr), (0, b"", b""))
+            self.assertGreaterEqual(time.monotonic() - started, marker_delay)
+            marker_identity = read_exact_receipt(marker_path)
+            custody_identity = read_exact_receipt(custody_path)
+            self.assertEqual(marker_identity, custody_identity)
+            self.assertEqual(
+                process_start_identity(marker_identity.pid),
+                "darwin-proc-start:"
+                f"{marker_identity.start_seconds}:"
+                f"{marker_identity.start_microseconds}",
+            )
+            raise RuntimeError("synthetic failure after fixture marker publication")
+
+        with (
+            mock.patch.object(
+                runner,
+                "_run_bounded_child",
+                side_effect=fail_after_marker,
+            ),
+            mock.patch.object(
+                runner,
+                "_require_process_identities_absent",
+                wraps=real_absence_proof,
+            ) as require_absence,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "failure after fixture marker publication",
+            ),
+        ):
+            self.test_bounded_child_rejects_setsid_double_fork_escape()
+
+        require_absence.assert_called_once()
+        recovered = require_absence.call_args.args[0]
+        self.assertEqual(len(recovered), 1)
+        self.assertGreater(recovered[0].pid, 0)
+        self.assertGreater(recovered[0].start_seconds, 0)
+        self.assertIsNotNone(require_absence.call_args.kwargs["deadline"])
 
     def test_bounded_child_output_overflow_settles_same_group_descendant(
         self,
@@ -6782,6 +7020,82 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
 
             process_group = int(group_file.read_text(encoding="ascii"))
             self._require_process_group_absent(process_group)
+
+    def test_bounded_child_receipt_failure_does_not_skip_closure(self) -> None:
+        with owned_temporary_directory("readonly-child-outcome-receipt-") as root:
+            baseline = (
+                runner.DarwinProcessIdentity(
+                    pid=os.getpid(),
+                    start_seconds=1_700_000_000,
+                    start_microseconds=1,
+                ),
+            )
+            escaped_process = runner.DarwinProcessIdentity(
+                pid=os.getpid() + 10_000,
+                start_seconds=1_700_000_001,
+                start_microseconds=2,
+            )
+            closure_error = runner.ChildProcessTreeClosureUnproven((escaped_process,))
+            previous_outcome = subprocess.CompletedProcess(
+                args=("previous",),
+                returncode=99,
+                stdout="previous stdout",
+                stderr="previous stderr",
+            )
+            outcome_receipt = runner.ChildRunOutcomeReceipt()
+            outcome_receipt.publish(previous_outcome)
+            closure_proof = runner.ChildProcessClosureProof()
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_bound_child_signals",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_stable_same_uid_processes",
+                    return_value=baseline,
+                ),
+                mock.patch.object(
+                    runner,
+                    "run_bounded",
+                    return_value=(0, b"current stdout", b"current stderr"),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_require_no_new_same_uid_processes",
+                    side_effect=closure_error,
+                ) as require_closure,
+                self.assertRaises(runner.ChildProcessTreeClosureUnproven) as caught,
+            ):
+                runner._run_bounded_child(
+                    (sys.executable, "-B", "-c", "raise SystemExit(0)"),
+                    cwd=root,
+                    environment={
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    closure_proof=closure_proof,
+                    outcome_receipt=outcome_receipt,
+                )
+
+            self.assertIs(caught.exception, closure_error)
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+            self.assertRegex(
+                str(caught.exception.__cause__),
+                "already published",
+            )
+            require_closure.assert_called_once_with(baseline)
+            self.assertIs(outcome_receipt.completed, previous_outcome)
+            self.assertTrue(closure_proof.started)
+            self.assertFalse(closure_proof.proven)
+            self.assertFalse(closure_proof.destructive_cleanup_authorized)
 
     def test_bounded_child_does_not_claim_closure_before_process_supervision(
         self,
@@ -7276,6 +7590,132 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 error_text.index("secondary failures"),
                 error_text.index("cleanup incomplete"),
             )
+
+    def test_main_preserves_bounded_outcome_when_same_uid_closure_unproven(
+        self,
+    ) -> None:
+        for child_returncode in (0, 23):
+            with (
+                self.subTest(child_returncode=child_returncode),
+                owned_temporary_directory(
+                    f"readonly-main-bounded-outcome-{child_returncode}-"
+                ) as root,
+            ):
+                sticky_parent = root / "sticky"
+                sticky_parent.mkdir()
+                sticky_parent.chmod(0o1777)
+                install_container = sticky_parent / "install"
+                self._make_private_directory(install_container)
+                runtime_home = root / "runtime-home"
+                self._make_private_directory(runtime_home)
+                runtime_parent = runtime_home / "runtime"
+                self._make_private_directory(runtime_parent)
+                bounded_stderr = (
+                    f"bounded child stderr for returncode {child_returncode}"
+                )
+
+                def fake_copytree(
+                    _source: pathlib.Path,
+                    destination: pathlib.Path,
+                    **_kwargs: object,
+                ) -> pathlib.Path:
+                    pathlib.Path(destination).mkdir()
+                    return pathlib.Path(destination)
+
+                process_baseline = (
+                    runner.DarwinProcessIdentity(
+                        pid=os.getpid(),
+                        start_seconds=1_700_000_000,
+                        start_microseconds=1,
+                    ),
+                )
+                escaped_process = runner.DarwinProcessIdentity(
+                    pid=os.getpid() + 10_000,
+                    start_seconds=1_700_000_001,
+                    start_microseconds=2,
+                )
+                closure_error = runner.ChildProcessTreeClosureUnproven(
+                    (escaped_process,)
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(runner.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        runner,
+                        "READONLY_INSTALL_PARENT",
+                        sticky_parent,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_private_runtime_parent",
+                        return_value=runtime_home,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_create_bound_owned_private_directory",
+                        side_effect=self._bound_directory_factory(
+                            install_container,
+                            runtime_parent,
+                        ),
+                    ),
+                    mock.patch.object(
+                        runner.shutil,
+                        "copytree",
+                        side_effect=fake_copytree,
+                    ),
+                    mock.patch.object(runner, "_set_tree_read_only"),
+                    mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                    mock.patch.object(
+                        runner,
+                        "_bound_child_signals",
+                        return_value=contextlib.nullcontext(),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_require_isolated_child_account",
+                        return_value=process_baseline,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "run_bounded",
+                        return_value=(
+                            child_returncode,
+                            b"bounded child stdout",
+                            bounded_stderr.encode("utf-8"),
+                        ),
+                    ) as run_bounded,
+                    mock.patch.object(
+                        runner,
+                        "_require_no_new_same_uid_processes",
+                        side_effect=closure_error,
+                    ),
+                    mock.patch.object(runner, "_cleanup_bound_tree") as cleanup_bound,
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = runner.main()
+
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(returncode, 1)
+                self.assertEqual(summary["returncode"], child_returncode)
+                self.assertEqual(summary["primary_status"], "closure-unproven")
+                self.assertEqual(summary["child_process_closure"], "unproven")
+                self.assertEqual(
+                    summary["primary_failure"]["error_kind"],
+                    "ChildProcessTreeClosureUnproven",
+                )
+                self.assertEqual(summary["cleanup_status"], "incomplete")
+                self.assertEqual(
+                    summary["retained_paths"],
+                    [str(install_container), str(runtime_parent)],
+                    summary["cleanup_failures"],
+                )
+                self.assertTrue(install_container.is_dir())
+                self.assertTrue(runtime_parent.is_dir())
+                self.assertIn(bounded_stderr, stderr.getvalue())
+                run_bounded.assert_called_once()
+                cleanup_bound.assert_not_called()
 
     def test_main_reports_primary_and_cleanup_failures_in_order(self) -> None:
         with owned_temporary_directory("readonly-main-failures-") as root:

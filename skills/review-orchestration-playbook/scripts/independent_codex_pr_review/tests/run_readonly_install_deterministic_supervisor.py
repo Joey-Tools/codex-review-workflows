@@ -184,9 +184,30 @@ class ChildSignalGuard:
 
 @dataclass
 class ChildProcessClosureProof:
+    # Protected property: same-UID process-tree closure. Only this proof may
+    # authorize destructive cleanup; a returned child outcome is not closure
+    # evidence and is deliberately carried by a separate caller-owned receipt.
     started: bool = False
     proven: bool = False
     destructive_cleanup_authorized: bool = True
+
+
+@dataclass
+class ChildRunOutcomeReceipt:
+    """Caller-owned receipt for a bounded child's returned process outcome.
+
+    The protected property is diagnostic stability of the return code and
+    byte-bounded output after ``run_bounded`` returns. Publication proves
+    neither same-UID process-tree closure nor permission to delete retained
+    directories; those responsibilities remain with ``ChildProcessClosureProof``.
+    """
+
+    completed: subprocess.CompletedProcess[str] | None = None
+
+    def publish(self, completed: subprocess.CompletedProcess[str]) -> None:
+        if self.completed is not None:
+            raise RuntimeError("bounded child outcome receipt was already published")
+        self.completed = completed
 
 
 def _child_process_closure_status(proof: ChildProcessClosureProof) -> str:
@@ -818,6 +839,7 @@ def _run_bounded_child(
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
     secondary_failures: list[SecondaryFailure] | None = None,
     closure_proof: ChildProcessClosureProof | None = None,
+    outcome_receipt: ChildRunOutcomeReceipt | None = None,
     require_isolated_account: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     diagnostics = secondary_failures if secondary_failures is not None else []
@@ -854,6 +876,25 @@ def _run_bounded_child(
             pending_error = error
         except BaseException as error:
             pending_error = error
+        completed: subprocess.CompletedProcess[str] | None = None
+        if result is not None:
+            try:
+                returncode, stdout, stderr = result
+                completed = subprocess.CompletedProcess(
+                    args=argv,
+                    returncode=returncode,
+                    stdout=stdout.decode("utf-8", "replace"),
+                    stderr=stderr.decode("utf-8", "replace"),
+                )
+                if outcome_receipt is not None:
+                    # Publish the diagnostic outcome before closure can fail. This
+                    # receipt is intentionally incapable of changing cleanup authority.
+                    outcome_receipt.publish(completed)
+            except BaseException as error:
+                # Receipt construction/publication is diagnostic custody, not
+                # closure. Preserve its failure without skipping the mandatory
+                # same-UID closure check below.
+                pending_error = error
         try:
             _require_no_new_same_uid_processes(baseline)
         except ChildProcessTreeClosureUnproven as error:
@@ -866,14 +907,8 @@ def _run_bounded_child(
         proof.destructive_cleanup_authorized = True
         if pending_error is not None:
             raise pending_error
-        assert result is not None
-        returncode, stdout, stderr = result
-    return subprocess.CompletedProcess(
-        args=argv,
-        returncode=returncode,
-        stdout=stdout.decode("utf-8", "replace"),
-        stderr=stderr.decode("utf-8", "replace"),
-    )
+        assert completed is not None
+    return completed
 
 
 def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
@@ -3095,6 +3130,7 @@ def main() -> int:
     cleanup_control_owner = _PrivateDirectoryCreationResultOwner()
     installed_root: pathlib.Path | None = None
     completed: subprocess.CompletedProcess[str] | None = None
+    child_outcome_receipt = ChildRunOutcomeReceipt()
     before: dict[str, TreeEntrySnapshot] | None = None
     after: dict[str, TreeEntrySnapshot] | None = None
     runtime_residue: tuple[str, ...] = ()
@@ -3167,6 +3203,7 @@ def main() -> int:
             environment=environment,
             secondary_failures=secondary_failures,
             closure_proof=closure_proof,
+            outcome_receipt=child_outcome_receipt,
             require_isolated_account=True,
         )
         child_process_closure = "proven"
@@ -3264,6 +3301,10 @@ def main() -> int:
             creation_cleanup_failures.append(creation_failure)
         deferred_control_flow_error = retained_control_flow_error or error
     finally:
+        if completed is None:
+            # Recover diagnostics published before a later closure failure.
+            # This does not alter closure proof or destructive-cleanup authority.
+            completed = child_outcome_receipt.completed
         try:
             install_container_binding = _claim_private_directory_creation_result(
                 install_container_owner,
