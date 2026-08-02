@@ -1849,7 +1849,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("_align_created_directory_group", readonly_install_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 839", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 840", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)

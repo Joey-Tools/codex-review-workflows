@@ -516,3 +516,21 @@ superseded_by:
   `printf '%s\n'` line after a fixed GitHub error annotation; the executable
   parser contract enables Bash 3.2 `xpg_echo` and proves a newline plus
   `::warning::...` payload remains data on that same diagnostic line.
+- Exact-head run `30736565697`, job `91466273221`, then proved the dedicated
+  account and outer census were working as designed: one raw test-fixture
+  `/usr/bin/git init` timed out after 10 seconds, the suite ended with one error,
+  and the supervisor found six same-UID `state=2` processes before retaining the
+  install/runtime roots and ephemeral account. The defect was the fixture's
+  leader-only `subprocess.run` timeout ownership, not the account verifier or
+  the supervisor's fail-closed retention. The fixture's Git and CLI subprocess
+  consumers now use the existing `gitraw.run_bounded` fresh session and process
+  group, fixed output caps, descendant termination, leader reap, and explicit
+  unproven-closure exception without increasing or retrying a deadline. A
+  timeout regression starts a real fake-Git leader and same-group descendant,
+  observes their live group binding, and requires leader, descendant, and group
+  absence after the typed timeout. The deterministic suite now selects 840
+  tests with identity digest
+  `6d40334cf49865b44402c49233a9f820b722eb9cb5f35de646f42194b6345fa0`.
+  After synchronizing the exact Trusted Mac source manifest, the final
+  host-level Python 3.13.12 deterministic gate passed 840/840 in 269.450
+  seconds. The earlier manifest-mismatch run is non-counting.

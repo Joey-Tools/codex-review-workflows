@@ -144,3 +144,20 @@ superseded_by:
   use `printf '%s\n'` on a separate ordinary line, and an executable Bash 3.2
   `xpg_echo` regression proves an observed newline followed by
   `::warning::...` cannot become a second workflow command.
+- The superseding account-verifier head reached the deterministic suite in PR
+  #86 run `30736565697`, job `91466273221`, but a fixture
+  `/usr/bin/git init` exceeded its existing 10-second deadline. The fixture used
+  `subprocess.run`, whose timeout path did not establish descendant process-tree
+  closure; the outer supervisor correctly reported six same-UID `state=2`
+  processes, retained both bound runtime leaves and the ephemeral account, and
+  failed closed. All five raw process launches in `test_git_checkout.py` now
+  share the production `gitraw.run_bounded` fresh-session process-group owner,
+  bounded output, timeout termination, leader reap, and typed
+  `GitProcessClosureUnproven` fallback. The 10- and 30-second command deadlines
+  remain unchanged. A real fake-Git timeout regression observes a live
+  same-group descendant and proves both processes and the group are gone before
+  the helper returns; the deterministic selection advances from 839 to 840 with
+  reviewed identity digest `6d40334cf49865b44402c49233a9f820b722eb9cb5f35de646f42194b6345fa0`.
+  After synchronizing the exact Trusted Mac source manifest, the final
+  host-level Python 3.13.12 deterministic gate passed 840/840 in 269.450
+  seconds. The earlier manifest-mismatch run is non-counting.

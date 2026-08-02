@@ -439,3 +439,14 @@ superseded_by:
   discovery, 2,833/2,833 tests in 941.501 seconds with six existing platform
   skips. Repository contracts passed 105/105 in 8.167 seconds after the journal
   identity update.
+- PR #86 run `30736565697`, job `91466273221`, exposed a raw fixture
+  `subprocess.run` timeout that left descendant closure unproven. All five raw
+  process launches in `test_git_checkout.py` now use the existing bounded
+  process-group owner without extending their deadlines. A real fake-Git
+  timeout regression proves leader, TERM-ignoring same-group descendant, and
+  process-group absence before return. After synchronizing the exact Trusted
+  Mac source manifest, the final host-level Python 3.13.12 deterministic gate
+  passed 840/840 in 269.450 seconds. The reviewed 840-test selected identity
+  has SHA-256
+  `6d40334cf49865b44402c49233a9f820b722eb9cb5f35de646f42194b6345fa0`.
+  The earlier manifest-mismatch run is non-counting.
