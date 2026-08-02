@@ -404,3 +404,21 @@ superseded_by:
   105/105 after the journal identity update. Both bounded source/bootstrap
   audits returned `No findings.`, and every applicable workflow, changed-file
   lint/format, source-only syntax, skill, journal, diff, and bytecode gate passed.
+- Hosted read-only execution exposed that the bounded copy receipt incorrectly
+  required a root-owned source and its nobody-owned execution copy to share one
+  owner. Source object identity and access policy now retain the original owner,
+  while the destination independently binds the exact execution UID and checks
+  an owner-projected expected manifest; a third owner remains rejected. The
+  corrected host-level deterministic gate passed 838/838 in 243.890 seconds on
+  Homebrew CPython 3.13.12. The reviewed 838-test selected identity has SHA-256
+  `76dedc279ab17a3033d3f87dcdbb1b6534bae68bde8837568e5bb913507e66f3`.
+- The hosted summary consumer now requires the source manifest to be an exact
+  lowercase 64-character SHA-256 and binds that value into the closed expected
+  summary before comparison. Raw runner output remains suppressed; only a
+  validated canonical JSON object reaches the workflow log, and invalid input
+  exposes bounded type/length diagnostics rather than attacker-controlled
+  bytes. The final precommit audit returned `No findings.` after both hosted
+  regressions were closed. Contracts passed 105/105, the affected read-only
+  runner passed 144/144 in 61.905 seconds, and the final host-level Python
+  3.13.12 full discovery passed 2,833/2,833 tests in 1008.735 seconds with six
+  platform skips.

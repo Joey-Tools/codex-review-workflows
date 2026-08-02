@@ -428,3 +428,23 @@ superseded_by:
   ruleset and surfaced 3,033 pre-existing all-rule baseline findings. It made no
   source change and is not counted as this diff's lint gate; the repository's
   installed Ruff 0.13.2 changed-file gate is the applicable passing evidence.
+- Canonical PR #86 hosted job `91434745317` then failed closed at
+  `install-copy`: the root-owned staged source receipt was incorrectly reused as
+  the expected owner of the nobody-owned installed tree. Cleanup completed, no
+  child started, and no path was retained. The replacement binds source
+  identity/access policy and destination execution ownership independently,
+  projects only the source UID when deriving the expected installed manifest,
+  and rejects any destination owner other than the frozen execution UID. The
+  affected read-only runner module passed 144/144, and the host-level
+  deterministic gate passed 838/838 in 243.890 seconds with selected-identity
+  SHA-256
+  `76dedc279ab17a3033d3f87dcdbb1b6534bae68bde8837568e5bb913507e66f3`.
+- The matching hosted summary contract now treats that manifest as a required
+  exact lowercase SHA-256 rather than a null field. The runner summary is never
+  printed before validation; successful validation emits a canonical JSON
+  object, while malformed input reports only bounded metadata and never echoes
+  injected content. Canonical and fixture workflows remain byte-identical. The
+  final read-only audit returned `No findings.`, contracts passed 105/105, the
+  affected runner passed 144/144 in 61.905 seconds, and the final host-level
+  Python 3.13.12 full discovery passed 2,833/2,833 in 1008.735 seconds with six
+  platform skips.

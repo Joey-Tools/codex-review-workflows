@@ -1819,8 +1819,10 @@ def _tree_property_unchanged(
     )
 
 
-def _source_snapshot_manifest_sha256(
+def _snapshot_manifest_sha256(
     snapshot: dict[str, TreeEntrySnapshot],
+    *,
+    owner_uid_override: int | None,
 ) -> str:
     records = []
     for path, entry in sorted(snapshot.items()):
@@ -1829,7 +1831,7 @@ def _source_snapshot_manifest_sha256(
                 path,
                 entry.kind,
                 entry.size,
-                entry.uid,
+                entry.uid if owner_uid_override is None else owner_uid_override,
                 entry.gid,
                 entry.mode,
                 entry.flags,
@@ -1842,6 +1844,23 @@ def _source_snapshot_manifest_sha256(
         "ascii"
     )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_snapshot_manifest_sha256(
+    snapshot: dict[str, TreeEntrySnapshot],
+) -> str:
+    return _snapshot_manifest_sha256(snapshot, owner_uid_override=None)
+
+
+def _destination_snapshot_manifest_sha256(
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...],
+    *,
+    destination_owner_uid: int,
+) -> str:
+    return _snapshot_manifest_sha256(
+        dict(source_entries),
+        owner_uid_override=destination_owner_uid,
+    )
 
 
 def _source_manifest_sha256(
@@ -2350,12 +2369,24 @@ def _copy_bound_xattrs(
             )
 
 
+def _require_copied_destination_owner(
+    destination_descriptor: int,
+    *,
+    destination_owner_uid: int,
+) -> os.stat_result:
+    destination_metadata = os.fstat(destination_descriptor)
+    if destination_metadata.st_uid != destination_owner_uid:
+        raise RuntimeError("bounded source copy changed the expected destination owner")
+    return destination_metadata
+
+
 def _apply_copied_entry_policy(
     source_descriptor: int,
     destination_descriptor: int,
     expected: TreeEntrySnapshot,
     *,
     scan: TreeSnapshotScan,
+    destination_owner_uid: int,
 ) -> None:
     source_policy = _stable_access_policy_snapshot(
         source_descriptor,
@@ -2365,15 +2396,20 @@ def _apply_copied_entry_policy(
         raise OSError(errno.ESTALE, "source access policy changed during bounded copy")
     if expected.acl_entries:
         raise RuntimeError("bounded source copy does not admit extended ACLs")
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
     _copy_bound_xattrs(
         source_descriptor,
         destination_descriptor,
         expected,
         scan=scan,
     )
-    destination_metadata = os.fstat(destination_descriptor)
-    if destination_metadata.st_uid != expected.uid:
-        raise RuntimeError("bounded source copy changed the expected owner")
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
     if destination_metadata.st_gid != expected.gid:
         os.fchown(destination_descriptor, -1, expected.gid)
     os.fchmod(destination_descriptor, expected.mode)
@@ -2381,6 +2417,10 @@ def _apply_copied_entry_policy(
         if not hasattr(os, "fchflags"):
             raise RuntimeError("bounded source copy cannot apply file flags")
         os.fchflags(destination_descriptor, expected.flags)
+    _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
 
 
 def _copy_bound_regular_file(
@@ -2389,6 +2429,7 @@ def _copy_bound_regular_file(
     expected: TreeEntrySnapshot,
     *,
     scan: TreeSnapshotScan,
+    destination_owner_uid: int,
 ) -> None:
     if expected.kind != "file" or expected.size is None or expected.digest is None:
         raise RuntimeError("bounded source file receipt is malformed")
@@ -2435,6 +2476,7 @@ def _copy_bound_regular_file(
             destination_descriptor,
             expected,
             scan=scan,
+            destination_owner_uid=destination_owner_uid,
         )
     finally:
         os.close(destination_descriptor)
@@ -2446,6 +2488,7 @@ def _copy_bound_source_tree(
     source_binding: SourceCheckoutBinding | SourceTreeBinding,
     *,
     budget: TreeSnapshotBudget,
+    destination_owner_uid: int,
 ) -> None:
     entries = dict(source_binding.source_entries)
     root_entry = entries.get(".")
@@ -2460,6 +2503,17 @@ def _copy_bound_source_tree(
                 errno.ESTALE, "bound source root identity changed before copy"
             )
         installed_root.mkdir(mode=0o700)
+        installed_root_descriptor = os.open(
+            installed_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            _require_copied_destination_owner(
+                installed_root_descriptor,
+                destination_owner_uid=destination_owner_uid,
+            )
+        finally:
+            os.close(installed_root_descriptor)
         directories = sorted(
             (
                 (path, entry)
@@ -2499,6 +2553,7 @@ def _copy_bound_source_tree(
                     installed_root / relative,
                     entry,
                     scan=scan,
+                    destination_owner_uid=destination_owner_uid,
                 )
         for relative, entry in sorted(
             ((".", root_entry), *directories),
@@ -2534,6 +2589,7 @@ def _copy_bound_source_tree(
                         destination_descriptor,
                         entry,
                         scan=scan,
+                        destination_owner_uid=destination_owner_uid,
                     )
                 finally:
                     os.close(destination_descriptor)
@@ -2548,11 +2604,13 @@ def _copy_bound_tree(
     *,
     budget: TreeSnapshotBudget,
 ) -> str:
+    destination_owner_uid = os.geteuid()
     _copy_bound_source_tree(
         source_root,
         installed_root,
         source_binding,
         budget=budget,
+        destination_owner_uid=destination_owner_uid,
     )
     installed_manifest = _source_manifest_sha256(
         installed_root,
@@ -2564,7 +2622,11 @@ def _copy_bound_tree(
     )
     if (
         source_binding_after != source_binding
-        or installed_manifest != source_binding.source_manifest_sha256
+        or installed_manifest
+        != _destination_snapshot_manifest_sha256(
+            source_binding.source_entries,
+            destination_owner_uid=destination_owner_uid,
+        )
     ):
         raise RuntimeError(
             "installed test input does not match the stable bounded source"
@@ -2581,11 +2643,13 @@ def _copy_bound_source(
     budget: TreeSnapshotBudget | None = None,
 ) -> str:
     active_budget = budget or TreeSnapshotBudget.create()
+    destination_owner_uid = os.geteuid()
     _copy_bound_source_tree(
         source_root,
         installed_root,
         source_binding,
         budget=active_budget,
+        destination_owner_uid=destination_owner_uid,
     )
     installed_manifest = _source_manifest_sha256(
         installed_root,
@@ -2599,7 +2663,11 @@ def _copy_bound_source(
     if (
         source_binding_after != source_binding
         or source_manifest_after != source_manifest_before
-        or installed_manifest != source_manifest_before
+        or installed_manifest
+        != _destination_snapshot_manifest_sha256(
+            source_binding.source_entries,
+            destination_owner_uid=destination_owner_uid,
+        )
     ):
         raise RuntimeError(
             "installed test input does not match the stable exact-head source"

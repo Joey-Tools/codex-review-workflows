@@ -1841,7 +1841,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("shutil.copytree(", readonly_install_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 837", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 838", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2310,6 +2310,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '"$isolated_python" -B -c \'import json, pathlib, sys;',
                     readonly_job,
                 )
+                self.assertNotIn('/bin/cat "$summary_file"', readonly_job)
                 self.assertEqual(
                     readonly_job.count('/bin/test -f "$summary_file"'),
                     2,
@@ -2355,6 +2356,13 @@ class RepositoryContractTest(unittest.TestCase):
                     'ValueError("duplicate JSON key")',
                     "set(payload) == set(expected)",
                     "type(payload[key]) is not type(value)",
+                    "type(source_manifest) is str",
+                    "len(source_manifest) == 64",
+                    'character in "0123456789abcdef"',
+                    'expected["source_manifest_sha256"] = source_manifest',
+                    '"source_manifest_sha256_contract"',
+                    "else print(json.dumps(payload, ensure_ascii=True, "
+                    'sort_keys=True, separators=(",", ":")))',
                 ):
                     self.assertIn(protection, readonly_job)
                 for evidence in (
@@ -2379,10 +2387,118 @@ class RepositoryContractTest(unittest.TestCase):
                     '"source_head_bound": False',
                     '"source_head_sha": None',
                     '"source_head_subtree_manifest_sha256": None',
-                    '"source_manifest_sha256": None',
                     '"timed_out": False',
                 ):
                     self.assertIn(evidence, readonly_job)
+                parser_source = (
+                    "import json, pathlib, sys;"
+                    + readonly_job.split(
+                        isolated_parser,
+                        1,
+                    )[1].split("' \\\n", 1)[0]
+                )
+                expected_source = parser_source.split("expected = ", 1)[1].split(
+                    "; source_manifest =",
+                    1,
+                )[0]
+                valid_payload = ast.literal_eval(expected_source)
+                valid_payload["source_manifest_sha256"] = "a" * 64
+                manifest_cases = (
+                    ("valid", valid_payload, 0),
+                    (
+                        "missing",
+                        {
+                            key: value
+                            for key, value in valid_payload.items()
+                            if key != "source_manifest_sha256"
+                        },
+                        1,
+                    ),
+                    ("null", valid_payload | {"source_manifest_sha256": None}, 1),
+                    ("short", valid_payload | {"source_manifest_sha256": "a" * 63}, 1),
+                    (
+                        "uppercase",
+                        valid_payload | {"source_manifest_sha256": "A" * 64},
+                        1,
+                    ),
+                    (
+                        "nonhex",
+                        valid_payload | {"source_manifest_sha256": "g" * 64},
+                        1,
+                    ),
+                    (
+                        "sentinel",
+                        valid_payload
+                        | {"source_manifest_sha256": "LEAK_SENTINEL_DO_NOT_PRINT"},
+                        1,
+                    ),
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    summary = pathlib.Path(temporary) / "summary.json"
+                    for label, payload, expected_status in manifest_cases:
+                        with self.subTest(profile=profile, manifest=label):
+                            summary.write_text(
+                                json.dumps(
+                                    payload,
+                                    ensure_ascii=True,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                                + "\n",
+                                encoding="ascii",
+                            )
+                            completed = subprocess.run(
+                                (
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    "-S",
+                                    "-c",
+                                    parser_source,
+                                    str(summary),
+                                ),
+                                cwd=temporary,
+                                env={
+                                    "LANG": "C",
+                                    "LC_ALL": "C",
+                                    "PATH": "/usr/bin:/bin",
+                                },
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=5,
+                                check=False,
+                            )
+                            self.assertEqual(
+                                completed.returncode,
+                                expected_status,
+                                completed.stderr.decode("utf-8", "replace"),
+                            )
+                            if expected_status:
+                                self.assertEqual(completed.stdout, b"")
+                                self.assertIn(
+                                    b"source_manifest_sha256",
+                                    completed.stderr,
+                                )
+                            else:
+                                self.assertEqual(
+                                    completed.stdout,
+                                    (
+                                        json.dumps(
+                                            payload,
+                                            ensure_ascii=True,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        )
+                                        + "\n"
+                                    ).encode("ascii"),
+                                )
+                                self.assertEqual(completed.stderr, b"")
+                            if label == "sentinel":
+                                self.assertNotIn(
+                                    b"LEAK_SENTINEL_DO_NOT_PRINT",
+                                    completed.stdout + completed.stderr,
+                                )
                 self.assertGreaterEqual(
                     readonly_job.count("retained at $isolated_root"), 3
                 )

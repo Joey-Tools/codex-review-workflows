@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from unittest import mock
 
 from review_supervisor import recovery_cleanup
@@ -8514,6 +8514,84 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 "original\n",
             )
 
+    def test_hosted_root_source_copy_binds_nobody_destination_owner(self) -> None:
+        source_entry = runner.TreeEntrySnapshot(
+            kind="file",
+            size=0,
+            device=1,
+            inode=2,
+            generation=0,
+            uid=0,
+            gid=0,
+            mode=0o444,
+            flags=0,
+            link_count=1,
+            digest=hashlib.sha256(b"").hexdigest(),
+            xattrs=(),
+            acl_entries=(),
+        )
+        nobody_uid = 65_534
+        expected_destination_manifest = runner._destination_snapshot_manifest_sha256(
+            (("payload.py", source_entry),),
+            destination_owner_uid=nobody_uid,
+        )
+        self.assertEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {"payload.py": replace(source_entry, uid=nobody_uid)}
+            ),
+        )
+        self.assertNotEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {"payload.py": replace(source_entry, uid=501)}
+            ),
+        )
+
+        nobody_metadata = mock.Mock(st_uid=nobody_uid, st_gid=0)
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(runner.os, "fstat", return_value=nobody_metadata),
+            mock.patch.object(runner.os, "fchown") as chown,
+            mock.patch.object(runner.os, "fchmod") as chmod,
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+            )
+        chown.assert_not_called()
+        chmod.assert_called_once_with(11, source_entry.mode)
+
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(
+                runner.os,
+                "fstat",
+                return_value=mock.Mock(st_uid=501, st_gid=0),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected destination owner"),
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+            )
+
     def test_binding_rejects_missing_invalid_and_mismatched_expected_head(
         self,
     ) -> None:
@@ -8843,12 +8921,14 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     root / "insufficient",
                     binding,
                     budget=self._snapshot_budget(observations=4),
+                    destination_owner_uid=os.geteuid(),
                 )
             runner._copy_bound_source_tree(
                 source,
                 root / "complete",
                 binding,
                 budget=self._snapshot_budget(observations=5),
+                destination_owner_uid=os.geteuid(),
             )
             self.assertEqual(
                 (root / "complete" / "nested" / "payload.py").read_text(
@@ -8921,12 +9001,14 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     source_receipt: runner.SourceCheckoutBinding,
                     *,
                     budget: runner.TreeSnapshotBudget,
+                    destination_owner_uid: int,
                 ) -> None:
                     real_copy(
                         source_path,
                         destination,
                         source_receipt,
                         budget=budget,
+                        destination_owner_uid=destination_owner_uid,
                     )
                     for index in range(64):
                         (source_path / f"extra-{index:02d}.ignored").write_bytes(b"")
@@ -8960,12 +9042,14 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     source_receipt: runner.SourceCheckoutBinding,
                     *,
                     budget: runner.TreeSnapshotBudget,
+                    destination_owner_uid: int,
                 ) -> None:
                     real_copy(
                         source_path,
                         destination,
                         source_receipt,
                         budget=budget,
+                        destination_owner_uid=destination_owner_uid,
                     )
                     (pathlib.Path(source_path) / "payload.txt").write_text(
                         "mutated during copy\n",

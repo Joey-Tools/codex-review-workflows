@@ -38,7 +38,9 @@ superseded_by:
 - Hosted read-only execution enters the source-only gate through bounded stdin
   under `-I -B -S`; the candidate path is never the Python entrypoint. Its
   root-owned staged source uses a bounded descriptor manifest and copy rather
-  than an unbounded recursive copy.
+  than an unbounded recursive copy. The source receipt retains root ownership
+  and source access policy, while the installed tree independently requires the
+  exact nobody execution UID and an owner-projected expected manifest.
 
 ## Next Steps
 
@@ -78,3 +80,18 @@ superseded_by:
   moving the outer gate to stdin. Private overlay synchronization and release
   are owned by the separate BL workstream; this canonical follow-up does not
   modify or trigger private PR #139 or #140.
+- Canonical PR #86 job `91434745317` proved the first bounded-copy revision
+  incorrectly compared the nobody-owned destination with the root source UID.
+  It failed before child launch with complete cleanup and no retained paths.
+  The follow-up keeps the two ownership policies separate and adds a synthetic
+  root-to-nobody acceptance plus wrong-destination-owner rejection regression.
+- A final hosted-consumer audit also found that the new nonempty source manifest
+  conflicted with the previous null-only parser contract and that printing the
+  raw summary before validation could expose attacker-controlled bytes. The
+  canonical workflow and both fixtures now accept only an exact lowercase
+  SHA-256, bind it into the closed expected summary, suppress raw output, and
+  print canonical JSON only after validation. The executable contract rejects
+  missing, null, short, uppercase, non-hex, and sentinel-bearing inputs without
+  echoing the sentinel. The final audit returned `No findings.`; contracts
+  passed 105/105 and full Python 3.13.12 discovery passed 2,833/2,833 in
+  1008.735 seconds with six platform skips.
