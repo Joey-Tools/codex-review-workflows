@@ -77,6 +77,7 @@ from .support import (
     _private_runtime_parent,
     _PrivateDirectoryCreationResultOwner,
     _PrivateDirectoryCreationRetentionRequired,
+    _runtime_parent_creation_allows_sticky_writable_ancestors,
     _settle_directory_parent_binding_result_preserving_trigger,
 )
 from .readonly_no_child_contract import SUCCESS_RECORD as NO_CHILD_SUCCESS_RECORD
@@ -90,6 +91,37 @@ READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _create_bound_owned_private_runtime_directory(
+    prefix: str,
+    *,
+    result_owner: _PrivateDirectoryCreationResultOwner,
+) -> _DirectoryParentBinding:
+    """Preserve runner-local parent and creation injection seams."""
+
+    explicit_parent = os.environ.get(EXPLICIT_RUNTIME_PARENT_ENV)
+    parent = _private_runtime_parent()
+    allow_sticky_writable_ancestors = (
+        _runtime_parent_creation_allows_sticky_writable_ancestors(
+            explicit_parent,
+            parent,
+        )
+    )
+    if allow_sticky_writable_ancestors:
+        return _create_bound_owned_private_directory(
+            parent,
+            prefix,
+            result_owner=result_owner,
+            allow_sticky_writable_ancestors=True,
+        )
+    return _create_bound_owned_private_directory(
+        parent,
+        prefix,
+        result_owner=result_owner,
+    )
+
+
 NO_CHILD_SUITE_CODE = (
     "import errno,os,pathlib,runpy,sys,tempfile\n"
     "if not sys.flags.isolated or not sys.flags.no_site:\n"
@@ -5065,8 +5097,7 @@ def _run_main(
         destination_owner_uid = install_container_binding.policy.uid
         destination_group_gid = install_container_binding.policy.gid
         stage = "runtime-parent"
-        runtime_parent_binding = _create_bound_owned_private_directory(
-            _private_runtime_parent(),
+        runtime_parent_binding = _create_bound_owned_private_runtime_directory(
             ".codex-review-readonly-runtime-",
             result_owner=runtime_parent_owner,
         )
@@ -5311,10 +5342,11 @@ def _run_main(
                     runtime_parent or install_container or READONLY_INSTALL_PARENT
                 )
                 try:
-                    cleanup_control_binding = _create_bound_owned_private_directory(
-                        _private_runtime_parent(),
-                        ".codex-review-readonly-cleanup-",
-                        result_owner=cleanup_control_owner,
+                    cleanup_control_binding = (
+                        _create_bound_owned_private_runtime_directory(
+                            ".codex-review-readonly-cleanup-",
+                            result_owner=cleanup_control_owner,
+                        )
                     )
                     cleanup_control_binding = cleanup_control_owner.transfer(
                         cleanup_control_binding

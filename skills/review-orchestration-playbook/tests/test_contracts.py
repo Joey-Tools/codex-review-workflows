@@ -1786,6 +1786,9 @@ class RepositoryContractTest(unittest.TestCase):
         trusted_mac_gate = (
             SCRIPTS / "independent_codex_pr_review/tests/trusted_mac_gate.py"
         ).read_text(encoding="utf-8")
+        readonly_support = (
+            SCRIPTS / "independent_codex_pr_review/tests/support.py"
+        ).read_text(encoding="utf-8")
         readonly_no_child_contract = (
             SCRIPTS / "independent_codex_pr_review/tests/readonly_no_child_contract.py"
         ).read_text(encoding="utf-8")
@@ -1835,8 +1838,217 @@ class RepositoryContractTest(unittest.TestCase):
             "hashlib.sha256(payload).hexdigest() != expected.sha256",
             "budget.consume_source(opened.st_size, probe_bytes=1)",
             "opened.st_nlink",
+            "def _validate_bound_git_toolchain(",
+            'HOSTED_GIT_BINDING_PROFILE = "hosted-git-toolchain-v2-external-tmp-custody"',
+            'TRUSTED_MAC_GIT_BINDING_PROFILE = "trusted-mac-git-toolchain-tmp-custody-v3"',
+            '"schema": "trusted-git-tmpdir-custody-v1"',
+            '"physical_chain": _directory_chain_records(closed)',
+            "GIT_TMPDIR_CUSTODY_DEPTH_LIMIT = 64",
+            "def _open_directory_chain(",
+            "dir_fd=descriptors[-1]",
+            "metadata.st_uid not in {0, os.getuid()}",
+            "metadata.st_uid == 0 and mode & stat.S_ISVTX",
+            "PERMITTED_GIT_DIRECTORY_ANCESTOR_XATTRS",
+            'b"com.apple.rootless"',
+            "_validate_trusted_git_tmpdir(",
+            "_measure_hosted_git_toolchain(arguments)",
+            "def _raise_preserving_secondary_failures(",
+            'setattr(primary, "codex_secondary_failures", secondary_failures)',
+            'context="trusted Git post-measurement custody also failed"',
+            'b"hosted-git-toolchain-v2\\0"',
+            '"schema": "hosted-git-toolchain-receipt-v2"',
+            'b"trusted-mac-bound-git-profile-v3\\0"',
+            '"CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR"',
+            '"CODEX_REVIEW_BOUND_GIT_EXECUTABLE"',
+            '"CODEX_REVIEW_BOUND_GIT_EXEC_PATH"',
+            '"CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256"',
+            '"CODEX_REVIEW_BOUND_GIT_TMPDIR"',
+            'environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"]',
         ):
             self.assertIn(contract, trusted_mac_gate)
+        for support_contract in (
+            "allow_sticky_writable_ancestors: bool",
+            "self.allow_sticky_writable_ancestors",
+            "allow_sticky_writable_ancestors=True",
+            "_require_owned_private_parent_policy(policy, path=canonical)",
+        ):
+            self.assertIn(support_contract, readonly_support)
+        support_tree = ast.parse(readonly_support)
+        readonly_runner_tree = ast.parse(readonly_install_runner)
+
+        def module_function(
+            tree: ast.Module,
+            name: str,
+        ) -> ast.FunctionDef:
+            matches = [
+                statement
+                for statement in tree.body
+                if isinstance(statement, ast.FunctionDef)
+                and statement.name == name
+            ]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
+            return [
+                candidate
+                for candidate in ast.walk(node)
+                if isinstance(candidate, ast.Call)
+                and isinstance(candidate.func, ast.Name)
+                and candidate.func.id == name
+            ]
+
+        private_creation = module_function(
+            support_tree,
+            "_create_bound_owned_private_directory",
+        )
+        private_creation_defaults = {
+            argument.arg: default
+            for argument, default in zip(
+                private_creation.args.kwonlyargs,
+                private_creation.args.kw_defaults,
+            )
+        }
+        sticky_default = private_creation_defaults[
+            "allow_sticky_writable_ancestors"
+        ]
+        self.assertIsInstance(sticky_default, ast.Constant)
+        self.assertIsNone(sticky_default.value)
+        for propagation_target in (
+            "_open_directory_parent",
+            "open_absolute_directory_chain",
+            "_DirectoryParentBinding",
+        ):
+            propagation_calls = calls_named(private_creation, propagation_target)
+            self.assertEqual(len(propagation_calls), 1)
+            sticky_keywords = [
+                keyword
+                for keyword in propagation_calls[0].keywords
+                if keyword.arg == "allow_sticky_writable_ancestors"
+            ]
+            self.assertEqual(len(sticky_keywords), 1)
+            self.assertIsInstance(sticky_keywords[0].value, ast.Name)
+            self.assertEqual(
+                sticky_keywords[0].value.id,
+                "allow_sticky_writable_ancestors",
+            )
+
+        runtime_creation_wrapper = module_function(
+            support_tree,
+            "_create_bound_owned_private_runtime_directory",
+        )
+        wrapped_creation_calls = calls_named(
+            runtime_creation_wrapper,
+            "_create_bound_owned_private_directory",
+        )
+        self.assertEqual(len(wrapped_creation_calls), 2)
+        wrapped_sticky_keywords = [
+            keyword
+            for call in wrapped_creation_calls
+            for keyword in call.keywords
+            if keyword.arg == "allow_sticky_writable_ancestors"
+        ]
+        self.assertEqual(len(wrapped_sticky_keywords), 1)
+        self.assertIsInstance(wrapped_sticky_keywords[0].value, ast.Constant)
+        self.assertIs(wrapped_sticky_keywords[0].value.value, True)
+        self.assertEqual(
+            len(
+                calls_named(
+                    runtime_creation_wrapper,
+                    "_runtime_parent_creation_allows_sticky_writable_ancestors",
+                )
+            ),
+            1,
+        )
+        initialization = module_function(
+            support_tree,
+            "_initialize_process_runtime_root_core",
+        )
+        self.assertEqual(
+            len(
+                calls_named(
+                    initialization,
+                    "_create_bound_owned_private_runtime_directory",
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                calls_named(
+                    readonly_runner_tree,
+                    "_create_bound_owned_private_runtime_directory",
+                )
+            ),
+            2,
+        )
+        runner_runtime_creation_wrapper = module_function(
+            readonly_runner_tree,
+            "_create_bound_owned_private_runtime_directory",
+        )
+        self.assertEqual(
+            len(
+                calls_named(
+                    runner_runtime_creation_wrapper,
+                    "_private_runtime_parent",
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                calls_named(
+                    runner_runtime_creation_wrapper,
+                    "_runtime_parent_creation_allows_sticky_writable_ancestors",
+                )
+            ),
+            1,
+        )
+        runner_wrapped_creation_calls = calls_named(
+            runner_runtime_creation_wrapper,
+            "_create_bound_owned_private_directory",
+        )
+        self.assertEqual(len(runner_wrapped_creation_calls), 2)
+        runner_wrapped_sticky_keywords = [
+            keyword
+            for call in runner_wrapped_creation_calls
+            for keyword in call.keywords
+            if keyword.arg == "allow_sticky_writable_ancestors"
+        ]
+        self.assertEqual(len(runner_wrapped_sticky_keywords), 1)
+        self.assertIsInstance(
+            runner_wrapped_sticky_keywords[0].value,
+            ast.Constant,
+        )
+        self.assertIs(runner_wrapped_sticky_keywords[0].value.value, True)
+        for removed_probe_contract in (
+            "version_sha256",
+            "--build-options",
+            "def _git_version_receipt(",
+            "GIT_VERSION_PROBE_",
+            "proc_listpgrppids",
+            "subprocess.Popen(",
+            "signal.pthread_sigmask(",
+        ):
+            self.assertNotIn(removed_probe_contract, trusted_mac_gate)
+        tmpdir_binding_source = trusted_mac_gate.split("def _tmpdir_stat_binding(", 1)[
+            1
+        ].split("def _require_candidate_readonly_physical_chain(", 1)[0]
+        for benign_child_churn_signal in (
+            "st_nlink",
+            "st_size",
+            "st_mtime",
+            "st_ctime",
+        ):
+            self.assertNotIn(benign_child_churn_signal, tmpdir_binding_source)
+        self.assertEqual(
+            trusted_mac_gate.count("current /= component"),
+            1,
+        )
+        self.assertEqual(
+            trusted_mac_gate.count("resolved_metadata = resolved.lstat()"),
+            1,
+        )
         self.assertNotIn("sys.path.insert", trusted_mac_gate)
         for contract in (
             "TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT",
@@ -1854,6 +2066,15 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(contract, readonly_install_runner)
         self.assertNotIn("shutil.copytree(", readonly_install_runner)
         self.assertNotIn("_align_created_directory_group", readonly_install_runner)
+        for regression_contract in (
+            "synthetic post-measurement custody drift",
+            "ambient repository fallback ran",
+            "unsafe writable ancestor",
+            "retained-policy-parent",
+            'self.assertNotIn("version_sha256", parsed_receipt)',
+            'exec_path / "added-helper"',
+        ):
+            self.assertIn(regression_contract, readonly_install_tests)
         for contract in (
             "runner.selected_git_executable()",
             "runner.bound_git_environment(",
@@ -1995,7 +2216,9 @@ class RepositoryContractTest(unittest.TestCase):
             'TOOL_ROOT="$REPO_ROOT/$TOOL_REL"',
             '[[ "$CONTROL_ROOT" != /* || "$SOURCE_OBJECTS" != /* ]]',
             '[[ "$CONTROL_ROOT" == *:* || "$SOURCE_OBJECTS" == *:* ]]',
-            "(( (8#$CONTROL_PARENT_MODE & 0022) != 0 ))",
+            '[[ "$CONTROL_PARENT_UID" != "$CONTROL_UID" ]]',
+            '[[ "$CONTROL_PARENT_MODE" != "700" ]]',
+            '[[ "$CONTROL_PARENT_FLAGS" != "0" ]]',
             "(( (8#$SOURCE_OBJECTS_MODE & 0022) != 0 ))",
             '[[ -e "$CONTROL_ROOT" || -L "$CONTROL_ROOT" ]]',
             'GIT_ALTERNATE_OBJECT_DIRECTORIES="$SOURCE_OBJECTS"',
@@ -2015,9 +2238,35 @@ class RepositoryContractTest(unittest.TestCase):
             '"$SOURCE_OBJECTS/pack/"*.promisor',
             "TRUSTED_GIT_BINDING",
             "TRUSTED_GIT_SHA256",
+            "TRUSTED_GIT_DEVELOPER_DIR_BINDING",
             "TRUSTED_GIT_EXEC_PATH_BINDING",
+            "CONTROL_TMP_BINDING",
+            "measure_trusted_git_directory_custody()",
+            "CONTROL_PARENT_CUSTODY_RECEIPT",
+            "TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT",
+            "--trusted-git-tmpdir-receipt",
+            '"schema":"trusted-git-tmpdir-custody-v1"',
+            "measure_trusted_git_toolchain()",
+            "TRUSTED_GIT_TOOLCHAIN_RECEIPT_SHA256",
+            '"schema":"hosted-git-toolchain-receipt-v2"',
             "verify_trusted_git_bootstrap_custody 'before gate execution'",
             "verify_trusted_git_bootstrap_custody 'after gate execution'",
+            "verify_trusted_git_bootstrap_structure "
+            "\\\n  'before directory receipt issuance'",
+            'if ! CONTROL_PARENT_CUSTODY_RECEIPT="$(',
+            'if ! TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(',
+            'if ! trusted_git cat-file blob "$GATE_SPEC" \\',
+            "trusted live gate failed",
+            "trusted readonly gate failed",
+            "root-owned sticky directory",
+            "com.apple.rootless",
+            "independent canonical `CONTROL_PARENT` and TMPDIR full-chain",
+            "canonical v2 toolchain receipt",
+            "fresh, non-executing measurement",
+            "version/capability evidence",
+            "The Python receipt and remeasurement logic never executes "
+            "the measured Git",
+            "The surrounding operator may use that already bound executable",
             "/usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin",
             'GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"',
             'SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"',
@@ -2032,9 +2281,16 @@ class RepositoryContractTest(unittest.TestCase):
             '"$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \\',
             '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" live',
             "no-group-write/no-other-write",
-            "interpreter and Git executable/exec-path absolute paths and digests",
+            "interpreter, Developer directory, Git executable/exec-path absolute",
             "HEAD_SHA=<full-head-sha>",
-            '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"',
+            '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA" \\',
+            '"$CONTROL_TMP" "$TRUSTED_GIT_DEVELOPER_DIR" "$TRUSTED_GIT" \\',
+            '"$TRUSTED_GIT_SHA256" "$TRUSTED_GIT_EXEC_PATH" \\',
+            '"$TRUSTED_GIT_TOOLCHAIN_RECEIPT" \\',
+            '"$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"',
+            "This candidate gate and its receipts are implementation/self-test "
+            "evidence only; formal named-review lanes remain controlled by an "
+            "independently trusted prior bundle.",
             "source_head_bound == true",
             "source_head_subtree_manifest_sha256",
             "production no-child proof",
@@ -2045,8 +2301,16 @@ class RepositoryContractTest(unittest.TestCase):
                 "verify_trusted_git_bootstrap_custody 'after gate execution'"
             ),
             pr_readiness.index(
-                '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"'
+                '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA" \\'
             ),
+        )
+        self.assertNotIn(
+            '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"\n',
+            pr_readiness,
+        )
+        self.assertNotIn(
+            '"$TRUSTED_GIT_EXEC_PATH" \\\n      "$TRUSTED_GIT_TOOLCHAIN_RECEIPT"\n',
+            pr_readiness,
         )
         for unsafe_gate_check in (
             '[[ "$GATE_SIZE" =~ ^[[:digit:]]+$ ]] &&',
@@ -2068,11 +2332,108 @@ class RepositoryContractTest(unittest.TestCase):
             "identity(opened) != identity(closed)",
             "hashlib.sha256(data).hexdigest() != expected_digest",
             "written = os.write(1, view)",
-            "stream_manifest_gate | /usr/bin/env -i",
+            "stream_manifest_gate \\\n    | /usr/bin/env -i",
+            "TRUSTED_GIT_CONTROL_PARENT=/absolute/path/to/owner-private-control-parent",
+            'TRUSTED_GIT_CONTROL_PARENT_CUSTODY_RECEIPT="$(',
+            'TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(',
+            'TRUSTED_GIT_TOOLCHAIN_RECEIPT="$(',
+            "measure_trusted_git_directory_custody()",
+            "verify_trusted_git_directory_custody()",
+            "if ! verify_trusted_git_directory_custody; then",
+            "if ! stream_manifest_gate",
+            "if ! PYTHONDONTWRITEBYTECODE=1",
+            "--hosted-git-receipt",
+            "--trusted-git-tmpdir-receipt",
+            '"$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA" \\',
+            '"$TRUSTED_GIT_TMPDIR" "$TRUSTED_GIT_DEVELOPER_DIR" "$TRUSTED_GIT" \\',
+            '"$TRUSTED_GIT_TOOLCHAIN_RECEIPT" \\',
+            '"$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"',
+            "This candidate gate and its receipts are implementation/self-test "
+            "evidence only; formal named-review lanes remain controlled by an "
+            "independently trusted prior bundle.",
             "descriptor 只读取一次",
+            "完整 root-to-target chain",
+            "com.apple.rootless",
+            "Readonly v3 entry",
+            "非执行方式重新读取 physical Git bytes",
+            "canonical v2 toolchain receipt",
+            "并列的外部 receipt",
+            "receipt issuance 与 child validation 均不执行 Git",
+            "CODEX_REVIEW_TEST_RUNTIME_PARENT",
         ):
             self.assertIn(manifest_stream_contract, installed_readme)
+
+        def guarded_block(source: str, marker: str, occurrence: int = 0) -> str:
+            offset = 0
+            start = -1
+            for _ in range(occurrence + 1):
+                start = source.index(marker, offset)
+                offset = start + len(marker)
+            end = source.index("\nfi", start) + len("\nfi")
+            return source[start:end]
+
+        guarded_failures = (
+            (pr_readiness, 'if ! CONTROL_PARENT_CUSTODY_RECEIPT="$(', 0),
+            (pr_readiness, 'if ! TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(', 0),
+            (
+                pr_readiness,
+                "if ! verify_trusted_git_bootstrap_custody "
+                "'before gate execution'; then",
+                0,
+            ),
+            (pr_readiness, 'if ! trusted_git cat-file blob "$GATE_SPEC" \\', 0),
+            (pr_readiness, 'if ! trusted_git cat-file blob "$GATE_SPEC" \\', 1),
+            (
+                pr_readiness,
+                "if ! verify_trusted_git_bootstrap_custody "
+                "'after gate execution'; then",
+                0,
+            ),
+            (
+                installed_readme,
+                'if ! TRUSTED_GIT_CONTROL_PARENT_CUSTODY_RECEIPT="$(',
+                0,
+            ),
+            (
+                installed_readme,
+                'if ! TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(',
+                0,
+            ),
+            (installed_readme, "if ! stream_manifest_gate \\", 0),
+            (installed_readme, "if ! stream_manifest_gate \\", 1),
+            (
+                installed_readme,
+                'if ! PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B \\',
+                1,
+            ),
+        )
+        for source, marker, occurrence in guarded_failures:
+            guard = guarded_block(source, marker, occurrence)
+            injected = subprocess.run(
+                [
+                    "/bin/zsh",
+                    "-c",
+                    "set -o pipefail\n" + guard + "\nprintf guarded-tail-reached\n",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(injected.returncode, 1, marker)
+            self.assertNotIn(b"guarded-tail-reached", injected.stdout, marker)
+
         self.assertNotIn('/bin/cat "$GATE_SOURCE"', installed_readme)
+        self.assertNotIn(
+            '"$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"\n',
+            installed_readme,
+        )
+        self.assertNotIn(
+            '"$TRUSTED_GIT_EXEC_PATH" \\\n  "$TRUSTED_GIT_TOOLCHAIN_RECEIPT"\n',
+            installed_readme,
+        )
 
         stream_start = '"$TRUSTED_PYTHON" -I -B -S -c \'\n'
         stream_end = '\n\' "$GATE_SOURCE" "$GATE_SOURCE_SHA256"'
@@ -3054,7 +3415,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "measure_git_toolchain_for_review_account() {",
                     "--hosted-git-receipt",
                     '"$direct_git_exec_path" "$git_toolchain_measurement"',
-                    '"schema":"hosted-git-toolchain-receipt-v1"',
+                    '"schema":"hosted-git-toolchain-receipt-v2"',
                     "retained until runner disposal",
                     '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"',
                     '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"',

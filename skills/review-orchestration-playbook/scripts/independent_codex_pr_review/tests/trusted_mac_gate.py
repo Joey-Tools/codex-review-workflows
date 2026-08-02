@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import importlib.abc
 import importlib.util
@@ -8,9 +10,7 @@ import os
 import pathlib
 import pwd
 import runpy
-import signal
 import stat
-import subprocess
 import sys
 from dataclasses import dataclass
 from types import CodeType, ModuleType
@@ -28,6 +28,14 @@ GIT_TOOLCHAIN_FILE_LIMIT_BYTES = 16 * 1024 * 1024
 GIT_TOOLCHAIN_TOTAL_LIMIT_BYTES = 64 * 1024 * 1024
 GIT_TOOLCHAIN_DEPTH_LIMIT = 8
 GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES = 4096
+GIT_TMPDIR_CUSTODY_DEPTH_LIMIT = 64
+GIT_TMPDIR_CUSTODY_RECEIPT_LIMIT_BYTES = 16384
+HOSTED_GIT_BINDING_PROFILE = "hosted-git-toolchain-v2-external-tmp-custody"
+TRUSTED_MAC_GIT_BINDING_PROFILE = "trusted-mac-git-toolchain-tmp-custody-v3"
+PERMITTED_GIT_DIRECTORY_XATTRS = frozenset({b"com.apple.provenance"})
+PERMITTED_GIT_DIRECTORY_ANCESTOR_XATTRS = frozenset(
+    {b"com.apple.provenance", b"com.apple.rootless"}
+)
 SOURCE_ROOTS = ("review_supervisor", "tests")
 PROHIBITED_SUFFIXES = (".pyc", ".pyo", ".so", ".dylib", ".dll", ".pyd")
 MODE_MODULES = {
@@ -58,6 +66,337 @@ def _require_sha256(value: str, label: str) -> None:
         character not in "0123456789abcdef" for character in value
     ):
         raise RuntimeError(f"{label} is not one lowercase SHA-256")
+
+
+def _raise_preserving_secondary_failures(
+    primary: BaseException,
+    secondary_failures: tuple[BaseException, ...],
+    *,
+    context: str,
+) -> None:
+    for secondary in secondary_failures:
+        add_note = getattr(primary, "add_note", None)
+        if add_note is not None:
+            add_note(f"{context}: {type(secondary).__name__}: {secondary}")
+    try:
+        setattr(primary, "codex_secondary_failures", secondary_failures)
+    except BaseException:
+        pass
+    raise primary.with_traceback(primary.__traceback__)
+
+
+def _explicit_absolute_path(value: str, label: str) -> pathlib.Path:
+    if (
+        not value
+        or "\0" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or not value.startswith("/")
+        or value.startswith("//")
+        or value != os.path.normpath(value)
+    ):
+        raise RuntimeError(f"{label} is not one explicit normalized absolute path")
+    return pathlib.Path(value)
+
+
+def _close_directory_chain(descriptors: list[int]) -> tuple[OSError, ...]:
+    failures = []
+    while descriptors:
+        try:
+            os.close(descriptors.pop())
+        except OSError as error:
+            failures.append(error)
+    return tuple(failures)
+
+
+def _raise_directory_chain_cleanup_failures(
+    failures: tuple[OSError, ...],
+) -> None:
+    if not failures:
+        return
+    active_error = sys.exception()
+    if active_error is None:
+        _raise_preserving_secondary_failures(
+            failures[0],
+            tuple(failures[1:]),
+            context="trusted Git custody directory descriptor cleanup also failed",
+        )
+    _raise_preserving_secondary_failures(
+        active_error,
+        failures,
+        context="trusted Git custody directory cleanup also failed",
+    )
+
+
+def _open_directory_chain(
+    path: pathlib.Path,
+) -> tuple[list[int], tuple[os.stat_result, ...]]:
+    components = path.parts[1:]
+    if len(components) + 1 > GIT_TMPDIR_CUSTODY_DEPTH_LIMIT:
+        raise RuntimeError("trusted Git custody directory exceeds its depth bound")
+    descriptors: list[int] = []
+    opened_records: list[os.stat_result] = []
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        for index, component in enumerate((path.anchor, *components)):
+            if index == 0:
+                named = pathlib.Path(component).lstat()
+                descriptor = os.open(component, flags)
+            else:
+                named = os.stat(
+                    component,
+                    dir_fd=descriptors[-1],
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(
+                    component,
+                    flags,
+                    dir_fd=descriptors[-1],
+                )
+            descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            if _tmpdir_stat_binding(named) != _tmpdir_stat_binding(opened):
+                raise RuntimeError(
+                    "trusted Git custody directory chain changed while opening"
+                )
+            opened_records.append(opened)
+        return descriptors, tuple(opened_records)
+    except OSError as error:
+        if isinstance(error, FileNotFoundError):
+            message = "trusted Git custody directory chain is missing"
+        elif isinstance(error, PermissionError):
+            message = "trusted Git custody directory chain is unreadable"
+        else:
+            message = "trusted Git custody directory chain revalidation failed"
+        primary = RuntimeError(message)
+        cleanup_failures = _close_directory_chain(descriptors)
+        if cleanup_failures:
+            primary.__cause__ = error
+            _raise_preserving_secondary_failures(
+                primary,
+                cleanup_failures,
+                context="trusted Git custody directory cleanup also failed",
+            )
+        raise primary from error
+    except BaseException:
+        cleanup_failures = _close_directory_chain(descriptors)
+        _raise_directory_chain_cleanup_failures(cleanup_failures)
+        raise
+
+
+def _macos_acl_entry_count(descriptor: int) -> int:
+    if sys.platform != "darwin":
+        raise OSError(errno.ENOTSUP, "extended ACL inspection requires macOS")
+    libc = ctypes.CDLL(None, use_errno=True)
+    acl_get_fd_np = libc.acl_get_fd_np
+    acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    acl_get_fd_np.restype = ctypes.c_void_p
+    acl_free = libc.acl_free
+    acl_free.argtypes = [ctypes.c_void_p]
+    acl_free.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(descriptor, 0x00000100)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT:
+            return 0
+        raise OSError(error_number or errno.EIO, "cannot inspect extended ACL")
+    try:
+        return 1
+    finally:
+        if acl_free(acl) != 0:
+            raise OSError(ctypes.get_errno() or errno.EIO, "cannot release ACL state")
+
+
+def _macos_fd_xattr_names(descriptor: int) -> tuple[bytes, ...]:
+    if sys.platform != "darwin":
+        raise OSError(errno.ENOTSUP, "extended attribute inspection requires macOS")
+    libc = ctypes.CDLL(None, use_errno=True)
+    flistxattr = libc.flistxattr
+    flistxattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    flistxattr.restype = ctypes.c_ssize_t
+
+    ctypes.set_errno(0)
+    size = flistxattr(descriptor, None, 0, 0)
+    if size < 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot size extended attribute names",
+        )
+    if size > 4096:
+        raise RuntimeError("trusted Git TMPDIR xattrs exceed their byte bound")
+    if size == 0:
+        return ()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    value = flistxattr(descriptor, buffer, size, 0)
+    if value < 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot read extended attribute names",
+        )
+    if value != size:
+        raise OSError(errno.ESTALE, "extended attributes changed during inspection")
+    raw = bytes(buffer.raw[:size])
+    if not raw.endswith(b"\0"):
+        raise RuntimeError("trusted Git TMPDIR xattr names are malformed")
+    raw_names = raw[:-1].split(b"\0")
+    if any(not name for name in raw_names) or len(raw_names) > 128:
+        raise RuntimeError("trusted Git TMPDIR xattrs exceed their count bound")
+    names = tuple(sorted(raw_names))
+    if len(set(names)) != len(names):
+        raise RuntimeError("trusted Git TMPDIR xattr names contain duplicates")
+    return names
+
+
+def _tmpdir_stat_binding(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Bind directory object identity and access policy, not child-entry churn."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+    )
+
+
+def _validate_directory_chain_access_policy(
+    descriptors: list[int],
+    records: tuple[os.stat_result, ...],
+) -> None:
+    last_index = len(records) - 1
+    for index, (descriptor, metadata) in enumerate(zip(descriptors, records)):
+        mode = stat.S_IMODE(metadata.st_mode)
+        flags = getattr(metadata, "st_flags", 0)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(
+                "trusted Git custody directory chain contains a non-directory"
+            )
+        if index == last_index:
+            if metadata.st_uid != os.getuid() or mode != 0o700 or flags != 0:
+                raise RuntimeError(
+                    "trusted Git custody directory target has an unsafe access policy"
+                )
+            permitted_xattrs = PERMITTED_GIT_DIRECTORY_XATTRS
+        else:
+            if metadata.st_uid not in {0, os.getuid()}:
+                raise RuntimeError(
+                    "trusted Git custody directory has an untrusted ancestor owner"
+                )
+            if mode & 0o022 and not (metadata.st_uid == 0 and mode & stat.S_ISVTX):
+                raise RuntimeError(
+                    "trusted Git custody directory has an unsafe writable ancestor"
+                )
+            permitted_xattrs = PERMITTED_GIT_DIRECTORY_ANCESTOR_XATTRS
+        acl_count = _macos_acl_entry_count(descriptor)
+        xattrs = _macos_fd_xattr_names(descriptor)
+        if acl_count != 0 or not set(xattrs) <= permitted_xattrs:
+            raise RuntimeError(
+                "trusted Git custody directory chain has unsafe ACL or xattr metadata"
+            )
+
+
+def _directory_chain_records(
+    metadata_records: tuple[os.stat_result, ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "device": metadata.st_dev,
+            "file_type": stat.S_IFMT(metadata.st_mode),
+            "flags": getattr(metadata, "st_flags", 0),
+            "group_gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "owner_uid": metadata.st_uid,
+        }
+        for metadata in metadata_records
+    ]
+
+
+def _trusted_git_tmpdir_record(path: pathlib.Path) -> dict[str, object]:
+    descriptors: list[int] = []
+    revalidation_descriptors: list[int] = []
+    try:
+        descriptors, opened = _open_directory_chain(path)
+        _validate_directory_chain_access_policy(descriptors, opened)
+        middle = tuple(os.fstat(descriptor) for descriptor in descriptors)
+        _validate_directory_chain_access_policy(descriptors, middle)
+        closed = tuple(os.fstat(descriptor) for descriptor in descriptors)
+        if tuple(map(_tmpdir_stat_binding, opened)) != tuple(
+            map(_tmpdir_stat_binding, middle)
+        ) or tuple(map(_tmpdir_stat_binding, middle)) != tuple(
+            map(_tmpdir_stat_binding, closed)
+        ):
+            raise RuntimeError(
+                "trusted Git custody directory chain changed during inspection"
+            )
+        revalidation_descriptors, revalidated = _open_directory_chain(path)
+        _validate_directory_chain_access_policy(
+            revalidation_descriptors,
+            revalidated,
+        )
+        revalidated_closed = tuple(
+            os.fstat(descriptor) for descriptor in revalidation_descriptors
+        )
+        if tuple(map(_tmpdir_stat_binding, closed)) != tuple(
+            map(_tmpdir_stat_binding, revalidated_closed)
+        ):
+            raise RuntimeError(
+                "trusted Git custody directory physical chain does not match"
+            )
+        return {
+            "device": closed[-1].st_dev,
+            "group_gid": closed[-1].st_gid,
+            "inode": closed[-1].st_ino,
+            "owner_uid": closed[-1].st_uid,
+            "path": str(path),
+            "physical_chain": _directory_chain_records(closed),
+            "schema": "trusted-git-tmpdir-custody-v1",
+        }
+    finally:
+        cleanup_failures = _close_directory_chain(
+            revalidation_descriptors
+        ) + _close_directory_chain(descriptors)
+        _raise_directory_chain_cleanup_failures(cleanup_failures)
+
+
+def _trusted_git_tmpdir_receipt_payload(arguments: list[str]) -> bytes:
+    if len(arguments) != 1:
+        raise RuntimeError("trusted Git TMPDIR receipt requires one directory")
+    path = _explicit_absolute_path(arguments[0], "trusted Git TMPDIR")
+    record = _trusted_git_tmpdir_record(path)
+    payload = (
+        json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    if len(payload) > GIT_TMPDIR_CUSTODY_RECEIPT_LIMIT_BYTES:
+        raise RuntimeError("trusted Git TMPDIR receipt exceeds its closed output bound")
+    return payload
+
+
+def _validate_trusted_git_tmpdir(path: pathlib.Path, receipt: str) -> bytes:
+    try:
+        encoded = receipt.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise RuntimeError("trusted Git TMPDIR receipt is not ASCII") from error
+    if not encoded or len(encoded) >= GIT_TMPDIR_CUSTODY_RECEIPT_LIMIT_BYTES:
+        raise RuntimeError("trusted Git TMPDIR receipt exceeds its closed input bound")
+    if b"\n" in encoded or b"\r" in encoded or b"\0" in encoded:
+        raise RuntimeError("trusted Git TMPDIR receipt is not one physical record")
+    observed = _trusted_git_tmpdir_receipt_payload([str(path)])
+    if observed != encoded + b"\n":
+        raise RuntimeError("trusted Git TMPDIR does not match its custody receipt")
+    return observed
 
 
 def _require_candidate_readonly_physical_chain(path: pathlib.Path) -> None:
@@ -252,10 +591,9 @@ def _git_toolchain_receipt(
     git_sha256: str,
     git_exec_path: pathlib.Path,
     git_exec_path_receipt: str,
-    git_version_receipt: str,
 ) -> str:
     return hashlib.sha256(
-        b"hosted-git-toolchain-v1\0"
+        b"hosted-git-toolchain-v2\0"
         + os.fsencode(str(developer_dir))
         + b"\0"
         + os.fsencode(str(git_executable))
@@ -266,77 +604,23 @@ def _git_toolchain_receipt(
         + b"\0"
         + git_exec_path_receipt.encode("ascii")
         + b"\0"
-        + git_version_receipt.encode("ascii")
-        + b"\0"
     ).hexdigest()
 
 
-def _git_version_receipt(
-    *,
-    developer_dir: pathlib.Path,
-    git_executable: pathlib.Path,
-    git_exec_path: pathlib.Path,
-    temporary_directory: pathlib.Path,
-) -> str:
-    process = subprocess.Popen(
-        (str(git_executable), "--version", "--build-options"),
-        cwd=temporary_directory,
-        env={
-            "DEVELOPER_DIR": str(developer_dir),
-            "GIT_EXEC_PATH": str(git_exec_path),
-            "HOME": "/var/empty",
-            "LANG": "C",
-            "LC_ALL": "C",
-            "PATH": "/usr/bin:/bin",
-            "TMPDIR": str(temporary_directory),
-        },
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        start_new_session=True,
-    )
-    try:
-        try:
-            stdout, stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=2)
-            raise RuntimeError("hosted Git version probe timed out") from None
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=2)
-    if (
-        process.returncode != 0
-        or stderr
-        or not stdout.endswith(b"\n")
-        or len(stdout) > 64 * 1024
-    ):
-        raise RuntimeError("hosted Git version probe is not an exact bounded record")
-    return hashlib.sha256(stdout).hexdigest()
-
-
-def _measure_hosted_git_toolchain(
-    arguments: list[str],
-    *,
-    version_receipt: str | None = None,
-) -> tuple[str, str, str]:
-    if len(arguments) != 5:
+def _measure_hosted_git_toolchain(arguments: list[str]) -> tuple[str, str]:
+    if len(arguments) != 4:
         raise RuntimeError(
-            "hosted Git receipt requires Developer, executable, digest, exec-path, and TMPDIR"
+            "hosted Git receipt requires Developer, executable, digest, and exec-path"
         )
     developer_dir = pathlib.Path(arguments[0])
     git_executable = pathlib.Path(arguments[1])
     expected_git_sha256 = arguments[2]
     git_exec_path = pathlib.Path(arguments[3])
-    temporary_directory = pathlib.Path(arguments[4])
     _require_sha256(expected_git_sha256, "hosted Git executable digest")
     for path in (
         developer_dir,
         git_executable,
         git_exec_path,
-        temporary_directory,
     ):
         if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
             raise RuntimeError("hosted Git receipt path is not absolute and normalized")
@@ -368,44 +652,27 @@ def _measure_hosted_git_toolchain(
         git_exec_path,
         developer_dir=developer_dir,
     )
-    if version_receipt is None:
-        version_receipt = _git_version_receipt(
-            developer_dir=developer_dir,
-            git_executable=git_executable,
-            git_exec_path=git_exec_path,
-            temporary_directory=temporary_directory,
-        )
-    else:
-        _require_sha256(version_receipt, "hosted Git version receipt")
     toolchain_receipt = _git_toolchain_receipt(
         developer_dir=developer_dir,
         git_executable=git_executable,
         git_sha256=expected_git_sha256,
         git_exec_path=git_exec_path,
         git_exec_path_receipt=exec_path_receipt,
-        git_version_receipt=version_receipt,
     )
-    return exec_path_receipt, version_receipt, toolchain_receipt
+    return exec_path_receipt, toolchain_receipt
 
 
-def _hosted_git_receipt_payload(
-    arguments: list[str],
-    *,
-    version_receipt: str | None = None,
-) -> bytes:
-    exec_path_receipt, version_receipt, toolchain_receipt = (
-        _measure_hosted_git_toolchain(arguments, version_receipt=version_receipt)
-    )
-    developer_dir, git_executable, git_sha256, git_exec_path, _ = arguments
+def _hosted_git_receipt_payload(arguments: list[str]) -> bytes:
+    exec_path_receipt, toolchain_receipt = _measure_hosted_git_toolchain(arguments)
+    developer_dir, git_executable, git_sha256, git_exec_path = arguments
     record = {
         "developer_dir": developer_dir,
         "exec_path": git_exec_path,
         "exec_path_sha256": exec_path_receipt,
         "executable": git_executable,
         "executable_sha256": git_sha256,
-        "schema": "hosted-git-toolchain-receipt-v1",
+        "schema": "hosted-git-toolchain-receipt-v2",
         "toolchain_sha256": toolchain_receipt,
-        "version_sha256": version_receipt,
     }
     payload = (
         json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -437,13 +704,12 @@ def _parse_hosted_git_receipt(value: str) -> dict[str, str]:
         "executable_sha256",
         "schema",
         "toolchain_sha256",
-        "version_sha256",
     }
     if (
         not isinstance(decoded, dict)
         or set(decoded) != expected_keys
         or any(not isinstance(item, str) for item in decoded.values())
-        or decoded["schema"] != "hosted-git-toolchain-receipt-v1"
+        or decoded["schema"] != "hosted-git-toolchain-receipt-v2"
     ):
         raise RuntimeError("hosted Git receipt does not match its closed schema")
     record = {key: decoded[key] for key in sorted(expected_keys)}
@@ -451,7 +717,6 @@ def _parse_hosted_git_receipt(value: str) -> dict[str, str]:
         "exec_path_sha256",
         "executable_sha256",
         "toolchain_sha256",
-        "version_sha256",
     ):
         _require_sha256(record[key], f"hosted Git receipt {key}")
     canonical = json.dumps(
@@ -463,6 +728,106 @@ def _parse_hosted_git_receipt(value: str) -> dict[str, str]:
     if canonical != value:
         raise RuntimeError("hosted Git receipt is not canonically encoded")
     return record
+
+
+def _validate_bound_git_toolchain(
+    arguments: list[str],
+    *,
+    profile: str,
+) -> dict[str, str]:
+    if profile == HOSTED_GIT_BINDING_PROFILE:
+        expected_argument_count = 6
+    elif profile == TRUSTED_MAC_GIT_BINDING_PROFILE:
+        expected_argument_count = 7
+    else:
+        raise RuntimeError("trusted Git binding profile is unsupported")
+    if len(arguments) != expected_argument_count:
+        raise RuntimeError(
+            "trusted Git binding requires TMPDIR, Developer, executable, "
+            "digest, exec-path, toolchain receipt, and profile custody"
+        )
+    (
+        runtime_parent_raw,
+        developer_dir_raw,
+        git_executable_raw,
+        expected_git_sha256,
+        git_exec_path_raw,
+        expected_toolchain_receipt_json,
+    ) = arguments[:6]
+    _require_sha256(expected_git_sha256, "hosted Git executable digest")
+    runtime_parent = pathlib.Path(runtime_parent_raw)
+    developer_dir = pathlib.Path(developer_dir_raw)
+    git_executable = pathlib.Path(git_executable_raw)
+    git_exec_path = pathlib.Path(git_exec_path_raw)
+    for path in (runtime_parent, developer_dir, git_executable, git_exec_path):
+        if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
+            raise RuntimeError("bound Git path is not absolute and normalized")
+    expected_receipt = _parse_hosted_git_receipt(expected_toolchain_receipt_json)
+    if (
+        expected_receipt["developer_dir"] != str(developer_dir)
+        or expected_receipt["executable"] != str(git_executable)
+        or expected_receipt["executable_sha256"] != expected_git_sha256
+        or expected_receipt["exec_path"] != str(git_exec_path)
+    ):
+        raise RuntimeError("hosted Git receipt does not bind the supplied toolchain")
+    observed_tmpdir_receipt = None
+    if profile == TRUSTED_MAC_GIT_BINDING_PROFILE:
+        observed_tmpdir_receipt = _validate_trusted_git_tmpdir(
+            runtime_parent,
+            arguments[6],
+        )
+    observed_receipt = b""
+    primary_failure: BaseException | None = None
+    try:
+        observed_receipt = _hosted_git_receipt_payload(
+            [
+                str(developer_dir),
+                str(git_executable),
+                expected_git_sha256,
+                str(git_exec_path),
+            ]
+        )
+        expected_payload = (expected_toolchain_receipt_json + "\n").encode("ascii")
+        if observed_receipt != expected_payload:
+            raise RuntimeError("hosted Git toolchain does not match its receipt")
+    except BaseException as error:
+        primary_failure = error
+    if profile == TRUSTED_MAC_GIT_BINDING_PROFILE:
+        custody_failure: BaseException | None = None
+        try:
+            _validate_trusted_git_tmpdir(
+                runtime_parent,
+                arguments[6],
+            )
+        except BaseException as error:
+            custody_failure = error
+        if primary_failure is not None and custody_failure is not None:
+            _raise_preserving_secondary_failures(
+                primary_failure,
+                (custody_failure,),
+                context="trusted Git post-measurement custody also failed",
+            )
+        if primary_failure is not None:
+            raise primary_failure.with_traceback(primary_failure.__traceback__)
+        if custody_failure is not None:
+            raise custody_failure.with_traceback(custody_failure.__traceback__)
+        assert observed_tmpdir_receipt is not None
+        observed_toolchain_receipt = hashlib.sha256(
+            b"trusted-mac-bound-git-profile-v3\0"
+            + hashlib.sha256(observed_receipt).digest()
+            + hashlib.sha256(observed_tmpdir_receipt).digest()
+        ).hexdigest()
+    else:
+        if primary_failure is not None:
+            raise primary_failure.with_traceback(primary_failure.__traceback__)
+        observed_toolchain_receipt = hashlib.sha256(observed_receipt).hexdigest()
+    return {
+        "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR": str(developer_dir),
+        "CODEX_REVIEW_BOUND_GIT_EXECUTABLE": str(git_executable),
+        "CODEX_REVIEW_BOUND_GIT_EXEC_PATH": str(git_exec_path),
+        "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256": observed_toolchain_receipt,
+        "CODEX_REVIEW_BOUND_GIT_TMPDIR": str(runtime_parent),
+    }
 
 
 def _validate_hosted_git_toolchain(arguments: list[str]) -> dict[str, str]:
@@ -483,11 +848,7 @@ def _validate_hosted_git_toolchain(arguments: list[str]) -> dict[str, str]:
         expected_gid,
         expected_account_receipt,
     ) = arguments
-    for value, label in (
-        (expected_git_sha256, "hosted Git executable digest"),
-        (expected_account_receipt, "hosted review-account receipt"),
-    ):
-        _require_sha256(value, label)
+    _require_sha256(expected_account_receipt, "hosted review-account receipt")
     account = pwd.getpwuid(os.getuid())
     if (
         account.pw_name != expected_account_name
@@ -495,51 +856,31 @@ def _validate_hosted_git_toolchain(arguments: list[str]) -> dict[str, str]:
         or str(account.pw_gid) != expected_gid
     ):
         raise RuntimeError("hosted review-account receipt does not match this process")
-    runtime_parent = pathlib.Path(runtime_parent_raw)
     home = pathlib.Path(home_raw)
-    developer_dir = pathlib.Path(developer_dir_raw)
-    git_executable = pathlib.Path(git_executable_raw)
-    git_exec_path = pathlib.Path(git_exec_path_raw)
-    for path in (runtime_parent, home, developer_dir, git_executable, git_exec_path):
-        if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
-            raise RuntimeError(
-                "hosted readonly gate path is not absolute and normalized"
-            )
-    expected_receipt = _parse_hosted_git_receipt(expected_toolchain_receipt_json)
-    if (
-        expected_receipt["developer_dir"] != str(developer_dir)
-        or expected_receipt["executable"] != str(git_executable)
-        or expected_receipt["executable_sha256"] != expected_git_sha256
-        or expected_receipt["exec_path"] != str(git_exec_path)
-    ):
-        raise RuntimeError("hosted Git receipt does not bind the supplied toolchain")
-    observed_receipt = _hosted_git_receipt_payload(
+    if not home.is_absolute() or home != pathlib.Path(os.path.abspath(home)):
+        raise RuntimeError("hosted readonly gate path is not absolute and normalized")
+    environment = _validate_bound_git_toolchain(
         [
-            str(developer_dir),
-            str(git_executable),
+            runtime_parent_raw,
+            developer_dir_raw,
+            git_executable_raw,
             expected_git_sha256,
-            str(git_exec_path),
-            str(runtime_parent),
+            git_exec_path_raw,
+            expected_toolchain_receipt_json,
         ],
-        version_receipt=expected_receipt["version_sha256"],
+        profile=HOSTED_GIT_BINDING_PROFILE,
     )
-    expected_payload = (expected_toolchain_receipt_json + "\n").encode("ascii")
-    if observed_receipt != expected_payload:
-        raise RuntimeError("hosted Git toolchain does not match its receipt")
-    observed_toolchain_receipt = hashlib.sha256(observed_receipt).hexdigest()
-    return {
-        "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR": str(developer_dir),
-        "CODEX_REVIEW_BOUND_GIT_EXECUTABLE": str(git_executable),
-        "CODEX_REVIEW_BOUND_GIT_EXEC_PATH": str(git_exec_path),
-        "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256": observed_toolchain_receipt,
-        "CODEX_REVIEW_BOUND_GIT_TMPDIR": str(runtime_parent),
-        "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256": expected_account_receipt,
-        "HOME": str(home),
-        "TMPDIR": str(runtime_parent),
-    }
+    environment.update(
+        {
+            "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256": expected_account_receipt,
+            "HOME": str(home),
+            "TMPDIR": environment["CODEX_REVIEW_BOUND_GIT_TMPDIR"],
+        }
+    )
+    return environment
 
 
-def _hosted_git_receipt_main() -> int:
+def _require_isolated_receipt_entry(label: str) -> None:
     if (
         not sys.flags.isolated
         or not sys.flags.ignore_environment
@@ -550,8 +891,19 @@ def _hosted_git_receipt_main() -> int:
         or __file__ != "<stdin>"
         or sys.argv[0] != "-"
     ):
-        raise RuntimeError("hosted Git receipt requires isolated trusted stdin")
+        raise RuntimeError(f"{label} requires isolated trusted stdin")
+
+
+def _hosted_git_receipt_main() -> int:
+    _require_isolated_receipt_entry("hosted Git receipt")
     sys.stdout.buffer.write(_hosted_git_receipt_payload(sys.argv[2:]))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def _trusted_git_tmpdir_receipt_main() -> int:
+    _require_isolated_receipt_entry("trusted Git TMPDIR receipt")
+    sys.stdout.buffer.write(_trusted_git_tmpdir_receipt_payload(sys.argv[2:]))
     sys.stdout.buffer.flush()
     return 0
 
@@ -1050,12 +1402,20 @@ def _configure_environment(mode: str, arguments: list[str]) -> str:
         environment["CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"] = "1"
     elif mode == "readonly":
         if (
-            len(arguments) != 1
+            not arguments
             or len(arguments[0]) != 40
             or any(character not in "0123456789abcdef" for character in arguments[0])
         ):
             raise RuntimeError("trusted readonly gate requires one full SHA-1")
         environment["CODEX_REVIEW_EXPECTED_HEAD_SHA"] = arguments[0]
+        trusted_mac_environment = _validate_bound_git_toolchain(
+            arguments[1:],
+            profile=TRUSTED_MAC_GIT_BINDING_PROFILE,
+        )
+        environment.update(trusted_mac_environment)
+        environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"] = trusted_mac_environment[
+            "CODEX_REVIEW_BOUND_GIT_TMPDIR"
+        ]
     elif mode == "hosted-readonly":
         hosted_environment = _validate_hosted_git_toolchain(arguments)
         environment.update(hosted_environment)
@@ -1072,6 +1432,8 @@ def _configure_environment(mode: str, arguments: list[str]) -> str:
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--hosted-git-receipt":
         return _hosted_git_receipt_main()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--trusted-git-tmpdir-receipt":
+        return _trusted_git_tmpdir_receipt_main()
     if (
         not sys.flags.isolated
         or not sys.flags.ignore_environment

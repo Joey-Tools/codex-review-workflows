@@ -1407,7 +1407,7 @@ jobs:
                   "$isolated_python" -I -B -S - \
                     --hosted-git-receipt \
                     "$DEVELOPER_DIR" "$direct_git" "$direct_git_digest" \
-                    "$direct_git_exec_path" "$isolated_root/payload/runtime"
+                    "$direct_git_exec_path"
           }
           git_toolchain_measurement=""
           git_toolchain_measurement_status=0
@@ -1426,7 +1426,7 @@ jobs:
               || git_toolchain_measurement_bytes > 4096 )) \
             || [[ "$git_toolchain_measurement" == *$'\n'* ]] \
             || [[ "$git_toolchain_measurement" != \
-              *'"schema":"hosted-git-toolchain-receipt-v1"'* ]]; then
+              *'"schema":"hosted-git-toolchain-receipt-v2"'* ]]; then
             /usr/bin/printf '%s\n' "::error::Pinned Xcode Git review-account receipt is malformed"
             exit 1
           fi

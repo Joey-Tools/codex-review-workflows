@@ -14,8 +14,10 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from dataclasses import asdict, replace
 from unittest import mock
 
@@ -25,6 +27,22 @@ from review_supervisor.process import process_start_identity
 from . import run_readonly_install_deterministic_supervisor as runner
 from . import support
 from .support import owned_temporary_directory
+
+
+@contextlib.contextmanager
+def _mock_ambient_runtime_parent(parent: pathlib.Path) -> Iterator[None]:
+    """Patch the synthetic selector without inheriting an outer explicit path."""
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=False),
+        mock.patch.object(
+            runner,
+            "_private_runtime_parent",
+            return_value=parent,
+        ),
+    ):
+        os.environ.pop(runner.EXPLICIT_RUNTIME_PARENT_ENV, None)
+        yield
 
 
 def _captured_gate_source_for_nested_tests(path: pathlib.Path) -> str:
@@ -145,7 +163,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             *,
             result_owner: support._PrivateDirectoryCreationResultOwner,
             require_owned_private_parent: bool = True,
+            allow_sticky_writable_ancestors: bool | None = None,
         ) -> support._DirectoryParentBinding:
+            if allow_sticky_writable_ancestors is not None:
+                raise AssertionError(
+                    "synthetic ambient runtime creation received explicit policy"
+                )
             parent_result_owner = support._DirectoryParentBindingResultOwner()
             binding = ReadOnlyInstallRunnerTests._open_parent_binding(
                 parent_result_owner,
@@ -1315,19 +1338,80 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertEqual(len(rejection_errors), 1)
                 self.assertIsInstance(rejection_errors[0], OSError)
                 self.assertEqual(rejection_errors[0].errno, errno.EPERM)
-                with (
-                    mock.patch.dict(
-                        os.environ,
-                        {support._EXPLICIT_RUNTIME_PARENT_ENV: str(parent)},
+                self.assertEqual(
+                    support._validated_private_runtime_parent(
+                        str(parent),
+                        allow_sticky_writable_ancestors=True,
                     ),
-                    self.assertRaisesRegex(
-                        RuntimeError,
-                        r"errno=1: .*group- or world-writable",
-                    ),
+                    parent.resolve(strict=True),
+                )
+                ancestor.chmod(0o777)
+                self.assertIsNone(
+                    support._validated_private_runtime_parent(
+                        str(parent),
+                        allow_sticky_writable_ancestors=True,
+                    )
+                )
+                ancestor.chmod(0o1777)
+                with mock.patch.dict(
+                    os.environ,
+                    {support._EXPLICIT_RUNTIME_PARENT_ENV: str(parent)},
                 ):
-                    support._private_runtime_parent()
+                    self.assertEqual(support._private_runtime_parent(), parent)
             finally:
                 ancestor.chmod(0o700)
+
+        sticky_root = pathlib.Path(
+            "/private/tmp" if pathlib.Path("/private/tmp").is_dir() else "/tmp"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="codex-explicit-runtime-parent-",
+            dir=sticky_root,
+        ) as raw_runtime_parent:
+            runtime_parent = pathlib.Path(raw_runtime_parent)
+            runtime_parent.chmod(0o700)
+            strict_owner = support._PrivateDirectoryCreationResultOwner()
+            with self.assertRaisesRegex(
+                OSError,
+                "group- or world-writable",
+            ):
+                support._create_bound_owned_private_directory(
+                    runtime_parent,
+                    ".strict-runtime-",
+                    result_owner=strict_owner,
+                )
+            self.assertIsNone(strict_owner.binding)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {support._EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent)},
+                ),
+                mock.patch.object(support, "_RUNTIME_ROOT_STATE", None),
+            ):
+                with owned_temporary_directory("sticky-runtime-child-") as child:
+                    state = support._RUNTIME_ROOT_STATE
+                    self.assertIsNotNone(state)
+                    assert state is not None
+                    self.assertTrue(state.binding.allow_sticky_writable_ancestors)
+                    self.assertTrue(child.is_dir())
+                    mismatch_owner = support._PrivateDirectoryCreationResultOwner()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "held temporary-directory parent is inconsistent",
+                    ):
+                        support._create_bound_owned_private_directory(
+                            state.path,
+                            ".mismatched-policy-",
+                            result_owner=mismatch_owner,
+                            held_parent_binding=state.binding,
+                            allow_sticky_writable_ancestors=False,
+                        )
+                    self.assertIsNone(mismatch_owner.binding)
+                runtime_root = state.path
+                support._cleanup_process_runtime_root(state)
+                self.assertFalse(runtime_root.exists())
+                self.assertIsNone(support._RUNTIME_ROOT_STATE)
 
     def test_runtime_parent_revalidation_rejects_writable_ancestor(self) -> None:
         with owned_temporary_directory("runtime-parent-drift-") as root:
@@ -2328,11 +2412,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                             "READONLY_INSTALL_PARENT",
                             sticky_parent,
                         ),
-                        mock.patch.object(
-                            runner,
-                            "_private_runtime_parent",
-                            return_value=runtime_home,
-                        ),
+                        _mock_ambient_runtime_parent(runtime_home),
                         mock.patch.object(
                             runner,
                             "_create_bound_owned_private_directory",
@@ -2503,11 +2583,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -2599,11 +2675,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2702,11 +2774,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2888,11 +2956,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2975,12 +3039,15 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 *,
                 require_owned_private_parent: bool,
                 result_owner: support._DirectoryParentBindingResultOwner,
+                allow_sticky_writable_ancestors: bool | None = None,
             ) -> support._DirectoryParentBinding:
                 nonlocal opened_binding
+                self.assertIs(allow_sticky_writable_ancestors, False)
                 opened_binding = real_open(
                     raw_path,
                     require_owned_private_parent=require_owned_private_parent,
                     result_owner=result_owner,
+                    allow_sticky_writable_ancestors=(allow_sticky_writable_ancestors),
                 )
                 raise open_failure
 
@@ -7511,11 +7578,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -7727,11 +7790,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -7914,11 +7973,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -8030,11 +8085,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -8147,11 +8198,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -8248,11 +8295,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -8549,7 +8592,12 @@ class _RunnerFilesystemTestCase(unittest.TestCase):
             *,
             result_owner: support._PrivateDirectoryCreationResultOwner,
             require_owned_private_parent: bool = True,
+            allow_sticky_writable_ancestors: bool | None = None,
         ) -> support._DirectoryParentBinding:
+            if allow_sticky_writable_ancestors is not None:
+                raise AssertionError(
+                    "synthetic ambient runtime creation received explicit policy"
+                )
             parent_result_owner = support._DirectoryParentBindingResultOwner()
             binding = cls._open_parent_binding(
                 parent_result_owner,
@@ -9488,10 +9536,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 "PYTHONPATH": str(hostile),
                 "PYTHONUSERBASE": str(hostile),
             }
-            cases = (
-                ("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),
-                ("readonly", ("readonly", "a" * 40), runner.EXPECTED_HEAD_ENV),
-            )
+            cases = (("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),)
             for label, arguments, expected_key in cases:
                 with self.subTest(mode=label):
                     completed = self._run_gate(
@@ -9539,17 +9584,23 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             "exec_path_sha256": "a" * 64,
             "executable": paths["executable"],
             "executable_sha256": "b" * 64,
-            "schema": "hosted-git-toolchain-receipt-v1",
+            "schema": "hosted-git-toolchain-receipt-v2",
             "toolchain_sha256": "c" * 64,
-            "version_sha256": "d" * 64,
         }
-        receipt = json.dumps(
-            record,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        receipt_payload = (receipt + "\n").encode("ascii")
+
+        def toolchain_payload(**overrides: str) -> bytes:
+            return (
+                json.dumps(
+                    {**record, **overrides},
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+
+        receipt_payload = toolchain_payload()
+        receipt = receipt_payload[:-1].decode("ascii")
         arguments = [
             paths["runtime"],
             paths["home"],
@@ -9590,17 +9641,496 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 paths["executable"],
                 "b" * 64,
                 paths["exec_path"],
-                paths["runtime"],
-            ],
-            version_receipt="d" * 64,
+            ]
         )
+
+        bound_environment = {
+            key: value
+            for key, value in environment.items()
+            if key.startswith("CODEX_REVIEW_BOUND_GIT_")
+        }
+        binding_arguments = [
+            paths["runtime"],
+            paths["developer"],
+            paths["executable"],
+            "b" * 64,
+            paths["exec_path"],
+            receipt,
+            "tmpdir-custody-receipt",
+        ]
+        tmpdir_custody_payload = b"canonical-tmpdir-custody-receipt\n"
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                return_value=receipt_payload,
+            ),
+            mock.patch.object(
+                gate,
+                "_validate_trusted_git_tmpdir",
+                return_value=tmpdir_custody_payload,
+            ) as validate_tmpdir,
+        ):
+            local_environment = gate._validate_bound_git_toolchain(
+                binding_arguments,
+                profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+            )
+        expected_tmpdir_validation = mock.call(
+            pathlib.Path(paths["runtime"]),
+            "tmpdir-custody-receipt",
+        )
+        self.assertEqual(
+            validate_tmpdir.call_args_list,
+            [expected_tmpdir_validation, expected_tmpdir_validation],
+        )
+        self.assertEqual(
+            local_environment["CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256"],
+            hashlib.sha256(
+                b"trusted-mac-bound-git-profile-v3\0"
+                + hashlib.sha256(receipt_payload).digest()
+                + hashlib.sha256(tmpdir_custody_payload).digest()
+            ).hexdigest(),
+        )
+        measurement_failure = RuntimeError("synthetic toolchain measurement failure")
+        custody_failure = RuntimeError("synthetic post-measurement custody drift")
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                side_effect=measurement_failure,
+            ),
+            mock.patch.object(
+                gate,
+                "_validate_trusted_git_tmpdir",
+                side_effect=(tmpdir_custody_payload, custody_failure),
+            ) as validate_drifting_tmpdir,
+            self.assertRaises(RuntimeError) as dual_failure,
+        ):
+            gate._validate_bound_git_toolchain(
+                binding_arguments,
+                profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+            )
+        self.assertIs(dual_failure.exception, measurement_failure)
+        self.assertEqual(
+            dual_failure.exception.codex_secondary_failures,
+            (custody_failure,),
+        )
+        self.assertEqual(
+            validate_drifting_tmpdir.call_args_list,
+            [expected_tmpdir_validation, expected_tmpdir_validation],
+        )
+        readonly_arguments = ["a" * 40, *binding_arguments]
+        cleared_environment: dict[str, str] = {}
+        with (
+            mock.patch.object(
+                gate,
+                "_validate_bound_git_toolchain",
+                return_value=bound_environment,
+            ) as validate,
+            mock.patch.object(gate.os, "environ", cleared_environment),
+        ):
+            module = gate._configure_environment("readonly", readonly_arguments)
+            selected_git = runner.selected_git_executable()
+            git_environment = runner.bound_git_environment()
+        self.assertEqual(
+            module,
+            "tests.run_readonly_install_deterministic_supervisor",
+        )
+        validate.assert_called_once_with(
+            binding_arguments,
+            profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+        )
+        self.assertEqual(
+            {key: cleared_environment[key] for key in bound_environment},
+            bound_environment,
+        )
+        self.assertEqual(cleared_environment[runner.EXPECTED_HEAD_ENV], "a" * 40)
+        self.assertEqual(
+            cleared_environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"],
+            paths["runtime"],
+        )
+        self.assertEqual(selected_git, paths["executable"])
+        self.assertNotEqual(selected_git, "/usr/bin/git")
+        self.assertEqual(git_environment["DEVELOPER_DIR"], paths["developer"])
+        self.assertEqual(git_environment["GIT_EXEC_PATH"], paths["exec_path"])
+        self.assertEqual(git_environment["TMPDIR"], paths["runtime"])
+
+        with (
+            mock.patch.object(gate.os, "environ", {}),
+            self.assertRaisesRegex(RuntimeError, "trusted Git binding requires"),
+        ):
+            gate._configure_environment("readonly", ["a" * 40])
+        mismatched_arguments = list(binding_arguments)
+        mismatched_arguments[2] = paths["executable"] + "-replacement"
+        with self.assertRaisesRegex(RuntimeError, "does not bind"):
+            gate._validate_bound_git_toolchain(
+                mismatched_arguments[:6],
+                profile=gate.HOSTED_GIT_BINDING_PROFILE,
+            )
+        drifted_payload = toolchain_payload(exec_path_sha256="e" * 64)
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                return_value=drifted_payload,
+            ) as measure,
+            self.assertRaisesRegex(RuntimeError, "does not match its receipt"),
+        ):
+            gate._validate_bound_git_toolchain(
+                binding_arguments[:6],
+                profile=gate.HOSTED_GIT_BINDING_PROFILE,
+            )
+        measure.assert_called_once_with(
+            [
+                paths["developer"],
+                paths["executable"],
+                "b" * 64,
+                paths["exec_path"],
+            ]
+        )
+
+        with owned_temporary_directory("trusted-git-tmpdir-") as root:
+            trusted_tmp = root / "runtime"
+            other_tmp = root / "other"
+            replacement_tmp = root / "replacement"
+            trusted_tmp.mkdir(mode=0o700)
+            other_tmp.mkdir(mode=0o700)
+            replacement_tmp.mkdir(mode=0o700)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"CODEX_REVIEW_TEST_RUNTIME_PARENT": str(trusted_tmp)},
+                ),
+                mock.patch.object(
+                    support,
+                    "_repository_runtime_candidates",
+                    side_effect=AssertionError("ambient repository fallback ran"),
+                ),
+                mock.patch.object(
+                    support.shutil,
+                    "which",
+                    side_effect=AssertionError("unbound Git lookup ran"),
+                ),
+                mock.patch.object(
+                    support.subprocess,
+                    "run",
+                    side_effect=AssertionError("unbound Git subprocess ran"),
+                ),
+                mock.patch.object(
+                    support,
+                    "open_absolute_directory_chain",
+                    wraps=support.open_absolute_directory_chain,
+                ) as open_runtime_parent,
+            ):
+                self.assertEqual(support._private_runtime_parent(), trusted_tmp)
+            self.assertTrue(open_runtime_parent.call_args_list)
+            self.assertTrue(
+                all(
+                    call.kwargs["allow_sticky_writable_ancestors"]
+                    for call in open_runtime_parent.call_args_list
+                )
+            )
+
+            unsafe_runtime_ancestor = root / "unsafe-runtime-ancestor"
+            unsafe_runtime_parent = unsafe_runtime_ancestor / "private"
+            unsafe_runtime_ancestor.mkdir(mode=0o700)
+            unsafe_runtime_parent.mkdir(mode=0o700)
+            unsafe_runtime_ancestor.chmod(0o777)
+            try:
+                rejection_errors: list[BaseException] = []
+                self.assertIsNone(
+                    support._validated_private_runtime_parent(
+                        str(unsafe_runtime_parent),
+                        allow_sticky_writable_ancestors=True,
+                        rejection_errors=rejection_errors,
+                    )
+                )
+                self.assertTrue(rejection_errors)
+            finally:
+                unsafe_runtime_ancestor.chmod(0o700)
+
+            if sys.platform == "darwin" and pathlib.Path("/private/tmp").is_dir():
+                with tempfile.TemporaryDirectory(
+                    prefix="codex-safe-sticky-runtime-",
+                    dir="/private/tmp",
+                ) as raw_sticky_runtime:
+                    sticky_runtime = pathlib.Path(raw_sticky_runtime)
+                    sticky_runtime.chmod(0o700)
+                    self.assertEqual(
+                        support._validated_private_runtime_parent(
+                            str(sticky_runtime),
+                            allow_sticky_writable_ancestors=True,
+                        ),
+                        sticky_runtime,
+                    )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+            ):
+                tmpdir_payload = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(trusted_tmp)]
+                )
+                tmpdir_receipt = tmpdir_payload[:-1].decode("ascii")
+                parsed_tmpdir_receipt = json.loads(tmpdir_payload)
+                self.assertEqual(
+                    parsed_tmpdir_receipt["schema"],
+                    "trusted-git-tmpdir-custody-v1",
+                )
+                self.assertEqual(parsed_tmpdir_receipt["path"], str(trusted_tmp))
+                self.assertEqual(
+                    parsed_tmpdir_receipt["group_gid"], trusted_tmp.stat().st_gid
+                )
+                physical_chain = parsed_tmpdir_receipt["physical_chain"]
+                self.assertEqual(len(physical_chain), len(trusted_tmp.parts))
+                self.assertEqual(
+                    set(physical_chain[-1]),
+                    {
+                        "device",
+                        "file_type",
+                        "flags",
+                        "group_gid",
+                        "inode",
+                        "mode",
+                        "owner_uid",
+                    },
+                )
+                self.assertEqual(physical_chain[-1]["file_type"], stat.S_IFDIR)
+                self.assertEqual(physical_chain[-1]["mode"], 0o700)
+                self.assertEqual(physical_chain[-1]["inode"], trusted_tmp.stat().st_ino)
+                self.assertEqual(
+                    gate._validate_trusted_git_tmpdir(
+                        trusted_tmp,
+                        tmpdir_receipt,
+                    ),
+                    tmpdir_payload,
+                )
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(other_tmp, tmpdir_receipt)
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    gate._trusted_git_tmpdir_receipt_payload([str(root / "missing")])
+                with self.assertRaises(RuntimeError):
+                    gate._trusted_git_tmpdir_receipt_payload(["/tmp"])
+
+                child = trusted_tmp / "benign-child"
+                child.mkdir(mode=0o700)
+                self.assertEqual(
+                    gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)]),
+                    tmpdir_payload,
+                )
+                with mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    return_value=(b"com.apple.provenance",),
+                ):
+                    self.assertEqual(
+                        gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)]),
+                        tmpdir_payload,
+                    )
+
+                policy_parent = root / "policy-parent"
+                stable_leaf = policy_parent / "stable-leaf"
+                policy_parent.mkdir(mode=0o700)
+                stable_leaf.mkdir(mode=0o700)
+                stable_leaf_payload = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(stable_leaf)]
+                )
+                stable_leaf_receipt = stable_leaf_payload[:-1].decode("ascii")
+                policy_parent.chmod(0o755)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "does not match"):
+                        gate._validate_trusted_git_tmpdir(
+                            stable_leaf,
+                            stable_leaf_receipt,
+                        )
+                finally:
+                    policy_parent.chmod(0o700)
+
+                original_leaf_inode = stable_leaf.stat().st_ino
+                retained_parent = root / "retained-policy-parent"
+                policy_parent.rename(retained_parent)
+                policy_parent.mkdir(mode=0o700)
+                (retained_parent / stable_leaf.name).rename(stable_leaf)
+                self.assertEqual(stable_leaf.stat().st_ino, original_leaf_inode)
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(
+                        stable_leaf,
+                        stable_leaf_receipt,
+                    )
+
+                unsafe_ancestor = root / "unsafe-ancestor"
+                unsafe_target = unsafe_ancestor / "target"
+                unsafe_ancestor.mkdir(mode=0o700)
+                unsafe_target.mkdir(mode=0o700)
+                unsafe_ancestor.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "unsafe writable ancestor",
+                    ):
+                        gate._trusted_git_tmpdir_receipt_payload([str(unsafe_target)])
+                finally:
+                    unsafe_ancestor.chmod(0o700)
+
+                trusted_tmp.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "unsafe access policy"):
+                        gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)])
+                finally:
+                    trusted_tmp.chmod(0o700)
+
+                replacement_receipt = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(replacement_tmp)]
+                )[:-1].decode("ascii")
+                retained_tmp = root / "retained-original"
+                replacement_tmp.rename(retained_tmp)
+                replacement_tmp.mkdir(mode=0o700)
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(
+                        replacement_tmp,
+                        replacement_receipt,
+                    )
+
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=1),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_trusted_git_tmpdir(trusted_tmp, tmpdir_receipt)
+            if sys.platform == "darwin" and pathlib.Path("/private/tmp").is_dir():
+                with tempfile.TemporaryDirectory(
+                    prefix="codex-git-custody-physical-",
+                    dir="/private/tmp",
+                ) as raw_actual_tmp:
+                    actual_tmp = pathlib.Path(raw_actual_tmp)
+                    actual_tmp.chmod(0o700)
+                    actual_metadata_payload = gate._trusted_git_tmpdir_receipt_payload(
+                        [str(actual_tmp)]
+                    )
+                    self.assertIn(
+                        b'"schema":"trusted-git-tmpdir-custody-v1"',
+                        actual_metadata_payload,
+                    )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    return_value=(b"com.apple.quarantine",),
+                ),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_trusted_git_tmpdir(trusted_tmp, tmpdir_receipt)
+
+            root_owned_sticky = os.stat_result(
+                (stat.S_IFDIR | 0o1777, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+                {"st_flags": 0},
+            )
+            current_uid_target = os.stat_result(
+                (
+                    stat.S_IFDIR | 0o700,
+                    2,
+                    1,
+                    1,
+                    os.getuid(),
+                    os.getgid(),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                {"st_flags": 0},
+            )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    side_effect=lambda descriptor: (
+                        (b"com.apple.rootless",) if descriptor == 10 else ()
+                    ),
+                ),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (root_owned_sticky, current_uid_target),
+                )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    side_effect=lambda descriptor: (
+                        (b"com.apple.rootless",) if descriptor == 11 else ()
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (root_owned_sticky, current_uid_target),
+                )
+            untrusted_owner = os.stat_result(
+                (
+                    stat.S_IFDIR | 0o755,
+                    3,
+                    1,
+                    1,
+                    os.getuid() + 1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                {"st_flags": 0},
+            )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+                self.assertRaisesRegex(RuntimeError, "untrusted ancestor owner"),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (untrusted_owner, current_uid_target),
+                )
+
+            close_calls: list[int] = []
+
+            def close_all_descriptors(descriptor: int) -> None:
+                close_calls.append(descriptor)
+                if descriptor == 12:
+                    raise OSError(errno.EIO, "synthetic descriptor close failure")
+
+            synthetic_descriptors = [10, 11, 12]
+            with mock.patch.object(
+                gate.os,
+                "close",
+                side_effect=close_all_descriptors,
+            ):
+                close_failures = gate._close_directory_chain(synthetic_descriptors)
+            self.assertEqual(close_calls, [12, 11, 10])
+            self.assertEqual(synthetic_descriptors, [])
+            self.assertEqual(len(close_failures), 1)
+            inspection_failure = RuntimeError("synthetic inspection failure")
+            try:
+                raise inspection_failure
+            except RuntimeError:
+                with self.assertRaises(RuntimeError) as cleanup_group:
+                    gate._raise_directory_chain_cleanup_failures(close_failures)
+            self.assertIs(cleanup_group.exception, inspection_failure)
+            self.assertEqual(
+                cleanup_group.exception.codex_secondary_failures,
+                close_failures,
+            )
 
         invalid_records = (
             receipt + "\n",
             receipt.replace('"schema":', '"unknown":"value","schema":'),
             receipt.replace(
-                '"version_sha256":"' + "d" * 64, '"version_sha256":"' + "D" * 64
+                '"toolchain_sha256":"' + "c" * 64,
+                '"toolchain_sha256":"' + "C" * 64,
             ),
+            receipt.replace("receipt-v2", "receipt-v1"),
             json.dumps(record, ensure_ascii=True),
         )
         for invalid in invalid_records:
@@ -9614,12 +10144,11 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             "/Applications/Trusted.app/Contents/Developer/usr/bin/git",
             "b" * 64,
             "/Applications/Trusted.app/Contents/Developer/usr/libexec/git-core",
-            "/private/runtime",
         ]
         with mock.patch.object(
             gate,
             "_measure_hosted_git_toolchain",
-            return_value=("a" * 64, "d" * 64, "c" * 64),
+            return_value=("a" * 64, "c" * 64),
         ) as measure:
             payload = gate._hosted_git_receipt_payload(arguments)
         self.assertLessEqual(len(payload), gate.GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES)
@@ -9634,12 +10163,11 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 "exec_path_sha256": "a" * 64,
                 "executable": arguments[1],
                 "executable_sha256": "b" * 64,
-                "schema": "hosted-git-toolchain-receipt-v1",
+                "schema": "hosted-git-toolchain-receipt-v2",
                 "toolchain_sha256": "c" * 64,
-                "version_sha256": "d" * 64,
             },
         )
-        measure.assert_called_once_with(arguments, version_receipt=None)
+        measure.assert_called_once_with(arguments)
 
         with owned_temporary_directory("hosted-git-helper-escape-") as root:
             developer = root / "Developer"
@@ -9678,6 +10206,52 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                     developer_dir=developer,
                 )
             self.assertNotEqual(before, after)
+
+            temporary_directory = root / "runtime"
+            temporary_directory.mkdir(mode=0o700)
+            executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            receipt_arguments = [
+                str(developer),
+                str(executable),
+                executable_digest,
+                str(exec_path),
+            ]
+            with (
+                mock.patch.object(
+                    gate,
+                    "_require_candidate_readonly_physical_chain",
+                ),
+                mock.patch.object(gate.os, "access", side_effect=readonly_access),
+            ):
+                fresh_receipt = gate._hosted_git_receipt_payload(receipt_arguments)
+                parsed_receipt = gate._parse_hosted_git_receipt(
+                    fresh_receipt[:-1].decode("ascii")
+                )
+                self.assertEqual(
+                    parsed_receipt["schema"],
+                    "hosted-git-toolchain-receipt-v2",
+                )
+                self.assertNotIn("version_sha256", parsed_receipt)
+                (exec_path / "added-helper").write_bytes(b"additional helper")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "does not match its receipt",
+                ):
+                    gate._validate_bound_git_toolchain(
+                        [
+                            str(temporary_directory),
+                            *receipt_arguments,
+                            fresh_receipt[:-1].decode("ascii"),
+                        ],
+                        profile=gate.HOSTED_GIT_BINDING_PROFILE,
+                    )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires Developer, executable, digest, and exec-path",
+                ):
+                    gate._hosted_git_receipt_payload(
+                        [*receipt_arguments, str(temporary_directory)]
+                    )
 
     def test_source_only_bootstrap_rejects_substitutes_and_nonisolated_start(
         self,
@@ -10044,11 +10618,7 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -10126,6 +10696,47 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
             )
 
     def test_explicit_expected_head_selects_trusted_mac_no_child_path(self) -> None:
+        with (
+            self.subTest("runner-local explicit runtime parent policy"),
+            owned_temporary_directory("runner-explicit-runtime-parent-") as parent,
+        ):
+            selected_parent = parent.resolve(strict=True)
+            result_owner = support._PrivateDirectoryCreationResultOwner()
+            expected_binding = mock.sentinel.explicit_runtime_binding
+            select_parent = mock.Mock(return_value=selected_parent)
+            create_directory = mock.Mock(return_value=expected_binding)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        runner.EXPLICIT_RUNTIME_PARENT_ENV: str(selected_parent),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    select_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_create_bound_owned_private_directory",
+                    create_directory,
+                ),
+            ):
+                binding = runner._create_bound_owned_private_runtime_directory(
+                    ".explicit-runtime-",
+                    result_owner=result_owner,
+                )
+            self.assertIs(binding, expected_binding)
+            select_parent.assert_called_once_with()
+            create_directory.assert_called_once_with(
+                selected_parent,
+                ".explicit-runtime-",
+                result_owner=result_owner,
+                allow_sticky_writable_ancestors=True,
+            )
+
         (
             returncode,
             summary,
@@ -10929,6 +11540,7 @@ class TerminalPublicationSignalIntegrationTests(unittest.TestCase):
         environment.pop("GITHUB_ACTIONS", None)
         environment.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
         environment.pop(runner.RUNNER_ARCH_ENV, None)
+        environment.pop(runner.EXPLICIT_RUNTIME_PARENT_ENV, None)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         return subprocess.run(
             (
