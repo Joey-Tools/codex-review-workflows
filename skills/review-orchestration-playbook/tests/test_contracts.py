@@ -12273,7 +12273,6 @@ class RepositoryContractTest(unittest.TestCase):
                                 return None
                             projected_request.pop("request_scope", None)
                             projected_request.pop("request_scope_receipt", None)
-                        projected_audit.pop("nonterminal_records", None)
                         projected_audits.append(projected_audit)
                 endpoint_result["sidecar_blind_scope_summaries"] = sorted(
                     scope_summaries,
@@ -14256,16 +14255,32 @@ class RepositoryContractTest(unittest.TestCase):
                             return None
 
                 raw_audits_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+                expected_raw_audit_fields = {
+                    "scope_key",
+                    "lifecycle",
+                    "requests",
+                    "reactions",
+                    "applicable_artifacts",
+                    "nonterminal_records",
+                }
                 for raw_audit in endpoint_result["sidecar_blind_authority_audit"]:
                     raw_scope_key = (
                         raw_audit.get("scope_key")
                         if isinstance(raw_audit, dict)
                         else None
                     )
-                    if not isinstance(raw_scope_key, list):
+                    if (
+                        not isinstance(raw_audit, dict)
+                        or set(raw_audit) != expected_raw_audit_fields
+                        or not isinstance(raw_scope_key, list)
+                        or not isinstance(raw_audit.get("nonterminal_records"), list)
+                    ):
                         return None
                     raw_scope_tuple = tuple(raw_scope_key)
-                    if raw_scope_tuple in raw_audits_by_scope:
+                    if (
+                        raw_scope_tuple not in raw_scope_by_key
+                        or raw_scope_tuple in raw_audits_by_scope
+                    ):
                         return None
                     raw_audits_by_scope[raw_scope_tuple] = raw_audit
                 required_raw_audits = {
@@ -14291,12 +14306,23 @@ class RepositoryContractTest(unittest.TestCase):
                     normalized_audits_by_scope[normalized_scope_tuple] = (
                         normalized_audit
                     )
+
+                def candidate_comparable_raw_audit(
+                    raw_audit: dict[str, object],
+                ) -> dict[str, object]:
+                    comparable = clone(raw_audit)
+                    assert isinstance(comparable, dict)
+                    comparable.pop("nonterminal_records")
+                    return comparable
+
                 if (
                     set(required_raw_audits) != required_scopes
                     or set(normalized_audits_by_scope) != required_scopes
                     or any(
                         not typed_json_equal(
-                            required_raw_audits[required_scope],
+                            candidate_comparable_raw_audit(
+                                required_raw_audits[required_scope]
+                            ),
                             normalized_audits_by_scope[required_scope],
                         )
                         for required_scope in required_scopes
@@ -14334,7 +14360,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "raw_authority_audit": [
                         raw_audits_by_scope[scope_key_value]
                         for scope_key_value in sorted(
-                            seen_candidate_scopes,
+                            raw_audits_by_scope,
                             key=lambda item: int(item[1]),
                         )
                     ],
@@ -22455,6 +22481,113 @@ class RepositoryContractTest(unittest.TestCase):
                 normal_lane_timing,
             )
         )
+
+        def append_scope_rest_record(
+            candidate_history: dict[str, object],
+            *,
+            phase: str,
+            pull_number: int,
+            fetch_kind: str,
+            record: dict[str, object],
+        ) -> None:
+            transcript = candidate_history[f"{phase}_inventory"][
+                "discovery_endpoint_transcript"
+            ]
+            scope_transcript = next(
+                item
+                for item in transcript["scopes"]
+                if item.get("pull_number") == pull_number
+            )
+            fetch = next(
+                item
+                for item in scope_transcript["fetches"]
+                if item.get("kind") == fetch_kind
+            )
+            page = fetch["pages"][0]
+            records = strict_json_loads(page["body_utf8"])
+            assert isinstance(records, list)
+            records.append(clone(record))
+            replace_raw_json_body(page, canonical_raw_body(records))
+
+        pending_review_drift_history = clone(terminal_sidecar_blind_history)
+        assert isinstance(pending_review_drift_history, dict)
+        pending_review_artifact = complete_review_artifact(
+            terminal_history[0],
+            91_101,
+            terminal_server_time - 4,
+        )
+        pending_review_snapshot = pending_review_artifact["final_snapshot"]
+        assert isinstance(pending_review_snapshot, dict)
+        pending_review_snapshot["state"] = "PENDING"
+        pending_review_snapshot["submitted_at"] = None
+        pending_review_snapshot["body"] = "Pending provider review phase one."
+        initial_pending_review = raw_review_record(pending_review_snapshot)
+        final_pending_review = clone(initial_pending_review)
+        assert isinstance(final_pending_review, dict)
+        final_pending_review["body"] = "Pending provider review phase two."
+        pending_pull_number = terminal_victim_scope[1]
+        assert isinstance(pending_pull_number, int)
+        append_scope_rest_record(
+            pending_review_drift_history,
+            phase="initial",
+            pull_number=pending_pull_number,
+            fetch_kind="reviews",
+            record=initial_pending_review,
+        )
+        append_scope_rest_record(
+            pending_review_drift_history,
+            phase="final",
+            pull_number=pending_pull_number,
+            fetch_kind="reviews",
+            record=final_pending_review,
+        )
+
+        noncandidate_progress_drift_history = clone(terminal_sidecar_blind_history)
+        assert isinstance(noncandidate_progress_drift_history, dict)
+        append_scope_rest_record(
+            noncandidate_progress_drift_history,
+            phase="final",
+            pull_number=declaration_pr,
+            fetch_kind="issue_comments",
+            record=exact_provider_issue_record(
+                91_102,
+                "Codex Review in progress.",
+            ),
+        )
+
+        current_eyes_drift_history = clone(terminal_sidecar_blind_history)
+        assert isinstance(current_eyes_drift_history, dict)
+        append_scope_rest_record(
+            current_eyes_drift_history,
+            phase="final",
+            pull_number=current_pr,
+            fetch_kind="request_reactions",
+            record=raw_reaction_record(
+                reaction(
+                    91_103,
+                    current_request["id"],
+                    15,
+                    content="eyes",
+                )
+            ),
+        )
+
+        for drift_name, drift_history in {
+            "candidate-pending-review": pending_review_drift_history,
+            "noncandidate-progress-comment": noncandidate_progress_drift_history,
+            "current-earlier-eyes": current_eyes_drift_history,
+        }.items():
+            with self.subTest(sidecar_blind_nonterminal_drift=drift_name):
+                self.assertIsNone(validate_history_universe_result(drift_history))
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        drift_history,
+                        terminal_current,
+                        normal_lane_timing,
+                    )
+                )
 
         def synchronized_normalized_omission(
             candidate_history: dict[str, object],
