@@ -295,6 +295,22 @@ def _github_codex_review_body_semantic(
     body = _normalize_github_codex_body(raw_body)
     if body is None:
         return ("malformed", None)
+    recognized_states = {
+        "APPROVED",
+        "COMMENTED",
+        "CHANGES_REQUESTED",
+        "PENDING",
+        "DISMISSED",
+    }
+    unknown_state = state is None or (
+        isinstance(state, str) and state not in recognized_states
+    )
+    if unknown_state:
+        return (
+            ("nonterminal", None)
+            if body == "" and not has_target_children
+            else ("malformed", None)
+        )
     if state == "APPROVED":
         if body == "No findings." and has_target_children:
             return ("findings", commit_id)
@@ -6285,6 +6301,8 @@ class RepositoryContractTest(unittest.TestCase):
         def charge_request_scope_response_resource(
             response: object,
             tracker: dict[str, object],
+            *,
+            record_already_charged: bool = False,
         ) -> bool:
             limits = tracker.get("limits")
             if (
@@ -6305,7 +6323,7 @@ class RepositoryContractTest(unittest.TestCase):
                     tracker,
                     fetch_attempts=1,
                     retained_pages=1,
-                    records=1,
+                    records=0 if record_already_charged else 1,
                 )
             ):
                 return False
@@ -6352,6 +6370,13 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
+            receipt_count = len(value)
+            if receipt_count and not resource_budget_charge(
+                tracker,
+                controlled_requests=receipt_count,
+                records=receipt_count * 6,
+            ):
+                return None
             mapping: dict[int, dict[str, object]] = {}
 
             def parse_response(
@@ -6378,6 +6403,7 @@ class RepositoryContractTest(unittest.TestCase):
                         and not charge_request_scope_response_resource(
                             response,
                             tracker,
+                            record_already_charged=True,
                         )
                     )
                 ):
@@ -6420,6 +6446,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or not charge_request_scope_response_resource(
                         pull_response,
                         tracker,
+                        record_already_charged=True,
                     )
                 ):
                     return None
@@ -6499,8 +6526,6 @@ class RepositoryContractTest(unittest.TestCase):
                     or set(receipt) != request_scope_receipt_fields
                     or receipt.get("kind") != "parent-recorded-request-scope-v1"
                 ):
-                    return None
-                if not resource_budget_charge(tracker, controlled_requests=1):
                     return None
                 request_id = receipt.get("request_id")
                 pre_scope = parse_scope_responses(
@@ -9078,7 +9103,7 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(user, dict)
                 or not isinstance(user.get("login"), str)
                 or not isinstance(user.get("type"), str)
-                or not isinstance(state, str)
+                or (state is not None and not isinstance(state, str))
                 or not isinstance(value.get("body"), str)
                 or (state == "PENDING" and raw_submitted_at is not None)
                 or (state != "PENDING" and submitted_at is None)
@@ -9734,8 +9759,9 @@ class RepositoryContractTest(unittest.TestCase):
                 raw_receipts = raw_scope.get("request_scope_receipts")
                 raw_requests = raw_scope.get("requests")
                 if isinstance(raw_receipts, list):
+                    receipt_count = len(raw_receipts)
                     if (
-                        len(receipts) + len(raw_receipts)
+                        len(receipts) + receipt_count
                         > evidence_resource_budget_v1["max_controlled_requests"]
                     ):
                         raise EvidenceResourceBudgetExceeded(
@@ -9743,14 +9769,19 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     if not resource_budget_charge(
                         tracker,
-                        controlled_requests=len(raw_receipts),
+                        controlled_requests=receipt_count,
+                        records=receipt_count * 6,
                     ):
                         raise EvidenceResourceBudgetExceeded(
                             "request-scope sidecar count budget exceeded"
                         )
                     receipts.extend(raw_receipts)
                 elif isinstance(raw_requests, list) and raw_requests:
-                    if not resource_budget_charge(tracker, controlled_requests=1):
+                    if not resource_budget_charge(
+                        tracker,
+                        controlled_requests=1,
+                        records=1,
+                    ):
                         raise EvidenceResourceBudgetExceeded(
                             "request-scope sidecar count budget exceeded"
                         )
@@ -9786,7 +9817,11 @@ class RepositoryContractTest(unittest.TestCase):
                     receipt["post_request_scope_receipts"]["compare"],
                 ]
                 if not all(
-                    charge_request_scope_response_resource(response, tracker)
+                    charge_request_scope_response_resource(
+                        response,
+                        tracker,
+                        record_already_charged=True,
+                    )
                     for response in responses
                 ):
                     raise EvidenceResourceBudgetExceeded(
@@ -11184,6 +11219,23 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                     if semantic_commit not in {None, review_commit}:
                         return None
+                    source_bundle = {
+                        "artifact": clone(raw_review),
+                        "inline_comments": clone(inline_by_review[review_id]),
+                        "review_threads": clone(thread_nodes_by_review[review_id]),
+                    }
+                    if semantic == "nonterminal":
+                        nonterminal_records.append(
+                            (
+                                "pull-request-review",
+                                review_id,
+                                submitted_at,
+                                hashlib.sha256(
+                                    canonical_raw_body(source_bundle).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
+                        continue
                     if (
                         parsed_scope == current_scope_key
                         and semantic == "findings"
@@ -11201,11 +11253,6 @@ class RepositoryContractTest(unittest.TestCase):
                         if parsed_scope == current_scope_key and semantic == "clean":
                             continue
                         return None
-                    source_bundle = {
-                        "artifact": clone(raw_review),
-                        "inline_comments": clone(inline_by_review[review_id]),
-                        "review_threads": clone(thread_nodes_by_review[review_id]),
-                    }
                     artifact_basis = (
                         submitted_at,
                         review_id,
@@ -13908,7 +13955,7 @@ class RepositoryContractTest(unittest.TestCase):
             max_controlled_requests=1,
             max_fetch_attempts=8,
             max_retained_pages=8,
-            max_records=5,
+            max_records=6,
         )
         self.assertIsNotNone(
             parse_discovery_endpoint_transcript(
@@ -13920,7 +13967,7 @@ class RepositoryContractTest(unittest.TestCase):
         for limit_name, overflow_value in (
             ("max_fetch_attempts", 7),
             ("max_retained_pages", 7),
-            ("max_records", 4),
+            ("max_records", 5),
         ):
             overflow_limits = clone(exact_current_resource_limits)
             assert isinstance(overflow_limits, dict)
@@ -13976,7 +14023,7 @@ class RepositoryContractTest(unittest.TestCase):
                     max_controlled_requests=1,
                     max_fetch_attempts=7,
                     max_retained_pages=7,
-                    max_records=5,
+                    max_records=6,
                 ),
             )
         )
@@ -13985,7 +14032,7 @@ class RepositoryContractTest(unittest.TestCase):
             max_controlled_requests=1,
             max_fetch_attempts=7,
             max_retained_pages=7,
-            max_records=5,
+            max_records=6,
         )
         self.assertIsNotNone(
             parse_current_endpoint_inventory(
@@ -13997,7 +14044,7 @@ class RepositoryContractTest(unittest.TestCase):
         for limit_name, overflow_value in (
             ("max_fetch_attempts", 6),
             ("max_retained_pages", 6),
-            ("max_records", 4),
+            ("max_records", 5),
         ):
             overflow_limits = clone(exact_current_detail_limits)
             assert isinstance(overflow_limits, dict)
@@ -14028,7 +14075,7 @@ class RepositoryContractTest(unittest.TestCase):
                 max_controlled_requests=1,
                 max_fetch_attempts=5,
                 max_retained_pages=5,
-                max_records=5,
+                max_records=6,
             )
         )
         self.assertIsNotNone(exact_sidecar_tracker)
@@ -14044,7 +14091,7 @@ class RepositoryContractTest(unittest.TestCase):
                 max_controlled_requests=1,
                 max_fetch_attempts=4,
                 max_retained_pages=5,
-                max_records=5,
+                max_records=6,
             )
         )
         self.assertIsNotNone(too_few_sidecar_attempts_tracker)
@@ -14055,6 +14102,134 @@ class RepositoryContractTest(unittest.TestCase):
                 resource_tracker=too_few_sidecar_attempts_tracker,
             )
         )
+
+        aggregate_request = request(11, 30, pr=current_pr)
+        aggregate_sidecar_receipts = [
+            current_resource_receipts[0],
+            request_scope_receipt(aggregate_request, current_scope),
+        ]
+        exact_aggregate_sidecar_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=2,
+                max_fetch_attempts=10,
+                max_retained_pages=10,
+                max_records=12,
+            )
+        )
+        self.assertIsNotNone(exact_aggregate_sidecar_tracker)
+        assert exact_aggregate_sidecar_tracker is not None
+        aggregate_mapping = request_scope_receipt_mapping(
+            aggregate_sidecar_receipts,
+            resource_tracker=exact_aggregate_sidecar_tracker,
+        )
+        self.assertIsNotNone(aggregate_mapping)
+        assert aggregate_mapping is not None
+        self.assertEqual(set(aggregate_mapping), {10, 11})
+        aggregate_sidecar_overflow_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=2,
+                max_fetch_attempts=10,
+                max_retained_pages=10,
+                max_records=11,
+            )
+        )
+        self.assertIsNotNone(aggregate_sidecar_overflow_tracker)
+        assert aggregate_sidecar_overflow_tracker is not None
+        self.assertIsNone(
+            request_scope_receipt_mapping(
+                aggregate_sidecar_receipts,
+                resource_tracker=aggregate_sidecar_overflow_tracker,
+            )
+        )
+
+        aggregate_sidecar_scope = clone(current)
+        assert isinstance(aggregate_sidecar_scope, dict)
+        aggregate_sidecar_scope["request_scope_receipts"] = aggregate_sidecar_receipts
+        aggregate_sidecar_scope["requests"] = [current_request, aggregate_request]
+        exact_aggregate_collector_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=2,
+                max_fetch_attempts=10,
+                max_retained_pages=10,
+                max_records=12,
+            )
+        )
+        self.assertIsNotNone(exact_aggregate_collector_tracker)
+        assert exact_aggregate_collector_tracker is not None
+        self.assertEqual(
+            len(
+                request_scope_receipts_for_scopes(
+                    [aggregate_sidecar_scope],
+                    _resource_tracker=exact_aggregate_collector_tracker,
+                )
+            ),
+            2,
+        )
+        aggregate_collector_overflow_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=2,
+                max_fetch_attempts=10,
+                max_retained_pages=10,
+                max_records=11,
+            )
+        )
+        self.assertIsNotNone(aggregate_collector_overflow_tracker)
+        assert aggregate_collector_overflow_tracker is not None
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            request_scope_receipts_for_scopes(
+                [aggregate_sidecar_scope],
+                _resource_tracker=aggregate_collector_overflow_tracker,
+            )
+
+        class RaisingReceiptList(list[object]):
+            def __init__(self, values: list[object]) -> None:
+                super().__init__(values)
+                self.iteration_count = 0
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                self.iteration_count += 1
+                raise AssertionError("sidecar receipt traversal occurred")
+
+        mapping_precharge_receipts = RaisingReceiptList([current_resource_receipts[0]])
+        mapping_precharge_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=1,
+                max_records=5,
+            )
+        )
+        self.assertIsNotNone(mapping_precharge_tracker)
+        assert mapping_precharge_tracker is not None
+        self.assertIsNone(
+            request_scope_receipt_mapping(
+                mapping_precharge_receipts,
+                resource_tracker=mapping_precharge_tracker,
+            )
+        )
+        self.assertEqual(mapping_precharge_receipts.iteration_count, 0)
+
+        collector_precharge_receipts = RaisingReceiptList(
+            [current_resource_receipts[0]]
+        )
+        collector_precharge_scope = clone(current)
+        assert isinstance(collector_precharge_scope, dict)
+        collector_precharge_scope["request_scope_receipts"] = (
+            collector_precharge_receipts
+        )
+        collector_precharge_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=1,
+                max_records=5,
+            )
+        )
+        self.assertIsNotNone(collector_precharge_tracker)
+        assert collector_precharge_tracker is not None
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            request_scope_receipts_for_scopes(
+                [collector_precharge_scope],
+                _resource_tracker=collector_precharge_tracker,
+            )
+        self.assertEqual(collector_precharge_receipts.iteration_count, 0)
+
         self.assertIsNone(
             request_scope_receipt_mapping(
                 [
@@ -16318,6 +16493,204 @@ class RepositoryContractTest(unittest.TestCase):
                     "current_authority_projection"
                 ]["nonterminal_records"]
                 self.assertEqual(len(nonterminal_records), 2)
+                self.assertIsNotNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        nonterminal_history,
+                        terminal_current,
+                        post_as_of_lane_timing,
+                    )
+                )
+
+        unknown_state_nonterminal_variants: dict[
+            str, tuple[dict[str, object], int, int]
+        ] = {}
+        for offset, (variant_name, unknown_state) in enumerate(
+            (("missing-state", None), ("unknown-string", "QUEUED")),
+            start=2,
+        ):
+            unknown_review_id = 82_100 + offset
+            unknown_review_time = terminal_server_time - offset
+            unknown_artifact = complete_review_artifact(
+                terminal_current,
+                unknown_review_id,
+                unknown_review_time,
+            )
+            unknown_snapshot = unknown_artifact["final_snapshot"]
+            assert isinstance(unknown_snapshot, dict)
+            unknown_snapshot["body"] = ""
+            unknown_review = raw_review_record(unknown_snapshot)
+            if unknown_state is None:
+                unknown_review.pop("state")
+            else:
+                unknown_review["state"] = unknown_state
+            unknown_state_current = clone(terminal_current)
+            assert isinstance(unknown_state_current, dict)
+            unknown_state_current["raw_review_records"] = [unknown_review]
+            unknown_state_nonterminal_variants[variant_name] = (
+                unknown_state_current,
+                unknown_review_id,
+                unknown_review_time,
+            )
+
+        for variant_name, (
+            unknown_state_current,
+            unknown_review_id,
+            unknown_review_time,
+        ) in unknown_state_nonterminal_variants.items():
+            with self.subTest(terminal_with_empty_unknown_review_state=variant_name):
+                unknown_state_history = history(
+                    samples,
+                    current_raw=unknown_state_current,
+                )
+                parsed_unknown_state_current = parse_current_endpoint_inventory(
+                    unknown_state_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                self.assertIsNotNone(parsed_unknown_state_current)
+                assert isinstance(parsed_unknown_state_current, dict)
+                unknown_nonterminal_records = parsed_unknown_state_current[
+                    "current_authority_projection"
+                ]["nonterminal_records"]
+                self.assertEqual(
+                    [
+                        {
+                            "channel": item["channel"],
+                            "id": item["id"],
+                            "server_time": item["server_time"],
+                        }
+                        for item in unknown_nonterminal_records
+                        if item.get("id") == unknown_review_id
+                    ],
+                    [
+                        {
+                            "channel": "pull-request-review",
+                            "id": unknown_review_id,
+                            "server_time": unknown_review_time,
+                        }
+                    ],
+                )
+                self.assertTrue(
+                    current_raw_authority_matches(
+                        unknown_state_history,
+                        terminal_current,
+                    )
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        unknown_state_history,
+                        terminal_current,
+                    ),
+                    "mixed",
+                )
+                self.assertIsNotNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        unknown_state_history,
+                        terminal_current,
+                        post_as_of_lane_timing,
+                    )
+                )
+
+        malformed_unknown_state_variants: dict[str, tuple[dict[str, object], int]] = {}
+        unknown_nonempty_id = 82_110
+        unknown_nonempty_artifact = complete_review_artifact(
+            terminal_current,
+            unknown_nonempty_id,
+            terminal_server_time + 1,
+        )
+        unknown_nonempty_snapshot = unknown_nonempty_artifact["final_snapshot"]
+        assert isinstance(unknown_nonempty_snapshot, dict)
+        unknown_nonempty_review = raw_review_record(unknown_nonempty_snapshot)
+        unknown_nonempty_review["state"] = "QUEUED"
+        unknown_nonempty_current = clone(terminal_current)
+        assert isinstance(unknown_nonempty_current, dict)
+        unknown_nonempty_current["raw_review_records"] = [unknown_nonempty_review]
+        malformed_unknown_state_variants["nonempty-body"] = (
+            unknown_nonempty_current,
+            unknown_nonempty_id,
+        )
+
+        unknown_child_id = 82_111
+        unknown_child_artifact = complete_review_artifact(
+            terminal_current,
+            unknown_child_id,
+            terminal_server_time + 2,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+        )
+        unknown_child_snapshot = unknown_child_artifact["final_snapshot"]
+        assert isinstance(unknown_child_snapshot, dict)
+        unknown_child_review = raw_review_record(unknown_child_snapshot)
+        unknown_child_review["state"] = "QUEUED"
+        unknown_child_review["body"] = ""
+        unknown_child_associated = unknown_child_snapshot["associated_inline_comments"]
+        unknown_child_threads = unknown_child_snapshot["review_thread_pages"]
+        assert isinstance(unknown_child_associated, dict)
+        assert isinstance(unknown_child_threads, dict)
+        unknown_child_current = clone(terminal_current)
+        assert isinstance(unknown_child_current, dict)
+        unknown_child_current["raw_review_records"] = [unknown_child_review]
+        unknown_child_current["raw_inline_records"] = [
+            raw_inline_record(item) for item in unknown_child_associated["records"]
+        ]
+        unknown_child_thread_nodes: list[dict[str, object]] = []
+        for unknown_child_page in unknown_child_threads["pages"]:
+            unknown_child_thread_nodes.extend(clone(unknown_child_page["nodes"]))
+        unknown_child_current["raw_thread_nodes"] = unknown_child_thread_nodes
+        malformed_unknown_state_variants["child-bearing"] = (
+            unknown_child_current,
+            unknown_child_id,
+        )
+
+        for malformed_variant, (
+            malformed_unknown_current,
+            malformed_unknown_id,
+        ) in malformed_unknown_state_variants.items():
+            with self.subTest(terminal_looking_unknown_review_state=malformed_variant):
+                malformed_unknown_history = history(
+                    samples,
+                    current_raw=malformed_unknown_current,
+                )
+                parsed_malformed_unknown = parse_current_endpoint_inventory(
+                    malformed_unknown_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                self.assertIsNotNone(parsed_malformed_unknown)
+                assert isinstance(parsed_malformed_unknown, dict)
+                self.assertIn(
+                    {
+                        "id": malformed_unknown_id,
+                        "semantic": "malformed",
+                    },
+                    [
+                        {
+                            "id": item["id"],
+                            "semantic": item["semantic"],
+                        }
+                        for item in parsed_malformed_unknown[
+                            "current_authority_projection"
+                        ]["applicable_artifacts"]
+                    ],
+                )
+                self.assertFalse(
+                    current_raw_authority_matches(
+                        malformed_unknown_history,
+                        terminal_current,
+                    )
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        malformed_unknown_history,
+                        terminal_current,
+                        post_as_of_lane_timing,
+                    )
+                )
 
         nonterminal_drift_cases: dict[
             str, tuple[dict[str, object], dict[str, object]]
