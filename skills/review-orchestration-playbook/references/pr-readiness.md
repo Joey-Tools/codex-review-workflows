@@ -83,19 +83,35 @@ matches the production runtime pin after the final commit exists. First resolve
 and record a parent-validated absolute Python 3.13 interpreter whose entire
 resolved execution path satisfies the no-group-write/no-other-write access
 policy. A convenience symlink through a standard group-writable Homebrew
-`Cellar` does not satisfy that policy. Start from the repository root and enter
-the source-only gate by absolute path. The gate starts under an empty
-environment with isolated, site-disabled, bytecode-disabled Python. The gate
-itself is streamed from the frozen HEAD blob through bounded stdin, so no
-candidate worktree path executes before that binding. A second exact-HEAD blob
-binds a closed source manifest containing every regular file's relative path,
-Git mode, byte length, and SHA-256 under `review_supervisor/` and `tests/`.
+`Cellar` does not satisfy that policy. Separately resolve and record a physical,
+parent-validated Git 2.45 or newer executable plus its exact exec-path; do not
+use the macOS `/usr/bin/git` toolchain dispatcher. Create a new owner-private
+control root outside the candidate repository, bind the source repository's
+physical common object directory, and reject the platform path-list separator
+in either path. The bootstrap initializes an empty bare control repository and
+exposes the source object directory only as a read-only alternate. Source local
+configuration, remotes, credential helpers, and promisor settings are therefore
+never loaded. Every Git invocation additionally disables lazy fetch, prompts,
+user-initiated protocols, optional writes, replacement objects, credential
+helpers, and all transport protocols before the first object query.
+
+Start from the repository root and enter the source-only gate by absolute path.
+The gate starts under an empty environment with isolated, site-disabled,
+bytecode-disabled Python. The gate itself is streamed from the frozen HEAD blob
+through bounded stdin, so no candidate worktree path executes before that
+binding. A second exact-HEAD blob binds a closed source manifest containing
+every regular file's relative path, Git mode, byte length, and SHA-256 under
+`review_supervisor/` and `tests/`.
 The gate snapshots the complete inventory, rejects missing or extra entries,
 symlinks, bytecode/native substitutes, and duplicate module mappings, and only
 then compiles the captured matching bytes:
 
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
+TRUSTED_GIT=/absolute/path/to/parent-validated/git
+TRUSTED_GIT_EXEC_PATH=/absolute/path/to/parent-validated/git-core
+CONTROL_ROOT=/absolute/path/to/parent-validated/absent-owner-private-control-root
+SOURCE_OBJECTS=/absolute/path/to/parent-validated-common-git-objects
 REPO_ROOT="$PWD"
 TOOL_REL=skills/review-orchestration-playbook/scripts/independent_codex_pr_review
 TOOL_ROOT="$REPO_ROOT/$TOOL_REL"
@@ -103,11 +119,137 @@ HEAD_SHA=<full-head-sha>
 GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"
 SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"
 SOURCE_MANIFEST_SPEC="$HEAD_SHA:$TOOL_REL/trusted_mac_gate_sources.index"
-trusted_git() {
-  /usr/bin/env -i GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-    HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin \
-    /usr/bin/git --no-replace-objects -C "$REPO_ROOT" "$@"
+CONTROL_GIT="$CONTROL_ROOT/repository.git"
+CONTROL_HOME="$CONTROL_ROOT/home"
+CONTROL_HOOKS="$CONTROL_ROOT/hooks"
+CONTROL_TEMPLATE="$CONTROL_ROOT/template"
+CONTROL_TMP="$CONTROL_ROOT/tmp"
+CONTROL_CONFIG="$CONTROL_GIT/config"
+CONTROL_PARENT="$(/usr/bin/dirname "$CONTROL_ROOT")"
+CONTROL_UID="$(/usr/bin/id -u)"
+probe_source_objects_acl() {
+  /usr/bin/find -s "$SOURCE_OBJECTS" -exec /bin/ls -lde {} \; \
+    | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
 }
+probe_source_object_escape_metadata() {
+  local promisor_marker=""
+  if [[ -L "$SOURCE_OBJECTS/info" ]] \
+    || [[ -L "$SOURCE_OBJECTS/pack" ]] \
+    || [[ -e "$SOURCE_OBJECTS/info/alternates" ]] \
+    || [[ -L "$SOURCE_OBJECTS/info/alternates" ]] \
+    || [[ -e "$SOURCE_OBJECTS/info/http-alternates" ]] \
+    || [[ -L "$SOURCE_OBJECTS/info/http-alternates" ]]; then
+    printf '%s\n' alternate-metadata
+    return 0
+  fi
+  for promisor_marker in "$SOURCE_OBJECTS/pack/"*.promisor; do
+    if [[ -e "$promisor_marker" || -L "$promisor_marker" ]]; then
+      printf '%s\n' promisor-marker
+      return 0
+    fi
+  done
+}
+probe_control_acl() {
+  /usr/bin/find -s "$CONTROL_ROOT" -exec /bin/ls -lde {} \; \
+    | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+}
+CONTROL_PARENT_PHYSICAL="$(cd "$CONTROL_PARENT" && pwd -P)"
+CONTROL_PARENT_MODE="$(/usr/bin/stat -f '%Lp' "$CONTROL_PARENT")"
+SOURCE_OBJECTS_PHYSICAL="$(cd "$SOURCE_OBJECTS" && pwd -P)"
+SOURCE_OBJECTS_MODE="$(/usr/bin/stat -f '%Lp' "$SOURCE_OBJECTS")"
+SOURCE_OBJECTS_ACL_VIOLATION="$(probe_source_objects_acl)" \
+  || SOURCE_OBJECTS_ACL_VIOLATION="<unreadable>"
+SOURCE_OBJECT_ESCAPE_METADATA="$(probe_source_object_escape_metadata)" \
+  || SOURCE_OBJECT_ESCAPE_METADATA="<unreadable>"
+TRUSTED_GIT_PHYSICAL="$(
+  cd "$(/usr/bin/dirname "$TRUSTED_GIT")" && pwd -P
+)/$(/usr/bin/basename "$TRUSTED_GIT")"
+TRUSTED_GIT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$TRUSTED_GIT")"
+TRUSTED_GIT_SHA256_RECORD="$(/usr/bin/shasum -a 256 "$TRUSTED_GIT")"
+TRUSTED_GIT_SHA256="${TRUSTED_GIT_SHA256_RECORD%% *}"
+TRUSTED_GIT_EXEC_PATH_PHYSICAL="$(cd "$TRUSTED_GIT_EXEC_PATH" && pwd -P)"
+TRUSTED_GIT_EXEC_PATH_BINDING="$(
+  /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_EXEC_PATH"
+)"
+if [[ "$CONTROL_ROOT" != /* || "$SOURCE_OBJECTS" != /* ]] \
+  || [[ "$CONTROL_ROOT" == *:* || "$SOURCE_OBJECTS" == *:* ]] \
+  || [[ "$CONTROL_ROOT" == *$'\n'* || "$SOURCE_OBJECTS" == *$'\n'* ]] \
+  || [[ "$CONTROL_PARENT_PHYSICAL" != "$CONTROL_PARENT" ]] \
+  || [[ "$SOURCE_OBJECTS_PHYSICAL" != "$SOURCE_OBJECTS" ]] \
+  || [[ ! "$CONTROL_UID" =~ ^[[:digit:]]+$ ]] \
+  || [[ ! "$CONTROL_PARENT_MODE" =~ ^[0-7]{3,4}$ ]] \
+  || [[ ! "$SOURCE_OBJECTS_MODE" =~ ^[0-7]{3,4}$ ]] \
+  || (( (8#$CONTROL_PARENT_MODE & 0022) != 0 )) \
+  || (( (8#$SOURCE_OBJECTS_MODE & 0022) != 0 )) \
+  || [[ -n "$SOURCE_OBJECTS_ACL_VIOLATION" ]] \
+  || [[ -n "$SOURCE_OBJECT_ESCAPE_METADATA" ]] \
+  || [[ "$TRUSTED_GIT_PHYSICAL" != "$TRUSTED_GIT" ]] \
+  || [[ ! -f "$TRUSTED_GIT" || -L "$TRUSTED_GIT" ]] \
+  || [[ ! "$TRUSTED_GIT_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || [[ "$TRUSTED_GIT_EXEC_PATH_PHYSICAL" != "$TRUSTED_GIT_EXEC_PATH" ]] \
+  || [[ ! -d "$TRUSTED_GIT_EXEC_PATH" || -L "$TRUSTED_GIT_EXEC_PATH" ]] \
+  || [[ -e "$CONTROL_ROOT" || -L "$CONTROL_ROOT" ]] \
+  || [[ ! -d "$SOURCE_OBJECTS" || -L "$SOURCE_OBJECTS" ]]; then
+  printf 'unsafe trusted Git bootstrap paths\n' >&2
+  exit 1
+fi
+/bin/mkdir -m 0700 "$CONTROL_ROOT"
+/bin/mkdir -m 0700 "$CONTROL_HOME" "$CONTROL_HOOKS" "$CONTROL_TEMPLATE" "$CONTROL_TMP"
+CONTROL_ROOT_PHYSICAL="$(cd "$CONTROL_ROOT" && pwd -P)"
+CONTROL_ROOT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_ROOT")"
+SOURCE_OBJECTS_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$SOURCE_OBJECTS")"
+if [[ "$CONTROL_ROOT_PHYSICAL" != "$CONTROL_ROOT" ]] \
+  || [[ "$(/usr/bin/stat -f '%u:%Lp' "$CONTROL_ROOT")" != "$CONTROL_UID:700" ]]; then
+  printf 'trusted Git control root failed custody validation\n' >&2
+  exit 1
+fi
+bootstrap_git() {
+  /usr/bin/env -i GIT_ASKPASS=/usr/bin/false GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_SYSTEM=/dev/null GIT_EXEC_PATH="$TRUSTED_GIT_EXEC_PATH" \
+    GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    GIT_PAGER=cat GIT_PROTOCOL_FROM_USER=0 GIT_TERMINAL_PROMPT=0 \
+    HOME="$CONTROL_HOME" LANG=C LC_ALL=C PAGER=cat PATH=/usr/bin:/bin \
+    TMPDIR="$CONTROL_TMP" \
+    "$TRUSTED_GIT" --no-pager --no-replace-objects "$@"
+}
+bootstrap_git init --bare -q --template="$CONTROL_TEMPLATE" "$CONTROL_GIT"
+/bin/chmod -RN "$CONTROL_ROOT"
+/bin/chmod -R go-rwx "$CONTROL_ROOT"
+/bin/chmod 0600 "$CONTROL_CONFIG"
+CONTROL_GIT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_GIT")"
+CONTROL_CONFIG_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$CONTROL_CONFIG")"
+CONTROL_CONFIG_SHA256_RECORD="$(/usr/bin/shasum -a 256 "$CONTROL_CONFIG")"
+CONTROL_CONFIG_SHA256="${CONTROL_CONFIG_SHA256_RECORD%% *}"
+CONTROL_ACL_VIOLATION="$(probe_control_acl)" \
+  || CONTROL_ACL_VIOLATION="<unreadable>"
+trusted_git() {
+  /usr/bin/env -i GIT_ALTERNATE_OBJECT_DIRECTORIES="$SOURCE_OBJECTS" \
+    GIT_ASKPASS=/usr/bin/false GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_SYSTEM=/dev/null GIT_DIR="$CONTROL_GIT" \
+    GIT_EXEC_PATH="$TRUSTED_GIT_EXEC_PATH" GIT_NO_LAZY_FETCH=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_PAGER=cat \
+    GIT_PROTOCOL_FROM_USER=0 GIT_TERMINAL_PROMPT=0 HOME="$CONTROL_HOME" \
+    LANG=C LC_ALL=C PAGER=cat PATH=/usr/bin:/bin TMPDIR="$CONTROL_TMP" \
+    "$TRUSTED_GIT" --no-pager --no-replace-objects \
+      -c core.commitGraph=false -c core.multiPackIndex=false \
+      -c core.fsmonitor=false -c core.hooksPath="$CONTROL_HOOKS" \
+      -c core.attributesFile=/dev/null -c maintenance.auto=false \
+      -c credential.helper= -c protocol.ext.allow=never \
+      -c protocol.file.allow=never -c protocol.git.allow=never \
+      -c protocol.http.allow=never -c protocol.https.allow=never \
+      -c protocol.ssh.allow=never "$@"
+}
+CONTROL_SYMLINK="$(/usr/bin/find "$CONTROL_ROOT" -type l -print -quit)"
+if [[ -n "$CONTROL_SYMLINK" ]] \
+  || [[ -n "$CONTROL_ACL_VIOLATION" ]] \
+  || [[ ! "$CONTROL_CONFIG_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || trusted_git config --local --name-only \
+    --get-regexp '^(remote|credential|protocol)\.' >/dev/null 2>&1; then
+  printf 'unsafe trusted Git control repository\n' >&2
+  exit 1
+fi
 set -o pipefail
 if ! GATE_SIZE="$(trusted_git cat-file -s "$GATE_SPEC")"; then
   printf 'unable to read trusted gate size\n' >&2
@@ -148,6 +290,84 @@ if [[ ! "$SOURCE_MANIFEST_SIZE" =~ ^[[:digit:]]+$ ]] \
   printf 'trusted source manifest is not the exact HEAD blob\n' >&2
   exit 1
 fi
+verify_trusted_git_bootstrap_custody() {
+  local phase="$1"
+  local current_control_root_binding=""
+  local current_control_git_binding=""
+  local current_control_config_binding=""
+  local current_control_config_sha256_record=""
+  local current_control_config_sha256=""
+  local current_control_acl_violation=""
+  local current_source_objects_physical=""
+  local current_source_objects_binding=""
+  local current_source_objects_acl_violation=""
+  local current_source_object_escape_metadata=""
+  local current_trusted_git_physical=""
+  local current_trusted_git_binding=""
+  local current_trusted_git_sha256_record=""
+  local current_trusted_git_sha256=""
+  local current_trusted_git_exec_path_physical=""
+  local current_trusted_git_exec_path_binding=""
+  current_control_root_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_ROOT"
+  )" || current_control_root_binding="<unreadable>"
+  current_control_git_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_GIT"
+  )" || current_control_git_binding="<unreadable>"
+  current_control_config_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$CONTROL_CONFIG"
+  )" || current_control_config_binding="<unreadable>"
+  current_control_config_sha256_record="$(
+    /usr/bin/shasum -a 256 "$CONTROL_CONFIG"
+  )" || current_control_config_sha256_record="<unreadable>"
+  current_control_config_sha256="${current_control_config_sha256_record%% *}"
+  current_control_acl_violation="$(probe_control_acl)" \
+    || current_control_acl_violation="<unreadable>"
+  current_source_objects_physical="$(cd "$SOURCE_OBJECTS" && pwd -P)" \
+    || current_source_objects_physical="<unreadable>"
+  current_source_objects_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$SOURCE_OBJECTS"
+  )" || current_source_objects_binding="<unreadable>"
+  current_source_objects_acl_violation="$(probe_source_objects_acl)" \
+    || current_source_objects_acl_violation="<unreadable>"
+  current_source_object_escape_metadata="$(probe_source_object_escape_metadata)" \
+    || current_source_object_escape_metadata="<unreadable>"
+  current_trusted_git_physical="$(
+    cd "$(/usr/bin/dirname "$TRUSTED_GIT")" && pwd -P
+  )/$(/usr/bin/basename "$TRUSTED_GIT")" \
+    || current_trusted_git_physical="<unreadable>"
+  current_trusted_git_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$TRUSTED_GIT"
+  )" || current_trusted_git_binding="<unreadable>"
+  current_trusted_git_sha256_record="$(
+    /usr/bin/shasum -a 256 "$TRUSTED_GIT"
+  )" || current_trusted_git_sha256_record="<unreadable>"
+  current_trusted_git_sha256="${current_trusted_git_sha256_record%% *}"
+  current_trusted_git_exec_path_physical="$(
+    cd "$TRUSTED_GIT_EXEC_PATH" && pwd -P
+  )" || current_trusted_git_exec_path_physical="<unreadable>"
+  current_trusted_git_exec_path_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_EXEC_PATH"
+  )" || current_trusted_git_exec_path_binding="<unreadable>"
+  if [[ "$current_control_root_binding" != "$CONTROL_ROOT_BINDING" ]] \
+    || [[ "$current_control_git_binding" != "$CONTROL_GIT_BINDING" ]] \
+    || [[ "$current_control_config_binding" != "$CONTROL_CONFIG_BINDING" ]] \
+    || [[ "$current_control_config_sha256" != "$CONTROL_CONFIG_SHA256" ]] \
+    || [[ -n "$current_control_acl_violation" ]] \
+    || [[ "$current_source_objects_physical" != "$SOURCE_OBJECTS" ]] \
+    || [[ "$current_source_objects_binding" != "$SOURCE_OBJECTS_BINDING" ]] \
+    || [[ -n "$current_source_objects_acl_violation" ]] \
+    || [[ -n "$current_source_object_escape_metadata" ]] \
+    || [[ "$current_trusted_git_physical" != "$TRUSTED_GIT" ]] \
+    || [[ "$current_trusted_git_binding" != "$TRUSTED_GIT_BINDING" ]] \
+    || [[ "$current_trusted_git_sha256" != "$TRUSTED_GIT_SHA256" ]] \
+    || [[ "$current_trusted_git_exec_path_physical" != "$TRUSTED_GIT_EXEC_PATH" ]] \
+    || [[ "$current_trusted_git_exec_path_binding" != "$TRUSTED_GIT_EXEC_PATH_BINDING" ]]; then
+    printf 'trusted Git bootstrap custody changed %s\n' "$phase" >&2
+    return 1
+  fi
+}
+verify_trusted_git_bootstrap_custody 'before gate execution'
 trusted_git cat-file blob "$GATE_SPEC" \
   | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
       "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
@@ -156,10 +376,13 @@ trusted_git cat-file blob "$GATE_SPEC" \
   | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
       "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
       "$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"
+verify_trusted_git_bootstrap_custody 'after gate execution'
 ```
 
-Record the interpreter's absolute path and digest, exact `head_sha`, gate blob
-size and SHA-256, and source-manifest blob size and SHA-256; record
+Record the interpreter and Git executable/exec-path absolute paths and digests,
+the isolated control-repository identity, source-object-directory identity,
+exact `head_sha`, gate blob size and SHA-256, and source-manifest blob size and
+SHA-256; record
 the live runner's thirteen tests, zero skips, and terminal result, followed by the
 read-only install runner's complete structured summary. Accept that summary
 only when all of these predicates hold:

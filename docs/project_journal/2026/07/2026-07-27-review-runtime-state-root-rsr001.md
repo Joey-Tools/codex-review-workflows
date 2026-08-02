@@ -120,6 +120,15 @@ superseded_by:
   syntax validation and explicit zero-cache guards. Their Python 3.13
   workflows run the installed-release immutability regression in a dedicated
   20-minute job, separate from the ordinary deterministic supervisor job.
+- Trusted Mac gate bootstrap object reads no longer load the candidate
+  repository's Git configuration. The hosted gate binds a detached exact-SHA
+  checkout, its Git object directory, and its `HEAD` file before creating an
+  owner-private empty bare control repository outside the candidate source. A
+  fixed direct Git executable reads the source objects only as an alternate,
+  with lazy fetch, prompts, credentials, replacement objects, optional writes,
+  and every transport protocol disabled. Control/source identities and the
+  control config digest are revalidated before and after the bounded object
+  reads. The documented operator gate uses the same isolated-control model.
 
 ## Next Steps
 
@@ -493,3 +502,36 @@ superseded_by:
   and 11 errors after 1203.084 seconds. Repeating the exact frozen tree on the
   same Python 3.13.12 runtime outside that sandbox passed 2,834/2,834 in
   1036.788 seconds with six existing platform skips.
+- The prior-bundle fresh Codex retry for exact head
+  `e8a0080de284711893c416f7ca546182e748c9fa` returned one P1: the Trusted Mac
+  bootstrap still ran its first `cat-file` through candidate-local Git config,
+  so a missing promisor blob could trigger lazy fetch, credential or remote
+  helpers, object-store writes, and external commands before isolated Python
+  started. The independent reviewer workspace was safely cleaned, and the
+  prior-b4ca control manifest remained
+  `b383222c430ab57779a750d137d509db885b235ca5bdb5ace2845ccdb7d3c71b`.
+  That finding makes all e8a admission, CI, Claude, and review evidence stale.
+- The replacement bootstrap uses an empty owner-private control repository and
+  the candidate object directory only as a read-only alternate. A real
+  malicious-promisor regression proves that the unsafe source-local query
+  starts an `ext::` helper, while the isolated query fails with no stdout,
+  helper start, or object materialization. Two bounded precommit audits then
+  required a positive alternate read before the missing-object failure, full
+  source/control object-store inventory comparison, recursive source/control
+  ACL rejection, rejection of local/HTTP alternate metadata and promisor pack
+  markers, and a final operator-side Git executable/digest/exec-path custody
+  check after both streamed gate executions. All five findings were fixed.
+  Final repository contracts passed 107/107 in 8.982 seconds. Extracted
+  workflow and operator shell passed `bash -n` and ShellCheck 0.11.0; Ruby
+  Psych parsed the workflow and canonical/private fixture parity remained
+  enforced. One exact 120-second actionlint run timed out with empty output and
+  is tooling-inconclusive rather than a lint result.
+- A Desktop-sandbox deterministic run was non-counting after Git emitted
+  `DARWIN_USER_TEMP_DIR` fallback warnings to stderr, causing 22 failures and 2
+  errors. The affected source-binding class passed 14/14 in 20.942 seconds at
+  host level. After all precommit findings were fixed, the same Python 3.13.12
+  host runtime passed the complete deterministic selection 847/847 in 283.459
+  seconds with unchanged identity
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`,
+  followed by full discovery 2,835/2,835 in 1058.164 seconds with six existing
+  platform skips.

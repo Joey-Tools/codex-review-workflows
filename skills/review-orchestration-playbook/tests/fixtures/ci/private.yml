@@ -172,6 +172,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Install pinned uv
         id: setup-uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -537,17 +541,151 @@ jobs:
           /usr/bin/printf '%s\n' \
             "Pinned Xcode Git: developer_dir=$DEVELOPER_DIR executable=$direct_git exec_path=$direct_git_exec_path sha256=$direct_git_digest loader_receipt=$direct_git_loader_binding codesign_receipt=$direct_git_codesign_binding"
           checkout_root="$(pwd -P)"
+          bootstrap_uid="$(/usr/bin/id -u)"
+          bootstrap_gid="$(/usr/bin/id -g)"
+          checkout_git_dir="$checkout_root/.git"
+          checkout_git_objects="$checkout_git_dir/objects"
+          checkout_head_file="$checkout_git_dir/HEAD"
+          probe_checkout_git_source_acl() {
+            {
+              /bin/ls -lde "$checkout_git_dir"
+              /bin/ls -lde "$checkout_head_file"
+              /usr/bin/find -s "$checkout_git_objects" -exec /bin/ls -lde {} \;
+            } | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          }
+          probe_checkout_git_escape_metadata() {
+            local promisor_marker=""
+            if [[ -L "$checkout_git_objects/info" ]] \
+              || [[ -L "$checkout_git_objects/pack" ]] \
+              || [[ -e "$checkout_git_objects/info/alternates" ]] \
+              || [[ -L "$checkout_git_objects/info/alternates" ]] \
+              || [[ -e "$checkout_git_objects/info/http-alternates" ]] \
+              || [[ -L "$checkout_git_objects/info/http-alternates" ]]; then
+              /usr/bin/printf '%s\n' alternate-metadata
+              return 0
+            fi
+            for promisor_marker in "$checkout_git_objects/pack/"*.promisor; do
+              if [[ -e "$promisor_marker" || -L "$promisor_marker" ]]; then
+                /usr/bin/printf '%s\n' promisor-marker
+                return 0
+              fi
+            done
+          }
+          if [[ ! "$bootstrap_uid" =~ ^[[:digit:]]+$ ]] \
+            || [[ ! "$bootstrap_gid" =~ ^[[:digit:]]+$ ]] \
+            || ! /bin/test -d "$checkout_git_dir" \
+            || /bin/test -L "$checkout_git_dir" \
+            || ! /bin/test -d "$checkout_git_objects" \
+            || /bin/test -L "$checkout_git_objects" \
+            || ! /bin/test -f "$checkout_head_file" \
+            || /bin/test -L "$checkout_head_file"; then
+            /usr/bin/printf '%s\n' "::error::Checkout Git metadata is not safely bindable"
+            exit 1
+          fi
+          checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || checkout_git_source_acl_violation="<unreadable>"
+          checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || checkout_git_escape_metadata="<unreadable>"
+          checkout_git_dir_physical="$(cd "$checkout_git_dir" && pwd -P)"
+          checkout_git_objects_physical="$(cd "$checkout_git_objects" && pwd -P)"
+          checkout_head_file_physical="$(cd "$checkout_git_dir" && pwd -P)/HEAD"
+          checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          checkout_git_dir_mode="$(/usr/bin/stat -f '%Lp' "$checkout_git_dir")"
+          checkout_git_objects_mode="$(/usr/bin/stat -f '%Lp' "$checkout_git_objects")"
+          checkout_head_mode="$(/usr/bin/stat -f '%Lp' "$checkout_head_file")"
+          checkout_head_size="$(/usr/bin/stat -f '%z' "$checkout_head_file")"
+          checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          if [[ "$checkout_git_dir_physical" != "$checkout_git_dir" ]] \
+            || [[ "$checkout_git_objects_physical" != "$checkout_git_objects" ]] \
+            || [[ "$checkout_head_file_physical" != "$checkout_head_file" ]] \
+            || [[ "$checkout_git_objects" == *:* ]] \
+            || [[ ! "$checkout_git_dir_mode" =~ ^[0-7]{3,4}$ ]] \
+            || [[ ! "$checkout_git_objects_mode" =~ ^[0-7]{3,4}$ ]] \
+            || [[ ! "$checkout_head_mode" =~ ^[0-7]{3,4}$ ]] \
+            || (( (8#$checkout_git_dir_mode & 0022) != 0 )) \
+            || (( (8#$checkout_git_objects_mode & 0022) != 0 )) \
+            || (( (8#$checkout_head_mode & 0022) != 0 )) \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_git_dir")" != "$bootstrap_uid" ]] \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_git_objects")" != "$bootstrap_uid" ]] \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_head_file")" != "$bootstrap_uid" ]] \
+            || [[ -n "$checkout_git_source_acl_violation" ]] \
+            || [[ -n "$checkout_git_escape_metadata" ]] \
+            || [[ ! "$checkout_head_size" =~ ^[[:digit:]]+$ ]] \
+            || (( checkout_head_size != 41 )) \
+            || [[ ! "$checkout_head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            /usr/bin/printf '%s\n' "::error::Checkout Git object root or detached HEAD is not safely bindable"
+            exit 1
+          fi
+          checkout_bootstrap_root="$isolated_root/git-bootstrap"
+          checkout_git_control="$checkout_bootstrap_root/repository.git"
+          checkout_git_home="$checkout_bootstrap_root/home"
+          checkout_git_hooks="$checkout_bootstrap_root/hooks"
+          checkout_git_template="$checkout_bootstrap_root/template"
+          checkout_git_tmp="$checkout_bootstrap_root/tmp"
+          bootstrap_checkout_git() {
+            /usr/bin/env -i \
+              DEVELOPER_DIR="$DEVELOPER_DIR" \
+              GIT_ASKPASS=/usr/bin/false \
+              GIT_ATTR_NOSYSTEM=1 \
+              GIT_CEILING_DIRECTORIES="$isolated_root" \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              GIT_EXEC_PATH="$direct_git_exec_path" \
+              GIT_NO_LAZY_FETCH=1 \
+              GIT_NO_REPLACE_OBJECTS=1 \
+              GIT_OPTIONAL_LOCKS=0 \
+              GIT_PAGER=cat \
+              GIT_PROTOCOL_FROM_USER=0 \
+              GIT_TERMINAL_PROMPT=0 \
+              HOME="$checkout_git_home" \
+              LANG=C \
+              LC_ALL=C \
+              PAGER=cat \
+              PATH=/usr/bin:/bin \
+              TMPDIR="$checkout_git_tmp" \
+              "$direct_git" --no-pager --no-replace-objects \
+                -C "$checkout_bootstrap_root" "$@"
+          }
           trusted_checkout_git() {
             /usr/bin/env -i \
               DEVELOPER_DIR="$DEVELOPER_DIR" \
+              GIT_ALTERNATE_OBJECT_DIRECTORIES="$checkout_git_objects" \
+              GIT_ASKPASS=/usr/bin/false \
+              GIT_ATTR_NOSYSTEM=1 \
               GIT_CONFIG_GLOBAL=/dev/null \
               GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              GIT_DIR="$checkout_git_control" \
               GIT_EXEC_PATH="$direct_git_exec_path" \
-              HOME=/ \
+              GIT_NO_LAZY_FETCH=1 \
+              GIT_NO_REPLACE_OBJECTS=1 \
+              GIT_OPTIONAL_LOCKS=0 \
+              GIT_PAGER=cat \
+              GIT_PROTOCOL_FROM_USER=0 \
+              GIT_TERMINAL_PROMPT=0 \
+              HOME="$checkout_git_home" \
               LANG=C \
               LC_ALL=C \
+              PAGER=cat \
               PATH=/usr/bin:/bin \
-              "$direct_git" --no-replace-objects -C "$checkout_root" "$@"
+              TMPDIR="$checkout_git_tmp" \
+              "$direct_git" --no-pager --no-replace-objects \
+                -c core.commitGraph=false \
+                -c core.multiPackIndex=false \
+                -c core.fsmonitor=false \
+                -c core.hooksPath="$checkout_git_hooks" \
+                -c core.attributesFile=/dev/null \
+                -c maintenance.auto=false \
+                -c credential.helper= \
+                -c protocol.ext.allow=never \
+                -c protocol.file.allow=never \
+                -c protocol.git.allow=never \
+                -c protocol.http.allow=never \
+                -c protocol.https.allow=never \
+                -c protocol.ssh.allow=never "$@"
           }
           source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"
           source_review_root_physical="$(cd "$source_review_root" && pwd -P)"
@@ -601,6 +739,45 @@ jobs:
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
           /usr/bin/sudo /bin/chmod 0755 "$isolated_root"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" = "0:755"
+          /usr/bin/sudo /bin/test ! -e "$checkout_bootstrap_root"
+          /usr/bin/sudo /bin/test ! -L "$checkout_bootstrap_root"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$checkout_bootstrap_root"
+          /usr/bin/sudo /usr/sbin/chown "$bootstrap_uid:$bootstrap_gid" "$checkout_bootstrap_root"
+          test "$(/usr/bin/stat -f '%u:%g:%Lp' "$checkout_bootstrap_root")" = \
+            "$bootstrap_uid:$bootstrap_gid:700"
+          checkout_bootstrap_root_physical="$(cd "$checkout_bootstrap_root" && pwd -P)"
+          checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          if [[ "$checkout_bootstrap_root_physical" != "$checkout_bootstrap_root" ]]; then
+            /usr/bin/printf '%s\n' "::error::Git bootstrap control root is not physical"
+            exit 1
+          fi
+          /bin/mkdir -m 0700 \
+            "$checkout_git_home" "$checkout_git_hooks" \
+            "$checkout_git_template" "$checkout_git_tmp"
+          bootstrap_checkout_git init --bare -q \
+            --template="$checkout_git_template" "$checkout_git_control"
+          /bin/chmod -RN "$checkout_bootstrap_root"
+          /bin/chmod -R go-rwx "$checkout_bootstrap_root"
+          /bin/chmod 0600 "$checkout_git_control/config"
+          checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          checkout_git_config_digest="${checkout_git_config_digest%% *}"
+          checkout_git_control_symlink="$(/usr/bin/find "$checkout_bootstrap_root" -type l -print -quit)"
+          checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || checkout_git_control_acl_violation="<unreadable>"
+          if [[ -n "$checkout_git_control_symlink" ]] \
+            || [[ -n "$checkout_git_control_acl_violation" ]] \
+            || [[ ! "$checkout_git_config_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || trusted_checkout_git config --local --name-only \
+              --get-regexp '^(remote|credential|protocol)\.' >/dev/null 2>&1; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap control is unsafe"
+            exit 1
+          fi
+          /usr/bin/printf '%s\n' \
+            "Isolated Git bootstrap: control=$checkout_git_control_binding config=$checkout_git_config_binding config_sha256=$checkout_git_config_digest objects=$checkout_git_objects head=$checkout_head_sha"
           review_user_guid="$(/usr/bin/uuidgen)"
           review_group_guid="$(/usr/bin/uuidgen)"
           review_account_suffix="$(/usr/bin/printf '%s' "$review_user_guid" \
@@ -1123,7 +1300,47 @@ jobs:
           run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
           run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
           run_review_user /bin/test ! -w "$isolated_source"
-          gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/trusted_mac_gate.py"
+          prequery_developer_dir_physical="$(cd "$DEVELOPER_DIR" && pwd -P)"
+          prequery_direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")"
+          prequery_direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")"
+          prequery_direct_git_digest="${prequery_direct_git_digest%% *}"
+          prequery_direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")"
+          prequery_checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          prequery_checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          prequery_checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          prequery_checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          prequery_checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          prequery_checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          prequery_checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          prequery_checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          prequery_checkout_git_config_digest="${prequery_checkout_git_config_digest%% *}"
+          prequery_checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || prequery_checkout_git_source_acl_violation="<unreadable>"
+          prequery_checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || prequery_checkout_git_control_acl_violation="<unreadable>"
+          prequery_checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || prequery_checkout_git_escape_metadata="<unreadable>"
+          if [[ "$prequery_developer_dir_physical" != "$DEVELOPER_DIR" ]] \
+            || [[ "$prequery_direct_git_binding" != "$direct_git_binding" ]] \
+            || [[ "$prequery_direct_git_digest" != "$direct_git_digest" ]] \
+            || [[ "$prequery_direct_git_exec_path_binding" != "$direct_git_exec_path_binding" ]] \
+            || [[ "$prequery_checkout_git_dir_binding" != "$checkout_git_dir_binding" ]] \
+            || [[ "$prequery_checkout_git_objects_binding" != "$checkout_git_objects_binding" ]] \
+            || [[ "$prequery_checkout_head_binding" != "$checkout_head_binding" ]] \
+            || [[ "$prequery_checkout_head_sha" != "$checkout_head_sha" ]] \
+            || [[ "$prequery_checkout_bootstrap_root_binding" != "$checkout_bootstrap_root_binding" ]] \
+            || [[ "$prequery_checkout_git_control_binding" != "$checkout_git_control_binding" ]] \
+            || [[ "$prequery_checkout_git_config_binding" != "$checkout_git_config_binding" ]] \
+            || [[ "$prequery_checkout_git_config_digest" != "$checkout_git_config_digest" ]] \
+            || [[ -n "$prequery_checkout_git_source_acl_violation" ]] \
+            || [[ -n "$prequery_checkout_git_control_acl_violation" ]] \
+            || [[ -n "$prequery_checkout_git_escape_metadata" ]]; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap custody changed before object reads"
+            exit 1
+          fi
+          gate_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/tests/trusted_mac_gate.py"
           gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"
           gate_digest="$(trusted_checkout_git cat-file blob "$gate_spec" | /usr/bin/shasum -a 256)"
           gate_digest="${gate_digest%% *}"
@@ -1137,7 +1354,7 @@ jobs:
           fi
           echo "Trusted gate bootstrap: bytes=$gate_size sha256=$gate_digest"
           gate_manifest="$isolated_source/trusted_mac_gate_sources.index"
-          gate_manifest_spec="HEAD:$REVIEW_SOURCE_RELATIVE/trusted_mac_gate_sources.index"
+          gate_manifest_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/trusted_mac_gate_sources.index"
           gate_manifest_size="$(trusted_checkout_git cat-file -s "$gate_manifest_spec")"
           gate_manifest_digest="$(trusted_checkout_git cat-file blob "$gate_manifest_spec" | /usr/bin/shasum -a 256)"
           gate_manifest_digest="${gate_manifest_digest%% *}"
@@ -1152,6 +1369,46 @@ jobs:
             exit 1
           fi
           echo "Trusted gate source manifest: bytes=$gate_manifest_size sha256=$gate_manifest_digest"
+          current_checkout_git_objects_physical="$(cd "$checkout_git_objects" && pwd -P)"
+          current_checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          current_checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          current_checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          current_checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          current_checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          current_checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          current_checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          current_checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          current_checkout_git_config_digest="${current_checkout_git_config_digest%% *}"
+          current_direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")"
+          current_direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")"
+          current_direct_git_digest="${current_direct_git_digest%% *}"
+          current_direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")"
+          current_checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || current_checkout_git_source_acl_violation="<unreadable>"
+          current_checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || current_checkout_git_control_acl_violation="<unreadable>"
+          current_checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || current_checkout_git_escape_metadata="<unreadable>"
+          if [[ "$current_checkout_git_objects_physical" != "$checkout_git_objects" ]] \
+            || [[ "$current_checkout_git_dir_binding" != "$checkout_git_dir_binding" ]] \
+            || [[ "$current_checkout_git_objects_binding" != "$checkout_git_objects_binding" ]] \
+            || [[ "$current_checkout_head_binding" != "$checkout_head_binding" ]] \
+            || [[ "$current_checkout_head_sha" != "$checkout_head_sha" ]] \
+            || [[ "$current_checkout_bootstrap_root_binding" != "$checkout_bootstrap_root_binding" ]] \
+            || [[ "$current_checkout_git_control_binding" != "$checkout_git_control_binding" ]] \
+            || [[ "$current_checkout_git_config_binding" != "$checkout_git_config_binding" ]] \
+            || [[ "$current_checkout_git_config_digest" != "$checkout_git_config_digest" ]] \
+            || [[ "$current_direct_git_binding" != "$direct_git_binding" ]] \
+            || [[ "$current_direct_git_digest" != "$direct_git_digest" ]] \
+            || [[ "$current_direct_git_exec_path_binding" != "$direct_git_exec_path_binding" ]] \
+            || [[ -n "$current_checkout_git_source_acl_violation" ]] \
+            || [[ -n "$current_checkout_git_control_acl_violation" ]] \
+            || [[ -n "$current_checkout_git_escape_metadata" ]]; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap custody changed during object reads"
+            exit 1
+          fi
           run_review_user /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
           isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
           review_profile="$isolated_root/readonly_child_isolation.sb"

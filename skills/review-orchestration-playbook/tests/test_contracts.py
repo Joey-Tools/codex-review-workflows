@@ -1985,9 +1985,39 @@ class RepositoryContractTest(unittest.TestCase):
             "neither Hosted CI's blocker-signature probe nor its "
             "isolated-account read-only",
             "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
+            "TRUSTED_GIT=/absolute/path/to/parent-validated/git",
+            "TRUSTED_GIT_EXEC_PATH=/absolute/path/to/parent-validated/git-core",
+            "CONTROL_ROOT=/absolute/path/to/parent-validated/"
+            "absent-owner-private-control-root",
+            "SOURCE_OBJECTS=/absolute/path/to/parent-validated-common-git-objects",
             "TOOL_REL=skills/review-orchestration-playbook/scripts/"
             "independent_codex_pr_review",
             'TOOL_ROOT="$REPO_ROOT/$TOOL_REL"',
+            '[[ "$CONTROL_ROOT" != /* || "$SOURCE_OBJECTS" != /* ]]',
+            '[[ "$CONTROL_ROOT" == *:* || "$SOURCE_OBJECTS" == *:* ]]',
+            "(( (8#$CONTROL_PARENT_MODE & 0022) != 0 ))",
+            "(( (8#$SOURCE_OBJECTS_MODE & 0022) != 0 ))",
+            '[[ -e "$CONTROL_ROOT" || -L "$CONTROL_ROOT" ]]',
+            'GIT_ALTERNATE_OBJECT_DIRECTORIES="$SOURCE_OBJECTS"',
+            'GIT_DIR="$CONTROL_GIT"',
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_PROTOCOL_FROM_USER=0",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_ASKPASS=/usr/bin/false",
+            "-c credential.helper= -c protocol.ext.allow=never",
+            "-c protocol.file.allow=never -c protocol.git.allow=never",
+            "-c protocol.http.allow=never -c protocol.https.allow=never",
+            "CONTROL_CONFIG_SHA256",
+            "SOURCE_OBJECTS_BINDING",
+            "SOURCE_OBJECTS_ACL_VIOLATION",
+            '[[ -e "$SOURCE_OBJECTS/info/alternates" ]]',
+            '[[ -e "$SOURCE_OBJECTS/info/http-alternates" ]]',
+            '"$SOURCE_OBJECTS/pack/"*.promisor',
+            "TRUSTED_GIT_BINDING",
+            "TRUSTED_GIT_SHA256",
+            "TRUSTED_GIT_EXEC_PATH_BINDING",
+            "verify_trusted_git_bootstrap_custody 'before gate execution'",
+            "verify_trusted_git_bootstrap_custody 'after gate execution'",
             "/usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin",
             'GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"',
             'SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"',
@@ -2002,7 +2032,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \\',
             '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" live',
             "no-group-write/no-other-write",
-            "interpreter's absolute path and digest",
+            "interpreter and Git executable/exec-path absolute paths and digests",
             "HEAD_SHA=<full-head-sha>",
             '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"',
             "source_head_bound == true",
@@ -2010,6 +2040,14 @@ class RepositoryContractTest(unittest.TestCase):
             "production no-child proof",
         ):
             self.assertIn(requirement, pr_readiness)
+        self.assertGreater(
+            pr_readiness.index(
+                "verify_trusted_git_bootstrap_custody 'after gate execution'"
+            ),
+            pr_readiness.index(
+                '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"'
+            ),
+        )
         for unsafe_gate_check in (
             '[[ "$GATE_SIZE" =~ ^[[:digit:]]+$ ]] &&',
             '[[ "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]\nset -o pipefail',
@@ -2203,6 +2241,15 @@ class RepositoryContractTest(unittest.TestCase):
                     f"{skill_root}/scripts/independent_codex_pr_review",
                     readonly_job,
                 )
+                self.assertIn(
+                    """      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+""",
+                    readonly_job,
+                )
                 for requirement in (
                     "/usr/bin/sudo /usr/bin/mktemp -d "
                     "/private/codex-review-readonly.XXXXXX",
@@ -2215,6 +2262,29 @@ class RepositoryContractTest(unittest.TestCase):
                     '"$isolated_python" -I -B -S - "$isolated_source"',
                     '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
                     '"$isolated_root/payload/runtime" "$isolated_root/payload"',
+                    'checkout_git_objects="$checkout_git_dir/objects"',
+                    'checkout_head_sha="$(/bin/cat "$checkout_head_file")"',
+                    'checkout_git_control="$checkout_bootstrap_root/repository.git"',
+                    "probe_checkout_git_source_acl()",
+                    "probe_checkout_git_escape_metadata()",
+                    '[[ -e "$checkout_git_objects/info/alternates" ]]',
+                    '[[ -e "$checkout_git_objects/info/http-alternates" ]]',
+                    '"$checkout_git_objects/pack/"*.promisor',
+                    "bootstrap_checkout_git init --bare -q",
+                    'GIT_ALTERNATE_OBJECT_DIRECTORIES="$checkout_git_objects"',
+                    'GIT_DIR="$checkout_git_control"',
+                    "GIT_NO_LAZY_FETCH=1",
+                    "GIT_PROTOCOL_FROM_USER=0",
+                    "GIT_TERMINAL_PROMPT=0",
+                    "GIT_ASKPASS=/usr/bin/false",
+                    "-c credential.helper=",
+                    "-c protocol.ext.allow=never",
+                    "-c protocol.file.allow=never",
+                    "-c protocol.http.allow=never",
+                    "Isolated Git bootstrap custody changed before object reads",
+                    "Isolated Git bootstrap custody changed during object reads",
+                    'gate_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/'
+                    'tests/trusted_mac_gate.py"',
                 ):
                     self.assertIn(requirement, readonly_job)
                 for ambient_import_contract in (
@@ -2227,7 +2297,322 @@ class RepositoryContractTest(unittest.TestCase):
                     "chown nobody:nobody",
                 ):
                     self.assertNotIn(ambient_import_contract, readonly_job)
+                trusted_git_start = readonly_job.index("trusted_checkout_git() {")
+                trusted_git_end = readonly_job.index("\n          }", trusted_git_start)
+                trusted_git = readonly_job[trusted_git_start:trusted_git_end]
+                self.assertIn(
+                    '"$direct_git" --no-pager --no-replace-objects', trusted_git
+                )
+                self.assertNotIn('-C "$checkout_root"', trusted_git)
+                self.assertNotIn("HOME=/", trusted_git)
+                first_object_query = readonly_job.index(
+                    'trusted_checkout_git cat-file -s "$gate_spec"'
+                )
+                for custody_anchor in (
+                    "prequery_direct_git_binding=",
+                    "prequery_checkout_git_objects_binding=",
+                    "prequery_checkout_git_control_binding=",
+                    "prequery_checkout_git_config_digest=",
+                    "prequery_checkout_git_source_acl_violation=",
+                    "prequery_checkout_git_control_acl_violation=",
+                    "prequery_checkout_git_escape_metadata=",
+                ):
+                    self.assertLess(
+                        readonly_job.index(custody_anchor),
+                        first_object_query,
+                    )
+                last_object_query = readonly_job.rindex(
+                    'trusted_checkout_git cat-file blob "$gate_manifest_spec"'
+                )
+                for postquery_anchor in (
+                    "current_checkout_git_source_acl_violation=",
+                    "current_checkout_git_control_acl_violation=",
+                    "current_checkout_git_escape_metadata=",
+                ):
+                    self.assertGreater(
+                        readonly_job.index(postquery_anchor),
+                        last_object_query,
+                    )
+                self.assertNotIn('gate_spec="HEAD:', readonly_job)
                 self.assertIn("if: always()", readonly_job)
+
+    def test_trusted_git_bootstrap_missing_promisor_blob_does_not_start_helper(
+        self,
+    ) -> None:
+        selected_git = shutil.which("git")
+        if selected_git is None:
+            self.skipTest("Git is unavailable")
+        git_executable = pathlib.Path(selected_git).resolve(strict=True)
+        version = subprocess.run(
+            [str(git_executable), "--version"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(version.returncode, 0, version.stderr)
+        version_fields = version.stdout.decode("ascii", errors="strict").split()
+        if len(version_fields) < 3:
+            self.fail(f"malformed Git version output: {version.stdout!r}")
+        try:
+            version_numbers = tuple(
+                int(field) for field in version_fields[2].split(".")[:2]
+            )
+        except ValueError as error:
+            self.fail(f"malformed Git version output: {version.stdout!r}: {error}")
+        if version_numbers < (2, 45):
+            self.skipTest("Git 2.45 or newer is required for GIT_NO_LAZY_FETCH")
+
+        exec_path_result = subprocess.run(
+            [str(git_executable), "--exec-path"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(exec_path_result.returncode, 0, exec_path_result.stderr)
+        git_exec_path = pathlib.Path(
+            exec_path_result.stdout.decode("utf-8", errors="strict").strip()
+        ).resolve(strict=True)
+        self.assertTrue(git_exec_path.is_dir())
+
+        with tempfile.TemporaryDirectory(prefix="trusted-git-promisor-") as raw_root:
+            root = pathlib.Path(raw_root)
+            home = root / "home"
+            hooks = root / "hooks"
+            template = root / "template"
+            temp = root / "tmp"
+            for directory in (home, hooks, template, temp):
+                directory.mkdir(mode=0o700)
+            base_env = {
+                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_EXEC_PATH": str(git_exec_path),
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_PAGER": "cat",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": str(home),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PAGER": "cat",
+                "PATH": "/usr/bin:/bin",
+                "TMPDIR": str(temp),
+            }
+
+            def run_git(
+                *arguments: str,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.run(
+                    [str(git_executable), *arguments],
+                    env=base_env if env is None else env,
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            initialized = run_git(
+                "-C",
+                str(source),
+                "init",
+                "-q",
+                f"--template={template}",
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            (source / "payload.txt").write_text("payload\n", encoding="utf-8")
+            added = run_git("-C", str(source), "add", "payload.txt")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            committed = run_git(
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Contract Test",
+                "-c",
+                "user.email=contract@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-gpg-sign",
+                "-qm",
+                "fixture",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            head_result = run_git(
+                "-C",
+                str(source),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            )
+            self.assertEqual(head_result.returncode, 0, head_result.stderr)
+            head_sha = head_result.stdout.decode("ascii", errors="strict").strip()
+            self.assertEqual(len(head_sha), 40)
+            blob_result = run_git(
+                "-C",
+                str(source),
+                "rev-parse",
+                "--verify",
+                "HEAD:payload.txt",
+            )
+            self.assertEqual(blob_result.returncode, 0, blob_result.stderr)
+            blob_sha = blob_result.stdout.decode("ascii", errors="strict").strip()
+            loose_blob = source / ".git" / "objects" / blob_sha[:2] / blob_sha[2:]
+            self.assertTrue(loose_blob.is_file())
+
+            helper = root / "remote-helper"
+            marker = root / "remote-helper-started"
+            helper.write_text(
+                "#!/bin/sh\n/usr/bin/printf '%s\\n' invoked > \"$1\"\nexit 1\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            for key, value in (
+                ("core.repositoryFormatVersion", "1"),
+                ("extensions.partialClone", "origin"),
+                ("remote.origin.url", f"ext::{helper} {marker}"),
+                ("remote.origin.promisor", "true"),
+                ("remote.origin.partialclonefilter", "blob:none"),
+                ("protocol.ext.allow", "always"),
+            ):
+                configured = run_git(
+                    "-C",
+                    str(source),
+                    "config",
+                    "--local",
+                    key,
+                    value,
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+            loose_blob.unlink()
+            self.assertFalse(loose_blob.exists())
+
+            control = root / "control.git"
+            control_initialized = run_git(
+                "init",
+                "--bare",
+                "-q",
+                f"--template={template}",
+                str(control),
+            )
+            self.assertEqual(
+                control_initialized.returncode,
+                0,
+                control_initialized.stderr,
+            )
+            safe_env = dict(base_env)
+            safe_env.update(
+                {
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                        source / ".git" / "objects"
+                    ),
+                    "GIT_DIR": str(control),
+                    "GIT_NO_LAZY_FETCH": "1",
+                    "GIT_PROTOCOL_FROM_USER": "0",
+                }
+            )
+            safe_prefix = (
+                "--no-pager",
+                "--no-replace-objects",
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                f"core.hooksPath={hooks}",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "protocol.file.allow=never",
+                "-c",
+                "protocol.git.allow=never",
+                "-c",
+                "protocol.http.allow=never",
+                "-c",
+                "protocol.https.allow=never",
+                "-c",
+                "protocol.ssh.allow=never",
+            )
+
+            def object_inventory(
+                object_root: pathlib.Path,
+            ) -> tuple[tuple[str, ...], ...]:
+                inventory: list[tuple[str, ...]] = []
+                for path in sorted(object_root.rglob("*")):
+                    relative = path.relative_to(object_root).as_posix()
+                    self.assertFalse(path.is_symlink(), relative)
+                    if path.is_dir():
+                        inventory.append((relative, "directory"))
+                        continue
+                    content = path.read_bytes()
+                    inventory.append(
+                        (
+                            relative,
+                            "regular",
+                            str(len(content)),
+                            hashlib.sha256(content).hexdigest(),
+                        )
+                    )
+                return tuple(inventory)
+
+            source_objects = source / ".git" / "objects"
+            control_objects = control / "objects"
+            source_inventory_before = object_inventory(source_objects)
+            control_inventory_before = object_inventory(control_objects)
+            safe_existing = run_git(
+                *safe_prefix,
+                "cat-file",
+                "-t",
+                head_sha,
+                env=safe_env,
+            )
+            self.assertEqual(safe_existing.returncode, 0, safe_existing.stderr)
+            self.assertEqual(safe_existing.stdout, b"commit\n")
+            self.assertFalse(marker.exists())
+
+            safe = run_git(
+                *safe_prefix,
+                "cat-file",
+                "blob",
+                f"{head_sha}:payload.txt",
+                env=safe_env,
+            )
+            self.assertNotEqual(safe.returncode, 0)
+            self.assertEqual(safe.stdout, b"")
+            self.assertFalse(marker.exists())
+            self.assertFalse(loose_blob.exists())
+            self.assertEqual(object_inventory(source_objects), source_inventory_before)
+            self.assertEqual(
+                object_inventory(control_objects), control_inventory_before
+            )
+
+            unsafe_env = dict(base_env)
+            unsafe_env["GIT_PROTOCOL_FROM_USER"] = "1"
+            unsafe = run_git(
+                "--no-pager",
+                "--no-replace-objects",
+                "-C",
+                str(source),
+                "cat-file",
+                "blob",
+                f"{head_sha}:payload.txt",
+                env=unsafe_env,
+            )
+            self.assertNotEqual(unsafe.returncode, 0)
+            self.assertEqual(unsafe.stdout, b"")
+            self.assertEqual(marker.read_text(encoding="ascii"), "invoked\n")
+            self.assertFalse(loose_blob.exists())
 
     def test_readonly_ci_deletes_only_a_proven_root_owned_outer_root(self) -> None:
         profile_contracts = {
@@ -3105,11 +3490,11 @@ class RepositoryContractTest(unittest.TestCase):
                     "run_review_user /bin/test -r "
                     '"$isolated_source/tests/trusted_mac_gate.py"',
                     'run_review_user /bin/test ! -w "$isolated_source"',
-                    'gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/'
+                    'gate_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/tests/'
                     'trusted_mac_gate.py"',
                     'gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"',
                     'gate_manifest="$isolated_source/trusted_mac_gate_sources.index"',
-                    'gate_manifest_spec="HEAD:$REVIEW_SOURCE_RELATIVE/'
+                    'gate_manifest_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/'
                     'trusted_mac_gate_sources.index"',
                     "gate_manifest_size > 1048576",
                     "gate_size > 131072",

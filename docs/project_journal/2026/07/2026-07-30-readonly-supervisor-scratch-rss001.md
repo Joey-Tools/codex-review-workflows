@@ -126,6 +126,16 @@ superseded_by:
   revalidated before and after launch. The outer summary parser runs with
   isolated, site-disabled Python imports and accepts only the exact terminal
   schema; its identity-bound path is reported whenever failure retains it.
+- Before the hosted gate's first candidate object query, the workflow binds the
+  detached exact-SHA checkout's Git directory, object directory, and `HEAD`,
+  creates an owner-private empty bare control repository, and points a fixed
+  direct Git executable at the source objects only through an alternate. The
+  query environment cannot load source-local remotes, promisor state,
+  credentials, protocols, or lazy fetch behavior. It also disables replacement
+  objects and optional writes, then revalidates the fixed toolchain,
+  control/source identities, exact `HEAD`, and control-config digest around the
+  bounded gate and manifest reads. The operator Trusted Mac gate documents the
+  same isolated-control contract.
 - Linux sandbox-command unit tests use a synthetic trusted runtime mount instead
   of assuming `/usr` ownership on a hosted image. A separate policy test still
   accepts a system path only when every resolved component is root-owned and
@@ -584,3 +594,35 @@ superseded_by:
   then passed the host-level full discovery 2,834/2,834 in 1036.788 seconds with
   six existing platform skips. No socket-bind failure reproduced outside the
   Desktop sandbox.
+- The prior-b4ca fresh Codex retry on
+  `e8a0080de284711893c416f7ca546182e748c9fa` found that the Trusted Mac
+  bootstrap's first `cat-file` still loaded candidate-local Git configuration.
+  A missing promisor blob could therefore start lazy fetch, credentials, remote
+  helpers, object-store writes, or external commands before isolated Python.
+  The reviewer workspace was safely cleaned and the trusted control manifest
+  stayed at
+  `b383222c430ab57779a750d137d509db885b235ca5bdb5ace2845ccdb7d3c71b`;
+  every e8a admission, CI, Claude, and review result is stale for the fix head.
+- A real malicious-promisor contract now deletes a required blob and configures
+  an `ext::` helper. The unsafe source-local query proves the fixture by
+  starting that helper; the isolated empty-control query fails without stdout,
+  helper start, or object materialization. Bounded precommit audits found two
+  evidence gaps and three shell-custody gaps: the safe test needed a positive
+  alternate read and complete source/control object-store inventories; source
+  and control ACLs needed recursive rejection; local/HTTP alternates and
+  promisor pack markers needed explicit rejection; and the operator gate
+  needed Git executable/digest/exec-path revalidation after both streamed
+  executions. All five findings were fixed. Final repository contracts passed
+  107/107 in 8.982 seconds. Extracted workflow and operator shell passed
+  `bash -n` and ShellCheck 0.11.0, and Ruby Psych parsed the YAML. One exact
+  120-second actionlint run timed out with empty output and remains
+  tooling-inconclusive.
+- The Desktop-sandbox deterministic attempt was non-counting because Git's
+  `DARWIN_USER_TEMP_DIR` fallback warning violated the fixture's empty-stderr
+  contract, producing 22 failures and 2 errors. Host-level Python 3.13.12 then
+  passed the affected source-binding class 14/14 in 20.942 seconds. After the
+  five precommit findings were fixed, the final deterministic selection passed
+  847/847 in 283.459 seconds with unchanged identity
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`,
+  and complete discovery passed 2,835/2,835 in 1058.164 seconds with six existing
+  platform skips.
