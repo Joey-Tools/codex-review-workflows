@@ -557,3 +557,30 @@ superseded_by:
   One bounded 90-second actionlint run timed out with empty output and is
   tool-inconclusive; both extracted workflow shell blocks passed `bash -n` and
   ShellCheck under an explicit Bash profile.
+- Exact-head PR #86 run `30741504176`, job `91479663871`, exposed one remaining
+  dispatcher path in `SourceCheckoutBindingIntegrationTests`: the
+  `assume-unchanged` case called raw `/usr/bin/git init`, timed out after the
+  unchanged ten-second deadline, and left the 846-test hosted suite with one
+  error after 254.968 seconds. The helper now selects the receipt-bound direct
+  Git executable, carries the exact exec path and owner-private `TMPDIR` through
+  the closed Git environment, and uses the existing bounded process owner. It
+  still rejects any stderr and does not extend or retry the deadline. A static
+  contract forbids raw `/usr/bin/git` and `subprocess.run` in that integration
+  class.
+- The exact failing case plus the new launch-contract regression passed 2/2,
+  the complete source-binding integration class passed 14/14, and the affected
+  read-only runner module passed 151/151. After regenerating the checked Trusted
+  Mac source manifest, the final host-level Python 3.13.12 deterministic gate
+  passed 847/847 in 356.893 seconds. The reviewed selected-identity SHA-256 is
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`.
+- The `acb1182dbcab61ab6076e661c35088719dac2f35` formal single is explicitly
+  zero-start and non-counting. A prior-bundle independent workspace was
+  materialized and validated, but no reviewer agent or model was launched and
+  no reviewer output or findings existed. The task root was then cleaned; none
+  of that head's admission, CI, or review-control evidence carries forward.
+- A Desktop-sandbox full discovery was diagnostic only: local Unix and loopback
+  socket binds returned `EPERM`, producing 7 failures and 11 errors among 2,834
+  tests after 1203.084 seconds. The same frozen tree and Python 3.13.12 runtime
+  then passed the host-level full discovery 2,834/2,834 in 1036.788 seconds with
+  six existing platform skips. No socket-bind failure reproduced outside the
+  Desktop sandbox.

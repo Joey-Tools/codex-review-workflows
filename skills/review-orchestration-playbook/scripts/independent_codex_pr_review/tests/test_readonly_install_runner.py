@@ -8565,9 +8565,14 @@ class _RunnerFilesystemTestCase(unittest.TestCase):
 class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
     @staticmethod
     def _git(repo: pathlib.Path, *arguments: str) -> str:
-        completed = subprocess.run(
+        environment = runner.bound_git_environment(
+            {
+                "HOME": str(repo),
+            }
+        )
+        returncode, stdout, stderr = runner.run_bounded(
             (
-                "/usr/bin/git",
+                runner.selected_git_executable(),
                 "--no-pager",
                 "-c",
                 "commit.gpgsign=false",
@@ -8581,26 +8586,53 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 str(repo),
                 *arguments,
             ),
-            env={
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "HOME": str(repo),
-                "LANG": "C",
-                "LC_ALL": "C",
-                "PATH": "/usr/bin:/bin",
-            },
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            cwd=repo,
+            environment=environment,
             timeout=10,
+            stdout_limit=1024 * 1024,
+            stderr_limit=1024 * 1024,
         )
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", "replace")[-2_048:]
+        if returncode != 0 or stderr:
+            detail = stderr.decode("utf-8", "replace")[-2_048:]
             raise AssertionError(
-                f"synthetic Git command failed ({completed.returncode}): {detail}"
+                f"synthetic Git command failed ({returncode}): {detail}"
             )
-        return completed.stdout.decode("ascii", "strict").strip()
+        return stdout.decode("ascii", "strict").strip()
+
+    def test_synthetic_git_uses_bound_toolchain_and_process_owner(self) -> None:
+        repo = pathlib.Path("/synthetic/repo")
+        environment = {"BOUND": "1"}
+        with (
+            mock.patch.object(
+                runner,
+                "selected_git_executable",
+                return_value="/trusted/Xcode/usr/bin/git",
+            ) as selected_git,
+            mock.patch.object(
+                runner,
+                "bound_git_environment",
+                return_value=environment,
+            ) as bound_environment,
+            mock.patch.object(
+                runner,
+                "run_bounded",
+                return_value=(0, b"synthetic-output\n", b""),
+            ) as run_bounded,
+        ):
+            self.assertEqual(
+                self._git(repo, "status", "--porcelain=v1"),
+                "synthetic-output",
+            )
+
+        selected_git.assert_called_once_with()
+        bound_environment.assert_called_once_with({"HOME": str(repo)})
+        argv = run_bounded.call_args.args[0]
+        self.assertEqual(argv[0], "/trusted/Xcode/usr/bin/git")
+        self.assertEqual(argv[-2:], ("status", "--porcelain=v1"))
+        self.assertEqual(run_bounded.call_args.kwargs["environment"], environment)
+        self.assertEqual(run_bounded.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run_bounded.call_args.kwargs["stdout_limit"], 1024 * 1024)
+        self.assertEqual(run_bounded.call_args.kwargs["stderr_limit"], 1024 * 1024)
 
     @classmethod
     @contextlib.contextmanager

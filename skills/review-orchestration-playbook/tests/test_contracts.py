@@ -1776,6 +1776,13 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
+        readonly_install_tests = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "test_readonly_install_runner.py"
+        ).read_text(encoding="utf-8")
+        source_binding_integration_tests = readonly_install_tests.split(
+            "class SourceCheckoutBindingIntegrationTests", 1
+        )[1].split("\nclass TrustedMacGateBootstrapTests", 1)[0]
         trusted_mac_gate = (
             SCRIPTS / "independent_codex_pr_review/tests/trusted_mac_gate.py"
         ).read_text(encoding="utf-8")
@@ -1847,9 +1854,19 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(contract, readonly_install_runner)
         self.assertNotIn("shutil.copytree(", readonly_install_runner)
         self.assertNotIn("_align_created_directory_group", readonly_install_runner)
+        for contract in (
+            "runner.selected_git_executable()",
+            "runner.bound_git_environment(",
+            "runner.run_bounded(",
+            "timeout=10",
+            "if returncode != 0 or stderr:",
+        ):
+            self.assertIn(contract, source_binding_integration_tests)
+        self.assertNotIn('"/usr/bin/git"', source_binding_integration_tests)
+        self.assertNotIn("subprocess.run(", source_binding_integration_tests)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 846", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 847", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)

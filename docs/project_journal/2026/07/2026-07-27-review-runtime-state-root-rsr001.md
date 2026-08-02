@@ -470,3 +470,26 @@ superseded_by:
   exact source bytes, and the final deterministic gate passed 846/846 in
   292.588 seconds. The reviewed 846-test selected identity has SHA-256
   `cf927546fed88325300574c2c802f42b63a2038ac0a22322e0fa773a48e317b8`.
+- PR #86 run `30741504176`, job `91479663871`, found that the source-binding
+  live integration fixture still bypassed the receipt-bound Git toolchain for
+  its raw `/usr/bin/git init`. The `assume-unchanged` case hit the unchanged
+  ten-second deadline and left the 846-test hosted suite with one error after
+  254.968 seconds. The integration owner now derives argv from the selected
+  direct Git executable and derives the exact exec path and owner-private
+  `TMPDIR` from the bound Git environment before launching through the bounded
+  process owner; stderr remains a hard failure.
+- The exact failing case and launch-contract regression passed 2/2, the whole
+  source-binding integration class passed 14/14, and the affected read-only
+  runner module passed 151/151. The regenerated trusted source manifest and
+  deterministic selection passed 847/847 in 356.893 seconds on host-level
+  Python 3.13.12. The reviewed 847-test selected identity has SHA-256
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`.
+- The `acb1182dbcab61ab6076e661c35088719dac2f35` local named-single preparation
+  is zero-start and non-counting: materialization and validation completed, no
+  reviewer agent or model started, no output or findings were produced, and the
+  independent task root was cleaned before any superseding-head work.
+- The first 2,834-test full discovery was intentionally non-counting because the
+  Desktop sandbox denied Unix and loopback socket binds, yielding 7 failures
+  and 11 errors after 1203.084 seconds. Repeating the exact frozen tree on the
+  same Python 3.13.12 runtime outside that sandbox passed 2,834/2,834 in
+  1036.788 seconds with six existing platform skips.
