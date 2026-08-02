@@ -2190,10 +2190,10 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo /usr/bin/mktemp -d "
                     "/private/codex-review-readonly.XXXXXX",
                     '/usr/bin/sudo /bin/chmod -N "$isolated_root"',
-                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody",
+                    '/usr/bin/sudo /usr/sbin/chown "$review_user:$review_group"',
                     '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
                     '"$isolated_source"',
-                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
+                    "run_review_user /usr/bin/sandbox-exec -f",
                     '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
                     '"$isolated_python" -I -B -S - "$isolated_source"',
                     '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
@@ -2206,6 +2206,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "CODEX_REVIEW_TEST_RUNTIME_PARENT=",
                     "LOGNAME=nobody",
                     "USER=nobody",
+                    "sudo -u nobody",
+                    "chown nobody:nobody",
                 ):
                     self.assertNotIn(ambient_import_contract, readonly_job)
                 self.assertIn("if: always()", readonly_job)
@@ -2240,7 +2242,8 @@ class RepositoryContractTest(unittest.TestCase):
                     '-f \'%d:%i\' "$isolated_root")"'
                 )
                 payload_index = readonly_job.index(
-                    "/usr/bin/sudo /usr/sbin/chown nobody:nobody "
+                    "/usr/bin/sudo /usr/sbin/chown "
+                    '"$review_user:$review_group" '
                     '"$isolated_root/payload"'
                 )
                 immutable_index = readonly_job.index(
@@ -2258,7 +2261,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '/bin/test -f "$summary_file"'
                 )
                 launch_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f"
+                    "run_review_user /usr/bin/sandbox-exec -f"
                 )
                 runner_failure_index = readonly_job.index(
                     "if (( runner_status != 0 )); then"
@@ -2347,9 +2350,9 @@ class RepositoryContractTest(unittest.TestCase):
                     '"$isolated_root")" = "0"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "
                     '"$isolated_root")" = "0:755"',
-                    "/usr/bin/sudo -u nobody /bin/test ! -w /private",
-                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"',
-                    '/usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"',
+                    "run_review_user /bin/test ! -w /private",
+                    'run_review_user /bin/test ! -w "$isolated_root"',
+                    'run_review_user /bin/test ! -w "$RUNNER_TEMP"',
                     "(( (isolated_flags & 2) == 2 ))",
                     "set -o pipefail",
                     '| /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?',
@@ -2516,6 +2519,177 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job.count("retained at $isolated_root"), 3
                 )
 
+    def test_readonly_ci_uses_a_receipt_bound_ephemeral_account(self) -> None:
+        profile_contracts = {
+            "canonical": "test",
+            "private": "python-39-compatibility",
+        }
+        for profile, next_job in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  readonly_install_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            readonly_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                account_generation = readonly_job.index(
+                    'review_user_guid="$(/usr/bin/uuidgen)"'
+                )
+                cleanup_trap = readonly_job.index("trap cleanup_review_account EXIT")
+                group_creation = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/dscl . -create "$review_group_path"'
+                )
+                user_creation = readonly_job.index(
+                    '/usr/bin/sudo /usr/bin/dscl . -create "$review_user_path"'
+                )
+                account_validation = readonly_job.index(
+                    "if ! verify_review_account; then", user_creation
+                )
+                payload_ownership = readonly_job.index(
+                    "/usr/bin/sudo /usr/sbin/chown "
+                    '"$review_user:$review_group" "$isolated_root/payload"'
+                )
+                prelaunch_validation = readonly_job.index(
+                    'echo "::error::Ephemeral review account changed before launch;'
+                )
+                launch = readonly_job.index(
+                    'run_review_user /usr/bin/sandbox-exec -f "$review_profile"'
+                )
+                postrun_validation = readonly_job.index(
+                    "review_account_postrun_status=0"
+                )
+                runner_failure = readonly_job.index("if (( runner_status != 0 )); then")
+                account_failure = readonly_job.index(
+                    "if (( review_account_postrun_status != 0 )); then"
+                )
+
+                self.assertLess(account_generation, cleanup_trap)
+                self.assertLess(cleanup_trap, group_creation)
+                self.assertLess(group_creation, user_creation)
+                self.assertLess(user_creation, account_validation)
+                self.assertLess(account_validation, payload_ownership)
+                self.assertLess(payload_ownership, prelaunch_validation)
+                self.assertLess(prelaunch_validation, launch)
+                self.assertLess(launch, postrun_validation)
+                self.assertLess(postrun_validation, runner_failure)
+                self.assertLess(runner_failure, account_failure)
+
+                for contract in (
+                    'review_group_guid="$(/usr/bin/uuidgen)"',
+                    'review_user="codexreview${review_account_suffix}"',
+                    'review_group="$review_user"',
+                    'review_user_path="/Users/$review_user"',
+                    'review_group_path="/Groups/$review_group"',
+                    '/usr/bin/dscacheutil -q user -a name "$review_user"',
+                    '/usr/bin/dscacheutil -q group -a name "$review_group"',
+                    "/usr/bin/sudo /usr/bin/dscl . -list /Users",
+                    "/usr/bin/sudo /usr/bin/dscl . -list /Groups",
+                    "/usr/bin/sudo /usr/bin/dscl . -list /Users UniqueID",
+                    "/usr/bin/sudo /usr/bin/dscl . -list /Groups PrimaryGroupID",
+                    "Ephemeral review account directory inventory is unavailable",
+                    "review_id_start=$((50000 + (16#$review_id_prefix % 10000)))",
+                    "review_id_offset < 10000",
+                    '/usr/bin/dscacheutil -q user -a uid "$review_id_candidate"',
+                    '/usr/bin/dscacheutil -q group -a gid "$review_id_candidate"',
+                    "Ephemeral review account UID/GID lookup failed",
+                    "review_local_user_uid_match=",
+                    "review_local_group_gid_match=",
+                    "review_uid < 50000 || review_uid > 59999",
+                    'GeneratedUID "$review_group_guid"',
+                    'GeneratedUID "$review_user_guid"',
+                    'UniqueID "$review_uid"',
+                    'PrimaryGroupID "$review_gid"',
+                    "NFSHomeDirectory /var/empty",
+                    "UserShell /usr/bin/false",
+                    'AuthenticationAuthority ";DisabledUser;"',
+                    "Password '*'",
+                    "/usr/bin/sudo /usr/bin/dscacheutil -flushcache",
+                    'review_admin_gid="$(/usr/bin/dscl . -read '
+                    "/Groups/admin PrimaryGroupID",
+                    '[[ " $account_groups " != *" $review_admin_gid "* ]]',
+                    '/usr/bin/sudo -u "$review_user" -g "$review_group" "$@"',
+                    "verify_review_cached_identity() {",
+                    '/usr/bin/dscacheutil -q user -a uid "$review_uid"',
+                    '/usr/bin/dscacheutil -q group -a gid "$review_gid"',
+                    "cached_user_names=",
+                    "cached_group_names=",
+                    '[[ "$cached_user_names" == "$review_user" ]]',
+                    '[[ "$cached_group_names" == "$review_group" ]]',
+                    "&& verify_review_cached_identity",
+                    "/bin/ps -axo uid=,pid=",
+                    "'$1 == target_uid {print $2}'",
+                    'review_processes_preuse="$(review_account_processes)"',
+                    'review_processes_prelaunch="$(review_account_processes)"',
+                    'review_processes_postrun="$(review_account_processes)"',
+                    '[[ -n "$review_processes" ]]',
+                    "retained until runner disposal",
+                    '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"',
+                    '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"',
+                ):
+                    self.assertIn(contract, readonly_job)
+
+                self.assertEqual(
+                    readonly_job.count(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"'
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"'
+                    ),
+                    1,
+                )
+                cleanup_start = readonly_job.index("cleanup_review_account() {")
+                cleanup_end = readonly_job.index(
+                    "trap cleanup_review_account EXIT", cleanup_start
+                )
+                cleanup_body = readonly_job[cleanup_start:cleanup_end]
+                self.assertLess(
+                    cleanup_body.index("if ! verify_review_account; then"),
+                    cleanup_body.index(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"'
+                    ),
+                )
+                self.assertLess(
+                    cleanup_body.index("elif ! verify_review_group; then"),
+                    cleanup_body.index(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"'
+                    ),
+                )
+                self.assertEqual(
+                    readonly_job.count("run_review_user /usr/bin/sandbox-exec"),
+                    1,
+                )
+                self.assertEqual(
+                    readonly_job.count(
+                        '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"'
+                    ),
+                    1,
+                )
+                for shared_account_use in (
+                    "sudo -u nobody",
+                    "chown nobody:nobody",
+                    "run_review_user /bin/cat",
+                ):
+                    self.assertNotIn(shared_account_use, readonly_job)
+
+                process_filter = "$1 == target_uid {print $2}"
+                filtered = subprocess.run(
+                    [
+                        "/usr/bin/awk",
+                        "-v",
+                        "target_uid=50000",
+                        process_filter,
+                    ],
+                    input=b"65534 101\n50000 202\n65534 303\n",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(filtered.returncode, 0, filtered.stderr)
+                self.assertEqual(filtered.stdout, b"202\n")
+                self.assertEqual(filtered.stderr, b"")
+
     def test_readonly_ci_binds_profile_and_denies_executable_setid_modes(
         self,
     ) -> None:
@@ -2584,13 +2758,13 @@ class RepositoryContractTest(unittest.TestCase):
                 isolated_root_traversal_index = readonly_job.index(
                     '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
                 )
-                nobody_source_probe_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /bin/test -r "
+                account_source_probe_index = readonly_job.index(
+                    "run_review_user /bin/test -r "
                     '"$isolated_source/tests/'
                     'run_readonly_install_deterministic_supervisor.py"'
                 )
-                nobody_gate_probe_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /bin/test -r "
+                account_gate_probe_index = readonly_job.index(
+                    "run_review_user /bin/test -r "
                     '"$isolated_source/tests/trusted_mac_gate.py"'
                 )
                 isolated_profile_path_index = readonly_job.index(
@@ -2616,7 +2790,7 @@ class RepositoryContractTest(unittest.TestCase):
                     'profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat'
                 )
                 sandbox_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    "run_review_user /usr/bin/sandbox-exec "
                     '-f "$review_profile" /usr/bin/env -i'
                 )
                 postrun_index = readonly_job.index(
@@ -2641,11 +2815,11 @@ class RepositoryContractTest(unittest.TestCase):
                     isolated_source_binding_index, isolated_root_traversal_index
                 )
                 self.assertLess(
-                    isolated_root_traversal_index, nobody_source_probe_index
+                    isolated_root_traversal_index, account_source_probe_index
                 )
-                self.assertLess(isolated_root_traversal_index, nobody_gate_probe_index)
-                self.assertLess(nobody_source_probe_index, isolated_profile_path_index)
-                self.assertLess(nobody_gate_probe_index, isolated_profile_path_index)
+                self.assertLess(isolated_root_traversal_index, account_gate_probe_index)
+                self.assertLess(account_source_probe_index, isolated_profile_path_index)
+                self.assertLess(account_gate_probe_index, isolated_profile_path_index)
                 self.assertLess(isolated_profile_path_index, profile_copy_index)
                 self.assertLess(profile_copy_index, profile_binding_index)
                 self.assertLess(profile_binding_index, immutable_index)
@@ -2655,15 +2829,15 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertLess(prelaunch_index, sandbox_index)
                 self.assertLess(sandbox_index, postrun_index)
                 self.assertEqual(
-                    readonly_job.count("/usr/bin/sudo -u nobody /usr/bin/sandbox-exec"),
+                    readonly_job.count("run_review_user /usr/bin/sandbox-exec"),
                     1,
                 )
                 self.assertNotIn(
-                    "/usr/bin/sudo -u nobody /usr/bin/env -i",
+                    "run_review_user /usr/bin/env -i",
                     readonly_job,
                 )
                 self.assertNotIn(
-                    "/usr/bin/sudo -u nobody /usr/bin/ditto",
+                    "run_review_user /usr/bin/ditto",
                     readonly_job,
                 )
                 self.assertNotIn(
@@ -2671,11 +2845,13 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job,
                 )
                 self.assertEqual(
-                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    readonly_job.count(
+                        '/usr/bin/sudo /usr/sbin/chown "$review_user:$review_group"'
+                    ),
                     1,
                 )
                 self.assertNotIn(
-                    "/usr/bin/sudo /usr/sbin/chown -R nobody:nobody",
+                    '/usr/bin/sudo /usr/sbin/chown -R "$review_user:$review_group"',
                     readonly_job,
                 )
                 self.assertEqual(
@@ -2738,12 +2914,12 @@ class RepositoryContractTest(unittest.TestCase):
                     '-f \'%d:%i:%u:%g:%Lp\' "$isolated_source")"',
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
                     '"$isolated_source")" = "0:0:555"',
-                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    "run_review_user /bin/test -r "
                     '"$isolated_source/tests/'
                     'run_readonly_install_deterministic_supervisor.py"',
-                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    "run_review_user /bin/test -r "
                     '"$isolated_source/tests/trusted_mac_gate.py"',
-                    '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
+                    'run_review_user /bin/test ! -w "$isolated_source"',
                     'gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/'
                     'trusted_mac_gate.py"',
                     'gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"',
@@ -2778,8 +2954,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "test \"$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "
                     '"$review_profile")" = "0:0:444"',
                     '/bin/test ! -w "$review_profile"',
-                    '/usr/bin/sudo -u nobody /bin/test -r "$review_profile"',
-                    '/usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"',
+                    'run_review_user /bin/test -r "$review_profile"',
+                    'run_review_user /bin/test ! -w "$review_profile"',
                     '[[ "$source_profile_postcopy_binding" '
                     '!= "$source_profile_binding" ]]',
                     '[[ "$source_profile_prelaunch_binding" '
@@ -2960,12 +3136,12 @@ printf '%s\n' "$trusted_uv"
                 root_traversal_index = readonly_job.index(
                     '/usr/bin/sudo /bin/chmod 0755 "$isolated_root"'
                 )
-                nobody_runtime_index = readonly_job.index(
-                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"'
+                account_runtime_index = readonly_job.index(
+                    'run_review_user /bin/test -x "$isolated_python"'
                 )
                 prelaunch_index = readonly_job.index("verify_runtime_custody prelaunch")
                 sandbox_index = readonly_job.index(
-                    "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec "
+                    "run_review_user /usr/bin/sandbox-exec "
                     '-f "$review_profile" /usr/bin/env -i'
                 )
                 postrun_index = readonly_job.index("verify_runtime_custody postrun")
@@ -2992,8 +3168,8 @@ printf '%s\n' "$trusted_uv"
                 self.assertLess(tree_binding_index, postinstall_index)
                 self.assertLess(postinstall_index, source_copy_index)
                 self.assertLess(source_copy_index, root_traversal_index)
-                self.assertLess(root_traversal_index, nobody_runtime_index)
-                self.assertLess(nobody_runtime_index, prelaunch_index)
+                self.assertLess(root_traversal_index, account_runtime_index)
+                self.assertLess(account_runtime_index, prelaunch_index)
                 self.assertLess(prelaunch_index, sandbox_index)
                 self.assertLess(sandbox_index, postrun_index)
                 self.assertLess(postrun_index, source_postrun_index)
@@ -3115,7 +3291,7 @@ printf '%s\n' "$trusted_uv"
                     "current_runtime_acl_violation",
                     "/usr/bin/sudo /usr/bin/codesign --verify --strict "
                     '"$isolated_python"',
-                    '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"',
+                    'run_review_user /bin/test -x "$isolated_python"',
                     '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
                     '"$isolated_python" -I -B -S - "$isolated_source"',
                     '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
@@ -3143,7 +3319,9 @@ printf '%s\n' "$trusted_uv"
                     1,
                 )
                 self.assertEqual(
-                    readonly_job.count("/usr/bin/sudo /usr/sbin/chown nobody:nobody"),
+                    readonly_job.count(
+                        '/usr/bin/sudo /usr/sbin/chown "$review_user:$review_group"'
+                    ),
                     1,
                 )
                 for prohibited in (
@@ -3167,8 +3345,10 @@ printf '%s\n' "$trusted_uv"
                     "-type f \\( -name '*.pyc'",
                     'sh "$isolated_source"',
                     '/usr/bin/sudo /bin/chmod 0711 "$managed_python_dir"',
-                    '/usr/bin/sudo /usr/sbin/chown nobody:nobody "$managed_python_dir"',
-                    '/usr/bin/sudo /usr/sbin/chown -R nobody:nobody "$runtime_root"',
+                    "/usr/bin/sudo /usr/sbin/chown "
+                    '"$review_user:$review_group" "$managed_python_dir"',
+                    "/usr/bin/sudo /usr/sbin/chown -R "
+                    '"$review_user:$review_group" "$runtime_root"',
                 ):
                     self.assertNotIn(prohibited, readonly_job)
 

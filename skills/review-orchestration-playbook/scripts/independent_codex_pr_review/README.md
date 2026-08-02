@@ -423,7 +423,11 @@ PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --hel
 ```
 
 第一条命令是确定性零跳过测试。Hosted CI 的 required read-only job 另以 root-owned
-isolated source、`nobody` child、受监管 Python runtime 和完整 deterministic suite 验证安装树；
+isolated source、随机命名且 receipt-bound 的 ephemeral non-admin child account、受监管
+Python runtime 和完整 deterministic suite 验证安装树。Workflow 为该 account 选择未占用的
+专用 UID/GID，绑定 user/group GUID，拒绝 admin membership 或该 UID 已存在的进程，并在启动前、
+supervised run 后和删除前重验同一身份与 exact-UID process census；身份不明、replacement、
+census 失败或残留进程都会 fail closed，并保留 account records 到 ephemeral runner disposal。
 它保留 `source_head_bound == false` 与 `no_child_runtime_profile == null`，因为 exact Git binding
 和 production no-child proof 不属于这个 isolated copy 的证明边界。
 
@@ -476,7 +480,8 @@ depth/path/entry/deadline 预算。Hosted root-owned source 没有 Git metadata�
 `source_head_bound`；它仍先建立同一有界 descriptor receipt，再按 receipt 复制并复验，
 不再使用无界 `copytree`。
 GitHub Hosted `macos-26` 的独立 production-profile probe仍必须以已审阅 blocker signature
-失败关闭；hosted read-only job 的 root/nobody 隔离成功不能替代 Trusted Mac no-child proof。
+失败关闭；hosted read-only job 的 root/ephemeral-account 隔离成功不能替代 Trusted Mac
+no-child proof。
 
 这个 Trusted Mac gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub
 check、branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR

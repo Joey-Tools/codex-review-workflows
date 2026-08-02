@@ -103,12 +103,16 @@ superseded_by:
   regression in separate macOS Python 3.13 jobs. The read-only job copies the
   tracked source from the checkout into a root-owned, read-only
   `/private/codex-review-readonly.*` isolation tree and executes the runner as
-  `nobody` with an empty environment inside an inherited Seatbelt profile.
-  Before starting the child, the runner proves real/effective UID equality,
-  non-root and non-admin membership, kernel-visible `job-creation` denial,
-  generic set-ID exec filtering through a direct `sudo` EPERM probe, and a
-  same-UID baseline containing only the supervisor. The job has a 20-minute
-  emergency outer budget around the
+  a randomly named, receipt-bound ephemeral account with an empty environment
+  inside an inherited Seatbelt profile. The workflow binds a dedicated unused
+  UID/GID to user/group GUIDs, rejects admin membership and any pre-existing
+  process for that UID, and revalidates identity plus the exact-UID process
+  census before launch, after the run, and before deletion. Before starting the
+  child, the runner additionally proves real/effective UID equality, non-root
+  and non-admin membership, kernel-visible `job-creation` denial, generic
+  set-ID exec filtering through a direct `sudo` EPERM probe, and a same-UID
+  baseline containing only the supervisor. The job has a 20-minute emergency
+  outer budget around the
   runner's 10-minute child timeout. CI success requires the terminal structured
   closure and cleanup proof; a host cancellation or missing terminal summary
   cannot count as a clean gate. The root-owned outer isolation container is
@@ -476,3 +480,20 @@ superseded_by:
   2,833/2,833 tests in 941.501 seconds with six existing platform skips;
   repository contracts passed 105/105 in 8.167 seconds after the deterministic
   identity was recorded.
+- Exact-head PR #86 run `30730882541` attempt 1 proved that the hosted workflow's
+  shared system `nobody` account violated the runner's whole-UID isolation
+  premise. The 839-test child suite passed, but a later same-UID process identity
+  `8608:1785641827.600459/state=2` made process-tree closure unprovable; the
+  install and runtime roots were retained with explicit incomplete-cleanup
+  evidence. Attempt 2 job `91453660059` completed with proven closure and clean
+  cleanup, but that single retry does not erase the demonstrated shared-account
+  race.
+- The hosted job now creates a randomly named, GUID-bound ephemeral non-admin
+  user and group with a dedicated unused UID/GID. It proves exact identity,
+  primary group, disabled login, non-admin membership, and an empty whole-UID
+  process census before use and launch, then repeats identity and census checks
+  after the supervised run. Cleanup deletes only the same GUID-bound records
+  after the UID is empty; mismatch, census failure, or residual processes retain
+  the records until ephemeral runner disposal. The executable contract also
+  proves that a synthetic shared-account process is excluded from the dedicated
+  UID census.

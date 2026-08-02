@@ -40,8 +40,11 @@ superseded_by:
   root-owned staged source uses a bounded descriptor manifest and copy rather
   than an unbounded recursive copy. The source receipt retains root ownership
   and source access policy, while the installed tree independently requires the
-  exact nobody execution UID and GID plus an execution-identity-projected
-  expected manifest.
+  exact receipt-bound ephemeral execution UID and GID plus an
+  execution-identity-projected expected manifest. Account creation, launch,
+  postrun closure, and cleanup remain bound to the same user/group GUIDs and
+  exact-UID process census; the shared system `nobody` account is no longer a
+  supported hosted execution identity.
 
 ## Next Steps
 
@@ -110,3 +113,17 @@ superseded_by:
 - The complete P1-corrected host-level Python 3.13.12 discovery passed
   2,833/2,833 tests in 941.501 seconds with six existing platform skips;
   repository contracts passed 105/105 in 8.167 seconds.
+- PR #86 run `30730882541` attempt 1 passed all 839 child tests but failed
+  closed with `ChildProcessTreeClosureUnproven` for
+  `8608:1785641827.600459/state=2`. The hosted workflow repeatedly used the
+  shared system `nobody` UID, so an empty baseline did not prove exclusive
+  ownership for the duration of the job. Attempt 2 job `91453660059` passed with
+  proven closure and complete cleanup, but remains retry evidence rather than a
+  refutation of the account-selection defect.
+- The canonical workflow and both reviewed fixtures now use a randomly named,
+  GUID-bound ephemeral non-admin account with a dedicated unused UID/GID.
+  Creation, prelaunch use, postrun closure, and deletion are bound to the same
+  user/group receipts and exact-UID process census. Any identity ambiguity,
+  replacement, census failure, or residual process fails closed and retains the
+  records until the ephemeral hosted runner is disposed; no shared `nobody`
+  process can contaminate the dedicated UID census.

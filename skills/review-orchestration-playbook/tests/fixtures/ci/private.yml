@@ -551,16 +551,227 @@ jobs:
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
           /usr/bin/sudo /bin/chmod 0755 "$isolated_root"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" = "0:755"
+          review_user_guid="$(/usr/bin/uuidgen)"
+          review_group_guid="$(/usr/bin/uuidgen)"
+          review_account_suffix="$(/usr/bin/printf '%s' "$review_user_guid" \
+            | /usr/bin/tr -d '-' \
+            | /usr/bin/tr '[:upper:]' '[:lower:]' \
+            | /usr/bin/cut -c 1-12)"
+          if [[ ! "$review_user_guid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+            || [[ ! "$review_group_guid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+            || [[ ! "$review_account_suffix" =~ ^[[:xdigit:]]{12}$ ]]; then
+            echo "::error::Ephemeral review account identity generation failed; retained at $isolated_root"
+            exit 1
+          fi
+          review_user="codexreview${review_account_suffix}"
+          review_group="$review_user"
+          review_user_path="/Users/$review_user"
+          review_group_path="/Groups/$review_group"
+          review_user_created=false
+          review_user_origin_bound=false
+          review_group_created=false
+          review_group_origin_bound=false
+          review_uid=""
+          review_gid=""
+          review_admin_gid="$(/usr/bin/dscl . -read /Groups/admin PrimaryGroupID \
+            | /usr/bin/awk '$1 == "PrimaryGroupID:" {print $2}')"
+          review_account_processes() {
+            /bin/ps -axo uid=,pid= \
+              | /usr/bin/awk -v target_uid="$review_uid" \
+                '$1 == target_uid {print $2}'
+          }
+          verify_review_group() {
+            [[ "$review_group_origin_bound" == "true" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" GeneratedUID 2>/dev/null)" == "GeneratedUID: $review_group_guid" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" PrimaryGroupID 2>/dev/null)" == "PrimaryGroupID: $review_gid" ]]
+          }
+          run_review_user() {
+            /usr/bin/sudo -u "$review_user" -g "$review_group" "$@"
+          }
+          verify_review_cached_identity() {
+            local cached_user_records=""
+            local cached_group_records=""
+            local cached_user_names=""
+            local cached_group_names=""
+            cached_user_records="$(/usr/bin/dscacheutil -q user -a uid "$review_uid")" \
+              || return 1
+            cached_group_records="$(/usr/bin/dscacheutil -q group -a gid "$review_gid")" \
+              || return 1
+            cached_user_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_user_records")" \
+              || return 1
+            cached_group_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_group_records")" \
+              || return 1
+            [[ "$cached_user_names" == "$review_user" ]] \
+              && [[ "$cached_group_names" == "$review_group" ]]
+          }
+          verify_review_account() {
+            local account_groups=""
+            verify_review_group \
+              && verify_review_cached_identity \
+              && [[ "$review_user_origin_bound" == "true" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" GeneratedUID 2>/dev/null)" == "GeneratedUID: $review_user_guid" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" UniqueID 2>/dev/null)" == "UniqueID: $review_uid" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" PrimaryGroupID 2>/dev/null)" == "PrimaryGroupID: $review_gid" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" NFSHomeDirectory 2>/dev/null)" == "NFSHomeDirectory: /var/empty" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" UserShell 2>/dev/null)" == "UserShell: /usr/bin/false" ]] \
+              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" IsHidden 2>/dev/null)" == "IsHidden: 1" ]] \
+              && [[ "$(/usr/bin/id -u "$review_user" 2>/dev/null)" == "$review_uid" ]] \
+              && [[ "$(/usr/bin/id -g "$review_user" 2>/dev/null)" == "$review_gid" ]] \
+              && [[ "$(run_review_user /usr/bin/id -u 2>/dev/null)" == "$review_uid" ]] \
+              && [[ "$(run_review_user /usr/bin/id -g 2>/dev/null)" == "$review_gid" ]] \
+              || return 1
+            account_groups="$(run_review_user /usr/bin/id -G 2>/dev/null)" \
+              || return 1
+            [[ " $account_groups " != *" $review_admin_gid "* ]]
+          }
+          cleanup_review_account() {
+            local primary_status=$?
+            local cleanup_status=0
+            local process_status=0
+            local review_processes=""
+            trap - EXIT
+            set +e
+            if [[ "$review_user_created" == "true" ]]; then
+              if ! verify_review_account; then
+                echo "::error::Ephemeral review user identity or policy is unproven; retained until runner disposal: name=$review_user uid=$review_uid"
+                cleanup_status=1
+              else
+                review_processes="$(review_account_processes)"
+                process_status=$?
+                if (( process_status != 0 )); then
+                  echo "::error::Ephemeral review account process census failed; retained until runner disposal: name=$review_user uid=$review_uid"
+                  cleanup_status=1
+                elif [[ -n "$review_processes" ]]; then
+                  echo "::error::Ephemeral review account still owns processes; retained until runner disposal: name=$review_user uid=$review_uid pids=${review_processes//$'\n'/,}"
+                  cleanup_status=1
+                elif ! /usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path" \
+                  || /usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" >/dev/null 2>&1; then
+                  echo "::error::Ephemeral review user cleanup failed; retained until runner disposal: name=$review_user uid=$review_uid"
+                  cleanup_status=1
+                else
+                  review_user_created=false
+                fi
+              fi
+            fi
+            if [[ "$review_group_created" == "true" ]]; then
+              if [[ "$review_user_created" == "true" ]]; then
+                echo "::error::Ephemeral review group retained with its user until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              elif ! verify_review_group; then
+                echo "::error::Ephemeral review group identity or policy is unproven; retained until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              elif ! /usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path" \
+                || /usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" >/dev/null 2>&1; then
+                echo "::error::Ephemeral review group cleanup failed; retained until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              else
+                review_group_created=false
+              fi
+            fi
+            if (( primary_status != 0 )); then
+              exit "$primary_status"
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_review_account EXIT
+          review_local_user_names=""
+          review_local_group_names=""
+          review_local_user_ids=""
+          review_local_group_ids=""
+          review_cached_user_name=""
+          review_cached_group_name=""
+          if ! review_local_user_names="$(/usr/bin/sudo /usr/bin/dscl . -list /Users)" \
+            || ! review_local_group_names="$(/usr/bin/sudo /usr/bin/dscl . -list /Groups)" \
+            || ! review_local_user_ids="$(/usr/bin/sudo /usr/bin/dscl . -list /Users UniqueID)" \
+            || ! review_local_group_ids="$(/usr/bin/sudo /usr/bin/dscl . -list /Groups PrimaryGroupID)" \
+            || ! review_cached_user_name="$(/usr/bin/dscacheutil -q user -a name "$review_user")" \
+            || ! review_cached_group_name="$(/usr/bin/dscacheutil -q group -a name "$review_group")"; then
+            echo "::error::Ephemeral review account directory inventory is unavailable; retained at $isolated_root"
+            exit 1
+          fi
+          review_local_user_name_match="$(/usr/bin/awk -v target="$review_user" '$1 == target {print $1}' <<< "$review_local_user_names")"
+          review_local_group_name_match="$(/usr/bin/awk -v target="$review_group" '$1 == target {print $1}' <<< "$review_local_group_names")"
+          if [[ -n "$review_cached_user_name" ]] \
+            || [[ -n "$review_cached_group_name" ]] \
+            || [[ -n "$review_local_user_name_match" ]] \
+            || [[ -n "$review_local_group_name_match" ]] \
+            || [[ ! "$review_admin_gid" =~ ^[[:digit:]]+$ ]]; then
+            echo "::error::Ephemeral review account name or admin-group evidence is unavailable; retained at $isolated_root"
+            exit 1
+          fi
+          review_id_prefix="${review_account_suffix:0:4}"
+          review_id_start=$((50000 + (16#$review_id_prefix % 10000)))
+          for (( review_id_offset = 0; review_id_offset < 10000; review_id_offset++ )); do
+            review_id_candidate=$((50000 + ((review_id_start - 50000 + review_id_offset) % 10000)))
+            review_cached_user_uid=""
+            review_cached_group_gid=""
+            if ! review_cached_user_uid="$(/usr/bin/dscacheutil -q user -a uid "$review_id_candidate")" \
+              || ! review_cached_group_gid="$(/usr/bin/dscacheutil -q group -a gid "$review_id_candidate")"; then
+              echo "::error::Ephemeral review account UID/GID lookup failed; retained at $isolated_root"
+              exit 1
+            fi
+            review_local_user_uid_match="$(/usr/bin/awk -v target="$review_id_candidate" '$NF == target {print $1}' <<< "$review_local_user_ids")"
+            review_local_group_gid_match="$(/usr/bin/awk -v target="$review_id_candidate" '$NF == target {print $1}' <<< "$review_local_group_ids")"
+            if [[ -z "$review_cached_user_uid" ]] \
+              && [[ -z "$review_cached_group_gid" ]] \
+              && [[ -z "$review_local_user_uid_match" ]] \
+              && [[ -z "$review_local_group_gid_match" ]]; then
+              review_uid="$review_id_candidate"
+              review_gid="$review_id_candidate"
+              break
+            fi
+          done
+          if [[ ! "$review_uid" =~ ^[[:digit:]]+$ ]] \
+            || (( review_uid < 50000 || review_uid > 59999 )); then
+            echo "::error::No unused ephemeral review account UID/GID is available; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path"
+          review_group_created=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" GeneratedUID "$review_group_guid"
+          if [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" GeneratedUID)" != "GeneratedUID: $review_group_guid" ]]; then
+            echo "::error::Ephemeral review group origin binding failed; retained until runner disposal"
+            exit 1
+          fi
+          review_group_origin_bound=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" PrimaryGroupID "$review_gid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" RealName "Codex Review CI"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path"
+          review_user_created=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" GeneratedUID "$review_user_guid"
+          if [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" GeneratedUID)" != "GeneratedUID: $review_user_guid" ]]; then
+            echo "::error::Ephemeral review user origin binding failed; retained until runner disposal"
+            exit 1
+          fi
+          review_user_origin_bound=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" UniqueID "$review_uid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" PrimaryGroupID "$review_gid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" NFSHomeDirectory /var/empty
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" UserShell /usr/bin/false
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" IsHidden 1
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" AuthenticationAuthority ";DisabledUser;"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" Password '*'
+          /usr/bin/sudo /usr/bin/dscacheutil -flushcache
+          if ! verify_review_account; then
+            echo "::error::Ephemeral review account failed identity or non-admin validation; retained until runner disposal"
+            exit 1
+          fi
+          review_processes_preuse="$(review_account_processes)"
+          if [[ -n "$review_processes_preuse" ]]; then
+            echo "::error::Ephemeral review account is already in use; retained until runner disposal: pids=${review_processes_preuse//$'\n'/,}"
+            exit 1
+          fi
+          echo "Ephemeral review account: name=$review_user uid=$review_uid gid=$review_gid user_guid=$review_user_guid group_guid=$review_group_guid"
           /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
-          /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
-          /usr/bin/sudo -u nobody /bin/test ! -w /private
-          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"
-          /usr/bin/sudo -u nobody /bin/test -x "$isolated_python"
-          /usr/bin/sudo -u nobody /bin/test ! -w "$managed_python_dir"
-          /usr/bin/sudo -u nobody /bin/test ! -w "$runtime_root"
-          /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
-          /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
-          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"
+          /usr/bin/sudo /usr/sbin/chown "$review_user:$review_group" "$isolated_root/payload"
+          run_review_user /bin/test ! -w /private
+          run_review_user /bin/test ! -w "$isolated_root"
+          run_review_user /bin/test -x "$isolated_python"
+          run_review_user /bin/test ! -w "$managed_python_dir"
+          run_review_user /bin/test ! -w "$runtime_root"
+          run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
+          run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
+          run_review_user /bin/test ! -w "$isolated_source"
           gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/trusted_mac_gate.py"
           gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"
           gate_digest="$(trusted_checkout_git cat-file blob "$gate_spec" | /usr/bin/shasum -a 256)"
@@ -582,15 +793,15 @@ jobs:
           if [[ ! "$gate_manifest_size" =~ ^[[:digit:]]+$ ]] \
             || (( gate_manifest_size < 1 || gate_manifest_size > 1048576 )) \
             || [[ ! "$gate_manifest_digest" =~ ^[[:xdigit:]]{64}$ ]] \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
             || ! trusted_checkout_git cat-file blob "$gate_manifest_spec" \
               | /usr/bin/sudo /usr/bin/cmp -s - "$gate_manifest"; then
             echo "::error::Trusted gate source manifest is not exact HEAD; retained at $isolated_root"
             exit 1
           fi
           echo "Trusted gate source manifest: bytes=$gate_manifest_size sha256=$gate_manifest_digest"
-          /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
+          run_review_user /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
           isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
           review_profile="$isolated_root/readonly_child_isolation.sb"
           /usr/bin/sudo /bin/test ! -e "$review_profile"
@@ -606,8 +817,8 @@ jobs:
           profile_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")"
           test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$review_profile")" = "0:0:444"
           /bin/test ! -w "$review_profile"
-          /usr/bin/sudo -u nobody /bin/test -r "$review_profile"
-          /usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"
+          run_review_user /bin/test -r "$review_profile"
+          run_review_user /bin/test ! -w "$review_profile"
           source_profile_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
           if [[ "$source_profile_postcopy_binding" != "$source_profile_binding" ]] \
             || ! /bin/test -f "$source_review_profile" \
@@ -620,7 +831,7 @@ jobs:
           isolated_flags="$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")"
           (( (isolated_flags & 2) == 2 ))
           test -n "${RUNNER_TEMP:-}"
-          /usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"
+          run_review_user /bin/test ! -w "$RUNNER_TEMP"
           summary_file="$(/usr/bin/mktemp "$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"
           echo "Read-only supervisor summary file (retained on failure): $summary_file"
           /bin/test -f "$summary_file"
@@ -661,11 +872,11 @@ jobs:
             || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || run_review_user /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
             || /bin/test -L "$source_review_profile" \
             || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
@@ -673,15 +884,24 @@ jobs:
             || ! /bin/test -f "$review_profile" \
             || /bin/test -L "$review_profile" \
             || /bin/test -w "$review_profile" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            || ! run_review_user /bin/test -r "$review_profile" \
+            || run_review_user /bin/test -w "$review_profile"; then
             echo "::error::Read-only child profile changed before launch; retained at $isolated_root"
             exit 1
           fi
           verify_runtime_custody prelaunch
+          if ! verify_review_account; then
+            echo "::error::Ephemeral review account changed before launch; retained until runner disposal"
+            exit 1
+          fi
+          review_processes_prelaunch="$(review_account_processes)"
+          if [[ -n "$review_processes_prelaunch" ]]; then
+            echo "::error::Ephemeral review account is not process-isolated before launch; retained until runner disposal: pids=${review_processes_prelaunch//$'\n'/,}"
+            exit 1
+          fi
           runner_status=0
-          /usr/bin/sudo -u nobody /bin/cat "$isolated_source/tests/trusted_mac_gate.py" \
-            | /usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
+          /bin/cat "$isolated_source/tests/trusted_mac_gate.py" \
+            | run_review_user /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
               LANG=C \
               LC_ALL=C \
               PATH=/usr/bin:/bin \
@@ -690,6 +910,14 @@ jobs:
               "$isolated_root/payload/runtime" "$isolated_root/payload" \
             | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
           verify_runtime_custody postrun
+          review_account_postrun_status=0
+          review_processes_postrun=""
+          verify_review_account || review_account_postrun_status=1
+          review_processes_postrun="$(review_account_processes)" \
+            || review_account_postrun_status=1
+          if [[ -n "$review_processes_postrun" ]]; then
+            review_account_postrun_status=1
+          fi
           source_profile_postrun_binding=""
           source_profile_postrun_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
             || source_profile_postrun_binding="<unreadable>"
@@ -714,11 +942,11 @@ jobs:
             || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || run_review_user /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
             || /bin/test -L "$source_review_profile" \
             || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
@@ -726,8 +954,8 @@ jobs:
             || ! /bin/test -f "$review_profile" \
             || /bin/test -L "$review_profile" \
             || /bin/test -w "$review_profile" \
-            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
-            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            || ! run_review_user /bin/test -r "$review_profile" \
+            || run_review_user /bin/test -w "$review_profile"; then
             echo "::error::Read-only child profile changed during launch; retained at $isolated_root"
             exit 1
           fi
@@ -741,6 +969,10 @@ jobs:
           if (( runner_status != 0 )); then
             echo "::error::Read-only supervisor exited $runner_status; retained at $isolated_root"
             exit "$runner_status"
+          fi
+          if (( review_account_postrun_status != 0 )); then
+            echo "::error::Ephemeral review account changed or retained processes during launch; retained until runner disposal: pids=${review_processes_postrun//$'\n'/,}"
+            exit 1
           fi
           summary_status=0
           "$isolated_python" -I -B -S -c 'import json, pathlib, sys; raw = pathlib.Path(sys.argv[1]).read_bytes(); valid_line = raw.endswith(b"\n") and b"\n" not in raw[:-1] and b"\r" not in raw; reject_duplicates = lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else (_ for _ in ()).throw(ValueError("duplicate JSON key")); payload = json.loads(raw, object_pairs_hook=reject_duplicates) if valid_line else {}; expected = {"child_process_closure": "proven", "cleanup_failures": [], "cleanup_guarantee": "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb", "cleanup_status": "complete", "creation_origin_guarantee": "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb", "creation_origin_proven": False, "install_parent_is_sticky_world_writable": True, "no_child_runtime_profile": None, "primary_failure": None, "primary_status": "complete", "release_tree_immutable": True, "release_tree_property": "object-identity-content-access-policy", "retained_paths": [], "returncode": 0, "runtime_residue": [], "secondary_failures": [], "signal_number": None, "source_head_bound": False, "source_head_sha": None, "source_head_subtree_manifest_sha256": None, "source_manifest_sha256": None, "timed_out": False}; source_manifest = payload.get("source_manifest_sha256") if isinstance(payload, dict) else None; source_manifest_valid = type(source_manifest) is str and len(source_manifest) == 64 and all(character in "0123456789abcdef" for character in source_manifest); expected["source_manifest_sha256"] = source_manifest; keys_exact = isinstance(payload, dict) and set(payload) == set(expected); invalid_values = {key: payload.get(key) for key, value in expected.items() if key not in payload or type(payload[key]) is not type(value) or payload[key] != value} if isinstance(payload, dict) else {"payload_type": type(payload).__name__}; invalid_values.update({} if source_manifest_valid else {"source_manifest_sha256_contract": {"length": len(source_manifest) if type(source_manifest) is str else None, "type": type(source_manifest).__name__}}); sys.exit("invalid terminal supervisor summary: " + json.dumps({"invalid_values": invalid_values, "keys_exact": keys_exact}, sort_keys=True, separators=(",", ":"))) if not valid_line or not keys_exact or invalid_values else print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))' \

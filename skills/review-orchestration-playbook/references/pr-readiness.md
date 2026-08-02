@@ -64,11 +64,17 @@ For issue-comment-only terminal or no-start evidence, apply the request-ledger a
 The pinned GitHub Hosted `macos-26` production-profile probe produces only a
 reviewed fail-closed signature, not production-equivalent no-child evidence.
 The separate required hosted read-only job remains valuable: it runs the full
-deterministic suite from a root-owned isolated source as `nobody`, with bound
-runtime custody and an exact terminal summary. Even without Git metadata, that
-source is captured under the shared snapshot resource bounds and copied only
-from its descriptor receipt; there is no unbounded copy fallback. Its
-isolated-account closure is
+deterministic suite from a root-owned isolated source as a randomly named,
+receipt-bound ephemeral non-admin account, with bound runtime custody and an
+exact terminal summary. The workflow selects an unused dedicated UID/GID,
+proves the account and group GUIDs, rejects admin membership or any process
+already using that UID, repeats the exact-UID process census immediately before
+launch and after the supervised run, and deletes only the same GUID-bound
+records after the UID is empty. Account ambiguity, replacement, a census
+failure, or a residual process fails closed and retains the records until the
+ephemeral runner is disposed. Even without Git metadata, the source is captured
+under the shared snapshot resource bounds and copied only from its descriptor
+receipt; there is no unbounded copy fallback. Its isolated-account closure is
 not the authenticated production no-child proof below. When the frozen range
 changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
