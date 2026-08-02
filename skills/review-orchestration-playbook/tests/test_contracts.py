@@ -1849,7 +1849,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("_align_created_directory_group", readonly_install_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 840", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 846", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2626,12 +2626,33 @@ class RepositoryContractTest(unittest.TestCase):
                     '[[ "$cached_user_names" != "$review_user" ]]',
                     '[[ "$cached_group_names" != "$review_group" ]]',
                     "verify_review_cached_identity || return 1",
-                    "/bin/ps -axo uid=,pid=",
-                    "'$1 == target_uid {print $2}'",
+                    "/bin/ps -axo ruid=,uid=,pid=",
+                    'if ! process_table="$(/bin/ps -axo ruid=,uid=,pid=)"; then',
+                    "(( ${#process_table} <= 1048576 )) || return 1",
+                    "'$1 == target_uid || $2 == target_uid {print $3}'",
+                    '<<< "$process_table"',
+                    "elif (( ${#diagnostic} > 4096 )); then",
+                    'diagnostic="${diagnostic:0:4096}"',
                     'review_processes_preuse="$(review_account_processes)"',
-                    'review_processes_prelaunch="$(review_account_processes)"',
+                    'if ! review_processes_prelaunch="$(review_account_processes)"; then',
+                    "Ephemeral review account process census failed before launch",
                     'review_processes_postrun="$(review_account_processes)"',
                     '[[ -n "$review_processes" ]]',
+                    "terminate_custodied_review_processes() {",
+                    "process_cleanup_proven=true",
+                    'run_review_user /bin/kill -TERM "$pid"',
+                    'run_review_user /bin/kill -KILL "$pid"',
+                    'review_process_diagnostics="$isolated_root/'
+                    'review-process-diagnostics.log"',
+                    '/usr/bin/sudo /bin/chmod 0600 "$review_process_diagnostics"',
+                    "current_bytes + record_bytes <= 1048576",
+                    '/usr/bin/sudo /usr/bin/tee -a "$review_process_diagnostics"',
+                    'direct_git="$DEVELOPER_DIR/usr/bin/git"',
+                    'direct_git_exec_path="$DEVELOPER_DIR/usr/libexec/git-core"',
+                    "measure_git_toolchain_for_review_account() {",
+                    "--hosted-git-receipt",
+                    '"$direct_git_exec_path" "$git_toolchain_measurement"',
+                    '"schema":"hosted-git-toolchain-receipt-v1"',
                     "retained until runner disposal",
                     '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"',
                     '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"',
@@ -2643,6 +2664,7 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job,
                 )
                 self.assertNotIn('== "IsHidden: 1"', readonly_job)
+                self.assertNotIn("| /usr/bin/cut -c 1-4096", readonly_job)
                 report_start = readonly_job.index(
                     "report_review_account_validation_failure() {"
                 )
@@ -2668,6 +2690,18 @@ class RepositoryContractTest(unittest.TestCase):
                     "trap cleanup_review_account EXIT", cleanup_start
                 )
                 cleanup_body = readonly_job[cleanup_start:cleanup_end]
+                self.assertLess(
+                    cleanup_body.index("terminate_custodied_review_processes"),
+                    cleanup_body.index(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"'
+                    ),
+                )
+                self.assertLess(
+                    cleanup_body.index('[[ "$process_cleanup_proven" == "true" ]]'),
+                    cleanup_body.index(
+                        '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"'
+                    ),
+                )
                 self.assertLess(
                     cleanup_body.index("if ! verify_review_account; then"),
                     cleanup_body.index("report_review_account_validation_failure"),
@@ -2702,8 +2736,19 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job.count(
                         '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"'
                     ),
+                    2,
+                )
+                self.assertEqual(
+                    readonly_job.count("run_review_user /usr/bin/env -i"),
                     1,
                 )
+                for prohibited_git_resolution in (
+                    "/usr/bin/xcrun",
+                    '"$direct_git" --exec-path',
+                    '"$direct_git" --version --build-options',
+                    "_trusted_git_measurement",
+                ):
+                    self.assertNotIn(prohibited_git_resolution, readonly_job)
                 for shared_account_use in (
                     "sudo -u nobody",
                     "chown nobody:nobody",
@@ -2711,7 +2756,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     self.assertNotIn(shared_account_use, readonly_job)
 
-                process_filter = "$1 == target_uid {print $2}"
+                process_filter = "$1 == target_uid || $2 == target_uid {print $3}"
                 filtered = subprocess.run(
                     [
                         "/usr/bin/awk",
@@ -2719,14 +2764,14 @@ class RepositoryContractTest(unittest.TestCase):
                         "target_uid=50000",
                         process_filter,
                     ],
-                    input=b"65534 101\n50000 202\n65534 303\n",
+                    input=(b"65534 65534 101\n50000 65534 202\n65534 50000 303\n"),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=5,
                     check=False,
                 )
                 self.assertEqual(filtered.returncode, 0, filtered.stderr)
-                self.assertEqual(filtered.stdout, b"202\n")
+                self.assertEqual(filtered.stdout, b"202\n303\n")
                 self.assertEqual(filtered.stderr, b"")
 
                 shell_functions: dict[str, str] = {}
@@ -2955,9 +3000,9 @@ class RepositoryContractTest(unittest.TestCase):
                     readonly_job.count("run_review_user /usr/bin/sandbox-exec"),
                     1,
                 )
-                self.assertNotIn(
-                    "run_review_user /usr/bin/env -i",
-                    readonly_job,
+                self.assertEqual(
+                    readonly_job.count("run_review_user /usr/bin/env -i"),
+                    1,
                 )
                 self.assertNotIn(
                     "run_review_user /usr/bin/ditto",

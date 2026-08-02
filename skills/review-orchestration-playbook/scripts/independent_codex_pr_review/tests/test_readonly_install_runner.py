@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import pwd
 import signal
 import stat
 import subprocess
@@ -729,6 +730,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 runner,
                 "_reap_terminal_same_uid_children",
             ),
+            mock.patch.object(runner.os, "kill") as kill,
             mock.patch.object(
                 runner.time,
                 "monotonic",
@@ -743,6 +745,156 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(closure.exception.processes, (escaped,))
+        kill.assert_not_called()
+
+    def test_dedicated_uid_scope_rejects_nonisolated_baseline(self) -> None:
+        supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
+        preexisting = runner.DarwinProcessIdentity(90_007, 2, 2)
+        account = mock.Mock(
+            pw_name="codexreview0123456789ab",
+            pw_uid=50_001,
+            pw_gid=50_001,
+            pw_dir="/var/empty",
+            pw_shell="/usr/bin/false",
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {runner.DEDICATED_ACCOUNT_CUSTODY_ENV: "a" * 64},
+            ),
+            mock.patch.object(runner.os, "getuid", return_value=50_001),
+            mock.patch.object(runner.pwd, "getpwuid", return_value=account),
+            self.assertRaisesRegex(PermissionError, "custody is not proven"),
+        ):
+            runner._dedicated_uid_scope((supervisor, preexisting))
+
+    def test_dedicated_uid_signal_rejects_pid_replacement(self) -> None:
+        selected = runner.DarwinProcessIdentity(90_008, 3, 3)
+        replacement = runner.DarwinProcessIdentity(selected.pid, 4, 4)
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(replacement,),
+            ),
+            mock.patch.object(runner.os, "kill") as kill,
+            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
+        ):
+            runner._signal_dedicated_uid_process(
+                selected,
+                signal.SIGTERM,
+                deadline=runner.time.monotonic() + 1.0,
+            )
+        self.assertIsInstance(closure.exception.cause, OSError)
+        self.assertIn("identity changed before signal", str(closure.exception.cause))
+        kill.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and hasattr(os, "fork"),
+        "requires Darwin process identity and fork",
+    )
+    def test_dedicated_uid_closure_kills_double_forked_session(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        leader = os.fork()
+        if leader == 0:
+            try:
+                os.close(read_descriptor)
+                os.setsid()
+                descendant = os.fork()
+                if descendant == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    os.write(write_descriptor, f"{os.getpid()}\n".encode("ascii"))
+                    while True:
+                        signal.pause()
+                os._exit(0)
+            except BaseException:
+                os._exit(97)
+
+        os.close(write_descriptor)
+        descendant_pid = -1
+        original_census = runner._darwin_same_uid_processes
+        real_kill = os.kill
+        selected_descendant: runner.DarwinProcessIdentity | None = None
+        try:
+            with os.fdopen(read_descriptor, "rb", closefd=True) as reader:
+                descendant_pid = int(reader.readline().decode("ascii"))
+            reaped_leader, leader_status = os.waitpid(leader, 0)
+            self.assertEqual(reaped_leader, leader)
+            self.assertEqual(leader_status, 0)
+
+            initial = original_census(deadline=time.monotonic() + 2.0)
+            supervisor = next(item for item in initial if item.pid == os.getpid())
+            selected_descendant = next(
+                item for item in initial if item.pid == descendant_pid
+            )
+            baseline = (supervisor,)
+            scope = runner.DedicatedUidScope(
+                uid=os.getuid(),
+                account_name=pwd.getpwuid(os.getuid()).pw_name,
+                receipt_sha256="a" * 64,
+                baseline=baseline,
+            )
+            signaled: list[tuple[int, int]] = []
+
+            def scoped_census(
+                *, deadline: float | None = None
+            ) -> tuple[runner.DarwinProcessIdentity, ...]:
+                return tuple(
+                    item
+                    for item in original_census(deadline=deadline)
+                    if item.pid in {os.getpid(), descendant_pid}
+                )
+
+            def record_kill(pid: int, signal_number: int) -> None:
+                signaled.append((pid, signal_number))
+                real_kill(pid, signal_number)
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_darwin_same_uid_processes",
+                    side_effect=scoped_census,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_require_dedicated_uid_scope_current",
+                ),
+                mock.patch.object(
+                    runner,
+                    "_reap_terminal_same_uid_children",
+                ),
+                mock.patch.object(runner.os, "kill", side_effect=record_kill),
+                mock.patch.object(
+                    runner,
+                    "DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS",
+                    0.02,
+                ),
+                mock.patch.object(
+                    runner,
+                    "DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS",
+                    0.02,
+                ),
+            ):
+                runner._require_no_new_same_uid_processes(
+                    baseline,
+                    deadline=time.monotonic() + 5.0,
+                    dedicated_scope=scope,
+                )
+
+            self.assertIn((descendant_pid, signal.SIGTERM), signaled)
+            self.assertIn((descendant_pid, signal.SIGKILL), signaled)
+        finally:
+            if descendant_pid > 0:
+                try:
+                    current = original_census(deadline=time.monotonic() + 1.0)
+                    if selected_descendant in current:
+                        real_kill(descendant_pid, signal.SIGKILL)
+                except (OSError, StopIteration, TimeoutError):
+                    pass
+            try:
+                os.waitpid(leader, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
     def test_terminal_same_uid_child_reap_binds_exact_identity_under_deadline(
         self,
@@ -6713,7 +6865,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, "")
-            require_closure.assert_called_once_with(())
+            require_closure.assert_called_once_with((), dedicated_scope=None)
             self._require_process_group_absent(process_group)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
@@ -7123,7 +7275,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             process_group = int(group_file.read_text(encoding="ascii"))
-            require_closure.assert_called_once_with(())
+            require_closure.assert_called_once_with((), dedicated_scope=None)
             self._require_process_group_absent(process_group)
 
     def test_bounded_child_receipt_failure_does_not_skip_closure(self) -> None:
@@ -7196,7 +7348,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 str(caught.exception.__cause__),
                 "already published",
             )
-            require_closure.assert_called_once_with(baseline)
+            require_closure.assert_called_once_with(
+                baseline,
+                dedicated_scope=None,
+            )
             self.assertIs(outcome_receipt.completed, previous_outcome)
             self.assertTrue(closure_proof.started)
             self.assertFalse(closure_proof.proven)
@@ -9304,11 +9459,6 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             cases = (
                 ("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),
                 ("readonly", ("readonly", "a" * 40), runner.EXPECTED_HEAD_ENV),
-                (
-                    "hosted-readonly",
-                    ("hosted-readonly", str(root / "runtime"), str(root / "home")),
-                    runner.EXPLICIT_RUNTIME_PARENT_ENV,
-                ),
             )
             for label, arguments, expected_key in cases:
                 with self.subTest(mode=label):
@@ -9338,6 +9488,164 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                     self.assertIs(result["marker_exists"], False)
                     self.assertFalse(marker.exists())
                     self.assertFalse(tuple(root.rglob("__pycache__")))
+
+    def test_hosted_git_receipt_is_closed_and_binds_runtime_environment(self) -> None:
+        gate = self._load_gate_module()
+        account = pwd.getpwuid(os.getuid())
+        paths = {
+            "runtime": "/private/runtime",
+            "home": "/private/home",
+            "developer": "/Applications/Trusted.app/Contents/Developer",
+            "executable": "/Applications/Trusted.app/Contents/Developer/usr/bin/git",
+            "exec_path": (
+                "/Applications/Trusted.app/Contents/Developer/usr/libexec/git-core"
+            ),
+        }
+        record = {
+            "developer_dir": paths["developer"],
+            "exec_path": paths["exec_path"],
+            "exec_path_sha256": "a" * 64,
+            "executable": paths["executable"],
+            "executable_sha256": "b" * 64,
+            "schema": "hosted-git-toolchain-receipt-v1",
+            "toolchain_sha256": "c" * 64,
+            "version_sha256": "d" * 64,
+        }
+        receipt = json.dumps(
+            record,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        receipt_payload = (receipt + "\n").encode("ascii")
+        arguments = [
+            paths["runtime"],
+            paths["home"],
+            paths["developer"],
+            paths["executable"],
+            "b" * 64,
+            paths["exec_path"],
+            receipt,
+            account.pw_name,
+            str(account.pw_uid),
+            str(account.pw_gid),
+            "e" * 64,
+        ]
+        with mock.patch.object(
+            gate,
+            "_hosted_git_receipt_payload",
+            return_value=receipt_payload,
+        ) as measure:
+            environment = gate._validate_hosted_git_toolchain(arguments)
+        self.assertEqual(
+            environment,
+            {
+                "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR": paths["developer"],
+                "CODEX_REVIEW_BOUND_GIT_EXECUTABLE": paths["executable"],
+                "CODEX_REVIEW_BOUND_GIT_EXEC_PATH": paths["exec_path"],
+                "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256": hashlib.sha256(
+                    receipt_payload
+                ).hexdigest(),
+                "CODEX_REVIEW_BOUND_GIT_TMPDIR": paths["runtime"],
+                "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256": "e" * 64,
+                "HOME": paths["home"],
+                "TMPDIR": paths["runtime"],
+            },
+        )
+        measure.assert_called_once_with(
+            [
+                paths["developer"],
+                paths["executable"],
+                "b" * 64,
+                paths["exec_path"],
+                paths["runtime"],
+            ],
+            version_receipt="d" * 64,
+        )
+
+        invalid_records = (
+            receipt + "\n",
+            receipt.replace('"schema":', '"unknown":"value","schema":'),
+            receipt.replace(
+                '"version_sha256":"' + "d" * 64, '"version_sha256":"' + "D" * 64
+            ),
+            json.dumps(record, ensure_ascii=True),
+        )
+        for invalid in invalid_records:
+            with self.subTest(receipt=invalid[:80]), self.assertRaises(RuntimeError):
+                gate._parse_hosted_git_receipt(invalid)
+
+    def test_hosted_git_receipt_payload_is_canonical_and_helper_bound(self) -> None:
+        gate = self._load_gate_module()
+        arguments = [
+            "/Applications/Trusted.app/Contents/Developer",
+            "/Applications/Trusted.app/Contents/Developer/usr/bin/git",
+            "b" * 64,
+            "/Applications/Trusted.app/Contents/Developer/usr/libexec/git-core",
+            "/private/runtime",
+        ]
+        with mock.patch.object(
+            gate,
+            "_measure_hosted_git_toolchain",
+            return_value=("a" * 64, "d" * 64, "c" * 64),
+        ) as measure:
+            payload = gate._hosted_git_receipt_payload(arguments)
+        self.assertLessEqual(len(payload), gate.GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES)
+        self.assertEqual(payload.count(b"\n"), 1)
+        self.assertTrue(payload.endswith(b"\n"))
+        parsed = gate._parse_hosted_git_receipt(payload[:-1].decode("ascii"))
+        self.assertEqual(
+            parsed,
+            {
+                "developer_dir": arguments[0],
+                "exec_path": arguments[3],
+                "exec_path_sha256": "a" * 64,
+                "executable": arguments[1],
+                "executable_sha256": "b" * 64,
+                "schema": "hosted-git-toolchain-receipt-v1",
+                "toolchain_sha256": "c" * 64,
+                "version_sha256": "d" * 64,
+            },
+        )
+        measure.assert_called_once_with(arguments, version_receipt=None)
+
+        with owned_temporary_directory("hosted-git-helper-escape-") as root:
+            developer = root / "Developer"
+            exec_path = developer / "usr" / "libexec" / "git-core"
+            exec_path.mkdir(parents=True)
+            outside = root / "outside-helper"
+            outside.write_bytes(b"outside")
+            (exec_path / "git-helper").symlink_to(outside)
+
+            def readonly_access(_path: object, mode: int) -> bool:
+                return not bool(mode & os.W_OK)
+
+            with (
+                mock.patch.object(gate.os, "access", side_effect=readonly_access),
+                self.assertRaisesRegex(RuntimeError, "escapes the Developer directory"),
+            ):
+                gate._snapshot_git_exec_path(exec_path, developer_dir=developer)
+
+            (exec_path / "git-helper").unlink()
+            executable = developer / "usr" / "bin" / "git"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"first!")
+            (exec_path / "git-helper").symlink_to("../../bin/git")
+            with mock.patch.object(
+                gate.os,
+                "access",
+                side_effect=readonly_access,
+            ):
+                before = gate._snapshot_git_exec_path(
+                    exec_path,
+                    developer_dir=developer,
+                )
+                executable.write_bytes(b"second")
+                after = gate._snapshot_git_exec_path(
+                    exec_path,
+                    developer_dir=developer,
+                )
+            self.assertNotEqual(before, after)
 
     def test_source_only_bootstrap_rejects_substitutes_and_nonisolated_start(
         self,

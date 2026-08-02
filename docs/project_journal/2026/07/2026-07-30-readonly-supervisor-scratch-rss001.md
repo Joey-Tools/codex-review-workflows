@@ -534,3 +534,26 @@ superseded_by:
   After synchronizing the exact Trusted Mac source manifest, the final
   host-level Python 3.13.12 deterministic gate passed 840/840 in 269.450
   seconds. The earlier manifest-mismatch run is non-counting.
+- PR #86 run `30737798906`, job `91469661843`, proved that process-group-only
+  fixture cleanup was still insufficient for the hosted gate. Two direct
+  `/usr/bin/git init` calls timed out, and the outer dedicated-account census
+  retained six additional same-UID `state=2` processes. The log does not bind
+  those six objects to exact argv or parentage, so the evidence is limited to
+  post-baseline whole-UID presence. The replacement gate keeps the ephemeral
+  account under whole-UID custody: it requires an empty baseline, revalidates
+  the exact account receipt, applies bounded TERM/KILL settlement to every
+  post-baseline process while the account remains exclusively owned, requires
+  stable absence, and retains the account and roots on any census, identity, or
+  cleanup uncertainty. Shared-account paths never signal by UID.
+- Process diagnostics now go only to a root-owned mode-`0600`, one-MiB-bounded
+  file; GitHub annotations remain fixed literals. Every `ps` census and detail
+  query has an independently checked exit status and bounded result, so the
+  hosted Bash default no longer lets a successful `awk` or `cut` hide a failed
+  `ps`. The focused dedicated-UID regressions include baseline rejection, PID
+  replacement, and a real `setsid` plus double-fork TERM-ignoring process that
+  requires KILL and stable absence. The final deterministic suite passed
+  846/846 in 292.588 seconds with selected-identity SHA-256
+  `cf927546fed88325300574c2c802f42b63a2038ac0a22322e0fa773a48e317b8`.
+  One bounded 90-second actionlint run timed out with empty output and is
+  tool-inconclusive; both extracted workflow shell blocks passed `bash -n` and
+  ShellCheck under an explicit Bash profile.

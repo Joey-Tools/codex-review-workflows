@@ -450,3 +450,23 @@ superseded_by:
   has SHA-256
   `6d40334cf49865b44402c49233a9f820b722eb9cb5f35de646f42194b6345fa0`.
   The earlier manifest-mismatch run is non-counting.
+- The next hosted run proved that `/usr/bin/git` is an Xcode-selection shim,
+  not the Git implementation the gate intended to trust. The hosted gate now
+  constructs the Git executable and `git-core` exec path directly below one
+  fixed `DEVELOPER_DIR`; it rejects the shim and symlink/escape cases, binds
+  executable content, code-signing and loader evidence, inventories and hashes
+  the bounded helper closure including resolved symlink targets, and compares
+  one canonical closed-schema JSON receipt before launch and after return. It
+  never calls `xcrun`, and every Git argv uses the measured executable with the
+  exact exec path.
+- The dedicated account receives only the validated owner-private runtime
+  `TMPDIR`; fixture sanitization carries that value explicitly rather than
+  inheriting or discarding an ambient path. The sandboxed gate consumes the
+  previously measured version hash instead of launching Git inside its
+  no-child boundary. Receipt mode itself runs under isolated Python with a
+  ten-second Git deadline and fixed output cap. Closed-schema, helper-escape,
+  target-content mutation, environment completeness, and canonical-payload
+  regressions passed. The regenerated Trusted Mac source manifest binds these
+  exact source bytes, and the final deterministic gate passed 846/846 in
+  292.588 seconds. The reviewed 846-test selected identity has SHA-256
+  `cf927546fed88325300574c2c802f42b63a2038ac0a22322e0fa773a48e317b8`.

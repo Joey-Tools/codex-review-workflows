@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.abc
 import importlib.util
+import json
 import os
 import pathlib
 import pwd
 import runpy
+import signal
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from types import CodeType, ModuleType
@@ -20,6 +23,11 @@ SOURCE_PATH_LIMIT_BYTES = 4 * 1024 * 1024
 SOURCE_DEPTH_LIMIT = 32
 SOURCE_MANIFEST_LIMIT_BYTES = 1024 * 1024
 SOURCE_MANIFEST_HEADER = b"trusted-mac-gate-source-manifest-v1\n"
+GIT_TOOLCHAIN_ENTRY_LIMIT = 1024
+GIT_TOOLCHAIN_FILE_LIMIT_BYTES = 16 * 1024 * 1024
+GIT_TOOLCHAIN_TOTAL_LIMIT_BYTES = 64 * 1024 * 1024
+GIT_TOOLCHAIN_DEPTH_LIMIT = 8
+GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES = 4096
 SOURCE_ROOTS = ("review_supervisor", "tests")
 PROHIBITED_SUFFIXES = (".pyc", ".pyo", ".so", ".dylib", ".dll", ".pyd")
 MODE_MODULES = {
@@ -43,6 +51,509 @@ class _ManifestEntry:
     git_mode: int
     size: int
     sha256: str
+
+
+def _require_sha256(value: str, label: str) -> None:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise RuntimeError(f"{label} is not one lowercase SHA-256")
+
+
+def _require_candidate_readonly_physical_chain(path: pathlib.Path) -> None:
+    if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
+        raise RuntimeError("hosted Git toolchain path is not absolute and normalized")
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError("hosted Git toolchain path contains a symlink")
+        if os.access(current, os.W_OK):
+            raise RuntimeError("hosted Git toolchain is writable by the review account")
+
+
+def _read_toolchain_file(path: pathlib.Path, *, expected_size: int) -> bytes:
+    if expected_size < 0 or expected_size > GIT_TOOLCHAIN_FILE_LIMIT_BYTES:
+        raise RuntimeError("hosted Git toolchain file exceeds its byte bound")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != expected_size:
+            raise RuntimeError("hosted Git toolchain file changed while opening")
+        chunks = []
+        remaining = expected_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise RuntimeError("hosted Git toolchain file is truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("hosted Git toolchain file grew while reading")
+        closed = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_size,
+        ) != (
+            closed.st_dev,
+            closed.st_ino,
+            stat.S_IFMT(closed.st_mode),
+            closed.st_uid,
+            closed.st_gid,
+            stat.S_IMODE(closed.st_mode),
+            closed.st_size,
+        ):
+            raise RuntimeError("hosted Git toolchain file changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _snapshot_git_exec_path(
+    exec_path: pathlib.Path,
+    *,
+    developer_dir: pathlib.Path,
+) -> str:
+    records: list[bytes] = []
+    entry_count = 0
+    total_bytes = 0
+    symlink_target_digests: dict[tuple[int, int], tuple[tuple[int, ...], str]] = {}
+
+    def walk(directory: pathlib.Path, relative: tuple[str, ...], depth: int) -> None:
+        nonlocal entry_count, total_bytes
+        if depth > GIT_TOOLCHAIN_DEPTH_LIMIT:
+            raise RuntimeError("hosted Git exec-path exceeds its depth bound")
+        entries = []
+        with os.scandir(directory) as iterator:
+            for entry in iterator:
+                entry_count += 1
+                if entry_count > GIT_TOOLCHAIN_ENTRY_LIMIT:
+                    raise RuntimeError("hosted Git exec-path exceeds its entry bound")
+                entries.append(entry)
+        entries.sort(key=lambda entry: os.fsencode(entry.name))
+        for entry in entries:
+            path = directory / entry.name
+            metadata = path.lstat()
+            if os.access(path.parent, os.W_OK):
+                raise RuntimeError(
+                    "hosted Git exec-path parent is writable by the review account"
+                )
+            encoded_relative = os.fsencode("/".join((*relative, entry.name)))
+            prefix = (
+                encoded_relative
+                + b"\0"
+                + f"{metadata.st_uid}:{metadata.st_gid}:{stat.S_IMODE(metadata.st_mode)}".encode(
+                    "ascii"
+                )
+                + b"\0"
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                if os.access(path, os.W_OK):
+                    raise RuntimeError(
+                        "hosted Git exec-path directory is writable by the review account"
+                    )
+                records.append(prefix + b"D\0")
+                walk(path, (*relative, entry.name), depth + 1)
+            elif stat.S_ISREG(metadata.st_mode):
+                if os.access(path, os.W_OK) or not os.access(path, os.R_OK):
+                    raise RuntimeError(
+                        "hosted Git exec-path file has unsafe review-account access"
+                    )
+                payload = _read_toolchain_file(path, expected_size=metadata.st_size)
+                total_bytes += len(payload)
+                if total_bytes > GIT_TOOLCHAIN_TOTAL_LIMIT_BYTES:
+                    raise RuntimeError("hosted Git exec-path exceeds its byte bound")
+                records.append(prefix + b"F" + hashlib.sha256(payload).digest() + b"\0")
+            elif stat.S_ISLNK(metadata.st_mode):
+                target = os.readlink(path)
+                encoded_target = os.fsencode(target)
+                if len(encoded_target) > 4096:
+                    raise RuntimeError(
+                        "hosted Git exec-path symlink exceeds its byte bound"
+                    )
+                resolved = path.resolve(strict=True)
+                try:
+                    resolved_relative = resolved.relative_to(developer_dir)
+                except ValueError as error:
+                    raise RuntimeError(
+                        "hosted Git exec-path symlink escapes the Developer directory"
+                    ) from error
+                _require_candidate_readonly_physical_chain(resolved)
+                resolved_metadata = resolved.lstat()
+                if (
+                    not stat.S_ISREG(resolved_metadata.st_mode)
+                    or os.access(resolved, os.W_OK)
+                    or not os.access(resolved, os.R_OK | os.X_OK)
+                ):
+                    raise RuntimeError(
+                        "hosted Git exec-path symlink target has unsafe review-account access"
+                    )
+                target_identity = (
+                    resolved_metadata.st_dev,
+                    resolved_metadata.st_ino,
+                )
+                target_policy = (
+                    resolved_metadata.st_dev,
+                    resolved_metadata.st_ino,
+                    resolved_metadata.st_uid,
+                    resolved_metadata.st_gid,
+                    stat.S_IMODE(resolved_metadata.st_mode),
+                    resolved_metadata.st_size,
+                )
+                cached_target = symlink_target_digests.get(target_identity)
+                if cached_target is None:
+                    target_payload = _read_toolchain_file(
+                        resolved,
+                        expected_size=resolved_metadata.st_size,
+                    )
+                    total_bytes += len(target_payload)
+                    if total_bytes > GIT_TOOLCHAIN_TOTAL_LIMIT_BYTES:
+                        raise RuntimeError(
+                            "hosted Git exec-path exceeds its byte bound"
+                        )
+                    target_digest = hashlib.sha256(target_payload).hexdigest()
+                    symlink_target_digests[target_identity] = (
+                        target_policy,
+                        target_digest,
+                    )
+                else:
+                    cached_policy, target_digest = cached_target
+                    if cached_policy != target_policy:
+                        raise RuntimeError(
+                            "hosted Git exec-path symlink target changed during snapshot"
+                        )
+                records.append(
+                    prefix
+                    + b"L"
+                    + encoded_target
+                    + b"\0"
+                    + os.fsencode(resolved_relative.as_posix())
+                    + b"\0"
+                    + target_digest.encode("ascii")
+                    + b"\0"
+                )
+            else:
+                raise RuntimeError("hosted Git exec-path contains a special file")
+
+    walk(exec_path, (), 1)
+    return hashlib.sha256(b"".join(records)).hexdigest()
+
+
+def _git_toolchain_receipt(
+    *,
+    developer_dir: pathlib.Path,
+    git_executable: pathlib.Path,
+    git_sha256: str,
+    git_exec_path: pathlib.Path,
+    git_exec_path_receipt: str,
+    git_version_receipt: str,
+) -> str:
+    return hashlib.sha256(
+        b"hosted-git-toolchain-v1\0"
+        + os.fsencode(str(developer_dir))
+        + b"\0"
+        + os.fsencode(str(git_executable))
+        + b"\0"
+        + git_sha256.encode("ascii")
+        + b"\0"
+        + os.fsencode(str(git_exec_path))
+        + b"\0"
+        + git_exec_path_receipt.encode("ascii")
+        + b"\0"
+        + git_version_receipt.encode("ascii")
+        + b"\0"
+    ).hexdigest()
+
+
+def _git_version_receipt(
+    *,
+    developer_dir: pathlib.Path,
+    git_executable: pathlib.Path,
+    git_exec_path: pathlib.Path,
+    temporary_directory: pathlib.Path,
+) -> str:
+    process = subprocess.Popen(
+        (str(git_executable), "--version", "--build-options"),
+        cwd=temporary_directory,
+        env={
+            "DEVELOPER_DIR": str(developer_dir),
+            "GIT_EXEC_PATH": str(git_exec_path),
+            "HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": str(temporary_directory),
+        },
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+            raise RuntimeError("hosted Git version probe timed out") from None
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+    if (
+        process.returncode != 0
+        or stderr
+        or not stdout.endswith(b"\n")
+        or len(stdout) > 64 * 1024
+    ):
+        raise RuntimeError("hosted Git version probe is not an exact bounded record")
+    return hashlib.sha256(stdout).hexdigest()
+
+
+def _measure_hosted_git_toolchain(
+    arguments: list[str],
+    *,
+    version_receipt: str | None = None,
+) -> tuple[str, str, str]:
+    if len(arguments) != 5:
+        raise RuntimeError(
+            "hosted Git receipt requires Developer, executable, digest, exec-path, and TMPDIR"
+        )
+    developer_dir = pathlib.Path(arguments[0])
+    git_executable = pathlib.Path(arguments[1])
+    expected_git_sha256 = arguments[2]
+    git_exec_path = pathlib.Path(arguments[3])
+    temporary_directory = pathlib.Path(arguments[4])
+    _require_sha256(expected_git_sha256, "hosted Git executable digest")
+    for path in (
+        developer_dir,
+        git_executable,
+        git_exec_path,
+        temporary_directory,
+    ):
+        if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
+            raise RuntimeError("hosted Git receipt path is not absolute and normalized")
+    if git_executable.resolve(strict=True) != git_executable:
+        raise RuntimeError("hosted Git executable is not a physical path")
+    if git_exec_path.resolve(strict=True) != git_exec_path:
+        raise RuntimeError("hosted Git exec-path is not a physical path")
+    try:
+        git_executable.relative_to(developer_dir)
+        git_exec_path.relative_to(developer_dir)
+    except ValueError as error:
+        raise RuntimeError(
+            "hosted Git toolchain escapes the Developer directory"
+        ) from error
+    _require_candidate_readonly_physical_chain(developer_dir)
+    _require_candidate_readonly_physical_chain(git_executable)
+    _require_candidate_readonly_physical_chain(git_exec_path)
+    metadata = git_executable.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not os.access(git_executable, os.R_OK | os.X_OK)
+        or os.access(git_executable, os.W_OK)
+    ):
+        raise RuntimeError("hosted Git executable has unsafe review-account access")
+    payload = _read_toolchain_file(git_executable, expected_size=metadata.st_size)
+    if hashlib.sha256(payload).hexdigest() != expected_git_sha256:
+        raise RuntimeError("hosted Git executable content does not match its receipt")
+    exec_path_receipt = _snapshot_git_exec_path(
+        git_exec_path,
+        developer_dir=developer_dir,
+    )
+    if version_receipt is None:
+        version_receipt = _git_version_receipt(
+            developer_dir=developer_dir,
+            git_executable=git_executable,
+            git_exec_path=git_exec_path,
+            temporary_directory=temporary_directory,
+        )
+    else:
+        _require_sha256(version_receipt, "hosted Git version receipt")
+    toolchain_receipt = _git_toolchain_receipt(
+        developer_dir=developer_dir,
+        git_executable=git_executable,
+        git_sha256=expected_git_sha256,
+        git_exec_path=git_exec_path,
+        git_exec_path_receipt=exec_path_receipt,
+        git_version_receipt=version_receipt,
+    )
+    return exec_path_receipt, version_receipt, toolchain_receipt
+
+
+def _hosted_git_receipt_payload(
+    arguments: list[str],
+    *,
+    version_receipt: str | None = None,
+) -> bytes:
+    exec_path_receipt, version_receipt, toolchain_receipt = (
+        _measure_hosted_git_toolchain(arguments, version_receipt=version_receipt)
+    )
+    developer_dir, git_executable, git_sha256, git_exec_path, _ = arguments
+    record = {
+        "developer_dir": developer_dir,
+        "exec_path": git_exec_path,
+        "exec_path_sha256": exec_path_receipt,
+        "executable": git_executable,
+        "executable_sha256": git_sha256,
+        "schema": "hosted-git-toolchain-receipt-v1",
+        "toolchain_sha256": toolchain_receipt,
+        "version_sha256": version_receipt,
+    }
+    payload = (
+        json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    if len(payload) > GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES or payload.count(b"\n") != 1:
+        raise RuntimeError("hosted Git receipt exceeds its closed output bound")
+    return payload
+
+
+def _parse_hosted_git_receipt(value: str) -> dict[str, str]:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise RuntimeError("hosted Git receipt is not ASCII") from error
+    if not encoded or len(encoded) >= GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES:
+        raise RuntimeError("hosted Git receipt exceeds its closed input bound")
+    if b"\n" in encoded or b"\r" in encoded or b"\0" in encoded:
+        raise RuntimeError("hosted Git receipt is not one physical record")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("hosted Git receipt is not valid JSON") from error
+    expected_keys = {
+        "developer_dir",
+        "exec_path",
+        "exec_path_sha256",
+        "executable",
+        "executable_sha256",
+        "schema",
+        "toolchain_sha256",
+        "version_sha256",
+    }
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != expected_keys
+        or any(not isinstance(item, str) for item in decoded.values())
+        or decoded["schema"] != "hosted-git-toolchain-receipt-v1"
+    ):
+        raise RuntimeError("hosted Git receipt does not match its closed schema")
+    record = {key: decoded[key] for key in sorted(expected_keys)}
+    for key in (
+        "exec_path_sha256",
+        "executable_sha256",
+        "toolchain_sha256",
+        "version_sha256",
+    ):
+        _require_sha256(record[key], f"hosted Git receipt {key}")
+    canonical = json.dumps(
+        record,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if canonical != value:
+        raise RuntimeError("hosted Git receipt is not canonically encoded")
+    return record
+
+
+def _validate_hosted_git_toolchain(arguments: list[str]) -> dict[str, str]:
+    if len(arguments) != 11:
+        raise RuntimeError(
+            "hosted readonly gate requires runtime, home, Git, and account receipts"
+        )
+    (
+        runtime_parent_raw,
+        home_raw,
+        developer_dir_raw,
+        git_executable_raw,
+        expected_git_sha256,
+        git_exec_path_raw,
+        expected_toolchain_receipt_json,
+        expected_account_name,
+        expected_uid,
+        expected_gid,
+        expected_account_receipt,
+    ) = arguments
+    for value, label in (
+        (expected_git_sha256, "hosted Git executable digest"),
+        (expected_account_receipt, "hosted review-account receipt"),
+    ):
+        _require_sha256(value, label)
+    account = pwd.getpwuid(os.getuid())
+    if (
+        account.pw_name != expected_account_name
+        or str(account.pw_uid) != expected_uid
+        or str(account.pw_gid) != expected_gid
+    ):
+        raise RuntimeError("hosted review-account receipt does not match this process")
+    runtime_parent = pathlib.Path(runtime_parent_raw)
+    home = pathlib.Path(home_raw)
+    developer_dir = pathlib.Path(developer_dir_raw)
+    git_executable = pathlib.Path(git_executable_raw)
+    git_exec_path = pathlib.Path(git_exec_path_raw)
+    for path in (runtime_parent, home, developer_dir, git_executable, git_exec_path):
+        if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
+            raise RuntimeError(
+                "hosted readonly gate path is not absolute and normalized"
+            )
+    expected_receipt = _parse_hosted_git_receipt(expected_toolchain_receipt_json)
+    if (
+        expected_receipt["developer_dir"] != str(developer_dir)
+        or expected_receipt["executable"] != str(git_executable)
+        or expected_receipt["executable_sha256"] != expected_git_sha256
+        or expected_receipt["exec_path"] != str(git_exec_path)
+    ):
+        raise RuntimeError("hosted Git receipt does not bind the supplied toolchain")
+    observed_receipt = _hosted_git_receipt_payload(
+        [
+            str(developer_dir),
+            str(git_executable),
+            expected_git_sha256,
+            str(git_exec_path),
+            str(runtime_parent),
+        ],
+        version_receipt=expected_receipt["version_sha256"],
+    )
+    expected_payload = (expected_toolchain_receipt_json + "\n").encode("ascii")
+    if observed_receipt != expected_payload:
+        raise RuntimeError("hosted Git toolchain does not match its receipt")
+    observed_toolchain_receipt = hashlib.sha256(observed_receipt).hexdigest()
+    return {
+        "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR": str(developer_dir),
+        "CODEX_REVIEW_BOUND_GIT_EXECUTABLE": str(git_executable),
+        "CODEX_REVIEW_BOUND_GIT_EXEC_PATH": str(git_exec_path),
+        "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256": observed_toolchain_receipt,
+        "CODEX_REVIEW_BOUND_GIT_TMPDIR": str(runtime_parent),
+        "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256": expected_account_receipt,
+        "HOME": str(home),
+        "TMPDIR": str(runtime_parent),
+    }
+
+
+def _hosted_git_receipt_main() -> int:
+    if (
+        not sys.flags.isolated
+        or not sys.flags.ignore_environment
+        or not sys.flags.no_site
+        or not sys.flags.no_user_site
+        or not sys.flags.safe_path
+        or not sys.dont_write_bytecode
+        or __file__ != "<stdin>"
+        or sys.argv[0] != "-"
+    ):
+        raise RuntimeError("hosted Git receipt requires isolated trusted stdin")
+    sys.stdout.buffer.write(_hosted_git_receipt_payload(sys.argv[2:]))
+    sys.stdout.buffer.flush()
+    return 0
 
 
 class _SourceOnlyLoader(importlib.abc.Loader):
@@ -546,15 +1057,11 @@ def _configure_environment(mode: str, arguments: list[str]) -> str:
             raise RuntimeError("trusted readonly gate requires one full SHA-1")
         environment["CODEX_REVIEW_EXPECTED_HEAD_SHA"] = arguments[0]
     elif mode == "hosted-readonly":
-        if len(arguments) != 2:
-            raise RuntimeError("hosted readonly gate requires runtime and home paths")
-        runtime_parent = pathlib.Path(arguments[0])
-        home = pathlib.Path(arguments[1])
-        if not runtime_parent.is_absolute() or not home.is_absolute():
-            raise RuntimeError("hosted readonly gate paths must be absolute")
-        environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"] = str(runtime_parent)
-        environment["HOME"] = str(home)
-        environment["TMPDIR"] = str(runtime_parent)
+        hosted_environment = _validate_hosted_git_toolchain(arguments)
+        environment.update(hosted_environment)
+        environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"] = hosted_environment[
+            "CODEX_REVIEW_BOUND_GIT_TMPDIR"
+        ]
     else:
         raise RuntimeError("trusted gate mode is unsupported")
     os.environ.clear()
@@ -563,6 +1070,8 @@ def _configure_environment(mode: str, arguments: list[str]) -> str:
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--hosted-git-receipt":
+        return _hosted_git_receipt_main()
     if (
         not sys.flags.isolated
         or not sys.flags.ignore_environment

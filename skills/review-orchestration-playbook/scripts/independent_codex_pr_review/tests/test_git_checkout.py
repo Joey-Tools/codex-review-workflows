@@ -35,12 +35,18 @@ from review_supervisor.constants import (
 )
 from review_supervisor.errors import SupervisorError
 from review_supervisor.gitraw import (
+    BOUND_GIT_DEVELOPER_DIR_ENV,
+    BOUND_GIT_EXECUTABLE_ENV,
+    BOUND_GIT_EXEC_PATH_ENV,
+    BOUND_GIT_RECEIPT_ENV,
+    BOUND_GIT_TMPDIR_ENV,
     CatFileBatch,
     GitProcessClosureUnproven,
     RepositoryInfo,
     _parse_tree_record,
     add_detached_worktree,
     authenticated_range_manifests,
+    bound_git_environment,
     check_attributes,
     create_sanitized_view,
     enumerate_tree,
@@ -53,6 +59,7 @@ from review_supervisor.gitraw import (
     revalidate_git_control,
     retry_git_process_closure,
     sanitized_git_environment,
+    selected_git_executable,
     verify_worktree_absent,
 )
 from review_supervisor.ledger import (
@@ -81,7 +88,7 @@ from tests.support import (
 )
 
 
-GIT = pathlib.Path("/usr/bin/git")
+GIT = pathlib.Path(selected_git_executable())
 FIXTURE_PROCESS_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 FIXTURE_PROCESS_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
 
@@ -109,7 +116,7 @@ def _git(repo: pathlib.Path, *arguments: str) -> bytes:
         (str(GIT), "-C", str(repo), *arguments),
         cwd=repo,
         timeout=10,
-        environment=sanitized_git_environment(),
+        environment=bound_git_environment(),
     )
     if completed.returncode != 0:
         raise AssertionError(completed.stderr.decode("utf-8", "replace"))
@@ -130,7 +137,7 @@ def _init_repository(
         tuple(arguments),
         cwd=repo.parent,
         timeout=timeout,
-        environment=sanitized_git_environment(),
+        environment=bound_git_environment(),
     )
 
 
@@ -2148,7 +2155,7 @@ class RawGitProtocolTests(unittest.TestCase):
         self.assertIn("pack.useBitmaps=false", argv)
 
 
-@unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
+@unittest.skipUnless(GIT.is_file(), "the selected Git executable is required")
 class RawGitCheckoutTests(unittest.TestCase):
     def test_authenticated_range_rejects_commit_content_mismatch(self) -> None:
         with owned_temporary_directory("git-metadata-content-mismatch-") as root:
@@ -2812,6 +2819,41 @@ class RawGitCheckoutTests(unittest.TestCase):
         self.assertEqual(environment["HOME"], "/var/empty")
         self.assertNotIn("GIT_CONFIG", environment)
         self.assertNotIn("XDG_CONFIG_HOME", environment)
+
+    def test_bound_git_environment_is_closed_and_complete(self) -> None:
+        values = {
+            BOUND_GIT_EXECUTABLE_ENV: "/trusted/Xcode/usr/bin/git",
+            BOUND_GIT_EXEC_PATH_ENV: "/trusted/Xcode/usr/libexec/git-core",
+            BOUND_GIT_DEVELOPER_DIR_ENV: "/trusted/Xcode",
+            BOUND_GIT_TMPDIR_ENV: "/private/runtime",
+            BOUND_GIT_RECEIPT_ENV: "a" * 64,
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            self.assertEqual(
+                selected_git_executable(),
+                "/trusted/Xcode/usr/bin/git",
+            )
+            environment = bound_git_environment()
+        self.assertEqual(environment["DEVELOPER_DIR"], "/trusted/Xcode")
+        self.assertEqual(
+            environment["GIT_EXEC_PATH"],
+            "/trusted/Xcode/usr/libexec/git-core",
+        )
+        self.assertEqual(environment["TMPDIR"], "/private/runtime")
+
+        with mock.patch.dict(
+            os.environ,
+            {BOUND_GIT_EXECUTABLE_ENV: "/trusted/git"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "environment is incomplete"):
+                selected_git_executable()
+
+        invalid = dict(values)
+        invalid[BOUND_GIT_TMPDIR_ENV] = "relative/runtime"
+        with mock.patch.dict(os.environ, invalid, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "not an absolute normalized"):
+                bound_git_environment()
 
     def test_materializer_blocks_small_lfs_pointer_content(self) -> None:
         with owned_temporary_directory("git-lfs-block-") as root:

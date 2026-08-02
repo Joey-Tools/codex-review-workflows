@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import shutil
 import signal
 import stat
@@ -22,10 +23,11 @@ from typing import Any
 from review_supervisor.gitraw import (
     CatFileBatch,
     GitProcessClosureUnproven,
+    bound_git_environment,
     enumerate_tree,
     inspect_repository,
     run_bounded,
-    sanitized_git_environment,
+    selected_git_executable,
 )
 from review_supervisor.models import Identity
 from review_supervisor import no_child_profile
@@ -83,6 +85,7 @@ EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
 RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
 RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
 EXPECTED_HEAD_ENV = "CODEX_REVIEW_EXPECTED_HEAD_SHA"
+DEDICATED_ACCOUNT_CUSTODY_ENV = "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -170,6 +173,7 @@ DARWIN_KINFO_PROC_BYTES = 648
 DARWIN_PROCESS_CENSUS_CAP = 4096
 DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS = 5.0
 DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS = 0.25
+DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS = 0.1
 SANDBOX_FILTER_NONE = 0
 CHILD_ACCOUNT_PROBE_ENVIRONMENT = {
     "LANG": "C",
@@ -549,6 +553,18 @@ class DarwinProcessIdentity:
     # Process state is diagnostic/scope evidence, not object identity. A live
     # process can become terminal without occupying a new process-table slot.
     process_state: bytes = field(default=b"?", compare=False)
+
+
+@dataclass(frozen=True)
+class DedicatedUidScope:
+    # This capability is valid only while the ephemeral account remains the
+    # caller's real/effective UID and its prelaunch census contains this
+    # supervisor alone. Signals are still ordinary same-UID kill(2) calls;
+    # Darwin provides no pidfd-style atomic revalidate-and-signal primitive.
+    uid: int
+    account_name: str
+    receipt_sha256: str
+    baseline: tuple[DarwinProcessIdentity, ...]
 
 
 class ChildProcessTreeClosureUnproven(RuntimeError):
@@ -1054,11 +1070,19 @@ def _require_no_new_same_uid_processes(
     baseline: tuple[DarwinProcessIdentity, ...],
     *,
     deadline: float | None = None,
+    dedicated_scope: DedicatedUidScope | None = None,
 ) -> None:
     operation_deadline = _process_census_deadline(deadline)
     baseline_set = set(baseline)
     last_escaped: tuple[DarwinProcessIdentity, ...] = ()
     absent_since: float | None = None
+    terminate_sent_at: dict[DarwinProcessIdentity, float] = {}
+    kill_sent: set[DarwinProcessIdentity] = set()
+    if dedicated_scope is not None and dedicated_scope.baseline != baseline:
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            OSError(errno.EPERM, "dedicated UID scope does not match the baseline"),
+        )
     while True:
         if time.monotonic() >= operation_deadline:
             if last_escaped:
@@ -1072,6 +1096,29 @@ def _require_no_new_same_uid_processes(
         if escaped:
             last_escaped = escaped
             absent_since = None
+            if dedicated_scope is not None:
+                _require_dedicated_uid_scope_current(dedicated_scope)
+                now = time.monotonic()
+                for process in escaped:
+                    first_signal = terminate_sent_at.get(process)
+                    if first_signal is None:
+                        if _signal_dedicated_uid_process(
+                            process,
+                            signal.SIGTERM,
+                            deadline=operation_deadline,
+                        ):
+                            terminate_sent_at[process] = now
+                    elif (
+                        process not in kill_sent
+                        and now - first_signal
+                        >= DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS
+                    ):
+                        if _signal_dedicated_uid_process(
+                            process,
+                            signal.SIGKILL,
+                            deadline=operation_deadline,
+                        ):
+                            kill_sent.add(process)
             _reap_terminal_same_uid_children(
                 escaped,
                 deadline=operation_deadline,
@@ -1091,6 +1138,59 @@ def _require_no_new_same_uid_processes(
         if remaining <= 0:
             continue
         time.sleep(min(0.01, remaining))
+
+
+def _require_dedicated_uid_scope_current(scope: DedicatedUidScope) -> None:
+    if os.getuid() != scope.uid or os.geteuid() != scope.uid:
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            PermissionError(errno.EPERM, "dedicated UID custody changed"),
+        )
+    try:
+        account = pwd.getpwuid(scope.uid)
+    except KeyError as error:
+        raise ChildProcessTreeClosureUnproven((), error) from error
+    if (
+        account.pw_name != scope.account_name
+        or account.pw_uid != scope.uid
+        or account.pw_gid != scope.uid
+        or account.pw_dir != "/var/empty"
+        or account.pw_shell != "/usr/bin/false"
+    ):
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            OSError(errno.ESTALE, "dedicated UID account identity or policy changed"),
+        )
+
+
+def _signal_dedicated_uid_process(
+    process: DarwinProcessIdentity,
+    signal_number: int,
+    *,
+    deadline: float,
+) -> bool:
+    _require_process_census_time(deadline)
+    rebound = tuple(
+        candidate
+        for candidate in _darwin_same_uid_processes(deadline=deadline)
+        if candidate.pid == process.pid
+    )
+    if not rebound:
+        return False
+    if len(rebound) != 1 or rebound[0] != process:
+        raise ChildProcessTreeClosureUnproven(
+            (process,),
+            OSError(
+                errno.ESTALE, "dedicated UID process identity changed before signal"
+            ),
+        )
+    try:
+        os.kill(process.pid, signal_number)
+    except ProcessLookupError:
+        return False
+    except OSError as error:
+        raise ChildProcessTreeClosureUnproven((process,), error) from error
+    return True
 
 
 def _reap_terminal_same_uid_children(
@@ -1264,6 +1364,48 @@ def _require_isolated_child_account() -> tuple[DarwinProcessIdentity, ...]:
     return baseline
 
 
+def _dedicated_uid_scope(
+    baseline: tuple[DarwinProcessIdentity, ...],
+) -> DedicatedUidScope | None:
+    receipt = os.environ.get(DEDICATED_ACCOUNT_CUSTODY_ENV)
+    if receipt is None:
+        return None
+    if len(receipt) != 64 or any(
+        character not in "0123456789abcdef" for character in receipt
+    ):
+        raise PermissionError(errno.EPERM, "dedicated UID receipt is malformed")
+    uid = os.getuid()
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as error:
+        raise PermissionError(
+            errno.EPERM,
+            "dedicated UID account identity is unavailable",
+        ) from error
+    suffix = account.pw_name.removeprefix("codexreview")
+    if (
+        not 50000 <= uid <= 59999
+        or account.pw_uid != uid
+        or account.pw_gid != uid
+        or len(suffix) != 12
+        or any(character not in "0123456789abcdef" for character in suffix)
+        or account.pw_dir != "/var/empty"
+        or account.pw_shell != "/usr/bin/false"
+        or len(baseline) != 1
+        or baseline[0].pid != os.getpid()
+    ):
+        raise PermissionError(
+            errno.EPERM,
+            "dedicated UID account custody is not proven",
+        )
+    return DedicatedUidScope(
+        uid=uid,
+        account_name=account.pw_name,
+        receipt_sha256=receipt,
+        baseline=baseline,
+    )
+
+
 def _run_bounded_child(
     argv: tuple[str, ...],
     *,
@@ -1285,6 +1427,9 @@ def _run_bounded_child(
             _require_isolated_child_account()
             if require_isolated_account
             else _stable_same_uid_processes()
+        )
+        dedicated_scope = (
+            _dedicated_uid_scope(baseline) if require_isolated_account else None
         )
         result: tuple[int, bytes, bytes] | None = None
         pending_error: BaseException | None = None
@@ -1331,7 +1476,10 @@ def _run_bounded_child(
                 # same-UID closure check below.
                 pending_error = error
         try:
-            _require_no_new_same_uid_processes(baseline)
+            _require_no_new_same_uid_processes(
+                baseline,
+                dedicated_scope=dedicated_scope,
+            )
         except ChildProcessTreeClosureUnproven as error:
             raise error from pending_error
         except BaseException as error:
@@ -1879,7 +2027,7 @@ def _source_manifest_sha256(
 
 def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
     command = (
-        "/usr/bin/git",
+        selected_git_executable(),
         "--no-pager",
         "-c",
         "core.commitGraph=false",
@@ -1904,7 +2052,7 @@ def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
     returncode, stdout, stderr = run_bounded(
         command,
         cwd=source_root,
-        environment=sanitized_git_environment(
+        environment=bound_git_environment(
             {
                 "GIT_ASKPASS": "/usr/bin/false",
                 "GIT_PAGER": "cat",
@@ -2008,7 +2156,7 @@ def _source_head_subtree(
         repo=repo_root,
         base_sha=head_sha,
         head_sha=head_sha,
-        git_executable="/usr/bin/git",
+        git_executable=selected_git_executable(),
     )
     tree = enumerate_tree(repository, head_sha)
     prefix = os.fsencode(source_relative_path)
