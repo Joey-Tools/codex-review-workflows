@@ -63,7 +63,10 @@ superseded_by:
   repository seed/detail traversal. Its exact receipt-bound comment is
   audit-only and `confirmed-non-candidate`; arbitrary exact-provider prose is
   still fail-closed, while the existing progress grammar remains nonterminal
-  audit evidence and terminal-looking malformed payloads remain candidates.
+  audit evidence and in-window terminal-looking malformed payloads remain
+  candidates. A fully parsed provider outcome at or before the exclusive lower
+  boundary remains `confirmed-non-candidate` audit evidence for that frozen
+  interval instead of entering candidate entries or count.
 - Terminal comments/reviews count only under the authority's fixed
   clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
   `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
@@ -551,6 +554,91 @@ These corrections were discovered by reviewing the exact signed candidate
 head rather than by changing the decision baseline. The immutable
 `codex-review-gate` source commit, released Action commit, common tree, complete
 15-path manifest, and result-present acceptance rationale remain unchanged.
+
+## Second Exact-Head Named-Single Corrections
+
+The formal named-single review of
+`0f77fb7b1dd59f5eed522fa9699497aa013695fc..3468090c9a3f81765d8401487d36dad61bd96b7c`
+found two remaining consumer-side completeness errors:
+
+1. **Frozen-window candidate boundary.** Repository discovery must still seed,
+   traverse, parse, and classify a provider-bearing scope whose final result is
+   older than or exactly on the exclusive lower boundary. Once proved valid,
+   that scope remains raw audit evidence and is classified
+   `confirmed-non-candidate` for the frozen interval, but it does not enter
+   `entries`, `candidate_universe_count`, or the 3–10 eligible-outcome sample.
+   Treating every discovered provider result as a candidate would make one old
+   result permanently disable an otherwise valid reaction-only fallback.
+   Post-as-of, ambiguous, schema-invalid/unparseable, or incomplete evidence is
+   still fail-closed and cannot use this temporal exclusion.
+2. **Semantic final-reread stability.** Initial and final repository discovery
+   are independent traversals. Each raw body digest, REST Link chain, GraphQL
+   cursor chain, and seed/detail closure must validate on its own, but GitHub's
+   opaque cursor tokens and therefore raw page bytes/digests may legitimately
+   differ. Stability compares the fixed semantic projection,
+   classifications, candidate entries/arrays, count, and selected source
+   evidence—not transport-token byte identity. Parent-owned request-time
+   sidecars remain type-preserving identical because they are immutable write
+   receipts, not independently refetched endpoint transport. Node, membership,
+   or semantic drift remains fail-closed.
+
+Two corrective read-only audits then exposed the remaining consequences of
+that semantic-stability rule:
+
+3. **Complete scope-authority audit.** Selected entries alone cannot establish
+   semantic stability. The fixed projector now derives an audit-only
+   `scope_authority_audit` for every provider-bearing seeded scope, retaining
+   lifecycle, every controlled request and sidecar binding, every individual
+   reaction including confirmed-different actors, every selected or unselected
+   provider artifact/source digest, and provider pending/progress records. It
+   is compared across traversals but never enters candidate entries/count.
+   Reaction candidates are also rebound to their matching raw audit, so a
+   final-only earlier `eyes` cannot hide behind the same selected `+1`.
+   Terminal-determined candidates keep request/reaction-plane isolation while
+   still binding lifecycle and every provider artifact. This also makes an old
+   audit-only scope changing clean/findings/malformed fail closed.
+4. **Actor-independent as-of bound.** The frozen server-time upper bound is
+   checked before actor filtering. In particular, a future submitted review
+   from a human or unrelated bot is impossible in the frozen observation and
+   selects `unknown`; it cannot be discarded as ordinary audit noise.
+5. **Final request-plane policy.** A final reread may legitimately discover a
+   second controlled request after a stable terminal result. The terminal
+   verdict remains unchanged, while `request_policy` is derived from the
+   complete independently parsed final raw request plane and preserves
+   `duplicate-observed`. Initial/final request-plane drift cannot erase a
+   duplicate that the final snapshot proves; malformed or unbound final
+   request evidence still makes only that plane `unknown`.
+6. **Artifact multiplicity binding.** A normalized candidate may not insert a
+   second copy of one native `(channel, artifact ID)` and rely on map
+   de-duplication to match a single raw artifact. Candidate-to-raw authority is
+   one-to-one and preserves occurrence count; any repeated native identity is
+   rejected.
+7. **Old-epoch and audit-only sidecars.** Each request derives its own immutable
+   scope from its pre/POST/post sidecar. An old-head request and reaction remain
+   old-epoch audit evidence even when their timestamps are newer than the
+   current-scope request; they do not enter current reaction ordering,
+   duplicate warnings, or `same_scope_request_audit`. Conversely, a final-only
+   sidecar change on an expired audit-only scope still invalidates the weak
+   reaction profile because the immutable write receipt changed.
+8. **Cross-document plane terminology.** Entrypoint, readiness, prompt, lane,
+   interface, and probe documents now reserve provider `unknown` for
+   provider-artifact/thread/finding or ancestry-authority failure. A
+   request/reaction/sidecar-only failure closes its own plane without erasing
+   an independently stable terminal result. Historical malformed terminal
+   evidence is a candidate only inside the frozen window; a fully parsed
+   expired record remains audit-only `confirmed-non-candidate` evidence.
+
+These are corrections to sampling and reread mechanics, not changes to the
+provider-evidence decision. They preserve the pinned alignment with
+`JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`
+and the released
+`JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`
+whose common Action tree is
+`d03de9035d20f285e6a93986d436403b4a30e9bc`. “Result present means pass” still
+means that a trustworthy current-scope provider result is verdict authority;
+it never meant that every fully traversed historical scope must count as a
+current profile sample, or that transport-specific opaque cursors are verdict
+semantics.
 
 ## Implementation Intent
 

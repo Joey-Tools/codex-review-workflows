@@ -64,9 +64,10 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    ancestry receipts for every raw-derived finding commit. Exact object return
    code `0` and ancestry return code `0` or `1` are the only admitted results.
    The complete raw artifact/thread projection must type-preservingly equal the
-   normalized current record. Missing receipts, another return code,
-   commit-set or projection mismatch, evidence-budget overflow, or
-   initial/final drift selects `unknown`; normalized current snapshot equality
+   normalized current record. Missing ancestry receipts, another return code,
+   commit-set mismatch, evidence-budget overflow,
+   provider-artifact/thread/finding projection drift, or ancestry-receipt drift
+   selects `unknown`; normalized current snapshot equality
    is insufficient. The basis also records independently derived
    `finding_commits.initial/final`. Any raw-derived applicable top-level
    finding blocks the reaction path; an unresolved applicable target-thread
@@ -138,7 +139,7 @@ A qualifying third-lane result must prove all of the following:
 - After thread blockers are applied, the latest trustworthy terminal provider artifact is selected by server timestamp. Any latest equal-time set spanning issue-comment and review channels is `triple-inconclusive` before outcome or numeric-ID tie-breaking. Within one channel, malformed blocks, finding takes precedence over clean, and only then may a same-channel positive ID choose the basis.
 - A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head when that finding has no unresolved thread and the complete snapshot contains no newer finding or malformed terminal evidence. The weak reaction fallback never supersedes a finding.
 - The selected `provider_profile` was recomputed from the final complete snapshot and bounded same-repository history using the predeclared definitions: `terminal-payload` is the default, `mixed` still makes terminal payload authoritative, `thumbs-up-clean` is the narrowly qualified reaction-only fallback, and `unknown` never accepts reaction-only clean evidence.
-- Immediately before success, lifecycle, base/head OIDs, unique merge base, complete evidence snapshot, and the selected artifact were re-read. For terminal clean/findings and reaction clean, this includes a new raw current endpoint traversal, a repeat of every parent-owned local Git ancestry receipt, and a new type-preserving comparison of the complete raw artifact/thread projection with the normalized current record. The exact whole-PR scope and `evidence_basis` remained stable and no new blocker appeared; normalized current snapshots alone are insufficient.
+- Immediately before success, lifecycle, base/head OIDs, unique merge base, complete evidence snapshot, and the selected artifact were re-read. For terminal clean/findings and reaction clean, this includes a new raw current endpoint traversal, a repeat of every parent-owned local Git ancestry receipt, and a new type-preserving comparison of the complete raw artifact/thread projection with the normalized current record. The exact whole-PR scope, terminal-decision projection, and selected artifact remained stable and no new blocker appeared; request/reaction/sidecar audit subrecords were evaluated separately on their own plane, and normalized current snapshots alone are insufficient.
 
 `eyes` is liveness only; it never proves a clean result.
 
@@ -163,8 +164,9 @@ declaration's bound PR and find the exact raw declaration record once in its
 issue comments. That exact declaration and closed progress-only grammar are
 audit-only nonterminal evidence; a declaration-only scope is
 `confirmed-non-candidate`. Any other exact-provider free-form prose fails
-closed, while a terminal-looking malformed artifact remains a historical
-candidate.
+closed, while an in-window terminal-looking malformed artifact remains a
+historical candidate. A fully parsed artifact at or before the exclusive lower
+boundary remains audit-only `confirmed-non-candidate` evidence.
 
 Each initial/final historical inventory independently embeds the closed
 schema-version-3 raw discovery transcript. Its fully paginated repository-wide
@@ -202,8 +204,10 @@ raw fetches. Local object resolution must return exact `0`, and
 `git merge-base --is-ancestor <finding_commit> <current_head>` must return
 exact `0` or `1`. A missing request sidecar disables reaction authority; a
 missing ancestry receipt, another ancestry return code, commit-set mismatch,
-evidence-budget overflow, or initial/final drift selects `unknown` for the
-corresponding provider-result authority. Any
+evidence-budget overflow, provider-artifact/thread/finding projection drift,
+or ancestry-receipt drift selects `unknown` for the corresponding
+provider-result authority. Request/reaction/sidecar-only drift closes that
+plane without erasing an independently stable terminal result. Any
 top-level finding with return code `0` or unresolved exact-provider
 selected-review target-thread finding with return code `0` blocks reaction
 clean. Fully fetched human, unrelated-bot, null-parent, and unrelated-only

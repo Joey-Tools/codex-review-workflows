@@ -3157,6 +3157,48 @@ class RepositoryContractTest(unittest.TestCase):
         github_pr_probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
             encoding="utf-8"
         )
+        normalized_skill_text = " ".join(
+            anti_drift_documents["skill"].lower().replace("`", "").split()
+        )
+        normalized_readiness_text = " ".join(
+            anti_drift_documents["pr-readiness"].lower().replace("`", "").split()
+        )
+        self.assertIn(
+            "request/reaction/sidecar-only drift is evaluated on its own plane",
+            normalized_skill_text,
+        )
+        self.assertIn(
+            "request/reaction/sidecar-only drift closes that plane without "
+            "erasing an independently stable terminal result",
+            normalized_readiness_text,
+        )
+        self.assertIn(
+            "terminal-decision projection, and selected artifact remained stable",
+            normalized_readiness_text,
+        )
+        malformed_window_documents = {
+            "skill": anti_drift_documents["skill"],
+            "README": (SKILL_SCOPE_ROOT / "README.md").read_text(encoding="utf-8"),
+            "interface": (SKILL_ROOT / "agents/openai.yaml").read_text(
+                encoding="utf-8"
+            ),
+            "PR readiness": anti_drift_documents["pr-readiness"],
+            "lane contracts": (
+                SKILL_ROOT / "references/review-lane-contracts.md"
+            ).read_text(encoding="utf-8"),
+            "prompt templates": (
+                SKILL_ROOT / "references/review-prompt-templates.md"
+            ).read_text(encoding="utf-8"),
+            "GitHub probes": github_pr_probes,
+        }
+        for document_name, document in malformed_window_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(malformed_window_document=document_name):
+                self.assertIn(
+                    "in-window terminal-looking malformed",
+                    normalized_document,
+                )
+                self.assertIn("exclusive lower boundary", normalized_document)
         for relative_path, blob_id in baseline_manifest.items():
             with self.subTest(journal_action_baseline_path=relative_path):
                 self.assertIn(
@@ -3392,6 +3434,76 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "the classification is exact current, historical-candidate, or "
             "confirmed-non-candidate",
+            normalized_authority_text,
+        )
+        history_window_candidate_contracts = {
+            "authority": (
+                normalized_authority_text,
+                (
+                    "window filtering happens only after a seeded scope has been "
+                    "completely traversed, parsed, and reduced by terminal precedence",
+                    "but it is omitted from entries and candidate_universe_count",
+                ),
+            ),
+            "github-pr-probes": (
+                normalized_github_pr_probes_text,
+                (
+                    "apply the frozen interval only after that complete parse and "
+                    "scope-final selection",
+                    "but it is audit-only and must not enter candidate entries or "
+                    "the count",
+                ),
+            ),
+        }
+        for document_name, (
+            document,
+            anchors,
+        ) in history_window_candidate_contracts.items():
+            for anchor in anchors:
+                with self.subTest(
+                    history_window_candidate_contract=document_name,
+                    anchor=anchor,
+                ):
+                    self.assertIn(anchor, document)
+        semantic_reread_contracts = {
+            "authority": (
+                normalized_authority_text,
+                "the two raw transcript envelopes, page bodies, body digests, and "
+                "opaque cursor tokens need not be byte-identical",
+            ),
+            "github-pr-probes": (
+                normalized_github_pr_probes_text,
+                "do not require the raw inventories or opaque cursor bytes to be "
+                "identical",
+            ),
+        }
+        for document_name, (document, anchor) in semantic_reread_contracts.items():
+            with self.subTest(semantic_reread_contract=document_name):
+                self.assertIn(anchor, document)
+                self.assertIn(
+                    "type-preserving equality of the fixed semantic projection",
+                    document,
+                )
+                self.assertIn("scope_authority_audit", document)
+        self.assertIn(
+            "retains every individual reaction, including confirmed-different actors",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "a final-only earlier eyes, is semantic drift",
+            normalized_github_pr_probes_text,
+        )
+        self.assertIn(
+            "apply this bound before actor filtering",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "a future human or unrelated-bot review is not ignorable audit noise",
+            normalized_github_pr_probes_text,
+        )
+        self.assertIn(
+            "a valid tuple with the same repository and pr but an older head "
+            "remains old-epoch audit evidence",
             normalized_authority_text,
         )
         self.assertIn(
@@ -7305,6 +7417,143 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             return descriptors[0]
 
+        def candidate_scope_authority_audit(
+            candidate: dict[str, object],
+        ) -> dict[str, object] | None:
+            candidate_scope_key = scope_key(candidate)
+            lifecycle = candidate.get("lifecycle")
+            requests = candidate.get("requests")
+            reactions = candidate.get("reactions")
+            evidence_state = candidate.get("evidence_state")
+            candidate_basis = candidate.get("candidate_basis")
+            if (
+                candidate_order_basis(candidate) is None
+                or candidate_scope_key is None
+                or not isinstance(lifecycle, dict)
+                or not isinstance(requests, list)
+                or not isinstance(reactions, list)
+                or not isinstance(evidence_state, dict)
+                or not isinstance(candidate_basis, dict)
+            ):
+                return None
+
+            reaction_authority = candidate_basis.get("kind") == "reaction"
+            audited_requests = requests if reaction_authority else []
+            audited_reactions = reactions if reaction_authority else []
+
+            receipt_mapping = request_scope_receipt_mapping(
+                candidate.get("request_scope_receipts")
+            )
+            request_audit: list[dict[str, object]] = []
+            for raw_request in audited_requests:
+                if not isinstance(raw_request, dict):
+                    return None
+                request_id = raw_request.get("id")
+                if type(request_id) is not int or request_id <= 0:
+                    return None
+                binding = (
+                    receipt_mapping.get(request_id)
+                    if isinstance(receipt_mapping, dict)
+                    else None
+                )
+                request_audit.append(
+                    {
+                        "request": clone(raw_request),
+                        "request_scope": (
+                            list(binding["scope"])
+                            if isinstance(binding, dict)
+                            and isinstance(binding.get("scope"), tuple)
+                            else None
+                        ),
+                        "request_scope_receipt": (
+                            clone(binding["receipt"])
+                            if isinstance(binding, dict)
+                            else None
+                        ),
+                    }
+                )
+            request_audit.sort(key=lambda item: int(item["request"]["id"]))
+
+            reaction_audit: list[dict[str, object]] = []
+            for raw_reaction in audited_reactions:
+                if not isinstance(raw_reaction, dict):
+                    return None
+                reaction_id = raw_reaction.get("id")
+                created_at = raw_reaction.get("created_at")
+                parent_request_id = raw_reaction.get("parent_request_id")
+                if (
+                    type(reaction_id) is not int
+                    or reaction_id <= 0
+                    or type(created_at) is not int
+                    or type(parent_request_id) is not int
+                ):
+                    return None
+                reaction_audit.append(clone(raw_reaction))
+            reaction_audit.sort(
+                key=lambda item: (
+                    int(item["created_at"]),
+                    int(item["id"]),
+                    int(item["parent_request_id"]),
+                )
+            )
+
+            artifact_fields = {
+                "terminal_payloads": "terminal-payload",
+                "malformed_terminal_artifacts": "malformed-terminal-artifact",
+                "active_top_level_findings": "active-top-level-finding",
+                "unresolved_thread_findings": "unresolved-thread-finding",
+            }
+            if set(evidence_state) != set(artifact_fields):
+                return None
+            artifact_audit_by_identity: dict[tuple[str, int], dict[str, object]] = {}
+            for field, kind in artifact_fields.items():
+                artifacts = evidence_state.get(field)
+                if not isinstance(artifacts, list):
+                    return None
+                for artifact in artifacts:
+                    validated = validate_candidate_artifact(
+                        artifact,
+                        expected_kind=kind,
+                        expected_scope=candidate_scope_key,
+                    )
+                    if (
+                        validated is None
+                        or not isinstance(artifact, dict)
+                        or not isinstance(artifact.get("final_snapshot"), dict)
+                    ):
+                        return None
+                    server_time, artifact_id, _, semantic, channel = validated
+                    source_bundle = artifact_source_bundle(artifact["final_snapshot"])
+                    audit_entry = {
+                        "server_time": server_time,
+                        "id": artifact_id,
+                        "channel": channel,
+                        "semantic": semantic,
+                        "source_record_sha256": hashlib.sha256(
+                            canonical_raw_body(source_bundle).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    native_identity = (channel, artifact_id)
+                    previous = artifact_audit_by_identity.get(native_identity)
+                    if previous is not None:
+                        return None
+                    artifact_audit_by_identity[native_identity] = audit_entry
+
+            return {
+                "scope_key": list(candidate_scope_key),
+                "lifecycle": clone(lifecycle),
+                "requests": request_audit,
+                "reactions": reaction_audit,
+                "applicable_artifacts": sorted(
+                    artifact_audit_by_identity.values(),
+                    key=lambda item: (
+                        int(item["server_time"]),
+                        int(item["id"]),
+                        str(item["channel"]),
+                    ),
+                ),
+            }
+
         def derived_inventory_entries(
             candidates: list[dict[str, object]],
         ) -> list[dict[str, object]]:
@@ -8447,6 +8696,7 @@ class RepositoryContractTest(unittest.TestCase):
 
             entries: list[dict[str, object]] = []
             scope_classifications: list[dict[str, object]] = []
+            scope_authority_audit: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
@@ -8775,6 +9025,17 @@ class RepositoryContractTest(unittest.TestCase):
                     ):
                         return None
                     seen_review_ids.add(review_id)
+                    review_state = projected_review.get("state")
+                    submitted_at = projected_review.get("submitted_at")
+                    if review_state == "PENDING":
+                        if submitted_at is not None:
+                            return None
+                    elif (
+                        type(submitted_at) is not int
+                        or submitted_at <= 0
+                        or submitted_at > history_as_of_server_time
+                    ):
+                        return None
                     actor = raw_actor(projected_review.get("user"))
                     if actor == "different":
                         other_review_ids.add(review_id)
@@ -8783,8 +9044,7 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     if projected_review.get("state") == "PENDING":
                         if (
-                            projected_review.get("submitted_at") is not None
-                            or projected_review.get("html_url")
+                            projected_review.get("html_url")
                             != (
                                 f"https://github.com/{repository}/pull/{pr}"
                                 f"#pullrequestreview-{review_id}"
@@ -8798,12 +9058,6 @@ class RepositoryContractTest(unittest.TestCase):
                             return None
                         nonterminal_review_by_id[review_id] = projected_review
                         continue
-                    if (
-                        type(projected_review.get("submitted_at")) is not int
-                        or projected_review["submitted_at"] <= 0
-                        or projected_review["submitted_at"] > history_as_of_server_time
-                    ):
-                        return None
                     review_by_id[review_id] = projected_review
 
                 inline_by_review: dict[int, list[dict[str, object]]] = {
@@ -9148,6 +9402,104 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     )
 
+                scope_audit_requests: list[dict[str, object]] = []
+                for request_id in sorted(request_times):
+                    binding = request_receipt_bindings.get(request_id)
+                    scope_audit_requests.append(
+                        {
+                            "request": clone(request_records[request_id]),
+                            "request_scope": (
+                                list(binding["scope"])
+                                if isinstance(binding, dict)
+                                else None
+                            ),
+                            "request_scope_receipt": (
+                                clone(binding["receipt"])
+                                if isinstance(binding, dict)
+                                else None
+                            ),
+                        }
+                    )
+                scope_audit_reactions: list[dict[str, object]] = []
+                for raw_reaction in sorted(
+                    reaction_records,
+                    key=lambda item: (
+                        int(item["created_at"]),
+                        int(item["id"]),
+                        int(item["parent_comment_id"]),
+                    ),
+                ):
+                    raw_user = raw_reaction.get("user")
+                    if not isinstance(raw_user, dict):
+                        return None
+                    parent_comment_id = raw_reaction["parent_comment_id"]
+                    scope_audit_reactions.append(
+                        {
+                            "id": raw_reaction["id"],
+                            "parent_request_id": parent_comment_id,
+                            "parent_reactions_api_url": (
+                                f"{api_root}/issues/comments/{parent_comment_id}/"
+                                "reactions?per_page=100"
+                            ),
+                            "created_at": raw_reaction["created_at"],
+                            "content": raw_reaction["content"],
+                            "user_login": raw_user.get("login"),
+                            "user_type": raw_user.get("type"),
+                        }
+                    )
+                scope_audit_artifacts = [
+                    {
+                        "server_time": server_time,
+                        "id": artifact_id,
+                        "channel": channel,
+                        "semantic": semantic,
+                        "source_record_sha256": source_digest,
+                    }
+                    for (
+                        server_time,
+                        artifact_id,
+                        channel,
+                        semantic,
+                        source_digest,
+                    ) in sorted(artifact_bases)
+                ]
+                scope_audit_nonterminal = [
+                    {
+                        "channel": channel,
+                        "id": record_id,
+                        "server_time": server_time,
+                        "source_record_sha256": source_digest,
+                    }
+                    for (
+                        channel,
+                        record_id,
+                        server_time,
+                        source_digest,
+                    ) in sorted(nonterminal_records)
+                ]
+                if any(
+                    (
+                        scope_audit_requests,
+                        scope_audit_reactions,
+                        scope_audit_artifacts,
+                        scope_audit_nonterminal,
+                    )
+                ):
+                    scope_authority_audit.append(
+                        {
+                            "scope_key": list(parsed_scope),
+                            "lifecycle": {
+                                "state": clone(pull_record.get("state")),
+                                "merged": clone(pull_record.get("merged")),
+                                "merged_at": clone(pull_record.get("merged_at")),
+                            },
+                            "requests": scope_audit_requests,
+                            "reactions": scope_audit_reactions,
+                            "applicable_artifacts": scope_audit_artifacts,
+                            "nonterminal_records": scope_audit_nonterminal,
+                        }
+                    )
+
                 current_request_times = {
                     request_id: request_time
                     for request_id, request_time in request_times.items()
@@ -9369,18 +9721,30 @@ class RepositoryContractTest(unittest.TestCase):
                             ) in sorted(nonterminal_records)
                         ],
                     }
-                entries.append(entry)
+                is_current_scope = parsed_scope == current_scope_key
+                is_in_history_window = (
+                    history_start_exclusive
+                    < int(source_ordering_key[0])
+                    <= history_as_of_server_time
+                )
+                classification = (
+                    "current"
+                    if is_current_scope
+                    else (
+                        "historical-candidate"
+                        if is_in_history_window
+                        else "confirmed-non-candidate"
+                    )
+                )
                 scope_classifications.append(
                     {
                         "pull_number": pr,
                         "scope_key": list(parsed_scope),
-                        "classification": (
-                            "current"
-                            if parsed_scope == current_scope_key
-                            else "historical-candidate"
-                        ),
+                        "classification": classification,
                     }
                 )
+                if classification != "confirmed-non-candidate":
+                    entries.append(entry)
             if (
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
@@ -9404,6 +9768,10 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             return {
                 "entries": entries,
+                "scope_authority_audit": sorted(
+                    scope_authority_audit,
+                    key=lambda item: int(item["scope_key"][1]),
+                ),
                 "scope_classifications": sorted(
                     scope_classifications,
                     key=lambda item: int(item["pull_number"]),
@@ -9693,7 +10061,6 @@ class RepositoryContractTest(unittest.TestCase):
                 or not typed_json_equal(initial_candidates, final_candidates)
                 or not isinstance(initial_inventory, dict)
                 or not isinstance(final_inventory, dict)
-                or not typed_json_equal(initial_inventory, final_inventory)
             ):
                 return None
             expected_inventory_fields = {
@@ -9705,38 +10072,45 @@ class RepositoryContractTest(unittest.TestCase):
                 "scope_classifications",
                 "entries",
             }
-            if (
-                set(initial_inventory) != expected_inventory_fields
-                or initial_inventory.get("complete") is not True
-                or initial_inventory.get("repository") != current_repository
-                or not exact_true_flags(
-                    initial_inventory.get("pagination"),
-                    required_universe_pagination,
+
+            def validate_inventory_projection(
+                value: object,
+            ) -> tuple[dict[str, object], list[dict[str, object]]] | None:
+                if (
+                    not isinstance(value, dict)
+                    or set(value) != expected_inventory_fields
+                    or value.get("complete") is not True
+                    or value.get("repository") != current_repository
+                    or not exact_true_flags(
+                        value.get("pagination"),
+                        required_universe_pagination,
+                    )
+                ):
+                    return None
+                projection = parse_discovery_endpoint_transcript(
+                    value.get("discovery_endpoint_transcript"),
+                    request_scope_receipts=value.get("request_scope_receipts"),
+                    provider_declaration=declaration,
                 )
-            ):
-                return None
-            transcript_projection = parse_discovery_endpoint_transcript(
-                initial_inventory.get("discovery_endpoint_transcript"),
-                request_scope_receipts=initial_inventory.get("request_scope_receipts"),
-                provider_declaration=declaration,
-            )
-            final_transcript_projection = parse_discovery_endpoint_transcript(
-                final_inventory.get("discovery_endpoint_transcript"),
-                request_scope_receipts=final_inventory.get("request_scope_receipts"),
-                provider_declaration=declaration,
-            )
-            transcript_entries = (
-                transcript_projection.get("entries")
-                if isinstance(transcript_projection, dict)
-                else None
-            )
-            raw_scope_classifications = (
-                transcript_projection.get("scope_classifications")
-                if isinstance(transcript_projection, dict)
-                else None
-            )
-            historical_transcript_entries = (
-                [
+                if not isinstance(projection, dict):
+                    return None
+                transcript_entries = projection.get("entries")
+                raw_scope_classifications = projection.get("scope_classifications")
+                if not isinstance(transcript_entries, list) or not isinstance(
+                    raw_scope_classifications, list
+                ):
+                    return None
+                if any(
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("scope_key"), list)
+                    for entry in transcript_entries
+                ) or any(
+                    not isinstance(classification, dict)
+                    or not isinstance(classification.get("scope_key"), list)
+                    for classification in raw_scope_classifications
+                ):
+                    return None
+                historical_transcript_entries = [
                     entry
                     for entry in transcript_entries
                     if not typed_json_equal(
@@ -9744,80 +10118,107 @@ class RepositoryContractTest(unittest.TestCase):
                         list(current_scope_key),
                     )
                 ]
-                if transcript_entries is not None
-                else None
-            )
-            candidate_entries = derived_inventory_entries(final_candidates)
-            historical_classification_scope_keys = (
-                sorted(
+                historical_classification_scope_keys = sorted(
                     tuple(classification["scope_key"])
                     for classification in raw_scope_classifications
-                    if isinstance(classification, dict)
-                    and classification.get("classification") == "historical-candidate"
-                    and isinstance(classification.get("scope_key"), list)
+                    if classification.get("classification") == "historical-candidate"
                 )
-                if isinstance(raw_scope_classifications, list)
-                else None
-            )
-            current_classifications = (
-                [
+                historical_entry_scope_keys = sorted(
+                    tuple(entry["scope_key"]) for entry in historical_transcript_entries
+                )
+                current_classifications = [
                     classification
                     for classification in raw_scope_classifications
-                    if isinstance(classification, dict)
-                    and classification.get("classification") == "current"
+                    if classification.get("classification") == "current"
                 ]
-                if isinstance(raw_scope_classifications, list)
-                else None
-            )
-            historical_entry_scope_keys = (
-                sorted(
-                    tuple(entry["scope_key"])
-                    for entry in historical_transcript_entries
-                    if isinstance(entry, dict)
-                    and isinstance(entry.get("scope_key"), list)
-                )
-                if historical_transcript_entries is not None
-                else None
-            )
+                if (
+                    not typed_json_equal(
+                        value.get("scope_classifications"),
+                        raw_scope_classifications,
+                    )
+                    or not typed_json_equal(
+                        value.get("entries"),
+                        historical_transcript_entries,
+                    )
+                    or not typed_json_equal(
+                        historical_classification_scope_keys,
+                        historical_entry_scope_keys,
+                    )
+                    or not typed_json_equal(
+                        current_classifications,
+                        [
+                            {
+                                "pull_number": current_pr,
+                                "scope_key": list(current_scope_key),
+                                "classification": "current",
+                            }
+                        ],
+                    )
+                ):
+                    return None
+                return projection, historical_transcript_entries
+
+            initial_validated = validate_inventory_projection(initial_inventory)
+            final_validated = validate_inventory_projection(final_inventory)
             if (
-                not isinstance(transcript_entries, list)
-                or final_transcript_projection is None
+                initial_validated is None
+                or final_validated is None
                 or not typed_json_equal(
-                    transcript_projection,
-                    final_transcript_projection,
+                    initial_inventory.get("request_scope_receipts"),
+                    final_inventory.get("request_scope_receipts"),
                 )
-                or historical_transcript_entries is None
-                or not isinstance(raw_scope_classifications, list)
+            ):
+                return None
+            initial_projection, initial_historical_entries = initial_validated
+            final_projection, final_historical_entries = final_validated
+            candidate_entries = derived_inventory_entries(final_candidates)
+            final_scope_audits = final_projection.get("scope_authority_audit")
+            if not isinstance(final_scope_audits, list):
+                return None
+            raw_audits_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+            for raw_audit in final_scope_audits:
+                raw_scope_key = (
+                    raw_audit.get("scope_key") if isinstance(raw_audit, dict) else None
+                )
+                if not isinstance(raw_scope_key, list):
+                    return None
+                raw_scope_tuple = tuple(raw_scope_key)
+                if raw_scope_tuple in raw_audits_by_scope:
+                    return None
+                raw_audits_by_scope[raw_scope_tuple] = raw_audit
+            for candidate in final_candidates:
+                if not isinstance(candidate, dict):
+                    return None
+                candidate_audit = candidate_scope_authority_audit(candidate)
+                candidate_scope_key = scope_key(candidate)
+                raw_audit = raw_audits_by_scope.get(candidate_scope_key or ())
+                if candidate_audit is None or not isinstance(raw_audit, dict):
+                    return None
+                comparable_raw_audit = clone(raw_audit)
+                assert isinstance(comparable_raw_audit, dict)
+                comparable_raw_audit.pop("nonterminal_records", None)
+                candidate_basis = candidate.get("candidate_basis")
+                if (
+                    isinstance(candidate_basis, dict)
+                    and candidate_basis.get("kind") != "reaction"
+                ):
+                    comparable_raw_audit.pop("requests", None)
+                    comparable_raw_audit.pop("reactions", None)
+                    candidate_audit.pop("requests", None)
+                    candidate_audit.pop("reactions", None)
+                if not typed_json_equal(candidate_audit, comparable_raw_audit):
+                    return None
+            if (
+                not typed_json_equal(initial_projection, final_projection)
                 or not typed_json_equal(
-                    initial_inventory.get("scope_classifications"),
-                    raw_scope_classifications,
+                    initial_historical_entries,
+                    final_historical_entries,
                 )
-                or not typed_json_equal(
-                    historical_classification_scope_keys,
-                    historical_entry_scope_keys,
-                )
-                or not typed_json_equal(
-                    current_classifications,
-                    [
-                        {
-                            "pull_number": current_pr,
-                            "scope_key": list(current_scope_key),
-                            "classification": "current",
-                        }
-                    ],
-                )
-                or not typed_json_equal(
-                    initial_inventory.get("entries"),
-                    historical_transcript_entries,
-                )
-                or not typed_json_equal(
-                    historical_transcript_entries,
-                    candidate_entries,
-                )
+                or not typed_json_equal(final_historical_entries, candidate_entries)
                 or type(candidate_history.get("candidate_universe_count")) is not int
                 or candidate_history.get("candidate_universe_count")
-                != len(historical_transcript_entries)
-                or len(final_candidates) != len(historical_transcript_entries)
+                != len(final_historical_entries)
+                or len(final_candidates) != len(final_historical_entries)
             ):
                 return None
             return final_candidates
@@ -9974,6 +10375,65 @@ class RepositoryContractTest(unittest.TestCase):
                 and typed_json_equal(
                     initial_decision_entry,
                     expected_initial_decision_entry,
+                )
+            )
+
+        def current_final_request_authority_matches(
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+        ) -> bool:
+            ancestry = current_ancestry_mapping(candidate_history)
+            final_inventory = candidate_history.get("final_current_raw_inventory")
+            if ancestry is None or not isinstance(final_inventory, dict):
+                return False
+            final_entry = parse_current_endpoint_inventory(
+                final_inventory,
+                current_ancestry=ancestry,
+            )
+            expected_final = parse_current_endpoint_inventory(
+                current_endpoint_inventory(
+                    current_record,
+                    observation_marker="final",
+                ),
+                current_ancestry=ancestry,
+                require_current_ancestry_exact=False,
+            )
+            if final_entry is None or expected_final is None:
+                return False
+            final_authority = final_entry.get("current_authority_projection")
+            final_requests = (
+                final_authority.get("requests")
+                if isinstance(final_authority, dict)
+                else None
+            )
+            if (
+                "request_scope_receipts" not in final_inventory
+                or not isinstance(final_requests, list)
+                or any(
+                    not isinstance(request_entry, dict)
+                    or not isinstance(request_entry.get("request_scope"), list)
+                    or not isinstance(
+                        request_entry.get("request_scope_receipt"),
+                        dict,
+                    )
+                    for request_entry in final_requests
+                )
+            ):
+                return False
+            final_decision_entry = current_decision_authority_entry(
+                final_entry,
+                retain_request_reaction_records=True,
+            )
+            expected_final_decision_entry = current_decision_authority_entry(
+                expected_final,
+                retain_request_reaction_records=True,
+            )
+            return (
+                final_decision_entry is not None
+                and expected_final_decision_entry is not None
+                and typed_json_equal(
+                    final_decision_entry,
+                    expected_final_decision_entry,
                 )
             )
 
@@ -11251,10 +11711,9 @@ class RepositoryContractTest(unittest.TestCase):
             if lane_state in {
                 "accepted-terminal-clean",
                 "accepted-terminal-findings",
-            } and not current_raw_authority_matches(
+            } and not current_final_request_authority_matches(
                 candidate_history,
                 current_record,
-                require_request_reaction_stability=True,
             ):
                 request_policy = {"status": "unknown", "warnings": []}
             return {
@@ -12017,8 +12476,12 @@ class RepositoryContractTest(unittest.TestCase):
                         f"{declaration_pr}#issuecomment-{artifact_id}"
                     ),
                     "body": body,
-                    "created_at": _format_github_rfc3339_seconds(101),
-                    "updated_at": _format_github_rfc3339_seconds(101),
+                    "created_at": _format_github_rfc3339_seconds(
+                        history_start_exclusive + 10
+                    ),
+                    "updated_at": _format_github_rfc3339_seconds(
+                        history_start_exclusive + 10
+                    ),
                 }
             )
             return record
@@ -12112,6 +12575,50 @@ class RepositoryContractTest(unittest.TestCase):
             )
         )
         self.assertEqual(complete_scope_history["candidate_universe_count"], 3)
+
+        expired_provider_scope = sample(5)
+        retime_sample(
+            expired_provider_scope,
+            request_time=history_start_exclusive - 1,
+            reaction_time=history_start_exclusive,
+        )
+        expired_audit_history = history(
+            samples,
+            confirmed_noncandidate_scopes=[expired_provider_scope],
+        )
+        expired_audit_projection = parse_discovery_endpoint_transcript(
+            expired_audit_history["initial_inventory"]["discovery_endpoint_transcript"],
+            request_scope_receipts=expired_audit_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(expired_audit_projection)
+        assert isinstance(expired_audit_projection, dict)
+        expired_scope_key = list(scope_key(expired_provider_scope) or ())
+        self.assertIn(
+            {
+                "pull_number": 5,
+                "scope_key": expired_scope_key,
+                "classification": "confirmed-non-candidate",
+            },
+            expired_audit_projection["scope_classifications"],
+        )
+        self.assertFalse(
+            any(
+                entry.get("scope_key") == expired_scope_key
+                for entry in expired_audit_projection["entries"]
+            )
+        )
+        self.assertEqual(expired_audit_history["candidate_universe_count"], 3)
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                expired_audit_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
         self.assertEqual(
             compute_provider_profile(
                 declaration,
@@ -12263,6 +12770,27 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(terminal_history, list)
         for index, historical_record in enumerate(terminal_history, start=1):
             with_terminal_payload(historical_record, 80_000 + index)
+        duplicate_normalized_artifact_history = history(terminal_history)
+        for phase in ("initial", "final"):
+            duplicate_candidate = duplicate_normalized_artifact_history[
+                f"{phase}_candidates"
+            ][0]
+            duplicate_payloads = duplicate_candidate["evidence_state"][
+                "terminal_payloads"
+            ]
+            duplicate_payloads.append(clone(duplicate_payloads[0]))
+            restamp(duplicate_candidate)
+        self.assertIsNone(
+            validate_history_universe(duplicate_normalized_artifact_history)
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                duplicate_normalized_artifact_history,
+                current,
+            ),
+            "unknown",
+        )
         terminal_current = clone(current)
         assert isinstance(terminal_current, dict)
         with_terminal_payload(terminal_current, 80_100)
@@ -13843,7 +14371,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         current_with_old_epoch_request = clone(current)
         assert isinstance(current_with_old_epoch_request, dict)
-        old_epoch_request = request(8, 3, pr=current_pr)
+        old_epoch_request = request(8, 30, pr=current_pr)
         old_epoch_scope = clone(current_with_old_epoch_request["scope"])
         assert isinstance(old_epoch_scope, dict)
         old_epoch_scope["head"] = "f" * 40
@@ -13853,7 +14381,7 @@ class RepositoryContractTest(unittest.TestCase):
             request_scope_receipt(old_epoch_request, old_epoch_scope),
             index=0,
         )
-        current_with_old_epoch_request["reactions"].append(reaction(80, 8, 4))
+        current_with_old_epoch_request["reactions"].append(reaction(80, 8, 40))
         restamp(current_with_old_epoch_request)
         old_epoch_history = history(
             samples,
@@ -13986,7 +14514,10 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             terminal_duplicate_final_read_drift_report["request_policy"],
-            {"status": "unknown", "warnings": []},
+            {
+                "status": "warning",
+                "warnings": ["duplicate-observed"],
+            },
         )
         early_lane_timing = lane_timing(5, 15)
         early_report = expected_report_from_inputs(
@@ -15505,6 +16036,22 @@ class RepositoryContractTest(unittest.TestCase):
                 ],
                 parent_comment_id=background_request_id,
             )
+        for candidates_name in ("initial_candidates", "final_candidates"):
+            background_candidate = next(
+                item
+                for item in background_noise_history[candidates_name]
+                if item.get("scope", {}).get("pr") == background_pr
+            )
+            background_candidate["reactions"].append(
+                reaction(
+                    910_004,
+                    background_request_id,
+                    2_500_002,
+                    user_login="octocat",
+                    user_type="User",
+                )
+            )
+            restamp(background_candidate)
         self.assertEqual(
             compute_provider_profile(
                 declaration,
@@ -15513,6 +16060,322 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "thumbs-up-clean",
         )
+
+        opaque_cursor_reread_history = clone(background_noise_history)
+        assert isinstance(opaque_cursor_reread_history, dict)
+        final_cursor_transcript = opaque_cursor_reread_history["final_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        final_cursor_fetches = final_cursor_transcript["scopes"][0]["fetches"]
+        final_cursor_thread_fetch = final_cursor_fetches[
+            fetch_index(final_cursor_fetches, "review_threads")
+        ]
+        final_cursor_pages = final_cursor_thread_fetch["pages"]
+        self.assertEqual(len(final_cursor_pages), 1)
+        final_cursor_body = strict_json_loads(final_cursor_pages[0]["body_utf8"])
+        final_cursor_connection = final_cursor_body["data"]["repository"][
+            "pullRequest"
+        ]["reviewThreads"]
+        final_cursor_nodes = clone(final_cursor_connection["nodes"])
+        first_cursor_body = clone(final_cursor_body)
+        first_cursor_connection = first_cursor_body["data"]["repository"][
+            "pullRequest"
+        ]["reviewThreads"]
+        replacement_cursor = "FINAL_REREAD_CURSOR_1"
+        first_cursor_connection["nodes"] = []
+        first_cursor_connection["pageInfo"] = {
+            "hasNextPage": True,
+            "endCursor": replacement_cursor,
+        }
+        final_cursor_connection["nodes"] = final_cursor_nodes
+        final_cursor_connection["pageInfo"] = {
+            "hasNextPage": False,
+            "endCursor": None,
+        }
+        final_cursor_thread_fetch["pages"] = [
+            raw_page(
+                request_url="https://api.github.com/graphql",
+                body=first_cursor_body,
+            ),
+            raw_page(
+                request_url="https://api.github.com/graphql",
+                body=final_cursor_body,
+                request_after=replacement_cursor,
+            ),
+        ]
+        self.assertFalse(
+            typed_json_equal(
+                opaque_cursor_reread_history["initial_inventory"],
+                opaque_cursor_reread_history["final_inventory"],
+            )
+        )
+        initial_cursor_projection = parse_discovery_endpoint_transcript(
+            opaque_cursor_reread_history["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=opaque_cursor_reread_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        final_cursor_projection = parse_discovery_endpoint_transcript(
+            opaque_cursor_reread_history["final_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=opaque_cursor_reread_history["final_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(initial_cursor_projection)
+        self.assertTrue(
+            typed_json_equal(
+                initial_cursor_projection,
+                final_cursor_projection,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                opaque_cursor_reread_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
+
+        broken_final_cursor_history = clone(opaque_cursor_reread_history)
+        assert isinstance(broken_final_cursor_history, dict)
+        broken_final_cursor_transcript = broken_final_cursor_history["final_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        broken_final_cursor_fetches = broken_final_cursor_transcript["scopes"][0][
+            "fetches"
+        ]
+        broken_final_thread_fetch = broken_final_cursor_fetches[
+            fetch_index(broken_final_cursor_fetches, "review_threads")
+        ]
+        broken_final_thread_fetch["pages"][1]["request_after"] = "UNBOUND_CURSOR"
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                broken_final_cursor_transcript,
+                request_scope_receipts=broken_final_cursor_history["final_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                broken_final_cursor_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        expired_semantic_drift_history = clone(expired_audit_history)
+        assert isinstance(expired_semantic_drift_history, dict)
+        expired_final_inventory = expired_semantic_drift_history["final_inventory"]
+        expired_final_transcript = expired_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        expired_final_scope = next(
+            item
+            for item in expired_final_transcript["scopes"]
+            if item.get("pull_number") == 5
+        )
+        expired_final_fetches = expired_final_scope["fetches"]
+        expired_reaction_index = fetch_index(
+            expired_final_fetches,
+            "request_reactions",
+        )
+        expired_reaction_fetch = expired_final_fetches[expired_reaction_index]
+        expired_reaction_records = raw_rest_records(expired_reaction_fetch)
+        self.assertEqual(len(expired_reaction_records), 1)
+        expired_reaction_records[0]["content"] = "eyes"
+        expired_parent_id = expired_reaction_fetch["parent_comment_id"]
+        expired_final_fetches[expired_reaction_index] = rest_fetch(
+            "request_reactions",
+            (
+                f"https://api.github.com/repos/{current_repository}/issues/comments/"
+                f"{expired_parent_id}/reactions?per_page=100"
+            ),
+            expired_reaction_records,
+            parent_comment_id=expired_parent_id,
+        )
+        expired_initial_projection = parse_discovery_endpoint_transcript(
+            expired_semantic_drift_history["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=expired_semantic_drift_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        expired_final_projection = parse_discovery_endpoint_transcript(
+            expired_final_transcript,
+            request_scope_receipts=expired_final_inventory["request_scope_receipts"],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(expired_initial_projection)
+        self.assertIsNotNone(expired_final_projection)
+        self.assertFalse(
+            typed_json_equal(
+                expired_initial_projection,
+                expired_final_projection,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                expired_semantic_drift_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        expired_sidecar_drift_history = clone(expired_audit_history)
+        assert isinstance(expired_sidecar_drift_history, dict)
+        expired_request_id = expired_provider_scope["requests"][0]["id"]
+        expired_final_receipt = next(
+            receipt
+            for receipt in expired_sidecar_drift_history["final_inventory"][
+                "request_scope_receipts"
+            ]
+            if receipt.get("request_id") == expired_request_id
+        )
+        set_response_date(
+            expired_final_receipt["pre_request_scope_receipts"]["pull"],
+            history_start_exclusive - 3,
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                expired_sidecar_drift_history["final_inventory"][
+                    "discovery_endpoint_transcript"
+                ],
+                request_scope_receipts=expired_sidecar_drift_history["final_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                expired_sidecar_drift_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        earlier_eyes_samples = clone(samples)
+        assert isinstance(earlier_eyes_samples, list)
+        earlier_eyes_request_time = earlier_eyes_samples[0]["requests"][0][
+            "request_server_time"
+        ]
+        retime_sample(
+            earlier_eyes_samples[0],
+            request_time=earlier_eyes_request_time,
+            reaction_time=earlier_eyes_request_time + 10,
+        )
+        final_only_earlier_eyes_history = history(earlier_eyes_samples)
+        eyes_candidate = final_only_earlier_eyes_history["final_candidates"][0]
+        eyes_request_id = eyes_candidate["selected_request_id"]
+        eyes_selected_time = eyes_candidate["reactions"][0]["created_at"]
+        eyes_request_time = eyes_candidate["requests"][0]["request_server_time"]
+        self.assertGreater(eyes_selected_time - 1, eyes_request_time)
+        eyes_final_inventory = final_only_earlier_eyes_history["final_inventory"]
+        eyes_final_transcript = eyes_final_inventory["discovery_endpoint_transcript"]
+        eyes_final_scope = next(
+            item
+            for item in eyes_final_transcript["scopes"]
+            if item.get("pull_number") == eyes_candidate["scope"]["pr"]
+        )
+        eyes_final_fetches = eyes_final_scope["fetches"]
+        eyes_reaction_index = fetch_index(eyes_final_fetches, "request_reactions")
+        eyes_reaction_fetch = eyes_final_fetches[eyes_reaction_index]
+        eyes_final_fetches[eyes_reaction_index] = rest_fetch(
+            "request_reactions",
+            eyes_reaction_fetch["pages"][0]["request_url"],
+            [
+                *raw_rest_records(eyes_reaction_fetch),
+                raw_reaction_record(
+                    reaction(
+                        930_001,
+                        eyes_request_id,
+                        eyes_selected_time - 1,
+                        content="eyes",
+                    )
+                ),
+            ],
+            parent_comment_id=eyes_request_id,
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                eyes_final_transcript,
+                request_scope_receipts=eyes_final_inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                final_only_earlier_eyes_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        future_human_review_history = clone(background_noise_history)
+        assert isinstance(future_human_review_history, dict)
+        future_review_inventory = future_human_review_history["final_inventory"]
+        future_review_transcript = future_review_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_review_scope = next(
+            item
+            for item in future_review_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_review_fetches = future_review_scope["fetches"]
+        future_review_index = fetch_index(future_review_fetches, "reviews")
+        future_review_records = raw_rest_records(
+            future_review_fetches[future_review_index]
+        )
+        future_human_review = next(
+            item
+            for item in future_review_records
+            if item.get("id") == background_review_id
+        )
+        future_human_review["submitted_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        future_review_fetches[future_review_index] = rest_fetch(
+            "reviews",
+            (
+                f"https://api.github.com/repos/{current_repository}/pulls/"
+                f"{background_pr}/reviews?per_page=100"
+            ),
+            future_review_records,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_review_transcript,
+                request_scope_receipts=future_review_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                future_human_review_history,
+                current,
+            ),
+            "unknown",
+        )
+
         ambiguous_background_noise = clone(background_noise_history)
         assert isinstance(ambiguous_background_noise, dict)
         for inventory_name in ("initial_inventory", "final_inventory"):
@@ -17400,7 +18263,7 @@ class RepositoryContractTest(unittest.TestCase):
             "provider-like identity ambiguity",
             "raw `discovery_endpoint_transcript`, not the candidate array",
             "each scope is exactly `{pull_number, fetches}`",
-            "deleting a candidate, deleting its inventory entry, and decrementing the count",
+            "deleting an in-window candidate, deleting its inventory entry, and decrementing the count",
             "do not themselves provide a cryptographic proof of github tls origin",
             "including confirmed-different-actor reactions",
             "its payload kind does not itself select the provider profile",

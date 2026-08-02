@@ -232,12 +232,16 @@ For each pre-request and post-request phase:
   `merge_base_commit.sha`.
 - The two independently parsed records derive one exact scope tuple
   `(repository, pr, pr_merge_base, head)`. The pre-request and post-request
-  tuples must be type-preserving identical and must both equal the enclosing
-  historical or current scope. Preserve the individual response `Date` values;
-  do not require the two sequential GETs in one phase to share a timestamp.
-  Every pre `Date` is no later than the request semantic time or POST response,
-  every post `Date` is no earlier than the POST response, and every receipt
-  `Date` is no later than the frozen history as-of bound.
+  tuples must be type-preserving identical. They must also equal the enclosing
+  historical or current scope before that request or any child reaction enters
+  the enclosing scope's request/reaction authority. A valid tuple with the same
+  repository and PR but an older head remains old-epoch audit evidence; the
+  dedicated same-head/different-merge-base classification follows the
+  base-only-retarget rule below. Preserve the individual response `Date`
+  values; do not require the two sequential GETs in one phase to share a
+  timestamp. Every pre `Date` is no later than the request semantic time or
+  POST response, every post `Date` is no earlier than the POST response, and
+  every receipt `Date` is no later than the frozen history as-of bound.
 
 `request_comment_receipt` is the exact authenticated response to parent-owned
 `POST` of `https://api.github.com/repos/<owner>/<repo>/issues/<pr>/comments`
@@ -265,10 +269,11 @@ independently fetched request record in the complete issue-comment traversal;
 and the request semantic server time must fall between every pre-read `Date`
 and the POST response `Date`.
 
-The mapping is one-to-one and onto: every accepted controlled request in a
-historical candidate or the current scope has exactly one sidecar, every
-sidecar names exactly one such request, and no duplicate, extra, cross-scope,
-or unmatched receipt is admitted. The selected request and every
+For the request/reaction plane, the mapping is one-to-one and onto: every
+observed controlled request has exactly one sidecar and every sidecar names
+exactly one such request. Duplicate, extra, cross-PR, or unmatched receipts are
+not admitted. A receipt-derived old epoch may remain in the complete audit but
+cannot be counted in the enclosing scope. The selected request and every
 `same_scope_request_audit` entry repeat their exact sidecar. Reaction
 `source_record_sha256` binds the request projection, this sidecar, and the
 individual reaction projection together.
@@ -907,8 +912,11 @@ downgraded to a confirmed non-candidate: prose that is neither the one exact
 declaration record nor closed progress-only syntax fails the projection and
 selects `unknown`. A terminal-looking exact-provider record that misses every
 accepted terminal branch remains a `malformed` historical candidate under
-ordinary terminal precedence; it is never hidden by the declaration or
-progress exceptions.
+ordinary terminal precedence when its final basis is inside the frozen
+interval; it is never hidden by the declaration or progress exceptions. A
+fully parsed malformed terminal record at or before the exclusive lower
+boundary remains visible audit evidence under the temporal classification rule
+below, but does not become an in-window candidate.
 
 A schema-version-3 `review_threads` response stores the real GraphQL
 `comments { nodes pageInfo }` connection inside each raw thread node; it never
@@ -970,15 +978,53 @@ its exact request-time scope sidecar, and the projected child reaction. Same
 time and numeric ID alone therefore cannot substitute one carrier, channel,
 scope epoch, or semantic result for another.
 
+Window filtering happens only after a seeded scope has been completely
+traversed, parsed, and reduced by terminal precedence. A fully valid
+provider-bearing non-current scope whose final `source_ordering_key.server_time`
+is at or before `window_start_exclusive` remains in the raw transcript and
+`scope_classifications` as `confirmed-non-candidate` for this frozen interval,
+but it is omitted from `entries` and `candidate_universe_count`. A scope is a
+`historical-candidate` for this interval only when its final basis satisfies
+`window_start_exclusive < server_time <= window_end_inclusive`. This audit-only
+classification never permits an incomplete traversal, ambiguous identity,
+malformed projection, or post-`as_of_server_time` record to be hidden as an
+expired non-candidate; those cases still fail closed.
+
+The fixed semantic projection also derives `scope_authority_audit`, sorted by
+positive pull number, for every seeded scope that contains policy-relevant
+request, reaction, provider artifact, or provider nonterminal evidence. Each
+item is exactly
+`{scope_key, lifecycle, requests, reactions, applicable_artifacts,
+nonterminal_records}`. `requests` retains every controlled request plus its
+derived scope and exact sidecar when valid; `reactions` retains every individual
+reaction, including confirmed-different actors; `applicable_artifacts` retains
+every provider terminal/finding/malformed source with channel, semantic time,
+native ID, outcome, and canonical source digest rather than only the selected
+one; and `nonterminal_records` retains exact-provider pending/progress audit
+evidence. This list is derived from the raw transcript and is not an inventory
+entry or sample-count input. It keeps current and temporally excluded provider
+scopes auditable and makes any policy-relevant node, semantic, lifecycle, or
+source-evidence drift visible across the two traversals.
+
+For an in-window reaction candidate, the closed candidate evaluator requires
+its complete request/sidecar and reaction audit plus lifecycle and every
+provider artifact to equal the matching raw scope-authority projection. This
+includes earlier `eyes`, confirmed-different reactions, duplicate parents, and
+unselected terminal artifacts. When a terminal artifact determines a
+candidate, request/reaction-plane defects remain isolated and do not veto that
+stronger carrier; lifecycle and the complete provider artifact projection must
+still match. Raw-only nonterminal records are compared between traversals even
+though they do not enter the normalized candidate array.
+
 The closed candidate evaluator independently validates each complete candidate
 array element and requires its full authority projection to equal the
 raw-derived entry. Initial/final candidate arrays must also be type-preserving
 identical. Audit-only normalized fields that do not originate in one endpoint
 are not falsely described as raw-derived. These checks never prove the
 transcript complete merely by agreeing with one another. In particular,
-deleting a candidate, deleting its inventory entry, and decrementing the count
-while leaving its raw fetch record present must fail closed. Missing required
-child fetches, an unreadable page, a repository-list or detail traversal that
+deleting an in-window candidate, deleting its inventory entry, and decrementing
+the count while leaving its raw fetch record present must fail closed. Missing
+required child fetches, an unreadable page, a repository-list or detail traversal that
 exceeds any predeclared page/count/byte/time evidence budget, a broken
 Link/cursor chain, a body-digest mismatch, initial/final semantic drift, or any
 projection mismatch selects `unknown`; no completeness flag can override it.
@@ -994,9 +1040,12 @@ TLS origin. Do not describe the record as a TLS attestation.
 
 A candidate basis at the lower boundary is outside the window; one at the upper
 boundary is inside. Every trusted server time in every historical/current raw
-record must be no later than `as_of_server_time`, including controlled-request
-times and confirmed-different-actor reactions that are excluded from provider
-semantic ordering. Any later artifact is impossible in the frozen observation
+record must be no later than `as_of_server_time`. Apply this bound before actor
+filtering, including controlled-request times and confirmed-different-actor
+issue comments, submitted reviews, and reactions that are excluded from
+provider semantic ordering. A `PENDING` review may retain its required null
+`submitted_at`; any non-pending review requires a positive in-bound server time
+regardless of actor. Any later artifact is impossible in the frozen observation
 and makes the profile `unknown`.
 
 Raw discovery includes the exact current scope and every confirmed
@@ -1023,11 +1072,17 @@ matching request-time scope sidecar.
 Complete pagination and scope inventory must prove that universe and its
 recorded count by derivation from the raw transcript. The initial and final
 enumerations must be semantically identical for the same frozen interval.
-Opaque GraphQL cursor bytes need only form a valid chain within each traversal;
-stable node content and derived universe, rather than cursor-byte equality,
-establish final equivalence. The current outcome's selected basis must not be
-later than the same `as_of_server_time`; its complete raw evidence snapshot is
-subject to that bound as well.
+Validate each traversal's page digests, REST links, GraphQL cursor chain, and
+seed-to-detail closure independently. The two raw transcript envelopes, page
+bodies, body digests, and opaque cursor tokens need not be byte-identical.
+Opaque GraphQL cursor bytes need only form a valid chain within their own
+traversal; type-preserving equality of the fixed semantic projection,
+`scope_classifications`, candidate `entries`, candidate arrays, and recorded
+count, together with the complete `scope_authority_audit`, establishes final
+equivalence. Any semantic or candidate-set drift still fails closed. The
+current outcome's selected basis must not be later than the
+same `as_of_server_time`; its complete raw evidence snapshot is subject to that
+bound as well.
 
 After applying terminal precedence inside each scope, record that final
 candidate outcome's ordering basis as `candidate_basis.kind`,
@@ -1643,7 +1698,7 @@ evidence_basis:
             semantic: "+1" | eyes | clean | findings | malformed
             native_identity: [<parent reactions URL or channel>, <positive native ID>]
             source_record_sha256: <canonical policy-projection SHA-256>
-    final_inventory: <repeat the complete identical initial_inventory record>
+    final_inventory: <independently fetched complete inventory with an identical semantic projection and stable request_scope_receipts>
     initial_candidates:
       - <complete candidate snapshot defined below>
     final_candidates:
@@ -1766,8 +1821,12 @@ fields: `complete`, all six pagination results, the four
 scope, every controlled request, its one-to-one `request_scope_receipts`, every
 individual reaction (including confirmed-different-actor reactions), selected
 request/reaction IDs when present, `same_scope_request_audit`, and
-`candidate_basis`. The initial and final inventory records and candidate arrays
-must be structurally identical.
+`candidate_basis`. The initial and final candidate arrays, parent-owned
+`request_scope_receipts`, derived `scope_classifications`, and derived `entries`
+must be type-preserving identical. The independently fetched raw transcript
+records need not be structurally or byte-identical when each traversal is
+complete and their fixed semantic projections are identical; opaque cursor and
+raw page-byte differences are transport evidence, not candidate drift.
 
 `current.raw_endpoint_inventories.initial` and `.final` are independent,
 complete endpoint traversals and each is the authority for its corresponding
@@ -1926,8 +1985,9 @@ implementation mechanically:
     declaration PR participates in the complete repository seed/detail
     traversal. The one exact declaration and closed progress-only grammar are
     audit-only; other exact-provider free-form prose fails closed, and
-    terminal-looking malformed artifacts remain candidates. This classification
-    is not behaviour attributed to either fixed upstream commit.
+    in-window terminal-looking malformed artifacts remain candidates. This
+    classification is not behaviour attributed to either fixed upstream
+    commit.
 
 ## Non-Goals
 
