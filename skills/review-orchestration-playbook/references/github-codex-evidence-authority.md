@@ -566,7 +566,10 @@ is missing, unknown, or no longer one of the three admitted terminal states.
 REST `submitted_at` records the original submission, not a trustworthy time for
 a later state transition. Until a provider-stable state-transition timestamp is
 defined, do not place these invalid-state blockers in ordinary artifact order
-and do not let a later-looking clean supersede them.
+and do not let a later-looking clean supersede them. In a non-current scope,
+their presence makes the historical universe inconclusive before window
+filtering; original `submitted_at` cannot classify one as an expired
+`confirmed-non-candidate`.
 
 Only the following terminal payloads are accepted:
 
@@ -1204,12 +1207,17 @@ shape `{scope_key, source_ordering_key, source_evidence}` and
 reaction versus terminal-artifact carrier, request-reaction versus review or
 issue-comment channel, `+1` / `eyes` / clean / findings / malformed semantics,
 the native parent-and-ID or channel-and-ID identity, and the digest of the
-canonical policy projection. Review projection digests include the review,
-associated inline records, and joined thread nodes; issue-comment digests bind
-the projected comment; reaction digests bind the seven-field parent request,
-its exact request-time scope sidecar, and the projected child reaction. Same
-time and numeric ID alone therefore cannot substitute one carrier, channel,
-scope epoch, or semantic result for another.
+canonical policy projection. A review result digest includes the review, its
+exact-provider target inline records, and their joined target thread nodes.
+It does not promote human, unrelated-bot, null-parent, or unrelated-only
+threads into provider result authority. An independent scope-level
+`review-thread-audit` bundle hashes every non-excluded semantic GraphQL thread
+projection and enters `nonterminal_records`, so changes to those audit-only
+threads still fail initial/final convergence. Issue-comment digests bind the
+projected comment; reaction digests bind the seven-field parent request, its
+exact request-time scope sidecar, and the projected child reaction. Same time
+and numeric ID alone therefore cannot substitute one carrier, channel, scope
+epoch, or semantic result for another.
 
 Window filtering happens only after a seeded scope has been completely
 traversed, parsed, and reduced by terminal precedence. A fully valid
@@ -2148,6 +2156,11 @@ ID, and canonical source digest. A progress comment also binds its semantic
 server time. A `PENDING` review requires the REST `submitted_at` value to be
 absent or null, records exact `server_time: null`, and binds its exact-provider
 inline and thread bundle instead of inventing a local or receipt timestamp.
+The same list carries at most one scope-level `review-thread-audit` item,
+identified by the positive pull number with `server_time: null`; its source
+digest binds every fully parsed semantic GraphQL thread after the allowed
+post-cutoff confirmed-different suffix exclusion. This item is audit-only and
+cannot complete, block, or resolve a provider result by itself.
 These records never enter terminal ordering or create a result, but the
 complete initial/final projection must keep them type-preserving identical.
 When comparing the raw terminal decision to the normalized current snapshot,

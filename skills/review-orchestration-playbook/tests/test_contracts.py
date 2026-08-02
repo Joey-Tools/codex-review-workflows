@@ -11253,7 +11253,6 @@ class RepositoryContractTest(unittest.TestCase):
                     review_id: [] for review_id in nonterminal_review_by_id
                 }
                 target_review_by_child_id: dict[str, int] = {}
-                associated_review_by_child_id: dict[str, int] = {}
                 nonterminal_review_by_child_id: dict[str, int] = {}
                 excluded_future_review_by_child_id: dict[
                     str, tuple[int, dict[str, object]]
@@ -11307,10 +11306,6 @@ class RepositoryContractTest(unittest.TestCase):
                         continue
                     if parent_id in associated_inline_by_review:
                         associated_inline_by_review[parent_id].append(projected_inline)
-                        associated_child_id = str(projected_inline["id"])
-                        if associated_child_id in associated_review_by_child_id:
-                            return None
-                        associated_review_by_child_id[associated_child_id] = parent_id
                     if actor == "different":
                         nonterminal_records.append(
                             (
@@ -11365,12 +11360,10 @@ class RepositoryContractTest(unittest.TestCase):
                 thread_nodes_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
-                associated_thread_nodes_by_review: dict[
-                    int, list[dict[str, object]]
-                ] = {review_id: [] for review_id in review_by_id}
                 nonterminal_thread_nodes_by_review: dict[
                     int, list[dict[str, object]]
                 ] = {review_id: [] for review_id in nonterminal_review_by_id}
+                thread_audit_nodes: list[dict[str, object]] = []
                 seen_graphql_comment_ids: set[str] = set()
                 seen_graphql_database_ids: set[str] = set()
                 matched_excluded_future_child_ids: set[str] = set()
@@ -11382,7 +11375,6 @@ class RepositoryContractTest(unittest.TestCase):
                         comments.get("pages") if isinstance(comments, dict) else None
                     )
                     target_review_ids: set[int] = set()
-                    associated_review_ids: set[int] = set()
                     nonterminal_review_ids: set[int] = set()
                     excluded_future_child_ids_in_thread: set[str] = set()
                     if not isinstance(pages, list):
@@ -11430,11 +11422,6 @@ class RepositoryContractTest(unittest.TestCase):
                             target_review_id = target_review_by_child_id.get(child_id)
                             if target_review_id is not None:
                                 target_review_ids.add(target_review_id)
-                            associated_review_id = associated_review_by_child_id.get(
-                                child_id
-                            )
-                            if associated_review_id is not None:
-                                associated_review_ids.add(associated_review_id)
                             nonterminal_review_id = nonterminal_review_by_child_id.get(
                                 child_id
                             )
@@ -11494,12 +11481,24 @@ class RepositoryContractTest(unittest.TestCase):
                                 )
                                 not in excluded_future_child_ids_in_thread
                             ]
+                    semantic_comments = semantic_thread.get("comments")
+                    semantic_pages = (
+                        semantic_comments.get("pages")
+                        if isinstance(semantic_comments, dict)
+                        else None
+                    )
+                    if not isinstance(semantic_pages, list):
+                        return None
+                    has_semantic_comments = any(
+                        isinstance(semantic_page, dict)
+                        and isinstance(semantic_page.get("nodes"), list)
+                        and bool(semantic_page["nodes"])
+                        for semantic_page in semantic_pages
+                    )
+                    if has_semantic_comments or not excluded_future_child_ids_in_thread:
+                        thread_audit_nodes.append(semantic_thread)
                     for target_review_id in target_review_ids:
                         thread_nodes_by_review[target_review_id].append(semantic_thread)
-                    for associated_review_id in associated_review_ids:
-                        associated_thread_nodes_by_review[associated_review_id].append(
-                            semantic_thread
-                        )
                     for nonterminal_review_id in nonterminal_review_ids:
                         nonterminal_thread_nodes_by_review[
                             nonterminal_review_id
@@ -11508,6 +11507,21 @@ class RepositoryContractTest(unittest.TestCase):
                     excluded_future_review_by_child_id
                 ):
                     return None
+
+                if thread_audit_nodes:
+                    thread_audit_bundle = {
+                        "review_threads": clone(thread_audit_nodes),
+                    }
+                    nonterminal_records.append(
+                        (
+                            "review-thread-audit",
+                            pr,
+                            None,
+                            hashlib.sha256(
+                                canonical_raw_body(thread_audit_bundle).encode("utf-8")
+                            ).hexdigest(),
+                        )
+                    )
 
                 for review_id, raw_review in nonterminal_review_by_id.items():
                     source_bundle = {
@@ -11845,7 +11859,7 @@ class RepositoryContractTest(unittest.TestCase):
             raw_scope: dict[str, object],
             *,
             prefer_unresolved_thread_blocker: bool,
-        ) -> tuple[bool, tuple[object, ...] | None]:
+        ) -> tuple[bool, tuple[object, ...] | None, bool]:
             artifact_bases = raw_scope.get("artifact_bases")
             unresolved_artifact_bases = raw_scope.get("unresolved_artifact_bases")
             invalid_review_state_blockers = raw_scope.get(
@@ -11856,9 +11870,9 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(unresolved_artifact_bases, list)
                 or not isinstance(invalid_review_state_blockers, list)
             ):
-                return (False, None)
+                return (False, None, False)
             if not artifact_bases:
-                return (True, None)
+                return (True, None, False)
             if prefer_unresolved_thread_blocker and unresolved_artifact_bases:
                 return (
                     True,
@@ -11868,6 +11882,7 @@ class RepositoryContractTest(unittest.TestCase):
                             key=lambda item: (item[0], item[1]),
                         )
                     ),
+                    bool(invalid_review_state_blockers),
                 )
             if invalid_review_state_blockers:
                 return (
@@ -11878,14 +11893,15 @@ class RepositoryContractTest(unittest.TestCase):
                             key=lambda item: (item[2], item[1]),
                         )
                     ),
+                    True,
                 )
             latest_time = max(item[0] for item in artifact_bases)
             latest = [item for item in artifact_bases if item[0] == latest_time]
             if len({item[2] for item in latest}) != 1:
-                return (False, None)
+                return (False, None, False)
             priority = {"clean": 1, "findings": 2, "malformed": 3}
             if any(item[3] not in priority for item in latest):
-                return (False, None)
+                return (False, None, False)
             highest = max(priority[item[3]] for item in latest)
             return (
                 True,
@@ -11895,6 +11911,7 @@ class RepositoryContractTest(unittest.TestCase):
                         key=lambda item: item[1],
                     )
                 ),
+                False,
             )
 
         def select_raw_reaction(
@@ -12164,13 +12181,20 @@ class RepositoryContractTest(unittest.TestCase):
                         raw_scope,
                         request_receipt_bindings=None,
                     )
-                    terminal_ok, selected = select_raw_terminal_artifact(
+                    (
+                        terminal_ok,
+                        selected,
+                        has_invalid_review_state_blocker,
+                    ) = select_raw_terminal_artifact(
                         raw_scope,
                         prefer_unresolved_thread_blocker=(
                             prefer_unresolved_thread_blocker
                         ),
                     )
-                    if not terminal_ok:
+                    if not terminal_ok or (
+                        has_invalid_review_state_blocker
+                        and tuple(scope_value) != current_scope_key
+                    ):
                         return None
                     source_ordering_key: list[int] | None = None
                     source_evidence: dict[str, object] | None = None
@@ -12407,11 +12431,18 @@ class RepositoryContractTest(unittest.TestCase):
                         request_scope_kinds[request_id] = "invalid"
                 if "base-changed-same-head" in request_scope_kinds.values():
                     return None
-                terminal_ok, selected = select_raw_terminal_artifact(
+                (
+                    terminal_ok,
+                    selected,
+                    has_invalid_review_state_blocker,
+                ) = select_raw_terminal_artifact(
                     raw_scope,
                     prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 )
-                if not terminal_ok:
+                if not terminal_ok or (
+                    has_invalid_review_state_blocker
+                    and parsed_scope != current_scope_key
+                ):
                     return None
                 if selected is not None:
                     source_ordering_key = [selected[0], selected[1]]
@@ -19364,7 +19395,22 @@ class RepositoryContractTest(unittest.TestCase):
                 nonterminal_records = parsed_nonterminal_current[
                     "current_authority_projection"
                 ]["nonterminal_records"]
-                self.assertEqual(len(nonterminal_records), 2)
+                expected_nonterminal_count = (
+                    3 if nonterminal_kind == "pending-review" else 2
+                )
+                self.assertEqual(
+                    len(nonterminal_records),
+                    expected_nonterminal_count,
+                )
+                if nonterminal_kind == "pending-review":
+                    self.assertIn(
+                        "review-thread-audit",
+                        {
+                            item.get("channel")
+                            for item in nonterminal_records
+                            if isinstance(item, dict)
+                        },
+                    )
                 self.assertIsNotNone(
                     expected_report_from_inputs(
                         "accepted-terminal-clean",
@@ -19702,11 +19748,17 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             body: str,
             different_actor_child: bool = False,
+            record: dict[str, object] | None = None,
+            server_time: int | None = None,
         ) -> dict[str, object]:
+            artifact_record = terminal_current if record is None else record
+            artifact_server_time = (
+                int(terminal_server_time) - 10 if server_time is None else server_time
+            )
             artifact = complete_review_artifact(
-                terminal_current,
+                artifact_record,
                 artifact_id,
-                int(terminal_server_time) - 10,
+                artifact_server_time,
                 artifact_kind="malformed-terminal-artifact",
                 outcome="malformed",
             )
@@ -19723,13 +19775,14 @@ class RepositoryContractTest(unittest.TestCase):
                         "id": artifact_id * 10,
                         "url": (
                             f"https://github.com/{current_repository}/pull/"
-                            f"{current_pr}#discussion_r{artifact_id * 10}"
+                            f"{artifact_record['scope']['pr']}"
+                            f"#discussion_r{artifact_id * 10}"
                         ),
                         "user_login": "octocat",
                         "user_type": "User",
                         "pull_request_review_id": artifact_id,
-                        "commit_id": current_head,
-                        "original_commit_id": current_head,
+                        "commit_id": artifact_record["scope"]["head"],
+                        "original_commit_id": artifact_record["scope"]["head"],
                         "body": "Human side discussion",
                         "normalized_body": "Human side discussion",
                     }
@@ -19832,6 +19885,93 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 restamp(incorrect_clean_basis)
                 self.assertIsNone(candidate_order_basis(incorrect_clean_basis))
+
+        historical_invalid_state_cases = {
+            "dismissed": ("DISMISSED", ""),
+            "missing-state": (None, "No findings."),
+            "unknown-state": ("QUEUED", "No findings."),
+        }
+        for historical_offset, (
+            historical_case,
+            (historical_state, historical_body),
+        ) in enumerate(historical_invalid_state_cases.items(), start=1):
+            historical_invalid_scope = sample(20 + historical_offset)
+            historical_invalid_time = history_start_exclusive - historical_offset
+            historical_invalid_artifact = invalid_state_blocker_artifact(
+                82_220 + historical_offset,
+                historical_state,
+                body=historical_body,
+                record=historical_invalid_scope,
+                server_time=historical_invalid_time,
+            )
+            historical_invalid_scope["evidence_state"][
+                "malformed_terminal_artifacts"
+            ] = [historical_invalid_artifact]
+            if historical_case == "unknown-state":
+                historical_invalid_scope["evidence_state"][
+                    "unresolved_thread_findings"
+                ] = [
+                    complete_review_artifact(
+                        historical_invalid_scope,
+                        82_229,
+                        historical_invalid_time - 1,
+                        artifact_kind="unresolved-thread-finding",
+                        outcome="findings",
+                    )
+                ]
+            restamp(historical_invalid_scope)
+            historical_invalid_history = history(
+                samples,
+                confirmed_noncandidate_scopes=[historical_invalid_scope],
+            )
+            historical_invalid_transcript = historical_invalid_history[
+                "initial_inventory"
+            ]["discovery_endpoint_transcript"]
+            historical_invalid_receipts = historical_invalid_history[
+                "initial_inventory"
+            ]["request_scope_receipts"]
+            full_historical_invalid_projection = parse_discovery_endpoint_transcript(
+                historical_invalid_transcript,
+                request_scope_receipts=historical_invalid_receipts,
+                provider_declaration=declaration,
+                prefer_unresolved_thread_blocker=(historical_case == "unknown-state"),
+            )
+            blind_historical_invalid_context = new_inventory_validation_context()
+            self.assertIsNotNone(blind_historical_invalid_context)
+            blind_historical_invalid_projection = parse_discovery_endpoint_transcript(
+                historical_invalid_transcript,
+                request_scope_receipts=None,
+                provider_declaration=declaration,
+                prefer_unresolved_thread_blocker=(historical_case == "unknown-state"),
+                _endpoint_plane_only=True,
+                _sidecar_blind_audit=True,
+                _inventory_validation_context=(blind_historical_invalid_context),
+            )
+            with self.subTest(
+                historical_invalid_review_state_outside_window=historical_case
+            ):
+                self.assertIsNone(full_historical_invalid_projection)
+                self.assertIsNone(blind_historical_invalid_projection)
+                self.assertIsNone(
+                    validate_history_universe_result(historical_invalid_history)
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        historical_invalid_history,
+                        current,
+                    ),
+                    "unknown",
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-reaction-clean",
+                        declaration,
+                        historical_invalid_history,
+                        current,
+                        post_as_of_lane_timing,
+                    )
+                )
 
         for child_offset, child_resolved in enumerate((False, True), start=1):
             child_parent_id = 82_230 + child_offset
@@ -20153,6 +20293,179 @@ class RepositoryContractTest(unittest.TestCase):
                         terminal_current,
                     ),
                     "unknown",
+                )
+
+        terminal_review_snapshot = terminal_current["evidence_state"][
+            "terminal_payloads"
+        ][0]["final_snapshot"]
+        assert isinstance(terminal_review_snapshot, dict)
+        terminal_review_id = terminal_review_snapshot["id"]
+        assert isinstance(terminal_review_id, int)
+
+        def audit_only_thread_current(
+            kind: str,
+            *,
+            child_id: int,
+            review_id: int,
+        ) -> dict[str, object]:
+            audit_current = clone(terminal_current)
+            assert isinstance(audit_current, dict)
+            child_url = (
+                f"https://github.com/{current_repository}/pull/{current_pr}"
+                f"#discussion_r{child_id}"
+            )
+            if kind == "associated-only":
+                parent_review_id: int | None = terminal_review_id
+                child_login = "octocat"
+                child_type = "User"
+            elif kind == "unrelated-parent-only":
+                parent_review_id = review_id
+                child_login = "chatgpt-codex-connector[bot]"
+                child_type = "Bot"
+                unrelated_review = raw_review_record(terminal_review_snapshot)
+                unrelated_review.update(
+                    {
+                        "id": review_id,
+                        "node_id": f"PRR_{review_id}",
+                        "html_url": (
+                            f"https://github.com/{current_repository}/pull/"
+                            f"{current_pr}#pullrequestreview-{review_id}"
+                        ),
+                        "user": {
+                            "login": "octocat",
+                            "type": "User",
+                            "node_id": "U_octocat",
+                        },
+                        "state": "COMMENTED",
+                        "body": "Human review context.",
+                    }
+                )
+                audit_current["raw_review_records"] = [unrelated_review]
+            elif kind == "null-parent-only":
+                parent_review_id = None
+                child_login = "chatgpt-codex-connector[bot]"
+                child_type = "Bot"
+            else:
+                raise AssertionError("unknown audit-only thread kind")
+            audit_current["raw_inline_records"] = [
+                raw_inline_record(
+                    {
+                        "id": child_id,
+                        "url": child_url,
+                        "user_login": child_login,
+                        "user_type": child_type,
+                        "pull_request_review_id": parent_review_id,
+                        "commit_id": current_head,
+                        "original_commit_id": current_head,
+                        "body": "Audit-only side discussion.",
+                    }
+                )
+            ]
+            thread_parent_id = (
+                parent_review_id if parent_review_id is not None else review_id
+            )
+            thread = _review_thread_pages(
+                [{"id": child_id, "url": child_url}],
+                parent_review_id=thread_parent_id,
+            )["pages"][0]["nodes"][0]
+            assert isinstance(thread, dict)
+            if parent_review_id is None:
+                thread["comments"]["pages"][0]["nodes"][0]["pullRequestReview"] = None
+            audit_current["raw_thread_nodes"] = [thread]
+            return audit_current
+
+        audit_thread_drift_cases: dict[
+            str, tuple[dict[str, object], dict[str, object]]
+        ] = {}
+        for audit_thread_offset, audit_thread_kind in enumerate(
+            ("associated-only", "unrelated-parent-only", "null-parent-only"),
+            start=1,
+        ):
+            initial_audit_thread_current = audit_only_thread_current(
+                audit_thread_kind,
+                child_id=82_600 + audit_thread_offset,
+                review_id=82_610 + audit_thread_offset,
+            )
+            final_audit_thread_current = clone(initial_audit_thread_current)
+            assert isinstance(final_audit_thread_current, dict)
+            final_audit_thread_current["raw_thread_nodes"][0]["isResolved"] = True
+            audit_thread_drift_cases[audit_thread_kind] = (
+                initial_audit_thread_current,
+                final_audit_thread_current,
+            )
+
+        for audit_thread_kind, (
+            initial_audit_thread_current,
+            final_audit_thread_current,
+        ) in audit_thread_drift_cases.items():
+            initial_audit_inventory = current_endpoint_inventory(
+                initial_audit_thread_current,
+                observation_marker=f"{audit_thread_kind}-initial",
+            )
+            final_audit_inventory = current_endpoint_inventory(
+                final_audit_thread_current,
+                observation_marker=f"{audit_thread_kind}-final",
+            )
+            initial_audit_entry = parse_current_endpoint_inventory(
+                initial_audit_inventory,
+                current_ancestry={},
+            )
+            final_audit_entry = parse_current_endpoint_inventory(
+                final_audit_inventory,
+                current_ancestry={},
+            )
+            self.assertIsNotNone(initial_audit_entry)
+            self.assertIsNotNone(final_audit_entry)
+            assert isinstance(initial_audit_entry, dict)
+            assert isinstance(final_audit_entry, dict)
+            initial_audit_authority = initial_audit_entry[
+                "current_authority_projection"
+            ]
+            final_audit_authority = final_audit_entry["current_authority_projection"]
+            audit_thread_history = history(
+                samples,
+                current_raw=initial_audit_thread_current,
+                final_current_raw=final_audit_thread_current,
+            )
+            with self.subTest(audit_only_thread_drift=audit_thread_kind):
+                self.assertEqual(
+                    initial_audit_entry["source_evidence"]["source_record_sha256"],
+                    final_audit_entry["source_evidence"]["source_record_sha256"],
+                )
+                self.assertNotEqual(
+                    [
+                        item
+                        for item in initial_audit_authority["nonterminal_records"]
+                        if item.get("channel") == "review-thread-audit"
+                    ],
+                    [
+                        item
+                        for item in final_audit_authority["nonterminal_records"]
+                        if item.get("channel") == "review-thread-audit"
+                    ],
+                )
+                self.assertFalse(
+                    current_raw_authority_matches(
+                        audit_thread_history,
+                        terminal_current,
+                    )
+                )
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        audit_thread_history,
+                        terminal_current,
+                    ),
+                    "unknown",
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        audit_thread_history,
+                        terminal_current,
+                        post_as_of_lane_timing,
+                    )
                 )
 
         progress_only_current = clone(current)

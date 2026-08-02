@@ -498,6 +498,11 @@ lifecycle, every controlled request and valid sidecar binding, every individual
 in-cutoff reaction including confirmed-different actors, every selected or
 unselected provider artifact with its canonical source digest, exact-provider
 pending/progress records, and in-cutoff/null-parent/unrelated audit context.
+Represent the complete non-excluded semantic GraphQL thread set as one
+scope-level `review-thread-audit` digest in `nonterminal_records`; keep the
+selected review result digest target-only. Thus non-target thread drift is
+visible without granting those threads provider-result or resolution
+authority.
 Fully validated post-cutoff
 confirmed-different suffix records remain in the raw transcript but do not
 enter this semantic projection. Compare the complete projection across the two

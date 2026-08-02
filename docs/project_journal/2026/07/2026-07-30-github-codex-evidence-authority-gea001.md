@@ -747,7 +747,14 @@ post-budget byte rewrite. Known
 GraphQL nested-record counts are charged before cloning/serialization. The
 semantic projection also retains in-cutoff confirmed-different and
 null-parent/unrelated audit context, while only fully validated post-cutoff
-confirmed-different suffixes may converge as raw-only noise.
+confirmed-different suffixes may converge as raw-only noise. The result digest
+for a review stays target-only; a separate scope-level `review-thread-audit`
+digest in `nonterminal_records` binds every non-excluded semantic GraphQL
+thread, so associated-human, unrelated-parent, and null-parent thread drift is
+visible without granting those threads provider result or resolution
+authority. Invalid-state terminal signals are also checked before the history
+window: their original `submitted_at` cannot turn a later dismissal or unknown
+state into an expired `confirmed-non-candidate`.
 
 Two outcome boundaries are likewise explicit. A valid same-head/different-base
 sidecar blocks even when a terminal clean exists, because it proves that the
