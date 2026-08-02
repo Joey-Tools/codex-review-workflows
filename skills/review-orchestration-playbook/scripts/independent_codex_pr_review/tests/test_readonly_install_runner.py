@@ -26,6 +26,18 @@ from . import support
 from .support import owned_temporary_directory
 
 
+def _captured_gate_source_for_nested_tests(path: pathlib.Path) -> str:
+    for finder in sys.meta_path:
+        sources = getattr(finder, "_sources", None)
+        if not isinstance(sources, dict):
+            continue
+        source = sources.get("tests.trusted_mac_gate")
+        payload = getattr(source, "payload", None)
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8")
+    return path.read_text(encoding="utf-8")
+
+
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self._source_binding = runner.SourceCheckoutBinding(
@@ -49,8 +61,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             _binding: runner.SourceTreeBinding,
             *,
             budget: runner.TreeSnapshotBudget,
+            destination_owner_uid: int,
+            destination_group_gid: int,
         ) -> str:
             self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+            self.assertEqual(destination_owner_uid, destination.parent.stat().st_uid)
+            self.assertEqual(destination_group_gid, destination.parent.stat().st_gid)
             runner.shutil.copytree(
                 source,
                 destination,
@@ -8514,7 +8530,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 "original\n",
             )
 
-    def test_hosted_root_source_copy_binds_nobody_destination_owner(self) -> None:
+    def test_hosted_root_source_copy_projects_nobody_destination_identity(self) -> None:
         source_entry = runner.TreeEntrySnapshot(
             kind="file",
             size=0,
@@ -8531,14 +8547,22 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
             acl_entries=(),
         )
         nobody_uid = 65_534
+        nobody_gid = 65_534
         expected_destination_manifest = runner._destination_snapshot_manifest_sha256(
             (("payload.py", source_entry),),
             destination_owner_uid=nobody_uid,
+            destination_group_gid=nobody_gid,
         )
         self.assertEqual(
             expected_destination_manifest,
             runner._source_snapshot_manifest_sha256(
-                {"payload.py": replace(source_entry, uid=nobody_uid)}
+                {
+                    "payload.py": replace(
+                        source_entry,
+                        uid=nobody_uid,
+                        gid=nobody_gid,
+                    )
+                }
             ),
         )
         self.assertNotEqual(
@@ -8547,8 +8571,21 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 {"payload.py": replace(source_entry, uid=501)}
             ),
         )
+        self.assertNotEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {"payload.py": replace(source_entry, uid=nobody_uid, gid=0)}
+            ),
+        )
 
-        nobody_metadata = mock.Mock(st_uid=nobody_uid, st_gid=0)
+        destination_state = {"gid": 0}
+
+        def destination_metadata(_descriptor: int) -> object:
+            return mock.Mock(st_uid=nobody_uid, st_gid=destination_state["gid"])
+
+        def project_group(_descriptor: int, _uid: int, gid: int) -> None:
+            destination_state["gid"] = gid
+
         with (
             mock.patch.object(
                 runner,
@@ -8556,8 +8593,8 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 return_value=((), ()),
             ),
             mock.patch.object(runner, "_copy_bound_xattrs"),
-            mock.patch.object(runner.os, "fstat", return_value=nobody_metadata),
-            mock.patch.object(runner.os, "fchown") as chown,
+            mock.patch.object(runner.os, "fstat", side_effect=destination_metadata),
+            mock.patch.object(runner.os, "fchown", side_effect=project_group) as chown,
             mock.patch.object(runner.os, "fchmod") as chmod,
         ):
             runner._apply_copied_entry_policy(
@@ -8566,8 +8603,9 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 source_entry,
                 scan=self._snapshot_budget(),
                 destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
             )
-        chown.assert_not_called()
+        chown.assert_called_once_with(11, -1, nobody_gid)
         chmod.assert_called_once_with(11, source_entry.mode)
 
         with (
@@ -8590,6 +8628,32 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 source_entry,
                 scan=self._snapshot_budget(),
                 destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
+            )
+
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(
+                runner.os,
+                "fstat",
+                return_value=mock.Mock(st_uid=nobody_uid, st_gid=0),
+            ),
+            mock.patch.object(runner.os, "fchown"),
+            mock.patch.object(runner.os, "fchmod"),
+            self.assertRaisesRegex(RuntimeError, "expected destination group"),
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
             )
 
     def test_binding_rejects_missing_invalid_and_mismatched_expected_head(
@@ -8922,6 +8986,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     binding,
                     budget=self._snapshot_budget(observations=4),
                     destination_owner_uid=os.geteuid(),
+                    destination_group_gid=os.getegid(),
                 )
             runner._copy_bound_source_tree(
                 source,
@@ -8929,6 +8994,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 binding,
                 budget=self._snapshot_budget(observations=5),
                 destination_owner_uid=os.geteuid(),
+                destination_group_gid=os.getegid(),
             )
             self.assertEqual(
                 (root / "complete" / "nested" / "payload.py").read_text(
@@ -9002,6 +9068,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     *,
                     budget: runner.TreeSnapshotBudget,
                     destination_owner_uid: int,
+                    destination_group_gid: int,
                 ) -> None:
                     real_copy(
                         source_path,
@@ -9009,6 +9076,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                         source_receipt,
                         budget=budget,
                         destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
                     )
                     for index in range(64):
                         (source_path / f"extra-{index:02d}.ignored").write_bytes(b"")
@@ -9043,6 +9111,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     *,
                     budget: runner.TreeSnapshotBudget,
                     destination_owner_uid: int,
+                    destination_group_gid: int,
                 ) -> None:
                     real_copy(
                         source_path,
@@ -9050,6 +9119,7 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                         source_receipt,
                         budget=budget,
                         destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
                     )
                     (pathlib.Path(source_path) / "payload.txt").write_text(
                         "mutated during copy\n",
@@ -9077,7 +9147,41 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
 
 class TrustedMacGateBootstrapTests(unittest.TestCase):
     GATE_PATH = pathlib.Path(runner.__file__).with_name("trusted_mac_gate.py")
-    GATE_SOURCE = GATE_PATH.read_text(encoding="utf-8")
+    GATE_SOURCE = _captured_gate_source_for_nested_tests(GATE_PATH)
+    MANIFEST_PATH = GATE_PATH.parents[1] / "trusted_mac_gate_sources.index"
+
+    @classmethod
+    def _manifest_payload(cls, root: pathlib.Path) -> bytes:
+        records = []
+        for package in ("review_supervisor", "tests"):
+            for path in sorted(
+                (root / package).rglob("*"),
+                key=lambda item: os.fsencode(item.relative_to(root)),
+            ):
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise AssertionError(
+                        f"cannot manifest non-regular test source: {path}"
+                    )
+                payload = path.read_bytes()
+                mode = 0o100755 if metadata.st_mode & 0o111 else 0o100644
+                relative = path.relative_to(root).as_posix().encode("ascii")
+                records.append(
+                    f"{mode:o} {len(payload)} {hashlib.sha256(payload).hexdigest()}\t".encode(
+                        "ascii"
+                    )
+                    + relative
+                    + b"\n"
+                )
+        return b"trusted-mac-gate-source-manifest-v1\n" + b"".join(records)
+
+    @classmethod
+    def _write_manifest(cls, root: pathlib.Path) -> pathlib.Path:
+        manifest = root / "trusted_mac_gate_sources.index"
+        manifest.write_bytes(cls._manifest_payload(root))
+        return manifest
 
     @staticmethod
     @contextlib.contextmanager
@@ -9088,6 +9192,10 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             review_supervisor.mkdir(mode=0o700)
             tests.mkdir(mode=0o700)
             (review_supervisor / "__init__.py").write_text("", encoding="ascii")
+            (review_supervisor / "captured.py").write_text(
+                "VALUE = 'captured'\n",
+                encoding="ascii",
+            )
             (tests / "__init__.py").write_text("", encoding="ascii")
             (tests / "trusted_mac_gate.py").write_text(
                 TrustedMacGateBootstrapTests.GATE_SOURCE,
@@ -9119,6 +9227,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 payload,
                 encoding="ascii",
             )
+            TrustedMacGateBootstrapTests._write_manifest(root)
             yield root, marker
 
     @staticmethod
@@ -9127,6 +9236,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
         *arguments: str,
         isolated: bool = True,
         extra_environment: dict[str, str] | None = None,
+        manifest_digest: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = ["/usr/bin/env", "-i", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin"]
         if extra_environment:
@@ -9135,7 +9245,9 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             )
         command.append(sys.executable)
         command.extend(("-I", "-B", "-S") if isolated else ("-B", "-S"))
-        command.extend(("-", str(root), *arguments))
+        manifest = root / "trusted_mac_gate_sources.index"
+        digest = manifest_digest or hashlib.sha256(manifest.read_bytes()).hexdigest()
+        command.extend(("-", str(root), str(manifest), digest, *arguments))
         return subprocess.run(
             command,
             cwd=root,
@@ -9295,7 +9407,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             self.assertNotEqual(direct.returncode, 0)
             self.assertIn("bounded trusted stdin", direct.stderr)
 
-    def test_external_bootstrap_prevents_gate_replacement_execution(self) -> None:
+    def test_external_bootstrap_rejects_gate_replacement_before_execution(self) -> None:
         with self._synthetic_tool_root() as (root, marker):
             gate_path = root / "tests" / "trusted_mac_gate.py"
             gate_path.write_text(
@@ -9304,7 +9416,8 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 encoding="ascii",
             )
             completed = self._run_gate(root, "live")
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("does not match the exact manifest", completed.stderr)
             self.assertFalse(marker.exists())
 
             gate_path.unlink()
@@ -9313,6 +9426,75 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("contains a symlink", completed.stderr)
             self.assertFalse(marker.exists())
+
+    def test_source_manifest_binds_content_mode_inventory_and_captured_bytes(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.MANIFEST_PATH.read_bytes(),
+            self._manifest_payload(self.GATE_PATH.parents[1]),
+        )
+
+        cases = (
+            (
+                "content",
+                lambda root: (root / "review_supervisor" / "captured.py").write_text(
+                    "VALUE = 'mutated'\n", encoding="ascii"
+                ),
+                "does not match the exact manifest",
+            ),
+            (
+                "mode",
+                lambda root: (root / "review_supervisor" / "captured.py").chmod(0o755),
+                "does not match the exact manifest",
+            ),
+            (
+                "extra",
+                lambda root: (root / "tests" / "extra.txt").write_text(
+                    "extra\n", encoding="ascii"
+                ),
+                "unexpected file",
+            ),
+            (
+                "missing",
+                lambda root: (root / "review_supervisor" / "captured.py").unlink(),
+                "missing exact manifest entries",
+            ),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label), self._synthetic_tool_root() as (root, _):
+                mutate(root)
+                completed = self._run_gate(root, "live")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
+
+        with self._synthetic_tool_root() as (root, _marker):
+            completed = self._run_gate(
+                root,
+                "live",
+                manifest_digest="0" * 64,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("manifest digest mismatch", completed.stderr)
+
+        gate = self._load_gate_module()
+        with self._synthetic_tool_root() as (root, _marker):
+            manifest_path = root / "trusted_mac_gate_sources.index"
+            manifest_payload = gate._read_source_manifest(
+                manifest_path,
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            )
+            sources = gate._snapshot_sources(
+                root,
+                gate._parse_source_manifest(manifest_payload),
+            )
+            (root / "review_supervisor" / "captured.py").write_text(
+                "VALUE = 'mutated-after-snapshot'\n",
+                encoding="ascii",
+            )
+            namespace: dict[str, object] = {}
+            exec(sources["review_supervisor.captured"].code, namespace)
+            self.assertEqual(namespace["VALUE"], "captured")
 
     def test_gate_file_budget_uses_opened_size_and_link_count(self) -> None:
         gate = self._load_gate_module()
@@ -9392,6 +9574,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
         duplicate = package / "duplicate"
         duplicate.mkdir(mode=0o700)
         (duplicate / "__init__.py").write_text("", encoding="ascii")
+        TrustedMacGateBootstrapTests._write_manifest(root)
 
 
 class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
@@ -9453,10 +9636,14 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 source_manifest: str,
                 *,
                 budget: runner.TreeSnapshotBudget,
+                destination_owner_uid: int,
+                destination_group_gid: int,
             ) -> str:
                 self.assertEqual(binding, source_binding)
                 self.assertEqual(source_manifest, self.SOURCE_MANIFEST)
                 self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+                self.assertEqual(destination_owner_uid, install_container.stat().st_uid)
+                self.assertEqual(destination_group_gid, install_container.stat().st_gid)
                 destination.mkdir(mode=0o700)
                 return source_manifest
 
@@ -9466,9 +9653,13 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 binding: runner.SourceTreeBinding,
                 *,
                 budget: runner.TreeSnapshotBudget,
+                destination_owner_uid: int,
+                destination_group_gid: int,
             ) -> str:
                 self.assertEqual(binding, source_tree_binding)
                 self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+                self.assertEqual(destination_owner_uid, install_container.stat().st_uid)
+                self.assertEqual(destination_group_gid, install_container.stat().st_gid)
                 destination.mkdir(mode=0o700)
                 return binding.source_manifest_sha256
 
@@ -9533,7 +9724,6 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                     "_bind_source_tree",
                     bind_source_tree,
                 ),
-                mock.patch.object(runner, "_align_created_directory_group"),
                 mock.patch.object(
                     runner,
                     "_copy_bound_source",
@@ -10157,6 +10347,8 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
         binding.fd = descriptor
         binding.fd_close_outcome = "owned"
         binding.fd_close_error = None
+        metadata = path.stat()
+        binding.policy = mock.Mock(uid=metadata.st_uid, gid=metadata.st_gid)
 
         def close():
             if binding.fd_close_outcome == "owned":
@@ -10197,8 +10389,12 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
         _source_manifest,
         *,
         budget,
+        destination_owner_uid,
+        destination_group_gid,
     ):
         assert isinstance(budget, runner.TreeSnapshotBudget)
+        assert destination_owner_uid == install_container.stat().st_uid
+        assert destination_group_gid == install_container.stat().st_gid
         destination.mkdir(mode=0o700)
         return source_manifest
 
@@ -10304,9 +10500,6 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
                 "_source_manifest_sha256",
                 return_value=source_manifest,
             )
-        )
-        stack.enter_context(
-            mock.patch.object(runner, "_align_created_directory_group")
         )
         stack.enter_context(
             mock.patch.object(

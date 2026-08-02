@@ -448,3 +448,31 @@ superseded_by:
   affected runner passed 144/144 in 61.905 seconds, and the final host-level
   Python 3.13.12 full discovery passed 2,833/2,833 in 1008.735 seconds with six
   platform skips.
+- Fresh prior-bundle Codex review of signed head
+  `7fd02b0ec52f0e60f5fd221cbf12ae40f44e70d0` returned two P1 findings. First,
+  the outer Trusted Mac gate performed stable local reads but did not prove that
+  every compiled module and fixture matched exact committed content, Git mode,
+  and inventory. Second, the bounded installed copy projected the destination
+  UID while retaining the source GID, so hosted success depended on incidental
+  BSD group inheritance. The old head and its head-bound review and CI evidence
+  are stale and must not be reused.
+- The source gate now validates an externally digest-bound checked manifest for
+  every regular file under `review_supervisor/` and `tests/`, rejects missing,
+  extra, linked, substituted, content-mutated, or executable-mode-mutated
+  entries, captures the complete validated byte set, and only then compiles the
+  required modules. Frozen-repository callers derive both gate and manifest
+  digests from exact HEAD; installed-release callers must supply independent
+  publication evidence for the manifest digest. Nested tests consume the
+  already captured gate bytes rather than reopening a mutable candidate path.
+- Destination object identity is now projected separately from source custody:
+  the held install-container policy supplies the exact execution UID and GID,
+  every copied entry is changed and revalidated against both values, and the
+  installed manifest uses the same projection. The source receipt continues to
+  bind the original owner, object identity, and access policy. The complete
+  affected runner passed 145/145 in 54.773 seconds. The host-level deterministic
+  gate passed 839/839 in 241.339 seconds with selected-identity SHA-256
+  `7eae7f29771b98d6ddef11365c2896b25f8a216b80d168464ffe5dec8e0b73fd`.
+- The complete P1-corrected host-level Python 3.13.12 discovery passed
+  2,833/2,833 tests in 941.501 seconds with six existing platform skips;
+  repository contracts passed 105/105 in 8.167 seconds after the deterministic
+  identity was recorded.

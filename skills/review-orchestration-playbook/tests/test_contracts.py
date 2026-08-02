@@ -1822,6 +1822,10 @@ class RepositoryContractTest(unittest.TestCase):
             "os.O_DIRECTORY | os.O_NOFOLLOW",
             "trusted gate source contains a substitute",
             "trusted gate source maps duplicate module",
+            "trusted gate source manifest digest mismatch",
+            "trusted gate source contains an unexpected file",
+            "trusted gate source is missing exact manifest entries",
+            "hashlib.sha256(payload).hexdigest() != expected.sha256",
             "budget.consume_source(opened.st_size, probe_bytes=1)",
             "opened.st_nlink",
         ):
@@ -1835,13 +1839,17 @@ class RepositoryContractTest(unittest.TestCase):
             "class SourceTreeBinding:",
             "_copy_bound_source_tree(",
             "_copy_bound_tree(",
+            "destination_group_gid=destination_group_gid",
+            "destination_group_gid = install_container_binding.policy.gid",
+            "bounded source copy changed the expected destination group",
             "_bind_source_checkout(\n        source_root,\n        budget=active_budget,",
         ):
             self.assertIn(contract, readonly_install_runner)
         self.assertNotIn("shutil.copytree(", readonly_install_runner)
+        self.assertNotIn("_align_created_directory_group", readonly_install_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 838", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 839", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1965,6 +1973,8 @@ class RepositoryContractTest(unittest.TestCase):
             'TOOL_ROOT="$REPO_ROOT/$TOOL_REL"',
             "/usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin",
             'GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"',
+            'SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"',
+            'SOURCE_MANIFEST_SPEC="$HEAD_SHA:$TOOL_REL/trusted_mac_gate_sources.index"',
             'trusted_git cat-file blob "$GATE_SPEC"',
             'if ! GATE_SIZE="$(trusted_git cat-file -s "$GATE_SPEC")"; then',
             'if ! GATE_SHA256_RECORD="$(\n  trusted_git cat-file blob',
@@ -1972,11 +1982,12 @@ class RepositoryContractTest(unittest.TestCase):
             'if [[ ! "$GATE_SIZE" =~ ^[[:digit:]]+$ ]]',
             "GATE_SIZE < 1 || GATE_SIZE > 131072",
             'if [[ ! "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]',
-            '"$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live',
+            '"$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \\',
+            '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" live',
             "no-group-write/no-other-write",
             "interpreter's absolute path and digest",
             "HEAD_SHA=<full-head-sha>",
-            '"$TOOL_ROOT" readonly "$HEAD_SHA"',
+            '"$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"',
             "source_head_bound == true",
             "source_head_subtree_manifest_sha256",
             "production no-child proof",
@@ -1993,6 +2004,8 @@ class RepositoryContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         for manifest_stream_contract in (
             "stream_manifest_gate()",
+            'SOURCE_MANIFEST="$TOOL_ROOT/trusted_mac_gate_sources.index"',
+            "SOURCE_MANIFEST_SHA256=<manifest-bound-sha256>",
             '"$TRUSTED_PYTHON" -I -B -S -c',
             "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK",
             "opened.st_nlink != 1",
@@ -2183,8 +2196,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
                     '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
                     '"$isolated_python" -I -B -S - "$isolated_source"',
-                    'hosted-readonly "$isolated_root/payload/runtime" '
-                    '"$isolated_root/payload"',
+                    '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
+                    '"$isolated_root/payload/runtime" "$isolated_root/payload"',
                 ):
                     self.assertIn(requirement, readonly_job)
                 for ambient_import_contract in (
@@ -2731,13 +2744,18 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo -u nobody /bin/test -r "
                     '"$isolated_source/tests/trusted_mac_gate.py"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
-                    "gate_size=\"$(/usr/bin/sudo /usr/bin/stat -f '%z' ",
-                    'gate_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 ',
+                    'gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/'
+                    'trusted_mac_gate.py"',
+                    'gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"',
+                    'gate_manifest="$isolated_source/trusted_mac_gate_sources.index"',
+                    'gate_manifest_spec="HEAD:$REVIEW_SOURCE_RELATIVE/'
+                    'trusted_mac_gate_sources.index"',
+                    "gate_manifest_size > 1048576",
                     "gate_size > 131072",
                     '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
                     '"$isolated_python" -I -B -S - "$isolated_source"',
-                    'hosted-readonly "$isolated_root/payload/runtime" '
-                    '"$isolated_root/payload"',
+                    '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
+                    '"$isolated_root/payload/runtime" "$isolated_root/payload"',
                     '/bin/test -f "$source_review_profile"',
                     '/bin/test ! -L "$source_review_profile"',
                     'source_profile_binding="$(/usr/bin/stat -f '
@@ -3100,8 +3118,8 @@ printf '%s\n' "$trusted_uv"
                     '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"',
                     '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
                     '"$isolated_python" -I -B -S - "$isolated_source"',
-                    'hosted-readonly "$isolated_root/payload/runtime" '
-                    '"$isolated_root/payload"',
+                    '"$gate_manifest" "$gate_manifest_digest" hosted-readonly',
+                    '"$isolated_root/payload/runtime" "$isolated_root/payload"',
                     '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;',
                     'if ! bytecode_artifact="$(/usr/bin/find .',
                     "\\( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \\)",

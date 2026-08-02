@@ -422,3 +422,20 @@ superseded_by:
   runner passed 144/144 in 61.905 seconds, and the final host-level Python
   3.13.12 full discovery passed 2,833/2,833 tests in 1008.735 seconds with six
   platform skips.
+- Fresh prior-bundle Codex review of signed head
+  `7fd02b0ec52f0e60f5fd221cbf12ae40f44e70d0` found that the Trusted Mac gate
+  compiled mutable local modules without proving exact committed content and
+  that destination copies projected the execution UID but retained the source
+  GID. That head and all head-bound review or CI evidence are stale. The
+  replacement binds a complete checked source inventory to an externally
+  supplied exact-HEAD or release-publication digest before compilation, and it
+  projects both the execution UID and GID from the held install-container
+  policy while retaining source identity and access policy separately.
+- The corrected host-level deterministic gate passed 839/839 in 241.339
+  seconds on Homebrew CPython 3.13.12. The reviewed 839-test selected identity
+  has SHA-256
+  `7eae7f29771b98d6ddef11365c2896b25f8a216b80d168464ffe5dec8e0b73fd`.
+- The same P1-corrected tree passed the complete host-level Python 3.13.12
+  discovery, 2,833/2,833 tests in 941.501 seconds with six existing platform
+  skips. Repository contracts passed 105/105 in 8.167 seconds after the journal
+  identity update.

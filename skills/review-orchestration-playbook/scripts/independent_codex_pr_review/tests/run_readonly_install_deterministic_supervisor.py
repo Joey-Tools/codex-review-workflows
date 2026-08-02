@@ -52,7 +52,6 @@ from review_supervisor.recovery_cleanup import (
 from review_supervisor.secureio import (
     directory_identities_match,
     identity_from_stat,
-    validate_directory_policy_fd,
 )
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
@@ -1823,6 +1822,7 @@ def _snapshot_manifest_sha256(
     snapshot: dict[str, TreeEntrySnapshot],
     *,
     owner_uid_override: int | None,
+    group_gid_override: int | None,
 ) -> str:
     records = []
     for path, entry in sorted(snapshot.items()):
@@ -1832,7 +1832,7 @@ def _snapshot_manifest_sha256(
                 entry.kind,
                 entry.size,
                 entry.uid if owner_uid_override is None else owner_uid_override,
-                entry.gid,
+                entry.gid if group_gid_override is None else group_gid_override,
                 entry.mode,
                 entry.flags,
                 entry.digest,
@@ -1849,17 +1849,23 @@ def _snapshot_manifest_sha256(
 def _source_snapshot_manifest_sha256(
     snapshot: dict[str, TreeEntrySnapshot],
 ) -> str:
-    return _snapshot_manifest_sha256(snapshot, owner_uid_override=None)
+    return _snapshot_manifest_sha256(
+        snapshot,
+        owner_uid_override=None,
+        group_gid_override=None,
+    )
 
 
 def _destination_snapshot_manifest_sha256(
     source_entries: tuple[tuple[str, TreeEntrySnapshot], ...],
     *,
     destination_owner_uid: int,
+    destination_group_gid: int,
 ) -> str:
     return _snapshot_manifest_sha256(
         dict(source_entries),
         owner_uid_override=destination_owner_uid,
+        group_gid_override=destination_group_gid,
     )
 
 
@@ -1869,20 +1875,6 @@ def _source_manifest_sha256(
     budget: TreeSnapshotBudget | None = None,
 ) -> str:
     return _source_snapshot_manifest_sha256(_tree_snapshot(root, budget=budget))
-
-
-def _align_created_directory_group(
-    binding: _DirectoryParentBinding,
-    expected_gid: int,
-) -> None:
-    binding.revalidate()
-    os.fchown(binding.fd, -1, expected_gid)
-    binding.policy = validate_directory_policy_fd(
-        binding.fd,
-        binding.path,
-        private=True,
-    )
-    binding.revalidate()
 
 
 def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
@@ -2380,6 +2372,21 @@ def _require_copied_destination_owner(
     return destination_metadata
 
 
+def _require_copied_destination_identity(
+    destination_descriptor: int,
+    *,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> os.stat_result:
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
+    if destination_metadata.st_gid != destination_group_gid:
+        raise RuntimeError("bounded source copy changed the expected destination group")
+    return destination_metadata
+
+
 def _apply_copied_entry_policy(
     source_descriptor: int,
     destination_descriptor: int,
@@ -2387,6 +2394,7 @@ def _apply_copied_entry_policy(
     *,
     scan: TreeSnapshotScan,
     destination_owner_uid: int,
+    destination_group_gid: int,
 ) -> None:
     source_policy = _stable_access_policy_snapshot(
         source_descriptor,
@@ -2410,16 +2418,17 @@ def _apply_copied_entry_policy(
         destination_descriptor,
         destination_owner_uid=destination_owner_uid,
     )
-    if destination_metadata.st_gid != expected.gid:
-        os.fchown(destination_descriptor, -1, expected.gid)
+    if destination_metadata.st_gid != destination_group_gid:
+        os.fchown(destination_descriptor, -1, destination_group_gid)
     os.fchmod(destination_descriptor, expected.mode)
     if expected.flags:
         if not hasattr(os, "fchflags"):
             raise RuntimeError("bounded source copy cannot apply file flags")
         os.fchflags(destination_descriptor, expected.flags)
-    _require_copied_destination_owner(
+    _require_copied_destination_identity(
         destination_descriptor,
         destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
     )
 
 
@@ -2430,6 +2439,7 @@ def _copy_bound_regular_file(
     *,
     scan: TreeSnapshotScan,
     destination_owner_uid: int,
+    destination_group_gid: int,
 ) -> None:
     if expected.kind != "file" or expected.size is None or expected.digest is None:
         raise RuntimeError("bounded source file receipt is malformed")
@@ -2477,6 +2487,7 @@ def _copy_bound_regular_file(
             expected,
             scan=scan,
             destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
         )
     finally:
         os.close(destination_descriptor)
@@ -2489,6 +2500,7 @@ def _copy_bound_source_tree(
     *,
     budget: TreeSnapshotBudget,
     destination_owner_uid: int,
+    destination_group_gid: int,
 ) -> None:
     entries = dict(source_binding.source_entries)
     root_entry = entries.get(".")
@@ -2554,6 +2566,7 @@ def _copy_bound_source_tree(
                     entry,
                     scan=scan,
                     destination_owner_uid=destination_owner_uid,
+                    destination_group_gid=destination_group_gid,
                 )
         for relative, entry in sorted(
             ((".", root_entry), *directories),
@@ -2590,6 +2603,7 @@ def _copy_bound_source_tree(
                         entry,
                         scan=scan,
                         destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
                     )
                 finally:
                     os.close(destination_descriptor)
@@ -2603,14 +2617,22 @@ def _copy_bound_tree(
     source_binding: SourceTreeBinding,
     *,
     budget: TreeSnapshotBudget,
+    destination_owner_uid: int | None = None,
+    destination_group_gid: int | None = None,
 ) -> str:
-    destination_owner_uid = os.geteuid()
+    destination_owner_uid = (
+        os.geteuid() if destination_owner_uid is None else destination_owner_uid
+    )
+    destination_group_gid = (
+        os.getegid() if destination_group_gid is None else destination_group_gid
+    )
     _copy_bound_source_tree(
         source_root,
         installed_root,
         source_binding,
         budget=budget,
         destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
     )
     installed_manifest = _source_manifest_sha256(
         installed_root,
@@ -2626,6 +2648,7 @@ def _copy_bound_tree(
         != _destination_snapshot_manifest_sha256(
             source_binding.source_entries,
             destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
         )
     ):
         raise RuntimeError(
@@ -2641,15 +2664,23 @@ def _copy_bound_source(
     source_manifest_before: str,
     *,
     budget: TreeSnapshotBudget | None = None,
+    destination_owner_uid: int | None = None,
+    destination_group_gid: int | None = None,
 ) -> str:
     active_budget = budget or TreeSnapshotBudget.create()
-    destination_owner_uid = os.geteuid()
+    destination_owner_uid = (
+        os.geteuid() if destination_owner_uid is None else destination_owner_uid
+    )
+    destination_group_gid = (
+        os.getegid() if destination_group_gid is None else destination_group_gid
+    )
     _copy_bound_source_tree(
         source_root,
         installed_root,
         source_binding,
         budget=active_budget,
         destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
     )
     installed_manifest = _source_manifest_sha256(
         installed_root,
@@ -2667,6 +2698,7 @@ def _copy_bound_source(
         != _destination_snapshot_manifest_sha256(
             source_binding.source_entries,
             destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
         )
     ):
         raise RuntimeError(
@@ -4856,7 +4888,6 @@ def _run_main(
     source_manifest_sha256: str | None = None
     trusted_source_requested = bool(os.environ.get(EXPECTED_HEAD_ENV))
     source_manifest_before: str | None = None
-    source_gid: int | None = None
     snapshot_budget = TreeSnapshotBudget.create()
     stage = "source-head-binding" if trusted_source_requested else "install-container"
     try:
@@ -4872,7 +4903,6 @@ def _run_main(
                 budget=snapshot_budget,
             )
         source_manifest_before = source_tree_binding.source_manifest_sha256
-        source_gid = source_tree_binding.source_root_gid
         stage = "install-container"
         install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
@@ -4884,9 +4914,8 @@ def _run_main(
             install_container_binding
         )
         install_container = install_container_binding.path
-        if source_gid is not None:
-            stage = "install-container-group"
-            _align_created_directory_group(install_container_binding, source_gid)
+        destination_owner_uid = install_container_binding.policy.uid
+        destination_group_gid = install_container_binding.policy.gid
         stage = "runtime-parent"
         runtime_parent_binding = _create_bound_owned_private_directory(
             _private_runtime_parent(),
@@ -4906,6 +4935,8 @@ def _run_main(
                 source_binding,
                 source_manifest_before,
                 budget=snapshot_budget,
+                destination_owner_uid=destination_owner_uid,
+                destination_group_gid=destination_group_gid,
             )
         else:
             assert isinstance(source_tree_binding, SourceTreeBinding)
@@ -4914,6 +4945,8 @@ def _run_main(
                 installed_root,
                 source_tree_binding,
                 budget=snapshot_budget,
+                destination_owner_uid=destination_owner_uid,
+                destination_group_gid=destination_group_gid,
             )
         install_container_binding.revalidate()
         source_head_bound = source_binding is not None

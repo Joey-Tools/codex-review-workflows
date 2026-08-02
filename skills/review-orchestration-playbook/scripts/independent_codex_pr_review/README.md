@@ -352,6 +352,8 @@ TOOL_ROOT="$PWD"
 HEAD_SHA=<full-head-sha>
 GATE_SOURCE="$TOOL_ROOT/tests/trusted_mac_gate.py"
 GATE_SOURCE_SHA256=<manifest-bound-sha256>
+SOURCE_MANIFEST="$TOOL_ROOT/trusted_mac_gate_sources.index"
+SOURCE_MANIFEST_SHA256=<manifest-bound-sha256>
 set -o pipefail
 stream_manifest_gate() {
   /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
@@ -412,9 +414,11 @@ while view:
 ' "$GATE_SOURCE" "$GATE_SOURCE_SHA256"
 }
 stream_manifest_gate | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
-  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+  "$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" live
 stream_manifest_gate | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
-  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" readonly "$HEAD_SHA"
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+  "$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
@@ -429,9 +433,11 @@ isolated source、`nobody` child、受监管 Python runtime 和完整 determinis
 131072-byte stdin 执行。Installed-release 模式由 parent-validated Python 以 no-follow
 descriptor 只读取一次，验证同一内存 byte sequence 的 manifest digest 后再流入 gate；
 路径替换、增长、链接、FIFO 或 access-policy 变化均失败关闭。直接执行 candidate gate path
-会失败。清空环境后只从
-descriptor-bound、双重读取且有 entry/path/source-byte
-上限的 `review_supervisor/**/*.py` 与 `tests/**/*.py` 映射加载模块；symlink、
+会失败。外部发布证据还必须分别绑定 `trusted_mac_gate_sources.index` 的 SHA-256；
+安装树内的自声明摘要不能作为信任根。清空环境后，gate 先将
+`review_supervisor/` 与 `tests/` 的完整 regular-file inventory 和 checked manifest 中的
+相对路径、Git mode、长度及 SHA-256 逐项比较，再从 descriptor-bound、双重读取且有
+entry/path/source-byte 上限的捕获 bytes 映射加载模块；missing/extra entry、symlink、
 `__pycache__`、`.pyc`/`.pyo`、native substitute 和重复 module mapping 均失败关闭。
 十三项 live 测试必须全部执行并通过，随后 exact-head read-only install runner 必须返回完整
 成功的 structured summary。该 Trusted Mac summary 只有在

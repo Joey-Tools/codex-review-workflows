@@ -489,6 +489,16 @@ jobs:
           }
           verify_runtime_custody post-install
           checkout_root="$(pwd -P)"
+          trusted_checkout_git() {
+            /usr/bin/env -i \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              HOME=/ \
+              LANG=C \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              /usr/bin/git --no-replace-objects -C "$checkout_root" "$@"
+          }
           source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"
           source_review_root_physical="$(cd "$source_review_root" && pwd -P)"
           if [[ "$source_review_root_physical" != "$source_review_root" ]] \
@@ -551,16 +561,35 @@ jobs:
           /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
           /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
           /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"
-          gate_size="$(/usr/bin/sudo /usr/bin/stat -f '%z' "$isolated_source/tests/trusted_mac_gate.py")"
-          gate_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_source/tests/trusted_mac_gate.py")"
+          gate_spec="HEAD:$REVIEW_SOURCE_RELATIVE/tests/trusted_mac_gate.py"
+          gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"
+          gate_digest="$(trusted_checkout_git cat-file blob "$gate_spec" | /usr/bin/shasum -a 256)"
           gate_digest="${gate_digest%% *}"
           if [[ ! "$gate_size" =~ ^[[:digit:]]+$ ]] \
             || (( gate_size < 1 || gate_size > 131072 )) \
-            || [[ ! "$gate_digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+            || [[ ! "$gate_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || ! trusted_checkout_git cat-file blob "$gate_spec" \
+              | /usr/bin/sudo /usr/bin/cmp -s - "$isolated_source/tests/trusted_mac_gate.py"; then
             echo "::error::Trusted gate bootstrap source is not bounded; retained at $isolated_root"
             exit 1
           fi
           echo "Trusted gate bootstrap: bytes=$gate_size sha256=$gate_digest"
+          gate_manifest="$isolated_source/trusted_mac_gate_sources.index"
+          gate_manifest_spec="HEAD:$REVIEW_SOURCE_RELATIVE/trusted_mac_gate_sources.index"
+          gate_manifest_size="$(trusted_checkout_git cat-file -s "$gate_manifest_spec")"
+          gate_manifest_digest="$(trusted_checkout_git cat-file blob "$gate_manifest_spec" | /usr/bin/shasum -a 256)"
+          gate_manifest_digest="${gate_manifest_digest%% *}"
+          if [[ ! "$gate_manifest_size" =~ ^[[:digit:]]+$ ]] \
+            || (( gate_manifest_size < 1 || gate_manifest_size > 1048576 )) \
+            || [[ ! "$gate_manifest_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
+            || ! trusted_checkout_git cat-file blob "$gate_manifest_spec" \
+              | /usr/bin/sudo /usr/bin/cmp -s - "$gate_manifest"; then
+            echo "::error::Trusted gate source manifest is not exact HEAD; retained at $isolated_root"
+            exit 1
+          fi
+          echo "Trusted gate source manifest: bytes=$gate_manifest_size sha256=$gate_manifest_digest"
           /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
           isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
           review_profile="$isolated_root/readonly_child_isolation.sb"
@@ -633,6 +662,8 @@ jobs:
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
             || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
@@ -655,7 +686,8 @@ jobs:
               LC_ALL=C \
               PATH=/usr/bin:/bin \
               "$isolated_python" -I -B -S - "$isolated_source" \
-              hosted-readonly "$isolated_root/payload/runtime" "$isolated_root/payload" \
+              "$gate_manifest" "$gate_manifest_digest" hosted-readonly \
+              "$isolated_root/payload/runtime" "$isolated_root/payload" \
             | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
           verify_runtime_custody postrun
           source_profile_postrun_binding=""
@@ -683,6 +715,8 @@ jobs:
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$gate_manifest" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$gate_manifest" \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
             || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \

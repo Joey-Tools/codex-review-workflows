@@ -81,10 +81,12 @@ policy. A convenience symlink through a standard group-writable Homebrew
 the source-only gate by absolute path. The gate starts under an empty
 environment with isolated, site-disabled, bytecode-disabled Python. The gate
 itself is streamed from the frozen HEAD blob through bounded stdin, so no
-candidate worktree path executes before that binding. It then snapshots only
-bounded regular `.py` source from `review_supervisor/` and `tests/`, and rejects
-symlinks, bytecode/native substitutes, and duplicate module mappings before
-importing the selected runner:
+candidate worktree path executes before that binding. A second exact-HEAD blob
+binds a closed source manifest containing every regular file's relative path,
+Git mode, byte length, and SHA-256 under `review_supervisor/` and `tests/`.
+The gate snapshots the complete inventory, rejects missing or extra entries,
+symlinks, bytecode/native substitutes, and duplicate module mappings, and only
+then compiles the captured matching bytes:
 
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
@@ -93,6 +95,8 @@ TOOL_REL=skills/review-orchestration-playbook/scripts/independent_codex_pr_revie
 TOOL_ROOT="$REPO_ROOT/$TOOL_REL"
 HEAD_SHA=<full-head-sha>
 GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"
+SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"
+SOURCE_MANIFEST_SPEC="$HEAD_SHA:$TOOL_REL/trusted_mac_gate_sources.index"
 trusted_git() {
   /usr/bin/env -i GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin \
@@ -119,16 +123,37 @@ if [[ ! "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
   printf 'invalid trusted gate digest\n' >&2
   exit 1
 fi
+if ! SOURCE_MANIFEST_SIZE="$(trusted_git cat-file -s "$SOURCE_MANIFEST_SPEC")"; then
+  printf 'unable to read trusted source manifest size\n' >&2
+  exit 1
+fi
+if ! SOURCE_MANIFEST_SHA256_RECORD="$(
+  trusted_git cat-file blob "$SOURCE_MANIFEST_SPEC" | /usr/bin/shasum -a 256
+)"; then
+  printf 'unable to hash trusted source manifest blob\n' >&2
+  exit 1
+fi
+SOURCE_MANIFEST_SHA256="${SOURCE_MANIFEST_SHA256_RECORD%% *}"
+if [[ ! "$SOURCE_MANIFEST_SIZE" =~ ^[[:digit:]]+$ ]] \
+  || (( SOURCE_MANIFEST_SIZE < 1 || SOURCE_MANIFEST_SIZE > 1048576 )) \
+  || [[ ! "$SOURCE_MANIFEST_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || ! trusted_git cat-file blob "$SOURCE_MANIFEST_SPEC" \
+    | /usr/bin/cmp -s - "$SOURCE_MANIFEST_PATH"; then
+  printf 'trusted source manifest is not the exact HEAD blob\n' >&2
+  exit 1
+fi
 trusted_git cat-file blob "$GATE_SPEC" \
   | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
-      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+      "$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" live
 trusted_git cat-file blob "$GATE_SPEC" \
   | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
-      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" readonly "$HEAD_SHA"
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+      "$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA"
 ```
 
 Record the interpreter's absolute path and digest, exact `head_sha`, gate blob
-size, and gate SHA-256; record
+size and SHA-256, and source-manifest blob size and SHA-256; record
 the live runner's thirteen tests, zero skips, and terminal result, followed by the
 read-only install runner's complete structured summary. Accept that summary
 only when all of these predicates hold:

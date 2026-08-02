@@ -40,7 +40,8 @@ superseded_by:
   root-owned staged source uses a bounded descriptor manifest and copy rather
   than an unbounded recursive copy. The source receipt retains root ownership
   and source access policy, while the installed tree independently requires the
-  exact nobody execution UID and an owner-projected expected manifest.
+  exact nobody execution UID and GID plus an execution-identity-projected
+  expected manifest.
 
 ## Next Steps
 
@@ -95,3 +96,17 @@ superseded_by:
   echoing the sentinel. The final audit returned `No findings.`; contracts
   passed 105/105 and full Python 3.13.12 discovery passed 2,833/2,833 in
   1008.735 seconds with six platform skips.
+- Fresh prior-bundle Codex review of the resulting signed head found two
+  additional protected-property gaps. The outer Trusted Mac gate did not bind
+  every compiled module and fixture to exact committed content, Git mode, and
+  inventory, while the hosted root-to-nobody copy still depended on ambient
+  filesystem group inheritance. The replacement uses an externally
+  digest-bound checked source manifest before any compile or execution and
+  derives both destination UID and GID from the held install-container policy.
+  Source owner and access-policy evidence remain independent. The affected
+  runner passed 145/145 in 54.773 seconds, and the host-level deterministic
+  selection passed 839/839 in 241.339 seconds with selected-identity SHA-256
+  `7eae7f29771b98d6ddef11365c2896b25f8a216b80d168464ffe5dec8e0b73fd`.
+- The complete P1-corrected host-level Python 3.13.12 discovery passed
+  2,833/2,833 tests in 941.501 seconds with six existing platform skips;
+  repository contracts passed 105/105 in 8.167 seconds.
