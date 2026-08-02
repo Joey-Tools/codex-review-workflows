@@ -7706,6 +7706,7 @@ class RepositoryContractTest(unittest.TestCase):
             "active_top_level_findings": "active-top-level-finding",
             "unresolved_thread_findings": "unresolved-thread-finding",
         }
+        unordered_invalid_review_state_marker = object()
 
         def precharged_artifact_wrapper_arrays(
             record: object,
@@ -8057,12 +8058,18 @@ class RepositoryContractTest(unittest.TestCase):
             finding_ancestry: dict[str, int] | None = None,
             artifact_validation_context: dict[str, object] | None = None,
             inventory_validation_context: dict[str, object] | None = None,
-        ) -> tuple[int, int] | None:
+            _return_unordered_invalid_state_marker: bool = False,
+        ) -> tuple[int, int] | object | None:
             context = artifact_validation_context
             if context is None:
                 context = new_artifact_validation_context()
             context_parts = artifact_validation_context_parts(context)
-            if context is None or context_parts is None or type(record) is not dict:
+            if (
+                context is None
+                or context_parts is None
+                or type(record) is not dict
+                or type(_return_unordered_invalid_state_marker) is not bool
+            ):
                 return None
             artifact_arrays = precharged_artifact_wrapper_arrays(
                 record,
@@ -8193,6 +8200,14 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                         return (server_time, stable_artifact_id)
                 if invalid_review_state_blockers:
+                    if len(invalid_review_state_blockers) > 1:
+                        if record.get("candidate_basis") is not None:
+                            return None
+                        return (
+                            unordered_invalid_review_state_marker
+                            if _return_unordered_invalid_state_marker
+                            else None
+                        )
                     (
                         blocker_time,
                         blocker_id,
@@ -8200,10 +8215,7 @@ class RepositoryContractTest(unittest.TestCase):
                         _,
                         _,
                         _,
-                    ) = max(
-                        invalid_review_state_blockers,
-                        key=lambda item: (item[4], item[1]),
-                    )
+                    ) = invalid_review_state_blockers[0]
                     expected_basis = {
                         "kind": blocker_kind,
                         "server_time": blocker_time,
@@ -8595,7 +8607,9 @@ class RepositoryContractTest(unittest.TestCase):
             basis_kind_override: str | None = None,
         ) -> dict[str, object] | None:
             basis = candidate.get("candidate_basis")
-            if ordering_key is None or not isinstance(basis, dict):
+            if ordering_key is None or (
+                basis_kind_override is None and not isinstance(basis, dict)
+            ):
                 return None
             basis_kind = (
                 basis_kind_override
@@ -8754,26 +8768,44 @@ class RepositoryContractTest(unittest.TestCase):
             reactions = candidate.get("reactions")
             evidence_state = candidate.get("evidence_state")
             candidate_basis = candidate.get("candidate_basis")
-            if (
-                context is None
-                or candidate_order_basis(
+            ordering_state = candidate_order_basis(
+                candidate,
+                prefer_unresolved_thread_blocker=prefer_unresolved_thread_blocker,
+                finding_ancestry=finding_ancestry,
+                artifact_validation_context=context,
+                inventory_validation_context=inventory_validation_context,
+                _return_unordered_invalid_state_marker=True,
+            )
+            unordered_invalid_review_state = (
+                candidate_basis is None
+                and candidate_order_basis(
                     candidate,
-                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     finding_ancestry=finding_ancestry,
                     artifact_validation_context=context,
                     inventory_validation_context=inventory_validation_context,
+                    _return_unordered_invalid_state_marker=True,
                 )
-                is None
+                is unordered_invalid_review_state_marker
+            )
+            if (
+                context is None
+                or (ordering_state is None and not unordered_invalid_review_state)
                 or candidate_scope_key is None
                 or not isinstance(lifecycle, dict)
                 or not isinstance(requests, list)
                 or not isinstance(reactions, list)
                 or not isinstance(evidence_state, dict)
-                or not isinstance(candidate_basis, dict)
+                or (
+                    not isinstance(candidate_basis, dict)
+                    and not unordered_invalid_review_state
+                )
             ):
                 return None
 
-            reaction_authority = candidate_basis.get("kind") == "reaction"
+            reaction_authority = (
+                isinstance(candidate_basis, dict)
+                and candidate_basis.get("kind") == "reaction"
+            )
             audited_requests = requests if reaction_authority else []
             audited_reactions = reactions if reaction_authority else []
 
@@ -10354,7 +10386,9 @@ class RepositoryContractTest(unittest.TestCase):
                     },
                     "state": lifecycle.get("state"),
                     "merged": lifecycle.get("merged"),
-                    "merged_at": lifecycle.get("merged_at"),
+                    "merged_at": _format_github_rfc3339_seconds(
+                        lifecycle.get("merged_at")
+                    ),
                     "merge_commit_sha": "f" * 40,
                     "node_id": f"PR_{pr}{node_id_suffixes.get(pr, '')}",
                 }
@@ -11460,6 +11494,17 @@ class RepositoryContractTest(unittest.TestCase):
                 pull_head = pull_record.get("head")
                 base_oid = base.get("sha") if isinstance(base, dict) else None
                 head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                raw_merged_at = pull_record.get("merged_at")
+                merged_at = (
+                    None
+                    if raw_merged_at is None
+                    else _parse_github_rfc3339_seconds(raw_merged_at)
+                )
+                normalized_lifecycle = {
+                    "state": pull_record.get("state"),
+                    "merged": pull_record.get("merged"),
+                    "merged_at": merged_at,
+                }
                 discovered_scope = discovered_pulls[pr]
                 if (
                     type(pull_record.get("number")) is not int
@@ -11472,14 +11517,11 @@ class RepositoryContractTest(unittest.TestCase):
                     or not isinstance(head, str)
                     or re.fullmatch(r"[0-9a-f]{40}", head) is None
                     or (discovered_scope is not None and head != discovered_scope[1])
-                    or pull_record.get("state") not in {"open", "closed"}
-                    or type(pull_record.get("merged")) is not bool
-                    or (
-                        pull_record.get("state") == "open"
-                        and (
-                            pull_record.get("merged") is not False
-                            or pull_record.get("merged_at") is not None
-                        )
+                    or "merged_at" not in pull_record
+                    or (raw_merged_at is not None and merged_at is None)
+                    or not lifecycle_is_typed(
+                        {"lifecycle": normalized_lifecycle},
+                        require_open=False,
                     )
                 ):
                     return None
@@ -12375,11 +12417,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "base_oid": base_oid,
                         "merge_base": merge_base,
                         "head": head,
-                        "lifecycle": {
-                            "state": clone(pull_record.get("state")),
-                            "merged": clone(pull_record.get("merged")),
-                            "merged_at": clone(pull_record.get("merged_at")),
-                        },
+                        "lifecycle": clone(normalized_lifecycle),
                         "request_times": dict(request_times),
                         "request_records": {
                             request_id: clone(request_record)
@@ -12456,14 +12494,11 @@ class RepositoryContractTest(unittest.TestCase):
                     bool(invalid_review_state_blockers),
                 )
             if invalid_review_state_blockers:
+                if len(invalid_review_state_blockers) > 1:
+                    return (True, None, True)
                 return (
                     True,
-                    tuple(
-                        max(
-                            invalid_review_state_blockers,
-                            key=lambda item: (item[2], item[1]),
-                        )
-                    ),
+                    tuple(invalid_review_state_blockers[0]),
                     True,
                 )
             latest_time = max(item[0] for item in artifact_bases)
@@ -12786,7 +12821,7 @@ class RepositoryContractTest(unittest.TestCase):
                             <= history_as_of_server_time
                         ):
                             category = "required-terminal"
-                    else:
+                    elif not has_invalid_review_state_blocker:
                         reaction_ok, selected_reaction = select_raw_reaction(raw_scope)
                         if not reaction_ok:
                             return None
@@ -13025,6 +13060,9 @@ class RepositoryContractTest(unittest.TestCase):
                         "native_identity": [selected[2], selected[1]],
                         "source_record_sha256": selected[4],
                     }
+                elif has_invalid_review_state_blocker:
+                    source_ordering_key = None
+                    source_evidence = None
                 else:
                     if not current_provider_reactions:
                         if any(
@@ -13210,7 +13248,8 @@ class RepositoryContractTest(unittest.TestCase):
                     }
                 is_current_scope = parsed_scope == current_scope_key
                 is_in_history_window = (
-                    history_start_exclusive
+                    source_ordering_key is not None
+                    and history_start_exclusive
                     < int(source_ordering_key[0])
                     <= history_as_of_server_time
                 )
@@ -15220,6 +15259,17 @@ class RepositoryContractTest(unittest.TestCase):
                 finding_ancestry=finding_ancestry,
                 artifact_validation_context=artifact_context,
                 inventory_validation_context=inventory_validation_context,
+                _return_unordered_invalid_state_marker=True,
+            )
+            unordered_invalid_review_state = (
+                candidate_order_basis(
+                    authority_record,
+                    finding_ancestry=finding_ancestry,
+                    artifact_validation_context=artifact_context,
+                    inventory_validation_context=inventory_validation_context,
+                    _return_unordered_invalid_state_marker=True,
+                )
+                is unordered_invalid_review_state_marker
             )
             evidence_state = authority_record.get("evidence_state")
             selected_kind_override = (
@@ -15229,12 +15279,16 @@ class RepositoryContractTest(unittest.TestCase):
                 and bool(evidence_state.get("unresolved_thread_findings"))
                 else None
             )
-            source_evidence = candidate_source_evidence(
-                authority_record,
-                ordering_key,
-                artifact_validation_context=artifact_context,
-                inventory_validation_context=inventory_validation_context,
-                basis_kind_override=selected_kind_override,
+            source_evidence = (
+                None
+                if ordering_key is unordered_invalid_review_state_marker
+                else candidate_source_evidence(
+                    authority_record,
+                    ordering_key,
+                    artifact_validation_context=artifact_context,
+                    inventory_validation_context=inventory_validation_context,
+                    basis_kind_override=selected_kind_override,
+                )
             )
             normalized_audit = candidate_scope_authority_audit(
                 authority_record,
@@ -15249,9 +15303,13 @@ class RepositoryContractTest(unittest.TestCase):
                 raw_authority.get("scope") if isinstance(raw_authority, dict) else None
             )
             lifecycle = authority_record.get("lifecycle")
+            uses_unordered_invalid_basis = (
+                ordering_key is unordered_invalid_review_state_marker
+            )
             if (
                 ordering_key is None
-                or source_evidence is None
+                or (uses_unordered_invalid_basis and not unordered_invalid_review_state)
+                or (not uses_unordered_invalid_basis and source_evidence is None)
                 or normalized_audit is None
                 or record_scope is None
                 or not isinstance(raw_scope, dict)
@@ -15384,7 +15442,9 @@ class RepositoryContractTest(unittest.TestCase):
                 expected_authority["provider_reactions"] = expected_provider_reactions
             return {
                 "scope_key": list(record_scope),
-                "source_ordering_key": list(ordering_key),
+                "source_ordering_key": (
+                    None if uses_unordered_invalid_basis else list(ordering_key)
+                ),
                 "source_evidence": source_evidence,
                 "current_authority_projection": expected_authority,
             }
@@ -17418,6 +17478,191 @@ class RepositoryContractTest(unittest.TestCase):
             selected_request_id=10,
             selected_reaction_id=100,
             merge_base=current_merge_base,
+        )
+
+        historical_merged_time = history_as_of_server_time - 100
+        historical_merged_scope = confirmed_nonprovider_scope(88)
+        historical_merged_scope["lifecycle"] = {
+            "state": "closed",
+            "merged": True,
+            "merged_at": historical_merged_time,
+        }
+        historical_closed_scope = confirmed_nonprovider_scope(89)
+        historical_closed_scope["lifecycle"] = {
+            "state": "closed",
+            "merged": False,
+            "merged_at": None,
+        }
+        historical_lifecycle_history = history(
+            samples,
+            confirmed_noncandidate_scopes=[
+                historical_merged_scope,
+                historical_closed_scope,
+            ],
+        )
+        historical_lifecycle_inventory = historical_lifecycle_history[
+            "initial_inventory"
+        ]
+        historical_lifecycle_transcript = historical_lifecycle_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        historical_lifecycle_receipts = historical_lifecycle_inventory[
+            "request_scope_receipts"
+        ]
+
+        def pull_detail_page_for_pr(
+            transcript: dict[str, object],
+            pull_number: int,
+        ) -> dict[str, object]:
+            scopes = transcript.get("scopes")
+            assert isinstance(scopes, list)
+            scope_transcript = next(
+                scope
+                for scope in scopes
+                if isinstance(scope, dict) and scope.get("pull_number") == pull_number
+            )
+            fetches = scope_transcript.get("fetches")
+            assert isinstance(fetches, list)
+            pull_fetch = next(
+                fetch
+                for fetch in fetches
+                if isinstance(fetch, dict) and fetch.get("kind") == "pull_requests"
+            )
+            pages = pull_fetch.get("pages")
+            assert isinstance(pages, list) and len(pages) == 1
+            page = pages[0]
+            assert isinstance(page, dict)
+            return page
+
+        merged_pull_page = pull_detail_page_for_pr(
+            historical_lifecycle_transcript,
+            88,
+        )
+        merged_pull_body = strict_json_loads(merged_pull_page["body_utf8"])
+        self.assertIsInstance(merged_pull_body, dict)
+        assert isinstance(merged_pull_body, dict)
+        self.assertEqual(
+            merged_pull_body["merged_at"],
+            _format_github_rfc3339_seconds(historical_merged_time),
+        )
+        self.assertIsInstance(merged_pull_body["merged_at"], str)
+
+        historical_lifecycle_projection = parse_discovery_endpoint_transcript(
+            historical_lifecycle_transcript,
+            request_scope_receipts=historical_lifecycle_receipts,
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(historical_lifecycle_projection)
+        assert isinstance(historical_lifecycle_projection, dict)
+        merged_scope_audit = next(
+            audit
+            for audit in historical_lifecycle_projection["scope_authority_audit"]
+            if audit["scope_key"][1] == 88
+        )
+        closed_scope_audit = next(
+            audit
+            for audit in historical_lifecycle_projection["scope_authority_audit"]
+            if audit["scope_key"][1] == 89
+        )
+        self.assertEqual(
+            merged_scope_audit["lifecycle"],
+            {
+                "state": "closed",
+                "merged": True,
+                "merged_at": historical_merged_time,
+            },
+        )
+        self.assertEqual(
+            closed_scope_audit["lifecycle"],
+            {"state": "closed", "merged": False, "merged_at": None},
+        )
+        historical_lifecycle_result = validate_history_universe_result(
+            historical_lifecycle_history
+        )
+        self.assertIsNotNone(historical_lifecycle_result)
+        assert isinstance(historical_lifecycle_result, dict)
+        self.assertEqual(historical_lifecycle_result["status"], "complete")
+
+        malformed_merged_at_values: dict[str, object] = {
+            "numeric-epoch": historical_merged_time,
+            "boolean": True,
+            "floating-point": float(historical_merged_time),
+            "offset": "1970-02-04T17:18:20+00:00",
+            "fractional": "1970-02-04T17:18:20.000Z",
+            "invalid-date": "1970-02-30T17:18:20Z",
+        }
+        invalid_raw_lifecycle_cases: dict[str, tuple[str, bool, object]] = {
+            **{
+                f"merged-{case_name}": ("closed", True, raw_value)
+                for case_name, raw_value in malformed_merged_at_values.items()
+            },
+            "merged-null": ("closed", True, None),
+            "merged-future": (
+                "closed",
+                True,
+                _format_github_rfc3339_seconds(history_as_of_server_time + 1),
+            ),
+            "closed-unmerged-with-time": (
+                "closed",
+                False,
+                _format_github_rfc3339_seconds(historical_merged_time),
+            ),
+            "open-with-time": (
+                "open",
+                False,
+                _format_github_rfc3339_seconds(historical_merged_time),
+            ),
+            "open-merged": (
+                "open",
+                True,
+                _format_github_rfc3339_seconds(historical_merged_time),
+            ),
+        }
+        for case_name, (
+            raw_state,
+            raw_merged,
+            raw_merged_at,
+        ) in invalid_raw_lifecycle_cases.items():
+            invalid_transcript = clone(historical_lifecycle_transcript)
+            assert isinstance(invalid_transcript, dict)
+            invalid_page = pull_detail_page_for_pr(invalid_transcript, 88)
+            invalid_pull_body = strict_json_loads(invalid_page["body_utf8"])
+            assert isinstance(invalid_pull_body, dict)
+            invalid_pull_body["state"] = raw_state
+            invalid_pull_body["merged"] = raw_merged
+            invalid_pull_body["merged_at"] = raw_merged_at
+            replace_raw_json_body(
+                invalid_page,
+                canonical_raw_body(invalid_pull_body),
+            )
+            with self.subTest(raw_pull_lifecycle=case_name):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_transcript,
+                        request_scope_receipts=historical_lifecycle_receipts,
+                        provider_declaration=declaration,
+                    )
+                )
+
+        missing_merged_at_transcript = clone(historical_lifecycle_transcript)
+        assert isinstance(missing_merged_at_transcript, dict)
+        missing_merged_at_page = pull_detail_page_for_pr(
+            missing_merged_at_transcript,
+            89,
+        )
+        missing_merged_at_body = strict_json_loads(missing_merged_at_page["body_utf8"])
+        assert isinstance(missing_merged_at_body, dict)
+        missing_merged_at_body.pop("merged_at")
+        replace_raw_json_body(
+            missing_merged_at_page,
+            canonical_raw_body(missing_merged_at_body),
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                missing_merged_at_transcript,
+                request_scope_receipts=historical_lifecycle_receipts,
+                provider_declaration=declaration,
+            )
         )
 
         self.assertEqual(
@@ -20753,6 +20998,12 @@ class RepositoryContractTest(unittest.TestCase):
             "QUEUED",
             body="No findings.",
         )
+        priority_invalid_2 = invalid_state_blocker_artifact(
+            82_242,
+            "DISMISSED",
+            body="",
+            server_time=int(terminal_server_time) - 7,
+        )
         priority_unresolved_id = 82_241
         priority_unresolved_time = int(terminal_server_time) - 5
         priority_unresolved = complete_review_artifact(
@@ -20765,16 +21016,13 @@ class RepositoryContractTest(unittest.TestCase):
         priority_current = clone(terminal_current)
         assert isinstance(priority_current, dict)
         priority_current["evidence_state"]["malformed_terminal_artifacts"] = [
-            priority_invalid
+            priority_invalid,
+            priority_invalid_2,
         ]
         priority_current["evidence_state"]["unresolved_thread_findings"] = [
             priority_unresolved
         ]
-        priority_current["candidate_basis"] = {
-            "kind": "malformed-terminal-artifact",
-            "server_time": int(terminal_server_time) - 10,
-            "stable_artifact_id": priority_invalid_id,
-        }
+        priority_current["candidate_basis"] = None
         restamp(priority_current)
         priority_history = history(
             samples,
@@ -20786,10 +21034,7 @@ class RepositoryContractTest(unittest.TestCase):
             current_ancestry={current_head: 0},
             prefer_unresolved_thread_blocker=True,
         )
-        self.assertEqual(
-            candidate_order_basis(priority_current),
-            (int(terminal_server_time) - 10, priority_invalid_id),
-        )
+        self.assertIsNone(candidate_order_basis(priority_current))
         self.assertEqual(
             candidate_order_basis(
                 priority_current,
@@ -20854,11 +21099,7 @@ class RepositoryContractTest(unittest.TestCase):
         deterministic_current["evidence_state"]["malformed_terminal_artifacts"] = (
             deterministic_invalid_artifacts
         )
-        deterministic_current["candidate_basis"] = {
-            "kind": "malformed-terminal-artifact",
-            "server_time": deterministic_invalid_times[82_251],
-            "stable_artifact_id": 82_251,
-        }
+        deterministic_current["candidate_basis"] = None
         restamp(deterministic_current)
         deterministic_history = history(
             samples,
@@ -20868,15 +21109,144 @@ class RepositoryContractTest(unittest.TestCase):
             deterministic_history["initial_current_raw_inventory"],
             current_ancestry={},
         )
-        self.assertEqual(
-            candidate_order_basis(deterministic_current),
-            (deterministic_invalid_times[82_251], 82_251),
-        )
+        self.assertIsNone(candidate_order_basis(deterministic_current))
         self.assertIsNotNone(deterministic_raw)
         assert isinstance(deterministic_raw, dict)
+        self.assertIsNone(deterministic_raw["source_ordering_key"])
+        self.assertIsNone(deterministic_raw["source_evidence"])
         self.assertEqual(
-            deterministic_raw["source_ordering_key"],
-            [deterministic_invalid_times[82_251], 82_251],
+            {
+                item["id"]
+                for item in deterministic_raw["current_authority_projection"][
+                    "applicable_artifacts"
+                ]
+                if item["semantic"] == "malformed"
+            },
+            set(deterministic_invalid_times),
+        )
+        self.assertTrue(
+            current_raw_authority_matches(
+                deterministic_history,
+                deterministic_current,
+                require_request_reaction_stability=False,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                deterministic_history,
+                deterministic_current,
+            ),
+            "unknown",
+        )
+        self.assertNotEqual(
+            classify_fallback(
+                declaration,
+                deterministic_history,
+                deterministic_current,
+            ),
+            "clean",
+        )
+        deterministic_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            deterministic_history,
+            deterministic_current,
+            post_as_of_lane_timing,
+        )
+        self.assertIsNotNone(deterministic_report)
+        assert isinstance(deterministic_report, dict)
+        self.assertIsNone(deterministic_report["evidence_basis"])
+        self.assertTrue(
+            validate_complete_report(
+                deterministic_report,
+                lane_state="inconclusive",
+                provider_declaration=declaration,
+                candidate_history=deterministic_history,
+                current_record=deterministic_current,
+                local_lane_timing=post_as_of_lane_timing,
+            )
+        )
+        for accepted_state in (
+            "accepted-terminal-clean",
+            "accepted-terminal-findings",
+            "accepted-reaction-clean",
+        ):
+            with self.subTest(multiple_invalid_state_blockers=accepted_state):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        accepted_state,
+                        declaration,
+                        deterministic_history,
+                        deterministic_current,
+                        post_as_of_lane_timing,
+                    )
+                )
+
+        reversed_invalid_current = clone(deterministic_current)
+        assert isinstance(reversed_invalid_current, dict)
+        reversed_invalid_current["evidence_state"][
+            "malformed_terminal_artifacts"
+        ].reverse()
+        restamp(reversed_invalid_current)
+        reversed_invalid_history = history(
+            samples,
+            current_raw=reversed_invalid_current,
+        )
+        reversed_invalid_raw = parse_current_endpoint_inventory(
+            reversed_invalid_history["initial_current_raw_inventory"],
+            current_ancestry={},
+        )
+        self.assertIsNotNone(reversed_invalid_raw)
+        assert isinstance(reversed_invalid_raw, dict)
+        self.assertIsNone(candidate_order_basis(reversed_invalid_current))
+        self.assertIsNone(reversed_invalid_raw["source_ordering_key"])
+        self.assertIsNone(reversed_invalid_raw["source_evidence"])
+        self.assertTrue(
+            current_raw_authority_matches(
+                reversed_invalid_history,
+                reversed_invalid_current,
+                require_request_reaction_stability=False,
+            )
+        )
+        reversed_invalid_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            reversed_invalid_history,
+            reversed_invalid_current,
+            post_as_of_lane_timing,
+        )
+        self.assertIsNotNone(reversed_invalid_report)
+        assert isinstance(reversed_invalid_report, dict)
+        self.assertIsNone(reversed_invalid_report["evidence_basis"])
+
+        historical_multiple_invalid = confirmed_nonprovider_scope(90)
+        historical_multiple_invalid["evidence_state"][
+            "malformed_terminal_artifacts"
+        ] = [
+            invalid_state_blocker_artifact(
+                82_260,
+                "QUEUED",
+                body="No findings.",
+                record=historical_multiple_invalid,
+                server_time=history_start_exclusive - 10,
+            ),
+            invalid_state_blocker_artifact(
+                82_261,
+                "DISMISSED",
+                body="",
+                record=historical_multiple_invalid,
+                server_time=history_start_exclusive - 20,
+            ),
+        ]
+        historical_multiple_invalid["candidate_basis"] = None
+        restamp(historical_multiple_invalid)
+        historical_multiple_invalid_history = history(
+            samples,
+            confirmed_noncandidate_scopes=[historical_multiple_invalid],
+        )
+        self.assertIsNone(
+            validate_history_universe_result(historical_multiple_invalid_history)
         )
 
         ordinary_old_malformed = clone(terminal_current)

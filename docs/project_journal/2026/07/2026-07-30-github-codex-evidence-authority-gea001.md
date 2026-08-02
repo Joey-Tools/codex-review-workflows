@@ -105,7 +105,15 @@ superseded_by:
   `PENDING` remains nonterminal; `DISMISSED`, or a missing/unknown state with a
   nonempty body or associated inline child, is a whole-snapshot inconclusive
   blocker. Its original `submitted_at` is not a trusted state-transition time,
-  so a later-looking clean cannot supersede it.
+  so a later-looking clean cannot supersede it. A single uniquely observed
+  blocker may be reported as the stable inconclusive basis. With two or more,
+  the snapshot proves only that the lane is inconclusive: IDs, list order,
+  channel, and original submission times do not authorize a selector, so
+  `candidate_basis`, raw source selection, and report `evidence_basis` remain
+  `null` while every blocker stays in the complete audit. This is the same
+  evidence-authority principle used for result-present acceptance: report only
+  what the provider evidence actually proves, and do not manufacture missing
+  lineage or ordering.
 - `+1` can count only for `thumbs-up-clean` after a directly fetched,
   finally stable exact-bot/App GitHub declaration artifact containing the
   predeclared `If Codex has suggestions, it will comment; otherwise it will

@@ -571,6 +571,17 @@ their presence makes the historical universe inconclusive before window
 filtering; original `submitted_at` cannot classify one as an expired
 `confirmed-non-candidate`.
 
+When the exact current scope contains exactly one fully validated invalid-state
+blocker, that uniquely observed artifact may supply the inconclusive blocking
+basis without claiming that `submitted_at` orders the state transition. When it
+contains two or more, retain every blocker in `scope_authority_audit` and the
+current `applicable_artifacts` projection, but set `candidate_basis`,
+`source_ordering_key`, `source_evidence`, and report `evidence_basis` to `null`.
+Neither list order, review ID, channel, nor original `submitted_at` may choose
+one. A fully validated unresolved target-thread finding remains the explicit
+higher-priority exception: it may supply its stable blocker basis while the
+overall verdict stays inconclusive.
+
 Only the following terminal payloads are accepted:
 
 1. **Clean issue comment.** Require exact provider REST identity, exact
@@ -1280,6 +1291,13 @@ exact request-time scope sidecar, and the projected child reaction. Same time
 and numeric ID alone therefore cannot substitute one carrier, channel, scope
 epoch, or semantic result for another.
 
+The only nullable-selection entry is the exact current scope with two or more
+fully validated invalid-state blockers and no selected unresolved-thread basis:
+both `source_ordering_key` and `source_evidence` are `null`, while the complete
+scope audit and applicable-artifact projection retain every blocker. Such an
+entry can support only an inconclusive result and can never enter historical
+window ordering or reaction fallback.
+
 Window filtering happens only after a seeded scope has been completely
 traversed, parsed, and reduced by terminal precedence. A fully valid
 provider-bearing non-current scope whose final `source_ordering_key.server_time`
@@ -1429,6 +1447,11 @@ later `eyes` or another provider-like reaction must change or invalidate the
 reaction basis. A later terminal artifact or an incomplete evidence page
 always changes or invalidates the recorded basis, even when that candidate
 would otherwise rank eleventh.
+
+The exact-current multiple-invalid-state exception above instead records
+`candidate_basis: null`: those blockers prove inconclusiveness but cannot supply
+a single authorized ordering basis. It is not a historical candidate and does
+not relax the complete-snapshot audit.
 
 Sort candidates newest first by the validated candidate-basis server time,
 then stable artifact ID. If any candidate lacks a trustworthy or correctly
