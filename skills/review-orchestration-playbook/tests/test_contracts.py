@@ -290,6 +290,7 @@ def _github_codex_review_body_semantic(
     state: object,
     commit_id: str,
     current_head: str,
+    has_associated_children: bool,
     has_target_children: bool,
 ) -> tuple[str, str | None]:
     body = _normalize_github_codex_body(raw_body)
@@ -308,7 +309,7 @@ def _github_codex_review_body_semantic(
     if unknown_state:
         return (
             ("nonterminal", None)
-            if body == "" and not has_target_children
+            if body == "" and not has_associated_children
             else ("malformed", None)
         )
     if state == "APPROVED":
@@ -7253,6 +7254,7 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
 
             preliminary_review_targets: list[dict[str, object]] | None = []
+            preliminary_has_associated_children = False
             if channel == "pull-request-review":
                 associated = final.get("associated_inline_comments")
                 preliminary_children = (
@@ -7266,6 +7268,12 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 if preliminary_review_targets is None:
                     return None
+                assert isinstance(preliminary_children, list)
+                preliminary_has_associated_children = any(
+                    isinstance(child, dict)
+                    and child.get("pull_request_review_id") == artifact_id
+                    for child in preliminary_children
+                )
             review_semantic, review_commit = (
                 _github_codex_review_body_semantic(
                     body,
@@ -7273,6 +7281,7 @@ class RepositoryContractTest(unittest.TestCase):
                     state=final.get("state"),
                     commit_id=artifact_commit,
                     current_head=str(head),
+                    has_associated_children=preliminary_has_associated_children,
                     has_target_children=bool(preliminary_review_targets),
                 )
                 if channel == "pull-request-review"
@@ -10887,6 +10896,9 @@ class RepositoryContractTest(unittest.TestCase):
                 inline_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
+                associated_inline_by_review: dict[int, list[dict[str, object]]] = {
+                    review_id: [] for review_id in review_by_id
+                }
                 nonterminal_inline_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in nonterminal_review_by_id
                 }
@@ -10942,6 +10954,8 @@ class RepositoryContractTest(unittest.TestCase):
                             projected_inline,
                         )
                         continue
+                    if parent_id in associated_inline_by_review:
+                        associated_inline_by_review[parent_id].append(projected_inline)
                     if actor == "different":
                         nonterminal_records.append(
                             (
@@ -11215,6 +11229,9 @@ class RepositoryContractTest(unittest.TestCase):
                         state=state,
                         commit_id=review_commit,
                         current_head=head,
+                        has_associated_children=bool(
+                            associated_inline_by_review[review_id]
+                        ),
                         has_target_children=bool(joined),
                     )
                     if semantic_commit not in {None, review_commit}:
@@ -16687,6 +16704,138 @@ class RepositoryContractTest(unittest.TestCase):
                         "accepted-terminal-clean",
                         declaration,
                         malformed_unknown_history,
+                        terminal_current,
+                        post_as_of_lane_timing,
+                    )
+                )
+
+        different_actor_child_variants: dict[
+            str, tuple[dict[str, object], int, int]
+        ] = {}
+        for offset, (
+            variant_name,
+            unknown_state,
+            child_login,
+            child_type,
+        ) in enumerate(
+            (
+                ("missing-state-human-child", None, "octocat", "User"),
+                (
+                    "unknown-state-unrelated-bot-child",
+                    "QUEUED",
+                    "dependabot[bot]",
+                    "Bot",
+                ),
+            ),
+            start=3,
+        ):
+            unknown_parent_id = 82_110 + offset
+            unknown_parent_artifact = complete_review_artifact(
+                terminal_current,
+                unknown_parent_id,
+                terminal_server_time + offset,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+            )
+            unknown_parent_snapshot = unknown_parent_artifact["final_snapshot"]
+            assert isinstance(unknown_parent_snapshot, dict)
+            unknown_parent_review = raw_review_record(unknown_parent_snapshot)
+            unknown_parent_review["body"] = ""
+            if unknown_state is None:
+                unknown_parent_review.pop("state")
+            else:
+                unknown_parent_review["state"] = unknown_state
+            unknown_parent_associated = unknown_parent_snapshot[
+                "associated_inline_comments"
+            ]
+            unknown_parent_threads = unknown_parent_snapshot["review_thread_pages"]
+            assert isinstance(unknown_parent_associated, dict)
+            assert isinstance(unknown_parent_threads, dict)
+            unknown_parent_children = clone(unknown_parent_associated["records"])
+            assert isinstance(unknown_parent_children, list)
+            self.assertEqual(len(unknown_parent_children), 1)
+            unknown_parent_child = unknown_parent_children[0]
+            assert isinstance(unknown_parent_child, dict)
+            unknown_parent_child["user_login"] = child_login
+            unknown_parent_child["user_type"] = child_type
+            unknown_parent_child_id = unknown_parent_child["id"]
+            assert isinstance(unknown_parent_child_id, int)
+            unknown_parent_current = clone(terminal_current)
+            assert isinstance(unknown_parent_current, dict)
+            unknown_parent_current["raw_review_records"] = [unknown_parent_review]
+            unknown_parent_current["raw_inline_records"] = [
+                raw_inline_record(unknown_parent_child)
+            ]
+            unknown_parent_thread_nodes: list[dict[str, object]] = []
+            for unknown_parent_page in unknown_parent_threads["pages"]:
+                unknown_parent_thread_nodes.extend(clone(unknown_parent_page["nodes"]))
+            unknown_parent_current["raw_thread_nodes"] = unknown_parent_thread_nodes
+            different_actor_child_variants[variant_name] = (
+                unknown_parent_current,
+                unknown_parent_id,
+                unknown_parent_child_id,
+            )
+
+        for variant_name, (
+            different_actor_child_current,
+            unknown_parent_id,
+            unknown_parent_child_id,
+        ) in different_actor_child_variants.items():
+            with self.subTest(
+                terminal_looking_unknown_review_with_different_actor_child=(
+                    variant_name
+                )
+            ):
+                different_actor_child_history = history(
+                    samples,
+                    current_raw=different_actor_child_current,
+                )
+                parsed_different_actor_child = parse_current_endpoint_inventory(
+                    different_actor_child_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                self.assertIsNotNone(parsed_different_actor_child)
+                assert isinstance(parsed_different_actor_child, dict)
+                current_authority_projection = parsed_different_actor_child[
+                    "current_authority_projection"
+                ]
+                self.assertIn(
+                    {
+                        "id": unknown_parent_id,
+                        "semantic": "malformed",
+                    },
+                    [
+                        {
+                            "id": item["id"],
+                            "semantic": item["semantic"],
+                        }
+                        for item in current_authority_projection["applicable_artifacts"]
+                    ],
+                )
+                self.assertIn(
+                    {
+                        "channel": "different-inline-comment",
+                        "id": unknown_parent_child_id,
+                    },
+                    [
+                        {
+                            "channel": item["channel"],
+                            "id": item["id"],
+                        }
+                        for item in current_authority_projection["nonterminal_records"]
+                    ],
+                )
+                self.assertFalse(
+                    current_raw_authority_matches(
+                        different_actor_child_history,
+                        terminal_current,
+                    )
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        different_actor_child_history,
                         terminal_current,
                         post_as_of_lane_timing,
                     )
