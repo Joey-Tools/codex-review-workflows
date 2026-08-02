@@ -731,6 +731,17 @@ time.
 The scenarios above do not authorise the orchestrator to create `R2`; they
 define how to consume provider evidence after a duplicate already exists.
 
+The frozen historical `as_of_server_time` bounds reaction-profile sampling; it
+does not erase later live current-scope request-policy evidence. If the final
+current reread first observes a fully validated, receipt-bound R2 after that
+cutoff, retain it in the final request audit and report the resulting duplicate
+warning. Terminal selection compares the complete provider artifact/thread/
+finding projection while isolating this request-plane delta, so stable `clean1`
+can still pass. An absent, malformed, or over-budget R2 sidecar instead makes
+request policy unknown. Neither case admits R2 into historical samples or the
+weak reaction fallback, and neither exception applies to a newer finding,
+malformed terminal artifact, unresolved thread, or scope/lifecycle change.
+
 ## Finding Authority
 
 ### Thread-Backed Findings
@@ -868,6 +879,52 @@ It has no `request_scope_receipts` member. Request-time scope receipts remain
 the independent parent-owned sidecar above and are supplied beside the
 transcript to the fixed projector; adding them neither changes this envelope
 nor authorizes another fetch kind.
+
+Each historical inventory and each current raw endpoint inventory carries a
+parent-owned `resource_budget` sibling beside, never inside, the unchanged
+version-3 transcript. It must type-preservingly equal this closed profile:
+
+```yaml
+profile: github-codex-evidence-resource-budget-v1
+schema_version: 1
+max_seeded_pull_requests: 512
+max_controlled_requests: 512
+max_fetch_attempts: 8192
+max_retained_pages: 4096
+max_records: 20000
+max_page_body_bytes: 8388608
+max_retained_utf8_bytes: 67108864
+deadline_seconds: 900
+```
+
+These are fixed maxima; evidence may not raise or lower them. Apply the profile
+to two non-borrowing ledgers for one inventory: the endpoint transcript/current
+detail fetch set and the request-scope-sidecar validation plane. Both ledgers
+share the inventory's same monotonic start and 900-second deadline. Count the
+sidecar array before iteration. Each controlled request charges one sidecar
+record plus its five retained raw responses (pre pull/compare, POST, and post
+pull/compare) as five attempts, pages, and records; each response applies the
+same body cap and counts the UTF-8 bytes of its request URL, `Date`, and body.
+A missing, malformed, or over-budget sidecar makes request policy unknown and
+disables reaction authority, but its isolated bounded validation work cannot
+consume or invalidate an independently complete terminal-payload ledger.
+
+For endpoint evidence, charge a fetch attempt before every REST or GraphQL
+request, including retries. Charge known page and record counts before cloning
+or serialization, then charge retained UTF-8 bytes and the body cap before
+hashing, JSON decoding, or appending. The per-page byte cap applies to
+`body_utf8`; the aggregate counts UTF-8 bytes for `request_url`, `link_header`
+when present, `request_after` when present, and `body_utf8`. Each REST array
+element or direct-object response is one record, and each GraphQL review-thread
+node and nested comment node is one record. Check the monotonic deadline at
+every boundary and once again before success. Initial and final inventories
+receive independent starts; provider waiting between them is not charged. Any
+endpoint-ledger overflow discards that traversal and selects `unknown`; it never
+authorizes truncation, newest-N sampling, or a caller-selected envelope. The
+offline transcript can be recounted against page, record, and byte limits, but
+does not itself attest the parent's monotonic clock or unretained retry attempts,
+so the trusted fetcher must enforce those controls while collecting.
+
 `scope_discovery` is exactly one `repository_pull_requests` REST fetch record
 for an
 independently fetched, fully paginated repository-wide
@@ -964,7 +1021,14 @@ positive pull-number order, with exactly one
 The classification is exact `current`, `historical-candidate`, or
 `confirmed-non-candidate`; a pending controlled request, ambiguous identity,
 incomplete traversal, or unparseable record cannot be downgraded to
-`confirmed-non-candidate`. The parser then derives `entries` in the closed
+`confirmed-non-candidate`. A receipt-bound request whose sidecar proves the
+same repository/PR but an older head is not pending for the parsed epoch: when
+no current-epoch provider result or terminal artifact exists, an
+old-epoch-only scope remains audit-only, produces no entry, and is classified
+`current` for the exact current scope or `confirmed-non-candidate` otherwise.
+Missing or unmatched sidecars and a same-head/different-merge-base tuple remain
+fail-closed; the exception is only for a fully proved older head. The parser
+then derives `entries` in the closed
 shape `{scope_key, source_ordering_key, source_evidence}` and
 `candidate_universe_count`. `source_evidence` is exactly
 `{carrier, channel, semantic, native_identity, source_record_sha256}`. It binds
@@ -987,8 +1051,10 @@ but it is omitted from `entries` and `candidate_universe_count`. A scope is a
 `historical-candidate` for this interval only when its final basis satisfies
 `window_start_exclusive < server_time <= window_end_inclusive`. This audit-only
 classification never permits an incomplete traversal, ambiguous identity,
-malformed projection, or post-`as_of_server_time` record to be hidden as an
-expired non-candidate; those cases still fail closed.
+malformed projection, or post-`as_of_server_time` policy-bearing record to be
+hidden as an expired non-candidate; those cases still fail closed. Only the
+fully validated confirmed-different suffix records defined below are raw-only
+and excludable from the fixed semantic projection.
 
 The fixed semantic projection also derives `scope_authority_audit`, sorted by
 positive pull number, for every seeded scope that contains policy-relevant
@@ -997,14 +1063,20 @@ item is exactly
 `{scope_key, lifecycle, requests, reactions, applicable_artifacts,
 nonterminal_records}`. `requests` retains every controlled request plus its
 derived scope and exact sidecar when valid; `reactions` retains every individual
-reaction, including confirmed-different actors; `applicable_artifacts` retains
+in-cutoff reaction, including confirmed-different actors. Raw-only post-cutoff
+confirmed-different suffix records remain in the transcript but do not enter
+this fixed semantic projection. `applicable_artifacts` retains
 every provider terminal/finding/malformed source with channel, semantic time,
 native ID, outcome, and canonical source digest rather than only the selected
-one; and `nonterminal_records` retains exact-provider pending/progress audit
-evidence. This list is derived from the raw transcript and is not an inventory
-entry or sample-count input. It keeps current and temporally excluded provider
-scopes auditable and makes any policy-relevant node, semantic, lifecycle, or
-source-evidence drift visible across the two traversals.
+one; and `nonterminal_records` retains exact-provider pending/progress plus
+in-cutoff confirmed-different and fully fetched null-parent/unrelated audit
+context. Because version 3 has no inline timestamp, such inline context remains
+semantic unless it belongs to a fully validated post-cutoff
+confirmed-different review bundle. This list is derived from the raw transcript
+and is not an inventory entry or sample-count input. It keeps current and
+temporally excluded provider scopes auditable and makes any policy-relevant
+node, semantic, lifecycle, or source-evidence drift visible across the two
+traversals.
 
 For an in-window reaction candidate, the closed candidate evaluator requires
 its complete request/sidecar and reaction audit plus lifecycle and every
@@ -1039,14 +1111,27 @@ to the decision, but do not themselves provide a cryptographic proof of GitHub
 TLS origin. Do not describe the record as a TLS attestation.
 
 A candidate basis at the lower boundary is outside the window; one at the upper
-boundary is inside. Every trusted server time in every historical/current raw
-record must be no later than `as_of_server_time`. Apply this bound before actor
-filtering, including controlled-request times and confirmed-different-actor
-issue comments, submitted reviews, and reactions that are excluded from
-provider semantic ordering. A `PENDING` review may retain its required null
-`submitted_at`; any non-pending review requires a positive in-bound server time
-regardless of actor. Any later artifact is impossible in the frozen observation
-and makes the profile `unknown`.
+boundary is inside. The fixed projector first validates complete pagination,
+closed syntax, native ID, canonical URL/parent joins, timestamp grammar, and
+the exact/confirmed-different/ambiguous actor classification. Controlled
+`@codex review` requests, exact-provider records, and ambiguous/provider-like
+records must be no later than `as_of_server_time`; a later one makes the
+profile `unknown`. A non-request issue comment proved to have been created
+entirely after the cutoff, a confirmed-different submitted review after the
+cutoff, or a confirmed-different reaction created after the cutoff is retained
+in the raw transcript but excluded as an irrelevant suffix from the fixed
+semantic projection. This lets two independent traversals converge when
+ordinary humans or unrelated bots write after the frozen observation; it does
+not move the cutoff. An issue comment created at or before the cutoff but
+edited after it remains fail-closed because its cutoff body cannot be
+reconstructed. A future confirmed-different review may carry only the fully
+validated unrelated child/thread bundle allowed by the closed join; an exact
+or ambiguous child is not hidden with that parent. Version 3 has no
+inline-child timestamp, so a later human reply on an in-cutoff provider review
+cannot be inferred to be a removable suffix and remains semantic drift. A
+`PENDING` review retains its required null `submitted_at` and follows the
+existing identity/nonterminal rules. Normalized candidate/current arrays may
+not inject any raw-only suffix record.
 
 Raw discovery includes the exact current scope and every confirmed
 non-candidate PR, including the PR that carries the authenticated declaration.
@@ -1326,6 +1411,14 @@ malformed target join still fails closed. Every accepted terminal or reaction
 `evidence_basis` embeds both independent raw current endpoint inventories and
 both parent-owned local Git ancestry-receipt arrays; external ledgers or
 normalized current snapshots do not replace them.
+
+A raw current endpoint inventory is already selected to one exact PR and
+contains exactly one retained detail fetch set. It does not contain a
+repository-wide `scope_discovery` seed. Its parser charges and parses the real
+pull-detail page exactly once, derives the scope from that page plus compare,
+and validates the outer PR/head selector against the result. It must not create
+or charge a synthetic seed, pre-parse the pull under another tracker, grant a
+second deadline, or mutate retained bytes after budget validation.
 
 ### +1 Fallback
 
@@ -1656,6 +1749,8 @@ evidence_basis:
     initial_inventory:
       complete: true
       repository: OWNER/REPO
+      resource_budget: <exact github-codex-evidence-resource-budget-v1 profile above>
+      pagination: <all eight repository/detail fetch-kind flags, each exact true>
       discovery_endpoint_transcript:
         schema_version: 3
         repository: OWNER/REPO
@@ -1709,6 +1804,7 @@ evidence_basis:
         repository: OWNER/REPO
         pull_number: 123
         head: <full lowercase SHA>
+        resource_budget: <exact github-codex-evidence-resource-budget-v1 profile above>
         fetches:
           - kind: pull_requests | compare | issue_comments | reviews | inline_comments | review_threads | request_reactions
             transport: rest | graphql
@@ -1819,7 +1915,7 @@ reference is insufficient. Each complete candidate snapshot repeats these
 fields: `complete`, all six pagination results, the four
 `evidence_state` artifact arrays with stable IDs/times, lifecycle, immutable
 scope, every controlled request, its one-to-one `request_scope_receipts`, every
-individual reaction (including confirmed-different-actor reactions), selected
+in-cutoff individual reaction (including confirmed-different-actor reactions), selected
 request/reaction IDs when present, `same_scope_request_audit`, and
 `candidate_basis`. The initial and final candidate arrays, parent-owned
 `request_scope_receipts`, derived `scope_classifications`, and derived `entries`
@@ -1842,13 +1938,15 @@ identical, while request-scope-sidecar metadata is excluded and reported on
 the request/reaction plane. `current.initial_snapshot` and `.final_snapshot`
 likewise embed the complete reader-facing field set for the exact current scope
 and must be structurally identical, but neither normalized snapshot substitutes
-for the raw inventories or ancestry receipts. Every raw
-artifact/request/reaction time in both historical and current inventories is
-checked against the recorded as-of bound before actor filtering or candidate
-selection. This lets a reader distinguish a valid
+for the raw inventories or ancestry receipts. Every policy-bearing time and
+every non-excludable raw record in historical and current inventories is
+checked against the recorded as-of bound after strict actor classification and
+before candidate selection. Fully validated post-cutoff confirmed-different
+suffix records stay visible only in the raw transcript under the rule above.
+This lets a reader distinguish a valid
 11-candidate universe from one whose unselected candidate was truncated,
 incompletely paginated, changed on final reread, or contained a future
-confirmed-human reaction.
+provider/provider-like record rather than an irrelevant human suffix.
 
 The current raw authority projection retains every exact-provider
 `PENDING` review and progress-only issue comment in a canonical
@@ -1972,7 +2070,11 @@ implementation mechanically:
    state-all PR list, traverses every seeded PR including current and confirmed
    non-candidates, and excludes current only after full parsing. Version 2
    cannot prove the fallback, and evidence-budget overflow selects `unknown`.
-   None of these discovery gates is attributed to the fixed Action baseline.
+   The versioned playbook budget deliberately reuses the fixed Action
+   baseline's 20000-item, 8 MiB per-response, and 64 MiB per-work bounds. Its
+   512 seeded PRs, 512 controlled requests, 8192 attempts, 4096 retained pages,
+   and 900-second per-traversal deadline are playbook extensions needed for
+   the two repository-wide traversals; they are not attributed to the Action.
 10. **Request-time scope sidecars are a playbook extension.** The fixed Action
     comparison does not establish the exact scope of a parent-created request.
     This playbook separately captures closed pre/post pull-and-compare receipts

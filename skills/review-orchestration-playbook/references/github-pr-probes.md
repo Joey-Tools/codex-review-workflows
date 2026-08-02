@@ -119,6 +119,15 @@ kind. If any observed request lacks a valid one-to-one sidecar, set
 and its reactions from reaction-profile authority. Continue to evaluate an
 independently complete terminal payload normally.
 
+A fully sidecar-bound request for the same repository and PR but a different
+head is old-epoch audit evidence. When a seeded scope has no current-epoch
+provider artifact or reaction and every controlled request is proved old-head,
+produce no result entry: classify the exact current PR as `current` and another
+seeded PR as `confirmed-non-candidate`. This audit-only exception requires
+one-to-one closure over every request and receipt. A missing, malformed, extra,
+or unmatched sidecar and a same-head/different-merge-base tuple remain
+fail-closed; neither may be relabelled as an old epoch.
+
 The sidecar binds request-time scope, not request/run lineage or continuous
 history. A child reaction from a different receipt-derived scope epoch cannot
 be relabelled into the current tuple. Matching pre/post observations do not
@@ -300,12 +309,53 @@ the independent repository-wide seed and cannot prove reaction fallback.
 Missing seed/detail coverage or any page/count/byte/time budget overflow makes
 the profile `unknown`; truncation is forbidden.
 
+Each historical discovery inventory and each current raw endpoint inventory
+stores a parent-owned `resource_budget` sibling beside, never inside, the
+unchanged version-3 transcript. It must type-preservingly equal this closed
+profile:
+
+```yaml
+profile: github-codex-evidence-resource-budget-v1
+schema_version: 1
+max_seeded_pull_requests: 512
+max_controlled_requests: 512
+max_fetch_attempts: 8192
+max_retained_pages: 4096
+max_records: 20000
+max_page_body_bytes: 8388608
+max_retained_utf8_bytes: 67108864
+deadline_seconds: 900
+```
+
+Apply those maxima to non-borrowing endpoint and request-scope-sidecar ledgers
+that share one inventory start/deadline. Pre-count the sidecar array and each
+controlled request's five raw responses. Sidecar overflow makes request policy
+unknown and disables reaction authority without erasing an independently
+complete terminal payload. For endpoint evidence, charge every REST or GraphQL
+attempt, including retries, before the request; charge known page/record counts
+before cloning or serialization, bytes before hashing, decoding, or
+accumulation, and check the 900-second monotonic deadline again before success.
+Endpoint overflow discards the entire traversal and selects `unknown`; it never
+permits truncation, newest-N sampling, or a caller-chosen subset. A current raw
+inventory parses and charges its one retained detail fetch set exactly once—no
+synthetic seed, duplicate pull parse, second deadline, or post-budget byte
+mutation. The initial and final inventories are independent fresh traversals
+with independent starts. The `20000`-record, `8388608`-byte
+per-response, and `67108864`-byte aggregate caps deliberately align with the
+fixed Action baseline above (20,000 items, 8 MiB per response, and 64 MiB per
+work unit). The 512 seeded PRs, 512 controlled requests, 8192 attempts, 4096
+retained pages, and 900-second deadline are playbook extensions for
+repository-wide evidence; do not attribute them to the pinned Action.
+
 The inventory stores `request_scope_receipts` beside that raw transcript. The
 version-3 root remains exactly
 `{schema_version, repository, scope_discovery, scopes}` and its fetch-kind set
 is unchanged. The fixed projector joins each seven-field request projection to
 exactly one parent-owned sidecar only when evaluating request/reaction
-authority; terminal-artifact projection does not depend on that join.
+authority; terminal-artifact projection does not depend on that join. Sidecar
+resource validation charges one controlled request and five response
+attempt/page/record units, applies the body cap to each raw body, and counts the
+retained request URL, `Date`, and body UTF-8 bytes before digesting or decoding.
 
 `pr_merge_base` comes only from the compare response's
 `merge_base_commit.sha`, with the compare URL bound to the pull-detail
@@ -366,16 +416,20 @@ remains unstable and selects `unknown`.
 For each traversal, derive the audit-only `scope_authority_audit` projection
 for every scope with policy-relevant evidence. Its closed items retain scope,
 lifecycle, every controlled request and valid sidecar binding, every individual
-reaction including confirmed-different actors, every selected or unselected
-provider artifact with its canonical source digest, and exact-provider
-pending/progress audit records. Compare this complete projection across the two
+in-cutoff reaction including confirmed-different actors, every selected or
+unselected provider artifact with its canonical source digest, exact-provider
+pending/progress records, and in-cutoff/null-parent/unrelated audit context.
+Fully validated post-cutoff
+confirmed-different suffix records remain in the raw transcript but do not
+enter this semantic projection. Compare the complete projection across the two
 traversals; an old audit-only provider scope changing clean/findings/malformed,
-or a final-only earlier `eyes`, is semantic drift even when selected entries and
-count do not change. Bind every in-window reaction candidate's matching fields
-to its raw scope audit. Preserve terminal/request-plane isolation by excluding
-request/reaction defects from a terminal-determined candidate comparison, while
-still requiring its lifecycle and complete provider artifact projection to
-match. The audit list itself never enters entries, count, or the 3–10 sample.
+or a final-only earlier `eyes`, is semantic drift even when selected entries
+and count do not change. Bind every in-window reaction candidate's matching
+fields to its raw scope audit. Preserve terminal/request-plane isolation by
+excluding request/reaction defects from a terminal-determined candidate
+comparison, while still requiring its lifecycle and complete provider artifact
+projection to match. The audit list itself never enters entries, count, or the
+3–10 sample.
 
 Every legal exact-provider reaction remains in a terminal carrier's complete
 audit projection, including content other than `+1` and `eyes`; none can
@@ -383,7 +437,25 @@ replace or invalidate the terminal basis. Only reaction-only classification
 restricts semantic content to `+1` plus compatible earlier `eyes`, and any
 other exact-provider content makes that weaker candidate `unknown`.
 
-The current outcome is validated separately and never counts toward the history minimum. Before sorting, bind every candidate's time/ID basis to its scope-final outcome after terminal precedence and validate the candidate's complete pagination, provider-like reaction sequence, and stable initial/final snapshot even when it will fall outside the selected newest 10. A terminal/finding artifact or incomplete page cannot be hidden behind an older reaction timestamp. Later `+1`/`eyes` records remain audited but cannot replace a terminal basis; when the basis is reaction-only, a later provider-like reaction changes or invalidates it. Require every raw historical/current request, reaction, issue-comment, and submitted-review server time to be no later than the same as-of time before filtering confirmed different actors; a future human or unrelated-bot review is not ignorable audit noise. When 10 or more historical candidates exist, select exactly the newest 10; otherwise select the complete historical candidate set. Never skip an incomplete, conflicting, ambiguous, or unfavourable candidate. Every selected candidate must be eligible; otherwise the profile is `unknown`. At least three selected historical outcomes must remain, all reaction-only and with no clean comment/review. Every sampled outcome must record one selected parent issue comment whose normalized body is `@codex review`, its seven fields, exact matching request-time scope sidecar, and the individual child exact-bot `+1` reaction's positive ID/`parent_request_id`/exact parent reactions endpoint/`created_at`/actor/content, with strict server ordering `reaction.created_at > request.request_server_time`. Both receipt-derived tuples must equal the sample scope and the POST response must project type-preservingly to the request; an old-epoch request or reaction cannot be relocated into another scope. The endpoint-and-ID tuple is the native reaction identity; no standalone reaction resource URL is synthesized. It must also enumerate every accepted same-scope request parent, repeat each matching sidecar, and fully paginate every parent's individual reactions. An edited request uses `updated_at`; a reaction that predates an edit into `@codex review` cannot count. A reaction's parent ID and endpoint must match its enclosing audited request, so an R1 reaction cannot be relocated under R2 by local nesting. Across all parents, de-duplicate only identical endpoint-and-ID reaction identities and order exact-provider reactions globally by `(created_at, positive numeric ID)`: only duplicate `+1` plus strictly earlier `eyes` are compatible. The selected `+1` parent must be the unique latest request by semantic time. Any other reaction content, nonpositive/missing ordering ID, `eyes` at or after the selected `+1`, or request whose `request_server_time >= selected_reaction.created_at` makes the candidate `unknown`. Require the same binding and cross-parent audit for the separate current outcome. Its normalized initial/final snapshots include exact lifecycle `state == open`, `merged == false`, and `merged_at == null`, stable scope, all evidence pages, and no active top-level finding on the current or an ancestor head, unresolved target-thread finding, malformed terminal artifact, terminal payload, or reaction conflict. The current basis cannot be later than the same trusted as-of time. A changed `baseRefOid` does not create another outcome when `pr_merge_base` and head are unchanged. `eyes` is liveness only. A clean-looking `APPROVED` review requires a fully paginated, present, empty exact-provider selected-review target-child set; a valid target child is findings and an unread/malformed target join is inconclusive. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. If payload and reaction carriers coexist, use `mixed` and keep the payload authoritative.
+The current outcome is validated separately and never counts toward the history minimum. Before sorting, bind every candidate's time/ID basis to its scope-final outcome after terminal precedence and validate the candidate's complete pagination, provider-like reaction sequence, and stable initial/final snapshot even when it will fall outside the selected newest 10. A terminal/finding artifact or incomplete page cannot be hidden behind an older reaction timestamp. Later `+1`/`eyes` records remain audited but cannot replace a terminal basis; when the basis is reaction-only, a later provider-like reaction changes or invalidates it.
+
+Classify actor identity and validate the complete carrier schema, native IDs,
+URLs, and joins before applying the frozen as-of cutoff. A confirmed-different
+non-request issue comment created wholly after the cutoff, submitted review
+after the cutoff, or reaction created after the cutoff is a raw-only future
+suffix: retain it in the transcript but exclude it from the fixed semantic
+projection so concurrent human or unrelated-bot writes can converge.
+Controlled `@codex review` comments remain policy-bearing regardless of actor
+and must be within the cutoff. Exact-provider and ambiguous/provider-like
+records also remain policy-bearing; a post-cutoff instance selects `unknown`.
+An issue comment created at or before the cutoff but edited after it is
+fail-closed because the cutoff body cannot be reconstructed. An exact or
+ambiguous child may not be hidden with an otherwise confirmed-different future
+review. Schema version 3 records no independent inline-child timestamp, so it
+cannot infer that a human reply on an in-cutoff provider review is a removable
+later suffix; that child remains semantic drift.
+
+When 10 or more historical candidates exist, select exactly the newest 10; otherwise select the complete historical candidate set. Never skip an incomplete, conflicting, ambiguous, or unfavourable candidate. Every selected candidate must be eligible; otherwise the profile is `unknown`. At least three selected historical outcomes must remain, all reaction-only and with no clean comment/review. Every sampled outcome must record one selected parent issue comment whose normalized body is `@codex review`, its seven fields, exact matching request-time scope sidecar, and the individual child exact-bot `+1` reaction's positive ID/`parent_request_id`/exact parent reactions endpoint/`created_at`/actor/content, with strict server ordering `reaction.created_at > request.request_server_time`. Both receipt-derived tuples must equal the sample scope and the POST response must project type-preservingly to the request; an old-epoch request or reaction cannot be relocated into another scope. The endpoint-and-ID tuple is the native reaction identity; no standalone reaction resource URL is synthesized. It must also enumerate every accepted same-scope request parent, repeat each matching sidecar, and fully paginate every parent's individual reactions. An edited request uses `updated_at`; a reaction that predates an edit into `@codex review` cannot count. A reaction's parent ID and endpoint must match its enclosing audited request, so an R1 reaction cannot be relocated under R2 by local nesting. Across all parents, de-duplicate only identical endpoint-and-ID reaction identities and order exact-provider reactions globally by `(created_at, positive numeric ID)`: only duplicate `+1` plus strictly earlier `eyes` are compatible. The selected `+1` parent must be the unique latest request by semantic time. Any other reaction content, nonpositive/missing ordering ID, `eyes` at or after the selected `+1`, or request whose `request_server_time >= selected_reaction.created_at` makes the candidate `unknown`. Require the same binding and cross-parent audit for the separate current outcome. Its normalized initial/final snapshots include exact lifecycle `state == open`, `merged == false`, and `merged_at == null`, stable scope, all evidence pages, and no active top-level finding on the current or an ancestor head, unresolved target-thread finding, malformed terminal artifact, terminal payload, or reaction conflict. The current basis cannot be later than the same trusted as-of time. A changed `baseRefOid` does not create another outcome when `pr_merge_base` and head are unchanged. `eyes` is liveness only. A clean-looking `APPROVED` review requires a fully paginated, present, empty exact-provider selected-review target-child set; a valid target child is findings and an unread/malformed target join is inconclusive. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. If payload and reaction carriers coexist, use `mixed` and keep the payload authoritative.
 
 The edited-request `updated_at` rule above is audit ordering only. Sidecar
 version `parent-recorded-request-scope-v1` admits only an unedited creation

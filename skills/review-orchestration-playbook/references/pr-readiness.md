@@ -184,6 +184,60 @@ Self-consistent summaries or selected samples do not prove completeness. The
 parent-owned `request_scope_receipts` array is stored beside the transcript;
 the version-3 root and fetch-kind set remain unchanged.
 
+Each historical inventory and each current raw endpoint inventory also stores
+a parent-owned `resource_budget` sibling beside, never inside, that unchanged
+transcript. It must type-preservingly equal this closed profile:
+
+```yaml
+profile: github-codex-evidence-resource-budget-v1
+schema_version: 1
+max_seeded_pull_requests: 512
+max_controlled_requests: 512
+max_fetch_attempts: 8192
+max_retained_pages: 4096
+max_records: 20000
+max_page_body_bytes: 8388608
+max_retained_utf8_bytes: 67108864
+deadline_seconds: 900
+```
+
+Enforce the profile independently for each complete inventory. Use
+non-borrowing endpoint and request-scope-sidecar ledgers with the same
+inventory start/deadline; pre-count the sidecar array and each controlled
+request's five raw responses. A sidecar-ledger overflow makes request policy
+unknown and disables reaction authority without erasing a complete terminal
+payload. For endpoint evidence, charge every REST or GraphQL attempt,
+including retries, before the request; charge known page/record counts before
+cloning or serialization, then charge UTF-8 bytes before hashing, decoding, or
+accumulation; and recheck the monotonic active-work deadline before success.
+Endpoint overflow discards the whole traversal and selects `unknown`; it never
+permits truncation, newest-N sampling, or a caller-selected subset. A current
+raw inventory charges its one real detail fetch set exactly once: no synthetic
+repository seed, duplicate pull parse, second deadline, or post-budget byte
+mutation. The initial and final inventories must be independent fresh fetches
+with independent 900-second starts. The `20000`-record, `8388608`-byte
+per-response, and `67108864`-byte aggregate caps intentionally align with the
+pinned `codex-review-gate-action` baseline above (20,000 items, 8 MiB per
+response, and 64 MiB per work unit). The 512 seeded PRs, 512 controlled
+requests, 8192 attempts, 4096 retained pages, and 900-second deadline are
+playbook extensions and are not attributed to that Action.
+
+Classify actor identity and validate each carrier's complete schema, native
+IDs, canonical URLs, and joins before applying the frozen as-of cutoff. A
+confirmed-different non-request issue comment created wholly after the cutoff,
+submitted review after the cutoff, or reaction created after the cutoff is a
+raw-only future suffix: keep it in the transcript but exclude it from the
+fixed semantic projection so independent traversals can converge despite
+ordinary concurrent human or unrelated-bot writes. Controlled `@codex review`
+comments remain policy-bearing regardless of actor and must be within the
+cutoff. Exact-provider and ambiguous/provider-like records also remain
+policy-bearing, so a post-cutoff instance selects `unknown`. A cross-cutoff
+issue-comment edit remains fail-closed because its earlier body cannot be
+reconstructed. An exact or ambiguous child cannot be hidden with an otherwise
+confirmed-different future review. Schema version 3 has no independent
+inline-child timestamp, so it cannot infer that a human reply on an in-cutoff
+provider review is a removable later suffix; the child remains semantic drift.
+
 Validate every seeded PR before sorting, including candidates outside the
 newest 10 and scopes that become confirmed non-candidates. Validate current
 separately and never count it toward the three-outcome history minimum. Every

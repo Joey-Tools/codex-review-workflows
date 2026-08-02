@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import unittest
 import urllib.parse
@@ -2776,6 +2777,8 @@ class RepositoryContractTest(unittest.TestCase):
             "compliant, not a warning",
             "does not independently invalidate complete provider-result evidence",
             "base-changed-same-head",
+            "does not erase later live current-scope request-policy evidence",
+            "neither case admits r2 into historical samples or the weak reaction fallback",
         ):
             self.assertIn(anchor.lower(), unquoted)
         self.assertIn("request_policy.status: warning", skill)
@@ -3133,9 +3136,19 @@ class RepositoryContractTest(unittest.TestCase):
 
         anti_drift_documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "readme": (SKILL_SCOPE_ROOT / "README.md").read_text(encoding="utf-8"),
+            "interface": (SKILL_ROOT / "agents/openai.yaml").read_text(
+                encoding="utf-8"
+            ),
+            "github-pr-probes": (
+                SKILL_ROOT / "references/github-pr-probes.md"
+            ).read_text(encoding="utf-8"),
             "pr-readiness": (SKILL_ROOT / "references/pr-readiness.md").read_text(
                 encoding="utf-8"
             ),
+            "review-lane-contracts": (
+                SKILL_ROOT / "references/review-lane-contracts.md"
+            ).read_text(encoding="utf-8"),
             "project-journal": (
                 SKILL_SCOPE_ROOT / "docs/project_journal/2026/07/"
                 "2026-07-30-github-codex-evidence-authority-gea001.md"
@@ -3154,8 +3167,18 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     self.assertIn(baseline_id, document)
         journal = anti_drift_documents["project-journal"]
-        github_pr_probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
-            encoding="utf-8"
+        github_pr_probes = anti_drift_documents["github-pr-probes"]
+        normalized_readme_text = " ".join(
+            anti_drift_documents["readme"].lower().replace("`", "").split()
+        )
+        self.assertIn(
+            "two independently complete initial/final discovery inventories whose "
+            "fixed semantic projections",
+            normalized_readme_text,
+        )
+        self.assertNotIn(
+            "embeds identical initial/final discovery inventories",
+            normalized_readme_text,
         )
         normalized_skill_text = " ".join(
             anti_drift_documents["skill"].lower().replace("`", "").split()
@@ -3486,7 +3509,8 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 self.assertIn("scope_authority_audit", document)
         self.assertIn(
-            "retains every individual reaction, including confirmed-different actors",
+            "retains every individual in-cutoff reaction, including "
+            "confirmed-different actors",
             normalized_authority_text,
         )
         self.assertIn(
@@ -3494,16 +3518,146 @@ class RepositoryContractTest(unittest.TestCase):
             normalized_github_pr_probes_text,
         )
         self.assertIn(
-            "apply this bound before actor filtering",
+            "controlled @codex review requests, exact-provider records, and "
+            "ambiguous/provider-like records must be no later than "
+            "as_of_server_time",
             normalized_authority_text,
         )
         self.assertIn(
-            "a future human or unrelated-bot review is not ignorable audit noise",
+            "classify actor identity and validate the complete carrier schema, "
+            "native ids, urls, and joins before applying the frozen as-of cutoff",
             normalized_github_pr_probes_text,
+        )
+        self.assertIn(
+            "a confirmed-different non-request issue comment created wholly after "
+            "the cutoff, submitted review after the cutoff, or reaction created "
+            "after the cutoff is a raw-only future suffix",
+            normalized_github_pr_probes_text,
+        )
+        self.assertIn(
+            "a cross-cutoff issue-comment edit remains fail-closed",
+            normalized_readiness_text,
+        )
+        self.assertIn(
+            "schema version 3 has no independent inline-child timestamp",
+            normalized_readiness_text,
         )
         self.assertIn(
             "a valid tuple with the same repository and pr but an older head "
             "remains old-epoch audit evidence",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "old-epoch-only scope remains audit-only, produces no entry, and is "
+            "classified current for the exact current scope or "
+            "confirmed-non-candidate otherwise",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "a missing, malformed, extra, or unmatched sidecar and a "
+            "same-head/different-merge-base tuple remain fail-closed",
+            normalized_github_pr_probes_text,
+        )
+
+        active_actor_first_documents = {
+            "authority": authority,
+            **malformed_window_documents,
+        }
+        for document_name, document in active_actor_first_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(actor_first_document=document_name):
+                self.assertIn("confirmed-different", normalized_document)
+                self.assertIn("raw-only", normalized_document)
+                self.assertIn("controlled @codex review", normalized_document)
+                self.assertIn("inline-child", normalized_document)
+                self.assertNotIn(
+                    "apply this bound before actor filtering",
+                    normalized_document,
+                )
+                self.assertNotIn(
+                    "a future human or unrelated-bot review is not ignorable "
+                    "audit noise",
+                    normalized_document,
+                )
+
+        exact_resource_profile_documents = {
+            "authority": authority,
+            "README": malformed_window_documents["README"],
+            "interface": malformed_window_documents["interface"],
+            "PR readiness": malformed_window_documents["PR readiness"],
+            "lane contracts": malformed_window_documents["lane contracts"],
+            "prompt templates": malformed_window_documents["prompt templates"],
+            "GitHub probes": malformed_window_documents["GitHub probes"],
+        }
+        resource_profile_anchors = (
+            "profile: github-codex-evidence-resource-budget-v1",
+            "schema_version: 1",
+            "max_seeded_pull_requests: 512",
+            "max_controlled_requests: 512",
+            "max_fetch_attempts: 8192",
+            "max_retained_pages: 4096",
+            "max_records: 20000",
+            "max_page_body_bytes: 8388608",
+            "max_retained_utf8_bytes: 67108864",
+            "deadline_seconds: 900",
+        )
+        for document_name, document in exact_resource_profile_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            for anchor in resource_profile_anchors:
+                with self.subTest(
+                    resource_profile_document=document_name,
+                    resource_profile_anchor=anchor,
+                ):
+                    self.assertIn(anchor, normalized_document)
+            with self.subTest(resource_action_alignment=document_name):
+                self.assertIn("action", normalized_document)
+                self.assertIn("playbook extensions", normalized_document)
+                self.assertTrue(
+                    "20,000" in normalized_document or "20000" in normalized_document
+                )
+                self.assertTrue(
+                    "8 mib" in normalized_document or "8-mib" in normalized_document
+                )
+                self.assertTrue(
+                    "64 mib" in normalized_document or "64-mib" in normalized_document
+                )
+        for document_name, document in (
+            ("skill", anti_drift_documents["skill"]),
+            ("project-journal", journal),
+        ):
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(resource_budget_summary=document_name):
+                self.assertIn(
+                    "github-codex-evidence-resource-budget-v1",
+                    normalized_document,
+                )
+                self.assertIn("512", normalized_document)
+                self.assertIn("8192", normalized_document.replace(",", ""))
+                self.assertIn("4096", normalized_document.replace(",", ""))
+                self.assertIn("20000", normalized_document.replace(",", ""))
+                self.assertIn("900", normalized_document)
+                self.assertIn("action", normalized_document)
+                self.assertIn("extension", normalized_document)
+        resource_plane_documents = {
+            "authority": authority,
+            "skill": anti_drift_documents["skill"],
+            "PR readiness": malformed_window_documents["PR readiness"],
+            "lane contracts": malformed_window_documents["lane contracts"],
+            "prompt templates": malformed_window_documents["prompt templates"],
+            "GitHub probes": malformed_window_documents["GitHub probes"],
+            "project-journal": journal,
+        }
+        for document_name, document in resource_plane_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(resource_plane_contract=document_name):
+                self.assertIn("non-borrowing", normalized_document)
+                self.assertIn("five", normalized_document)
+                self.assertIn("raw responses", normalized_document)
+                self.assertIn("synthetic", normalized_document)
+                self.assertIn("sidecar", normalized_document)
+        self.assertIn(
+            "in-cutoff confirmed-different and fully fetched null-parent/unrelated "
+            "audit context",
             normalized_authority_text,
         )
         self.assertIn(
@@ -3595,6 +3749,21 @@ class RepositoryContractTest(unittest.TestCase):
                     result_present_contract=anchor,
                 ):
                     self.assertIn(anchor, result_present_sections[document_name])
+        v7_correction_section = section_text(
+            journal,
+            "## v7 Named-Single Superseding Corrections",
+        )
+        for anchor in (
+            "a trustworthy result being present is sufficient verdict evidence",
+            "a request records producer intent and orchestration compliance; it is "
+            "not the consumer verdict",
+            "must not silently restore request/run binding or erase this rationale",
+            "the 20,000-item, 8-mib-response, and 64-mib-run magnitudes align",
+            "the 512 seeded-pr, 512 controlled-request, 8,192 fetch-attempt, "
+            "4,096 retained-page, and 900-second limits are playbook-specific "
+            "extensions",
+        ):
+            self.assertIn(anchor, v7_correction_section)
 
         action_boundary_sections = {
             "authority": section_text(
@@ -5817,6 +5986,14 @@ class RepositoryContractTest(unittest.TestCase):
             "request_comment_receipt",
             "post_request_scope_receipts",
         }
+        request_scope_response_fields = {
+            "method",
+            "request_url",
+            "status",
+            "date_header",
+            "body_utf8",
+            "body_sha256",
+        }
         reaction_fields = {
             "id",
             "parent_request_id",
@@ -5917,10 +6094,75 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             return (repository, pr, merge_base, head)
 
+        def charge_request_scope_response_resource(
+            response: object,
+            tracker: dict[str, object],
+        ) -> bool:
+            limits = tracker.get("limits")
+            if (
+                not isinstance(response, dict)
+                or len(response) != len(request_scope_response_fields)
+                or set(response) != request_scope_response_fields
+                or not isinstance(limits, dict)
+                or not isinstance(response.get("method"), str)
+                or response.get("method") not in ("GET", "POST")
+                or type(response.get("status")) is not int
+                or response.get("status") not in {200, 201}
+                or not isinstance(response.get("body_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", response["body_sha256"]) is None
+                or not isinstance(response.get("request_url"), str)
+                or not isinstance(response.get("date_header"), str)
+                or not isinstance(response.get("body_utf8"), str)
+                or not resource_budget_charge(
+                    tracker,
+                    fetch_attempts=1,
+                    retained_pages=1,
+                    records=1,
+                )
+            ):
+                return False
+            body_utf8 = response["body_utf8"]
+            if len(body_utf8) > limits["max_page_body_bytes"]:
+                return False
+            try:
+                body_bytes = body_utf8.encode("utf-8")
+                retained_bytes = sum(
+                    len(item.encode("utf-8"))
+                    for item in (
+                        response["request_url"],
+                        response["date_header"],
+                        body_utf8,
+                    )
+                )
+            except UnicodeEncodeError:
+                return False
+            return resource_budget_charge(
+                tracker,
+                retained_utf8_bytes=retained_bytes,
+                page_body_bytes=len(body_bytes),
+            )
+
         def request_scope_receipt_mapping(
             value: object,
+            *,
+            resource_tracker: dict[str, object] | None = None,
+            maximum_server_time: int | None = history_as_of_server_time,
         ) -> dict[int, dict[str, object]] | None:
-            if not isinstance(value, list):
+            tracker = resource_tracker
+            if tracker is None:
+                tracker = new_resource_tracker()
+            limits = tracker.get("limits") if isinstance(tracker, dict) else None
+            if (
+                not isinstance(value, list)
+                or not isinstance(limits, dict)
+                or len(value) > limits["max_controlled_requests"]
+                or (
+                    maximum_server_time is not None
+                    and (
+                        type(maximum_server_time) is not int or maximum_server_time <= 0
+                    )
+                )
+            ):
                 return None
             mapping: dict[int, dict[str, object]] = {}
 
@@ -5930,29 +6172,43 @@ class RepositoryContractTest(unittest.TestCase):
                 method: str,
                 request_url: str,
                 status: int,
+                resource_already_charged: bool = False,
             ) -> tuple[object, int] | None:
                 if (
                     not isinstance(response, dict)
-                    or set(response)
-                    != {
-                        "method",
-                        "request_url",
-                        "status",
-                        "date_header",
-                        "body_utf8",
-                        "body_sha256",
-                    }
+                    or len(response) != len(request_scope_response_fields)
+                    or set(response) != request_scope_response_fields
                     or response.get("method") != method
                     or response.get("request_url") != request_url
                     or type(response.get("status")) is not int
                     or response.get("status") != status
                     or not isinstance(response.get("body_utf8"), str)
-                    or response.get("body_sha256")
-                    != strict_utf8_sha256(response["body_utf8"])
+                    or not isinstance(response.get("date_header"), str)
+                    or not isinstance(response.get("body_sha256"), str)
+                    or (
+                        not resource_already_charged
+                        and not charge_request_scope_response_resource(
+                            response,
+                            tracker,
+                        )
+                    )
+                ):
+                    return None
+                body_utf8 = response["body_utf8"]
+                try:
+                    body_bytes = body_utf8.encode("utf-8")
+                except UnicodeEncodeError:
+                    return None
+                if (
+                    response.get("body_sha256")
+                    != hashlib.sha256(body_bytes).hexdigest()
                 ):
                     return None
                 server_time = parse_http_date(response.get("date_header"))
-                if server_time is None or server_time > history_as_of_server_time:
+                if server_time is None or (
+                    maximum_server_time is not None
+                    and server_time > maximum_server_time
+                ):
                     return None
                 try:
                     body = strict_json_loads(response["body_utf8"])
@@ -5963,13 +6219,21 @@ class RepositoryContractTest(unittest.TestCase):
             def parse_scope_responses(
                 responses: object,
             ) -> tuple[tuple[object, ...], tuple[int, int]] | None:
-                if not isinstance(responses, dict) or set(responses) != {
-                    "pull",
-                    "compare",
-                }:
+                if (
+                    not isinstance(responses, dict)
+                    or len(responses) != 2
+                    or set(responses) != {"pull", "compare"}
+                ):
                     return None
                 pull_response = responses["pull"]
-                if not isinstance(pull_response, dict):
+                if (
+                    not isinstance(pull_response, dict)
+                    or len(pull_response) != 6
+                    or not charge_request_scope_response_resource(
+                        pull_response,
+                        tracker,
+                    )
+                ):
                     return None
                 try:
                     pull_body = strict_json_loads(pull_response.get("body_utf8"))
@@ -5988,6 +6252,7 @@ class RepositoryContractTest(unittest.TestCase):
                     method="GET",
                     request_url=f"{api_root}/pulls/{pr}",
                     status=200,
+                    resource_already_charged=True,
                 )
                 if (
                     parsed_pull is None
@@ -6042,9 +6307,12 @@ class RepositoryContractTest(unittest.TestCase):
             for receipt in value:
                 if (
                     not isinstance(receipt, dict)
+                    or len(receipt) != len(request_scope_receipt_fields)
                     or set(receipt) != request_scope_receipt_fields
                     or receipt.get("kind") != "parent-recorded-request-scope-v1"
                 ):
+                    return None
+                if not resource_budget_charge(tracker, controlled_requests=1):
                     return None
                 request_id = receipt.get("request_id")
                 pre_scope = parse_scope_responses(
@@ -6124,7 +6392,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "request": normalized_request,
                     "receipt": clone(receipt),
                 }
-            return mapping
+            return mapping if resource_budget_charge(tracker) else None
 
         def request_receipt_binding_matches(
             receipt_mapping: dict[int, dict[str, object]],
@@ -7587,22 +7855,222 @@ class RepositoryContractTest(unittest.TestCase):
                 sort_keys=True,
             )
 
+        evidence_resource_budget_v1 = {
+            "profile": "github-codex-evidence-resource-budget-v1",
+            "schema_version": 1,
+            "max_seeded_pull_requests": 512,
+            "max_controlled_requests": 512,
+            "max_fetch_attempts": 8192,
+            "max_retained_pages": 4096,
+            "max_records": 20_000,
+            "max_page_body_bytes": 8_388_608,
+            "max_retained_utf8_bytes": 67_108_864,
+            "deadline_seconds": 900,
+        }
+        evidence_resource_limit_fields = {
+            key
+            for key in evidence_resource_budget_v1
+            if key not in {"profile", "schema_version"}
+        }
+
+        class EvidenceResourceBudgetExceeded(ValueError):
+            pass
+
+        def effective_resource_limits(
+            tightened_limits: dict[str, int] | None = None,
+        ) -> dict[str, int] | None:
+            production = {
+                key: int(evidence_resource_budget_v1[key])
+                for key in evidence_resource_limit_fields
+            }
+            if tightened_limits is None:
+                return production
+            if set(tightened_limits) != evidence_resource_limit_fields or any(
+                type(tightened_limits.get(key)) is not int
+                or tightened_limits[key] <= 0
+                or tightened_limits[key] > production[key]
+                for key in evidence_resource_limit_fields
+            ):
+                return None
+            return clone(tightened_limits)
+
+        def new_resource_tracker(
+            *,
+            tightened_limits: dict[str, int] | None = None,
+            monotonic_clock: object = time.monotonic,
+        ) -> dict[str, object] | None:
+            limits = effective_resource_limits(tightened_limits)
+            if limits is None or not callable(monotonic_clock):
+                return None
+            try:
+                started = monotonic_clock()
+            except Exception:
+                return None
+            if (
+                isinstance(started, bool)
+                or not isinstance(started, (int, float))
+                or not math.isfinite(float(started))
+            ):
+                return None
+            return {
+                "limits": limits,
+                "clock": monotonic_clock,
+                "started": float(started),
+                "max_observed": float(started),
+                "controlled_requests": 0,
+                "fetch_attempts": 0,
+                "retained_pages": 0,
+                "records": 0,
+                "retained_utf8_bytes": 0,
+            }
+
+        def new_sibling_resource_tracker(
+            parent: dict[str, object],
+        ) -> dict[str, object] | None:
+            limits = parent.get("limits")
+            clock = parent.get("clock")
+            started = parent.get("started")
+            max_observed = parent.get("max_observed")
+            if (
+                not isinstance(limits, dict)
+                or not callable(clock)
+                or not isinstance(started, float)
+                or not isinstance(max_observed, float)
+                or not math.isfinite(started)
+                or not math.isfinite(max_observed)
+                or max_observed < started
+            ):
+                return None
+            return {
+                "limits": clone(limits),
+                "clock": clock,
+                "started": started,
+                "max_observed": max_observed,
+                "controlled_requests": 0,
+                "fetch_attempts": 0,
+                "retained_pages": 0,
+                "records": 0,
+                "retained_utf8_bytes": 0,
+            }
+
+        def resource_budget_charge(
+            tracker: dict[str, object],
+            *,
+            controlled_requests: int = 0,
+            fetch_attempts: int = 0,
+            retained_pages: int = 0,
+            records: int = 0,
+            retained_utf8_bytes: int = 0,
+            page_body_bytes: int | None = None,
+        ) -> bool:
+            if any(
+                type(value) is not int or value < 0
+                for value in (
+                    controlled_requests,
+                    fetch_attempts,
+                    retained_pages,
+                    records,
+                    retained_utf8_bytes,
+                )
+            ) or (
+                page_body_bytes is not None
+                and (type(page_body_bytes) is not int or page_body_bytes < 0)
+            ):
+                return False
+            limits = tracker.get("limits")
+            clock = tracker.get("clock")
+            started = tracker.get("started")
+            max_observed = tracker.get("max_observed")
+            if (
+                not isinstance(limits, dict)
+                or not callable(clock)
+                or not isinstance(started, float)
+                or not isinstance(max_observed, float)
+            ):
+                return False
+            try:
+                observed = clock()
+            except Exception:
+                return False
+            if (
+                isinstance(observed, bool)
+                or not isinstance(observed, (int, float))
+                or not math.isfinite(float(observed))
+                or float(observed) < max_observed
+                or float(observed) - started > limits["deadline_seconds"]
+                or (
+                    page_body_bytes is not None
+                    and page_body_bytes > limits["max_page_body_bytes"]
+                )
+            ):
+                return False
+            charges = {
+                "controlled_requests": controlled_requests,
+                "fetch_attempts": fetch_attempts,
+                "retained_pages": retained_pages,
+                "records": records,
+                "retained_utf8_bytes": retained_utf8_bytes,
+            }
+            limit_names = {
+                "controlled_requests": "max_controlled_requests",
+                "fetch_attempts": "max_fetch_attempts",
+                "retained_pages": "max_retained_pages",
+                "records": "max_records",
+                "retained_utf8_bytes": "max_retained_utf8_bytes",
+            }
+            next_values: dict[str, int] = {}
+            for counter, charge in charges.items():
+                current = tracker.get(counter)
+                if type(current) is not int:
+                    return False
+                next_value = current + charge
+                if next_value > limits[limit_names[counter]]:
+                    return False
+                next_values[counter] = next_value
+            tracker.update(next_values)
+            tracker["max_observed"] = float(observed)
+            return True
+
+        def retained_page_utf8_sizes(
+            page: dict[str, object],
+        ) -> tuple[int, int] | None:
+            body_utf8 = page.get("body_utf8")
+            if not isinstance(body_utf8, str):
+                return None
+            values = [page.get("request_url"), body_utf8]
+            for optional_field in ("link_header", "request_after"):
+                optional_value = page.get(optional_field)
+                if optional_value is not None:
+                    values.append(optional_value)
+            if any(not isinstance(value, str) for value in values):
+                return None
+            try:
+                encoded = [value.encode("utf-8") for value in values]
+            except UnicodeEncodeError:
+                return None
+            return len(body_utf8.encode("utf-8")), sum(map(len, encoded))
+
         def raw_page(
             *,
             request_url: str,
             body: object,
             link_header: str | None = None,
             request_after: str | None = None,
+            include_digest: bool = True,
         ) -> dict[str, object]:
             body_utf8 = canonical_raw_body(body)
-            return {
+            page = {
                 "request_url": request_url,
                 "status": 200,
                 "link_header": link_header,
                 "request_after": request_after,
                 "body_utf8": body_utf8,
-                "body_sha256": hashlib.sha256(body_utf8.encode("utf-8")).hexdigest(),
             }
+            if include_digest:
+                page["body_sha256"] = hashlib.sha256(
+                    body_utf8.encode("utf-8")
+                ).hexdigest()
+            return page
 
         def rest_fetch(
             kind: str,
@@ -7611,15 +8079,30 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             parent_comment_id: int | None = None,
             direct_object: bool = False,
+            resource_tracker: dict[str, object] | None = None,
+            records_precharged: bool = False,
         ) -> dict[str, object]:
-            if direct_object:
-                chunks = [records[0] if records else {}]
-            else:
-                chunks = [
-                    records[index : index + 1] for index in range(0, len(records), 1)
-                ] or [[]]
             pages: list[dict[str, object]] = []
-            for index, chunk in enumerate(chunks):
+            page_count = 1 if direct_object or not records else len(records)
+            for index in range(page_count):
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker,
+                    fetch_attempts=1,
+                ):
+                    raise EvidenceResourceBudgetExceeded("REST fetch budget exceeded")
+                record_count = 1 if direct_object or records else 0
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker,
+                    retained_pages=1,
+                    records=0 if records_precharged else record_count,
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "REST page or record budget exceeded"
+                    )
+                if direct_object:
+                    chunk: object = records[0] if records else {}
+                else:
+                    chunk = records[index : index + 1]
                 page_number = index + 1
                 page_url = (
                     request_url
@@ -7628,20 +8111,40 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 next_url = (
                     f"{request_url}&page={page_number + 1}"
-                    if page_number < len(chunks)
+                    if page_number < page_count
                     else None
                 )
-                pages.append(
-                    raw_page(
-                        request_url=page_url,
-                        body=chunk,
-                        link_header=(
-                            f'<{next_url}>; rel="next"'
-                            if next_url is not None
-                            else None
-                        ),
-                    )
+                page = raw_page(
+                    request_url=page_url,
+                    body=chunk,
+                    link_header=(
+                        f'<{next_url}>; rel="next"' if next_url is not None else None
+                    ),
+                    include_digest=False,
                 )
+                sizes = retained_page_utf8_sizes(page)
+                if (
+                    sizes is None
+                    or resource_tracker is not None
+                    and not resource_budget_charge(
+                        resource_tracker,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    )
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "REST retained evidence budget exceeded"
+                    )
+                page["body_sha256"] = hashlib.sha256(
+                    str(page["body_utf8"]).encode("utf-8")
+                ).hexdigest()
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "REST retained evidence deadline exceeded"
+                    )
+                pages.append(page)
             return {
                 "kind": kind,
                 "transport": "rest",
@@ -7683,17 +8186,84 @@ class RepositoryContractTest(unittest.TestCase):
                 },
             }
 
+        def bounded_graphql_record_count(
+            nodes: object,
+            *,
+            maximum_records: int,
+        ) -> int | None:
+            if (
+                not isinstance(nodes, list)
+                or type(maximum_records) is not int
+                or maximum_records <= 0
+                or len(nodes) > maximum_records
+            ):
+                return None
+            count = len(nodes)
+            for node in nodes:
+                comments = node.get("comments") if isinstance(node, dict) else None
+                pages = comments.get("pages") if isinstance(comments, dict) else None
+                if not isinstance(pages, list):
+                    continue
+                if len(pages) > maximum_records:
+                    return None
+                for page in pages:
+                    nested_nodes = page.get("nodes") if isinstance(page, dict) else None
+                    if not isinstance(nested_nodes, list):
+                        continue
+                    count += len(nested_nodes)
+                    if count > maximum_records:
+                        return None
+            return count
+
         def graphql_thread_fetch(
             nodes: list[dict[str, object]],
+            *,
+            resource_tracker: dict[str, object] | None = None,
+            records_precharged: bool = False,
         ) -> dict[str, object]:
-            raw_nodes = [raw_graphql_thread_node_from_internal(node) for node in nodes]
-            chunks = [
-                raw_nodes[index : index + 1] for index in range(0, len(raw_nodes), 1)
-            ] or [[]]
             pages: list[dict[str, object]] = []
             request_after: str | None = None
-            for index, chunk in enumerate(chunks):
-                has_next = index < len(chunks) - 1
+            page_count = len(nodes) or 1
+            for index in range(page_count):
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker,
+                    fetch_attempts=1,
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "GraphQL fetch budget exceeded"
+                    )
+                record_count = 0
+                if nodes and not records_precharged:
+                    record_count = 1
+                    internal_node = nodes[index]
+                    if isinstance(internal_node, dict):
+                        internal_comments = internal_node.get("comments")
+                        internal_pages = (
+                            internal_comments.get("pages")
+                            if isinstance(internal_comments, dict)
+                            else None
+                        )
+                        if isinstance(internal_pages, list):
+                            record_count += sum(
+                                len(internal_page.get("nodes", []))
+                                for internal_page in internal_pages
+                                if isinstance(internal_page, dict)
+                                and isinstance(internal_page.get("nodes"), list)
+                            )
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker,
+                    retained_pages=1,
+                    records=0 if records_precharged else record_count,
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "GraphQL page or record budget exceeded"
+                    )
+                chunk = (
+                    [raw_graphql_thread_node_from_internal(nodes[index])]
+                    if nodes
+                    else []
+                )
+                has_next = index < page_count - 1
                 end_cursor = f"THREAD_CURSOR_{index + 1}" if has_next else None
                 body = {
                     "data": {
@@ -7710,13 +8280,35 @@ class RepositoryContractTest(unittest.TestCase):
                         }
                     }
                 }
-                pages.append(
-                    raw_page(
-                        request_url="https://api.github.com/graphql",
-                        body=body,
-                        request_after=request_after,
-                    )
+                page = raw_page(
+                    request_url="https://api.github.com/graphql",
+                    body=body,
+                    request_after=request_after,
+                    include_digest=False,
                 )
+                sizes = retained_page_utf8_sizes(page)
+                if (
+                    sizes is None
+                    or resource_tracker is not None
+                    and not resource_budget_charge(
+                        resource_tracker,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    )
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "GraphQL retained evidence budget exceeded"
+                    )
+                page["body_sha256"] = hashlib.sha256(
+                    str(page["body_utf8"]).encode("utf-8")
+                ).hexdigest()
+                if resource_tracker is not None and not resource_budget_charge(
+                    resource_tracker
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "GraphQL retained evidence deadline exceeded"
+                    )
+                pages.append(page)
                 request_after = end_cursor
             return {
                 "kind": "review_threads",
@@ -7727,22 +8319,22 @@ class RepositoryContractTest(unittest.TestCase):
 
         def raw_review_record(snapshot: object) -> dict[str, object]:
             if not isinstance(snapshot, dict):
-                return {"invalid_snapshot": clone(snapshot)}
+                return {"invalid_snapshot": snapshot}
             return {
-                "id": clone(snapshot.get("id")),
+                "id": snapshot.get("id"),
                 "node_id": f"PRR_{snapshot.get('id')}",
-                "html_url": clone(snapshot.get("url")),
+                "html_url": snapshot.get("url"),
                 "user": {
-                    "login": clone(snapshot.get("user_login")),
-                    "type": clone(snapshot.get("user_type")),
+                    "login": snapshot.get("user_login"),
+                    "type": snapshot.get("user_type"),
                     "node_id": "BOT_codex",
                 },
-                "state": clone(snapshot.get("state")),
-                "body": clone(snapshot.get("body")),
+                "state": snapshot.get("state"),
+                "body": snapshot.get("body"),
                 "submitted_at": _format_github_rfc3339_seconds(
                     snapshot.get("submitted_at")
                 ),
-                "commit_id": clone(snapshot.get("commit_id")),
+                "commit_id": snapshot.get("commit_id"),
                 "author_association": "NONE",
             }
 
@@ -7785,22 +8377,22 @@ class RepositoryContractTest(unittest.TestCase):
 
         def raw_issue_artifact_record(snapshot: object) -> dict[str, object]:
             if not isinstance(snapshot, dict):
-                return {"invalid_snapshot": clone(snapshot)}
+                return {"invalid_snapshot": snapshot}
             return {
-                "id": clone(snapshot.get("id")),
+                "id": snapshot.get("id"),
                 "node_id": f"IC_{snapshot.get('id')}",
-                "url": clone(snapshot.get("api_url")),
-                "html_url": clone(snapshot.get("url")),
+                "url": snapshot.get("api_url"),
+                "html_url": snapshot.get("url"),
                 "user": {
-                    "login": clone(snapshot.get("user_login")),
-                    "type": clone(snapshot.get("user_type")),
+                    "login": snapshot.get("user_login"),
+                    "type": snapshot.get("user_type"),
                     "node_id": "BOT_codex",
                 },
                 "performed_via_github_app": {
-                    "slug": clone(snapshot.get("app_slug")),
+                    "slug": snapshot.get("app_slug"),
                     "id": 1,
                 },
-                "body": clone(snapshot.get("body")),
+                "body": snapshot.get("body"),
                 "created_at": _format_github_rfc3339_seconds(
                     snapshot.get("created_at")
                 ),
@@ -7812,16 +8404,16 @@ class RepositoryContractTest(unittest.TestCase):
 
         def raw_request_record(value: object) -> dict[str, object]:
             if not isinstance(value, dict):
-                return {"invalid_request": clone(value)}
+                return {"invalid_request": value}
             return {
-                "id": clone(value.get("id")),
+                "id": value.get("id"),
                 "node_id": f"IC_{value.get('id')}",
                 "url": (
                     "https://api.github.com/repos/OWNER/REPO/issues/comments/"
                     f"{value.get('id')}"
                 ),
-                "html_url": clone(value.get("url")),
-                "body": clone(value.get("normalized_body")),
+                "html_url": value.get("url"),
+                "body": value.get("normalized_body"),
                 "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
                 "updated_at": _format_github_rfc3339_seconds(value.get("updated_at")),
                 "user": {
@@ -7880,15 +8472,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         def raw_reaction_record(value: object) -> dict[str, object]:
             if not isinstance(value, dict):
-                return {"invalid_reaction": clone(value)}
+                return {"invalid_reaction": value}
             return {
-                "id": clone(value.get("id")),
+                "id": value.get("id"),
                 "node_id": f"REACTION_{value.get('id')}",
-                "content": clone(value.get("content")),
+                "content": value.get("content"),
                 "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
                 "user": {
-                    "login": clone(value.get("user_login")),
-                    "type": clone(value.get("user_type")),
+                    "login": value.get("user_login"),
+                    "type": value.get("user_type"),
                     "node_id": "BOT_codex",
                 },
             }
@@ -7923,18 +8515,18 @@ class RepositoryContractTest(unittest.TestCase):
 
         def raw_inline_record(value: object) -> dict[str, object]:
             if not isinstance(value, dict):
-                return {"invalid_inline": clone(value)}
+                return {"invalid_inline": value}
             return {
-                "id": clone(value.get("id")),
+                "id": value.get("id"),
                 "node_id": f"PRRC_{value.get('id')}",
-                "html_url": clone(value.get("url")),
-                "pull_request_review_id": clone(value.get("pull_request_review_id")),
-                "commit_id": clone(value.get("commit_id")),
-                "original_commit_id": clone(value.get("original_commit_id")),
-                "body": clone(value.get("body")),
+                "html_url": value.get("url"),
+                "pull_request_review_id": value.get("pull_request_review_id"),
+                "commit_id": value.get("commit_id"),
+                "original_commit_id": value.get("original_commit_id"),
+                "body": value.get("body"),
                 "user": {
-                    "login": clone(value.get("user_login")),
-                    "type": clone(value.get("user_type")),
+                    "login": value.get("user_login"),
+                    "type": value.get("user_type"),
                     "node_id": "BOT_codex",
                 },
                 "author_association": "NONE",
@@ -7981,10 +8573,66 @@ class RepositoryContractTest(unittest.TestCase):
 
         def build_discovery_endpoint_transcript(
             raw_scopes: list[dict[str, object]],
+            *,
+            _tightened_resource_limits: dict[str, int] | None = None,
+            _monotonic_clock: object = time.monotonic,
+            _pull_node_id_suffix_by_pr: dict[int, str] | None = None,
+            _resource_tracker: dict[str, object] | None = None,
+            _single_scope_detail_only: bool = False,
         ) -> dict[str, object]:
+            effective_limits = effective_resource_limits(_tightened_resource_limits)
+            resource_tracker = (
+                new_resource_tracker(
+                    tightened_limits=_tightened_resource_limits,
+                    monotonic_clock=_monotonic_clock,
+                )
+                if _resource_tracker is None
+                else _resource_tracker
+            )
+            tracker_limits = (
+                resource_tracker.get("limits")
+                if isinstance(resource_tracker, dict)
+                else None
+            )
+            node_id_suffixes = (
+                {} if _pull_node_id_suffix_by_pr is None else _pull_node_id_suffix_by_pr
+            )
+            suffixes_valid = isinstance(node_id_suffixes, dict)
+            if suffixes_valid:
+                try:
+                    suffixes_valid = all(
+                        type(pr) is int
+                        and pr > 0
+                        and isinstance(suffix, str)
+                        and len(suffix.encode("utf-8")) <= 1_024
+                        for pr, suffix in node_id_suffixes.items()
+                    )
+                except UnicodeEncodeError:
+                    suffixes_valid = False
+            if (
+                resource_tracker is None
+                or effective_limits is None
+                or not typed_json_equal(tracker_limits, effective_limits)
+                or len(raw_scopes) > effective_limits["max_seeded_pull_requests"]
+                or not suffixes_valid
+                or type(_single_scope_detail_only) is not bool
+                or (_single_scope_detail_only and len(raw_scopes) != 1)
+            ):
+                raise EvidenceResourceBudgetExceeded("repository scope budget exceeded")
+            if not _single_scope_detail_only and not resource_budget_charge(
+                resource_tracker,
+                records=len(raw_scopes),
+            ):
+                raise EvidenceResourceBudgetExceeded(
+                    "repository discovery record budget exceeded"
+                )
             repository_pull_records: list[dict[str, object]] = []
             scope_transcripts: list[dict[str, object]] = []
             for raw_scope_record in raw_scopes:
+                if not resource_budget_charge(resource_tracker, records=2):
+                    raise EvidenceResourceBudgetExceeded(
+                        "pull and compare record budget exceeded"
+                    )
                 raw_scope = raw_scope_record.get("scope")
                 raw_lifecycle = raw_scope_record.get("lifecycle")
                 scope = raw_scope if isinstance(raw_scope, dict) else {}
@@ -7997,24 +8645,24 @@ class RepositoryContractTest(unittest.TestCase):
                     f"{pr + 100_000:040x}" if type(pr) is int and pr > 0 else "0" * 40
                 )
                 pull_record = {
-                    "number": clone(pr),
+                    "number": pr,
                     "base": {
                         "sha": base_oid,
                         "ref": "master",
                     },
                     "head": {
-                        "sha": clone(head),
+                        "sha": head,
                         "ref": f"fixture-{pr}",
                     },
-                    "state": clone(lifecycle.get("state")),
-                    "merged": clone(lifecycle.get("merged")),
-                    "merged_at": clone(lifecycle.get("merged_at")),
+                    "state": lifecycle.get("state"),
+                    "merged": lifecycle.get("merged"),
+                    "merged_at": lifecycle.get("merged_at"),
                     "merge_commit_sha": "f" * 40,
-                    "node_id": f"PR_{pr}",
+                    "node_id": f"PR_{pr}{node_id_suffixes.get(pr, '')}",
                 }
                 compare_record = {
                     "base_commit": {"sha": base_oid},
-                    "merge_base_commit": {"sha": clone(merge_base)},
+                    "merge_base_commit": {"sha": merge_base},
                     "status": "ahead",
                     "ahead_by": 1,
                 }
@@ -8023,42 +8671,83 @@ class RepositoryContractTest(unittest.TestCase):
                 else:
                     api_root = "https://api.github.com/repos/INVALID/INVALID"
                 pull_api_url = f"{api_root}/pulls/{pr}"
-                repository_pull_records.append(
-                    {
-                        "number": clone(pr),
-                        "url": pull_api_url,
-                        "base": {
-                            "sha": base_oid,
-                            "ref": "master",
-                        },
-                        "head": {
-                            "sha": clone(head),
-                            "ref": f"fixture-{pr}",
-                        },
-                        "state": clone(lifecycle.get("state")),
-                        "node_id": f"PR_{pr}",
-                    }
-                )
+                if not _single_scope_detail_only:
+                    repository_pull_records.append(
+                        {
+                            "number": pr,
+                            "url": pull_api_url,
+                            "base": {
+                                "sha": base_oid,
+                                "ref": "master",
+                            },
+                            "head": {
+                                "sha": head,
+                                "ref": f"fixture-{pr}",
+                            },
+                            "state": lifecycle.get("state"),
+                            "node_id": f"PR_{pr}",
+                        }
+                    )
                 requests = raw_scope_record.get("requests")
                 raw_requests = requests if isinstance(requests, list) else []
+                if not resource_budget_charge(
+                    resource_tracker,
+                    controlled_requests=len(raw_requests),
+                    records=len(raw_requests),
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "controlled request or request-record budget exceeded"
+                    )
                 reactions = raw_scope_record.get("reactions")
                 raw_reactions = reactions if isinstance(reactions, list) else []
                 issue_records = [raw_request_record(item) for item in raw_requests]
                 extra_issue_records = raw_scope_record.get("raw_issue_records")
                 if isinstance(extra_issue_records, list):
-                    issue_records.extend(clone(extra_issue_records))
+                    if not resource_budget_charge(
+                        resource_tracker,
+                        records=len(extra_issue_records),
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "extra issue-comment record budget exceeded"
+                        )
+                    issue_records.extend(extra_issue_records)
                 review_records: list[dict[str, object]] = []
                 extra_review_records = raw_scope_record.get("raw_review_records")
                 if isinstance(extra_review_records, list):
-                    review_records.extend(clone(extra_review_records))
+                    if not resource_budget_charge(
+                        resource_tracker,
+                        records=len(extra_review_records),
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "extra review record budget exceeded"
+                        )
+                    review_records.extend(extra_review_records)
                 inline_records: list[object] = []
                 thread_nodes: list[dict[str, object]] = []
                 extra_inline_records = raw_scope_record.get("raw_inline_records")
                 if isinstance(extra_inline_records, list):
-                    inline_records.extend(clone(extra_inline_records))
+                    if not resource_budget_charge(
+                        resource_tracker,
+                        records=len(extra_inline_records),
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "extra inline-comment record budget exceeded"
+                        )
+                    inline_records.extend(extra_inline_records)
                 extra_thread_nodes = raw_scope_record.get("raw_thread_nodes")
                 if isinstance(extra_thread_nodes, list):
-                    thread_nodes.extend(clone(extra_thread_nodes))
+                    extra_thread_record_count = bounded_graphql_record_count(
+                        extra_thread_nodes,
+                        maximum_records=effective_limits["max_records"],
+                    )
+                    if extra_thread_record_count is None or not resource_budget_charge(
+                        resource_tracker,
+                        records=extra_thread_record_count,
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "extra review-thread record budget exceeded"
+                        )
+                    thread_nodes.extend(extra_thread_nodes)
                 evidence_state = raw_scope_record.get("evidence_state")
                 if isinstance(evidence_state, dict):
                     for field in (
@@ -8070,6 +8759,10 @@ class RepositoryContractTest(unittest.TestCase):
                         artifacts = evidence_state.get(field)
                         if not isinstance(artifacts, list):
                             continue
+                        if len(artifacts) > effective_limits["max_records"]:
+                            raise EvidenceResourceBudgetExceeded(
+                                "artifact collection budget exceeded"
+                            )
                         for artifact in artifacts:
                             final = (
                                 artifact.get("final_snapshot")
@@ -8082,8 +8775,22 @@ class RepositoryContractTest(unittest.TestCase):
                                 else None
                             )
                             if channel == "issue-comment":
+                                if not resource_budget_charge(
+                                    resource_tracker,
+                                    records=1,
+                                ):
+                                    raise EvidenceResourceBudgetExceeded(
+                                        "artifact issue-comment record budget exceeded"
+                                    )
                                 issue_records.append(raw_issue_artifact_record(final))
                             elif channel == "pull-request-review":
+                                if not resource_budget_charge(
+                                    resource_tracker,
+                                    records=1,
+                                ):
+                                    raise EvidenceResourceBudgetExceeded(
+                                        "artifact review record budget exceeded"
+                                    )
                                 review_records.append(raw_review_record(final))
                                 associated = (
                                     final.get("associated_inline_comments")
@@ -8096,6 +8803,13 @@ class RepositoryContractTest(unittest.TestCase):
                                     else None
                                 )
                                 if isinstance(child_records, list):
+                                    if not resource_budget_charge(
+                                        resource_tracker,
+                                        records=len(child_records),
+                                    ):
+                                        raise EvidenceResourceBudgetExceeded(
+                                            "artifact inline record budget exceeded"
+                                        )
                                     inline_records.extend(
                                         raw_inline_record(item)
                                         for item in child_records
@@ -8118,7 +8832,26 @@ class RepositoryContractTest(unittest.TestCase):
                                             else None
                                         )
                                         if isinstance(nodes, list):
-                                            thread_nodes.extend(clone(nodes))
+                                            thread_record_count = (
+                                                bounded_graphql_record_count(
+                                                    nodes,
+                                                    maximum_records=effective_limits[
+                                                        "max_records"
+                                                    ],
+                                                )
+                                            )
+                                            if (
+                                                thread_record_count is None
+                                                or not resource_budget_charge(
+                                                    resource_tracker,
+                                                    records=thread_record_count,
+                                                )
+                                            ):
+                                                raise EvidenceResourceBudgetExceeded(
+                                                    "artifact review-thread record "
+                                                    "budget exceeded"
+                                                )
+                                            thread_nodes.extend(nodes)
 
                 pull_url = f"{api_root}/pulls/{pr}?per_page=100"
                 compare_url = f"{api_root}/compare/{base_oid}...{head}"
@@ -8131,17 +8864,43 @@ class RepositoryContractTest(unittest.TestCase):
                         pull_url,
                         [pull_record],
                         direct_object=True,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
                     ),
                     rest_fetch(
                         "compare",
                         compare_url,
                         [compare_record],
                         direct_object=True,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
                     ),
-                    rest_fetch("issue_comments", issue_url, issue_records),
-                    rest_fetch("reviews", reviews_url, review_records),
-                    rest_fetch("inline_comments", inline_url, inline_records),
-                    graphql_thread_fetch(thread_nodes),
+                    rest_fetch(
+                        "issue_comments",
+                        issue_url,
+                        issue_records,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
+                    ),
+                    rest_fetch(
+                        "reviews",
+                        reviews_url,
+                        review_records,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
+                    ),
+                    rest_fetch(
+                        "inline_comments",
+                        inline_url,
+                        inline_records,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
+                    ),
+                    graphql_thread_fetch(
+                        thread_nodes,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
+                    ),
                 ]
                 request_ids: list[int | None] = []
                 for raw_request in raw_requests:
@@ -8149,6 +8908,31 @@ class RepositoryContractTest(unittest.TestCase):
                         raw_request.get("id") if isinstance(raw_request, dict) else None
                     )
                     request_ids.append(request_id if type(request_id) is int else None)
+                if len(raw_reactions) > effective_limits["max_records"]:
+                    raise EvidenceResourceBudgetExceeded(
+                        "reaction source record budget exceeded"
+                    )
+                matching_reaction_count = 0
+                for request_id in request_ids:
+                    matching_reaction_count += sum(
+                        1
+                        for item in raw_reactions
+                        if isinstance(item, dict)
+                        and item.get("parent_request_id") == request_id
+                    )
+                    if matching_reaction_count > effective_limits[
+                        "max_records"
+                    ] or not resource_budget_charge(resource_tracker):
+                        raise EvidenceResourceBudgetExceeded(
+                            "matching reaction record budget exceeded"
+                        )
+                if not resource_budget_charge(
+                    resource_tracker,
+                    records=matching_reaction_count,
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "matching reaction record budget exceeded"
+                    )
                 for request_id in request_ids:
                     matching_reactions = [
                         raw_reaction_record(item)
@@ -8165,11 +8949,13 @@ class RepositoryContractTest(unittest.TestCase):
                             ),
                             matching_reactions,
                             parent_comment_id=request_id,
+                            resource_tracker=resource_tracker,
+                            records_precharged=True,
                         )
                     )
                 scope_transcripts.append(
                     {
-                        "pull_number": clone(pr),
+                        "pull_number": pr,
                         "fetches": fetches,
                     }
                 )
@@ -8177,47 +8963,145 @@ class RepositoryContractTest(unittest.TestCase):
                 f"https://api.github.com/repos/{current_repository}/pulls"
                 "?state=all&sort=created&direction=asc&per_page=100"
             )
-            return {
+            transcript = {
                 "schema_version": 3,
                 "repository": current_repository,
-                "scope_discovery": rest_fetch(
-                    "repository_pull_requests",
-                    scope_discovery_url,
-                    repository_pull_records,
+                "scope_discovery": (
+                    None
+                    if _single_scope_detail_only
+                    else rest_fetch(
+                        "repository_pull_requests",
+                        scope_discovery_url,
+                        repository_pull_records,
+                        resource_tracker=resource_tracker,
+                        records_precharged=True,
+                    )
                 ),
                 "scopes": scope_transcripts,
             }
+            if not resource_budget_charge(resource_tracker):
+                raise EvidenceResourceBudgetExceeded(
+                    "repository traversal deadline exceeded"
+                )
+            return transcript
 
         def request_scope_receipts_for_scopes(
             raw_scopes: list[dict[str, object]],
+            *,
+            _resource_tracker: dict[str, object] | None = None,
         ) -> list[object]:
+            if (
+                len(raw_scopes)
+                > evidence_resource_budget_v1["max_seeded_pull_requests"]
+            ):
+                raise EvidenceResourceBudgetExceeded(
+                    "request-scope sidecar scope budget exceeded"
+                )
+            tracker = (
+                new_resource_tracker()
+                if _resource_tracker is None
+                else _resource_tracker
+            )
+            if tracker is None:
+                raise EvidenceResourceBudgetExceeded(
+                    "request-scope sidecar resource tracker unavailable"
+                )
             receipts: list[object] = []
             for raw_scope in raw_scopes:
                 raw_receipts = raw_scope.get("request_scope_receipts")
                 raw_requests = raw_scope.get("requests")
                 if isinstance(raw_receipts, list):
-                    receipts.extend(clone(raw_receipts))
+                    if (
+                        len(receipts) + len(raw_receipts)
+                        > evidence_resource_budget_v1["max_controlled_requests"]
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "request-scope sidecar count budget exceeded"
+                        )
+                    if not resource_budget_charge(
+                        tracker,
+                        controlled_requests=len(raw_receipts),
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "request-scope sidecar count budget exceeded"
+                        )
+                    receipts.extend(raw_receipts)
                 elif isinstance(raw_requests, list) and raw_requests:
+                    if not resource_budget_charge(tracker, controlled_requests=1):
+                        raise EvidenceResourceBudgetExceeded(
+                            "request-scope sidecar count budget exceeded"
+                        )
                     receipts.append(
                         {
-                            "invalid_request_scope_receipts": clone(raw_receipts),
+                            "invalid_request_scope_receipts": True,
                         }
                     )
-            return receipts
+            bounded_receipts: list[object] = []
+            for receipt in receipts:
+                if (
+                    not isinstance(receipt, dict)
+                    or len(receipt) != len(request_scope_receipt_fields)
+                    or set(receipt) != request_scope_receipt_fields
+                    or receipt.get("kind") != "parent-recorded-request-scope-v1"
+                    or type(receipt.get("request_id")) is not int
+                    or receipt["request_id"] <= 0
+                    or not isinstance(receipt.get("pre_request_scope_receipts"), dict)
+                    or len(receipt["pre_request_scope_receipts"]) != 2
+                    or set(receipt["pre_request_scope_receipts"]) != {"pull", "compare"}
+                    or not isinstance(receipt.get("post_request_scope_receipts"), dict)
+                    or len(receipt["post_request_scope_receipts"]) != 2
+                    or set(receipt["post_request_scope_receipts"])
+                    != {"pull", "compare"}
+                ):
+                    bounded_receipts.append({"invalid_request_scope_receipt": True})
+                    continue
+                responses = [
+                    receipt["pre_request_scope_receipts"]["pull"],
+                    receipt["pre_request_scope_receipts"]["compare"],
+                    receipt.get("request_comment_receipt"),
+                    receipt["post_request_scope_receipts"]["pull"],
+                    receipt["post_request_scope_receipts"]["compare"],
+                ]
+                if not all(
+                    charge_request_scope_response_resource(response, tracker)
+                    for response in responses
+                ):
+                    raise EvidenceResourceBudgetExceeded(
+                        "request-scope sidecar response budget exceeded"
+                    )
+                bounded_receipts.append(clone(receipt))
+            if not resource_budget_charge(tracker):
+                raise EvidenceResourceBudgetExceeded(
+                    "request-scope sidecar deadline exceeded"
+                )
+            return bounded_receipts
 
         def parse_rest_pages(
             fetch: object,
             *,
             expected_kind: str,
             expected_url: str,
+            resource_tracker: dict[str, object] | None = None,
+            retained_record_limit: int | None = None,
         ) -> list[object] | None:
             if (
                 not isinstance(fetch, dict)
+                or len(fetch) != 4
                 or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
                 or fetch.get("kind") != expected_kind
                 or fetch.get("transport") != "rest"
                 or not isinstance(fetch.get("pages"), list)
                 or not fetch["pages"]
+            ):
+                return None
+            tracker = resource_tracker
+            if tracker is None:
+                tracker = new_resource_tracker()
+            if tracker is None or (
+                retained_record_limit is not None
+                and (
+                    type(retained_record_limit) is not int or retained_record_limit <= 0
+                )
             ):
                 return None
 
@@ -8245,8 +9129,11 @@ class RepositoryContractTest(unittest.TestCase):
             page_url = expected_url
             seen_page_urls: set[str] = set()
             for index, page in enumerate(pages):
+                if not resource_budget_charge(tracker, fetch_attempts=1):
+                    return None
                 if (
                     not isinstance(page, dict)
+                    or len(page) != 6
                     or set(page)
                     != {
                         "request_url",
@@ -8262,6 +9149,17 @@ class RepositoryContractTest(unittest.TestCase):
                     or page.get("status") != 200
                     or page.get("request_after") is not None
                     or not isinstance(page.get("body_utf8"), str)
+                ):
+                    return None
+                sizes = retained_page_utf8_sizes(page)
+                if (
+                    sizes is None
+                    or not resource_budget_charge(
+                        tracker,
+                        retained_pages=1,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    )
                     or page.get("body_sha256") != strict_utf8_sha256(page["body_utf8"])
                 ):
                     return None
@@ -8278,14 +9176,24 @@ class RepositoryContractTest(unittest.TestCase):
                 except (TypeError, ValueError):
                     return None
                 if isinstance(body, list):
+                    if (
+                        retained_record_limit is not None
+                        and len(records) + len(body) > retained_record_limit
+                    ) or not resource_budget_charge(tracker, records=len(body)):
+                        return None
                     records.extend(body)
                 elif len(pages) == 1:
+                    if (
+                        retained_record_limit is not None
+                        and len(records) + 1 > retained_record_limit
+                    ) or not resource_budget_charge(tracker, records=1):
+                        return None
                     records.append(body)
                 else:
                     return None
                 if isinstance(next_url, str):
                     page_url = next_url
-            return records
+            return records if resource_budget_charge(tracker) else None
 
         strict_rest_url = "https://api.github.com/repos/OWNER/REPO/strict?per_page=100"
         for case_name, body_utf8 in {
@@ -8328,9 +9236,12 @@ class RepositoryContractTest(unittest.TestCase):
 
         def parse_graphql_thread_pages(
             fetch: object,
+            *,
+            resource_tracker: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             if (
                 not isinstance(fetch, dict)
+                or len(fetch) != 4
                 or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
                 or fetch.get("kind") != "review_threads"
                 or fetch.get("transport") != "graphql"
@@ -8339,12 +9250,20 @@ class RepositoryContractTest(unittest.TestCase):
                 or not fetch["pages"]
             ):
                 return None
+            tracker = resource_tracker
+            if tracker is None:
+                tracker = new_resource_tracker()
+            if tracker is None:
+                return None
             expected_after: str | None = None
             nodes: list[dict[str, object]] = []
             pages = fetch["pages"]
             for index, page in enumerate(pages):
+                if not resource_budget_charge(tracker, fetch_attempts=1):
+                    return None
                 if (
                     not isinstance(page, dict)
+                    or len(page) != 6
                     or set(page)
                     != {
                         "request_url",
@@ -8360,6 +9279,17 @@ class RepositoryContractTest(unittest.TestCase):
                     or page.get("link_header") is not None
                     or page.get("request_after") != expected_after
                     or not isinstance(page.get("body_utf8"), str)
+                ):
+                    return None
+                sizes = retained_page_utf8_sizes(page)
+                if (
+                    sizes is None
+                    or not resource_budget_charge(
+                        tracker,
+                        retained_pages=1,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    )
                     or page.get("body_sha256") != strict_utf8_sha256(page["body_utf8"])
                 ):
                     return None
@@ -8400,6 +9330,8 @@ class RepositoryContractTest(unittest.TestCase):
                 else:
                     expected_after = None
                 for raw_node in connection["nodes"]:
+                    if not resource_budget_charge(tracker, records=1):
+                        return None
                     if (
                         not isinstance(raw_node, dict)
                         or not {"id", "isResolved", "isOutdated", "comments"}
@@ -8422,6 +9354,8 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     projected_comments: list[dict[str, object]] = []
                     for raw_comment in raw_comments["nodes"]:
+                        if not resource_budget_charge(tracker, records=1):
+                            return None
                         if not isinstance(raw_comment, dict) or not {
                             "id",
                             "fullDatabaseId",
@@ -8474,7 +9408,7 @@ class RepositoryContractTest(unittest.TestCase):
                             },
                         }
                     )
-            return nodes
+            return nodes if resource_budget_charge(tracker) else None
 
         graphql_shape_child = {
             "id": 990_001,
@@ -8624,9 +9558,14 @@ class RepositoryContractTest(unittest.TestCase):
             current_ancestry: dict[str, int] | None = None,
             require_current_ancestry_exact: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
+            _tightened_resource_limits: dict[str, int] | None = None,
+            _monotonic_clock: object = time.monotonic,
+            _single_scope_pull_number: int | None = None,
+            _allow_post_as_of_requests: bool = False,
         ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
+                or len(value) != 4
                 or set(value)
                 != {"schema_version", "repository", "scope_discovery", "scopes"}
                 or type(value.get("schema_version")) is not int
@@ -8634,9 +9573,41 @@ class RepositoryContractTest(unittest.TestCase):
                 or value.get("repository") != current_repository
                 or not isinstance(value.get("scopes"), list)
                 or type(prefer_unresolved_thread_blocker) is not bool
+                or type(_allow_post_as_of_requests) is not bool
+                or (
+                    _single_scope_pull_number is not None
+                    and (
+                        type(_single_scope_pull_number) is not int
+                        or _single_scope_pull_number <= 0
+                    )
+                )
             ):
                 return None
-            receipt_mapping = request_scope_receipt_mapping(request_scope_receipts)
+            resource_tracker = new_resource_tracker(
+                tightened_limits=_tightened_resource_limits,
+                monotonic_clock=_monotonic_clock,
+            )
+            effective_limits = effective_resource_limits(_tightened_resource_limits)
+            if (
+                resource_tracker is None
+                or effective_limits is None
+                or len(value["scopes"]) > effective_limits["max_seeded_pull_requests"]
+            ):
+                return None
+            receipt_resource_tracker = new_sibling_resource_tracker(resource_tracker)
+            receipt_mapping = (
+                request_scope_receipt_mapping(
+                    request_scope_receipts,
+                    resource_tracker=receipt_resource_tracker,
+                    maximum_server_time=(
+                        None
+                        if _allow_post_as_of_requests
+                        else history_as_of_server_time
+                    ),
+                )
+                if receipt_resource_tracker is not None
+                else None
+            )
             expected_declaration_raw: dict[str, object] | None = None
             if provider_declaration is not None:
                 if not declaration_is_authoritative(
@@ -8660,39 +9631,56 @@ class RepositoryContractTest(unittest.TestCase):
                 f"{api_root}/pulls?state=all&sort=created&direction=asc&per_page=100"
             )
             scope_discovery = value.get("scope_discovery")
-            if (
-                not isinstance(scope_discovery, dict)
-                or scope_discovery.get("parent_comment_id") is not None
-            ):
-                return None
-            repository_pull_records = parse_rest_pages(
-                scope_discovery,
-                expected_kind="repository_pull_requests",
-                expected_url=scope_discovery_url,
-            )
-            if not isinstance(repository_pull_records, list):
-                return None
-            discovered_pulls: dict[int, tuple[str, str]] = {}
-            for raw_pull in repository_pull_records:
-                if not isinstance(raw_pull, dict):
-                    return None
-                pr = raw_pull.get("number")
-                base = raw_pull.get("base")
-                pull_head = raw_pull.get("head")
-                base_oid = base.get("sha") if isinstance(base, dict) else None
-                head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+            discovered_pulls: dict[int, tuple[str, str] | None] = {}
+            if _single_scope_pull_number is None:
                 if (
-                    type(pr) is not int
-                    or pr <= 0
-                    or pr in discovered_pulls
-                    or raw_pull.get("url") != f"{api_root}/pulls/{pr}"
-                    or not isinstance(base_oid, str)
-                    or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
-                    or not isinstance(head, str)
-                    or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                    not isinstance(scope_discovery, dict)
+                    or scope_discovery.get("parent_comment_id") is not None
                 ):
                     return None
-                discovered_pulls[pr] = (base_oid, head)
+                repository_pull_records = parse_rest_pages(
+                    scope_discovery,
+                    expected_kind="repository_pull_requests",
+                    expected_url=scope_discovery_url,
+                    resource_tracker=resource_tracker,
+                    retained_record_limit=effective_limits["max_seeded_pull_requests"],
+                )
+                if (
+                    not isinstance(repository_pull_records, list)
+                    or len(repository_pull_records)
+                    > effective_limits["max_seeded_pull_requests"]
+                ):
+                    return None
+                for raw_pull in repository_pull_records:
+                    if not isinstance(raw_pull, dict):
+                        return None
+                    pr = raw_pull.get("number")
+                    base = raw_pull.get("base")
+                    pull_head = raw_pull.get("head")
+                    base_oid = base.get("sha") if isinstance(base, dict) else None
+                    head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+                    if (
+                        type(pr) is not int
+                        or pr <= 0
+                        or pr in discovered_pulls
+                        or raw_pull.get("url") != f"{api_root}/pulls/{pr}"
+                        or not isinstance(base_oid, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                        or not isinstance(head, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                    ):
+                        return None
+                    discovered_pulls[pr] = (base_oid, head)
+            else:
+                if (
+                    scope_discovery is not None
+                    or len(value["scopes"]) != 1
+                    or not isinstance(value["scopes"][0], dict)
+                    or value["scopes"][0].get("pull_number")
+                    != _single_scope_pull_number
+                ):
+                    return None
+                discovered_pulls[_single_scope_pull_number] = None
 
             entries: list[dict[str, object]] = []
             scope_classifications: list[dict[str, object]] = []
@@ -8702,7 +9690,7 @@ class RepositoryContractTest(unittest.TestCase):
             observed_current_finding_heads: set[str] = set()
             used_receipt_ids: set[int] = set()
             declaration_match_count = 0
-            reaction_entry_selected = False
+            request_receipt_closure_required = False
             ancestry = current_ancestry if current_ancestry is not None else {}
             if not isinstance(ancestry, dict) or any(
                 not isinstance(candidate, str)
@@ -8718,6 +9706,7 @@ class RepositoryContractTest(unittest.TestCase):
             for scope_transcript in value["scopes"]:
                 if (
                     not isinstance(scope_transcript, dict)
+                    or len(scope_transcript) != 2
                     or set(scope_transcript) != {"pull_number", "fetches"}
                     or type(scope_transcript.get("pull_number")) is not int
                     or scope_transcript.get("pull_number") <= 0
@@ -8730,9 +9719,14 @@ class RepositoryContractTest(unittest.TestCase):
                 seen_detail_pulls.add(pr)
                 repository = current_repository
                 fetches = scope_transcript["fetches"]
+                if (
+                    len(fetches)
+                    > len(detail_kinds) + effective_limits["max_controlled_requests"]
+                ):
+                    return None
                 by_kind: dict[str, list[dict[str, object]]] = {}
                 for fetch in fetches:
-                    if not isinstance(fetch, dict):
+                    if not isinstance(fetch, dict) or len(fetch) != 4:
                         return None
                     kind = fetch.get("kind")
                     if not isinstance(kind, str):
@@ -8755,6 +9749,7 @@ class RepositoryContractTest(unittest.TestCase):
                     pull_fetch,
                     expected_kind="pull_requests",
                     expected_url=f"{api_root}/pulls/{pr}?per_page=100",
+                    resource_tracker=resource_tracker,
                 )
                 if (
                     not isinstance(pull_records, list)
@@ -8767,16 +9762,18 @@ class RepositoryContractTest(unittest.TestCase):
                 pull_head = pull_record.get("head")
                 base_oid = base.get("sha") if isinstance(base, dict) else None
                 head = pull_head.get("sha") if isinstance(pull_head, dict) else None
-                discovered_base_oid, discovered_head = discovered_pulls[pr]
+                discovered_scope = discovered_pulls[pr]
                 if (
                     type(pull_record.get("number")) is not int
                     or pull_record.get("number") != pr
                     or not isinstance(base_oid, str)
                     or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
-                    or base_oid != discovered_base_oid
+                    or (
+                        discovered_scope is not None and base_oid != discovered_scope[0]
+                    )
                     or not isinstance(head, str)
                     or re.fullmatch(r"[0-9a-f]{40}", head) is None
-                    or head != discovered_head
+                    or (discovered_scope is not None and head != discovered_scope[1])
                     or pull_record.get("state") not in {"open", "closed"}
                     or type(pull_record.get("merged")) is not bool
                     or (
@@ -8792,6 +9789,7 @@ class RepositoryContractTest(unittest.TestCase):
                     by_kind["compare"][0],
                     expected_kind="compare",
                     expected_url=f"{api_root}/compare/{base_oid}...{head}",
+                    resource_tracker=resource_tracker,
                 )
                 if (
                     not isinstance(compare_records, list)
@@ -8823,18 +9821,24 @@ class RepositoryContractTest(unittest.TestCase):
                     by_kind["issue_comments"][0],
                     expected_kind="issue_comments",
                     expected_url=(f"{api_root}/issues/{pr}/comments?per_page=100"),
+                    resource_tracker=resource_tracker,
                 )
                 review_records = parse_rest_pages(
                     by_kind["reviews"][0],
                     expected_kind="reviews",
                     expected_url=f"{api_root}/pulls/{pr}/reviews?per_page=100",
+                    resource_tracker=resource_tracker,
                 )
                 inline_records = parse_rest_pages(
                     by_kind["inline_comments"][0],
                     expected_kind="inline_comments",
                     expected_url=f"{api_root}/pulls/{pr}/comments?per_page=100",
+                    resource_tracker=resource_tracker,
                 )
-                thread_nodes = parse_graphql_thread_pages(by_kind["review_threads"][0])
+                thread_nodes = parse_graphql_thread_pages(
+                    by_kind["review_threads"][0],
+                    resource_tracker=resource_tracker,
+                )
                 if not all(
                     isinstance(records, list)
                     for records in (
@@ -8899,18 +9903,26 @@ class RepositoryContractTest(unittest.TestCase):
                         or type(updated_at) is not int
                         or created_at <= 0
                         or updated_at < created_at
-                        or updated_at > history_as_of_server_time
+                        or projected_issue.get("url")
+                        != f"{api_root}/issues/comments/{issue_id}"
+                        or projected_issue.get("html_url")
+                        != (
+                            f"https://github.com/{repository}/pull/{pr}"
+                            f"#issuecomment-{issue_id}"
+                        )
                     ):
                         return None
+                    actor = raw_actor(projected_issue.get("user"))
                     if body == "@codex review":
                         if (
-                            raw_actor(projected_issue.get("user")) != "different"
-                            or projected_issue.get("url")
-                            != f"{api_root}/issues/comments/{issue_id}"
-                            or projected_issue.get("html_url")
-                            != (
-                                f"https://github.com/{repository}/pull/{pr}"
-                                f"#issuecomment-{issue_id}"
+                            actor != "different"
+                            or (
+                                not _allow_post_as_of_requests
+                                and updated_at > history_as_of_server_time
+                            )
+                            or not resource_budget_charge(
+                                resource_tracker,
+                                controlled_requests=1,
                             )
                         ):
                             return None
@@ -8943,10 +9955,15 @@ class RepositoryContractTest(unittest.TestCase):
                         normalized_issue = _normalize_github_codex_body(body)
                         if normalized_issue is None:
                             return None
+                        if created_at > history_as_of_server_time:
+                            if actor == "different":
+                                continue
+                            return None
+                        if updated_at > history_as_of_server_time:
+                            return None
                         terminal_looking = _github_codex_issue_terminal_looking(
                             normalized_issue
                         )
-                        actor = raw_actor(projected_issue.get("user"))
                         if (
                             actor == "exact"
                             and expected_declaration_raw is not None
@@ -8957,12 +9974,22 @@ class RepositoryContractTest(unittest.TestCase):
                         ):
                             declaration_match_count += 1
                             continue
-                        if not terminal_looking:
-                            if actor == "different":
-                                continue
-                            return None
                         if actor == "different":
+                            nonterminal_records.append(
+                                (
+                                    "different-issue-comment",
+                                    issue_id,
+                                    updated_at,
+                                    hashlib.sha256(
+                                        canonical_raw_body(projected_issue).encode(
+                                            "utf-8"
+                                        )
+                                    ).hexdigest(),
+                                )
+                            )
                             continue
+                        if not terminal_looking:
+                            return None
                         if actor != "exact":
                             return None
                         if (
@@ -8999,6 +10026,7 @@ class RepositoryContractTest(unittest.TestCase):
                             f"{api_root}/issues/comments/{parent_comment_id}/"
                             "reactions?per_page=100"
                         ),
+                        resource_tracker=resource_tracker,
                     )
                     if reactions_for_parent is None:
                         return None
@@ -9011,6 +10039,8 @@ class RepositoryContractTest(unittest.TestCase):
 
                 review_by_id: dict[int, dict[str, object]] = {}
                 other_review_ids: set[int] = set()
+                excluded_future_review_ids: set[int] = set()
+                excluded_future_review_by_id: dict[int, dict[str, object]] = {}
                 nonterminal_review_by_id: dict[int, dict[str, object]] = {}
                 seen_review_ids: set[int] = set()
                 for raw_review in review_records:
@@ -9027,18 +10057,47 @@ class RepositoryContractTest(unittest.TestCase):
                     seen_review_ids.add(review_id)
                     review_state = projected_review.get("state")
                     submitted_at = projected_review.get("submitted_at")
+                    actor = raw_actor(projected_review.get("user"))
+                    if (
+                        projected_review.get("html_url")
+                        != (
+                            f"https://github.com/{repository}/pull/{pr}"
+                            f"#pullrequestreview-{review_id}"
+                        )
+                        or re.fullmatch(
+                            r"[0-9a-f]{40}",
+                            str(projected_review.get("commit_id")),
+                        )
+                        is None
+                    ):
+                        return None
                     if review_state == "PENDING":
                         if submitted_at is not None:
                             return None
-                    elif (
-                        type(submitted_at) is not int
-                        or submitted_at <= 0
-                        or submitted_at > history_as_of_server_time
-                    ):
+                    elif type(submitted_at) is not int or submitted_at <= 0:
                         return None
-                    actor = raw_actor(projected_review.get("user"))
+                    if (
+                        type(submitted_at) is int
+                        and submitted_at > history_as_of_server_time
+                    ):
+                        if actor != "different":
+                            return None
+                        other_review_ids.add(review_id)
+                        excluded_future_review_ids.add(review_id)
+                        excluded_future_review_by_id[review_id] = projected_review
+                        continue
                     if actor == "different":
                         other_review_ids.add(review_id)
+                        nonterminal_records.append(
+                            (
+                                "different-pull-request-review",
+                                review_id,
+                                submitted_at,
+                                hashlib.sha256(
+                                    canonical_raw_body(projected_review).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
                         continue
                     if actor != "exact":
                         return None
@@ -9068,6 +10127,9 @@ class RepositoryContractTest(unittest.TestCase):
                 }
                 target_review_by_child_id: dict[str, int] = {}
                 nonterminal_review_by_child_id: dict[str, int] = {}
+                excluded_future_review_by_child_id: dict[
+                    str, tuple[int, dict[str, object]]
+                ] = {}
                 seen_inline_ids: set[int] = set()
                 for raw_inline in inline_records:
                     if not isinstance(raw_inline, dict):
@@ -9088,11 +10150,68 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                     if actor == "ambiguous":
                         return None
-                    if parent_id is None or actor == "different":
-                        continue
-                    if type(parent_id) is not int:
+                    if parent_id is not None and type(parent_id) is not int:
                         return None
+                    if parent_id in excluded_future_review_ids:
+                        future_parent = excluded_future_review_by_id[parent_id]
+                        child_id = str(projected_inline["id"])
+                        if (
+                            actor != "different"
+                            or projected_inline.get("url")
+                            != (
+                                f"https://github.com/{repository}/pull/{pr}"
+                                f"#discussion_r{child_id}"
+                            )
+                            or projected_inline.get("commit_id")
+                            != future_parent.get("commit_id")
+                            or re.fullmatch(
+                                r"[0-9a-f]{40}",
+                                str(projected_inline.get("original_commit_id")),
+                            )
+                            is None
+                            or child_id in excluded_future_review_by_child_id
+                        ):
+                            return None
+                        excluded_future_review_by_child_id[child_id] = (
+                            parent_id,
+                            projected_inline,
+                        )
+                        continue
+                    if actor == "different":
+                        nonterminal_records.append(
+                            (
+                                "different-inline-comment",
+                                inline_id,
+                                None,
+                                hashlib.sha256(
+                                    canonical_raw_body(projected_inline).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
+                        continue
+                    if parent_id is None:
+                        nonterminal_records.append(
+                            (
+                                "null-parent-inline-comment",
+                                inline_id,
+                                None,
+                                hashlib.sha256(
+                                    canonical_raw_body(projected_inline).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
+                        continue
                     if parent_id in other_review_ids:
+                        nonterminal_records.append(
+                            (
+                                "unrelated-parent-inline-comment",
+                                inline_id,
+                                None,
+                                hashlib.sha256(
+                                    canonical_raw_body(projected_inline).encode("utf-8")
+                                ).hexdigest(),
+                            )
+                        )
                         continue
                     if parent_id in nonterminal_inline_by_review:
                         child_id = str(projected_inline["id"])
@@ -9117,6 +10236,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ] = {review_id: [] for review_id in nonterminal_review_by_id}
                 seen_graphql_comment_ids: set[str] = set()
                 seen_graphql_database_ids: set[str] = set()
+                matched_excluded_future_child_ids: set[str] = set()
                 for thread in thread_nodes:
                     if not isinstance(thread, dict):
                         return None
@@ -9126,6 +10246,7 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                     target_review_ids: set[int] = set()
                     nonterminal_review_ids: set[int] = set()
+                    excluded_future_child_ids_in_thread: set[str] = set()
                     if not isinstance(pages, list):
                         return None
                     for page in pages:
@@ -9176,12 +10297,70 @@ class RepositoryContractTest(unittest.TestCase):
                             )
                             if nonterminal_review_id is not None:
                                 nonterminal_review_ids.add(nonterminal_review_id)
+                            excluded_future_binding = (
+                                excluded_future_review_by_child_id.get(child_id)
+                            )
+                            parent_database_id = (
+                                _canonical_positive_decimal(
+                                    parent.get("fullDatabaseId")
+                                )
+                                if isinstance(parent, dict)
+                                else None
+                            )
+                            if excluded_future_binding is not None:
+                                excluded_review_id, excluded_inline = (
+                                    excluded_future_binding
+                                )
+                                if (
+                                    child_id in matched_excluded_future_child_ids
+                                    or parent_database_id != str(excluded_review_id)
+                                    or comment.get("url") != excluded_inline.get("url")
+                                ):
+                                    return None
+                                matched_excluded_future_child_ids.add(child_id)
+                                excluded_future_child_ids_in_thread.add(child_id)
+                            elif (
+                                parent_database_id is not None
+                                and int(parent_database_id)
+                                in excluded_future_review_ids
+                            ):
+                                return None
+                    semantic_thread = clone(thread)
+                    if excluded_future_child_ids_in_thread:
+                        semantic_comments = semantic_thread.get("comments")
+                        semantic_pages = (
+                            semantic_comments.get("pages")
+                            if isinstance(semantic_comments, dict)
+                            else None
+                        )
+                        if not isinstance(semantic_pages, list):
+                            return None
+                        for semantic_page in semantic_pages:
+                            semantic_nodes = (
+                                semantic_page.get("nodes")
+                                if isinstance(semantic_page, dict)
+                                else None
+                            )
+                            if not isinstance(semantic_nodes, list):
+                                return None
+                            semantic_page["nodes"] = [
+                                semantic_comment
+                                for semantic_comment in semantic_nodes
+                                if _canonical_positive_decimal(
+                                    semantic_comment.get("fullDatabaseId")
+                                )
+                                not in excluded_future_child_ids_in_thread
+                            ]
                     for target_review_id in target_review_ids:
-                        thread_nodes_by_review[target_review_id].append(thread)
+                        thread_nodes_by_review[target_review_id].append(semantic_thread)
                     for nonterminal_review_id in nonterminal_review_ids:
                         nonterminal_thread_nodes_by_review[
                             nonterminal_review_id
-                        ].append(thread)
+                        ].append(semantic_thread)
+                if matched_excluded_future_child_ids != set(
+                    excluded_future_review_by_child_id
+                ):
+                    return None
 
                 for review_id, raw_review in nonterminal_review_by_id.items():
                     source_bundle = {
@@ -9368,6 +10547,7 @@ class RepositoryContractTest(unittest.TestCase):
                     )
 
                 provider_reactions: list[tuple[int, int, int, str]] = []
+                semantic_reaction_records: list[dict[str, object]] = []
                 seen_reaction_ids: set[int] = set()
                 for raw_reaction in reaction_records:
                     reaction_id = raw_reaction.get("id")
@@ -9380,12 +10560,16 @@ class RepositoryContractTest(unittest.TestCase):
                         or reaction_id in seen_reaction_ids
                         or type(created_at) is not int
                         or created_at <= 0
-                        or created_at > history_as_of_server_time
                         or type(parent_comment_id) is not int
                         or parent_comment_id not in request_times
                     ):
                         return None
                     seen_reaction_ids.add(reaction_id)
+                    if created_at > history_as_of_server_time:
+                        if actor == "different":
+                            continue
+                        return None
+                    semantic_reaction_records.append(raw_reaction)
                     if actor == "different":
                         continue
                     if (
@@ -9422,7 +10606,7 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 scope_audit_reactions: list[dict[str, object]] = []
                 for raw_reaction in sorted(
-                    reaction_records,
+                    semantic_reaction_records,
                     key=lambda item: (
                         int(item["created_at"]),
                         int(item["id"]),
@@ -9515,6 +10699,32 @@ class RepositoryContractTest(unittest.TestCase):
                     if item[2] in current_request_times
                 ]
 
+                request_scope_kinds: dict[int, str] = {}
+                for request_id in request_times:
+                    binding = request_receipt_bindings.get(request_id)
+                    binding_scope = (
+                        binding.get("scope") if isinstance(binding, dict) else None
+                    )
+                    if binding_scope == parsed_scope:
+                        request_scope_kinds[request_id] = "exact"
+                    elif (
+                        isinstance(binding_scope, tuple)
+                        and binding_scope[:2] == parsed_scope[:2]
+                        and binding_scope[3] != parsed_scope[3]
+                    ):
+                        request_scope_kinds[request_id] = "old-epoch"
+                    elif (
+                        isinstance(binding_scope, tuple)
+                        and binding_scope[:2] == parsed_scope[:2]
+                        and binding_scope[2] != parsed_scope[2]
+                        and binding_scope[3] == parsed_scope[3]
+                    ):
+                        request_scope_kinds[request_id] = "base-changed-same-head"
+                    else:
+                        request_scope_kinds[request_id] = "invalid"
+
+                if "base-changed-same-head" in request_scope_kinds.values():
+                    return None
                 if artifact_bases:
                     if prefer_unresolved_thread_blocker and unresolved_artifact_bases:
                         selected = max(
@@ -9544,8 +10754,13 @@ class RepositoryContractTest(unittest.TestCase):
                     }
                 else:
                     if not current_provider_reactions:
-                        if request_times:
+                        if any(
+                            request_scope_kinds[request_id] != "old-epoch"
+                            for request_id in request_times
+                        ):
                             return None
+                        if request_times:
+                            request_receipt_closure_required = True
                         scope_classifications.append(
                             {
                                 "pull_number": pr,
@@ -9633,7 +10848,7 @@ class RepositoryContractTest(unittest.TestCase):
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
                     }
-                    reaction_entry_selected = True
+                    request_receipt_closure_required = True
                 entry: dict[str, object] = {
                     "scope_key": list(parsed_scope),
                     "source_ordering_key": source_ordering_key,
@@ -9753,7 +10968,7 @@ class RepositoryContractTest(unittest.TestCase):
                     and declaration_match_count != 1
                 )
                 or (
-                    reaction_entry_selected
+                    request_receipt_closure_required
                     and (
                         receipt_mapping is None
                         or set(receipt_mapping) != used_receipt_ids
@@ -9766,16 +10981,20 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
+            sorted_scope_authority_audit = sorted(
+                scope_authority_audit,
+                key=lambda item: int(item["scope_key"][1]),
+            )
+            sorted_scope_classifications = sorted(
+                scope_classifications,
+                key=lambda item: int(item["pull_number"]),
+            )
+            if not resource_budget_charge(resource_tracker):
+                return None
             return {
                 "entries": entries,
-                "scope_authority_audit": sorted(
-                    scope_authority_audit,
-                    key=lambda item: int(item["scope_key"][1]),
-                ),
-                "scope_classifications": sorted(
-                    scope_classifications,
-                    key=lambda item: int(item["pull_number"]),
-                ),
+                "scope_authority_audit": sorted_scope_authority_audit,
+                "scope_classifications": sorted_scope_classifications,
             }
 
         def fixture_scope_classifications(
@@ -9813,9 +11032,29 @@ class RepositoryContractTest(unittest.TestCase):
         def universe_inventory(
             raw_scopes: list[dict[str, object]],
             candidates: list[dict[str, object]],
+            *,
+            _monotonic_clock: object = time.monotonic,
         ) -> dict[str, object]:
-            transcript = build_discovery_endpoint_transcript(raw_scopes)
-            request_scope_receipts = request_scope_receipts_for_scopes(raw_scopes)
+            endpoint_tracker = new_resource_tracker(
+                monotonic_clock=_monotonic_clock,
+            )
+            sidecar_tracker = (
+                new_sibling_resource_tracker(endpoint_tracker)
+                if endpoint_tracker is not None
+                else None
+            )
+            if endpoint_tracker is None or sidecar_tracker is None:
+                raise EvidenceResourceBudgetExceeded(
+                    "inventory resource trackers unavailable"
+                )
+            transcript = build_discovery_endpoint_transcript(
+                raw_scopes,
+                _resource_tracker=endpoint_tracker,
+            )
+            request_scope_receipts = request_scope_receipts_for_scopes(
+                raw_scopes,
+                _resource_tracker=sidecar_tracker,
+            )
             projection = parse_discovery_endpoint_transcript(
                 transcript,
                 request_scope_receipts=request_scope_receipts,
@@ -9830,6 +11069,7 @@ class RepositoryContractTest(unittest.TestCase):
             return {
                 "complete": True,
                 "repository": current_repository,
+                "resource_budget": clone(evidence_resource_budget_v1),
                 "pagination": clone(required_universe_pagination),
                 "discovery_endpoint_transcript": transcript,
                 "request_scope_receipts": request_scope_receipts,
@@ -9841,10 +11081,33 @@ class RepositoryContractTest(unittest.TestCase):
             raw_current: dict[str, object],
             *,
             observation_marker: str,
+            _monotonic_clock: object = time.monotonic,
+            _tightened_resource_limits: dict[str, int] | None = None,
         ) -> dict[str, object]:
-            transcript = build_discovery_endpoint_transcript([clone(raw_current)])
+            endpoint_tracker = new_resource_tracker(
+                monotonic_clock=_monotonic_clock,
+                tightened_limits=_tightened_resource_limits,
+            )
+            sidecar_tracker = (
+                new_sibling_resource_tracker(endpoint_tracker)
+                if endpoint_tracker is not None
+                else None
+            )
+            if endpoint_tracker is None or sidecar_tracker is None:
+                raise EvidenceResourceBudgetExceeded(
+                    "current inventory resource trackers unavailable"
+                )
+            transcript = build_discovery_endpoint_transcript(
+                [raw_current],
+                _pull_node_id_suffix_by_pr={
+                    current_pr: f":{observation_marker}",
+                },
+                _resource_tracker=endpoint_tracker,
+                _tightened_resource_limits=_tightened_resource_limits,
+                _single_scope_detail_only=True,
+            )
             scope = transcript["scopes"][0]
-            fetches = clone(scope["fetches"])
+            fetches = scope["fetches"]
             assert isinstance(fetches, list)
             pull_fetches = [
                 fetch
@@ -9852,26 +11115,17 @@ class RepositoryContractTest(unittest.TestCase):
                 if isinstance(fetch, dict) and fetch.get("kind") == "pull_requests"
             ]
             assert len(pull_fetches) == 1
-            pull_pages = pull_fetches[0]["pages"]
-            assert isinstance(pull_pages, list) and len(pull_pages) == 1
-            pull_page = pull_pages[0]
-            assert isinstance(pull_page, dict)
-            pull_body = json.loads(pull_page["body_utf8"])
-            assert isinstance(pull_body, dict)
-            pull_body["node_id"] = f"{pull_body.get('node_id')}:{observation_marker}"
-            pull_page["body_utf8"] = canonical_raw_body(pull_body)
-            pull_page["body_sha256"] = hashlib.sha256(
-                pull_page["body_utf8"].encode("utf-8")
-            ).hexdigest()
             raw_scope = raw_current.get("scope")
             assert isinstance(raw_scope, dict)
             return {
                 "repository": current_repository,
                 "pull_number": current_pr,
-                "head": clone(raw_scope.get("head")),
+                "head": raw_scope.get("head"),
+                "resource_budget": clone(evidence_resource_budget_v1),
                 "fetches": fetches,
                 "request_scope_receipts": request_scope_receipts_for_scopes(
-                    [raw_current]
+                    [raw_current],
+                    _resource_tracker=sidecar_tracker,
                 ),
             }
 
@@ -9881,11 +11135,14 @@ class RepositoryContractTest(unittest.TestCase):
             current_ancestry: dict[str, int],
             require_current_ancestry_exact: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
+            _tightened_resource_limits: dict[str, int] | None = None,
+            _monotonic_clock: object = time.monotonic,
         ) -> dict[str, object] | None:
             base_inventory_fields = {
                 "repository",
                 "pull_number",
                 "head",
+                "resource_budget",
                 "fetches",
             }
             if (
@@ -9898,62 +11155,22 @@ class RepositoryContractTest(unittest.TestCase):
                 or value.get("repository") != current_repository
                 or value.get("pull_number") != current_pr
                 or value.get("head") != current_head
+                or not typed_json_equal(
+                    value.get("resource_budget"),
+                    evidence_resource_budget_v1,
+                )
                 or not isinstance(value.get("fetches"), list)
             ):
                 return None
             fetches = value["fetches"]
-            pull_fetches = [
-                fetch
-                for fetch in fetches
-                if isinstance(fetch, dict) and fetch.get("kind") == "pull_requests"
-            ]
-            if len(pull_fetches) != 1:
-                return None
-            api_root = f"https://api.github.com/repos/{current_repository}"
-            pull_records = parse_rest_pages(
-                pull_fetches[0],
-                expected_kind="pull_requests",
-                expected_url=f"{api_root}/pulls/{current_pr}?per_page=100",
-            )
-            if (
-                not isinstance(pull_records, list)
-                or len(pull_records) != 1
-                or not isinstance(pull_records[0], dict)
-            ):
-                return None
-            pull_record = pull_records[0]
-            base = pull_record.get("base")
-            head = pull_record.get("head")
-            if (
-                pull_record.get("number") != current_pr
-                or not isinstance(base, dict)
-                or not isinstance(head, dict)
-                or head.get("sha") != current_head
-            ):
-                return None
-            root_record = {
-                "number": current_pr,
-                "url": f"{api_root}/pulls/{current_pr}",
-                "base": clone(base),
-                "head": clone(head),
-                "state": clone(pull_record.get("state")),
-                "node_id": clone(pull_record.get("node_id")),
-            }
             transcript = {
                 "schema_version": 3,
                 "repository": current_repository,
-                "scope_discovery": rest_fetch(
-                    "repository_pull_requests",
-                    (
-                        f"{api_root}/pulls"
-                        "?state=all&sort=created&direction=asc&per_page=100"
-                    ),
-                    [root_record],
-                ),
+                "scope_discovery": None,
                 "scopes": [
                     {
                         "pull_number": current_pr,
-                        "fetches": clone(fetches),
+                        "fetches": fetches,
                     }
                 ],
             }
@@ -9963,6 +11180,10 @@ class RepositoryContractTest(unittest.TestCase):
                 current_ancestry=current_ancestry,
                 require_current_ancestry_exact=require_current_ancestry_exact,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                _tightened_resource_limits=_tightened_resource_limits,
+                _monotonic_clock=_monotonic_clock,
+                _single_scope_pull_number=current_pr,
+                _allow_post_as_of_requests=True,
             )
             entries = (
                 parsed_transcript.get("entries")
@@ -10066,6 +11287,7 @@ class RepositoryContractTest(unittest.TestCase):
             expected_inventory_fields = {
                 "complete",
                 "repository",
+                "resource_budget",
                 "pagination",
                 "discovery_endpoint_transcript",
                 "request_scope_receipts",
@@ -10081,6 +11303,10 @@ class RepositoryContractTest(unittest.TestCase):
                     or set(value) != expected_inventory_fields
                     or value.get("complete") is not True
                     or value.get("repository") != current_repository
+                    or not typed_json_equal(
+                        value.get("resource_budget"),
+                        evidence_resource_budget_v1,
+                    )
                     or not exact_true_flags(
                         value.get("pagination"),
                         required_universe_pagination,
@@ -10460,7 +11686,8 @@ class RepositoryContractTest(unittest.TestCase):
                     assert isinstance(raw_noncandidate_scope, dict)
                     raw_scopes.append(raw_noncandidate_scope)
             raw_scopes.append(provider_declaration_scope())
-            inventory = universe_inventory(raw_scopes, candidates)
+            initial_inventory = universe_inventory(raw_scopes, candidates)
+            final_inventory = universe_inventory(raw_scopes, candidates)
             initial_raw_current = clone(current if current_raw is None else current_raw)
             final_raw_current = clone(
                 initial_raw_current if final_current_raw is None else final_current_raw
@@ -10481,8 +11708,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "window_start_exclusive": history_start_exclusive,
                 "window_end_inclusive": history_as_of_server_time,
                 "candidate_universe_count": len(candidates),
-                "initial_inventory": clone(inventory),
-                "final_inventory": clone(inventory),
+                "initial_inventory": initial_inventory,
+                "final_inventory": final_inventory,
                 "initial_current_raw_inventory": current_endpoint_inventory(
                     initial_raw_current,
                     observation_marker="initial",
@@ -11342,7 +12569,8 @@ class RepositoryContractTest(unittest.TestCase):
             raw_requests = current_record.get("requests")
             current_scope = scope_key(current_record)
             receipt_scopes = request_scope_receipt_mapping(
-                current_record.get("request_scope_receipts")
+                current_record.get("request_scope_receipts"),
+                maximum_server_time=None,
             )
             if (
                 not isinstance(raw_requests, list)
@@ -11767,6 +12995,577 @@ class RepositoryContractTest(unittest.TestCase):
             merge_base=current_merge_base,
         )
 
+        self.assertEqual(
+            evidence_resource_budget_v1,
+            {
+                "profile": "github-codex-evidence-resource-budget-v1",
+                "schema_version": 1,
+                "max_seeded_pull_requests": 512,
+                "max_controlled_requests": 512,
+                "max_fetch_attempts": 8192,
+                "max_retained_pages": 4096,
+                "max_records": 20_000,
+                "max_page_body_bytes": 8_388_608,
+                "max_retained_utf8_bytes": 67_108_864,
+                "deadline_seconds": 900,
+            },
+        )
+        for inventory_builder in (universe_inventory, current_endpoint_inventory):
+            inventory_builder_source = inspect.getsource(inventory_builder)
+            self.assertIn(
+                "new_sibling_resource_tracker(endpoint_tracker)",
+                inventory_builder_source,
+            )
+            self.assertIn(
+                "_resource_tracker=endpoint_tracker", inventory_builder_source
+            )
+            self.assertIn("_resource_tracker=sidecar_tracker", inventory_builder_source)
+        self.assertIn(
+            "_single_scope_detail_only=True",
+            inspect.getsource(current_endpoint_inventory),
+        )
+
+        def tightened_resource_limits(**changes: int) -> dict[str, int]:
+            limits = {
+                key: int(evidence_resource_budget_v1[key])
+                for key in evidence_resource_limit_fields
+            }
+            limits.update(changes)
+            return limits
+
+        current_resource_transcript = build_discovery_endpoint_transcript([current])
+        current_resource_receipts = request_scope_receipts_for_scopes([current])
+        exact_current_resource_limits = tightened_resource_limits(
+            max_seeded_pull_requests=1,
+            max_controlled_requests=1,
+            max_fetch_attempts=8,
+            max_retained_pages=8,
+            max_records=5,
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                current_resource_transcript,
+                request_scope_receipts=current_resource_receipts,
+                _tightened_resource_limits=exact_current_resource_limits,
+            )
+        )
+        for limit_name, overflow_value in (
+            ("max_fetch_attempts", 7),
+            ("max_retained_pages", 7),
+            ("max_records", 4),
+        ):
+            overflow_limits = clone(exact_current_resource_limits)
+            assert isinstance(overflow_limits, dict)
+            overflow_limits[limit_name] = overflow_value
+            with self.subTest(discovery_resource_overflow=limit_name):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        current_resource_transcript,
+                        request_scope_receipts=current_resource_receipts,
+                        _tightened_resource_limits=overflow_limits,
+                    )
+                )
+
+        exact_current_collector_limits = tightened_resource_limits(
+            max_seeded_pull_requests=1,
+            max_controlled_requests=1,
+            max_fetch_attempts=7,
+            max_retained_pages=7,
+            max_records=4,
+        )
+        exact_current_collector_transcript = build_discovery_endpoint_transcript(
+            [current],
+            _tightened_resource_limits=exact_current_collector_limits,
+            _single_scope_detail_only=True,
+        )
+        self.assertIsNone(exact_current_collector_transcript["scope_discovery"])
+        for limit_name, overflow_value in (
+            ("max_fetch_attempts", 6),
+            ("max_retained_pages", 6),
+            ("max_records", 3),
+        ):
+            overflow_limits = clone(exact_current_collector_limits)
+            assert isinstance(overflow_limits, dict)
+            overflow_limits[limit_name] = overflow_value
+            with self.subTest(current_collector_resource_overflow=limit_name):
+                with self.assertRaises(EvidenceResourceBudgetExceeded):
+                    build_discovery_endpoint_transcript(
+                        [current],
+                        _tightened_resource_limits=overflow_limits,
+                        _single_scope_detail_only=True,
+                    )
+
+        current_detail_inventory = current_endpoint_inventory(
+            current,
+            observation_marker="resource-exact",
+        )
+        self.assertIsNotNone(
+            current_endpoint_inventory(
+                current,
+                observation_marker="resource-collector-exact",
+                _tightened_resource_limits=tightened_resource_limits(
+                    max_seeded_pull_requests=1,
+                    max_controlled_requests=1,
+                    max_fetch_attempts=7,
+                    max_retained_pages=7,
+                    max_records=5,
+                ),
+            )
+        )
+        exact_current_detail_limits = tightened_resource_limits(
+            max_seeded_pull_requests=1,
+            max_controlled_requests=1,
+            max_fetch_attempts=7,
+            max_retained_pages=7,
+            max_records=5,
+        )
+        self.assertIsNotNone(
+            parse_current_endpoint_inventory(
+                current_detail_inventory,
+                current_ancestry={},
+                _tightened_resource_limits=exact_current_detail_limits,
+            )
+        )
+        for limit_name, overflow_value in (
+            ("max_fetch_attempts", 6),
+            ("max_retained_pages", 6),
+            ("max_records", 4),
+        ):
+            overflow_limits = clone(exact_current_detail_limits)
+            assert isinstance(overflow_limits, dict)
+            overflow_limits[limit_name] = overflow_value
+            with self.subTest(current_detail_resource_overflow=limit_name):
+                self.assertIsNone(
+                    parse_current_endpoint_inventory(
+                        current_detail_inventory,
+                        current_ancestry={},
+                        _tightened_resource_limits=overflow_limits,
+                    )
+                )
+
+        unserializable_current_detail = dict(current_detail_inventory)
+        unserializable_current_fetches = list(current_detail_inventory["fetches"])
+        unserializable_current_fetches.append(object())
+        unserializable_current_detail["fetches"] = unserializable_current_fetches
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                unserializable_current_detail,
+                current_ancestry={},
+                _tightened_resource_limits=exact_current_detail_limits,
+            )
+        )
+
+        exact_sidecar_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=1,
+                max_fetch_attempts=5,
+                max_retained_pages=5,
+                max_records=5,
+            )
+        )
+        self.assertIsNotNone(exact_sidecar_tracker)
+        assert exact_sidecar_tracker is not None
+        self.assertIsNotNone(
+            request_scope_receipt_mapping(
+                current_resource_receipts,
+                resource_tracker=exact_sidecar_tracker,
+            )
+        )
+        too_few_sidecar_attempts_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_controlled_requests=1,
+                max_fetch_attempts=4,
+                max_retained_pages=5,
+                max_records=5,
+            )
+        )
+        self.assertIsNotNone(too_few_sidecar_attempts_tracker)
+        assert too_few_sidecar_attempts_tracker is not None
+        self.assertIsNone(
+            request_scope_receipt_mapping(
+                current_resource_receipts,
+                resource_tracker=too_few_sidecar_attempts_tracker,
+            )
+        )
+        self.assertIsNone(
+            request_scope_receipt_mapping(
+                [
+                    current_resource_receipts[0]
+                    for _ in range(
+                        evidence_resource_budget_v1["max_controlled_requests"] + 1
+                    )
+                ]
+            )
+        )
+        excessive_sidecars = clone(current)
+        assert isinstance(excessive_sidecars, dict)
+        excessive_sidecars["request_scope_receipts"] = [
+            current_resource_receipts[0]
+            for _ in range(evidence_resource_budget_v1["max_controlled_requests"] + 1)
+        ]
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            request_scope_receipts_for_scopes([excessive_sidecars])
+
+        sidecar_with_extra_response_field = clone(current)
+        assert isinstance(sidecar_with_extra_response_field, dict)
+        extra_response_receipts = sidecar_with_extra_response_field[
+            "request_scope_receipts"
+        ]
+        assert isinstance(extra_response_receipts, list)
+        extra_response_receipt = extra_response_receipts[0]
+        assert isinstance(extra_response_receipt, dict)
+        extra_pre_responses = extra_response_receipt["pre_request_scope_receipts"]
+        assert isinstance(extra_pre_responses, dict)
+        extra_pull_response = extra_pre_responses["pull"]
+        assert isinstance(extra_pull_response, dict)
+        extra_pull_response["unbudgeted"] = "must-not-be-cloned"
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            request_scope_receipts_for_scopes([sidecar_with_extra_response_field])
+
+        sidecar_with_unbounded_response_value = clone(current)
+        assert isinstance(sidecar_with_unbounded_response_value, dict)
+        unbounded_value_receipts = sidecar_with_unbounded_response_value[
+            "request_scope_receipts"
+        ]
+        assert isinstance(unbounded_value_receipts, list)
+        unbounded_value_receipt = unbounded_value_receipts[0]
+        assert isinstance(unbounded_value_receipt, dict)
+        unbounded_pre_responses = unbounded_value_receipt["pre_request_scope_receipts"]
+        assert isinstance(unbounded_pre_responses, dict)
+        unbounded_pull_response = unbounded_pre_responses["pull"]
+        assert isinstance(unbounded_pull_response, dict)
+        unbounded_pull_response["method"] = [object()]
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            request_scope_receipts_for_scopes([sidecar_with_unbounded_response_value])
+
+        record_overflow_before_serialization = clone(current)
+        assert isinstance(record_overflow_before_serialization, dict)
+        record_overflow_before_serialization["raw_issue_records"] = [{}, object()]
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            build_discovery_endpoint_transcript(
+                [record_overflow_before_serialization],
+                _tightened_resource_limits=tightened_resource_limits(max_records=4),
+            )
+
+        two_scope_resource_records = [current, samples[0]]
+        two_scope_resource_transcript = build_discovery_endpoint_transcript(
+            two_scope_resource_records
+        )
+        two_scope_resource_receipts = request_scope_receipts_for_scopes(
+            two_scope_resource_records
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                two_scope_resource_transcript,
+                request_scope_receipts=two_scope_resource_receipts,
+                _tightened_resource_limits=tightened_resource_limits(
+                    max_seeded_pull_requests=2,
+                    max_controlled_requests=2,
+                ),
+            )
+        )
+        for limit_name in (
+            "max_seeded_pull_requests",
+            "max_controlled_requests",
+        ):
+            overflow_limits = tightened_resource_limits(**{limit_name: 1})
+            with self.subTest(discovery_scope_resource_overflow=limit_name):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        two_scope_resource_transcript,
+                        request_scope_receipts=two_scope_resource_receipts,
+                        _tightened_resource_limits=overflow_limits,
+                    )
+                )
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            build_discovery_endpoint_transcript(
+                two_scope_resource_records,
+                _tightened_resource_limits=tightened_resource_limits(
+                    max_seeded_pull_requests=1
+                ),
+            )
+
+        budget_rest_url = (
+            f"https://api.github.com/repos/{current_repository}/budget?per_page=100"
+        )
+        budget_rest_fetch = rest_fetch(
+            "budget_fixture",
+            budget_rest_url,
+            [{"text": "é"}],
+        )
+        budget_page_sizes = retained_page_utf8_sizes(budget_rest_fetch["pages"][0])
+        self.assertIsNotNone(budget_page_sizes)
+        assert budget_page_sizes is not None
+        budget_page = budget_rest_fetch["pages"][0]
+        manual_body_bytes = len(budget_page["body_utf8"].encode("utf-8"))
+        manual_retained_bytes = sum(
+            len(value.encode("utf-8"))
+            for value in (
+                budget_page["request_url"],
+                budget_page["body_utf8"],
+            )
+        )
+        self.assertGreater(
+            len(budget_page["body_utf8"].encode("utf-8")),
+            len(budget_page["body_utf8"]),
+        )
+        self.assertEqual(
+            budget_page_sizes,
+            (manual_body_bytes, manual_retained_bytes),
+        )
+        exact_page_limits = tightened_resource_limits(
+            max_fetch_attempts=1,
+            max_retained_pages=1,
+            max_records=1,
+            max_page_body_bytes=budget_page_sizes[0],
+            max_retained_utf8_bytes=budget_page_sizes[1],
+        )
+        exact_page_tracker = new_resource_tracker(tightened_limits=exact_page_limits)
+        self.assertIsNotNone(exact_page_tracker)
+        assert exact_page_tracker is not None
+        self.assertIsNotNone(
+            parse_rest_pages(
+                budget_rest_fetch,
+                expected_kind="budget_fixture",
+                expected_url=budget_rest_url,
+                resource_tracker=exact_page_tracker,
+            )
+        )
+        for limit_name, exact_value in (
+            ("max_page_body_bytes", budget_page_sizes[0]),
+            ("max_retained_utf8_bytes", budget_page_sizes[1]),
+        ):
+            too_small_limits = clone(exact_page_limits)
+            assert isinstance(too_small_limits, dict)
+            too_small_limits[limit_name] = exact_value - 1
+            too_small_tracker = new_resource_tracker(tightened_limits=too_small_limits)
+            self.assertIsNotNone(too_small_tracker)
+            assert too_small_tracker is not None
+            with self.subTest(rest_resource_overflow=limit_name):
+                self.assertIsNone(
+                    parse_rest_pages(
+                        budget_rest_fetch,
+                        expected_kind="budget_fixture",
+                        expected_url=budget_rest_url,
+                        resource_tracker=too_small_tracker,
+                    )
+                )
+
+        two_record_rest_fetch = rest_fetch(
+            "budget_fixture",
+            budget_rest_url,
+            [{"id": 1}, {"id": 2}],
+        )
+        exact_seed_record_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=2,
+                max_retained_pages=2,
+                max_records=2,
+            )
+        )
+        self.assertIsNotNone(exact_seed_record_tracker)
+        assert exact_seed_record_tracker is not None
+        self.assertIsNotNone(
+            parse_rest_pages(
+                two_record_rest_fetch,
+                expected_kind="budget_fixture",
+                expected_url=budget_rest_url,
+                resource_tracker=exact_seed_record_tracker,
+                retained_record_limit=2,
+            )
+        )
+        too_few_rest_attempts_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=1,
+                max_retained_pages=2,
+                max_records=2,
+            )
+        )
+        self.assertIsNotNone(too_few_rest_attempts_tracker)
+        assert too_few_rest_attempts_tracker is not None
+        self.assertIsNone(
+            parse_rest_pages(
+                two_record_rest_fetch,
+                expected_kind="budget_fixture",
+                expected_url=budget_rest_url,
+                resource_tracker=too_few_rest_attempts_tracker,
+                retained_record_limit=2,
+            )
+        )
+        overflowing_seed_record_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=2,
+                max_retained_pages=2,
+                max_records=2,
+            )
+        )
+        self.assertIsNotNone(overflowing_seed_record_tracker)
+        assert overflowing_seed_record_tracker is not None
+        self.assertIsNone(
+            parse_rest_pages(
+                two_record_rest_fetch,
+                expected_kind="budget_fixture",
+                expected_url=budget_rest_url,
+                resource_tracker=overflowing_seed_record_tracker,
+                retained_record_limit=1,
+            )
+        )
+
+        second_graphql_shape = clone(graphql_shape_internal)
+        assert isinstance(second_graphql_shape, dict)
+        second_graphql_shape["id"] = "THREAD_990_002"
+        two_page_graphql_fetch = graphql_thread_fetch(
+            [graphql_shape_internal, second_graphql_shape]
+        )
+        two_page_graphql_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=2,
+                max_retained_pages=2,
+                max_records=4,
+            )
+        )
+        self.assertIsNotNone(two_page_graphql_tracker)
+        assert two_page_graphql_tracker is not None
+        self.assertIsNotNone(
+            parse_graphql_thread_pages(
+                two_page_graphql_fetch,
+                resource_tracker=two_page_graphql_tracker,
+            )
+        )
+        too_few_graphql_attempts_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=1,
+                max_retained_pages=2,
+                max_records=4,
+            )
+        )
+        self.assertIsNotNone(too_few_graphql_attempts_tracker)
+        assert too_few_graphql_attempts_tracker is not None
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                two_page_graphql_fetch,
+                resource_tracker=too_few_graphql_attempts_tracker,
+            )
+        )
+
+        graphql_budget_fetch = graphql_thread_fetch([graphql_shape_internal])
+        graphql_exact_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=1,
+                max_retained_pages=1,
+                max_records=2,
+            )
+        )
+        self.assertIsNotNone(graphql_exact_tracker)
+        assert graphql_exact_tracker is not None
+        self.assertIsNotNone(
+            parse_graphql_thread_pages(
+                graphql_budget_fetch,
+                resource_tracker=graphql_exact_tracker,
+            )
+        )
+        graphql_overflow_tracker = new_resource_tracker(
+            tightened_limits=tightened_resource_limits(
+                max_fetch_attempts=1,
+                max_retained_pages=1,
+                max_records=1,
+            )
+        )
+        self.assertIsNotNone(graphql_overflow_tracker)
+        assert graphql_overflow_tracker is not None
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                graphql_budget_fetch,
+                resource_tracker=graphql_overflow_tracker,
+            )
+        )
+        oversized_internal_graphql = clone(graphql_shape_internal)
+        assert isinstance(oversized_internal_graphql, dict)
+        oversized_internal_graphql["comments"]["pages"][0]["nodes"] = [
+            object() for _ in range(evidence_resource_budget_v1["max_records"])
+        ]
+        graphql_precharge_tracker = new_resource_tracker()
+        self.assertIsNotNone(graphql_precharge_tracker)
+        assert graphql_precharge_tracker is not None
+        with self.assertRaises(EvidenceResourceBudgetExceeded):
+            graphql_thread_fetch(
+                [oversized_internal_graphql],
+                resource_tracker=graphql_precharge_tracker,
+            )
+
+        def stepped_clock(first: float, later: float) -> object:
+            observations = iter((first, later))
+
+            def observe() -> float:
+                return next(observations, later)
+
+            return observe
+
+        deadline_limits = tightened_resource_limits(deadline_seconds=1)
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                current_resource_transcript,
+                request_scope_receipts=current_resource_receipts,
+                _tightened_resource_limits=deadline_limits,
+                _monotonic_clock=stepped_clock(0.0, 1.0),
+            )
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                current_resource_transcript,
+                request_scope_receipts=current_resource_receipts,
+                _tightened_resource_limits=deadline_limits,
+                _monotonic_clock=stepped_clock(0.0, 1.001),
+            )
+        )
+        for invalid_start in (math.nan, math.inf, -math.inf):
+            with self.subTest(invalid_resource_clock_start=invalid_start):
+                self.assertIsNone(
+                    new_resource_tracker(
+                        monotonic_clock=lambda value=invalid_start: value
+                    )
+                )
+        for invalid_later in (math.nan, math.inf, -math.inf, -1.0):
+            with self.subTest(invalid_resource_clock_observation=invalid_later):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        current_resource_transcript,
+                        request_scope_receipts=current_resource_receipts,
+                        _tightened_resource_limits=deadline_limits,
+                        _monotonic_clock=stepped_clock(0.0, invalid_later),
+                    )
+                )
+        self.assertIsNone(
+            new_resource_tracker(
+                monotonic_clock=lambda: (_ for _ in ()).throw(
+                    RuntimeError("clock unavailable")
+                )
+            )
+        )
+        raising_later_clock_calls = 0
+
+        def raising_later_clock() -> float:
+            nonlocal raising_later_clock_calls
+            raising_later_clock_calls += 1
+            if raising_later_clock_calls == 1:
+                return 0.0
+            raise RuntimeError("clock unavailable")
+
+        raising_later_tracker = new_resource_tracker(
+            monotonic_clock=raising_later_clock
+        )
+        self.assertIsNotNone(raising_later_tracker)
+        assert raising_later_tracker is not None
+        self.assertFalse(resource_budget_charge(raising_later_tracker))
+        invalid_tightening = tightened_resource_limits()
+        invalid_tightening["max_records"] = True
+        self.assertIsNone(effective_resource_limits(invalid_tightening))
+        invalid_tightening = tightened_resource_limits()
+        invalid_tightening["max_records"] = (
+            evidence_resource_budget_v1["max_records"] + 1
+        )
+        self.assertIsNone(effective_resource_limits(invalid_tightening))
+
         for case_name in ("duplicate-key", "nonstandard-constant"):
             malformed_scope_receipt = clone(current["request_scope_receipts"][0])
             assert isinstance(malformed_scope_receipt, dict)
@@ -12087,6 +13886,79 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             compute_provider_profile(declaration, baseline_history, current),
             "thumbs-up-clean",
+        )
+        self.assertIsNot(
+            baseline_history["initial_inventory"],
+            baseline_history["final_inventory"],
+        )
+        self.assertIsNot(
+            baseline_history["initial_inventory"]["discovery_endpoint_transcript"],
+            baseline_history["final_inventory"]["discovery_endpoint_transcript"],
+        )
+
+        malformed_resource_budget_histories: dict[str, dict[str, object]] = {}
+        for name, mutate_budget in {
+            "missing": lambda inventory: inventory.pop("resource_budget"),
+            "extra-field": lambda inventory: inventory["resource_budget"].update(
+                {"extra": 1}
+            ),
+            "boolean-version": lambda inventory: inventory["resource_budget"].update(
+                {"schema_version": True}
+            ),
+            "float-record-cap": lambda inventory: inventory["resource_budget"].update(
+                {"max_records": 20_000.0}
+            ),
+            "raised-record-cap": lambda inventory: inventory["resource_budget"].update(
+                {"max_records": 20_001}
+            ),
+            "lowered-record-cap": lambda inventory: inventory["resource_budget"].update(
+                {"max_records": 19_999}
+            ),
+            "wrong-profile": lambda inventory: inventory["resource_budget"].update(
+                {"profile": "github-codex-evidence-resource-budget-v2"}
+            ),
+        }.items():
+            malformed_history = clone(baseline_history)
+            assert isinstance(malformed_history, dict)
+            for inventory_name in ("initial_inventory", "final_inventory"):
+                mutate_budget(malformed_history[inventory_name])
+            malformed_resource_budget_histories[name] = malformed_history
+        for name, malformed_history in malformed_resource_budget_histories.items():
+            with self.subTest(resource_budget_profile_near_miss=name):
+                self.assertEqual(
+                    compute_provider_profile(
+                        declaration,
+                        malformed_history,
+                        current,
+                    ),
+                    "unknown",
+                )
+
+        malformed_current_budget = clone(baseline_history)
+        assert isinstance(malformed_current_budget, dict)
+        for inventory_name in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            malformed_current_budget[inventory_name]["resource_budget"][
+                "max_retained_pages"
+            ] = 4095
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                malformed_current_budget,
+                current,
+            ),
+            "unknown",
+        )
+
+        budget_inside_v3_transcript = clone(baseline_transcript)
+        assert isinstance(budget_inside_v3_transcript, dict)
+        budget_inside_v3_transcript["resource_budget"] = clone(
+            evidence_resource_budget_v1
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(budget_inside_v3_transcript)
         )
 
         def raw_current_with_issue_finding(
@@ -12618,6 +14490,116 @@ class RepositoryContractTest(unittest.TestCase):
                 current,
             ),
             "thumbs-up-clean",
+        )
+
+        historical_old_epoch_only = sample(5)
+        historical_old_epoch_scope = clone(historical_old_epoch_only["scope"])
+        assert isinstance(historical_old_epoch_scope, dict)
+        historical_old_epoch_scope["head"] = "f" * 40
+        historical_old_epoch_only["request_scope_receipts"] = [
+            request_scope_receipt(
+                historical_old_epoch_only["requests"][0],
+                historical_old_epoch_scope,
+            )
+        ]
+        restamp(historical_old_epoch_only)
+        old_epoch_raw_scopes = [current, historical_old_epoch_only]
+        historical_old_epoch_projection = parse_discovery_endpoint_transcript(
+            build_discovery_endpoint_transcript(old_epoch_raw_scopes),
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                old_epoch_raw_scopes
+            ),
+        )
+        self.assertIsNotNone(historical_old_epoch_projection)
+        assert isinstance(historical_old_epoch_projection, dict)
+        historical_old_epoch_key = list(scope_key(historical_old_epoch_only) or ())
+        self.assertIn(
+            {
+                "pull_number": 5,
+                "scope_key": historical_old_epoch_key,
+                "classification": "confirmed-non-candidate",
+            },
+            historical_old_epoch_projection["scope_classifications"],
+        )
+        self.assertFalse(
+            any(
+                entry.get("scope_key") == historical_old_epoch_key
+                for entry in historical_old_epoch_projection["entries"]
+            )
+        )
+        historical_old_epoch_audit = next(
+            audit
+            for audit in historical_old_epoch_projection["scope_authority_audit"]
+            if audit.get("scope_key") == historical_old_epoch_key
+        )
+        self.assertEqual(len(historical_old_epoch_audit["requests"]), 1)
+        self.assertEqual(len(historical_old_epoch_audit["reactions"]), 1)
+
+        current_old_epoch_only = clone(current)
+        assert isinstance(current_old_epoch_only, dict)
+        current_old_epoch_scope = clone(current_old_epoch_only["scope"])
+        assert isinstance(current_old_epoch_scope, dict)
+        current_old_epoch_scope["head"] = "f" * 40
+        current_old_epoch_only["request_scope_receipts"] = [
+            request_scope_receipt(
+                current_old_epoch_only["requests"][0],
+                current_old_epoch_scope,
+            )
+        ]
+        current_old_epoch_projection = parse_discovery_endpoint_transcript(
+            build_discovery_endpoint_transcript([current_old_epoch_only]),
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                [current_old_epoch_only]
+            ),
+        )
+        self.assertIsNotNone(current_old_epoch_projection)
+        assert isinstance(current_old_epoch_projection, dict)
+        self.assertEqual(current_old_epoch_projection["entries"], [])
+        self.assertEqual(
+            current_old_epoch_projection["scope_classifications"],
+            [
+                {
+                    "pull_number": current_pr,
+                    "scope_key": list(current_scope_key),
+                    "classification": "current",
+                }
+            ],
+        )
+        self.assertEqual(
+            len(current_old_epoch_projection["scope_authority_audit"]),
+            1,
+        )
+
+        current_exact_pending = clone(current)
+        assert isinstance(current_exact_pending, dict)
+        current_exact_pending["reactions"] = []
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                build_discovery_endpoint_transcript([current_exact_pending]),
+                request_scope_receipts=request_scope_receipts_for_scopes(
+                    [current_exact_pending]
+                ),
+            )
+        )
+
+        current_same_head_different_base = clone(current)
+        assert isinstance(current_same_head_different_base, dict)
+        mismatched_base_scope = clone(current_same_head_different_base["scope"])
+        assert isinstance(mismatched_base_scope, dict)
+        mismatched_base_scope["pr_merge_base"] = "e" * 40
+        current_same_head_different_base["request_scope_receipts"] = [
+            request_scope_receipt(
+                current_same_head_different_base["requests"][0],
+                mismatched_base_scope,
+            )
+        ]
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                build_discovery_endpoint_transcript([current_same_head_different_base]),
+                request_scope_receipts=request_scope_receipts_for_scopes(
+                    [current_same_head_different_base]
+                ),
+            )
         )
         self.assertEqual(
             compute_provider_profile(
@@ -13281,6 +15263,57 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             terminal_with_malformed_receipt_report["request_policy"],
             {"status": "unknown", "warnings": []},
+        )
+        terminal_with_base_changed_request = clone(terminal_current)
+        assert isinstance(terminal_with_base_changed_request, dict)
+        base_changed_scope = clone(terminal_with_base_changed_request["scope"])
+        assert isinstance(base_changed_scope, dict)
+        base_changed_scope["pr_merge_base"] = "e" * 40
+        terminal_with_base_changed_request["request_scope_receipts"] = [
+            request_scope_receipt(
+                terminal_with_base_changed_request["requests"][0],
+                base_changed_scope,
+            )
+        ]
+        restamp(terminal_with_base_changed_request)
+        base_changed_terminal_history = history(
+            terminal_history,
+            current_raw=terminal_with_base_changed_request,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                base_changed_terminal_history,
+                terminal_with_base_changed_request,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_with_old_epoch_request = clone(terminal_current)
+        assert isinstance(terminal_with_old_epoch_request, dict)
+        terminal_old_epoch_scope = clone(terminal_with_old_epoch_request["scope"])
+        assert isinstance(terminal_old_epoch_scope, dict)
+        terminal_old_epoch_scope["head"] = "f" * 40
+        terminal_with_old_epoch_request["request_scope_receipts"] = [
+            request_scope_receipt(
+                terminal_with_old_epoch_request["requests"][0],
+                terminal_old_epoch_scope,
+            )
+        ]
+        restamp(terminal_with_old_epoch_request)
+        old_epoch_terminal_history = history(
+            terminal_history,
+            current_raw=terminal_with_old_epoch_request,
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                old_epoch_terminal_history,
+                terminal_with_old_epoch_request,
+                normal_lane_timing,
+            )
         )
 
         terminal_with_absent_raw_sidecar_history = history(
@@ -14494,16 +16527,33 @@ class RepositoryContractTest(unittest.TestCase):
                 "warnings": ["duplicate-observed"],
             },
         )
+        post_cutoff_duplicate_request = request(
+            9,
+            history_as_of_server_time + 1,
+            pr=current_pr,
+        )
+        terminal_with_post_cutoff_pending = clone(terminal_current)
+        assert isinstance(terminal_with_post_cutoff_pending, dict)
+        add_scoped_request(
+            terminal_with_post_cutoff_pending,
+            post_cutoff_duplicate_request,
+            request_scope_receipt(
+                post_cutoff_duplicate_request,
+                terminal_with_post_cutoff_pending["scope"],
+            ),
+            index=0,
+        )
+        restamp(terminal_with_post_cutoff_pending)
         terminal_duplicate_final_read_drift = history(
             terminal_history,
             current_raw=terminal_current,
-            final_current_raw=terminal_with_duplicate_request,
+            final_current_raw=terminal_with_post_cutoff_pending,
         )
         terminal_duplicate_final_read_drift_report = expected_report_from_inputs(
             "accepted-terminal-clean",
             declaration,
             terminal_duplicate_final_read_drift,
-            terminal_with_duplicate_request,
+            terminal_with_post_cutoff_pending,
             normal_lane_timing,
         )
         self.assertIsNotNone(terminal_duplicate_final_read_drift_report)
@@ -14518,6 +16568,30 @@ class RepositoryContractTest(unittest.TestCase):
                 "status": "warning",
                 "warnings": ["duplicate-observed"],
             },
+        )
+        terminal_post_cutoff_missing_sidecar = clone(terminal_with_post_cutoff_pending)
+        assert isinstance(terminal_post_cutoff_missing_sidecar, dict)
+        terminal_post_cutoff_missing_sidecar["request_scope_receipts"] = [
+            clone(terminal_current["request_scope_receipts"][0])
+        ]
+        restamp(terminal_post_cutoff_missing_sidecar)
+        missing_sidecar_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+            final_current_raw=terminal_post_cutoff_missing_sidecar,
+        )
+        missing_sidecar_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            missing_sidecar_history,
+            terminal_post_cutoff_missing_sidecar,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(missing_sidecar_report)
+        assert isinstance(missing_sidecar_report, dict)
+        self.assertEqual(
+            missing_sidecar_report["request_policy"],
+            {"status": "unknown", "warnings": []},
         )
         early_lane_timing = lane_timing(5, 15)
         early_report = expected_report_from_inputs(
@@ -15954,6 +18028,92 @@ class RepositoryContractTest(unittest.TestCase):
                 derived_inventory_entries([ordinary_replies_candidate, current]),
             )
         )
+        mixed_future_thread_transcript = clone(ordinary_replies_transcript)
+        assert isinstance(mixed_future_thread_transcript, dict)
+        mixed_future_scope = mixed_future_thread_transcript["scopes"][0]
+        mixed_future_fetches = mixed_future_scope["fetches"]
+        mixed_future_review_id = 920_030
+        mixed_future_inline_id = 920_031
+        mixed_future_review_index = fetch_index(mixed_future_fetches, "reviews")
+        mixed_future_review_fetch = mixed_future_fetches[mixed_future_review_index]
+        mixed_future_review = clone(background_review)
+        assert isinstance(mixed_future_review, dict)
+        mixed_future_review.update(
+            {
+                "id": mixed_future_review_id,
+                "html_url": (
+                    f"https://github.com/{current_repository}/pull/{background_pr}"
+                    f"#pullrequestreview-{mixed_future_review_id}"
+                ),
+                "submitted_at": _format_github_rfc3339_seconds(
+                    history_as_of_server_time + 1
+                ),
+            }
+        )
+        mixed_future_fetches[mixed_future_review_index] = rest_fetch(
+            "reviews",
+            mixed_future_review_fetch["pages"][0]["request_url"],
+            [
+                *raw_rest_records(mixed_future_review_fetch),
+                mixed_future_review,
+            ],
+        )
+        mixed_future_inline_index = fetch_index(
+            mixed_future_fetches,
+            "inline_comments",
+        )
+        mixed_future_inline_fetch = mixed_future_fetches[mixed_future_inline_index]
+        mixed_future_fetches[mixed_future_inline_index] = rest_fetch(
+            "inline_comments",
+            mixed_future_inline_fetch["pages"][0]["request_url"],
+            [
+                *raw_rest_records(mixed_future_inline_fetch),
+                {
+                    "id": mixed_future_inline_id,
+                    "html_url": (
+                        f"https://github.com/{current_repository}/pull/"
+                        f"{background_pr}#discussion_r{mixed_future_inline_id}"
+                    ),
+                    "user": {"login": "octocat", "type": "User"},
+                    "pull_request_review_id": mixed_future_review_id,
+                    "commit_id": background_head,
+                    "original_commit_id": background_head,
+                    "body": "Future human reply in an existing provider thread.",
+                },
+            ],
+        )
+        mixed_future_thread_index = fetch_index(
+            mixed_future_fetches,
+            "review_threads",
+        )
+        mixed_future_threads = parse_graphql_thread_pages(
+            mixed_future_fetches[mixed_future_thread_index]
+        )
+        assert isinstance(mixed_future_threads, list) and mixed_future_threads
+        mixed_future_threads[0]["comments"]["pages"][0]["nodes"].append(
+            _graphql_thread_comment_fixture(
+                mixed_future_inline_id,
+                parent_id=mixed_future_review_id,
+                repository=current_repository,
+                pull_request=background_pr,
+            )
+        )
+        mixed_future_fetches[mixed_future_thread_index] = graphql_thread_fetch(
+            mixed_future_threads
+        )
+        mixed_future_projection = parse_discovery_endpoint_transcript(
+            mixed_future_thread_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                [ordinary_replies_candidate, current]
+            ),
+        )
+        self.assertIsNotNone(mixed_future_projection)
+        self.assertTrue(
+            typed_json_equal(
+                ordinary_replies_projection,
+                mixed_future_projection,
+            )
+        )
         audit_shadow_transcript = clone(ordinary_replies_transcript)
         assert isinstance(audit_shadow_transcript, dict)
         audit_shadow_fetches = audit_shadow_transcript["scopes"][0]["fetches"]
@@ -16328,6 +18488,53 @@ class RepositoryContractTest(unittest.TestCase):
 
         future_human_review_history = clone(background_noise_history)
         assert isinstance(future_human_review_history, dict)
+        for candidates_name in ("initial_candidates", "final_candidates"):
+            future_candidate = next(
+                item
+                for item in future_human_review_history[candidates_name]
+                if item.get("scope", {}).get("pr") == background_pr
+            )
+            future_candidate["reactions"] = [
+                item
+                for item in future_candidate["reactions"]
+                if item.get("id") != background_reaction["id"]
+            ]
+            restamp(future_candidate)
+        future_initial_transcript = future_human_review_history["initial_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        future_initial_scope = next(
+            item
+            for item in future_initial_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_initial_fetches = future_initial_scope["fetches"]
+        for kind, record_id in (
+            ("issue_comments", background_issue["id"]),
+            ("reviews", background_review_id),
+            ("inline_comments", background_inline_id),
+            ("request_reactions", background_reaction["id"]),
+        ):
+            initial_fetch_index = fetch_index(future_initial_fetches, kind)
+            initial_fetch = future_initial_fetches[initial_fetch_index]
+            initial_records = [
+                item
+                for item in raw_rest_records(initial_fetch)
+                if item.get("id") != record_id
+            ]
+            future_initial_fetches[initial_fetch_index] = rest_fetch(
+                kind,
+                initial_fetch["pages"][0]["request_url"],
+                initial_records,
+                parent_comment_id=(
+                    background_request_id if kind == "request_reactions" else None
+                ),
+            )
+        initial_thread_index = fetch_index(
+            future_initial_fetches,
+            "review_threads",
+        )
+        future_initial_fetches[initial_thread_index] = graphql_thread_fetch([])
         future_review_inventory = future_human_review_history["final_inventory"]
         future_review_transcript = future_review_inventory[
             "discovery_endpoint_transcript"
@@ -16358,14 +18565,121 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             future_review_records,
         )
-        self.assertIsNone(
-            parse_discovery_endpoint_transcript(
-                future_review_transcript,
-                request_scope_receipts=future_review_inventory[
-                    "request_scope_receipts"
+
+        future_issue_index = fetch_index(future_review_fetches, "issue_comments")
+        future_issue_records = raw_rest_records(
+            future_review_fetches[future_issue_index]
+        )
+        future_human_issue = next(
+            item
+            for item in future_issue_records
+            if item.get("id") == background_issue["id"]
+        )
+        future_human_issue["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 2
+        )
+        future_human_issue["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 2
+        )
+        future_review_fetches[future_issue_index] = rest_fetch(
+            "issue_comments",
+            (
+                f"https://api.github.com/repos/{current_repository}/issues/"
+                f"{background_pr}/comments?per_page=100"
+            ),
+            future_issue_records,
+        )
+
+        future_reaction_index = fetch_index(
+            future_review_fetches,
+            "request_reactions",
+        )
+        future_reaction_fetch = future_review_fetches[future_reaction_index]
+        future_reaction_records = raw_rest_records(future_reaction_fetch)
+        future_human_reaction = next(
+            item
+            for item in future_reaction_records
+            if item.get("id") == background_reaction["id"]
+        )
+        future_human_reaction["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 3
+        )
+        future_review_fetches[future_reaction_index] = rest_fetch(
+            "request_reactions",
+            (
+                f"https://api.github.com/repos/{current_repository}/issues/comments/"
+                f"{background_request_id}/reactions?per_page=100"
+            ),
+            future_reaction_records,
+            parent_comment_id=background_request_id,
+        )
+
+        initial_noise_projection = parse_discovery_endpoint_transcript(
+            future_human_review_history["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=future_human_review_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        future_human_projection = parse_discovery_endpoint_transcript(
+            future_review_transcript,
+            request_scope_receipts=future_review_inventory["request_scope_receipts"],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(initial_noise_projection)
+        self.assertIsNotNone(future_human_projection)
+        self.assertTrue(
+            typed_json_equal(initial_noise_projection, future_human_projection)
+        )
+        self.assertFalse(
+            typed_json_equal(
+                future_human_review_history["initial_inventory"][
+                    "discovery_endpoint_transcript"
                 ],
-                provider_declaration=declaration,
+                future_review_transcript,
             )
+        )
+        for inventory, projection in (
+            (
+                future_human_review_history["initial_inventory"],
+                initial_noise_projection,
+            ),
+            (future_review_inventory, future_human_projection),
+        ):
+            assert isinstance(projection, dict)
+            self.assertTrue(
+                typed_json_equal(
+                    inventory["scope_classifications"],
+                    projection["scope_classifications"],
+                )
+            )
+            self.assertTrue(
+                typed_json_equal(
+                    inventory["entries"],
+                    [
+                        entry
+                        for entry in projection["entries"]
+                        if entry.get("scope_key") != list(current_scope_key)
+                    ],
+                )
+            )
+        assert isinstance(future_human_projection, dict)
+        future_audits = {
+            tuple(audit["scope_key"]): audit
+            for audit in future_human_projection["scope_authority_audit"]
+        }
+        for expected_candidate in future_human_review_history["final_candidates"]:
+            expected_audit = candidate_scope_authority_audit(expected_candidate)
+            actual_audit = clone(future_audits[scope_key(expected_candidate)])
+            assert isinstance(expected_audit, dict)
+            assert isinstance(actual_audit, dict)
+            actual_audit.pop("nonterminal_records", None)
+            self.assertTrue(typed_json_equal(expected_audit, actual_audit))
+        self.assertIsNotNone(validate_history_universe(future_human_review_history))
+        self.assertTrue(
+            current_raw_authority_matches(future_human_review_history, current)
         )
         self.assertEqual(
             compute_provider_profile(
@@ -16373,7 +18687,362 @@ class RepositoryContractTest(unittest.TestCase):
                 future_human_review_history,
                 current,
             ),
-            "unknown",
+            "thumbs-up-clean",
+        )
+
+        in_cutoff_human_history = clone(future_human_review_history)
+        assert isinstance(in_cutoff_human_history, dict)
+        in_cutoff_final_inventory = in_cutoff_human_history["final_inventory"]
+        in_cutoff_final_transcript = in_cutoff_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        in_cutoff_scope = next(
+            item
+            for item in in_cutoff_final_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        in_cutoff_fetches = in_cutoff_scope["fetches"]
+        in_cutoff_issue_index = fetch_index(in_cutoff_fetches, "issue_comments")
+        in_cutoff_issue_fetch = in_cutoff_fetches[in_cutoff_issue_index]
+        in_cutoff_issue_records = raw_rest_records(in_cutoff_issue_fetch)
+        in_cutoff_issue = next(
+            item
+            for item in in_cutoff_issue_records
+            if item.get("id") == background_issue["id"]
+        )
+        in_cutoff_issue["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time - 1
+        )
+        in_cutoff_issue["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time - 1
+        )
+        in_cutoff_fetches[in_cutoff_issue_index] = rest_fetch(
+            "issue_comments",
+            in_cutoff_issue_fetch["pages"][0]["request_url"],
+            in_cutoff_issue_records,
+        )
+        in_cutoff_projection = parse_discovery_endpoint_transcript(
+            in_cutoff_final_transcript,
+            request_scope_receipts=in_cutoff_final_inventory["request_scope_receipts"],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(in_cutoff_projection)
+        self.assertFalse(
+            typed_json_equal(initial_noise_projection, in_cutoff_projection)
+        )
+        self.assertIsNone(validate_history_universe(in_cutoff_human_history))
+
+        future_exact_child_inventory = clone(future_review_inventory)
+        assert isinstance(future_exact_child_inventory, dict)
+        future_exact_child_transcript = future_exact_child_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_exact_child_scope = next(
+            item
+            for item in future_exact_child_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_exact_child_fetches = future_exact_child_scope["fetches"]
+        future_exact_child_index = fetch_index(
+            future_exact_child_fetches,
+            "inline_comments",
+        )
+        future_exact_child_fetch = future_exact_child_fetches[future_exact_child_index]
+        future_exact_child_records = raw_rest_records(future_exact_child_fetch)
+        future_exact_child = next(
+            item
+            for item in future_exact_child_records
+            if item.get("id") == background_inline_id
+        )
+        future_exact_child["user"] = {"login": exact_login, "type": "Bot"}
+        future_exact_child_fetches[future_exact_child_index] = rest_fetch(
+            "inline_comments",
+            future_exact_child_fetch["pages"][0]["request_url"],
+            future_exact_child_records,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_exact_child_transcript,
+                request_scope_receipts=future_exact_child_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        future_parent_mismatch_inventory = clone(future_review_inventory)
+        assert isinstance(future_parent_mismatch_inventory, dict)
+        future_parent_mismatch_transcript = future_parent_mismatch_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_parent_mismatch_scope = next(
+            item
+            for item in future_parent_mismatch_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_parent_mismatch_fetches = future_parent_mismatch_scope["fetches"]
+        future_parent_mismatch_index = fetch_index(
+            future_parent_mismatch_fetches,
+            "review_threads",
+        )
+        future_parent_mismatch_fetch = future_parent_mismatch_fetches[
+            future_parent_mismatch_index
+        ]
+        for page in future_parent_mismatch_fetch["pages"]:
+            body = json.loads(page["body_utf8"])
+            raw_nodes = body["data"]["repository"]["pullRequest"]["reviewThreads"][
+                "nodes"
+            ]
+            for raw_thread in raw_nodes:
+                for raw_comment in raw_thread["comments"]["nodes"]:
+                    if raw_comment.get("fullDatabaseId") == str(background_inline_id):
+                        raw_comment["pullRequestReview"]["fullDatabaseId"] = str(
+                            background_review_id + 1
+                        )
+            replace_raw_json_body(page, canonical_raw_body(body))
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_parent_mismatch_transcript,
+                request_scope_receipts=future_parent_mismatch_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        future_missing_thread_inventory = clone(future_review_inventory)
+        assert isinstance(future_missing_thread_inventory, dict)
+        future_missing_thread_transcript = future_missing_thread_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_missing_thread_scope = next(
+            item
+            for item in future_missing_thread_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_missing_thread_fetches = future_missing_thread_scope["fetches"]
+        future_missing_thread_index = fetch_index(
+            future_missing_thread_fetches,
+            "review_threads",
+        )
+        future_missing_thread_fetches[future_missing_thread_index] = (
+            graphql_thread_fetch([])
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_missing_thread_transcript,
+                request_scope_receipts=future_missing_thread_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        for actor_name, actor_type, expected_clean in (
+            ("dependabot[bot]", "Bot", True),
+            (exact_login, "Bot", False),
+            ("other-codex[bot]", "Bot", False),
+        ):
+            actor_history = clone(future_human_review_history)
+            assert isinstance(actor_history, dict)
+            actor_inventory = actor_history["final_inventory"]
+            actor_transcript = actor_inventory["discovery_endpoint_transcript"]
+            actor_scope = next(
+                item
+                for item in actor_transcript["scopes"]
+                if item.get("pull_number") == background_pr
+            )
+            actor_fetches = actor_scope["fetches"]
+            for kind, record_id in (
+                ("issue_comments", background_issue["id"]),
+                ("reviews", background_review_id),
+                ("request_reactions", background_reaction["id"]),
+            ):
+                actor_fetch_index = fetch_index(actor_fetches, kind)
+                actor_fetch = actor_fetches[actor_fetch_index]
+                actor_records = raw_rest_records(actor_fetch)
+                actor_record = next(
+                    item for item in actor_records if item.get("id") == record_id
+                )
+                actor_record["user"] = {
+                    "login": actor_name,
+                    "type": actor_type,
+                }
+                actor_fetches[actor_fetch_index] = rest_fetch(
+                    kind,
+                    actor_fetch["pages"][0]["request_url"],
+                    actor_records,
+                    parent_comment_id=(
+                        background_request_id if kind == "request_reactions" else None
+                    ),
+                )
+            parsed_actor_history = parse_discovery_endpoint_transcript(
+                actor_transcript,
+                request_scope_receipts=actor_inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
+            with self.subTest(post_as_of_actor=actor_name):
+                if expected_clean:
+                    self.assertIsNotNone(parsed_actor_history)
+                    self.assertEqual(
+                        compute_provider_profile(
+                            declaration,
+                            actor_history,
+                            current,
+                        ),
+                        "thumbs-up-clean",
+                    )
+                else:
+                    self.assertIsNone(parsed_actor_history)
+                    self.assertEqual(
+                        compute_provider_profile(
+                            declaration,
+                            actor_history,
+                            current,
+                        ),
+                        "unknown",
+                    )
+
+        for carrier_kind, record_id in (
+            ("issue_comments", background_issue["id"]),
+            ("reviews", background_review_id),
+            ("request_reactions", background_reaction["id"]),
+        ):
+            for actor_name in (exact_login, "other-codex[bot]"):
+                isolated_actor_history = clone(future_human_review_history)
+                assert isinstance(isolated_actor_history, dict)
+                isolated_inventory = isolated_actor_history["final_inventory"]
+                isolated_transcript = isolated_inventory[
+                    "discovery_endpoint_transcript"
+                ]
+                isolated_scope = next(
+                    item
+                    for item in isolated_transcript["scopes"]
+                    if item.get("pull_number") == background_pr
+                )
+                isolated_fetches = isolated_scope["fetches"]
+                isolated_fetch_index = fetch_index(
+                    isolated_fetches,
+                    carrier_kind,
+                )
+                isolated_fetch = isolated_fetches[isolated_fetch_index]
+                isolated_records = raw_rest_records(isolated_fetch)
+                isolated_record = next(
+                    item for item in isolated_records if item.get("id") == record_id
+                )
+                isolated_record["user"] = {
+                    "login": actor_name,
+                    "type": "Bot",
+                }
+                isolated_fetches[isolated_fetch_index] = rest_fetch(
+                    carrier_kind,
+                    isolated_fetch["pages"][0]["request_url"],
+                    isolated_records,
+                    parent_comment_id=(
+                        background_request_id
+                        if carrier_kind == "request_reactions"
+                        else None
+                    ),
+                )
+                with self.subTest(
+                    post_as_of_carrier=carrier_kind,
+                    post_as_of_non_excludable_actor=actor_name,
+                ):
+                    self.assertIsNone(
+                        parse_discovery_endpoint_transcript(
+                            isolated_transcript,
+                            request_scope_receipts=isolated_inventory[
+                                "request_scope_receipts"
+                            ],
+                            provider_declaration=declaration,
+                        )
+                    )
+
+        cross_cutoff_human_edit = clone(future_human_review_history)
+        assert isinstance(cross_cutoff_human_edit, dict)
+        cross_cutoff_inventory = cross_cutoff_human_edit["final_inventory"]
+        cross_cutoff_transcript = cross_cutoff_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        cross_cutoff_scope = next(
+            item
+            for item in cross_cutoff_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        cross_cutoff_fetches = cross_cutoff_scope["fetches"]
+        cross_cutoff_issue_index = fetch_index(
+            cross_cutoff_fetches,
+            "issue_comments",
+        )
+        cross_cutoff_issue_fetch = cross_cutoff_fetches[cross_cutoff_issue_index]
+        cross_cutoff_issue_records = raw_rest_records(cross_cutoff_issue_fetch)
+        cross_cutoff_issue = next(
+            item
+            for item in cross_cutoff_issue_records
+            if item.get("id") == background_issue["id"]
+        )
+        cross_cutoff_issue["created_at"] = background_issue["created_at"]
+        cross_cutoff_issue["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 2
+        )
+        cross_cutoff_fetches[cross_cutoff_issue_index] = rest_fetch(
+            "issue_comments",
+            cross_cutoff_issue_fetch["pages"][0]["request_url"],
+            cross_cutoff_issue_records,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                cross_cutoff_transcript,
+                request_scope_receipts=cross_cutoff_inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
+        )
+
+        post_cutoff_request_history = clone(baseline_history)
+        assert isinstance(post_cutoff_request_history, dict)
+        post_cutoff_inventory = post_cutoff_request_history["final_inventory"]
+        post_cutoff_transcript = post_cutoff_inventory["discovery_endpoint_transcript"]
+        post_cutoff_scope = next(
+            item
+            for item in post_cutoff_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        post_cutoff_fetches = post_cutoff_scope["fetches"]
+        post_cutoff_issue_index = fetch_index(
+            post_cutoff_fetches,
+            "issue_comments",
+        )
+        post_cutoff_issue_fetch = post_cutoff_fetches[post_cutoff_issue_index]
+        post_cutoff_request = request(
+            940_001,
+            history_as_of_server_time + 1,
+            pr=background_pr,
+        )
+        post_cutoff_fetches[post_cutoff_issue_index] = rest_fetch(
+            "issue_comments",
+            post_cutoff_issue_fetch["pages"][0]["request_url"],
+            [
+                *raw_rest_records(post_cutoff_issue_fetch),
+                raw_request_record(post_cutoff_request),
+            ],
+        )
+        post_cutoff_fetches.append(
+            rest_fetch(
+                "request_reactions",
+                (
+                    f"https://api.github.com/repos/{current_repository}/issues/"
+                    "comments/940001/reactions?per_page=100"
+                ),
+                [],
+                parent_comment_id=940_001,
+            )
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                post_cutoff_transcript,
+                request_scope_receipts=post_cutoff_inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
         )
 
         ambiguous_background_noise = clone(background_noise_history)
@@ -18020,7 +20689,7 @@ class RepositoryContractTest(unittest.TestCase):
                 history(terminal_basis_with_future_human),
                 current,
             ),
-            "unknown",
+            "clean",
         )
 
         terminal_basis_with_relocated_reaction = (

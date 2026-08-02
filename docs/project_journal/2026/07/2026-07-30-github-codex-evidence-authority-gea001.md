@@ -150,16 +150,26 @@ superseded_by:
     native identity, and canonical source-record digest; same time/ID cannot
     substitute a reaction for a terminal artifact. Pull scope uses a canonical
     compare fetch, and only `merge_base_commit.sha` supplies `pr_merge_base`.
-    Every raw historical/current server time must be
-  at or before the GitHub response-time as-of, including confirmed-different
-    actors excluded from provider ordering. Confirmed different-user and clearly
-    unrelated-bot comments, reviews, inline threads, and reactions remain in the
-    audit but do not enter provider ordering; missing identity,
-    exact-login/wrong-type, and differently cased or other `codex`-containing bot
-    identities make the profile unknown. A provider terminal artifact can form
-    a candidate without an observed request, while reaction-only evidence always
-    requires its exact controlled parent. `mixed` always requires terminal
-    payload for a clean result.
+    Repository discovery uses the closed
+    `github-codex-evidence-resource-budget-v1` profile: at most 512 seeded pull
+    requests, 512 controlled requests, 8,192 fetch attempts, 4,096 retained
+    pages, 20,000 records, 8,388,608 UTF-8 bytes in one page, 67,108,864
+    retained UTF-8 bytes in one traversal, and 900 monotonic seconds. Every
+    overflow selects `unknown`; no prefix may be treated as complete.
+    Actor identity is validated before applying the frozen as-of projection.
+    A fully new post-cutoff issue comment, review, or reaction from a confirmed
+    different human or clearly unrelated bot remains in the raw transcript but
+    may be excluded from the semantic projection only after its carrier schema,
+    canonical URL, commit/scope fields, and actor all validate. A controlled
+    exact `@codex review` request is always policy-relevant and must be within
+    the cutoff. Any post-cutoff exact-provider or identity-ambiguous record,
+    cross-cutoff issue-comment edit, or unproved carrier selects `unknown`.
+    Schema version 3 has no per-inline-child server timestamp, so it cannot
+    infer that a human reply attached to an in-cutoff provider review is a
+    safely excludable suffix. A provider terminal artifact can form a candidate
+    without an observed request, while reaction-only evidence always requires
+    its exact controlled parent. `mixed` always requires terminal payload for
+    a clean result.
 - A no-start rejection would be availability evidence, not clean evidence, but
   the fixed authority baseline has no accepted no-start body grammar. Free-form exact-bot
   prose therefore remains inconclusive. A future policy may activate
@@ -228,8 +238,10 @@ superseded_by:
   current scope from the exact GitHub-server-time-anchored 30-day historical
   candidate universe and validate it separately. The interval is
   `(as_of - 2592000, as_of]`; the lower boundary is excluded, the upper
-  boundary is included, future artifacts are impossible, and the source URL,
-  boundaries, and complete universe count are recorded. If that historical
+  boundary is included, post-cutoff policy-bearing artifacts remain invalid,
+  and only the fully validated confirmed-different raw-only suffix described
+  below is excluded without moving that window. The source URL, boundaries,
+  and complete universe count are recorded. If that historical
   universe has at least ten candidates, take exactly the newest ten; otherwise
   take the complete historical candidate set without skipping an incomplete or
   unfavourable outcome. A moving
@@ -640,6 +652,100 @@ it never meant that every fully traversed historical scope must count as a
 current profile sample, or that transport-specific opaque cursors are verdict
 semantics.
 
+## v7 Named-Single Superseding Corrections
+
+The formal v7 named-single review of
+`0f77fb7b1dd59f5eed522fa9699497aa013695fc..1774f12e180b88193c0b88568b3895a2760393b5`
+found three P2 gaps. This section deliberately preserves the earlier
+“Actor-independent as-of bound” and old-epoch entries above as review history,
+but supersedes them wherever they conflict with the rules below.
+
+1. **Old-epoch-only poisoning.** A fully validated request-scope sidecar bound
+   to the same repository and PR but a genuinely different head is old-epoch
+   audit evidence. It does not enter current-scope request ordering, duplicate
+   warnings, reaction fallback, or candidate count. When the traversed endpoint
+   is the selected current PR but every controlled request is old-head, the
+   scope remains classified `current` with no candidate entry; for another
+   fully traversed historical PR scope it is `confirmed-non-candidate`, also
+   with no entry. This exception requires closure over every request receipt.
+   A same-head/different-merge-base receipt is not an old epoch; missing,
+   malformed, duplicate, extra, or unmatched sidecars remain fail-closed.
+2. **Actor-first raw-only suffix.** The former actor-independent rule could
+   never converge after a legitimate human or unrelated bot wrote a record
+   after the frozen cutoff. Identity is now validated first. A fully new
+   post-cutoff non-request issue comment, review, or reaction may remain
+   raw-only and be excluded from the semantic projection only when it is proved
+   to come from a confirmed different human or clearly unrelated bot and its
+   complete carrier schema, canonical URL, commit/scope fields, and actor all
+   validate. A controlled exact `@codex review` request is always
+   policy-relevant and must be within the cutoff. A post-cutoff exact-provider
+   or identity-ambiguous record, a cross-cutoff edit to an issue comment, or an
+   invalid/incomplete carrier remains fail-closed. Schema version 3 exposes no
+   per-inline-child server timestamp, so it cannot infer that a reply attached
+   to an in-cutoff provider review is a safely excludable later human suffix.
+3. **Executable repository-wide resource budget.** Every initial and final
+   traversal now uses the exact closed
+   `github-codex-evidence-resource-budget-v1` profile: 512 seeded pull requests,
+   512 controlled requests, 8,192 fetch attempts, 4,096 retained pages, 20,000
+   records, 8,388,608 UTF-8 bytes per page, 67,108,864 retained UTF-8 bytes per
+   traversal, and a 900-second monotonic deadline. Attempts, pages, bytes, and
+   records are charged before their corresponding request, decode, retention,
+   or accumulation step; exceeding any cap selects `unknown` without accepting
+   a truncated prefix. Initial and final traversals receive independent
+   budgets and deadlines.
+
+Implementation hardening while closing those findings made the bounds and
+plane separation explicit. Endpoint evidence and request-scope sidecars use
+non-borrowing ledgers under the same inventory start/deadline; each sidecar is
+pre-counted and its five raw responses are byte- and record-bounded before
+digesting or decoding. Sidecar overflow closes request/reaction authority but
+does not erase a complete terminal result. A current raw inventory parses its
+single retained detail fetch set once—without a synthetic repository seed,
+duplicate pull parse, second deadline, or post-budget byte rewrite. Known
+GraphQL nested-record counts are charged before cloning/serialization. The
+semantic projection also retains in-cutoff confirmed-different and
+null-parent/unrelated audit context, while only fully validated post-cutoff
+confirmed-different suffixes may converge as raw-only noise.
+
+Two outcome boundaries are likewise explicit. A valid same-head/different-base
+sidecar blocks even when a terminal clean exists, because it proves that the
+whole-PR scope changed. Conversely, a new receipt-bound R2 observed only during
+the final reread after a stable clean changes request policy (normally to
+`duplicate-observed`) but not terminal outcome authority. A missing or malformed
+R2 sidecar makes request policy unknown; it still cannot delete the already
+proved stable result. This is the direct implementation of the producer-policy
+versus consumer-verdict split below.
+
+The decision itself is unchanged and is recorded here explicitly to prevent
+future drift: **a trustworthy result being present is sufficient verdict
+evidence**. In concrete terms, a stable current-scope clean provider artifact
+may pass when every historical finding is resolved and no newer finding,
+malformed terminal artifact, unresolved thread, lifecycle/scope change, or
+incomplete snapshot contradicts it. A request records producer intent and
+orchestration compliance; it is not the consumer verdict. Therefore
+`duplicate-observed` and early-request warnings remain visible, and the agent
+must not produce another same-scope request, but those producer-policy defects
+do not veto an independently valid provider result or require a fabricated
+request/run join.
+
+This decision remains pinned to
+[`JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`](https://github.com/JoeyTeng/codex-review-gate/commit/16366aa81270ad2c875d2ceb8ce194f5b2308af6)
+and the released
+[`JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`](https://github.com/JoeyTeng/codex-review-gate-action/commit/2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6),
+with common Action tree
+`d03de9035d20f285e6a93986d436403b4a30e9bc`. Provider-result authority and
+consumption despite duplicate or early request timing are inherited from that
+baseline. The 20,000-item, 8-MiB-response, and 64-MiB-run magnitudes align with
+its pinned `src/evidence-budget.mjs`; the playbook maps those bounds to records,
+per-page UTF-8 bytes, and retained traversal bytes. The 512 seeded-PR, 512
+controlled-request, 8,192 fetch-attempt, 4,096 retained-page, and 900-second
+limits are playbook-specific extensions. This is an evidence-authority
+alignment, not a claim that the Action and playbook have identical scope or
+runtime policy.
+Any future change must update the pinned source/release/tree evidence and state
+which inherited decision or playbook extension changed; it must not silently
+restore request/run binding or erase this rationale.
+
 ## Implementation Intent
 
 - Use
@@ -692,6 +798,14 @@ semantics.
 
 ## Validation
 
+- The v7 named-single review of head
+  `1774f12e180b88193c0b88568b3895a2760393b5` reported the three P2 findings
+  recorded in “v7 Named-Single Superseding Corrections”: old-epoch-only scope
+  poisoning, non-convergent actor-independent as-of filtering, and the absence
+  of an executable numeric repository-wide budget. The current candidate
+  contains the corresponding policy and contract corrections. Its final full
+  validation gate and successor exact-head named-single review remain pending;
+  this journal does not claim either result in advance.
 - The final candidate gate reruns the focused 102-test contract module, the
   complete review-orchestration suite, Ruff format/lint, the skill validator,
   the project-journal validator, JSON parsing when changed JSON exists, and
