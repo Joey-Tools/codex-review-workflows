@@ -44,7 +44,11 @@ superseded_by:
   execution-identity-projected expected manifest. Account creation, launch,
   postrun closure, and cleanup remain bound to the same user/group GUIDs and
   exact-UID process census; the shared system `nobody` account is no longer a
-  supported hosted execution identity.
+  supported hosted execution identity. The hidden-account policy is bound to
+  the exact native Directory Services attribute
+  `dsAttrTypeNative:IsHidden: 1`; every account check reports a controlled
+  property-specific reason plus shell-escaped expected and observed values
+  before retaining an unproved record.
 
 ## Next Steps
 
@@ -127,3 +131,16 @@ superseded_by:
   replacement, census failure, or residual process fails closed and retains the
   records until the ephemeral hosted runner is disposed; no shared `nobody`
   process can contaminate the dedicated UID census.
+- PR #86 exact-head run `30734590280`, job `91460962452`, created
+  `codexreviewb4aed91925e3` with UID/GID `56254` but failed before supervisor
+  launch because the workflow expected the display string `IsHidden: 1`.
+  macOS exposes that native record as `dsAttrTypeNative:IsHidden: 1`, including
+  when queried through the short attribute name. The replacement creates and
+  reads the full native attribute, keeps exact scalar comparison, rejects the
+  short name, `YES`, empty, and multi-record forms in an executable parser
+  contract, and emits the first failing property before retaining the user and
+  group. It does not add a retry, change `RealName`, or weaken any identity or
+  non-admin assertion. The GitHub annotation is fixed text; dynamic diagnostics
+  use `printf '%s\n'` on a separate ordinary line, and an executable Bash 3.2
+  `xpg_echo` regression proves an observed newline followed by
+  `::warning::...` cannot become a second workflow command.

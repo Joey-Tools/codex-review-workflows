@@ -535,15 +535,62 @@ jobs:
           review_gid=""
           review_admin_gid="$(/usr/bin/dscl . -read /Groups/admin PrimaryGroupID \
             | /usr/bin/awk '$1 == "PrimaryGroupID:" {print $2}')"
+          review_account_validation_reason="not-run"
+          review_account_validation_expected="<unset>"
+          review_account_validation_observed="<unset>"
+          set_review_account_validation_failure() {
+            review_account_validation_reason="$1"
+            printf -v review_account_validation_expected '%q' "$2"
+            printf -v review_account_validation_observed '%q' "$3"
+          }
+          report_review_account_validation_failure() {
+            /usr/bin/printf '%s\n' \
+              "::error::Ephemeral review account validation failed"
+            /usr/bin/printf '%s\n' \
+              "Ephemeral review account validation diagnostics: reason=$review_account_validation_reason expected=$review_account_validation_expected observed=$review_account_validation_observed"
+          }
+          verify_review_scalar_record() {
+            local record_kind="$1"
+            local attribute="$2"
+            local expected_value="$3"
+            local observed_record="$4"
+            local expected_record="$attribute: $expected_value"
+            if [[ "$observed_record" != "$expected_record" ]]; then
+              set_review_account_validation_failure \
+                "$record_kind.$attribute.mismatch" "$expected_record" "$observed_record"
+              return 1
+            fi
+          }
+          verify_review_record_attribute() {
+            local record_kind="$1"
+            local record_path="$2"
+            local attribute="$3"
+            local expected_value="$4"
+            local expected_record="$attribute: $expected_value"
+            local observed_record=""
+            if ! observed_record="$(/usr/bin/sudo /usr/bin/dscl . -read "$record_path" "$attribute" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "$record_kind.$attribute.unavailable" "$expected_record" "<unavailable>"
+              return 1
+            fi
+            verify_review_scalar_record \
+              "$record_kind" "$attribute" "$expected_value" "$observed_record"
+          }
           review_account_processes() {
             /bin/ps -axo uid=,pid= \
               | /usr/bin/awk -v target_uid="$review_uid" \
                 '$1 == target_uid {print $2}'
           }
           verify_review_group() {
-            [[ "$review_group_origin_bound" == "true" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" GeneratedUID 2>/dev/null)" == "GeneratedUID: $review_group_guid" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" PrimaryGroupID 2>/dev/null)" == "PrimaryGroupID: $review_gid" ]]
+            if [[ "$review_group_origin_bound" != "true" ]]; then
+              set_review_account_validation_failure \
+                "group.origin.unbound" "true" "$review_group_origin_bound"
+              return 1
+            fi
+            verify_review_record_attribute \
+              group "$review_group_path" GeneratedUID "$review_group_guid" \
+              && verify_review_record_attribute \
+                group "$review_group_path" PrimaryGroupID "$review_gid"
           }
           run_review_user() {
             /usr/bin/sudo -u "$review_user" -g "$review_group" "$@"
@@ -554,35 +601,126 @@ jobs:
             local cached_user_names=""
             local cached_group_names=""
             cached_user_records="$(/usr/bin/dscacheutil -q user -a uid "$review_uid")" \
-              || return 1
+              || {
+                set_review_account_validation_failure \
+                  "cache.user.unavailable" "$review_user" "<unavailable>"
+                return 1
+              }
             cached_group_records="$(/usr/bin/dscacheutil -q group -a gid "$review_gid")" \
-              || return 1
+              || {
+                set_review_account_validation_failure \
+                  "cache.group.unavailable" "$review_group" "<unavailable>"
+                return 1
+              }
             cached_user_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_user_records")" \
-              || return 1
+              || {
+                set_review_account_validation_failure \
+                  "cache.user.parse-failed" "$review_user" "<unavailable>"
+                return 1
+              }
             cached_group_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_group_records")" \
-              || return 1
-            [[ "$cached_user_names" == "$review_user" ]] \
-              && [[ "$cached_group_names" == "$review_group" ]]
+              || {
+                set_review_account_validation_failure \
+                  "cache.group.parse-failed" "$review_group" "<unavailable>"
+                return 1
+              }
+            if [[ "$cached_user_names" != "$review_user" ]]; then
+              set_review_account_validation_failure \
+                "cache.user.name-mismatch" "$review_user" "$cached_user_names"
+              return 1
+            fi
+            if [[ "$cached_group_names" != "$review_group" ]]; then
+              set_review_account_validation_failure \
+                "cache.group.name-mismatch" "$review_group" "$cached_group_names"
+              return 1
+            fi
           }
           verify_review_account() {
             local account_groups=""
-            verify_review_group \
-              && verify_review_cached_identity \
-              && [[ "$review_user_origin_bound" == "true" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" GeneratedUID 2>/dev/null)" == "GeneratedUID: $review_user_guid" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" UniqueID 2>/dev/null)" == "UniqueID: $review_uid" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" PrimaryGroupID 2>/dev/null)" == "PrimaryGroupID: $review_gid" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" NFSHomeDirectory 2>/dev/null)" == "NFSHomeDirectory: /var/empty" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" UserShell 2>/dev/null)" == "UserShell: /usr/bin/false" ]] \
-              && [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" IsHidden 2>/dev/null)" == "IsHidden: 1" ]] \
-              && [[ "$(/usr/bin/id -u "$review_user" 2>/dev/null)" == "$review_uid" ]] \
-              && [[ "$(/usr/bin/id -g "$review_user" 2>/dev/null)" == "$review_gid" ]] \
-              && [[ "$(run_review_user /usr/bin/id -u 2>/dev/null)" == "$review_uid" ]] \
-              && [[ "$(run_review_user /usr/bin/id -g 2>/dev/null)" == "$review_gid" ]] \
+            local observed_identity=""
+            verify_review_group || return 1
+            verify_review_cached_identity || return 1
+            if [[ "$review_user_origin_bound" != "true" ]]; then
+              set_review_account_validation_failure \
+                "user.origin.unbound" "true" "$review_user_origin_bound"
+              return 1
+            fi
+            verify_review_record_attribute \
+              user "$review_user_path" GeneratedUID "$review_user_guid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" UniqueID "$review_uid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" PrimaryGroupID "$review_gid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" NFSHomeDirectory /var/empty \
+              && verify_review_record_attribute \
+                user "$review_user_path" UserShell /usr/bin/false \
+              && verify_review_record_attribute \
+                user "$review_user_path" dsAttrTypeNative:IsHidden 1 \
               || return 1
-            account_groups="$(run_review_user /usr/bin/id -G 2>/dev/null)" \
-              || return 1
-            [[ " $account_groups " != *" $review_admin_gid "* ]]
+            if ! observed_identity="$(/usr/bin/id -u "$review_user" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.user.uid-unavailable" "$review_uid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_uid" ]]; then
+              set_review_account_validation_failure \
+                "identity.user.uid-mismatch" "$review_uid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(/usr/bin/id -g "$review_user" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.user.gid-unavailable" "$review_gid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_gid" ]]; then
+              set_review_account_validation_failure \
+                "identity.user.gid-mismatch" "$review_gid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(run_review_user /usr/bin/id -u 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.uid-unavailable" "$review_uid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_uid" ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.uid-mismatch" "$review_uid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(run_review_user /usr/bin/id -g 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.gid-unavailable" "$review_gid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_gid" ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.gid-mismatch" "$review_gid" "$observed_identity"
+              return 1
+            fi
+            if ! account_groups="$(run_review_user /usr/bin/id -G 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.groups-unavailable" "numeric group list" "<unavailable>"
+              return 1
+            fi
+            if [[ ! "$account_groups" =~ ^[[:digit:]]+([[:space:]][[:digit:]]+)*$ ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.groups-malformed" "numeric group list" "$account_groups"
+              return 1
+            fi
+            if [[ " $account_groups " != *" $review_gid "* ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.primary-group-missing" "$review_gid" "$account_groups"
+              return 1
+            fi
+            if [[ " $account_groups " == *" $review_admin_gid "* ]]; then
+              set_review_account_validation_failure \
+                "policy.admin-group-present" "admin group absent" "$account_groups"
+              return 1
+            fi
+            review_account_validation_reason="ok"
+            review_account_validation_expected="<none>"
+            review_account_validation_observed="<none>"
           }
           cleanup_review_account() {
             local primary_status=$?
@@ -593,6 +731,7 @@ jobs:
             set +e
             if [[ "$review_user_created" == "true" ]]; then
               if ! verify_review_account; then
+                report_review_account_validation_failure
                 echo "::error::Ephemeral review user identity or policy is unproven; retained until runner disposal: name=$review_user uid=$review_uid"
                 cleanup_status=1
               else
@@ -618,6 +757,7 @@ jobs:
                 echo "::error::Ephemeral review group retained with its user until runner disposal: name=$review_group gid=$review_gid"
                 cleanup_status=1
               elif ! verify_review_group; then
+                report_review_account_validation_failure
                 echo "::error::Ephemeral review group identity or policy is unproven; retained until runner disposal: name=$review_group gid=$review_gid"
                 cleanup_status=1
               elif ! /usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path" \
@@ -689,7 +829,9 @@ jobs:
           /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path"
           review_group_created=true
           /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" GeneratedUID "$review_group_guid"
-          if [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" GeneratedUID)" != "GeneratedUID: $review_group_guid" ]]; then
+          if ! verify_review_record_attribute \
+            group "$review_group_path" GeneratedUID "$review_group_guid"; then
+            report_review_account_validation_failure
             echo "::error::Ephemeral review group origin binding failed; retained until runner disposal"
             exit 1
           fi
@@ -699,7 +841,9 @@ jobs:
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path"
           review_user_created=true
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" GeneratedUID "$review_user_guid"
-          if [[ "$(/usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" GeneratedUID)" != "GeneratedUID: $review_user_guid" ]]; then
+          if ! verify_review_record_attribute \
+            user "$review_user_path" GeneratedUID "$review_user_guid"; then
+            report_review_account_validation_failure
             echo "::error::Ephemeral review user origin binding failed; retained until runner disposal"
             exit 1
           fi
@@ -708,11 +852,13 @@ jobs:
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" PrimaryGroupID "$review_gid"
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" NFSHomeDirectory /var/empty
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" UserShell /usr/bin/false
-          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" IsHidden 1
+          /usr/bin/sudo /usr/bin/dscl . -create \
+            "$review_user_path" dsAttrTypeNative:IsHidden 1
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" AuthenticationAuthority ";DisabledUser;"
           /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" Password '*'
           /usr/bin/sudo /usr/bin/dscacheutil -flushcache
           if ! verify_review_account; then
+            report_review_account_validation_failure
             echo "::error::Ephemeral review account failed identity or non-admin validation; retained until runner disposal"
             exit 1
           fi
@@ -851,6 +997,7 @@ jobs:
           fi
           verify_runtime_custody prelaunch
           if ! verify_review_account; then
+            report_review_account_validation_failure
             echo "::error::Ephemeral review account changed before launch; retained until runner disposal"
             exit 1
           fi
@@ -872,7 +1019,10 @@ jobs:
           verify_runtime_custody postrun
           review_account_postrun_status=0
           review_processes_postrun=""
-          verify_review_account || review_account_postrun_status=1
+          if ! verify_review_account; then
+            report_review_account_validation_failure
+            review_account_postrun_status=1
+          fi
           review_processes_postrun="$(review_account_processes)" \
             || review_account_postrun_status=1
           if [[ -n "$review_processes_postrun" ]]; then

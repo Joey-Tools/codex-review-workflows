@@ -107,7 +107,11 @@ superseded_by:
   inside an inherited Seatbelt profile. The workflow binds a dedicated unused
   UID/GID to user/group GUIDs, rejects admin membership and any pre-existing
   process for that UID, and revalidates identity plus the exact-UID process
-  census before launch, after the run, and before deletion. Before starting the
+  census before launch, after the run, and before deletion. The hidden-user
+  assertion uses the exact native Directory Services record
+  `dsAttrTypeNative:IsHidden: 1`; all directory, cache, runtime identity, primary
+  group, and non-admin checks have distinct fail-closed reason codes and report
+  shell-escaped expected/observed values before retention. Before starting the
   child, the runner additionally proves real/effective UID equality, non-root
   and non-admin membership, kernel-visible `job-creation` denial, generic
   set-ID exec filtering through a direct `sudo` EPERM probe, and a same-UID
@@ -497,3 +501,18 @@ superseded_by:
   the records until ephemeral runner disposal. The executable contract also
   proves that a synthetic shared-account process is excluded from the dedicated
   UID census.
+- Exact-head PR #86 run `30734590280`, job `91460962452`, stopped before the
+  supervisor after creating account `codexreviewb4aed91925e3` with UID/GID
+  `56254`. The account verifier compared the native hidden-user record against
+  `IsHidden: 1`, while macOS returns `dsAttrTypeNative:IsHidden: 1`; that exact
+  mismatch made the otherwise intentional fail-closed retention path fire.
+  The corrected workflow binds the full native attribute name and decomposes
+  the previous short-circuit chain into independently reported property checks.
+  An executable scalar-parser fixture accepts only the native-prefix form and
+  rejects the short name, `YES`, empty, and multi-record values. On any failure,
+  the specific reason is emitted before cleanup revalidation and neither the
+  user nor its group is deleted while identity or policy remains unproved.
+  Dynamic expected/observed diagnostics are printed as one ordinary
+  `printf '%s\n'` line after a fixed GitHub error annotation; the executable
+  parser contract enables Bash 3.2 `xpg_echo` and proves a newline plus
+  `::warning::...` payload remains data on that same diagnostic line.

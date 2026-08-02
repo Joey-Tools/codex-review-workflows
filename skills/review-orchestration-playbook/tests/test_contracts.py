@@ -2602,18 +2602,30 @@ class RepositoryContractTest(unittest.TestCase):
                     'AuthenticationAuthority ";DisabledUser;"',
                     "Password '*'",
                     "/usr/bin/sudo /usr/bin/dscacheutil -flushcache",
+                    "set_review_account_validation_failure() {",
+                    "report_review_account_validation_failure() {",
+                    "verify_review_scalar_record() {",
+                    "verify_review_record_attribute() {",
+                    '"::error::Ephemeral review account validation failed"',
+                    "Ephemeral review account validation diagnostics: reason=",
+                    "reason=$review_account_validation_reason",
+                    "expected=$review_account_validation_expected",
+                    "observed=$review_account_validation_observed",
+                    'user "$review_user_path" dsAttrTypeNative:IsHidden 1',
+                    '"$review_user_path" dsAttrTypeNative:IsHidden 1',
+                    '"policy.admin-group-present"',
                     'review_admin_gid="$(/usr/bin/dscl . -read '
                     "/Groups/admin PrimaryGroupID",
-                    '[[ " $account_groups " != *" $review_admin_gid "* ]]',
+                    '[[ " $account_groups " == *" $review_admin_gid "* ]]',
                     '/usr/bin/sudo -u "$review_user" -g "$review_group" "$@"',
                     "verify_review_cached_identity() {",
                     '/usr/bin/dscacheutil -q user -a uid "$review_uid"',
                     '/usr/bin/dscacheutil -q group -a gid "$review_gid"',
                     "cached_user_names=",
                     "cached_group_names=",
-                    '[[ "$cached_user_names" == "$review_user" ]]',
-                    '[[ "$cached_group_names" == "$review_group" ]]',
-                    "&& verify_review_cached_identity",
+                    '[[ "$cached_user_names" != "$review_user" ]]',
+                    '[[ "$cached_group_names" != "$review_group" ]]',
+                    "verify_review_cached_identity || return 1",
                     "/bin/ps -axo uid=,pid=",
                     "'$1 == target_uid {print $2}'",
                     'review_processes_preuse="$(review_account_processes)"',
@@ -2625,6 +2637,19 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"',
                 ):
                     self.assertIn(contract, readonly_job)
+
+                self.assertNotIn(
+                    '/usr/bin/dscl . -create "$review_user_path" IsHidden 1',
+                    readonly_job,
+                )
+                self.assertNotIn('== "IsHidden: 1"', readonly_job)
+                report_start = readonly_job.index(
+                    "report_review_account_validation_failure() {"
+                )
+                report_end = readonly_job.index("\n          }\n", report_start)
+                report_body = readonly_job[report_start:report_end]
+                self.assertNotIn("echo ", report_body)
+                self.assertEqual(report_body.count("/usr/bin/printf '%s\\n'"), 2)
 
                 self.assertEqual(
                     readonly_job.count(
@@ -2645,12 +2670,26 @@ class RepositoryContractTest(unittest.TestCase):
                 cleanup_body = readonly_job[cleanup_start:cleanup_end]
                 self.assertLess(
                     cleanup_body.index("if ! verify_review_account; then"),
+                    cleanup_body.index("report_review_account_validation_failure"),
+                )
+                self.assertLess(
+                    cleanup_body.index("report_review_account_validation_failure"),
                     cleanup_body.index(
                         '/usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path"'
                     ),
                 )
                 self.assertLess(
                     cleanup_body.index("elif ! verify_review_group; then"),
+                    cleanup_body.index(
+                        "report_review_account_validation_failure",
+                        cleanup_body.index("elif ! verify_review_group; then"),
+                    ),
+                )
+                self.assertLess(
+                    cleanup_body.index(
+                        "report_review_account_validation_failure",
+                        cleanup_body.index("elif ! verify_review_group; then"),
+                    ),
                     cleanup_body.index(
                         '/usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path"'
                     ),
@@ -2689,6 +2728,90 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertEqual(filtered.returncode, 0, filtered.stderr)
                 self.assertEqual(filtered.stdout, b"202\n")
                 self.assertEqual(filtered.stderr, b"")
+
+                shell_functions: dict[str, str] = {}
+                for function_name in (
+                    "set_review_account_validation_failure",
+                    "report_review_account_validation_failure",
+                    "verify_review_scalar_record",
+                ):
+                    name = function_name
+                    marker = f"          {name}() {{\n"
+                    function_start = readonly_job.index(marker)
+                    function_end = readonly_job.index(
+                        "\n          }\n", function_start
+                    ) + len("\n          }")
+                    shell_functions[name] = "\n".join(
+                        line[10:] if line.startswith("          ") else line
+                        for line in readonly_job[
+                            function_start:function_end
+                        ].splitlines()
+                    )
+
+                scalar_parser = subprocess.run(
+                    ["/bin/bash"],
+                    input=(
+                        "set -euo pipefail\n"
+                        + shell_functions["set_review_account_validation_failure"]
+                        + "\n"
+                        + shell_functions["report_review_account_validation_failure"]
+                        + "\n"
+                        + shell_functions["verify_review_scalar_record"]
+                        + "\n"
+                        + "verify_review_scalar_record user "
+                        + "dsAttrTypeNative:IsHidden 1 "
+                        + "'dsAttrTypeNative:IsHidden: 1'\n"
+                        + "printf 'accepted\\n'\n"
+                        + "for observed in 'IsHidden: 1' "
+                        + "'dsAttrTypeNative:IsHidden: YES' '' "
+                        + "$'dsAttrTypeNative:IsHidden: 1\\n"
+                        + "dsAttrTypeNative:IsHidden: 1'; do\n"
+                        + "  if verify_review_scalar_record user "
+                        + 'dsAttrTypeNative:IsHidden 1 "$observed"; then\n'
+                        + "    exit 12\n"
+                        + "  fi\n"
+                        + "  printf '%s\\n' \"$review_account_validation_reason\"\n"
+                        + "done\n"
+                        + "shopt -s xpg_echo\n"
+                        + "set_review_account_validation_failure "
+                        + "diagnostic.inject safe "
+                        + "$'line-one\\n::warning::injected'\n"
+                        + "report_review_account_validation_failure\n"
+                    ).encode("utf-8"),
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(
+                    scalar_parser.returncode,
+                    0,
+                    scalar_parser.stderr.decode("utf-8", "replace"),
+                )
+                output_lines = scalar_parser.stdout.splitlines()
+                self.assertEqual(
+                    output_lines[:5],
+                    [
+                        b"accepted",
+                        b"user.dsAttrTypeNative:IsHidden.mismatch",
+                        b"user.dsAttrTypeNative:IsHidden.mismatch",
+                        b"user.dsAttrTypeNative:IsHidden.mismatch",
+                        b"user.dsAttrTypeNative:IsHidden.mismatch",
+                    ],
+                )
+                self.assertEqual(
+                    output_lines[5],
+                    b"::error::Ephemeral review account validation failed",
+                )
+                self.assertTrue(
+                    output_lines[6].startswith(
+                        b"Ephemeral review account validation diagnostics: "
+                    ),
+                    output_lines[6],
+                )
+                self.assertIn(b"diagnostic.inject", output_lines[6])
+                self.assertIn(b"\\n::warning::injected", output_lines[6])
+                self.assertEqual(len(output_lines), 7)
+                self.assertEqual(scalar_parser.stderr, b"")
 
     def test_readonly_ci_binds_profile_and_denies_executable_setid_modes(
         self,
