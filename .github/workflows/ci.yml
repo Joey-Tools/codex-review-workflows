@@ -508,8 +508,19 @@ jobs:
           /usr/bin/sudo -u nobody /bin/test -x "$isolated_python"
           /usr/bin/sudo -u nobody /bin/test ! -w "$managed_python_dir"
           /usr/bin/sudo -u nobody /bin/test ! -w "$runtime_root"
+          /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
           /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
           /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"
+          gate_size="$(/usr/bin/sudo /usr/bin/stat -f '%z' "$isolated_source/tests/trusted_mac_gate.py")"
+          gate_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_source/tests/trusted_mac_gate.py")"
+          gate_digest="${gate_digest%% *}"
+          if [[ ! "$gate_size" =~ ^[[:digit:]]+$ ]] \
+            || (( gate_size < 1 || gate_size > 131072 )) \
+            || [[ ! "$gate_digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Trusted gate bootstrap source is not bounded; retained at $isolated_root"
+            exit 1
+          fi
+          echo "Trusted gate bootstrap: bytes=$gate_size sha256=$gate_digest"
           /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
           isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
           review_profile="$isolated_root/readonly_child_isolation.sb"
@@ -581,6 +592,7 @@ jobs:
             || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
             || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \
@@ -597,17 +609,13 @@ jobs:
           fi
           verify_runtime_custody prelaunch
           runner_status=0
-          /usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
-            CODEX_REVIEW_TEST_RUNTIME_PARENT="$isolated_root/payload/runtime" \
-            HOME="$isolated_root/payload" \
-            LANG=C \
-            LC_ALL=C \
-            LOGNAME=nobody \
-            PATH=/usr/bin:/bin \
-            PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONPATH="$isolated_source" \
-            USER=nobody \
-            "$isolated_python" -P -B -m tests.run_readonly_install_deterministic_supervisor \
+          /usr/bin/sudo -u nobody /bin/cat "$isolated_source/tests/trusted_mac_gate.py" \
+            | /usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
+              LANG=C \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              "$isolated_python" -I -B -S - "$isolated_source" \
+              hosted-readonly "$isolated_root/payload/runtime" "$isolated_root/payload" \
             | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
           verify_runtime_custody postrun
           source_profile_postrun_binding=""
@@ -634,6 +642,7 @@ jobs:
             || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
             || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
             || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
             || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
             || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
             || ! /bin/test -f "$source_review_profile" \

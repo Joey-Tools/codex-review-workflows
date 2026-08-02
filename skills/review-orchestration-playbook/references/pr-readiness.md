@@ -65,7 +65,10 @@ The pinned GitHub Hosted `macos-26` production-profile probe produces only a
 reviewed fail-closed signature, not production-equivalent no-child evidence.
 The separate required hosted read-only job remains valuable: it runs the full
 deterministic suite from a root-owned isolated source as `nobody`, with bound
-runtime custody and an exact terminal summary. Its isolated-account closure is
+runtime custody and an exact terminal summary. Even without Git metadata, that
+source is captured under the shared snapshot resource bounds and copied only
+from its descriptor receipt; there is no unbounded copy fallback. Its
+isolated-account closure is
 not the authenticated production no-child proof below. When the frozen range
 changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
@@ -75,17 +78,57 @@ and record a parent-validated absolute Python 3.13 interpreter whose entire
 resolved execution path satisfies the no-group-write/no-other-write access
 policy. A convenience symlink through a standard group-writable Homebrew
 `Cellar` does not satisfy that policy. Start from the repository root and enter
-the self-contained tool directory before invoking the package-local test
-runner:
+the source-only gate by absolute path. The gate starts under an empty
+environment with isolated, site-disabled, bytecode-disabled Python. The gate
+itself is streamed from the frozen HEAD blob through bounded stdin, so no
+candidate worktree path executes before that binding. It then snapshots only
+bounded regular `.py` source from `review_supervisor/` and `tests/`, and rejects
+symlinks, bytecode/native substitutes, and duplicate module mappings before
+importing the selected runner:
 
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
-cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
-CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
+REPO_ROOT="$PWD"
+TOOL_REL=skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+TOOL_ROOT="$REPO_ROOT/$TOOL_REL"
+HEAD_SHA=<full-head-sha>
+GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"
+trusted_git() {
+  /usr/bin/env -i GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    HOME=/ LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+    /usr/bin/git --no-replace-objects -C "$REPO_ROOT" "$@"
+}
+set -o pipefail
+if ! GATE_SIZE="$(trusted_git cat-file -s "$GATE_SPEC")"; then
+  printf 'unable to read trusted gate size\n' >&2
+  exit 1
+fi
+if ! GATE_SHA256_RECORD="$(
+  trusted_git cat-file blob "$GATE_SPEC" | /usr/bin/shasum -a 256
+)"; then
+  printf 'unable to hash trusted gate blob\n' >&2
+  exit 1
+fi
+GATE_SHA256="${GATE_SHA256_RECORD%% *}"
+if [[ ! "$GATE_SIZE" =~ ^[[:digit:]]+$ ]] \
+  || (( GATE_SIZE < 1 || GATE_SIZE > 131072 )); then
+  printf 'invalid trusted gate size: %s\n' "$GATE_SIZE" >&2
+  exit 1
+fi
+if [[ ! "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  printf 'invalid trusted gate digest\n' >&2
+  exit 1
+fi
+trusted_git cat-file blob "$GATE_SPEC" \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live
+trusted_git cat-file blob "$GATE_SPEC" \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" readonly "$HEAD_SHA"
 ```
 
-Record the interpreter's absolute path and digest and exact `head_sha`; record
+Record the interpreter's absolute path and digest, exact `head_sha`, gate blob
+size, and gate SHA-256; record
 the live runner's thirteen tests, zero skips, and terminal result, followed by the
 read-only install runner's complete structured summary. Accept that summary
 only when all of these predicates hold:

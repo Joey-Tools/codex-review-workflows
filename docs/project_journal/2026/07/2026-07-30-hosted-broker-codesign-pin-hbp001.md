@@ -3,7 +3,7 @@ id: 20260730-hbp001
 title: Hosted Broker Codesign Pin
 status: completed
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-01
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -35,6 +35,10 @@ superseded_by:
   an unknown runtime fails before the probe.
 - Source, artifact, Xcode, SDK, clang, linker, lipo, vtool, and
   `codesign_allocate` pins are unchanged.
+- Hosted read-only execution enters the source-only gate through bounded stdin
+  under `-I -B -S`; the candidate path is never the Python entrypoint. Its
+  root-owned staged source uses a bounded descriptor manifest and copy rather
+  than an unbounded recursive copy.
 
 ## Next Steps
 
@@ -61,3 +65,16 @@ superseded_by:
   the unchanged source, toolchain, signing identity, and CDHashes.
 - `Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai`;
   the unrun lane is not counted as a completed named double or triple.
+- A fresh control review found that shell size/digest predicates could fall
+  through and that installed-release validation reopened the gate path for
+  execution. The corrected runbook exits explicitly on every predicate failure
+  and uses parent-validated Python to read one no-follow descriptor, validate
+  the manifest digest over those exact bytes, and stream that same memory image
+  to the isolated gate. The executable regression accepts the bound input and
+  rejects digest mismatch, oversize, symlink, hard-link, and FIFO inputs before
+  any candidate byte reaches the consumer. Frozen Git size and digest producer
+  failures also terminate before the gate pipeline.
+- The canonical/fixture hosted workflows remain byte-for-byte aligned after
+  moving the outer gate to stdin. Private overlay synchronization and release
+  are owned by the separate BL workstream; this canonical follow-up does not
+  modify or trigger private PR #139 or #140.

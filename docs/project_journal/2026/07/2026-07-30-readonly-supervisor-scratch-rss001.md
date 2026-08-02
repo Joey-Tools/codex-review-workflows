@@ -384,3 +384,47 @@ superseded_by:
   workflow and both generated CI fixtures; full Ruff lint, changed-file Ruff
   formatting, source-only compilation, skill validation, project-journal
   validation, `git diff --check`, and the zero-bytecode inventory also passed.
+- The Trusted Mac outer gate now executes only source bytes streamed from the
+  exact frozen HEAD blob or from one manifest-bound, no-follow descriptor read.
+  The installed-release producer validates a closed 131072-byte cap, a singly
+  linked regular file, stable object identity and selected access policy, and
+  the exact manifest SHA-256 before writing the same in-memory bytes to the
+  isolated Python consumer. Size and digest predicates exit explicitly on
+  failure. Regressions execute the documented producer and prove that digest
+  mismatch, oversize content, a symlink, a hard link, and a FIFO produce no gate
+  bytes. Git size and digest producer failures are checked independently before
+  any frozen gate blob is consumed.
+- Exact source custody now shares bounded entry, path, source-byte, depth, and
+  per-snapshot deadline accounting across raw HEAD expansion, descriptor
+  snapshots, and copy revalidation. The hosted no-HEAD path uses the same
+  bounded descriptor manifest and copy owner; neither production path calls
+  `shutil.copytree`. Opened gate files are charged from descriptor size plus a
+  growth probe before reading, while immutable content is the compared
+  property and timestamp-only churn remains benign.
+- The replacement host-level deterministic gate passed 837/837 in 253.934
+  seconds on Homebrew CPython 3.13.12. The reviewed selected-identity SHA-256 is
+  `100e6bfa5e93c72f61c20d45cfe69a1d945ae55908b3fc4e6943564886fed434`.
+  The complete read-only runner module passed 143/143 in 55.021 seconds, the
+  source-binding/bootstrap focus passed 18/18 in 20.851 seconds, the read-only
+  no-child subset passed 275/275 in 19.809 seconds with selected-identity
+  SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`,
+  and the fixed `/usr/bin/git` checkout module passed 43/43 in 29.644 seconds.
+- A direct real read-only wrapper attempt in the current Desktop host failed
+  closed before child launch because the configured read-only child account is
+  a member of the admin group. Process closure remained `not-started`, and the
+  runner retained two descriptor-bound roots with explicit incomplete-cleanup
+  evidence. This host-configuration result is not counted as the 275-test
+  deterministic gate or as Trusted Mac exact-head evidence; no retained path
+  was silently deleted or reported as clean.
+- The frozen final host-level Python 3.13.12 full discovery passed
+  2,833/2,833 in 941.136 seconds with six existing platform skips. Final
+  contracts passed 105/105, both bounded precommit audits returned
+  `No findings.`, and canonical/fixture Actionlint plus canonical fixture byte
+  equality passed. Changed Python files passed Ruff 0.13.2 lint and formatting,
+  source-only compilation, skill validation, project-journal validation,
+  `git diff --check`, and the zero-bytecode inventory.
+- A diagnostic repository-wide `uvx ruff check .` used a newer unpinned Ruff
+  ruleset and surfaced 3,033 pre-existing all-rule baseline findings. It made no
+  source change and is not counted as this diff's lint gate; the repository's
+  installed Ruff 0.13.2 changed-file gate is the applicable passing evidence.

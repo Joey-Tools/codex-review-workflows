@@ -1776,6 +1776,9 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS / "independent_codex_pr_review/tests/"
             "run_readonly_install_deterministic_supervisor.py"
         ).read_text(encoding="utf-8")
+        trusted_mac_gate = (
+            SCRIPTS / "independent_codex_pr_review/tests/trusted_mac_gate.py"
+        ).read_text(encoding="utf-8")
         readonly_no_child_contract = (
             SCRIPTS / "independent_codex_pr_review/tests/readonly_no_child_contract.py"
         ).read_text(encoding="utf-8")
@@ -1803,9 +1806,42 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("CodexExecutableAuthenticationTests", live_runner)
         self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
+        for contract in (
+            '"hosted-readonly":',
+            '"live": "tests.run_required_no_child_profile"',
+            '"readonly": "tests.run_readonly_install_deterministic_supervisor"',
+            "not sys.flags.isolated",
+            "not sys.flags.ignore_environment",
+            "not sys.flags.no_site",
+            "not sys.flags.no_user_site",
+            "not sys.dont_write_bytecode",
+            '__file__ != "<stdin>"',
+            "trusted gate must be executed from bounded trusted stdin",
+            "os.environ.clear()",
+            "class _ClosedSourceFinder",
+            "os.O_DIRECTORY | os.O_NOFOLLOW",
+            "trusted gate source contains a substitute",
+            "trusted gate source maps duplicate module",
+            "budget.consume_source(opened.st_size, probe_bytes=1)",
+            "opened.st_nlink",
+        ):
+            self.assertIn(contract, trusted_mac_gate)
+        self.assertNotIn("sys.path.insert", trusted_mac_gate)
+        for contract in (
+            "TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT",
+            "tree snapshot exceeds its entry-observation bound",
+            "time.monotonic() >= self.deadline",
+            "source_binding.source_entries",
+            "class SourceTreeBinding:",
+            "_copy_bound_source_tree(",
+            "_copy_bound_tree(",
+            "_bind_source_checkout(\n        source_root,\n        budget=active_budget,",
+        ):
+            self.assertIn(contract, readonly_install_runner)
+        self.assertNotIn("shutil.copytree(", readonly_install_runner)
         self.assertIn("expected_count != 13", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 827", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 837", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1821,9 +1857,9 @@ class RepositoryContractTest(unittest.TestCase):
             'flags=getattr(final_descriptor, "st_flags", 0)',
             "link_count=link_count",
             "initial.st_nlink != 1",
-            "_xattr_snapshot(descriptor)",
+            "_xattr_snapshot(descriptor, budget=budget)",
             "_acl_entries(descriptor)",
-            "_tree_snapshot_once(root)",
+            "_tree_snapshot_once(\n        root,",
             "_tree_property_unchanged(before, after)",
             "_set_tree_read_only(installed_root)",
             "run_bounded(",
@@ -1849,7 +1885,7 @@ class RepositoryContractTest(unittest.TestCase):
             "inspect_repository(",
             "enumerate_tree(repository, head_sha)",
             "with CatFileBatch(repository) as batch:",
-            "_bind_source_checkout(source_root)",
+            "_bind_source_checkout(",
             "_copy_bound_source(",
             "os.link(probe,hardlink_probe)",
             "_run_no_child_test_suite(",
@@ -1923,20 +1959,125 @@ class RepositoryContractTest(unittest.TestCase):
             "Any push invalidates that evidence",
             "neither Hosted CI's blocker-signature probe nor its "
             "isolated-account read-only",
-            "cd skills/review-orchestration-playbook/scripts/"
-            "independent_codex_pr_review",
             "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
-            '"$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile',
+            "TOOL_REL=skills/review-orchestration-playbook/scripts/"
+            "independent_codex_pr_review",
+            'TOOL_ROOT="$REPO_ROOT/$TOOL_REL"',
+            "/usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin",
+            'GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"',
+            'trusted_git cat-file blob "$GATE_SPEC"',
+            'if ! GATE_SIZE="$(trusted_git cat-file -s "$GATE_SPEC")"; then',
+            'if ! GATE_SHA256_RECORD="$(\n  trusted_git cat-file blob',
+            "unable to hash trusted gate blob",
+            'if [[ ! "$GATE_SIZE" =~ ^[[:digit:]]+$ ]]',
+            "GATE_SIZE < 1 || GATE_SIZE > 131072",
+            'if [[ ! "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]',
+            '"$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live',
             "no-group-write/no-other-write",
             "interpreter's absolute path and digest",
-            "tests.run_required_no_child_profile",
-            "CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha>",
-            "tests.run_readonly_install_deterministic_supervisor",
+            "HEAD_SHA=<full-head-sha>",
+            '"$TOOL_ROOT" readonly "$HEAD_SHA"',
             "source_head_bound == true",
             "source_head_subtree_manifest_sha256",
             "production no-child proof",
         ):
             self.assertIn(requirement, pr_readiness)
+        for unsafe_gate_check in (
+            '[[ "$GATE_SIZE" =~ ^[[:digit:]]+$ ]] &&',
+            '[[ "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]\nset -o pipefail',
+        ):
+            self.assertNotIn(unsafe_gate_check, pr_readiness)
+
+        installed_readme = (
+            SCRIPTS / "independent_codex_pr_review/README.md"
+        ).read_text(encoding="utf-8")
+        for manifest_stream_contract in (
+            "stream_manifest_gate()",
+            '"$TRUSTED_PYTHON" -I -B -S -c',
+            "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK",
+            "opened.st_nlink != 1",
+            "opened.st_size > limit",
+            "identity(opened) != identity(closed)",
+            "hashlib.sha256(data).hexdigest() != expected_digest",
+            "written = os.write(1, view)",
+            "stream_manifest_gate | /usr/bin/env -i",
+            "descriptor 只读取一次",
+        ):
+            self.assertIn(manifest_stream_contract, installed_readme)
+        self.assertNotIn('/bin/cat "$GATE_SOURCE"', installed_readme)
+
+        stream_start = '"$TRUSTED_PYTHON" -I -B -S -c \'\n'
+        stream_end = '\n\' "$GATE_SOURCE" "$GATE_SOURCE_SHA256"'
+        self.assertEqual(installed_readme.count(stream_start), 1)
+        stream_source = installed_readme.split(stream_start, 1)[1].split(stream_end, 1)[
+            0
+        ]
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            gate = root / "trusted_mac_gate.py"
+            gate_bytes = b"print('manifest-bound gate')\n"
+            gate.write_bytes(gate_bytes)
+            gate_digest = hashlib.sha256(gate_bytes).hexdigest()
+
+            accepted = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    "-c",
+                    stream_source,
+                    str(gate),
+                    gate_digest,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(accepted.stdout, gate_bytes)
+
+            rejected_inputs: list[tuple[str, pathlib.Path, str]] = [
+                ("digest", gate, "0" * 64),
+            ]
+            oversized = root / "oversized.py"
+            oversized.write_bytes(b"x" * 131073)
+            rejected_inputs.append(
+                (
+                    "oversized",
+                    oversized,
+                    hashlib.sha256(oversized.read_bytes()).hexdigest(),
+                )
+            )
+            symlink = root / "symlink.py"
+            symlink.symlink_to(gate.name)
+            rejected_inputs.append(("symlink", symlink, gate_digest))
+            hardlink = root / "hardlink.py"
+            os.link(gate, hardlink)
+            rejected_inputs.append(("hardlink", gate, gate_digest))
+            fifo = root / "fifo.py"
+            os.mkfifo(fifo)
+            rejected_inputs.append(("fifo", fifo, gate_digest))
+
+            for scope, candidate, digest in rejected_inputs:
+                with self.subTest(scope=scope):
+                    rejected = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            "-S",
+                            "-c",
+                            stream_source,
+                            str(candidate),
+                            digest,
+                        ],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertEqual(rejected.stdout, b"")
         integration_test = (
             SCRIPTS / "independent_codex_pr_review/tests/test_no_child_profile.py"
         ).read_text(encoding="utf-8")
@@ -2040,12 +2181,20 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/sudo /usr/bin/ditto "$source_review_root" '
                     '"$isolated_source"',
                     "/usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f",
+                    '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
+                    '"$isolated_python" -I -B -S - "$isolated_source"',
+                    'hosted-readonly "$isolated_root/payload/runtime" '
+                    '"$isolated_root/payload"',
+                ):
+                    self.assertIn(requirement, readonly_job)
+                for ambient_import_contract in (
+                    'PYTHONPATH="$isolated_source"',
+                    '"$isolated_python" -P -B -m',
                     "CODEX_REVIEW_TEST_RUNTIME_PARENT=",
                     "LOGNAME=nobody",
                     "USER=nobody",
-                    "tests.run_readonly_install_deterministic_supervisor",
                 ):
-                    self.assertIn(requirement, readonly_job)
+                    self.assertNotIn(ambient_import_contract, readonly_job)
                 self.assertIn("if: always()", readonly_job)
 
     def test_readonly_ci_deletes_only_a_proven_root_owned_outer_root(self) -> None:
@@ -2311,6 +2460,10 @@ class RepositoryContractTest(unittest.TestCase):
                     '"$isolated_source/tests/'
                     'run_readonly_install_deterministic_supervisor.py"'
                 )
+                nobody_gate_probe_index = readonly_job.index(
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/trusted_mac_gate.py"'
+                )
                 isolated_profile_path_index = readonly_job.index(
                     'review_profile="$isolated_root/readonly_child_isolation.sb"'
                 )
@@ -2361,7 +2514,9 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertLess(
                     isolated_root_traversal_index, nobody_source_probe_index
                 )
+                self.assertLess(isolated_root_traversal_index, nobody_gate_probe_index)
                 self.assertLess(nobody_source_probe_index, isolated_profile_path_index)
+                self.assertLess(nobody_gate_probe_index, isolated_profile_path_index)
                 self.assertLess(isolated_profile_path_index, profile_copy_index)
                 self.assertLess(profile_copy_index, profile_binding_index)
                 self.assertLess(profile_binding_index, immutable_index)
@@ -2457,9 +2612,16 @@ class RepositoryContractTest(unittest.TestCase):
                     "/usr/bin/sudo -u nobody /bin/test -r "
                     '"$isolated_source/tests/'
                     'run_readonly_install_deterministic_supervisor.py"',
+                    "/usr/bin/sudo -u nobody /bin/test -r "
+                    '"$isolated_source/tests/trusted_mac_gate.py"',
                     '/usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"',
-                    '"$isolated_python" -P -B -m '
-                    "tests.run_readonly_install_deterministic_supervisor",
+                    "gate_size=\"$(/usr/bin/sudo /usr/bin/stat -f '%z' ",
+                    'gate_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 ',
+                    "gate_size > 131072",
+                    '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
+                    '"$isolated_python" -I -B -S - "$isolated_source"',
+                    'hosted-readonly "$isolated_root/payload/runtime" '
+                    '"$isolated_root/payload"',
                     '/bin/test -f "$source_review_profile"',
                     '/bin/test ! -L "$source_review_profile"',
                     'source_profile_binding="$(/usr/bin/stat -f '
@@ -2515,6 +2677,8 @@ class RepositoryContractTest(unittest.TestCase):
                     '/usr/bin/chflags uchg "$review_profile"',
                     "profile_flags",
                     "'%d:%i:%u:%g:%Lp:%f' \"$review_profile\"",
+                    'PYTHONPATH="$isolated_source"',
+                    '"$isolated_python" -P -B -m',
                 ):
                     self.assertNotIn(prohibited_checkout_mutation, readonly_job)
                 for policy_contract in (
@@ -2818,10 +2982,10 @@ printf '%s\n' "$trusted_uv"
                     "/usr/bin/sudo /usr/bin/codesign --verify --strict "
                     '"$isolated_python"',
                     '/usr/bin/sudo -u nobody /bin/test -x "$isolated_python"',
-                    "PYTHONDONTWRITEBYTECODE=1 \\\n"
-                    '            PYTHONPATH="$isolated_source"',
-                    '"$isolated_python" -P -B -m '
-                    "tests.run_readonly_install_deterministic_supervisor",
+                    '/bin/cat "$isolated_source/tests/trusted_mac_gate.py"',
+                    '"$isolated_python" -I -B -S - "$isolated_source"',
+                    'hosted-readonly "$isolated_root/payload/runtime" '
+                    '"$isolated_root/payload"',
                     '"$isolated_python" -I -B -S -c \'import json, pathlib, sys;',
                     'if ! bytecode_artifact="$(/usr/bin/find .',
                     "\\( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \\)",
@@ -2863,6 +3027,8 @@ printf '%s\n' "$trusted_uv"
                     '/bin/rm -rf "$uv_staging_dir"',
                     '"$isolated_python" -B -m '
                     "tests.run_readonly_install_deterministic_supervisor",
+                    '"$isolated_python" -P -B -m',
+                    'PYTHONPATH="$isolated_source"',
                     "-type d -name __pycache__",
                     "-type f \\( -name '*.pyc'",
                     'sh "$isolated_source"',

@@ -379,3 +379,28 @@ superseded_by:
   workflow and both generated CI fixtures; full Ruff lint, changed-file Ruff
   formatting, source-only compilation, skill validation, project-journal
   validation, `git diff --check`, and the zero-bytecode inventory also passed.
+- The bounded-source follow-up passed 837/837 deterministic tests in 253.934
+  seconds on host-level Homebrew CPython 3.13.12.
+  The reviewed 837-test selected identity has SHA-256
+  `100e6bfa5e93c72f61c20d45cfe69a1d945ae55908b3fc4e6943564886fed434`.
+  The read-only no-child subset independently passed 275/275 in 19.809 seconds
+  with selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`,
+  and the fixed `/usr/bin/git` checkout module passed 43/43 in 29.644 seconds.
+  Source and installed-tree resource counters are shared across exact raw HEAD
+  expansion, descriptor snapshots, bounded copy, and revalidation; each
+  snapshot retains its own absolute deadline so a legitimate long child run
+  cannot expire post-run verification in advance.
+- Trusted Mac bootstrap content is now an explicit protected property. Frozen
+  repository mode streams the exact HEAD blob, while installed-release mode
+  performs one bounded no-follow descriptor read, validates object identity,
+  selected access policy, and the manifest digest, then writes that same
+  in-memory byte sequence to isolated Python. The producer never executes the
+  candidate path and emits no bytes for oversized, linked, FIFO, replaced, or
+  digest-mismatched input. The frozen Git producer's command status is part of
+  admission rather than being inferred from a digest-shaped string.
+- The final host-level Python 3.13.12 full discovery passed 2,833/2,833 in
+  941.136 seconds with six existing platform skips. Repository contracts passed
+  105/105 after the journal identity update. Both bounded source/bootstrap
+  audits returned `No findings.`, and every applicable workflow, changed-file
+  lint/format, source-only syntax, skill, journal, diff, and bytecode gate passed.

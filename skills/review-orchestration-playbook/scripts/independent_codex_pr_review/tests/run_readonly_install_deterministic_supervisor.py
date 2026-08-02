@@ -155,6 +155,13 @@ XATTR_NOFOLLOW = 0x0001
 XATTR_NAMES_LIMIT_BYTES = 64 * 1024
 XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
+# This counts listing, capture, and revalidation observations, not unique paths.
+TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT = 32 * 1024
+TREE_SNAPSHOT_FILE_READ_LIMIT_BYTES = 512 * 1024 * 1024
+TREE_SNAPSHOT_ACCESS_POLICY_READ_LIMIT_BYTES = 128 * 1024 * 1024
+TREE_SNAPSHOT_PATH_READ_LIMIT_BYTES = 16 * 1024 * 1024
+TREE_SNAPSHOT_MAX_DEPTH = 64
+TREE_SNAPSHOT_TIMEOUT_SECONDS = 60.0
 DARWIN_PROC_UID_ONLY = 4
 DARWIN_PROC_RUID_ONLY = 5
 DARWIN_CTL_KERN = 1
@@ -182,6 +189,7 @@ _CLEANUP_RECOVERY_EVIDENCE_ATTR = "_readonly_cleanup_recovery_evidence"
 @dataclass(frozen=True)
 class TreeEntrySnapshot:
     kind: str
+    size: int | None
     device: int
     inode: int
     generation: int
@@ -197,6 +205,7 @@ class TreeEntrySnapshot:
     def protected_key(self) -> tuple[object, ...]:
         return (
             self.kind,
+            self.size,
             self.device,
             self.inode,
             self.generation,
@@ -212,12 +221,83 @@ class TreeEntrySnapshot:
 
 
 @dataclass(frozen=True)
+class SourceTreeBinding:
+    source_manifest_sha256: str
+    source_root_gid: int
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...]
+
+
+@dataclass(frozen=True)
 class SourceCheckoutBinding:
     repo_root: pathlib.Path
     head_sha: str
     source_relative_path: str
     source_manifest_sha256: str
     head_subtree_manifest_sha256: str
+    source_root_gid: int
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...]
+
+
+@dataclass
+class TreeSnapshotBudget:
+    entry_observations_remaining: int
+    file_read_bytes_remaining: int
+    access_policy_read_bytes_remaining: int
+    path_read_bytes_remaining: int
+    max_depth: int
+
+    @classmethod
+    def create(cls) -> TreeSnapshotBudget:
+        return cls(
+            entry_observations_remaining=TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT,
+            file_read_bytes_remaining=TREE_SNAPSHOT_FILE_READ_LIMIT_BYTES,
+            access_policy_read_bytes_remaining=(
+                TREE_SNAPSHOT_ACCESS_POLICY_READ_LIMIT_BYTES
+            ),
+            path_read_bytes_remaining=TREE_SNAPSHOT_PATH_READ_LIMIT_BYTES,
+            max_depth=TREE_SNAPSHOT_MAX_DEPTH,
+        )
+
+    def start_scan(self) -> TreeSnapshotScan:
+        return TreeSnapshotScan(
+            budget=self,
+            deadline=time.monotonic() + TREE_SNAPSHOT_TIMEOUT_SECONDS,
+        )
+
+
+@dataclass
+class TreeSnapshotScan:
+    budget: TreeSnapshotBudget
+    deadline: float
+
+    def checkpoint(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise RuntimeError("tree snapshot exceeded its total deadline")
+
+    def observe_entry(self, *, depth: int, path_bytes: int) -> None:
+        self.checkpoint()
+        if depth > self.budget.max_depth:
+            raise RuntimeError("tree snapshot exceeds its depth bound")
+        if self.budget.entry_observations_remaining <= 0:
+            raise RuntimeError("tree snapshot exceeds its entry-observation bound")
+        if path_bytes < 0 or path_bytes > self.budget.path_read_bytes_remaining:
+            raise RuntimeError("tree snapshot exceeds its cumulative path byte bound")
+        self.budget.entry_observations_remaining -= 1
+        self.budget.path_read_bytes_remaining -= path_bytes
+
+    def consume_file_read(self, size: int) -> None:
+        self.checkpoint()
+        if size < 0 or size > self.budget.file_read_bytes_remaining:
+            raise RuntimeError("tree snapshot exceeds its cumulative file byte bound")
+        self.budget.file_read_bytes_remaining -= size
+
+    def consume_access_policy_read(self, size: int) -> None:
+        self.checkpoint()
+        if size < 0 or size > self.budget.access_policy_read_bytes_remaining:
+            raise RuntimeError(
+                "tree snapshot exceeds its cumulative access-policy byte bound"
+            )
+        self.budget.access_policy_read_bytes_remaining -= size
 
 
 @dataclass(frozen=True)
@@ -1273,7 +1353,11 @@ def _acl_entries(descriptor: int) -> tuple[bytes, ...]:
     )
 
 
-def _xattr_snapshot(descriptor: int) -> tuple[tuple[bytes, str], ...]:
+def _xattr_snapshot(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan | None = None,
+) -> tuple[tuple[bytes, str], ...]:
     libc = ctypes.CDLL(None, use_errno=True)
     listxattr = libc.flistxattr
     listxattr.argtypes = (
@@ -1304,6 +1388,8 @@ def _xattr_snapshot(descriptor: int) -> tuple[tuple[bytes, str], ...]:
             )
         if size > XATTR_NAMES_LIMIT_BYTES:
             raise ValueError("extended attribute names exceed their byte bound")
+        if budget is not None:
+            budget.consume_access_policy_read(size)
         if size == 0:
             return b""
         buffer = ctypes.create_string_buffer(size)
@@ -1348,6 +1434,8 @@ def _xattr_snapshot(descriptor: int) -> tuple[tuple[bytes, str], ...]:
                 )
             if size > XATTR_VALUE_LIMIT_BYTES:
                 raise ValueError("extended attribute value exceeds its byte bound")
+            if budget is not None:
+                budget.consume_access_policy_read(size)
             if size == 0:
                 return b""
             buffer = ctypes.create_string_buffer(size)
@@ -1438,23 +1526,35 @@ def _open_snapshot_root(root: pathlib.Path) -> tuple[int, os.stat_result]:
         raise
 
 
-def _descriptor_digest(descriptor: int) -> str:
+def _descriptor_digest(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> str:
     before = os.fstat(descriptor)
     if not stat.S_ISREG(before.st_mode):
         raise OSError(errno.EINVAL, "snapshot digest requires a regular file")
+    budget.consume_file_read(before.st_size + 1)
     digest = hashlib.sha256()
     offset = 0
-    while True:
-        chunk = os.pread(descriptor, 1024 * 1024, offset)
+    while offset < before.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, before.st_size - offset),
+            offset,
+        )
         if not chunk:
             break
         digest.update(chunk)
         offset += len(chunk)
+        budget.checkpoint()
+    extra = os.pread(descriptor, 1, offset)
     after = os.fstat(descriptor)
     if (
         _snapshot_binding_key(before) != _snapshot_binding_key(after)
         or before.st_size != after.st_size
         or offset != after.st_size
+        or extra
     ):
         raise OSError(errno.ESTALE, "regular file changed during snapshot")
     return digest.hexdigest()
@@ -1462,15 +1562,22 @@ def _descriptor_digest(descriptor: int) -> str:
 
 def _access_policy_snapshot(
     descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
 ) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
-    return _xattr_snapshot(descriptor), _acl_entries(descriptor)
+    xattrs = _xattr_snapshot(descriptor, budget=budget)
+    acl_entries = _acl_entries(descriptor)
+    budget.consume_access_policy_read(sum(len(entry) for entry in acl_entries))
+    return xattrs, acl_entries
 
 
 def _stable_access_policy_snapshot(
     descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
 ) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
-    first = _access_policy_snapshot(descriptor)
-    second = _access_policy_snapshot(descriptor)
+    first = _access_policy_snapshot(descriptor, budget=budget)
+    second = _access_policy_snapshot(descriptor, budget=budget)
     if first != second:
         raise OSError(errno.ESTALE, "access policy changed during snapshot")
     return second
@@ -1478,13 +1585,15 @@ def _stable_access_policy_snapshot(
 
 def _regular_entry_sample(
     descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
 ) -> tuple[
     str,
     tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
 ]:
-    digest_before = _descriptor_digest(descriptor)
-    access_policy = _stable_access_policy_snapshot(descriptor)
-    digest_after = _descriptor_digest(descriptor)
+    digest_before = _descriptor_digest(descriptor, budget=budget)
+    access_policy = _stable_access_policy_snapshot(descriptor, budget=budget)
+    digest_after = _descriptor_digest(descriptor, budget=budget)
     if digest_before != digest_after:
         raise OSError(errno.ESTALE, "regular file changed during snapshot")
     return digest_after, access_policy
@@ -1492,12 +1601,14 @@ def _regular_entry_sample(
 
 def _stable_regular_entry_sample(
     descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
 ) -> tuple[
     str,
     tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
 ]:
-    first = _regular_entry_sample(descriptor)
-    second = _regular_entry_sample(descriptor)
+    first = _regular_entry_sample(descriptor, budget=budget)
+    second = _regular_entry_sample(descriptor, budget=budget)
     if first != second:
         raise OSError(
             errno.ESTALE,
@@ -1512,21 +1623,43 @@ def _snapshot_opened_entry(
     *,
     relative: str,
     snapshot: dict[str, TreeEntrySnapshot],
+    scan: TreeSnapshotScan,
+    depth: int,
+    expected_kinds: dict[bytes, str] | None,
 ) -> TreeEntrySnapshot:
+    relative_bytes = os.fsencode(relative)
+    scan.observe_entry(depth=depth, path_bytes=len(relative_bytes))
     if stat.S_ISREG(initial.st_mode):
+        kind = "file"
+    elif stat.S_ISDIR(initial.st_mode):
+        kind = "directory"
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    if expected_kinds is not None and expected_kinds.get(relative_bytes) != kind:
+        raise RuntimeError("source checkout subtree does not match the exact HEAD tree")
+
+    if kind == "file":
         if initial.st_nlink != 1:
             raise RuntimeError(
                 f"regular file has an external hardlink alias: {relative}"
             )
-        digest, access_policy = _stable_regular_entry_sample(descriptor)
-        kind = "file"
+        digest, access_policy = _stable_regular_entry_sample(
+            descriptor,
+            budget=scan,
+        )
         link_count = initial.st_nlink
-    elif stat.S_ISDIR(initial.st_mode):
+    else:
         digest = None
-        kind = "directory"
         link_count = None
-        access_before = _stable_access_policy_snapshot(descriptor)
-        names = tuple(sorted(os.listdir(descriptor)))
+        access_before = _stable_access_policy_snapshot(
+            descriptor,
+            budget=scan,
+        )
+        names = _bounded_snapshot_directory_names(
+            descriptor,
+            scan=scan,
+            child_depth=depth + 1,
+        )
         for name in names:
             child_relative = name if relative == "." else f"{relative}/{name}"
             child_descriptor, child_initial = _open_snapshot_entry(descriptor, name)
@@ -1536,6 +1669,9 @@ def _snapshot_opened_entry(
                     child_initial,
                     relative=child_relative,
                     snapshot=snapshot,
+                    scan=scan,
+                    depth=depth + 1,
+                    expected_kinds=expected_kinds,
                 )
                 final_child = os.stat(
                     name,
@@ -1553,16 +1689,21 @@ def _snapshot_opened_entry(
                 snapshot[child_relative] = child_snapshot
             finally:
                 os.close(child_descriptor)
-        if names != tuple(sorted(os.listdir(descriptor))):
+        if names != _bounded_snapshot_directory_names(
+            descriptor,
+            scan=scan,
+            child_depth=depth + 1,
+        ):
             raise OSError(
                 errno.ESTALE,
                 f"directory changed during snapshot: {relative}",
             )
-        access_policy = _stable_access_policy_snapshot(descriptor)
+        access_policy = _stable_access_policy_snapshot(
+            descriptor,
+            budget=scan,
+        )
         if access_before != access_policy:
             raise OSError(errno.ESTALE, "access policy changed during snapshot")
-    else:
-        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
     final_descriptor = os.fstat(descriptor)
     if _snapshot_binding_key(initial) != _snapshot_binding_key(final_descriptor):
         raise OSError(
@@ -1574,6 +1715,7 @@ def _snapshot_opened_entry(
     xattrs, acl_entries = access_policy
     return TreeEntrySnapshot(
         kind=kind,
+        size=final_descriptor.st_size if kind == "file" else None,
         device=final_descriptor.st_dev,
         inode=final_descriptor.st_ino,
         generation=getattr(final_descriptor, "st_gen", 0),
@@ -1588,8 +1730,30 @@ def _snapshot_opened_entry(
     )
 
 
-def _tree_snapshot_once(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
+def _bounded_snapshot_directory_names(
+    descriptor: int,
+    *,
+    scan: TreeSnapshotScan,
+    child_depth: int,
+) -> tuple[str, ...]:
+    names = []
+    with os.scandir(descriptor) as iterator:
+        for entry in iterator:
+            encoded = os.fsencode(entry.name)
+            scan.observe_entry(depth=child_depth, path_bytes=len(encoded))
+            names.append(entry.name)
+    scan.checkpoint()
+    return tuple(sorted(names))
+
+
+def _tree_snapshot_once(
+    root: pathlib.Path,
+    *,
+    scan: TreeSnapshotScan,
+    expected_kinds: dict[bytes, str] | None = None,
+) -> dict[str, TreeEntrySnapshot]:
     snapshot: dict[str, TreeEntrySnapshot] = {}
+    scan.checkpoint()
     descriptor, initial = _open_snapshot_root(root)
     try:
         root_snapshot = _snapshot_opened_entry(
@@ -1597,6 +1761,9 @@ def _tree_snapshot_once(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
             initial,
             relative=".",
             snapshot=snapshot,
+            scan=scan,
+            depth=0,
+            expected_kinds=expected_kinds,
         )
         final_descriptor = os.fstat(descriptor)
         final_path = root.lstat()
@@ -1606,14 +1773,36 @@ def _tree_snapshot_once(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
                 "snapshot root path no longer names the bound object",
             )
         snapshot["."] = root_snapshot
+        if (
+            expected_kinds is not None
+            and {os.fsencode(path): entry.kind for path, entry in snapshot.items()}
+            != expected_kinds
+        ):
+            raise RuntimeError(
+                "source checkout subtree does not match the exact HEAD tree"
+            )
         return snapshot
     finally:
         os.close(descriptor)
 
 
-def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
-    first = _tree_snapshot_once(root)
-    second = _tree_snapshot_once(root)
+def _tree_snapshot(
+    root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+    expected_kinds: dict[bytes, str] | None = None,
+) -> dict[str, TreeEntrySnapshot]:
+    scan = (budget or TreeSnapshotBudget.create()).start_scan()
+    first = _tree_snapshot_once(
+        root,
+        scan=scan,
+        expected_kinds=expected_kinds,
+    )
+    second = _tree_snapshot_once(
+        root,
+        scan=scan,
+        expected_kinds=expected_kinds,
+    )
     if not _tree_property_unchanged(first, second):
         raise OSError(errno.ESTALE, "install tree changed during snapshot")
     return second
@@ -1639,6 +1828,7 @@ def _source_snapshot_manifest_sha256(
             (
                 path,
                 entry.kind,
+                entry.size,
                 entry.uid,
                 entry.gid,
                 entry.mode,
@@ -1654,12 +1844,12 @@ def _source_snapshot_manifest_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _source_manifest_sha256(root: pathlib.Path) -> str:
-    return _source_snapshot_manifest_sha256(_tree_snapshot(root))
-
-
-def _source_root_gid(root: pathlib.Path) -> int:
-    return _tree_snapshot(root)["."].gid
+def _source_manifest_sha256(
+    root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+) -> str:
+    return _source_snapshot_manifest_sha256(_tree_snapshot(root, budget=budget))
 
 
 def _align_created_directory_group(
@@ -1796,13 +1986,13 @@ def _validate_source_index_flags(
             )
 
 
-def _verify_source_snapshot_matches_head(
+def _source_head_subtree(
     *,
-    source_snapshot: dict[str, TreeEntrySnapshot],
     repo_root: pathlib.Path,
     source_relative_path: str,
     head_sha: str,
-) -> str:
+    budget: TreeSnapshotBudget,
+) -> tuple[Any, tuple[tuple[bytes, Any], ...], dict[bytes, str]]:
     repository = inspect_repository(
         repo=repo_root,
         base_sha=head_sha,
@@ -1813,7 +2003,9 @@ def _verify_source_snapshot_matches_head(
     prefix = os.fsencode(source_relative_path)
     prefix_with_separator = b"" if prefix == b"." else prefix + b"/"
     selected = []
+    expansion_scan = budget.start_scan()
     for entry in tree.entries:
+        expansion_scan.checkpoint()
         if prefix_with_separator:
             if not entry.path.startswith(prefix_with_separator):
                 continue
@@ -1827,7 +2019,47 @@ def _verify_source_snapshot_matches_head(
         selected.append((relative_path, entry))
     if not selected:
         raise RuntimeError("source checkout exact-head subtree is empty")
+    expected_kinds = {b".": "directory"}
+    expansion_scan.observe_entry(depth=0, path_bytes=1)
+    for relative_path, _entry in selected:
+        components = relative_path.split(b"/")
+        if any(not component or component in {b".", b".."} for component in components):
+            raise RuntimeError("source checkout exact-head path is malformed")
+        for index in range(1, len(components)):
+            directory = b"/".join(components[:index])
+            if directory not in expected_kinds:
+                expansion_scan.observe_entry(
+                    depth=index,
+                    path_bytes=len(directory),
+                )
+                expected_kinds[directory] = "directory"
+        expansion_scan.observe_entry(
+            depth=len(components),
+            path_bytes=len(relative_path),
+        )
+        expected_kinds[relative_path] = "file"
+    return repository, tuple(selected), expected_kinds
 
+
+def _bind_source_tree(
+    source_root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget,
+) -> SourceTreeBinding:
+    source_snapshot = _tree_snapshot(source_root, budget=budget)
+    return SourceTreeBinding(
+        source_manifest_sha256=_source_snapshot_manifest_sha256(source_snapshot),
+        source_root_gid=source_snapshot["."].gid,
+        source_entries=tuple(sorted(source_snapshot.items())),
+    )
+
+
+def _verify_source_snapshot_matches_head(
+    *,
+    source_snapshot: dict[str, TreeEntrySnapshot],
+    repository: Any,
+    selected: tuple[tuple[bytes, Any], ...],
+) -> str:
     actual_files = {
         os.fsencode(path): entry
         for path, entry in source_snapshot.items()
@@ -1874,7 +2106,12 @@ def _verify_source_snapshot_matches_head(
     return manifest_digest.hexdigest()
 
 
-def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
+def _bind_source_checkout(
+    source_root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+) -> SourceCheckoutBinding:
+    active_budget = budget or TreeSnapshotBudget.create()
     expected_head = os.environ.get(EXPECTED_HEAD_ENV, "")
     if len(expected_head) != 40 or any(
         character not in "0123456789abcdef" for character in expected_head
@@ -1902,12 +2139,21 @@ def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
         )
     relative_path = relative.as_posix()
     _validate_source_index_flags(repo_root, relative_path)
-    source_snapshot = _tree_snapshot(source_root)
-    head_subtree_manifest_sha256 = _verify_source_snapshot_matches_head(
-        source_snapshot=source_snapshot,
+    repository, selected, expected_kinds = _source_head_subtree(
         repo_root=repo_root,
         source_relative_path=relative_path,
         head_sha=expected_head,
+        budget=active_budget,
+    )
+    source_snapshot = _tree_snapshot(
+        source_root,
+        budget=active_budget,
+        expected_kinds=expected_kinds,
+    )
+    head_subtree_manifest_sha256 = _verify_source_snapshot_matches_head(
+        source_snapshot=source_snapshot,
+        repository=repository,
+        selected=selected,
     )
     _validate_source_git_configuration(source_root)
     _validate_source_index_flags(repo_root, relative_path)
@@ -1917,7 +2163,413 @@ def _bind_source_checkout(source_root: pathlib.Path) -> SourceCheckoutBinding:
         source_relative_path=relative_path,
         source_manifest_sha256=_source_snapshot_manifest_sha256(source_snapshot),
         head_subtree_manifest_sha256=head_subtree_manifest_sha256,
+        source_root_gid=source_snapshot["."].gid,
+        source_entries=tuple(sorted(source_snapshot.items())),
     )
+
+
+def _snapshot_entry_matches_metadata(
+    entry: TreeEntrySnapshot,
+    metadata: os.stat_result,
+) -> bool:
+    return (
+        entry.device == metadata.st_dev
+        and entry.inode == metadata.st_ino
+        and entry.generation == getattr(metadata, "st_gen", 0)
+        and entry.uid == metadata.st_uid
+        and entry.gid == metadata.st_gid
+        and entry.mode == stat.S_IMODE(metadata.st_mode)
+        and entry.flags == getattr(metadata, "st_flags", 0)
+        and entry.link_count
+        == (metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None)
+        and entry.size == (metadata.st_size if stat.S_ISREG(metadata.st_mode) else None)
+    )
+
+
+@contextmanager
+def _open_relative_source_entry(
+    root_descriptor: int,
+    relative: str,
+) -> Iterator[tuple[int, os.stat_result]]:
+    if relative == ".":
+        descriptor = os.dup(root_descriptor)
+        try:
+            yield descriptor, os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+    components = pathlib.PurePosixPath(relative).parts
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise RuntimeError("bound source path is malformed")
+    parent_descriptor = os.dup(root_descriptor)
+    try:
+        metadata: os.stat_result | None = None
+        for component in components:
+            child_descriptor, metadata = _open_snapshot_entry(
+                parent_descriptor,
+                component,
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+        assert metadata is not None
+        yield parent_descriptor, metadata
+    finally:
+        os.close(parent_descriptor)
+
+
+def _copy_bound_xattrs(
+    source_descriptor: int,
+    destination_descriptor: int,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    listxattr = libc.flistxattr
+    listxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    )
+    listxattr.restype = ctypes.c_ssize_t
+    getxattr = libc.fgetxattr
+    getxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    getxattr.restype = ctypes.c_ssize_t
+    setxattr = libc.fsetxattr
+    setxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    setxattr.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    names_size = listxattr(source_descriptor, None, 0, 0)
+    if names_size < 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot size source extended attribute names during bounded copy",
+        )
+    if names_size > XATTR_NAMES_LIMIT_BYTES:
+        raise ValueError("source extended attribute names exceed their byte bound")
+    scan.consume_access_policy_read(names_size)
+    if names_size:
+        names_buffer = ctypes.create_string_buffer(names_size)
+        ctypes.set_errno(0)
+        actual_names_size = listxattr(
+            source_descriptor,
+            names_buffer,
+            names_size,
+            0,
+        )
+        if actual_names_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot read source extended attribute names during bounded copy",
+            )
+        if actual_names_size != names_size:
+            raise OSError(
+                errno.ESTALE,
+                "source extended attributes changed during bounded copy",
+            )
+        raw_names = bytes(names_buffer.raw[:names_size])
+        if not raw_names.endswith(b"\0"):
+            raise ValueError("source extended attribute name list is malformed")
+        observed_names = tuple(sorted(raw_names[:-1].split(b"\0")))
+    else:
+        observed_names = ()
+    if (
+        any(not name for name in observed_names)
+        or len(observed_names) > 128
+        or len(set(observed_names)) != len(observed_names)
+    ):
+        raise ValueError("source extended attribute name list is malformed")
+    expected_names = tuple(name for name, _digest in expected.xattrs)
+    if observed_names != expected_names:
+        raise OSError(errno.ESTALE, "source xattrs changed during bounded copy")
+    for name, expected_digest in expected.xattrs:
+        ctypes.set_errno(0)
+        value_size = getxattr(source_descriptor, name, None, 0, 0, 0)
+        if value_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot size source extended attribute during bounded copy",
+            )
+        if value_size > XATTR_VALUE_LIMIT_BYTES:
+            raise ValueError("source extended attribute exceeds its byte bound")
+        scan.consume_access_policy_read(value_size)
+        value_buffer = ctypes.create_string_buffer(max(1, value_size))
+        ctypes.set_errno(0)
+        actual_value_size = getxattr(
+            source_descriptor,
+            name,
+            value_buffer,
+            value_size,
+            0,
+            0,
+        )
+        if actual_value_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot read source extended attribute during bounded copy",
+            )
+        if actual_value_size != value_size:
+            raise OSError(
+                errno.ESTALE,
+                "source extended attribute changed during bounded copy",
+            )
+        value = bytes(value_buffer.raw[:value_size])
+        if hashlib.sha256(value).hexdigest() != expected_digest:
+            raise OSError(errno.ESTALE, "source xattr changed during bounded copy")
+        ctypes.set_errno(0)
+        if (
+            setxattr(
+                destination_descriptor,
+                name,
+                value_buffer,
+                value_size,
+                0,
+                0,
+            )
+            != 0
+        ):
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot copy source extended attribute to installed tree",
+            )
+
+
+def _apply_copied_entry_policy(
+    source_descriptor: int,
+    destination_descriptor: int,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+) -> None:
+    source_policy = _stable_access_policy_snapshot(
+        source_descriptor,
+        budget=scan,
+    )
+    if source_policy != (expected.xattrs, expected.acl_entries):
+        raise OSError(errno.ESTALE, "source access policy changed during bounded copy")
+    if expected.acl_entries:
+        raise RuntimeError("bounded source copy does not admit extended ACLs")
+    _copy_bound_xattrs(
+        source_descriptor,
+        destination_descriptor,
+        expected,
+        scan=scan,
+    )
+    destination_metadata = os.fstat(destination_descriptor)
+    if destination_metadata.st_uid != expected.uid:
+        raise RuntimeError("bounded source copy changed the expected owner")
+    if destination_metadata.st_gid != expected.gid:
+        os.fchown(destination_descriptor, -1, expected.gid)
+    os.fchmod(destination_descriptor, expected.mode)
+    if expected.flags:
+        if not hasattr(os, "fchflags"):
+            raise RuntimeError("bounded source copy cannot apply file flags")
+        os.fchflags(destination_descriptor, expected.flags)
+
+
+def _copy_bound_regular_file(
+    source_descriptor: int,
+    destination: pathlib.Path,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+) -> None:
+    if expected.kind != "file" or expected.size is None or expected.digest is None:
+        raise RuntimeError("bounded source file receipt is malformed")
+    initial = os.fstat(source_descriptor)
+    if not _snapshot_entry_matches_metadata(expected, initial):
+        raise OSError(errno.ESTALE, "bound source file identity changed before copy")
+    scan.consume_file_read(expected.size + 1)
+    destination_descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.size:
+            chunk = os.pread(
+                source_descriptor,
+                min(1024 * 1024, expected.size - offset),
+                offset,
+            )
+            if not chunk:
+                break
+            digest.update(chunk)
+            written = 0
+            while written < len(chunk):
+                count = os.write(destination_descriptor, chunk[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "bounded source copy made no progress")
+                written += count
+            offset += len(chunk)
+            scan.checkpoint()
+        extra = os.pread(source_descriptor, 1, offset)
+        final = os.fstat(source_descriptor)
+        if (
+            offset != expected.size
+            or extra
+            or not _snapshot_entry_matches_metadata(expected, final)
+            or digest.hexdigest() != expected.digest
+        ):
+            raise OSError(errno.ESTALE, "bound source file changed during copy")
+        _apply_copied_entry_policy(
+            source_descriptor,
+            destination_descriptor,
+            expected,
+            scan=scan,
+        )
+    finally:
+        os.close(destination_descriptor)
+
+
+def _copy_bound_source_tree(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceCheckoutBinding | SourceTreeBinding,
+    *,
+    budget: TreeSnapshotBudget,
+) -> None:
+    entries = dict(source_binding.source_entries)
+    root_entry = entries.get(".")
+    if root_entry is None or root_entry.kind != "directory":
+        raise RuntimeError("bound source root receipt is malformed")
+    scan = budget.start_scan()
+    source_descriptor, source_metadata = _open_snapshot_root(source_root)
+    try:
+        scan.observe_entry(depth=0, path_bytes=1)
+        if not _snapshot_entry_matches_metadata(root_entry, source_metadata):
+            raise OSError(
+                errno.ESTALE, "bound source root identity changed before copy"
+            )
+        installed_root.mkdir(mode=0o700)
+        directories = sorted(
+            (
+                (path, entry)
+                for path, entry in entries.items()
+                if path != "." and entry.kind == "directory"
+            ),
+            key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0]),
+        )
+        files = sorted(
+            (item for item in entries.items() if item[1].kind == "file"),
+            key=lambda item: item[0],
+        )
+        if len(directories) + len(files) + 1 != len(entries):
+            raise RuntimeError("bound source receipt contains an unsupported entry")
+        for relative, _entry in directories:
+            scan.observe_entry(
+                depth=len(pathlib.PurePosixPath(relative).parts),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            (installed_root / relative).mkdir(mode=0o700)
+        for relative, entry in files:
+            scan.observe_entry(
+                depth=len(pathlib.PurePosixPath(relative).parts),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            with _open_relative_source_entry(
+                source_descriptor,
+                relative,
+            ) as (entry_descriptor, metadata):
+                if not _snapshot_entry_matches_metadata(entry, metadata):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound source file identity changed before copy",
+                    )
+                _copy_bound_regular_file(
+                    entry_descriptor,
+                    installed_root / relative,
+                    entry,
+                    scan=scan,
+                )
+        for relative, entry in sorted(
+            ((".", root_entry), *directories),
+            key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0]),
+            reverse=True,
+        ):
+            scan.observe_entry(
+                depth=(
+                    0 if relative == "." else len(pathlib.PurePosixPath(relative).parts)
+                ),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            with _open_relative_source_entry(
+                source_descriptor,
+                relative,
+            ) as (entry_descriptor, metadata):
+                if not _snapshot_entry_matches_metadata(entry, metadata):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound source directory identity changed during copy",
+                    )
+                destination_descriptor = os.open(
+                    installed_root if relative == "." else installed_root / relative,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_NONBLOCK
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW,
+                )
+                try:
+                    _apply_copied_entry_policy(
+                        entry_descriptor,
+                        destination_descriptor,
+                        entry,
+                        scan=scan,
+                    )
+                finally:
+                    os.close(destination_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
+def _copy_bound_tree(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceTreeBinding,
+    *,
+    budget: TreeSnapshotBudget,
+) -> str:
+    _copy_bound_source_tree(
+        source_root,
+        installed_root,
+        source_binding,
+        budget=budget,
+    )
+    installed_manifest = _source_manifest_sha256(
+        installed_root,
+        budget=budget,
+    )
+    source_binding_after = _bind_source_tree(
+        source_root,
+        budget=budget,
+    )
+    if (
+        source_binding_after != source_binding
+        or installed_manifest != source_binding.source_manifest_sha256
+    ):
+        raise RuntimeError(
+            "installed test input does not match the stable bounded source"
+        )
+    return source_binding.source_manifest_sha256
 
 
 def _copy_bound_source(
@@ -1925,16 +2577,25 @@ def _copy_bound_source(
     installed_root: pathlib.Path,
     source_binding: SourceCheckoutBinding,
     source_manifest_before: str,
+    *,
+    budget: TreeSnapshotBudget | None = None,
 ) -> str:
-    shutil.copytree(
+    active_budget = budget or TreeSnapshotBudget.create()
+    _copy_bound_source_tree(
         source_root,
         installed_root,
-        symlinks=True,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        source_binding,
+        budget=active_budget,
     )
-    installed_manifest = _source_manifest_sha256(installed_root)
-    source_manifest_after = _source_manifest_sha256(source_root)
-    source_binding_after = _bind_source_checkout(source_root)
+    installed_manifest = _source_manifest_sha256(
+        installed_root,
+        budget=active_budget,
+    )
+    source_binding_after = _bind_source_checkout(
+        source_root,
+        budget=active_budget,
+    )
+    source_manifest_after = source_binding_after.source_manifest_sha256
     if (
         source_binding_after != source_binding
         or source_manifest_after != source_manifest_before
@@ -4122,17 +4783,28 @@ def _run_main(
     creation_cleanup_failures: list[CleanupFailure] = []
     deferred_control_flow_error: BaseException | None = None
     source_binding: SourceCheckoutBinding | None = None
+    source_tree_binding: SourceTreeBinding | SourceCheckoutBinding | None = None
     source_head_bound = False
     source_manifest_sha256: str | None = None
     trusted_source_requested = bool(os.environ.get(EXPECTED_HEAD_ENV))
     source_manifest_before: str | None = None
     source_gid: int | None = None
+    snapshot_budget = TreeSnapshotBudget.create()
     stage = "source-head-binding" if trusted_source_requested else "install-container"
     try:
         if trusted_source_requested:
-            source_binding = _bind_source_checkout(source_root)
-            source_manifest_before = source_binding.source_manifest_sha256
-            source_gid = _source_root_gid(source_root)
+            source_binding = _bind_source_checkout(
+                source_root,
+                budget=snapshot_budget,
+            )
+            source_tree_binding = source_binding
+        else:
+            source_tree_binding = _bind_source_tree(
+                source_root,
+                budget=snapshot_budget,
+            )
+        source_manifest_before = source_tree_binding.source_manifest_sha256
+        source_gid = source_tree_binding.source_root_gid
         stage = "install-container"
         install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
@@ -4159,19 +4831,21 @@ def _run_main(
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
         install_container_binding.revalidate()
-        if source_binding is not None and source_manifest_before is not None:
+        if source_binding is not None:
             source_manifest_sha256 = _copy_bound_source(
                 source_root,
                 installed_root,
                 source_binding,
                 source_manifest_before,
+                budget=snapshot_budget,
             )
         else:
-            shutil.copytree(
+            assert isinstance(source_tree_binding, SourceTreeBinding)
+            source_manifest_sha256 = _copy_bound_tree(
                 source_root,
                 installed_root,
-                symlinks=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+                source_tree_binding,
+                budget=snapshot_budget,
             )
         install_container_binding.revalidate()
         source_head_bound = source_binding is not None
@@ -4179,7 +4853,7 @@ def _run_main(
         _set_tree_read_only(installed_root)
         stage = "snapshot-before"
         install_container_binding.revalidate()
-        before = _tree_snapshot(installed_root)
+        before = _tree_snapshot(installed_root, budget=snapshot_budget)
         stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
@@ -4227,7 +4901,7 @@ def _run_main(
         stage = "install-container-revalidation"
         install_container_binding.revalidate()
         stage = "snapshot-after"
-        after = _tree_snapshot(installed_root)
+        after = _tree_snapshot(installed_root, budget=snapshot_budget)
         install_container_binding.revalidate()
         stage = "runtime-residue"
         runtime_residue = _list_bound_directory(runtime_parent_binding)

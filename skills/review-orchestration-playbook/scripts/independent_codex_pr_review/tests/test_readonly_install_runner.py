@@ -4,6 +4,7 @@ import contextlib
 import dis
 import errno
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -33,7 +34,31 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             source_relative_path="source",
             source_manifest_sha256="b" * 64,
             head_subtree_manifest_sha256="c" * 64,
+            source_root_gid=os.getgid(),
+            source_entries=(),
         )
+        self._source_tree_binding = runner.SourceTreeBinding(
+            source_manifest_sha256="b" * 64,
+            source_root_gid=os.getgid(),
+            source_entries=(),
+        )
+
+        def copy_bound_tree(
+            source: pathlib.Path,
+            destination: pathlib.Path,
+            _binding: runner.SourceTreeBinding,
+            *,
+            budget: runner.TreeSnapshotBudget,
+        ) -> str:
+            self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+            runner.shutil.copytree(
+                source,
+                destination,
+                symlinks=True,
+                ignore=runner.shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            return self._source_tree_binding.source_manifest_sha256
+
         patchers = (
             mock.patch.object(
                 runner,
@@ -42,13 +67,18 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             ),
             mock.patch.object(
                 runner,
-                "_source_manifest_sha256",
-                return_value="b" * 64,
+                "_bind_source_tree",
+                return_value=self._source_tree_binding,
             ),
             mock.patch.object(
                 runner,
-                "_source_root_gid",
-                return_value=os.getgid(),
+                "_copy_bound_tree",
+                side_effect=copy_bound_tree,
+            ),
+            mock.patch.object(
+                runner,
+                "_source_manifest_sha256",
+                return_value="b" * 64,
             ),
         )
         for patcher in patchers:
@@ -6500,7 +6530,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "_xattr_snapshot",
-                    side_effect=lambda _descriptor: xattrs,
+                    side_effect=lambda _descriptor, **_kwargs: xattrs,
                 ),
             ):
                 baseline = runner._tree_snapshot(root)
@@ -8432,6 +8462,23 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 os.environ[runner.EXPECTED_HEAD_ENV] = value
             yield
 
+    @staticmethod
+    def _snapshot_budget(
+        *,
+        observations: int = 256,
+        file_bytes: int = 1024 * 1024,
+        access_policy_bytes: int = 1024 * 1024,
+        path_bytes: int = 1024 * 1024,
+        max_depth: int = 16,
+    ) -> runner.TreeSnapshotBudget:
+        return runner.TreeSnapshotBudget(
+            entry_observations_remaining=observations,
+            file_read_bytes_remaining=file_bytes,
+            access_policy_read_bytes_remaining=access_policy_bytes,
+            path_read_bytes_remaining=path_bytes,
+            max_depth=max_depth,
+        )
+
     def test_clean_exact_head_binding_and_stable_copy(self) -> None:
         with self._synthetic_repository() as (root, repo, source, head_sha):
             with self._expected_head(head_sha):
@@ -8653,29 +8700,282 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                 ):
                     runner._bind_source_checkout(source)
 
+    def test_snapshot_budget_is_shared_across_observations_bytes_and_passes(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-snapshot-budget-") as root:
+            first = root / "first"
+            first.write_bytes(b"1234")
+            runner._tree_snapshot(
+                root,
+                budget=self._snapshot_budget(
+                    observations=8,
+                    file_bytes=40,
+                    max_depth=1,
+                ),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "entry-observation bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=7,
+                        file_bytes=40,
+                        max_depth=1,
+                    ),
+                )
+
+            second = root / "second"
+            second.write_bytes(b"5678")
+            with self.assertRaisesRegex(RuntimeError, "cumulative file byte bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=64,
+                        file_bytes=40,
+                        max_depth=1,
+                    ),
+                )
+
+            first.unlink()
+            second.unlink()
+            sparse = root / "sparse"
+            with sparse.open("wb") as stream:
+                stream.truncate(1024 * 1024)
+            with (
+                mock.patch.object(
+                    runner.os,
+                    "pread",
+                    side_effect=AssertionError(
+                        "oversized sparse content must fail before pread"
+                    ),
+                ) as pread,
+                self.assertRaisesRegex(RuntimeError, "cumulative file byte bound"),
+            ):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=128,
+                        file_bytes=16,
+                        max_depth=1,
+                    ),
+                )
+            pread.assert_not_called()
+
+    def test_snapshot_budget_enforces_depth_and_one_deadline_for_both_passes(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-snapshot-depth-") as root:
+            nested = root / "nested"
+            nested.mkdir(mode=0o700)
+            (nested / "payload").write_bytes(b"x")
+            runner._tree_snapshot(
+                root,
+                budget=self._snapshot_budget(max_depth=2),
+            )
+            with self.assertRaisesRegex(RuntimeError, "depth bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(max_depth=1),
+                )
+
+        def one_pass(
+            _root: pathlib.Path,
+            *,
+            scan: runner.TreeSnapshotScan,
+            expected_kinds: dict[bytes, str] | None = None,
+        ) -> dict[str, runner.TreeEntrySnapshot]:
+            del expected_kinds
+            scan.checkpoint()
+            return {}
+
+        with (
+            mock.patch.object(
+                runner.time, "monotonic", side_effect=(0.0, 59.999, 60.0)
+            ),
+            mock.patch.object(runner, "_tree_snapshot_once", side_effect=one_pass),
+            self.assertRaisesRegex(RuntimeError, "total deadline"),
+        ):
+            runner._tree_snapshot(pathlib.Path("/synthetic"))
+
+    def test_head_prefix_expansion_obeys_snapshot_depth_and_entry_budget(
+        self,
+    ) -> None:
+        for failure, budget in (
+            (
+                "depth bound",
+                self._snapshot_budget(observations=256, max_depth=2),
+            ),
+            (
+                "entry-observation bound",
+                self._snapshot_budget(observations=2, max_depth=16),
+            ),
+        ):
+            with (
+                self.subTest(failure=failure),
+                self._synthetic_repository() as (_root, repo, source, _head_sha),
+            ):
+                nested = source / "one" / "two"
+                nested.mkdir(mode=0o700, parents=True)
+                (nested / "payload.py").write_text("VALUE = 1\n", encoding="ascii")
+                self._git(repo, "add", "--all")
+                self._git(repo, "commit", "-q", "-m", "Add nested source")
+                head_sha = self._git(repo, "rev-parse", "HEAD")
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, failure),
+                ):
+                    runner._bind_source_checkout(source, budget=budget)
+
+    def test_directory_copy_revalidation_consumes_observation_budget(self) -> None:
+        with owned_temporary_directory("readonly-directory-copy-budget-") as root:
+            source = root / "source"
+            nested = source / "nested"
+            nested.mkdir(mode=0o700, parents=True)
+            (nested / "payload.py").write_text("VALUE = 1\n", encoding="ascii")
+            binding = runner._bind_source_tree(
+                source,
+                budget=self._snapshot_budget(observations=128),
+            )
+            with self.assertRaisesRegex(RuntimeError, "entry-observation bound"):
+                runner._copy_bound_source_tree(
+                    source,
+                    root / "insufficient",
+                    binding,
+                    budget=self._snapshot_budget(observations=4),
+                )
+            runner._copy_bound_source_tree(
+                source,
+                root / "complete",
+                binding,
+                budget=self._snapshot_budget(observations=5),
+            )
+            self.assertEqual(
+                (root / "complete" / "nested" / "payload.py").read_text(
+                    encoding="ascii"
+                ),
+                "VALUE = 1\n",
+            )
+
+    def test_bounded_copy_ignores_concurrent_extra_until_bounded_revalidation(
+        self,
+    ) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                extra = source / "oversized.ignored"
+                with extra.open("wb") as stream:
+                    stream.truncate(1024 * 1024)
+                extra_identity = (extra.stat().st_dev, extra.stat().st_ino)
+                real_pread = runner.os.pread
+
+                def reject_extra_pread(
+                    descriptor: int,
+                    size: int,
+                    offset: int,
+                ) -> bytes:
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) == extra_identity:
+                        raise AssertionError(
+                            "bounded copy read a path absent from the exact receipt"
+                        )
+                    return real_pread(descriptor, size, offset)
+
+                installed = root / "installed"
+                with (
+                    mock.patch.object(
+                        runner.os, "pread", side_effect=reject_extra_pread
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "does not match the exact HEAD"
+                    ),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        installed,
+                        binding,
+                        source_manifest,
+                        budget=self._snapshot_budget(
+                            observations=128,
+                            file_bytes=1024,
+                        ),
+                    )
+
+            self.assertFalse((installed / extra.name).exists())
+            self.assertEqual(
+                (installed / "payload.txt").read_text(encoding="ascii"),
+                "original\n",
+            )
+
+    def test_post_copy_fanout_is_stopped_by_shared_observation_budget(self) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                real_copy = runner._copy_bound_source_tree
+
+                def copy_then_inject_fanout(
+                    source_path: pathlib.Path,
+                    destination: pathlib.Path,
+                    source_receipt: runner.SourceCheckoutBinding,
+                    *,
+                    budget: runner.TreeSnapshotBudget,
+                ) -> None:
+                    real_copy(
+                        source_path,
+                        destination,
+                        source_receipt,
+                        budget=budget,
+                    )
+                    for index in range(64):
+                        (source_path / f"extra-{index:02d}.ignored").write_bytes(b"")
+
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_copy_bound_source_tree",
+                        side_effect=copy_then_inject_fanout,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "entry-observation bound"),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        root / "installed",
+                        binding,
+                        source_manifest,
+                        budget=self._snapshot_budget(observations=24),
+                    )
+
     def test_copy_rejects_source_mutation_during_copy(self) -> None:
         with self._synthetic_repository() as (root, _repo, source, head_sha):
             with self._expected_head(head_sha):
                 binding = runner._bind_source_checkout(source)
                 source_manifest = binding.source_manifest_sha256
-                real_copytree = runner.shutil.copytree
+                real_copy = runner._copy_bound_source_tree
 
                 def copy_then_mutate(
                     source_path: pathlib.Path,
                     destination: pathlib.Path,
-                    **kwargs: object,
-                ) -> pathlib.Path:
-                    copied = real_copytree(source_path, destination, **kwargs)
+                    source_receipt: runner.SourceCheckoutBinding,
+                    *,
+                    budget: runner.TreeSnapshotBudget,
+                ) -> None:
+                    real_copy(
+                        source_path,
+                        destination,
+                        source_receipt,
+                        budget=budget,
+                    )
                     (pathlib.Path(source_path) / "payload.txt").write_text(
                         "mutated during copy\n",
                         encoding="ascii",
                     )
-                    return copied
 
                 with (
                     mock.patch.object(
-                        runner.shutil,
-                        "copytree",
+                        runner,
+                        "_copy_bound_source_tree",
                         side_effect=copy_then_mutate,
                     ),
                     self.assertRaisesRegex(
@@ -8691,6 +8991,325 @@ class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
                     )
 
 
+class TrustedMacGateBootstrapTests(unittest.TestCase):
+    GATE_PATH = pathlib.Path(runner.__file__).with_name("trusted_mac_gate.py")
+    GATE_SOURCE = GATE_PATH.read_text(encoding="utf-8")
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _synthetic_tool_root() -> object:
+        with owned_temporary_directory("trusted-mac-gate-") as root:
+            review_supervisor = root / "review_supervisor"
+            tests = root / "tests"
+            review_supervisor.mkdir(mode=0o700)
+            tests.mkdir(mode=0o700)
+            (review_supervisor / "__init__.py").write_text("", encoding="ascii")
+            (tests / "__init__.py").write_text("", encoding="ascii")
+            (tests / "trusted_mac_gate.py").write_text(
+                TrustedMacGateBootstrapTests.GATE_SOURCE,
+                encoding="utf-8",
+            )
+            marker = root / "ambient-marker"
+            payload = (
+                "import json, os, pathlib, sys\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "print(json.dumps({\n"
+                "    'environment': dict(sorted(os.environ.items())),\n"
+                "    'flags': {\n"
+                "        'isolated': sys.flags.isolated,\n"
+                "        'ignore_environment': sys.flags.ignore_environment,\n"
+                "        'no_site': sys.flags.no_site,\n"
+                "        'no_user_site': sys.flags.no_user_site,\n"
+                "        'safe_path': sys.flags.safe_path,\n"
+                "        'dont_write_bytecode': sys.dont_write_bytecode,\n"
+                "    },\n"
+                "    'marker_exists': marker.exists(),\n"
+                "    'sys_path': sys.path,\n"
+                "}, sort_keys=True))\n"
+            )
+            (tests / "run_required_no_child_profile.py").write_text(
+                payload,
+                encoding="ascii",
+            )
+            (tests / "run_readonly_install_deterministic_supervisor.py").write_text(
+                payload,
+                encoding="ascii",
+            )
+            yield root, marker
+
+    @staticmethod
+    def _run_gate(
+        root: pathlib.Path,
+        *arguments: str,
+        isolated: bool = True,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = ["/usr/bin/env", "-i", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin"]
+        if extra_environment:
+            command.extend(
+                f"{key}={value}" for key, value in sorted(extra_environment.items())
+            )
+        command.append(sys.executable)
+        command.extend(("-I", "-B", "-S") if isolated else ("-B", "-S"))
+        command.extend(("-", str(root), *arguments))
+        return subprocess.run(
+            command,
+            cwd=root,
+            input=TrustedMacGateBootstrapTests.GATE_SOURCE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+    @classmethod
+    def _load_gate_module(cls) -> object:
+        spec = importlib.util.spec_from_file_location(
+            "_trusted_mac_gate_budget_test",
+            cls.GATE_PATH,
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load trusted gate test module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+        return module
+
+    def test_source_only_bootstrap_ignores_ambient_python_startup(self) -> None:
+        with self._synthetic_tool_root() as (root, marker):
+            hostile = root / "hostile-python"
+            hostile.mkdir(mode=0o700)
+            marker_script = (
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('executed', encoding='ascii')\n"
+            )
+            (hostile / "sitecustomize.py").write_text(
+                marker_script,
+                encoding="ascii",
+            )
+            (hostile / "usercustomize.py").write_text(
+                marker_script,
+                encoding="ascii",
+            )
+            (hostile / "ambient.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('pth')\n",
+                encoding="ascii",
+            )
+            hostile_environment = {
+                "HOME": str(hostile),
+                "PYTHONHOME": str(hostile),
+                "PYTHONPATH": str(hostile),
+                "PYTHONUSERBASE": str(hostile),
+            }
+            cases = (
+                ("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),
+                ("readonly", ("readonly", "a" * 40), runner.EXPECTED_HEAD_ENV),
+                (
+                    "hosted-readonly",
+                    ("hosted-readonly", str(root / "runtime"), str(root / "home")),
+                    runner.EXPLICIT_RUNTIME_PARENT_ENV,
+                ),
+            )
+            for label, arguments, expected_key in cases:
+                with self.subTest(mode=label):
+                    completed = self._run_gate(
+                        root,
+                        *arguments,
+                        extra_environment=hostile_environment,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stderr, "")
+                    result = json.loads(completed.stdout)
+                    self.assertEqual(
+                        result["flags"],
+                        {
+                            "dont_write_bytecode": True,
+                            "ignore_environment": 1,
+                            "isolated": 1,
+                            "no_site": 1,
+                            "no_user_site": 1,
+                            "safe_path": True,
+                        },
+                    )
+                    self.assertIn(expected_key, result["environment"])
+                    self.assertNotEqual(result["environment"]["HOME"], str(hostile))
+                    self.assertNotIn(str(hostile), result["sys_path"])
+                    self.assertNotIn(str(root), result["sys_path"])
+                    self.assertIs(result["marker_exists"], False)
+                    self.assertFalse(marker.exists())
+                    self.assertFalse(tuple(root.rglob("__pycache__")))
+
+    def test_source_only_bootstrap_rejects_substitutes_and_nonisolated_start(
+        self,
+    ) -> None:
+        mutators = (
+            (
+                "symlink",
+                lambda root: (root / "review_supervisor" / "alias.py").symlink_to(
+                    "__init__.py"
+                ),
+                "contains a symlink",
+            ),
+            (
+                "native-substitute",
+                lambda root: (root / "review_supervisor" / "native.so").write_bytes(
+                    b"synthetic"
+                ),
+                "contains a substitute",
+            ),
+            (
+                "bytecode-cache",
+                lambda root: (root / "review_supervisor" / "__pycache__").mkdir(),
+                "contains __pycache__",
+            ),
+            (
+                "duplicate-module",
+                self._create_duplicate_module,
+                "maps duplicate module",
+            ),
+        )
+        for label, mutate, expected_message in mutators:
+            with (
+                self.subTest(case=label),
+                self._synthetic_tool_root() as (root, _marker),
+            ):
+                mutate(root)
+                completed = self._run_gate(root, "live")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_message, completed.stderr)
+
+        with self._synthetic_tool_root() as (root, _marker):
+            completed = self._run_gate(root, "live", isolated=False)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires -I -B -S", completed.stderr)
+
+            completed = self._run_gate(root, "readonly", "A" * 40)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires one full SHA-1", completed.stderr)
+
+            direct = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(root / "tests" / "trusted_mac_gate.py"),
+                    "live",
+                ),
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertIn("bounded trusted stdin", direct.stderr)
+
+    def test_external_bootstrap_prevents_gate_replacement_execution(self) -> None:
+        with self._synthetic_tool_root() as (root, marker):
+            gate_path = root / "tests" / "trusted_mac_gate.py"
+            gate_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed', encoding='ascii')\n",
+                encoding="ascii",
+            )
+            completed = self._run_gate(root, "live")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(marker.exists())
+
+            gate_path.unlink()
+            gate_path.symlink_to("run_required_no_child_profile.py")
+            completed = self._run_gate(root, "live")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("contains a symlink", completed.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_gate_file_budget_uses_opened_size_and_link_count(self) -> None:
+        gate = self._load_gate_module()
+        with owned_temporary_directory("trusted-gate-open-budget-") as root:
+            payload = root / "payload.py"
+            payload.write_bytes(b"x")
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+            )
+            real_open = os.open
+            try:
+                for mutation in ("grow", "hardlink"):
+                    with self.subTest(mutation=mutation):
+                        payload.write_bytes(b"x")
+                        alias = root / "payload-link.py"
+                        if alias.exists():
+                            alias.unlink()
+
+                        def mutate_then_open(
+                            name: str,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            if mutation == "grow":
+                                mutation_descriptor = real_open(
+                                    payload,
+                                    os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC,
+                                )
+                                try:
+                                    os.write(
+                                        mutation_descriptor,
+                                        b"x" * (gate.SOURCE_FILE_LIMIT_BYTES + 1),
+                                    )
+                                finally:
+                                    os.close(mutation_descriptor)
+                            else:
+                                os.link(payload, alias)
+                            return real_open(name, flags, mode, dir_fd=dir_fd)
+
+                        with (
+                            mock.patch.object(
+                                gate.os,
+                                "open",
+                                side_effect=mutate_then_open,
+                            ),
+                            mock.patch.object(
+                                gate.os,
+                                "read",
+                                side_effect=AssertionError(
+                                    "mutated source must fail before read"
+                                ),
+                            ) as read,
+                            self.assertRaisesRegex(
+                                OSError,
+                                "changed while opening",
+                            ),
+                        ):
+                            gate._read_source_at(
+                                parent_descriptor,
+                                payload.name,
+                                payload,
+                                budget=gate._SnapshotBudget(),
+                            )
+                        read.assert_not_called()
+                        if alias.exists():
+                            alias.unlink()
+            finally:
+                os.close(parent_descriptor)
+
+    @staticmethod
+    def _create_duplicate_module(root: pathlib.Path) -> None:
+        package = root / "review_supervisor"
+        (package / "duplicate.py").write_text("", encoding="ascii")
+        duplicate = package / "duplicate"
+        duplicate.mkdir(mode=0o700)
+        (duplicate / "__init__.py").write_text("", encoding="ascii")
+
+
 class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
     SOURCE_HEAD = "a" * 40
     SOURCE_MANIFEST = "b" * 64
@@ -8703,6 +9322,8 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
     ) -> tuple[
         int,
         dict[str, object],
+        mock.Mock,
+        mock.Mock,
         mock.Mock,
         mock.Mock,
         mock.Mock,
@@ -8726,6 +9347,13 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 source_relative_path="source",
                 source_manifest_sha256=self.SOURCE_MANIFEST,
                 head_subtree_manifest_sha256=self.SOURCE_HEAD_MANIFEST,
+                source_root_gid=os.getgid(),
+                source_entries=(),
+            )
+            source_tree_binding = runner.SourceTreeBinding(
+                source_manifest_sha256=self.SOURCE_MANIFEST,
+                source_root_gid=os.getgid(),
+                source_entries=(),
             )
             completed = subprocess.CompletedProcess(
                 args=(sys.executable,),
@@ -8734,25 +9362,31 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 stderr="",
             )
 
-            def fake_copytree(
-                _source: pathlib.Path,
-                destination: pathlib.Path,
-                **_kwargs: object,
-            ) -> pathlib.Path:
-                destination = pathlib.Path(destination)
-                destination.mkdir(mode=0o700)
-                return destination
-
             def fake_bound_copy(
                 _source: pathlib.Path,
                 destination: pathlib.Path,
                 binding: runner.SourceCheckoutBinding,
                 source_manifest: str,
+                *,
+                budget: runner.TreeSnapshotBudget,
             ) -> str:
                 self.assertEqual(binding, source_binding)
                 self.assertEqual(source_manifest, self.SOURCE_MANIFEST)
+                self.assertIsInstance(budget, runner.TreeSnapshotBudget)
                 destination.mkdir(mode=0o700)
                 return source_manifest
+
+            def fake_bounded_tree_copy(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                binding: runner.SourceTreeBinding,
+                *,
+                budget: runner.TreeSnapshotBudget,
+            ) -> str:
+                self.assertEqual(binding, source_tree_binding)
+                self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+                destination.mkdir(mode=0o700)
+                return binding.source_manifest_sha256
 
             def complete_no_child(**kwargs: object) -> subprocess.CompletedProcess[str]:
                 proof = kwargs["closure_proof"]
@@ -8775,8 +9409,9 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 return completed
 
             bind_source = mock.Mock(return_value=source_binding)
-            source_manifest = mock.Mock(return_value=self.SOURCE_MANIFEST)
+            bind_source_tree = mock.Mock(return_value=source_tree_binding)
             copy_bound_source = mock.Mock(side_effect=fake_bound_copy)
+            copy_bound_tree = mock.Mock(side_effect=fake_bounded_tree_copy)
             run_no_child = mock.Mock(side_effect=complete_no_child)
             run_bounded_child = mock.Mock(side_effect=complete_hosted)
             stdout = io.StringIO()
@@ -8811,13 +9446,8 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 mock.patch.object(runner, "_bind_source_checkout", bind_source),
                 mock.patch.object(
                     runner,
-                    "_source_manifest_sha256",
-                    source_manifest,
-                ),
-                mock.patch.object(
-                    runner,
-                    "_source_root_gid",
-                    return_value=os.getgid(),
+                    "_bind_source_tree",
+                    bind_source_tree,
                 ),
                 mock.patch.object(runner, "_align_created_directory_group"),
                 mock.patch.object(
@@ -8826,9 +9456,9 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                     copy_bound_source,
                 ),
                 mock.patch.object(
-                    runner.shutil,
-                    "copytree",
-                    side_effect=fake_copytree,
+                    runner,
+                    "_copy_bound_tree",
+                    copy_bound_tree,
                 ),
                 mock.patch.object(runner, "_set_tree_read_only"),
                 mock.patch.object(runner, "_tree_snapshot", return_value={}),
@@ -8874,7 +9504,9 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
                 returncode,
                 summary,
                 bind_source,
+                bind_source_tree,
                 copy_bound_source,
+                copy_bound_tree,
                 run_no_child,
                 run_bounded_child,
             )
@@ -8884,14 +9516,18 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
             returncode,
             summary,
             bind_source,
+            bind_source_tree,
             copy_bound_source,
+            copy_bound_tree,
             run_no_child,
             run_bounded_child,
         ) = self._run_selected_path(expected_head=self.SOURCE_HEAD)
 
         self.assertEqual(returncode, 0)
         bind_source.assert_called_once()
+        bind_source_tree.assert_not_called()
         copy_bound_source.assert_called_once()
+        copy_bound_tree.assert_not_called()
         run_no_child.assert_called_once()
         run_bounded_child.assert_not_called()
         self.assertEqual(summary["primary_status"], "complete")
@@ -8919,14 +9555,18 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
             returncode,
             summary,
             bind_source,
+            bind_source_tree,
             copy_bound_source,
+            copy_bound_tree,
             run_no_child,
             run_bounded_child,
         ) = self._run_selected_path(expected_head=None)
 
         self.assertEqual(returncode, 0)
         bind_source.assert_not_called()
+        bind_source_tree.assert_called_once()
         copy_bound_source.assert_not_called()
+        copy_bound_tree.assert_called_once()
         run_no_child.assert_not_called()
         run_bounded_child.assert_called_once()
         call = run_bounded_child.call_args
@@ -8945,7 +9585,7 @@ class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
         self.assertIs(summary["source_head_bound"], False)
         self.assertIsNone(summary["source_head_sha"])
         self.assertIsNone(summary["source_head_subtree_manifest_sha256"])
-        self.assertIsNone(summary["source_manifest_sha256"])
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
 
 
 class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
@@ -9461,6 +10101,8 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
         source_relative_path="source",
         source_manifest_sha256="b" * 64,
         head_subtree_manifest_sha256="c" * 64,
+        source_root_gid=os.getgid(),
+        source_entries=(),
     )
     source_manifest = "b" * 64
 
@@ -9469,14 +10111,18 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
         destination,
         _binding,
         _source_manifest,
+        *,
+        budget,
     ):
+        assert isinstance(budget, runner.TreeSnapshotBudget)
         destination.mkdir(mode=0o700)
         return source_manifest
 
     snapshot_count = 0
 
-    def snapshot(_path):
+    def snapshot(_path, *, budget):
         global snapshot_count
+        assert isinstance(budget, runner.TreeSnapshotBudget)
         snapshot_count += 1
         if scenario == "existing-primary-late-signal" and snapshot_count == 2:
             raise RuntimeError("existing primary remains authoritative")
@@ -9574,9 +10220,6 @@ with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root
                 "_source_manifest_sha256",
                 return_value=source_manifest,
             )
-        )
-        stack.enter_context(
-            mock.patch.object(runner, "_source_root_gid", return_value=os.getgid())
         )
         stack.enter_context(
             mock.patch.object(runner, "_align_created_directory_group")

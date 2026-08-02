@@ -348,8 +348,73 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
-CODEX_REVIEW_EXPECTED_HEAD_SHA=<full-head-sha> PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_readonly_install_deterministic_supervisor
+TOOL_ROOT="$PWD"
+HEAD_SHA=<full-head-sha>
+GATE_SOURCE="$TOOL_ROOT/tests/trusted_mac_gate.py"
+GATE_SOURCE_SHA256=<manifest-bound-sha256>
+set -o pipefail
+stream_manifest_gate() {
+  /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+    "$TRUSTED_PYTHON" -I -B -S -c '
+import hashlib
+import os
+import stat
+import sys
+
+limit = 131072
+path, expected_digest = sys.argv[1:]
+if len(expected_digest) != 64 or any(
+    character not in "0123456789abcdef" for character in expected_digest
+):
+    raise SystemExit("invalid manifest-bound gate digest")
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise SystemExit("trusted gate is not a singly linked regular file")
+    if opened.st_size < 1 or opened.st_size > limit:
+        raise SystemExit("trusted gate size is outside the closed bound")
+    chunks = []
+    total = 0
+    while total <= limit:
+        chunk = os.read(descriptor, min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    data = b"".join(chunks)
+    closed = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+identity = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    stat.S_IFMT(value.st_mode),
+    value.st_uid,
+    value.st_gid,
+    stat.S_IMODE(value.st_mode),
+    value.st_nlink,
+    value.st_size,
+)
+if identity(opened) != identity(closed):
+    raise SystemExit("trusted gate identity or access policy changed")
+if len(data) != opened.st_size or not 1 <= len(data) <= limit:
+    raise SystemExit("trusted gate content exceeded or disagreed with its bound")
+if hashlib.sha256(data).hexdigest() != expected_digest:
+    raise SystemExit("trusted gate digest disagrees with the installed manifest")
+view = memoryview(data)
+while view:
+    written = os.write(1, view)
+    if written <= 0:
+        raise SystemExit("trusted gate stream made no progress")
+    view = view[written:]
+' "$GATE_SOURCE" "$GATE_SOURCE_SHA256"
+}
+stream_manifest_gate | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" live
+stream_manifest_gate | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" readonly "$HEAD_SHA"
 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
@@ -359,6 +424,15 @@ isolated source、`nobody` child、受监管 Python runtime 和完整 determinis
 和 production no-child proof 不属于这个 isolated copy 的证明边界。
 
 第二、三条命令只允许在匹配 production pin、且没有外层 Seatbelt 的受信任 Mac 上连续运行。
+它们不通过 ambient `PYTHONPATH` 或 `-m` 解析 candidate source。source-only bootstrap
+要求 `-I -B -S`，且只从已绑定 exact HEAD blob 或 installed-release manifest 的最多
+131072-byte stdin 执行。Installed-release 模式由 parent-validated Python 以 no-follow
+descriptor 只读取一次，验证同一内存 byte sequence 的 manifest digest 后再流入 gate；
+路径替换、增长、链接、FIFO 或 access-policy 变化均失败关闭。直接执行 candidate gate path
+会失败。清空环境后只从
+descriptor-bound、双重读取且有 entry/path/source-byte
+上限的 `review_supervisor/**/*.py` 与 `tests/**/*.py` 映射加载模块；symlink、
+`__pycache__`、`.pyc`/`.pyo`、native substitute 和重复 module mapping 均失败关闭。
 十三项 live 测试必须全部执行并通过，随后 exact-head read-only install runner 必须返回完整
 成功的 structured summary。该 Trusted Mac summary 只有在
 `primary_status == "complete"`、`primary_failure == null`、
@@ -386,6 +460,15 @@ Descriptor-based 双重 source snapshot 必须在路径集合、目录集合、�
 bit 上与该 raw subtree 精确一致；`source_head_subtree_manifest_sha256` 绑定这份 HEAD 证明，
 而 `source_manifest_sha256` 继续绑定实际 source 的 path/type、content、mode/flags 和
 access policy；descriptor snapshot 在 capture/revalidation 边界单独保护 object identity。
+所有 source/installed snapshot 与 exact-receipt copy 共用累计 file/access-policy/path byte
+和 entry-observation 预算；entry observation 统计 listing、open/capture 与 revalidation
+观察，并非 unique path 数。每个双 pass snapshot 另有一个两遍共享的 monotonic deadline，
+child 前后 snapshot 各自取得新 deadline。Copy 只遍历 initial exact snapshot 中已绑定的
+expected path set；并发新增的 untracked/ignored/fanout path 不会先被复制或读取，随后仍由
+同一累计预算下的 exact-head rebind 显式拒绝。Raw HEAD path 的隐式目录展开同样消费
+depth/path/entry/deadline 预算。Hosted root-owned source 没有 Git metadata，因此不声明
+`source_head_bound`；它仍先建立同一有界 descriptor receipt，再按 receipt 复制并复验，
+不再使用无界 `copytree`。
 GitHub Hosted `macos-26` 的独立 production-profile probe仍必须以已审阅 blocker signature
 失败关闭；hosted read-only job 的 root/nobody 隔离成功不能替代 Trusted Mac no-child proof。
 
