@@ -410,8 +410,32 @@ recomputation tracker or recharge the same wrapper. Sidecar overflow makes
 request policy unknown and disables reaction authority without erasing an
 independently complete terminal payload. Aggregate artifact-ledger overflow
 invalidates the complete terminal-artifact projection and selects `unknown`,
-never a validated prefix. For endpoint evidence, charge every REST or GraphQL
-attempt, including retries, before the request; charge known page/record counts
+never a validated prefix. Before memo lookup, apply the fixed
+`github-codex-memo-fingerprint-guard-v1`: an iterative no-hash strict-JSON
+preflight capped at depth 64, 20,000 entries per container, 2,000,000
+value/key occurrences (each object key and each value counts once), a 128-bit
+integer ceiling, 8,388,608 UTF-8 bytes per scalar, and 67,108,864 aggregate
+scalar bytes. Fingerprint only the owning plane's endpoint transcript/fetches,
+sidecar, or artifact wrapper. Apply the no-hash guard to declaration/ancestry
+policy inputs before deriving their streaming namespace fingerprint; never use
+canonical JSON for that key. Validate the owning ledger before a cache-miss
+subject hash, and discard even a truthy producer result if that ledger failed.
+Healthy positive and negative entries both retain a digest; every hit rechecks
+the bounded summary and content fingerprint. Do not
+build a complete canonical JSON body or charge transient fingerprint bytes as
+retained evidence; keep periodic zero-charge deadline checks on that same
+endpoint, sidecar, or artifact plane. The root coordinator cannot own a memo;
+cache identity binds the exact plane tracker, exact artifact scope types, and
+the closed scaffold around a narrowed current `fetches` subject. Mutation of an
+immutable cached negative stays fail-closed until a fresh reread/context.
+Complete, sidecar-blind, ancestry-filtering, and candidate-ordering consumers share one
+exact-list/dict wrapper-array precharge before iteration; one wrapper plus its
+five responses consumes six artifact records exactly once. A filtered view must
+be an identity-preserving subsequence of those charged arrays. Require an exact
+built-in current raw object/fetch list and an exact positive integer PR number
+before rebuilding its narrow transcript; reject boolean/floating equality
+aliases. For endpoint evidence, charge every REST
+or GraphQL attempt, including retries, before the request; charge known page/record counts
 before cloning or serialization, bytes before hashing, decoding, or
 accumulation, and check the 900-second monotonic deadline again before success.
 Endpoint overflow discards the entire traversal and selects `unknown`; it never

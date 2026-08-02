@@ -1081,6 +1081,67 @@ and disables reaction authority, but its isolated bounded validation work
 cannot consume or invalidate an independently complete terminal-artifact
 ledger. No ledger may borrow unused capacity from another.
 
+Memoization has its own fixed admission envelope because the memo key is not
+authority evidence and therefore must never become an unmetered copy of the
+untrusted evidence tree. `github-codex-memo-fingerprint-guard-v1` accepts only
+strict JSON values with string object keys and finite floats. It permits at
+most 64 container levels, 20,000 entries in one container, 2,000,000 value/key
+occurrences (each object key and each value counts once), 128 bits in one
+integer, 8,388,608 UTF-8 bytes in one scalar, and 67,108,864 aggregate scalar
+UTF-8 bytes. The integer cap keeps conversion to a small fixed operation;
+GitHub native IDs and server times are far below it. It processes strings in 4,096-character chunks and checks
+the owning plane's shared deadline at entry, exit, every 1,024 occurrences,
+and every 1,048,576 scalar bytes. Cycles, unsupported values, or any exceeded
+bound fail closed in that endpoint, sidecar, or artifact plane.
+
+The order is normative. First perform the iterative, no-hash structural
+preflight. Apply it to the bounded policy-binding envelope too, including the
+provider declaration and local ancestry map, before deriving that envelope's
+streaming namespace digest; never derive a namespace with canonical JSON. On a
+cache miss, run the owning plane's uncached evidence validator so its record,
+page, and retained-byte charges succeed before hashing the memo subject. A
+truthy partial result cannot override a failed ledger. Only then compute a
+sorted-key, type-tagged, length-framed SHA-256 incrementally; never call
+`json.dumps` or build a complete canonical body for the memo key. Healthy
+positive and negative results both retain that digest. Every cache hit repeats
+the bounded preflight and rehashes unchanged summaries, so an equal-size nested
+content edit cannot reuse either result. Because snapshots are immutable, a
+mutation after a cached negative remains fail-closed rather than being upgraded
+in place; a fresh reread uses a fresh context. Transient fingerprint bytes are
+not retained evidence and are not charged again; zero-charge deadline
+observations still advance. This sequencing preserves immutable-result
+memoization without letting memo work precede the evidence budget or letting a
+sidecar failure consume the independent terminal-artifact ledger.
+
+Memo subjects and cache identity are plane-specific. Endpoint memoization sees
+only the retained transcript or the exact single-scope `fetches` list;
+sidecar memoization sees only `request_scope_receipts`; artifact memoization
+sees each artifact wrapper. Composite normalized inventory records are checked
+afresh from those memoized plane results and are never fingerprinted against a
+single plane tracker. Therefore a deep or oversized unused sidecar cannot mark
+the endpoint or artifact tracker failed, and the same namespace/object pair
+cannot reuse a cache entry created under another plane tracker. The root
+deadline coordinator is never an owning memo ledger. Artifact wrapper and
+wrapper-array cache entries bind the exact artifact tracker, while lookup also
+validates exact scope types before key construction, so Python equality such as
+`True == 1` cannot alias a previously validated PR scope. The narrowed current
+single-scope subject is permitted only when the excluded transcript scaffold
+has the exact schema, repository, scope, pull number, and field set; its root,
+scope array, scope record, fetch array, and repository text must all be exact
+built-in JSON types rather than equality-compatible subclasses. Complete,
+sidecar-blind, ancestry-filtering, and candidate-ordering paths share one
+tracker-bound wrapper-array precharge before any wrapper iteration; only exact
+built-in list/dict scaffolds enter that path. A filtered projection proves that
+each retained wrapper is an identity-preserving subsequence of the charged
+source arrays before it reuses that ledger: cloned entries, reordering, and
+multiplicity beyond the source are rejected, while an accepted projection is
+seeded without charging the same wrapper array again. The wrapper plus its five
+responses therefore always costs six records exactly once. The outer current
+raw inventory likewise requires an exact built-in object/fetch list, exact
+built-in repository and head strings, and an exact positive integer PR number
+before rebuilding the narrow transcript; subclass, boolean, or floating-point
+equality aliases cannot be normalized into current authority.
+
 For endpoint evidence, charge a fetch attempt before every REST or GraphQL
 request, including retries. Charge known page and record counts before cloning
 or serialization, then charge retained UTF-8 bytes and the body cap before

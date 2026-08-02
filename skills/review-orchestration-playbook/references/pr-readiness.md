@@ -218,7 +218,32 @@ responses. Create the artifact ledger once per inventory decision pass,
 validate each immutable wrapper once, and thread its memoized result through
 candidate ordering, audit, profile, outcome, and report projection. Never
 reset it per candidate/scope/recomputation or recharge the same wrapper. A
-sidecar-ledger overflow makes request policy unknown and disables reaction
+memo lookup first applies `github-codex-memo-fingerprint-guard-v1`: iterative
+strict-JSON preflight with depth 64, 20,000 entries per container, 2,000,000
+value/key occurrences (each object key and each value counts once), a 128-bit
+integer ceiling, 8,388,608 UTF-8 bytes per scalar, and 67,108,864 aggregate
+scalar bytes. Plane-specific subjects keep endpoint transcripts/fetches,
+sidecars, and artifact wrappers out of one another's tracker. Declaration and
+ancestry policy inputs receive the same bounded no-hash preflight before their
+streaming namespace fingerprint; canonical JSON is forbidden for that key. The
+owning ledger must validate successfully before a cache miss uses the
+sorted-key, type-tagged subject fingerprint, and a failed ledger defeats any
+truthy partial producer result. Healthy positive and negative entries both
+retain a digest; every cache hit rechecks the bounded summary and content
+fingerprint. It never serializes a complete
+untrusted JSON body or recharges transient fingerprint bytes, and its periodic
+zero-charge deadline checks remain on the same endpoint, sidecar, or artifact
+plane. The root deadline coordinator never owns a memo. Cache identity binds
+the exact tracker and exact artifact scope types; a narrow current `fetches`
+subject requires its closed transcript scaffold. Mutated immutable negatives
+remain fail-closed until a fresh reread/context. Complete, sidecar-blind,
+ancestry-filtering, and candidate-ordering consumers share the same
+exact-list/dict wrapper-array precharge before iteration, so each wrapper plus
+five responses consumes six artifact-ledger records exactly once. A filtered
+view must be an identity-preserving subsequence of the charged source arrays.
+Before rebuilding a narrow current transcript, require an exact built-in raw
+object/fetch list and an exact positive integer PR number; boolean/floating
+equality aliases are invalid. A sidecar-ledger overflow makes request policy unknown and disables reaction
 authority without erasing a complete terminal payload. Aggregate artifact
 ledger overflow invalidates the complete terminal-artifact projection and
 selects `unknown`; accepting a validated prefix is forbidden. For endpoint

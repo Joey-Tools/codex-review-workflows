@@ -756,6 +756,26 @@ authority. Invalid-state terminal signals are also checked before the history
 window: their original `submitted_at` cannot turn a later dismissal or unknown
 state into an expired `confirmed-non-candidate`.
 
+The memo cache is deliberately outside those retained-evidence counters, but
+it is not outside the resource boundary. The fixed
+`github-codex-memo-fingerprint-guard-v1` rejects non-JSON values, cycles,
+depth above 64, more than 20,000 entries in one container, more than 2,000,000
+value/key occurrences (each object key and each value counts once), an integer
+above 128 bits, a scalar above 8 MiB UTF-8, or more than 64 MiB of scalar UTF-8
+in one memo input. A no-hash iterative preflight runs first. On a
+miss, the endpoint, sidecar, or artifact producer then completes its ordinary
+ledger validation before a sorted-key, type-tagged streaming fingerprint is
+created; on a hit, summary drift rejects before hashing and equal-summary
+content is rehashed. This ordering is intentional: memo identity must still
+detect equal-size nested edits, but it must not serialize or hash the complete
+untrusted tree before the evidence budget that gives the result authority.
+Periodic zero-charge deadline checks keep that temporary work inside the same
+plane without double-charging fingerprint bytes as retained GitHub evidence.
+The cache key also binds the owning tracker. Endpoint transcripts/fetches,
+request-scope sidecars, and artifact wrappers are separate memo subjects;
+composite normalized inventory envelopes are rechecked from those plane-local
+results rather than scanned under one plane's budget.
+
 Two outcome boundaries are likewise explicit. A valid same-head/different-base
 sidecar blocks even when a terminal clean exists, because it proves that the
 whole-PR scope changed. Conversely, a new receipt-bound R2 observed only during
@@ -936,6 +956,58 @@ restore request/run binding or erase this rationale.
   `id` and `stable_artifact_id`. The example now uses positive JSON integers,
   and executable review/issue-comment regressions reject string terminal
   artifact IDs.
+- The subsequent final-range named-single review found one P2 resource-ordering
+  gap: artifact and inventory memo keys called full-tree `json.dumps` and
+  SHA-256 before their uncached validators charged the evidence ledgers. The
+  bounded two-stage guard above is the correction. Its regressions prove that
+  over-budget and over-depth inputs reach neither the unbounded serializer nor
+  the hasher/producer, while an equal-summary nested edit still invalidates a
+  successful cached result. The successor exact-head review remains required;
+  this entry records the reason and correction, not a future verdict.
+- Two focused follow-up audits then found that a bounded fingerprint could
+  still be assigned to the wrong ledger: the current endpoint path scanned its
+  composite inventory, while historical endpoint/artifact paths scanned
+  envelopes containing request sidecars. That would let a deep unused sidecar
+  fail the endpoint or artifact tracker and erase an otherwise complete
+  terminal result. Memo subjects are now the exact plane-owned transcript or
+  fetch list, sidecar list, or artifact wrapper; cache identity also binds the
+  owning tracker, and composite envelopes are rebuilt from those independent
+  results. The same audits fixed the integer conversion boundary at 128 bits,
+  clarified that the 2,000,000 limit counts every value and every object key,
+  and added probes proving that producer, canonical serialization,
+  `json.dumps`, and SHA-256 are not reached before a guard rejection. The
+  declaration/ancestry policy namespace now uses the same bounded preflight and
+  streaming digest instead of canonical JSON. Artifact caches bind the exact
+  tracker and exact-type PR scope, the root coordinator cannot own a memo, and
+  narrowed current-fetch memoization validates the complete excluded scaffold.
+  Healthy negative cache results carry and recheck a content digest; mutation
+  of an immutable negative remains fail-closed until the next fresh context.
+  Finally, a truthy partial producer result cannot survive a failed owning
+  ledger. These details prevent Python equality aliases, cross-ledger reuse,
+  and stale summary-only negatives from weakening the authority boundary.
+  A final focused audit found one remaining accounting path: complete history
+  could validate wrapper responses before the wrapper-array record precharge,
+  then fall back sidecar-blind and reuse the cached artifact. Complete,
+  sidecar-blind, and candidate-ordering paths now call one tracker-bound
+  exact-list/dict precharge before wrapper iteration. The regression asserts
+  the closed six-record cost for every wrapper (one wrapper record plus five
+  responses), including an accepted
+  `unused-sidecar-unavailable` fallback.
+  The next independent pass closed two adjacent aliases: ancestry filtering now
+  precharges the original exact arrays before iteration and can bind a filtered
+  view only when it is an identity-preserving subsequence, while current raw
+  parsing requires an exact object/fetch-list scaffold and exact positive
+  integer PR number. Thus a list subclass cannot run before admission, and JSON
+  `true` or `1.0` cannot be washed into PR `1` by the synthesized narrow
+  transcript. The final memo audit extended the same rule to every narrowed
+  transcript container and to repository/head text: equality-compatible dict,
+  list, or string subclasses are rejected before cold-cache or cache-hit reuse.
+  It also locked the filtered ledger contract directly: a retained wrapper must
+  be the identical ordered source object with no extra multiplicity, and a valid
+  projection reuses the already charged array entries without charging them a
+  second time. These checks prevent the synthetic current-scope envelope from
+  laundering foreign outer metadata or uncharged cloned evidence into provider
+  authority.
 
 ## Post-Review Artifact Receipt Hardening
 

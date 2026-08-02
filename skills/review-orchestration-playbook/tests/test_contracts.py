@@ -3728,6 +3728,68 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("900", normalized_document)
                 self.assertIn("action", normalized_document)
                 self.assertIn("extension", normalized_document)
+        memo_guard_documents = {
+            "authority": authority,
+            "skill": anti_drift_documents["skill"],
+            "PR readiness": malformed_window_documents["PR readiness"],
+            "GitHub probes": malformed_window_documents["GitHub probes"],
+            "project-journal": journal,
+        }
+        for document_name, document in memo_guard_documents.items():
+            normalized_document = " ".join(
+                document.lower().replace("`", "").replace(",", "").split()
+            )
+            with self.subTest(memo_fingerprint_guard=document_name):
+                self.assertIn(
+                    "github-codex-memo-fingerprint-guard-v1",
+                    normalized_document,
+                )
+                self.assertIn("64", normalized_document)
+                self.assertIn("20000", normalized_document)
+                self.assertIn("2000000", normalized_document)
+                self.assertIn("value/key occurrences", normalized_document)
+                self.assertIn(
+                    "each object key and each value counts once",
+                    normalized_document,
+                )
+                self.assertTrue(
+                    "128-bit" in normalized_document
+                    or "128 bits" in normalized_document
+                )
+                self.assertTrue(
+                    "8388608" in normalized_document
+                    or "8 mib" in normalized_document
+                    or "8-mib" in normalized_document
+                )
+                self.assertTrue(
+                    "67108864" in normalized_document
+                    or "64 mib" in normalized_document
+                    or "64-mib" in normalized_document
+                )
+                self.assertIn("preflight", normalized_document)
+                self.assertIn("stream", normalized_document)
+                self.assertIn("deadline", normalized_document)
+                self.assertIn("endpoint", normalized_document)
+                self.assertIn("sidecar", normalized_document)
+                self.assertIn("artifact", normalized_document)
+                self.assertIn("declaration", normalized_document)
+                self.assertIn("ancestry", normalized_document)
+                self.assertIn("negative", normalized_document)
+                self.assertIn("root", normalized_document)
+                self.assertIn("tracker", normalized_document)
+                self.assertIn("sidecar-blind", normalized_document)
+                self.assertIn("five responses", normalized_document)
+                self.assertIn("six", normalized_document)
+                self.assertTrue(
+                    "ancestry-filtering" in normalized_document
+                    or "ancestry filtering" in normalized_document
+                )
+                self.assertIn("identity-preserving", normalized_document)
+                self.assertIn("positive integer pr", normalized_document)
+        self.assertIn(
+            "never call json.dumps or build a complete canonical body",
+            normalized_authority_text,
+        )
         resource_plane_documents = {
             "authority": authority,
             "README": malformed_window_documents["README"],
@@ -7524,14 +7586,29 @@ class RepositoryContractTest(unittest.TestCase):
             resource_tracker, validated_artifacts = context_parts
             if resource_tracker.get("failed") is not False:
                 return None
-            if not isinstance(value, dict) or not isinstance(expected_scope, tuple):
+            if (
+                not isinstance(value, dict)
+                or type(expected_scope) is not tuple
+                or len(expected_scope) != 4
+                or not isinstance(expected_scope[0], str)
+                or not expected_scope[0]
+                or type(expected_scope[1]) is not int
+                or expected_scope[1] <= 0
+                or not isinstance(expected_scope[2], str)
+                or re.fullmatch(r"[0-9a-f]{40}", expected_scope[2]) is None
+                or not isinstance(expected_scope[3], str)
+                or re.fullmatch(r"[0-9a-f]{40}", expected_scope[3]) is None
+            ):
                 return None
-            try:
-                wrapper_body = canonical_raw_body(value)
-                wrapper_digest = hashlib.sha256(
-                    wrapper_body.encode("utf-8")
-                ).hexdigest()
-            except (TypeError, UnicodeEncodeError, ValueError):
+            wrapper_summary_result = bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=False,
+            )
+            if wrapper_summary_result is None:
+                return None
+            wrapper_summary, wrapper_digest = wrapper_summary_result
+            if wrapper_digest is not None:
                 return None
             wrapper_header = (
                 "dict",
@@ -7549,7 +7626,12 @@ class RepositoryContractTest(unittest.TestCase):
                     for key in sorted(value)
                 ),
             )
-            cache_key = (id(value), expected_kind, expected_scope)
+            cache_key = (
+                id(resource_tracker),
+                id(value),
+                expected_kind,
+                expected_scope,
+            )
             try:
                 hash(cache_key)
             except TypeError:
@@ -7558,13 +7640,35 @@ class RepositoryContractTest(unittest.TestCase):
                 cache_entry = validated_artifacts[cache_key]
                 if (
                     not isinstance(cache_entry, dict)
-                    or set(cache_entry) != {"wrapper", "header", "digest", "validated"}
+                    or set(cache_entry)
+                    != {
+                        "tracker",
+                        "wrapper",
+                        "header",
+                        "summary",
+                        "digest",
+                        "validated",
+                    }
+                    or cache_entry.get("tracker") is not resource_tracker
                     or cache_entry.get("wrapper") is not value
                     or cache_entry.get("header") != wrapper_header
-                    or cache_entry.get("digest") != wrapper_digest
+                    or cache_entry.get("summary") != wrapper_summary
                 ):
                     return None
                 cached = cache_entry["validated"]
+                cached_digest = cache_entry["digest"]
+                current_fingerprint = bounded_json_fingerprint_pass(
+                    value,
+                    resource_tracker=resource_tracker,
+                    calculate_digest=True,
+                )
+                if (
+                    current_fingerprint is None
+                    or current_fingerprint[0] != wrapper_summary
+                    or not isinstance(cached_digest, str)
+                    or current_fingerprint[1] != cached_digest
+                ):
+                    return None
                 return cached if isinstance(cached, tuple) else None
             validated = _validate_candidate_artifact_uncached(
                 value,
@@ -7572,13 +7676,165 @@ class RepositoryContractTest(unittest.TestCase):
                 expected_scope=expected_scope,
                 artifact_receipt_resource_tracker=resource_tracker,
             )
+            if validated is None:
+                if resource_tracker.get("failed") is not False:
+                    return None
+            wrapper_fingerprint = bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=True,
+            )
+            if (
+                wrapper_fingerprint is None
+                or wrapper_fingerprint[0] != wrapper_summary
+                or not isinstance(wrapper_fingerprint[1], str)
+            ):
+                return None
             validated_artifacts[cache_key] = {
+                "tracker": resource_tracker,
                 "wrapper": value,
                 "header": wrapper_header,
-                "digest": wrapper_digest,
+                "summary": wrapper_summary,
+                "digest": wrapper_fingerprint[1],
                 "validated": validated,
             }
             return validated
+
+        artifact_kind_by_field = {
+            "terminal_payloads": "terminal-payload",
+            "malformed_terminal_artifacts": "malformed-terminal-artifact",
+            "active_top_level_findings": "active-top-level-finding",
+            "unresolved_thread_findings": "unresolved-thread-finding",
+        }
+
+        def precharged_artifact_wrapper_arrays(
+            record: object,
+            *,
+            artifact_validation_context: dict[str, object],
+        ) -> dict[str, list[object]] | None:
+            context_parts = artifact_validation_context_parts(
+                artifact_validation_context
+            )
+            if context_parts is None or type(record) is not dict:
+                return None
+            resource_tracker, validated_artifacts = context_parts
+            evidence_state = record.get("evidence_state")
+            if type(evidence_state) is not dict or set(evidence_state) != set(
+                artifact_kind_by_field
+            ):
+                return None
+            artifact_arrays: dict[str, list[object]] = {}
+            wrapper_array_headers: list[tuple[str, int, int]] = []
+            wrapper_entry_count = 0
+            for field in artifact_kind_by_field:
+                artifacts = evidence_state.get(field)
+                if type(artifacts) is not list:
+                    return None
+                artifact_count = len(artifacts)
+                if (
+                    artifact_count > evidence_resource_budget_v1["max_records"]
+                    or wrapper_entry_count
+                    > evidence_resource_budget_v1["max_records"] - artifact_count
+                ):
+                    return None
+                artifact_arrays[field] = artifacts
+                wrapper_entry_count += artifact_count
+                wrapper_array_headers.append((field, id(artifacts), artifact_count))
+            wrapper_ledger_key = (
+                "artifact-wrapper-array-entries",
+                id(resource_tracker),
+                id(record),
+            )
+            wrapper_ledger_entry = validated_artifacts.get(wrapper_ledger_key)
+            if wrapper_ledger_entry is None:
+                if wrapper_entry_count and not resource_budget_charge(
+                    resource_tracker, records=wrapper_entry_count
+                ):
+                    return None
+            elif (
+                not isinstance(wrapper_ledger_entry, dict)
+                or set(wrapper_ledger_entry)
+                != {"tracker", "record", "array_headers", "entry_identity"}
+                or wrapper_ledger_entry.get("tracker") is not resource_tracker
+                or wrapper_ledger_entry.get("record") is not record
+                or wrapper_ledger_entry.get("array_headers")
+                != tuple(wrapper_array_headers)
+            ):
+                return None
+            wrapper_entry_identity = tuple(
+                (field, tuple(id(artifact) for artifact in artifact_arrays[field]))
+                for field in artifact_kind_by_field
+            )
+            if wrapper_ledger_entry is None:
+                validated_artifacts[wrapper_ledger_key] = {
+                    "tracker": resource_tracker,
+                    "record": record,
+                    "array_headers": tuple(wrapper_array_headers),
+                    "entry_identity": wrapper_entry_identity,
+                }
+            elif wrapper_ledger_entry.get("entry_identity") != wrapper_entry_identity:
+                return None
+            return artifact_arrays
+
+        def bind_precharged_artifact_wrapper_projection(
+            source_record: object,
+            projected_record: object,
+            *,
+            artifact_validation_context: dict[str, object],
+        ) -> bool:
+            context_parts = artifact_validation_context_parts(
+                artifact_validation_context
+            )
+            source_arrays = precharged_artifact_wrapper_arrays(
+                source_record,
+                artifact_validation_context=artifact_validation_context,
+            )
+            if (
+                context_parts is None
+                or source_arrays is None
+                or type(projected_record) is not dict
+            ):
+                return False
+            resource_tracker, validated_artifacts = context_parts
+            projected_state = projected_record.get("evidence_state")
+            if type(projected_state) is not dict or set(projected_state) != set(
+                artifact_kind_by_field
+            ):
+                return False
+            array_headers: list[tuple[str, int, int]] = []
+            entry_identity: list[tuple[str, tuple[int, ...]]] = []
+            for field in artifact_kind_by_field:
+                projected = projected_state.get(field)
+                if type(projected) is not list:
+                    return False
+                source = source_arrays[field]
+                source_index = 0
+                for artifact in projected:
+                    while source_index < len(source) and (
+                        source[source_index] is not artifact
+                    ):
+                        source_index += 1
+                    if source_index == len(source):
+                        return False
+                    source_index += 1
+                array_headers.append((field, id(projected), len(projected)))
+                entry_identity.append(
+                    (field, tuple(id(artifact) for artifact in projected))
+                )
+            ledger_key = (
+                "artifact-wrapper-array-entries",
+                id(resource_tracker),
+                id(projected_record),
+            )
+            if ledger_key in validated_artifacts:
+                return False
+            validated_artifacts[ledger_key] = {
+                "tracker": resource_tracker,
+                "record": projected_record,
+                "array_headers": tuple(array_headers),
+                "entry_identity": tuple(entry_identity),
+            }
+            return True
 
         def classify_reaction_scope(
             record: dict[str, object],
@@ -7806,77 +8062,24 @@ class RepositoryContractTest(unittest.TestCase):
             if context is None:
                 context = new_artifact_validation_context()
             context_parts = artifact_validation_context_parts(context)
+            if context is None or context_parts is None or type(record) is not dict:
+                return None
+            artifact_arrays = precharged_artifact_wrapper_arrays(
+                record,
+                artifact_validation_context=context,
+            )
+            if artifact_arrays is None:
+                return None
             initial_snapshot = record.get("initial_snapshot")
             final_snapshot = record.get("final_snapshot")
             evidence_state = record.get("evidence_state")
-            artifact_fields = {
-                "terminal_payloads": "terminal-payload",
-                "malformed_terminal_artifacts": "malformed-terminal-artifact",
-                "active_top_level_findings": "active-top-level-finding",
-                "unresolved_thread_findings": "unresolved-thread-finding",
-            }
             if (
-                context is None
-                or context_parts is None
-                or set(record) != record_fields
+                set(record) != record_fields
                 or not isinstance(initial_snapshot, dict)
                 or not isinstance(final_snapshot, dict)
                 or not isinstance(evidence_state, dict)
-                or set(evidence_state) != set(artifact_fields)
+                or set(evidence_state) != set(artifact_kind_by_field)
             ):
-                return None
-            resource_tracker, validated_artifacts = context_parts
-            artifact_arrays: dict[str, list[object]] = {}
-            artifact_counts: dict[str, int] = {}
-            wrapper_array_headers: list[tuple[str, int, int]] = []
-            wrapper_entry_count = 0
-            for field in artifact_fields:
-                artifacts = evidence_state.get(field)
-                if not isinstance(artifacts, list):
-                    return None
-                try:
-                    artifact_count = len(artifacts)
-                except (OverflowError, TypeError, ValueError):
-                    return None
-                artifact_arrays[field] = artifacts
-                artifact_counts[field] = artifact_count
-                wrapper_entry_count += artifact_count
-                wrapper_array_headers.append((field, id(artifacts), artifact_count))
-            wrapper_ledger_key = ("artifact-wrapper-array-entries", id(record))
-            wrapper_ledger_entry = validated_artifacts.get(wrapper_ledger_key)
-            if wrapper_ledger_entry is None:
-                if wrapper_entry_count and not resource_budget_charge(
-                    resource_tracker, records=wrapper_entry_count
-                ):
-                    return None
-            elif (
-                not isinstance(wrapper_ledger_entry, dict)
-                or set(wrapper_ledger_entry)
-                != {"record", "array_headers", "entry_identity"}
-                or wrapper_ledger_entry.get("record") is not record
-                or wrapper_ledger_entry.get("array_headers")
-                != tuple(wrapper_array_headers)
-            ):
-                return None
-            try:
-                wrapper_entry_identity_parts: list[tuple[str, tuple[int, ...]]] = []
-                for field in artifact_fields:
-                    entry_identity = tuple(
-                        id(artifact) for artifact in artifact_arrays[field]
-                    )
-                    if len(entry_identity) != artifact_counts[field]:
-                        return None
-                    wrapper_entry_identity_parts.append((field, entry_identity))
-                wrapper_entry_identity = tuple(wrapper_entry_identity_parts)
-            except Exception:
-                return None
-            if wrapper_ledger_entry is None:
-                validated_artifacts[wrapper_ledger_key] = {
-                    "record": record,
-                    "array_headers": tuple(wrapper_array_headers),
-                    "entry_identity": wrapper_entry_identity,
-                }
-            elif wrapper_ledger_entry.get("entry_identity") != wrapper_entry_identity:
                 return None
             if not typed_json_equal(
                 initial_snapshot, final_snapshot
@@ -7898,7 +8101,7 @@ class RepositoryContractTest(unittest.TestCase):
             artifact_semantics_by_time_id: dict[
                 tuple[str, int, int], tuple[str, str]
             ] = {}
-            for field, kind in artifact_fields.items():
+            for field, kind in artifact_kind_by_field.items():
                 artifacts = artifact_arrays[field]
                 for artifact in artifacts:
                     validated_artifact = validate_candidate_artifact(
@@ -8763,6 +8966,19 @@ class RepositoryContractTest(unittest.TestCase):
             "max_retained_utf8_bytes": 67_108_864,
             "deadline_seconds": 900,
         }
+        memo_fingerprint_guard_v1 = {
+            "profile": "github-codex-memo-fingerprint-guard-v1",
+            "schema_version": 1,
+            "max_depth": 64,
+            "max_container_entries": 20_000,
+            "max_nodes": 2_000_000,
+            "max_integer_bits": 128,
+            "max_scalar_utf8_bytes": 8_388_608,
+            "max_total_scalar_utf8_bytes": 67_108_864,
+            "deadline_check_nodes": 1024,
+            "deadline_check_utf8_bytes": 1_048_576,
+            "utf8_chunk_characters": 4096,
+        }
         evidence_resource_limit_fields = {
             key
             for key in evidence_resource_budget_v1
@@ -8986,6 +9202,7 @@ class RepositoryContractTest(unittest.TestCase):
             namespace: str,
             inventory: object,
             producer: object,
+            budget_tracker: dict[str, object],
         ) -> object:
             parts = inventory_validation_context_parts(context)
             if (
@@ -8994,33 +9211,87 @@ class RepositoryContractTest(unittest.TestCase):
                 or not callable(producer)
             ):
                 return None
+            artifact_parts = artifact_validation_context_parts(parts[3])
+            if (
+                artifact_parts is None
+                or not isinstance(budget_tracker, dict)
+                or all(
+                    budget_tracker is not tracker
+                    for tracker in (parts[1], parts[2], artifact_parts[0])
+                )
+                or budget_tracker.get("failed") is not False
+            ):
+                return None
             memo = parts[4]
-            try:
-                body = canonical_raw_body(inventory)
-                digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-            except (TypeError, UnicodeEncodeError, ValueError):
+            summary_result = bounded_json_fingerprint_pass(
+                inventory,
+                resource_tracker=budget_tracker,
+                calculate_digest=False,
+            )
+            if summary_result is None:
+                return None
+            summary, digest = summary_result
+            if digest is not None:
                 return None
             header = (
                 type(inventory).__name__,
                 len(inventory) if isinstance(inventory, (dict, list)) else None,
             )
-            cache_key = (namespace, id(inventory))
+            cache_key = (namespace, id(budget_tracker), id(inventory))
             cached = memo.get(cache_key)
             if cached is not None:
                 if (
                     not isinstance(cached, dict)
-                    or set(cached) != {"inventory", "header", "digest", "result"}
+                    or set(cached)
+                    != {
+                        "tracker",
+                        "inventory",
+                        "header",
+                        "summary",
+                        "digest",
+                        "result",
+                    }
+                    or cached.get("tracker") is not budget_tracker
                     or cached.get("inventory") is not inventory
                     or cached.get("header") != header
-                    or cached.get("digest") != digest
+                    or cached.get("summary") != summary
                 ):
                     return None
-                return cached.get("result")
+                cached_result = cached.get("result")
+                cached_digest = cached.get("digest")
+                current_fingerprint = bounded_json_fingerprint_pass(
+                    inventory,
+                    resource_tracker=budget_tracker,
+                    calculate_digest=True,
+                )
+                if (
+                    current_fingerprint is None
+                    or current_fingerprint[0] != summary
+                    or not isinstance(cached_digest, str)
+                    or current_fingerprint[1] != cached_digest
+                ):
+                    return None
+                return cached_result
             result = producer()
+            if budget_tracker.get("failed") is not False:
+                return None
+            fingerprint = bounded_json_fingerprint_pass(
+                inventory,
+                resource_tracker=budget_tracker,
+                calculate_digest=True,
+            )
+            if (
+                fingerprint is None
+                or fingerprint[0] != summary
+                or not isinstance(fingerprint[1], str)
+            ):
+                return None
             memo[cache_key] = {
+                "tracker": budget_tracker,
                 "inventory": inventory,
                 "header": header,
-                "digest": digest,
+                "summary": summary,
+                "digest": fingerprint[1],
                 "result": result,
             }
             return result
@@ -9040,15 +9311,17 @@ class RepositoryContractTest(unittest.TestCase):
             parts = inventory_validation_context_parts(inventory_validation_context)
             if parts is None:
                 return None
+            receipt_inventory = record.get("request_scope_receipts")
             memoized = inventory_validation_memoized(
                 inventory_validation_context,
                 namespace=f"{namespace}:{maximum_server_time}",
-                inventory=record,
+                inventory=receipt_inventory,
                 producer=lambda: request_scope_receipt_mapping(
-                    record.get("request_scope_receipts"),
+                    receipt_inventory,
                     resource_tracker=parts[2],
                     maximum_server_time=maximum_server_time,
                 ),
+                budget_tracker=parts[2],
             )
             return memoized if isinstance(memoized, dict) else None
 
@@ -9155,6 +9428,304 @@ class RepositoryContractTest(unittest.TestCase):
             tracker.update(next_values)
             tracker["max_observed"] = float(observed)
             return True
+
+        def bounded_json_fingerprint_pass(
+            value: object,
+            *,
+            resource_tracker: dict[str, object],
+            calculate_digest: bool,
+        ) -> tuple[tuple[object, ...], str | None] | None:
+            """Bound one strict-JSON traversal before optionally hashing it."""
+
+            def fail() -> None:
+                resource_tracker["failed"] = True
+                return None
+
+            if type(calculate_digest) is not bool or not resource_budget_charge(
+                resource_tracker
+            ):
+                return None
+
+            max_depth = memo_fingerprint_guard_v1["max_depth"]
+            max_container_entries = memo_fingerprint_guard_v1["max_container_entries"]
+            max_nodes = memo_fingerprint_guard_v1["max_nodes"]
+            max_integer_bits = memo_fingerprint_guard_v1["max_integer_bits"]
+            max_scalar_utf8_bytes = min(
+                memo_fingerprint_guard_v1["max_scalar_utf8_bytes"],
+                resource_tracker["limits"]["max_page_body_bytes"],
+            )
+            max_total_scalar_utf8_bytes = memo_fingerprint_guard_v1[
+                "max_total_scalar_utf8_bytes"
+            ]
+            node_check_interval = memo_fingerprint_guard_v1["deadline_check_nodes"]
+            byte_check_interval = memo_fingerprint_guard_v1["deadline_check_utf8_bytes"]
+            chunk_characters = memo_fingerprint_guard_v1["utf8_chunk_characters"]
+            if any(
+                type(item) is not int or item <= 0
+                for item in (
+                    max_depth,
+                    max_container_entries,
+                    max_nodes,
+                    max_integer_bits,
+                    max_scalar_utf8_bytes,
+                    max_total_scalar_utf8_bytes,
+                    node_check_interval,
+                    byte_check_interval,
+                    chunk_characters,
+                )
+            ):
+                return fail()
+
+            hasher = hashlib.sha256() if calculate_digest else None
+            active_containers: set[int] = set()
+            work: list[tuple[object, ...]] = [("value", value, 0)]
+            node_count = 0
+            container_count = 0
+            maximum_depth = 0
+            maximum_container_entries = 0
+            scalar_utf8_bytes = 0
+            next_node_deadline_check = node_check_interval
+            next_byte_deadline_check = byte_check_interval
+
+            def update_digest(payload: bytes) -> None:
+                if hasher is not None:
+                    hasher.update(payload)
+
+            def check_deadline() -> bool:
+                nonlocal next_node_deadline_check
+                nonlocal next_byte_deadline_check
+                needs_check = (
+                    node_count >= next_node_deadline_check
+                    or scalar_utf8_bytes >= next_byte_deadline_check
+                )
+                if not needs_check:
+                    return True
+                if not resource_budget_charge(resource_tracker):
+                    return False
+                while node_count >= next_node_deadline_check:
+                    next_node_deadline_check += node_check_interval
+                while scalar_utf8_bytes >= next_byte_deadline_check:
+                    next_byte_deadline_check += byte_check_interval
+                return True
+
+            def encode_scalar(tag: bytes, text: str) -> bool:
+                nonlocal scalar_utf8_bytes
+                if len(text) > max_scalar_utf8_bytes:
+                    return False
+                update_digest(tag)
+                update_digest(len(text).to_bytes(8, "big"))
+                scalar_size = 0
+                for start in range(0, len(text), chunk_characters):
+                    encoded = text[start : start + chunk_characters].encode("utf-8")
+                    scalar_size += len(encoded)
+                    if (
+                        scalar_size > max_scalar_utf8_bytes
+                        or scalar_utf8_bytes + len(encoded)
+                        > max_total_scalar_utf8_bytes
+                    ):
+                        return False
+                    scalar_utf8_bytes += len(encoded)
+                    update_digest(len(encoded).to_bytes(4, "big"))
+                    update_digest(encoded)
+                    if not check_deadline():
+                        return False
+                update_digest((0).to_bytes(4, "big"))
+                return True
+
+            try:
+                while work:
+                    frame = work.pop()
+                    action = frame[0]
+                    if action in {"value", "key"}:
+                        item = frame[1]
+                        parent_depth = frame[2]
+                        if type(parent_depth) is not int:
+                            return fail()
+                        node_count += 1
+                        if node_count > max_nodes or not check_deadline():
+                            return fail()
+                        if action == "key":
+                            if type(item) is not str or not encode_scalar(b"K", item):
+                                return fail()
+                            continue
+                        if item is None:
+                            scalar_utf8_bytes += 4
+                            if scalar_utf8_bytes > max_total_scalar_utf8_bytes:
+                                return fail()
+                            update_digest(b"N")
+                            if not check_deadline():
+                                return fail()
+                            continue
+                        if type(item) is bool:
+                            scalar_utf8_bytes += 4 if item else 5
+                            if scalar_utf8_bytes > max_total_scalar_utf8_bytes:
+                                return fail()
+                            update_digest(b"B1" if item else b"B0")
+                            if not check_deadline():
+                                return fail()
+                            continue
+                        if type(item) is int:
+                            if item.bit_length() > max_integer_bits:
+                                return fail()
+                            if not encode_scalar(b"I", str(item)):
+                                return fail()
+                            continue
+                        if type(item) is float:
+                            if not math.isfinite(item) or not encode_scalar(
+                                b"R", repr(item)
+                            ):
+                                return fail()
+                            continue
+                        if type(item) is str:
+                            if not encode_scalar(b"S", item):
+                                return fail()
+                            continue
+                        if type(item) not in {dict, list}:
+                            return fail()
+
+                        container_depth = parent_depth + 1
+                        if container_depth > max_depth:
+                            return fail()
+                        container_id = id(item)
+                        if container_id in active_containers:
+                            return fail()
+                        entry_count = len(item)
+                        if entry_count > max_container_entries:
+                            return fail()
+                        minimum_child_nodes = entry_count * (
+                            2 if type(item) is dict else 1
+                        )
+                        if node_count + minimum_child_nodes > max_nodes:
+                            return fail()
+                        active_containers.add(container_id)
+                        container_count += 1
+                        maximum_depth = max(maximum_depth, container_depth)
+                        maximum_container_entries = max(
+                            maximum_container_entries, entry_count
+                        )
+                        update_digest(b"D" if type(item) is dict else b"L")
+                        update_digest(entry_count.to_bytes(8, "big"))
+                        if type(item) is dict:
+                            keys = sorted(item) if calculate_digest else item.keys()
+                            iterator = iter(keys)
+                            work.append(
+                                (
+                                    "dict-iterator",
+                                    item,
+                                    iterator,
+                                    entry_count,
+                                    0,
+                                    container_depth,
+                                    container_id,
+                                )
+                            )
+                        else:
+                            work.append(
+                                (
+                                    "list-iterator",
+                                    item,
+                                    iter(item),
+                                    entry_count,
+                                    0,
+                                    container_depth,
+                                    container_id,
+                                )
+                            )
+                        continue
+
+                    if action == "dict-iterator":
+                        container = frame[1]
+                        iterator = frame[2]
+                        expected_count = frame[3]
+                        seen_count = frame[4]
+                        container_depth = frame[5]
+                        container_id = frame[6]
+                        try:
+                            key = next(iterator)
+                        except StopIteration:
+                            if (
+                                seen_count != expected_count
+                                or len(container) != expected_count
+                            ):
+                                return fail()
+                            active_containers.remove(container_id)
+                            continue
+                        if seen_count >= expected_count:
+                            return fail()
+                        child = container[key]
+                        work.append(
+                            (
+                                action,
+                                container,
+                                iterator,
+                                expected_count,
+                                seen_count + 1,
+                                container_depth,
+                                container_id,
+                            )
+                        )
+                        work.append(("value", child, container_depth))
+                        work.append(("key", key, container_depth))
+                        continue
+
+                    if action == "list-iterator":
+                        container = frame[1]
+                        iterator = frame[2]
+                        expected_count = frame[3]
+                        seen_count = frame[4]
+                        container_depth = frame[5]
+                        container_id = frame[6]
+                        try:
+                            child = next(iterator)
+                        except StopIteration:
+                            if (
+                                seen_count != expected_count
+                                or len(container) != expected_count
+                            ):
+                                return fail()
+                            active_containers.remove(container_id)
+                            continue
+                        if seen_count >= expected_count:
+                            return fail()
+                        work.append(
+                            (
+                                action,
+                                container,
+                                iterator,
+                                expected_count,
+                                seen_count + 1,
+                                container_depth,
+                                container_id,
+                            )
+                        )
+                        work.append(("value", child, container_depth))
+                        continue
+                    return fail()
+            except (
+                KeyError,
+                OverflowError,
+                RecursionError,
+                RuntimeError,
+                TypeError,
+                UnicodeEncodeError,
+                ValueError,
+            ):
+                return fail()
+
+            if active_containers:
+                return fail()
+            if not resource_budget_charge(resource_tracker):
+                return None
+            summary = (
+                type(value).__name__,
+                len(value) if type(value) in {dict, list} else None,
+                node_count,
+                container_count,
+                maximum_depth,
+                maximum_container_entries,
+                scalar_utf8_bytes,
+            )
+            return (summary, hasher.hexdigest() if hasher is not None else None)
 
         def retained_page_utf8_sizes(
             page: dict[str, object],
@@ -12326,6 +12897,7 @@ class RepositoryContractTest(unittest.TestCase):
                         None if allow_post_as_of_requests else history_as_of_server_time
                     ),
                 ),
+                budget_tracker=context_parts[2],
             )
             receipt_mapping = (
                 receipt_mapping_result
@@ -12692,6 +13264,7 @@ class RepositoryContractTest(unittest.TestCase):
             _endpoint_plane_only: bool = False,
             _sidecar_blind_audit: bool = False,
             _inventory_validation_context: dict[str, object] | None = None,
+            _memo_subject: object = None,
         ) -> dict[str, object] | None:
             if (
                 type(prefer_unresolved_thread_blocker) is not bool
@@ -12719,31 +13292,73 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
-            try:
-                policy_binding = {
-                    "provider_declaration_sha256": hashlib.sha256(
-                        canonical_raw_body(provider_declaration).encode("utf-8")
-                    ).hexdigest(),
-                    "current_ancestry_sha256": hashlib.sha256(
-                        canonical_raw_body(current_ancestry).encode("utf-8")
-                    ).hexdigest(),
-                    "require_current_ancestry_exact": (require_current_ancestry_exact),
-                    "history_start_exclusive": history_start_exclusive,
-                    "history_as_of_server_time": history_as_of_server_time,
-                    "single_scope_pull_number": _single_scope_pull_number,
-                    "allow_post_as_of_requests": _allow_post_as_of_requests,
-                    "allow_post_as_of_artifacts": _allow_post_as_of_artifacts,
-                    "resource_limits": effective_limits,
-                }
-                policy_digest = hashlib.sha256(
-                    canonical_raw_body(policy_binding).encode("utf-8")
-                ).hexdigest()
-            except (TypeError, UnicodeEncodeError, ValueError):
+            memo_subject = value
+            memo_subject_mode = "complete-transcript"
+            if _memo_subject is not None:
+                scopes = value.get("scopes") if type(value) is dict else None
+                scope_record = (
+                    scopes[0]
+                    if type(scopes) is list
+                    and len(scopes) == 1
+                    and type(scopes[0]) is dict
+                    else None
+                )
+                if (
+                    type(value) is not dict
+                    or set(value)
+                    != {"schema_version", "repository", "scope_discovery", "scopes"}
+                    or type(value.get("schema_version")) is not int
+                    or value.get("schema_version") != 3
+                    or type(value.get("repository")) is not str
+                    or value.get("repository") != current_repository
+                    or type(_single_scope_pull_number) is not int
+                    or _single_scope_pull_number <= 0
+                    or value.get("scope_discovery") is not None
+                    or scope_record is None
+                    or set(scope_record) != {"pull_number", "fetches"}
+                    or type(scope_record.get("pull_number")) is not int
+                    or scope_record.get("pull_number") != _single_scope_pull_number
+                    or type(scope_record.get("fetches")) is not list
+                    or scope_record.get("fetches") is not _memo_subject
+                ):
+                    return None
+                memo_subject = _memo_subject
+                memo_subject_mode = "single-scope-fetches"
+            policy_binding = {
+                "provider_declaration": provider_declaration,
+                "current_ancestry": current_ancestry,
+                "require_current_ancestry_exact": require_current_ancestry_exact,
+                "history_start_exclusive": history_start_exclusive,
+                "history_as_of_server_time": history_as_of_server_time,
+                "single_scope_pull_number": _single_scope_pull_number,
+                "allow_post_as_of_requests": _allow_post_as_of_requests,
+                "allow_post_as_of_artifacts": _allow_post_as_of_artifacts,
+                "resource_limits": effective_limits,
+                "memo_subject_mode": memo_subject_mode,
+            }
+            policy_preflight = bounded_json_fingerprint_pass(
+                policy_binding,
+                resource_tracker=inventory_parts[1],
+                calculate_digest=False,
+            )
+            if policy_preflight is None or policy_preflight[1] is not None:
                 return None
+            policy_fingerprint = bounded_json_fingerprint_pass(
+                policy_binding,
+                resource_tracker=inventory_parts[1],
+                calculate_digest=True,
+            )
+            if (
+                policy_fingerprint is None
+                or policy_fingerprint[0] != policy_preflight[0]
+                or not isinstance(policy_fingerprint[1], str)
+            ):
+                return None
+            policy_digest = policy_fingerprint[1]
             raw_dataset = inventory_validation_memoized(
                 inventory_context,
                 namespace=f"raw_semantic_dataset_v1:{policy_digest}",
-                inventory=value,
+                inventory=memo_subject,
                 producer=lambda: produce_raw_semantic_dataset(
                     value,
                     provider_declaration=provider_declaration,
@@ -12756,6 +13371,7 @@ class RepositoryContractTest(unittest.TestCase):
                     _allow_post_as_of_artifacts=_allow_post_as_of_artifacts,
                     _inventory_validation_context=inventory_context,
                 ),
+                budget_tracker=inventory_parts[1],
             )
             return project_raw_semantic_dataset(
                 raw_dataset,
@@ -12929,20 +13545,24 @@ class RepositoryContractTest(unittest.TestCase):
                 "fetches",
             }
             if (
-                not isinstance(value, dict)
+                type(value) is not dict
                 or set(value)
                 not in {
                     frozenset(base_inventory_fields),
                     frozenset(base_inventory_fields | {"request_scope_receipts"}),
                 }
+                or type(value.get("repository")) is not str
                 or value.get("repository") != current_repository
+                or type(value.get("pull_number")) is not int
+                or value.get("pull_number") <= 0
                 or value.get("pull_number") != current_pr
+                or type(value.get("head")) is not str
                 or value.get("head") != current_head
                 or not typed_json_equal(
                     value.get("resource_budget"),
                     evidence_resource_budget_v1,
                 )
-                or not isinstance(value.get("fetches"), list)
+                or type(value.get("fetches")) is not list
             ):
                 return None
             fetches = value["fetches"]
@@ -12969,6 +13589,7 @@ class RepositoryContractTest(unittest.TestCase):
                 _allow_post_as_of_requests=True,
                 _allow_post_as_of_artifacts=True,
                 _inventory_validation_context=_inventory_validation_context,
+                _memo_subject=fetches,
             )
             entries = (
                 parsed_transcript.get("entries")
@@ -13019,30 +13640,17 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             if inventory_context is None:
                 return None
-            try:
-                ancestry_digest = hashlib.sha256(
-                    canonical_raw_body(current_ancestry).encode("utf-8")
-                ).hexdigest()
-            except (TypeError, UnicodeEncodeError, ValueError):
+            inventory_parts = inventory_validation_context_parts(inventory_context)
+            if inventory_parts is None:
                 return None
-            result = inventory_validation_memoized(
-                inventory_context,
-                namespace=(
-                    "current-endpoint-inventory-v1:"
-                    f"{ancestry_digest}:"
-                    f"{require_current_ancestry_exact}:"
-                    f"{prefer_unresolved_thread_blocker}"
-                ),
-                inventory=value,
-                producer=lambda: _parse_current_endpoint_inventory_uncached(
-                    value,
-                    current_ancestry=current_ancestry,
-                    require_current_ancestry_exact=require_current_ancestry_exact,
-                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
-                    _tightened_resource_limits=_tightened_resource_limits,
-                    _monotonic_clock=_monotonic_clock,
-                    _inventory_validation_context=inventory_context,
-                ),
+            result = _parse_current_endpoint_inventory_uncached(
+                value,
+                current_ancestry=current_ancestry,
+                require_current_ancestry_exact=require_current_ancestry_exact,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                _tightened_resource_limits=_tightened_resource_limits,
+                _monotonic_clock=_monotonic_clock,
+                _inventory_validation_context=inventory_context,
             )
             return result if isinstance(result, dict) else None
 
@@ -13223,9 +13831,12 @@ class RepositoryContractTest(unittest.TestCase):
             initial_inventory = candidate_history.get("initial_inventory")
             final_inventory = candidate_history.get("final_inventory")
             if (
-                not isinstance(initial_candidates, list)
-                or not isinstance(final_candidates, list)
-                or not typed_json_equal(initial_candidates, final_candidates)
+                type(initial_candidates) is not list
+                or type(final_candidates) is not list
+                or len(initial_candidates)
+                > evidence_resource_budget_v1["max_seeded_pull_requests"]
+                or len(final_candidates)
+                > evidence_resource_budget_v1["max_seeded_pull_requests"]
                 or not isinstance(initial_inventory, dict)
                 or not isinstance(final_inventory, dict)
             ):
@@ -13363,27 +13974,25 @@ class RepositoryContractTest(unittest.TestCase):
                 artifact_context = parts[3]
 
                 def validate_artifact_plane() -> bool:
-                    artifact_kinds = {
-                        "terminal_payloads": "terminal-payload",
-                        "malformed_terminal_artifacts": ("malformed-terminal-artifact"),
-                        "active_top_level_findings": ("active-top-level-finding"),
-                        "unresolved_thread_findings": ("unresolved-thread-finding"),
-                    }
+                    if type(candidates) is not list or len(candidates) > int(
+                        evidence_resource_budget_v1["max_seeded_pull_requests"]
+                    ):
+                        return False
                     for candidate in candidates:
-                        if not isinstance(candidate, dict):
+                        if type(candidate) is not dict:
                             return False
                         candidate_scope = scope_key(candidate)
-                        evidence_state = candidate.get("evidence_state")
-                        if (
-                            candidate_scope is None
-                            or not isinstance(evidence_state, dict)
-                            or set(evidence_state) != set(artifact_kinds)
-                        ):
+                        artifact_arrays = precharged_artifact_wrapper_arrays(
+                            candidate,
+                            artifact_validation_context=artifact_context,
+                        )
+                        if candidate_scope is None or artifact_arrays is None:
                             return False
-                        for artifact_field, artifact_kind in artifact_kinds.items():
-                            artifacts = evidence_state.get(artifact_field)
-                            if not isinstance(artifacts, list):
-                                return False
+                        for (
+                            artifact_field,
+                            artifact_kind,
+                        ) in artifact_kind_by_field.items():
+                            artifacts = artifact_arrays[artifact_field]
                             for artifact in artifacts:
                                 if (
                                     validate_candidate_artifact(
@@ -13397,22 +14006,11 @@ class RepositoryContractTest(unittest.TestCase):
                                     return False
                     return True
 
-                artifact_plane_result = inventory_validation_memoized(
-                    inventory_context,
-                    namespace=f"historical-artifact-plane-v1:{field}",
-                    inventory=candidates,
-                    producer=validate_artifact_plane,
-                )
-                if artifact_plane_result is not True:
+                if not validate_artifact_plane():
                     return None
-                memoized = inventory_validation_memoized(
+                validated_projection = validate_inventory_projection_uncached(
+                    value,
                     inventory_context,
-                    namespace=f"historical-universe-inventory-v1:{field}",
-                    inventory=value,
-                    producer=lambda: validate_inventory_projection_uncached(
-                        value,
-                        inventory_context,
-                    ),
                 )
                 transcript = value.get("discovery_endpoint_transcript")
                 if not isinstance(transcript, dict):
@@ -13420,10 +14018,10 @@ class RepositoryContractTest(unittest.TestCase):
 
                 def endpoint_plane_result() -> object:
                     if (
-                        isinstance(memoized, tuple)
-                        and len(memoized) == 2
-                        and isinstance(memoized[0], dict)
-                        and isinstance(memoized[1], list)
+                        isinstance(validated_projection, tuple)
+                        and len(validated_projection) == 2
+                        and isinstance(validated_projection[0], dict)
+                        and isinstance(validated_projection[1], list)
                     ):
                         try:
                             transcript_digest = hashlib.sha256(
@@ -13448,6 +14046,7 @@ class RepositoryContractTest(unittest.TestCase):
                     namespace=f"historical-endpoint-plane-v1:{field}",
                     inventory=transcript,
                     producer=endpoint_plane_result,
+                    budget_tracker=parts[1],
                 )
                 if (
                     not isinstance(endpoint_result, dict)
@@ -13463,13 +14062,13 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return None
                 if (
-                    not isinstance(memoized, tuple)
-                    or len(memoized) != 2
-                    or not isinstance(memoized[0], dict)
-                    or not isinstance(memoized[1], list)
+                    not isinstance(validated_projection, tuple)
+                    or len(validated_projection) != 2
+                    or not isinstance(validated_projection[0], dict)
+                    or not isinstance(validated_projection[1], list)
                 ):
                     return None
-                return memoized
+                return validated_projection
 
             initial_validated = validate_inventory_projection(
                 initial_inventory,
@@ -13577,7 +14176,10 @@ class RepositoryContractTest(unittest.TestCase):
                 return True
 
             if (
-                not typed_json_equal(initial_projection, final_projection)
+                not isinstance(initial_candidate_entries, list)
+                or not isinstance(final_candidate_entries, list)
+                or not typed_json_equal(initial_candidates, final_candidates)
+                or not typed_json_equal(initial_projection, final_projection)
                 or not typed_json_equal(
                     initial_historical_entries,
                     final_historical_entries,
@@ -13614,7 +14216,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             artifact_validation_context: dict[str, object],
         ) -> dict[str, object] | None:
-            if not isinstance(candidate, dict) or not isinstance(stored_entry, dict):
+            if type(candidate) is not dict or type(stored_entry) is not dict:
                 return None
             allowed_record_fields = {
                 frozenset(record_fields),
@@ -13628,12 +14230,31 @@ class RepositoryContractTest(unittest.TestCase):
             final_snapshot = candidate.get("final_snapshot")
             if (
                 frozenset(candidate) not in allowed_record_fields
-                or not isinstance(initial_snapshot, dict)
-                or not isinstance(final_snapshot, dict)
+                or type(initial_snapshot) is not dict
+                or type(final_snapshot) is not dict
                 or frozenset(initial_snapshot) not in allowed_snapshot_fields
                 or frozenset(final_snapshot) not in allowed_snapshot_fields
             ):
                 return None
+            candidate_scope_key = scope_key(candidate)
+            artifact_arrays = precharged_artifact_wrapper_arrays(
+                candidate,
+                artifact_validation_context=artifact_validation_context,
+            )
+            if candidate_scope_key is None or artifact_arrays is None:
+                return None
+            for artifact_field, artifact_kind in artifact_kind_by_field.items():
+                for artifact in artifact_arrays[artifact_field]:
+                    if (
+                        validate_candidate_artifact(
+                            artifact,
+                            expected_kind=artifact_kind,
+                            expected_scope=candidate_scope_key,
+                            artifact_validation_context=(artifact_validation_context),
+                        )
+                        is None
+                    ):
+                        return None
             request_reaction_fields = {
                 "requests",
                 "request_scope_receipts",
@@ -13664,7 +14285,6 @@ class RepositoryContractTest(unittest.TestCase):
                 or not current_lifecycle_is_eligible(candidate)
             ):
                 return None
-            candidate_scope_key = scope_key(candidate)
             basis = candidate.get("candidate_basis")
             if (
                 candidate_scope_key is None
@@ -13688,22 +14308,9 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
 
-            evidence_state = candidate.get("evidence_state")
-            artifact_fields = {
-                "terminal_payloads": "terminal-payload",
-                "malformed_terminal_artifacts": "malformed-terminal-artifact",
-                "active_top_level_findings": "active-top-level-finding",
-                "unresolved_thread_findings": "unresolved-thread-finding",
-            }
-            if not isinstance(evidence_state, dict) or set(evidence_state) != set(
-                artifact_fields
-            ):
-                return None
             artifact_audit_by_identity: dict[tuple[str, int], dict[str, object]] = {}
-            for artifact_field, artifact_kind in artifact_fields.items():
-                artifacts = evidence_state.get(artifact_field)
-                if not isinstance(artifacts, list):
-                    return None
+            for artifact_field, artifact_kind in artifact_kind_by_field.items():
+                artifacts = artifact_arrays[artifact_field]
                 for artifact in artifacts:
                     validated = validate_candidate_artifact(
                         artifact,
@@ -13960,8 +14567,13 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> dict[str, object] | None:
             initial_candidates = candidate_history.get("initial_candidates")
             final_candidates = candidate_history.get("final_candidates")
-            if not isinstance(initial_candidates, list) or not isinstance(
-                final_candidates, list
+            if (
+                type(initial_candidates) is not list
+                or type(final_candidates) is not list
+                or len(initial_candidates)
+                > evidence_resource_budget_v1["max_seeded_pull_requests"]
+                or len(final_candidates)
+                > evidence_resource_budget_v1["max_seeded_pull_requests"]
             ):
                 return None
             expected_inventory_fields = {
@@ -14058,6 +14670,7 @@ class RepositoryContractTest(unittest.TestCase):
                         _sidecar_blind_audit=True,
                         _inventory_validation_context=inventory_context,
                     ),
+                    budget_tracker=context_parts[1],
                 )
                 if (
                     not isinstance(endpoint_result, dict)
@@ -14370,6 +14983,7 @@ class RepositoryContractTest(unittest.TestCase):
                         sidecar_value,
                         resource_tracker=context_parts[2],
                     ),
+                    budget_tracker=context_parts[2],
                 )
                 candidate_mapping_available = True
                 for candidate in candidates:
@@ -14554,24 +15168,22 @@ class RepositoryContractTest(unittest.TestCase):
             if parts is None:
                 return None
             artifact_context = parts[3]
+            record_artifact_arrays = precharged_artifact_wrapper_arrays(
+                record,
+                artifact_validation_context=artifact_context,
+            )
+            if record_artifact_arrays is None:
+                return None
             authority_record = record
             record_evidence_state = record.get("evidence_state")
             if isinstance(record_evidence_state, dict) and finding_ancestry:
-                artifact_kinds = {
-                    "terminal_payloads": "terminal-payload",
-                    "malformed_terminal_artifacts": ("malformed-terminal-artifact"),
-                    "active_top_level_findings": "active-top-level-finding",
-                    "unresolved_thread_findings": "unresolved-thread-finding",
-                }
                 projected_evidence_state: dict[str, list[object]] = {}
                 filtered_nonancestor = False
                 record_scope_for_filter = scope_key(record)
                 if record_scope_for_filter is None:
                     return None
-                for field, artifact_kind in artifact_kinds.items():
-                    artifacts = record_evidence_state.get(field)
-                    if not isinstance(artifacts, list):
-                        return None
+                for field, artifact_kind in artifact_kind_by_field.items():
+                    artifacts = record_artifact_arrays[field]
                     projected_artifacts: list[object] = []
                     for artifact in artifacts:
                         validated = validate_candidate_artifact(
@@ -14596,6 +15208,12 @@ class RepositoryContractTest(unittest.TestCase):
                     authority_snapshot = record_snapshot(authority_record)
                     authority_record["initial_snapshot"] = clone(authority_snapshot)
                     authority_record["final_snapshot"] = clone(authority_snapshot)
+                    if not bind_precharged_artifact_wrapper_projection(
+                        record,
+                        authority_record,
+                        artifact_validation_context=artifact_context,
+                    ):
+                        return None
             ordering_key = candidate_order_basis(
                 authority_record,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
@@ -16730,8 +17348,22 @@ class RepositoryContractTest(unittest.TestCase):
                 not inventory_validation_deadlines_hold(
                     report_phase_contexts[field],
                     ignore_sidecar_failure=(
-                        history_validation_status == "unused-sidecar-unavailable"
-                        and field in {"initial_inventory", "final_inventory"}
+                        (
+                            history_validation_status == "unused-sidecar-unavailable"
+                            and field in {"initial_inventory", "final_inventory"}
+                        )
+                        or (
+                            lane_state
+                            in {
+                                "accepted-terminal-clean",
+                                "accepted-terminal-findings",
+                            }
+                            and field
+                            in {
+                                "initial_current_raw_inventory",
+                                "final_current_raw_inventory",
+                            }
+                        )
                     ),
                 )
                 for field in report_inventory_context_fields
@@ -16801,6 +17433,22 @@ class RepositoryContractTest(unittest.TestCase):
                 "max_page_body_bytes": 8_388_608,
                 "max_retained_utf8_bytes": 67_108_864,
                 "deadline_seconds": 900,
+            },
+        )
+        self.assertEqual(
+            memo_fingerprint_guard_v1,
+            {
+                "profile": "github-codex-memo-fingerprint-guard-v1",
+                "schema_version": 1,
+                "max_depth": 64,
+                "max_container_entries": 20_000,
+                "max_nodes": 2_000_000,
+                "max_integer_bits": 128,
+                "max_scalar_utf8_bytes": 8_388_608,
+                "max_total_scalar_utf8_bytes": 67_108_864,
+                "deadline_check_nodes": 1024,
+                "deadline_check_utf8_bytes": 1_048_576,
+                "utf8_chunk_characters": 4096,
             },
         )
         for inventory_builder in (universe_inventory, current_endpoint_inventory):
@@ -16965,13 +17613,55 @@ class RepositoryContractTest(unittest.TestCase):
         unserializable_current_fetches = list(current_detail_inventory["fetches"])
         unserializable_current_fetches.append(object())
         unserializable_current_detail["fetches"] = unserializable_current_fetches
-        self.assertIsNone(
-            parse_current_endpoint_inventory(
+        unbounded_inventory_serializations = 0
+        unbounded_inventory_json_dumps = 0
+        unbounded_inventory_producer_calls = 0
+        original_canonical_raw_body = canonical_raw_body
+        original_json_dumps = json.dumps
+        original_current_inventory_producer = produce_raw_semantic_dataset
+
+        def guarded_canonical_raw_body(value: object) -> str:
+            nonlocal unbounded_inventory_serializations
+            if value is unserializable_current_detail or value is (
+                unserializable_current_fetches
+            ):
+                unbounded_inventory_serializations += 1
+            return original_canonical_raw_body(value)
+
+        def guarded_inventory_json_dumps(
+            value: object, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal unbounded_inventory_json_dumps
+            if value is unserializable_current_detail or value is (
+                unserializable_current_fetches
+            ):
+                unbounded_inventory_json_dumps += 1
+            return original_json_dumps(value, *args, **kwargs)
+
+        def guarded_current_inventory_producer(
+            *args: object, **kwargs: object
+        ) -> object:
+            nonlocal unbounded_inventory_producer_calls
+            unbounded_inventory_producer_calls += 1
+            return original_current_inventory_producer(*args, **kwargs)
+
+        canonical_raw_body = guarded_canonical_raw_body
+        json.dumps = guarded_inventory_json_dumps
+        produce_raw_semantic_dataset = guarded_current_inventory_producer
+        try:
+            unserializable_current_result = parse_current_endpoint_inventory(
                 unserializable_current_detail,
                 current_ancestry={},
                 _tightened_resource_limits=exact_current_detail_limits,
             )
-        )
+        finally:
+            canonical_raw_body = original_canonical_raw_body
+            json.dumps = original_json_dumps
+            produce_raw_semantic_dataset = original_current_inventory_producer
+        self.assertIsNone(unserializable_current_result)
+        self.assertEqual(unbounded_inventory_serializations, 0)
+        self.assertEqual(unbounded_inventory_json_dumps, 0)
+        self.assertEqual(unbounded_inventory_producer_calls, 0)
 
         exact_sidecar_tracker = new_resource_tracker(
             tightened_limits=tightened_resource_limits(
@@ -20795,9 +21485,98 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(duplicate_wrapper_parts[0]["records"], 7)
         self.assertEqual(duplicate_wrapper_parts[0]["retained_pages"], 5)
 
+        first_projection_wrapper: dict[str, object] = {"wrapper": "first"}
+        second_projection_wrapper: dict[str, object] = {"wrapper": "second"}
+        projection_source_record = {
+            "evidence_state": {
+                field: (
+                    [first_projection_wrapper, second_projection_wrapper]
+                    if field == "terminal_payloads"
+                    else []
+                )
+                for field in artifact_kind_by_field
+            }
+        }
+        projection_context = new_artifact_validation_context()
+        self.assertIsNotNone(projection_context)
+        assert projection_context is not None
+        self.assertIsNotNone(
+            precharged_artifact_wrapper_arrays(
+                projection_source_record,
+                artifact_validation_context=projection_context,
+            )
+        )
+        projection_parts = artifact_validation_context_parts(projection_context)
+        assert projection_parts is not None
+        projection_tracker, projection_ledger = projection_parts
+        self.assertEqual(projection_tracker["records"], 2)
+
+        valid_projection_record = {
+            "evidence_state": {
+                field: (
+                    [second_projection_wrapper] if field == "terminal_payloads" else []
+                )
+                for field in artifact_kind_by_field
+            }
+        }
+        self.assertTrue(
+            bind_precharged_artifact_wrapper_projection(
+                projection_source_record,
+                valid_projection_record,
+                artifact_validation_context=projection_context,
+            )
+        )
+        self.assertEqual(projection_tracker["records"], 2)
+        self.assertIsNotNone(
+            precharged_artifact_wrapper_arrays(
+                valid_projection_record,
+                artifact_validation_context=projection_context,
+            )
+        )
+        self.assertEqual(projection_tracker["records"], 2)
+
+        invalid_projection_arrays = {
+            "cloned-entry": [clone(second_projection_wrapper)],
+            "reordered": [second_projection_wrapper, first_projection_wrapper],
+            "excess-multiplicity": [
+                second_projection_wrapper,
+                second_projection_wrapper,
+            ],
+        }
+        for (
+            projection_case,
+            projected_terminal_payloads,
+        ) in invalid_projection_arrays.items():
+            projected_record = {
+                "evidence_state": {
+                    field: (
+                        projected_terminal_payloads
+                        if field == "terminal_payloads"
+                        else []
+                    )
+                    for field in artifact_kind_by_field
+                }
+            }
+            projected_ledger_key = (
+                "artifact-wrapper-array-entries",
+                id(projection_tracker),
+                id(projected_record),
+            )
+            with self.subTest(wrapper_projection=projection_case):
+                self.assertFalse(
+                    bind_precharged_artifact_wrapper_projection(
+                        projection_source_record,
+                        projected_record,
+                        artifact_validation_context=projection_context,
+                    )
+                )
+                self.assertNotIn(projected_ledger_key, projection_ledger)
+                self.assertEqual(projection_tracker["records"], 2)
+
         wrapper_iteration_attempts: dict[str, int] = {
             "over-budget": 0,
             "cache-header-mismatch": 0,
+            "normalized-ancestry": 0,
         }
 
         class RaisingWrapperList(list[object]):
@@ -20843,6 +21622,32 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(wrapper_iteration_attempts["over-budget"], 0)
 
+        normalized_ancestry_wrapper_current = clone(terminal_current)
+        assert isinstance(normalized_ancestry_wrapper_current, dict)
+        normalized_ancestry_wrapper = normalized_ancestry_wrapper_current[
+            "evidence_state"
+        ]["terminal_payloads"][0]
+        normalized_ancestry_wrapper_current["evidence_state"]["terminal_payloads"] = (
+            RaisingWrapperList(
+                [normalized_ancestry_wrapper],
+                reported_length=evidence_resource_budget_v1["max_records"] + 1,
+                probe="normalized-ancestry",
+            )
+        )
+        normalized_ancestry_context = new_inventory_validation_context()
+        assert normalized_ancestry_context is not None
+        self.assertIsNone(
+            normalized_current_decision_entry(
+                normalized_ancestry_wrapper_current,
+                {},
+                prefer_unresolved_thread_blocker=False,
+                retain_request_reaction_records=False,
+                finding_ancestry={current_head: 0},
+                inventory_validation_context=normalized_ancestry_context,
+            )
+        )
+        self.assertEqual(wrapper_iteration_attempts["normalized-ancestry"], 0)
+
         cache_header_current = clone(terminal_current)
         assert isinstance(cache_header_current, dict)
         cache_header_context = new_artifact_validation_context()
@@ -20873,6 +21678,1070 @@ class RepositoryContractTest(unittest.TestCase):
             )
         )
         self.assertEqual(wrapper_iteration_attempts["cache-header-mismatch"], 0)
+
+        prehash_artifact_context = new_artifact_validation_context(
+            tightened_limits=tightened_resource_limits(max_page_body_bytes=1),
+            monotonic_clock=lambda: 0.0,
+        )
+        self.assertIsNotNone(prehash_artifact_context)
+        assert prehash_artifact_context is not None
+        prehash_artifact_parts = artifact_validation_context_parts(
+            prehash_artifact_context
+        )
+        assert prehash_artifact_parts is not None
+        prehash_serializations = 0
+        prehash_json_dumps = 0
+        prehash_sha256_calls = 0
+        prehash_producer_calls = 0
+        original_canonical_raw_body = canonical_raw_body
+        original_json_dumps = json.dumps
+        original_sha256 = hashlib.sha256
+        original_artifact_producer = _validate_candidate_artifact_uncached
+
+        def guarded_wrapper_serializer(value: object) -> str:
+            nonlocal prehash_serializations
+            if value is over_budget_wrapper:
+                prehash_serializations += 1
+            return original_canonical_raw_body(value)
+
+        def guarded_wrapper_json_dumps(
+            value: object, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal prehash_json_dumps
+            prehash_json_dumps += 1
+            return original_json_dumps(value, *args, **kwargs)
+
+        def guarded_sha256(*args: object, **kwargs: object):
+            nonlocal prehash_sha256_calls
+            prehash_sha256_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        def guarded_artifact_producer(value: object, **kwargs: object) -> object:
+            nonlocal prehash_producer_calls
+            if value is over_budget_wrapper:
+                prehash_producer_calls += 1
+            return original_artifact_producer(value, **kwargs)
+
+        canonical_raw_body = guarded_wrapper_serializer
+        json.dumps = guarded_wrapper_json_dumps
+        hashlib.sha256 = guarded_sha256
+        _validate_candidate_artifact_uncached = guarded_artifact_producer
+        try:
+            prehash_artifact_result = validate_candidate_artifact(
+                over_budget_wrapper,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=prehash_artifact_context,
+            )
+        finally:
+            canonical_raw_body = original_canonical_raw_body
+            json.dumps = original_json_dumps
+            hashlib.sha256 = original_sha256
+            _validate_candidate_artifact_uncached = original_artifact_producer
+        self.assertIsNone(prehash_artifact_result)
+        self.assertEqual(prehash_serializations, 0)
+        self.assertEqual(prehash_json_dumps, 0)
+        self.assertEqual(prehash_sha256_calls, 0)
+        self.assertEqual(prehash_producer_calls, 0)
+        self.assertEqual(prehash_artifact_parts[1], {})
+        self.assertIs(prehash_artifact_parts[0]["failed"], True)
+
+        deep_inventory: dict[str, object] = {}
+        deep_cursor = deep_inventory
+        for _ in range(memo_fingerprint_guard_v1["max_depth"] + 1):
+            child: dict[str, object] = {}
+            deep_cursor["nested"] = child
+            deep_cursor = child
+        deep_inventory_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        self.assertIsNotNone(deep_inventory_context)
+        assert deep_inventory_context is not None
+        deep_inventory_parts = inventory_validation_context_parts(
+            deep_inventory_context
+        )
+        assert deep_inventory_parts is not None
+        deep_producer_calls = 0
+
+        def deep_inventory_producer() -> object:
+            nonlocal deep_producer_calls
+            deep_producer_calls += 1
+            raise AssertionError("deep inventory producer ran before admission")
+
+        deep_serializations = 0
+        deep_json_dumps = 0
+        deep_hash_calls = 0
+        original_canonical_raw_body = canonical_raw_body
+        original_json_dumps = json.dumps
+        original_sha256 = hashlib.sha256
+
+        def guarded_deep_serializer(value: object) -> str:
+            nonlocal deep_serializations
+            if value is deep_inventory:
+                deep_serializations += 1
+            return original_canonical_raw_body(value)
+
+        def guarded_deep_json_dumps(
+            value: object, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal deep_json_dumps
+            deep_json_dumps += 1
+            return original_json_dumps(value, *args, **kwargs)
+
+        def guarded_deep_sha256(*args: object, **kwargs: object):
+            nonlocal deep_hash_calls
+            deep_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        canonical_raw_body = guarded_deep_serializer
+        json.dumps = guarded_deep_json_dumps
+        hashlib.sha256 = guarded_deep_sha256
+        try:
+            deep_inventory_result = inventory_validation_memoized(
+                deep_inventory_context,
+                namespace="deep-inventory-preflight-v1",
+                inventory=deep_inventory,
+                producer=deep_inventory_producer,
+                budget_tracker=deep_inventory_parts[1],
+            )
+        finally:
+            canonical_raw_body = original_canonical_raw_body
+            json.dumps = original_json_dumps
+            hashlib.sha256 = original_sha256
+        self.assertIsNone(deep_inventory_result)
+        self.assertEqual(deep_producer_calls, 0)
+        self.assertEqual(deep_serializations, 0)
+        self.assertEqual(deep_json_dumps, 0)
+        self.assertEqual(deep_hash_calls, 0)
+        self.assertEqual(deep_inventory_parts[4], {})
+        self.assertIs(deep_inventory_parts[1]["failed"], True)
+
+        oversized_scalar_inventory = {
+            "x": "x" * (memo_fingerprint_guard_v1["max_scalar_utf8_bytes"] + 1)
+        }
+        oversized_scalar_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert oversized_scalar_context is not None
+        oversized_scalar_parts = inventory_validation_context_parts(
+            oversized_scalar_context
+        )
+        assert oversized_scalar_parts is not None
+        oversized_scalar_producer_calls = 0
+        oversized_scalar_serializations = 0
+        oversized_scalar_json_dumps = 0
+        oversized_scalar_hash_calls = 0
+        original_canonical_raw_body = canonical_raw_body
+        original_json_dumps = json.dumps
+        original_sha256 = hashlib.sha256
+
+        def oversized_scalar_producer() -> object:
+            nonlocal oversized_scalar_producer_calls
+            oversized_scalar_producer_calls += 1
+            raise AssertionError("oversized scalar producer ran before admission")
+
+        def guarded_oversized_scalar_serializer(value: object) -> str:
+            nonlocal oversized_scalar_serializations
+            if value is oversized_scalar_inventory:
+                oversized_scalar_serializations += 1
+            return original_canonical_raw_body(value)
+
+        def guarded_oversized_scalar_json_dumps(
+            value: object, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal oversized_scalar_json_dumps
+            oversized_scalar_json_dumps += 1
+            return original_json_dumps(value, *args, **kwargs)
+
+        def guarded_oversized_scalar_sha256(*args: object, **kwargs: object):
+            nonlocal oversized_scalar_hash_calls
+            oversized_scalar_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        canonical_raw_body = guarded_oversized_scalar_serializer
+        json.dumps = guarded_oversized_scalar_json_dumps
+        hashlib.sha256 = guarded_oversized_scalar_sha256
+        try:
+            oversized_scalar_result = inventory_validation_memoized(
+                oversized_scalar_context,
+                namespace="oversized-scalar-preflight-v1",
+                inventory=oversized_scalar_inventory,
+                producer=oversized_scalar_producer,
+                budget_tracker=oversized_scalar_parts[1],
+            )
+        finally:
+            canonical_raw_body = original_canonical_raw_body
+            json.dumps = original_json_dumps
+            hashlib.sha256 = original_sha256
+        self.assertIsNone(oversized_scalar_result)
+        self.assertEqual(oversized_scalar_producer_calls, 0)
+        self.assertEqual(oversized_scalar_serializations, 0)
+        self.assertEqual(oversized_scalar_json_dumps, 0)
+        self.assertEqual(oversized_scalar_hash_calls, 0)
+        self.assertEqual(oversized_scalar_parts[4], {})
+        self.assertIs(oversized_scalar_parts[1]["failed"], True)
+
+        oversized_integer_inventory = {
+            "x": 1 << memo_fingerprint_guard_v1["max_integer_bits"]
+        }
+        oversized_integer_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert oversized_integer_context is not None
+        oversized_integer_parts = inventory_validation_context_parts(
+            oversized_integer_context
+        )
+        assert oversized_integer_parts is not None
+        oversized_integer_producer_calls = 0
+        oversized_integer_serializations = 0
+        oversized_integer_json_dumps = 0
+        oversized_integer_hash_calls = 0
+        original_canonical_raw_body = canonical_raw_body
+        original_json_dumps = json.dumps
+        original_sha256 = hashlib.sha256
+
+        def oversized_integer_producer() -> object:
+            nonlocal oversized_integer_producer_calls
+            oversized_integer_producer_calls += 1
+            raise AssertionError("oversized integer producer ran before admission")
+
+        def guarded_oversized_integer_serializer(value: object) -> str:
+            nonlocal oversized_integer_serializations
+            if value is oversized_integer_inventory:
+                oversized_integer_serializations += 1
+            return original_canonical_raw_body(value)
+
+        def guarded_oversized_integer_json_dumps(
+            value: object, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal oversized_integer_json_dumps
+            oversized_integer_json_dumps += 1
+            return original_json_dumps(value, *args, **kwargs)
+
+        def guarded_oversized_integer_sha256(*args: object, **kwargs: object):
+            nonlocal oversized_integer_hash_calls
+            oversized_integer_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        canonical_raw_body = guarded_oversized_integer_serializer
+        json.dumps = guarded_oversized_integer_json_dumps
+        hashlib.sha256 = guarded_oversized_integer_sha256
+        try:
+            oversized_integer_result = inventory_validation_memoized(
+                oversized_integer_context,
+                namespace="oversized-integer-preflight-v1",
+                inventory=oversized_integer_inventory,
+                producer=oversized_integer_producer,
+                budget_tracker=oversized_integer_parts[1],
+            )
+        finally:
+            canonical_raw_body = original_canonical_raw_body
+            json.dumps = original_json_dumps
+            hashlib.sha256 = original_sha256
+        self.assertIsNone(oversized_integer_result)
+        self.assertEqual(oversized_integer_producer_calls, 0)
+        self.assertEqual(oversized_integer_serializations, 0)
+        self.assertEqual(oversized_integer_json_dumps, 0)
+        self.assertEqual(oversized_integer_hash_calls, 0)
+        self.assertEqual(oversized_integer_parts[4], {})
+        self.assertIs(oversized_integer_parts[1]["failed"], True)
+
+        plane_cache_inventory = {"plane": "stable"}
+        plane_cache_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert plane_cache_context is not None
+        plane_cache_parts = inventory_validation_context_parts(plane_cache_context)
+        assert plane_cache_parts is not None
+        plane_cache_producer_calls = 0
+
+        def plane_cache_producer() -> dict[str, int]:
+            nonlocal plane_cache_producer_calls
+            plane_cache_producer_calls += 1
+            return {"producer_call": plane_cache_producer_calls}
+
+        endpoint_plane_cache_result = inventory_validation_memoized(
+            plane_cache_context,
+            namespace="tracker-bound-cache-v1",
+            inventory=plane_cache_inventory,
+            producer=plane_cache_producer,
+            budget_tracker=plane_cache_parts[1],
+        )
+        sidecar_plane_cache_result = inventory_validation_memoized(
+            plane_cache_context,
+            namespace="tracker-bound-cache-v1",
+            inventory=plane_cache_inventory,
+            producer=plane_cache_producer,
+            budget_tracker=plane_cache_parts[2],
+        )
+        self.assertTrue(
+            typed_json_equal(endpoint_plane_cache_result, {"producer_call": 1})
+        )
+        self.assertTrue(
+            typed_json_equal(sidecar_plane_cache_result, {"producer_call": 2})
+        )
+        self.assertEqual(plane_cache_producer_calls, 2)
+        self.assertEqual(len(plane_cache_parts[4]), 2)
+        self.assertTrue(
+            typed_json_equal(
+                inventory_validation_memoized(
+                    plane_cache_context,
+                    namespace="tracker-bound-cache-v1",
+                    inventory=plane_cache_inventory,
+                    producer=plane_cache_producer,
+                    budget_tracker=plane_cache_parts[1],
+                ),
+                {"producer_call": 1},
+            )
+        )
+        self.assertTrue(
+            typed_json_equal(
+                inventory_validation_memoized(
+                    plane_cache_context,
+                    namespace="tracker-bound-cache-v1",
+                    inventory=plane_cache_inventory,
+                    producer=plane_cache_producer,
+                    budget_tracker=plane_cache_parts[2],
+                ),
+                {"producer_call": 2},
+            )
+        )
+        self.assertEqual(plane_cache_producer_calls, 2)
+        root_tracker_producer_calls = 0
+
+        def root_tracker_producer() -> dict[str, bool]:
+            nonlocal root_tracker_producer_calls
+            root_tracker_producer_calls += 1
+            return {"accepted": True}
+
+        self.assertIsNone(
+            inventory_validation_memoized(
+                plane_cache_context,
+                namespace="root-tracker-forbidden-v1",
+                inventory=plane_cache_inventory,
+                producer=root_tracker_producer,
+                budget_tracker=plane_cache_parts[0],
+            )
+        )
+        self.assertEqual(root_tracker_producer_calls, 0)
+
+        failed_truthy_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert failed_truthy_context is not None
+        failed_truthy_parts = inventory_validation_context_parts(failed_truthy_context)
+        assert failed_truthy_parts is not None
+
+        def failed_truthy_producer() -> dict[str, bool]:
+            failed_truthy_parts[1]["failed"] = True
+            return {"partial": True}
+
+        self.assertIsNone(
+            inventory_validation_memoized(
+                failed_truthy_context,
+                namespace="failed-truthy-producer-v1",
+                inventory={"input": "bounded"},
+                producer=failed_truthy_producer,
+                budget_tracker=failed_truthy_parts[1],
+            )
+        )
+        self.assertEqual(failed_truthy_parts[4], {})
+        self.assertIs(failed_truthy_parts[1]["failed"], True)
+
+        negative_cache_inventory = {"state": "invalid"}
+        negative_cache_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert negative_cache_context is not None
+        negative_cache_parts = inventory_validation_context_parts(
+            negative_cache_context
+        )
+        assert negative_cache_parts is not None
+        negative_cache_producer_calls = 0
+
+        def negative_cache_producer() -> None:
+            nonlocal negative_cache_producer_calls
+            negative_cache_producer_calls += 1
+            return None
+
+        self.assertIsNone(
+            inventory_validation_memoized(
+                negative_cache_context,
+                namespace="negative-cache-fingerprint-v1",
+                inventory=negative_cache_inventory,
+                producer=negative_cache_producer,
+                budget_tracker=negative_cache_parts[1],
+            )
+        )
+        self.assertEqual(negative_cache_producer_calls, 1)
+        self.assertEqual(len(negative_cache_parts[4]), 1)
+        negative_cache_entry = next(iter(negative_cache_parts[4].values()))
+        self.assertIsInstance(negative_cache_entry.get("digest"), str)
+        negative_cache_inventory["state"] = "changed"
+        negative_cache_hash_calls = 0
+        original_sha256 = hashlib.sha256
+
+        def guarded_negative_cache_sha256(*args: object, **kwargs: object):
+            nonlocal negative_cache_hash_calls
+            negative_cache_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        hashlib.sha256 = guarded_negative_cache_sha256
+        try:
+            self.assertIsNone(
+                inventory_validation_memoized(
+                    negative_cache_context,
+                    namespace="negative-cache-fingerprint-v1",
+                    inventory=negative_cache_inventory,
+                    producer=negative_cache_producer,
+                    budget_tracker=negative_cache_parts[1],
+                )
+            )
+        finally:
+            hashlib.sha256 = original_sha256
+        self.assertGreater(negative_cache_hash_calls, 0)
+        self.assertEqual(negative_cache_producer_calls, 1)
+        self.assertIs(negative_cache_parts[1]["failed"], False)
+
+        positive_cache_inventory = {"state": "valid"}
+        positive_cache_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert positive_cache_context is not None
+        positive_cache_parts = inventory_validation_context_parts(
+            positive_cache_context
+        )
+        assert positive_cache_parts is not None
+        positive_cache_producer_calls = 0
+
+        def positive_cache_producer() -> dict[str, bool]:
+            nonlocal positive_cache_producer_calls
+            positive_cache_producer_calls += 1
+            return {"accepted": True}
+
+        self.assertTrue(
+            typed_json_equal(
+                inventory_validation_memoized(
+                    positive_cache_context,
+                    namespace="positive-cache-fingerprint-v1",
+                    inventory=positive_cache_inventory,
+                    producer=positive_cache_producer,
+                    budget_tracker=positive_cache_parts[1],
+                ),
+                {"accepted": True},
+            )
+        )
+        positive_cache_counters = {
+            field: positive_cache_parts[1][field]
+            for field in (
+                "controlled_requests",
+                "fetch_attempts",
+                "retained_pages",
+                "records",
+                "retained_utf8_bytes",
+                "failed",
+            )
+        }
+        positive_cache_inventory["state"] = "other"
+        positive_cache_hash_calls = 0
+        original_sha256 = hashlib.sha256
+
+        def guarded_positive_cache_sha256(*args: object, **kwargs: object):
+            nonlocal positive_cache_hash_calls
+            positive_cache_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        hashlib.sha256 = guarded_positive_cache_sha256
+        try:
+            self.assertIsNone(
+                inventory_validation_memoized(
+                    positive_cache_context,
+                    namespace="positive-cache-fingerprint-v1",
+                    inventory=positive_cache_inventory,
+                    producer=positive_cache_producer,
+                    budget_tracker=positive_cache_parts[1],
+                )
+            )
+        finally:
+            hashlib.sha256 = original_sha256
+        self.assertGreater(positive_cache_hash_calls, 0)
+        self.assertEqual(positive_cache_producer_calls, 1)
+        self.assertEqual(
+            {
+                field: positive_cache_parts[1][field]
+                for field in positive_cache_counters
+            },
+            positive_cache_counters,
+        )
+
+        def memo_depth_overflow_value() -> dict[str, object]:
+            root: dict[str, object] = {}
+            cursor = root
+            for _ in range(memo_fingerprint_guard_v1["max_depth"] + 1):
+                child: dict[str, object] = {}
+                cursor["nested"] = child
+                cursor = child
+            return root
+
+        policy_preflight_transcript = clone(current_resource_transcript)
+        policy_preflight_cases = {
+            "provider-declaration": {
+                "provider_declaration": memo_depth_overflow_value(),
+            },
+            "current-ancestry": {
+                "current_ancestry": memo_depth_overflow_value(),
+            },
+        }
+        for policy_case, policy_kwargs in policy_preflight_cases.items():
+            policy_preflight_context = new_inventory_validation_context(
+                monotonic_clock=lambda: 0.0
+            )
+            assert policy_preflight_context is not None
+            policy_preflight_parts = inventory_validation_context_parts(
+                policy_preflight_context
+            )
+            assert policy_preflight_parts is not None
+            policy_preflight_serializations = 0
+            policy_preflight_json_dumps = 0
+            policy_preflight_hash_calls = 0
+            policy_preflight_producer_calls = 0
+            original_canonical_raw_body = canonical_raw_body
+            original_json_dumps = json.dumps
+            original_sha256 = hashlib.sha256
+            original_raw_semantic_producer = produce_raw_semantic_dataset
+
+            def guarded_policy_serializer(value: object) -> str:
+                nonlocal policy_preflight_serializations
+                policy_preflight_serializations += 1
+                return original_canonical_raw_body(value)
+
+            def guarded_policy_json_dumps(
+                value: object, *args: object, **kwargs: object
+            ) -> str:
+                nonlocal policy_preflight_json_dumps
+                policy_preflight_json_dumps += 1
+                return original_json_dumps(value, *args, **kwargs)
+
+            def guarded_policy_sha256(*args: object, **kwargs: object):
+                nonlocal policy_preflight_hash_calls
+                policy_preflight_hash_calls += 1
+                return original_sha256(*args, **kwargs)
+
+            def guarded_policy_producer(
+                *args: object, **kwargs: object
+            ) -> dict[str, object] | None:
+                nonlocal policy_preflight_producer_calls
+                policy_preflight_producer_calls += 1
+                return original_raw_semantic_producer(*args, **kwargs)
+
+            canonical_raw_body = guarded_policy_serializer
+            json.dumps = guarded_policy_json_dumps
+            hashlib.sha256 = guarded_policy_sha256
+            produce_raw_semantic_dataset = guarded_policy_producer
+            try:
+                policy_preflight_result = parse_discovery_endpoint_transcript(
+                    policy_preflight_transcript,
+                    _endpoint_plane_only=True,
+                    _inventory_validation_context=policy_preflight_context,
+                    **policy_kwargs,
+                )
+            finally:
+                canonical_raw_body = original_canonical_raw_body
+                json.dumps = original_json_dumps
+                hashlib.sha256 = original_sha256
+                produce_raw_semantic_dataset = original_raw_semantic_producer
+            with self.subTest(memo_policy_preflight=policy_case):
+                self.assertIsNone(policy_preflight_result)
+                self.assertEqual(policy_preflight_serializations, 0)
+                self.assertEqual(policy_preflight_json_dumps, 0)
+                self.assertEqual(policy_preflight_hash_calls, 0)
+                self.assertEqual(policy_preflight_producer_calls, 0)
+                self.assertEqual(policy_preflight_parts[4], {})
+                self.assertIs(policy_preflight_parts[1]["failed"], True)
+
+        single_scope_fetches = current_detail_inventory["fetches"]
+        single_scope_receipts = current_detail_inventory["request_scope_receipts"]
+        assert isinstance(single_scope_fetches, list)
+        single_scope_scaffold = {
+            "schema_version": 3,
+            "repository": current_repository,
+            "scope_discovery": None,
+            "scopes": [
+                {
+                    "pull_number": current_pr,
+                    "fetches": single_scope_fetches,
+                }
+            ],
+        }
+        single_scope_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert single_scope_context is not None
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                single_scope_scaffold,
+                request_scope_receipts=single_scope_receipts,
+                _single_scope_pull_number=current_pr,
+                _allow_post_as_of_requests=True,
+                _allow_post_as_of_artifacts=True,
+                _endpoint_plane_only=True,
+                _inventory_validation_context=single_scope_context,
+                _memo_subject=single_scope_fetches,
+            )
+        )
+
+        class EqualLikeStr(str):
+            def __eq__(self, other: object) -> bool:
+                return True
+
+            def __ne__(self, other: object) -> bool:
+                return False
+
+            __hash__ = str.__hash__
+
+        class BuiltinDictSubclass(dict[str, object]):
+            pass
+
+        class BuiltinListSubclass(list[object]):
+            pass
+
+        single_scope_parts = inventory_validation_context_parts(single_scope_context)
+        assert single_scope_parts is not None
+        single_scope_memo_keys = set(single_scope_parts[4])
+
+        def fresh_single_scope_scaffold() -> dict[str, object]:
+            scaffold = clone(single_scope_scaffold)
+            assert isinstance(scaffold, dict)
+            scopes = scaffold["scopes"]
+            assert isinstance(scopes, list)
+            scope = scopes[0]
+            assert isinstance(scope, dict)
+            scope["fetches"] = single_scope_fetches
+            return scaffold
+
+        root_subclass_scaffold = BuiltinDictSubclass(fresh_single_scope_scaffold())
+        scopes_subclass_scaffold = fresh_single_scope_scaffold()
+        scopes_subclass_scaffold["scopes"] = BuiltinListSubclass(
+            scopes_subclass_scaffold["scopes"]
+        )
+        scope_record_subclass_scaffold = fresh_single_scope_scaffold()
+        scope_record_subclass_scaffold["scopes"][0] = BuiltinDictSubclass(
+            scope_record_subclass_scaffold["scopes"][0]
+        )
+        fetches_subclass_scaffold = fresh_single_scope_scaffold()
+        subclass_fetches = BuiltinListSubclass(single_scope_fetches)
+        fetches_subclass_scaffold["scopes"][0]["fetches"] = subclass_fetches
+        repository_subclass_scaffold = fresh_single_scope_scaffold()
+        repository_subclass_scaffold["repository"] = EqualLikeStr("foreign/repository")
+        subclass_single_scope_scaffolds = (
+            ("root-dict", root_subclass_scaffold, single_scope_fetches),
+            ("scopes-list", scopes_subclass_scaffold, single_scope_fetches),
+            (
+                "scope-record-dict",
+                scope_record_subclass_scaffold,
+                single_scope_fetches,
+            ),
+            ("fetches-list", fetches_subclass_scaffold, subclass_fetches),
+            (
+                "repository-string",
+                repository_subclass_scaffold,
+                single_scope_fetches,
+            ),
+        )
+        for (
+            scaffold_subclass,
+            subclass_scaffold,
+            subclass_memo_subject,
+        ) in subclass_single_scope_scaffolds:
+            for cache_state in ("cold", "hot"):
+                subclass_context = (
+                    new_inventory_validation_context(monotonic_clock=lambda: 0.0)
+                    if cache_state == "cold"
+                    else single_scope_context
+                )
+                assert subclass_context is not None
+                with self.subTest(
+                    single_scope_scaffold_subclass=scaffold_subclass,
+                    cache_state=cache_state,
+                ):
+                    self.assertIsNone(
+                        parse_discovery_endpoint_transcript(
+                            subclass_scaffold,
+                            request_scope_receipts=single_scope_receipts,
+                            _single_scope_pull_number=current_pr,
+                            _allow_post_as_of_requests=True,
+                            _allow_post_as_of_artifacts=True,
+                            _endpoint_plane_only=True,
+                            _inventory_validation_context=subclass_context,
+                            _memo_subject=subclass_memo_subject,
+                        )
+                    )
+                    subclass_parts = inventory_validation_context_parts(
+                        subclass_context
+                    )
+                    assert subclass_parts is not None
+                    self.assertEqual(
+                        set(subclass_parts[4]),
+                        single_scope_memo_keys if cache_state == "hot" else set(),
+                    )
+        malformed_single_scope_scaffolds = []
+        for scaffold_mutation in (
+            "schema-version",
+            "schema-version-float-alias",
+            "repository",
+            "top-level-field",
+            "scope-field",
+            "pull-number-float-alias",
+        ):
+            malformed_scaffold = clone(single_scope_scaffold)
+            assert isinstance(malformed_scaffold, dict)
+            malformed_scaffold["scopes"][0]["fetches"] = single_scope_fetches
+            if scaffold_mutation == "schema-version":
+                malformed_scaffold["schema_version"] = 4
+            elif scaffold_mutation == "schema-version-float-alias":
+                malformed_scaffold["schema_version"] = 3.0
+            elif scaffold_mutation == "repository":
+                malformed_scaffold["repository"] = "other/repository"
+            elif scaffold_mutation == "top-level-field":
+                malformed_scaffold["unbound"] = True
+            elif scaffold_mutation == "scope-field":
+                malformed_scaffold["scopes"][0]["unbound"] = True
+            else:
+                malformed_scaffold["scopes"][0]["pull_number"] = 1.0
+            malformed_single_scope_scaffolds.append(
+                (scaffold_mutation, malformed_scaffold)
+            )
+        for scaffold_mutation, malformed_scaffold in malformed_single_scope_scaffolds:
+            with self.subTest(single_scope_memo_scaffold=scaffold_mutation):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        malformed_scaffold,
+                        request_scope_receipts=single_scope_receipts,
+                        _single_scope_pull_number=current_pr,
+                        _allow_post_as_of_requests=True,
+                        _allow_post_as_of_artifacts=True,
+                        _endpoint_plane_only=True,
+                        _inventory_validation_context=single_scope_context,
+                        _memo_subject=single_scope_fetches,
+                    )
+                )
+
+        def tracker_rebind_clock() -> float:
+            return 0.0
+
+        tracker_rebind_artifact_context = new_artifact_validation_context(
+            monotonic_clock=tracker_rebind_clock
+        )
+        assert tracker_rebind_artifact_context is not None
+        self.assertIsNotNone(
+            candidate_order_basis(
+                terminal_current,
+                finding_ancestry={},
+                artifact_validation_context=tracker_rebind_artifact_context,
+            )
+        )
+        tracker_rebind_parts = artifact_validation_context_parts(
+            tracker_rebind_artifact_context
+        )
+        assert tracker_rebind_parts is not None
+        initial_tracker_rebind_counters = {
+            field: tracker_rebind_parts[0][field]
+            for field in (
+                "controlled_requests",
+                "fetch_attempts",
+                "retained_pages",
+                "records",
+                "retained_utf8_bytes",
+                "failed",
+            )
+        }
+        replacement_artifact_tracker = new_resource_tracker(
+            monotonic_clock=tracker_rebind_clock
+        )
+        assert replacement_artifact_tracker is not None
+        tracker_rebind_artifact_context["resource_tracker"] = (
+            replacement_artifact_tracker
+        )
+        self.assertIsNotNone(
+            candidate_order_basis(
+                terminal_current,
+                finding_ancestry={},
+                artifact_validation_context=tracker_rebind_artifact_context,
+            )
+        )
+        self.assertEqual(
+            {
+                field: replacement_artifact_tracker[field]
+                for field in initial_tracker_rebind_counters
+            },
+            initial_tracker_rebind_counters,
+        )
+        rebound_artifact_parts = artifact_validation_context_parts(
+            tracker_rebind_artifact_context
+        )
+        assert rebound_artifact_parts is not None
+        self.assertEqual(len(rebound_artifact_parts[1]), 4)
+
+        scope_collision_artifact = terminal_current["evidence_state"][
+            "terminal_payloads"
+        ][0]
+        scope_collision_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert scope_collision_context is not None
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                scope_collision_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=scope_collision_context,
+            )
+        )
+        bool_pr_scope = (
+            current_repository,
+            True,
+            current_merge_base,
+            current_head,
+        )
+        self.assertIsNone(
+            validate_candidate_artifact(
+                scope_collision_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=bool_pr_scope,
+                artifact_validation_context=scope_collision_context,
+            )
+        )
+
+        negative_artifact = clone(scope_collision_artifact)
+        assert isinstance(negative_artifact, dict)
+        negative_artifact_initial = negative_artifact["initial_snapshot"]
+        negative_artifact_final = negative_artifact["final_snapshot"]
+        assert isinstance(negative_artifact_initial, dict)
+        assert isinstance(negative_artifact_final, dict)
+        original_negative_body = negative_artifact_initial["body"]
+        assert isinstance(original_negative_body, str)
+        negative_artifact_initial["body"] = "X" * len(original_negative_body)
+        negative_artifact_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert negative_artifact_context is not None
+        self.assertIsNone(
+            validate_candidate_artifact(
+                negative_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=negative_artifact_context,
+            )
+        )
+        negative_artifact_parts = artifact_validation_context_parts(
+            negative_artifact_context
+        )
+        assert negative_artifact_parts is not None
+        self.assertEqual(len(negative_artifact_parts[1]), 1)
+        negative_artifact_entry = next(iter(negative_artifact_parts[1].values()))
+        self.assertIsInstance(negative_artifact_entry.get("digest"), str)
+        negative_artifact_initial["body"] = "Y" * len(original_negative_body)
+        negative_artifact_hash_calls = 0
+        original_sha256 = hashlib.sha256
+
+        def guarded_negative_artifact_sha256(*args: object, **kwargs: object):
+            nonlocal negative_artifact_hash_calls
+            negative_artifact_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        hashlib.sha256 = guarded_negative_artifact_sha256
+        try:
+            self.assertIsNone(
+                validate_candidate_artifact(
+                    negative_artifact,
+                    expected_kind="terminal-payload",
+                    expected_scope=current_scope_key,
+                    artifact_validation_context=negative_artifact_context,
+                )
+            )
+        finally:
+            hashlib.sha256 = original_sha256
+        self.assertGreater(negative_artifact_hash_calls, 0)
+        self.assertIs(negative_artifact_parts[0]["failed"], False)
+
+        current_plane_isolation_inventory = current_endpoint_inventory(
+            terminal_current,
+            observation_marker="memo-current-plane-isolation",
+        )
+        current_plane_isolation_receipts = current_plane_isolation_inventory[
+            "request_scope_receipts"
+        ]
+        assert isinstance(current_plane_isolation_receipts, list)
+        assert isinstance(current_plane_isolation_receipts[0], dict)
+        current_plane_isolation_receipts[0]["unused_guard_overflow"] = (
+            memo_depth_overflow_value()
+        )
+        current_plane_isolation_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert current_plane_isolation_context is not None
+        current_plane_isolation_entry = parse_current_endpoint_inventory(
+            current_plane_isolation_inventory,
+            current_ancestry={},
+            _inventory_validation_context=current_plane_isolation_context,
+        )
+        self.assertIsNotNone(current_plane_isolation_entry)
+        current_plane_isolation_parts = inventory_validation_context_parts(
+            current_plane_isolation_context
+        )
+        assert current_plane_isolation_parts is not None
+        current_plane_artifact_parts = artifact_validation_context_parts(
+            current_plane_isolation_parts[3]
+        )
+        assert current_plane_artifact_parts is not None
+        self.assertIs(current_plane_isolation_parts[1]["failed"], False)
+        self.assertIs(current_plane_isolation_parts[2]["failed"], True)
+        self.assertIs(current_plane_artifact_parts[0]["failed"], False)
+        self.assertTrue(
+            inventory_validation_deadlines_hold(
+                current_plane_isolation_context,
+                ignore_sidecar_failure=True,
+            )
+        )
+        current_plane_isolation_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        for current_inventory_field in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            current_inventory_receipts = current_plane_isolation_history[
+                current_inventory_field
+            ]["request_scope_receipts"]
+            assert isinstance(current_inventory_receipts, list)
+            assert isinstance(current_inventory_receipts[0], dict)
+            current_inventory_receipts[0]["unused_guard_overflow"] = (
+                memo_depth_overflow_value()
+            )
+        current_plane_isolation_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            current_plane_isolation_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(current_plane_isolation_report)
+        assert isinstance(current_plane_isolation_report, dict)
+        self.assertEqual(
+            current_plane_isolation_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        self.assertEqual(
+            current_plane_isolation_report["provider_profile"],
+            "terminal-payload",
+        )
+        reaction_plane_isolation_history = history(samples)
+        for current_inventory_field in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            reaction_inventory_receipts = reaction_plane_isolation_history[
+                current_inventory_field
+            ]["request_scope_receipts"]
+            assert isinstance(reaction_inventory_receipts, list)
+            assert isinstance(reaction_inventory_receipts[0], dict)
+            reaction_inventory_receipts[0]["unused_guard_overflow"] = (
+                memo_depth_overflow_value()
+            )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_plane_isolation_history,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_plane_isolation_history,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        historical_plane_isolation = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        historical_plane_request_id = terminal_history[0]["requests"][0]["id"]
+        for phase in ("initial", "final"):
+            historical_candidate = next(
+                candidate
+                for candidate in historical_plane_isolation[f"{phase}_candidates"]
+                if candidate["scope"]["pr"] == terminal_history[0]["scope"]["pr"]
+            )
+            historical_candidate["request_scope_receipts"][0][
+                "unused_guard_overflow"
+            ] = memo_depth_overflow_value()
+            restamp(historical_candidate)
+            historical_inventory_receipt = next(
+                receipt
+                for receipt in historical_plane_isolation[f"{phase}_inventory"][
+                    "request_scope_receipts"
+                ]
+                if receipt.get("request_id") == historical_plane_request_id
+            )
+            historical_inventory_receipt["unused_guard_overflow"] = (
+                memo_depth_overflow_value()
+            )
+        historical_plane_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=lambda: 0.0
+        )
+        assert historical_plane_contexts is not None
+        historical_plane_validation = validate_history_universe_result(
+            historical_plane_isolation,
+            inventory_validation_contexts=historical_plane_contexts,
+        )
+        self.assertIsNotNone(historical_plane_validation)
+        assert isinstance(historical_plane_validation, dict)
+        self.assertEqual(
+            historical_plane_validation["status"],
+            "unused-sidecar-unavailable",
+        )
+        for phase in ("initial_inventory", "final_inventory"):
+            phase_context = report_inventory_validation_context_for(
+                historical_plane_contexts,
+                phase,
+            )
+            assert phase_context is not None
+            phase_parts = inventory_validation_context_parts(phase_context)
+            assert phase_parts is not None
+            phase_artifact_parts = artifact_validation_context_parts(phase_parts[3])
+            assert phase_artifact_parts is not None
+            self.assertIs(phase_parts[1]["failed"], False)
+            self.assertIs(phase_parts[2]["failed"], True)
+            self.assertIs(phase_artifact_parts[0]["failed"], False)
+            self.assertEqual(
+                phase_artifact_parts[0]["records"],
+                6 * len(terminal_history),
+            )
+            self.assertTrue(
+                inventory_validation_deadlines_hold(
+                    phase_context,
+                    ignore_sidecar_failure=True,
+                )
+            )
+        historical_plane_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            historical_plane_isolation,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(historical_plane_report)
+        assert isinstance(historical_plane_report, dict)
+        self.assertEqual(
+            historical_plane_report["provider_profile"],
+            "terminal-payload",
+        )
 
         mutable_cached_artifact = clone(
             terminal_current["evidence_state"]["terminal_payloads"][0]
@@ -20927,6 +22796,48 @@ class RepositoryContractTest(unittest.TestCase):
             mutable_cache_counters,
         )
 
+        equal_summary_artifact = clone(
+            terminal_current["evidence_state"]["terminal_payloads"][0]
+        )
+        assert isinstance(equal_summary_artifact, dict)
+        equal_summary_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 60.0
+        )
+        assert equal_summary_context is not None
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                equal_summary_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=equal_summary_context,
+            )
+        )
+        equal_summary_snapshot = equal_summary_artifact["final_snapshot"]
+        assert isinstance(equal_summary_snapshot, dict)
+        equal_summary_body = equal_summary_snapshot["body"]
+        assert isinstance(equal_summary_body, str) and equal_summary_body
+        equal_summary_snapshot["body"] = "X" + equal_summary_body[1:]
+        equal_summary_hash_calls = 0
+        original_sha256 = hashlib.sha256
+
+        def count_equal_summary_sha256(*args: object, **kwargs: object):
+            nonlocal equal_summary_hash_calls
+            equal_summary_hash_calls += 1
+            return original_sha256(*args, **kwargs)
+
+        hashlib.sha256 = count_equal_summary_sha256
+        try:
+            equal_summary_result = validate_candidate_artifact(
+                equal_summary_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=equal_summary_context,
+            )
+        finally:
+            hashlib.sha256 = original_sha256
+        self.assertIsNone(equal_summary_result)
+        self.assertGreater(equal_summary_hash_calls, 0)
+
         decision_clock_calls = 0
 
         def decision_audit_clock() -> float:
@@ -20951,11 +22862,9 @@ class RepositoryContractTest(unittest.TestCase):
         decision_audit_parts = artifact_validation_context_parts(decision_audit_context)
         assert decision_audit_parts is not None
         decision_audit_tracker = decision_audit_parts[0]
-        before_audit_tracker = {
+        before_audit_counters = {
             key: decision_audit_tracker[key]
             for key in (
-                "started",
-                "max_observed",
                 "controlled_requests",
                 "fetch_attempts",
                 "retained_pages",
@@ -20964,6 +22873,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "failed",
             )
         }
+        before_audit_max_observed = decision_audit_tracker["max_observed"]
         before_audit_clock_calls = decision_clock_calls
         self.assertIsNotNone(
             candidate_scope_authority_audit(
@@ -20972,10 +22882,13 @@ class RepositoryContractTest(unittest.TestCase):
             )
         )
         self.assertEqual(
-            {key: decision_audit_tracker[key] for key in before_audit_tracker},
-            before_audit_tracker,
+            {key: decision_audit_tracker[key] for key in before_audit_counters},
+            before_audit_counters,
         )
-        self.assertEqual(decision_clock_calls, before_audit_clock_calls)
+        self.assertGreater(
+            decision_audit_tracker["max_observed"], before_audit_max_observed
+        )
+        self.assertGreater(decision_clock_calls, before_audit_clock_calls)
 
         report_budget_probe = new_report_inventory_validation_contexts()
         self.assertIsNotNone(report_budget_probe)
@@ -21192,6 +23105,67 @@ class RepositoryContractTest(unittest.TestCase):
             ],
             memo_counters,
         )
+        memo_cache_keys = set(memo_parts[4])
+        current_root_subclass = BuiltinDictSubclass(memo_inventory)
+        current_fetches_subclass = dict(memo_inventory)
+        current_fetches_subclass["fetches"] = BuiltinListSubclass(
+            memo_inventory["fetches"]
+        )
+        current_repository_subclass = dict(memo_inventory)
+        current_repository_subclass["repository"] = EqualLikeStr("foreign/repository")
+        current_head_subclass = dict(memo_inventory)
+        current_head_subclass["head"] = EqualLikeStr("f" * 40)
+        current_raw_subclass_variants = (
+            ("root-dict", current_root_subclass),
+            ("fetches-list", current_fetches_subclass),
+            ("repository-string", current_repository_subclass),
+            ("head-string", current_head_subclass),
+        )
+        for current_subclass, subclass_inventory in current_raw_subclass_variants:
+            for cache_state in ("cold", "hot"):
+                subclass_context = (
+                    new_inventory_validation_context(monotonic_clock=lambda: 0.0)
+                    if cache_state == "cold"
+                    else memo_context
+                )
+                assert subclass_context is not None
+                with self.subTest(
+                    current_raw_subclass=current_subclass,
+                    cache_state=cache_state,
+                ):
+                    self.assertIsNone(
+                        parse_current_endpoint_inventory(
+                            subclass_inventory,
+                            current_ancestry={},
+                            _inventory_validation_context=subclass_context,
+                        )
+                    )
+                    subclass_parts = inventory_validation_context_parts(
+                        subclass_context
+                    )
+                    assert subclass_parts is not None
+                    self.assertEqual(
+                        set(subclass_parts[4]),
+                        memo_cache_keys if cache_state == "hot" else set(),
+                    )
+        for pull_number_alias in (True, 1.0):
+            memo_inventory["pull_number"] = pull_number_alias
+            with self.subTest(current_raw_pull_number_alias=pull_number_alias):
+                self.assertIsNone(
+                    parse_current_endpoint_inventory(
+                        memo_inventory,
+                        current_ancestry={},
+                        _inventory_validation_context=memo_context,
+                    )
+                )
+        memo_inventory["pull_number"] = current_pr
+        self.assertIsNotNone(
+            parse_current_endpoint_inventory(
+                memo_inventory,
+                current_ancestry={},
+                _inventory_validation_context=memo_context,
+            )
+        )
         memo_inventory["head"] = "f" * 40
         self.assertIsNone(
             parse_current_endpoint_inventory(
@@ -21269,8 +23243,10 @@ class RepositoryContractTest(unittest.TestCase):
         ) -> tuple[object, list[float], list[float]]:
             phase_root_creation_times: list[float] = []
             standalone_root_creation_times: list[float] = []
+            last_observation = 0.0
 
             def observe() -> float:
+                nonlocal last_observation
                 callers = {frame.function for frame in inspect.stack(context=0)}
                 if "new_resource_tracker" in callers:
                     if "new_inventory_validation_context" in callers:
@@ -21279,8 +23255,8 @@ class RepositoryContractTest(unittest.TestCase):
                     standalone_root_creation_times.append(800.0)
                     return 800.0
                 if "inventory_validation_deadlines_hold" in callers:
-                    return 900.0
-                if callers.intersection(
+                    proposed_observation = 900.0
+                elif callers.intersection(
                     {
                         "artifact_scope_receipt_matches",
                         "candidate_order_basis",
@@ -21288,10 +23264,13 @@ class RepositoryContractTest(unittest.TestCase):
                         "_validate_candidate_artifact_uncached",
                     }
                 ):
-                    return artifact_observation
-                if "request_scope_receipt_mapping" in callers:
-                    return 800.0
-                return 400.0
+                    proposed_observation = artifact_observation
+                elif "request_scope_receipt_mapping" in callers:
+                    proposed_observation = 800.0
+                else:
+                    proposed_observation = 400.0
+                last_observation = max(last_observation, proposed_observation)
+                return last_observation
 
             return (
                 observe,
@@ -22983,7 +24962,6 @@ class RepositoryContractTest(unittest.TestCase):
             "retained_pages",
             "records",
             "retained_utf8_bytes",
-            "max_observed",
             "failed",
         }
 
