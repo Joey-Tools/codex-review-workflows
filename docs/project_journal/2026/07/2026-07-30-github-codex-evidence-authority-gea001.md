@@ -28,6 +28,11 @@ superseded_by:
 
 - The canonical profile names are `terminal-payload`, `mixed`,
   `thumbs-up-clean`, and `unknown`.
+- A strong current terminal clean/findings result defaults to
+  `terminal-payload`. Missing declaration or failure confined to historical
+  traversal, pagination, endpoint/artifact budget, or sidecar validation blocks
+  only `mixed` and weak reaction authority; current endpoint/artifact and
+  whole-PR/lifecycle/final-stability failures still block the strong result.
 - Reports keep `request_policy`, `provider_profile`, and `evidence_basis`
   independent. `request_policy` is a record whose stable warning codes include
   `early-request-observed` and `duplicate-observed`. A lone compliant pending
@@ -50,7 +55,8 @@ superseded_by:
   and does not authorize an agent-created third request.
 - Reaction-only authority now uses a parent-owned request-time scope receipt
   sidecar. Its closed raw pre/post PR-detail and compare receipts plus exact
-  request-comment response bind the seven request fields to the immutable
+  request-comment response bind the eight request fields—including closed
+  `user: {login, type}` actor identity—to the immutable
   repository/PR/merge-base/head scope. The raw discovery transcript remains
   schema version 3; final PR metadata can never regenerate or relabel an older
   request receipt. Missing or malformed receipts close only the weaker
@@ -86,13 +92,16 @@ superseded_by:
   implementation must not rewrite an ancestor finding to current head or omit
   it merely to make raw and normalized projections agree.
 - The authenticated provider declaration PR is itself part of the complete
-  repository seed/detail traversal. Its exact receipt-bound comment is
-  audit-only and `confirmed-non-candidate`; arbitrary exact-provider prose is
-  still fail-closed, while the existing progress grammar remains nonterminal
-  audit evidence and in-window terminal-looking malformed payloads remain
-  candidates. A fully parsed provider outcome at or before the exclusive lower
-  boundary remains `confirmed-non-candidate` audit evidence for that frozen
-  interval instead of entering candidate entries or count.
+  repository seed/detail traversal. Declaration authority and terminal
+  classification are orthogonal: one exact receipt-bound comment may prove the
+  declaration and independently classify as clean, findings, or malformed.
+  Only an independently nonterminal declaration record is audit-only and, by
+  itself, `confirmed-non-candidate`; arbitrary exact-provider prose is still
+  fail-closed, while the existing progress grammar remains nonterminal audit
+  evidence and in-window terminal-looking malformed payloads remain candidates.
+  A fully parsed provider outcome at or before the exclusive lower boundary
+  remains `confirmed-non-candidate` audit evidence for that frozen interval
+  instead of entering candidate entries or count.
 - Terminal comments/reviews count only under the authority's fixed
   clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
   `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
@@ -228,6 +237,41 @@ superseded_by:
   decision and commit scope; a request comment carries only intent to start.
   Provider evidence is therefore the verdict authority, while requests remain
   producer controls and audit records.
+- The controlled request projection has exactly eight top-level fields:
+  `id`, `url`, `created_at`, `updated_at`, `request_server_time`,
+  `request_server_time_field`, `normalized_body`, and closed
+  `user: {login, type}`. Actor identity belongs in the normalized request and
+  every digest/report/sidecar comparison so an actor change cannot preserve a
+  superficially identical request record. The machine-readable base-only
+  retarget state machine carries the same eight-field projection and closed
+  two-field user schema. The reaction projection remains its separate
+  seven-field schema; the two cardinalities must not drift together.
+- Declaration matching is a role, not an exclusive artifact class. A canonical
+  terminal comment may contain the provider declaration line while also
+  carrying a clean/finding payload; consuming it as declaration-only would hide
+  the provider result and violate result-present authority. The same artifact
+  is therefore evaluated independently for declaration authority and ordinary
+  clean/findings/malformed terminal classification. Only a declaration record
+  that independently classifies as nonterminal is audit-only, and only that
+  declaration-only nonterminal scope is `confirmed-non-candidate`.
+- Dynamic adaptation is subordinate to strong current evidence. Missing
+  declaration, incomplete historical traversal or pagination, historical
+  endpoint/artifact budget exhaustion, and historical request-sidecar failure
+  may prevent `mixed` or the weak `+1` fallback, but they do not contradict an
+  independently complete current terminal result; that result defaults to
+  `terminal-payload`. Failures in the current endpoint/artifact receipt plane,
+  current identity/scope/lifecycle/thread/ancestry/grammar, selected artifact,
+  or final stability still block. This is the direct operational consequence
+  of the pinned `codex-review-gate` / released Action “result present is
+  sufficient verdict evidence” baseline, not a relaxation of triple's
+  whole-PR proof.
+- Resource deadlines are plane-local, not a global wall-clock veto. Optional
+  history runs before the final current reread; fresh current trackers start
+  afterward, completed phases retain their failure state without being aged by
+  another phase's work, and the fresh final-current deadline is rechecked
+  immediately before success. Otherwise a history timeout could incorrectly
+  expire an earlier current tracker and recreate the same weak-plane veto that
+  result-present authority forbids.
 - Result-present acceptance does not imply retroactive scope assignment. The
   provider payload supplies the verdict, while the independent artifact-time
   receipt supplies evidence that its semantic server time was bracketed by the
@@ -516,7 +560,8 @@ and executable regressions are now present and validated:
     parser rejected the exact nonterminal declaration before its audit path.
     The declaration PR is now seeded and fully traversed, its exact
     independently authenticated raw record must appear once, and it is
-    classified `confirmed-non-candidate` without changing candidate counts.
+    classified `confirmed-non-candidate` without changing candidate counts when
+    that record is independently nonterminal.
     Only that exact declaration and the closed progress grammar are
     nonterminal audit exceptions; other free-form provider prose remains
     inconclusive and terminal-looking malformed evidence keeps fail-closed

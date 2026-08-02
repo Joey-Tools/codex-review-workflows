@@ -233,7 +233,11 @@ def _github_codex_issue_body_semantic(
         }:
             return ("clean", head)
 
-    lines = body.split("\n")
+    finding_body = body
+    disclosure_suffix = f"\n\n{_GITHUB_CODEX_DISCLOSURE}"
+    if finding_body.endswith(disclosure_suffix):
+        finding_body = finding_body[: -len(disclosure_suffix)]
+    lines = finding_body.split("\n")
     if len(lines) >= 2 and lines[0] == "### 💡 Codex Review":
         finding_pattern = re.compile(
             r"^- \[P[0-3]\] (?P<title>.{1,240}) — "
@@ -2892,6 +2896,8 @@ class RepositoryContractTest(unittest.TestCase):
             "aggregate issue-comment reaction counts do not identify the actor",
             "fully paginated individual reaction records",
             "fixed grammar below and an exact commit binding",
+            "the body either ends after the final finding line or appends exactly",
+            "two lf characters plus the exact disclosure block above",
             "state admissibility and terminal-looking detection are separate",
             "`dismissed` is terminal-looking but inadmissible",
             (
@@ -2981,6 +2987,8 @@ class RepositoryContractTest(unittest.TestCase):
             "stable recorded scope",
             "normalized body is exactly `@codex review`",
             "parent-owned request-time scope receipt sidecar",
+            "controlled request's eight-field record",
+            "closed `user: {login, type}` actor projection",
             "`pre_request_scope_receipts`",
             "`request_comment_receipt`",
             "`post_request_scope_receipts`",
@@ -2988,6 +2996,13 @@ class RepositoryContractTest(unittest.TestCase):
             "does not erase a separately complete, trustworthy current-scope terminal payload",
             "neither request/run lineage nor continuous scope stability",
             "the seed/detail closure includes the authenticated declaration pr",
+            "declaration authority and terminal classification are orthogonal roles",
+            "matching the declaration line never suppresses terminal-looking classification",
+            "historical endpoint or artifact ledger exceeds its budget",
+            "do not turn a strong current terminal result into `unknown`",
+            "a failed current endpoint traversal or current artifact ledger/receipt",
+            "evaluate optional historical adaptation before the final current-evidence reread",
+            "elapsed time spent in another inventory must not age out",
             "record every reaction's positive id, `parent_request_id`, the exact",
             "does not return a reaction self url, so never synthesize one",
             "stable native identity is the tuple",
@@ -4077,7 +4092,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         def finding_sha(body: str) -> str | None:
-            lines = body.split("\n")
+            finding_body = body
+            disclosure_suffix = f"\n\n{disclosure}"
+            if finding_body.endswith(disclosure_suffix):
+                finding_body = finding_body[: -len(disclosure_suffix)]
+            lines = finding_body.split("\n")
             if len(lines) < 2 or lines[0] != "### 💡 Codex Review":
                 return None
             shas: set[str] = set()
@@ -4355,6 +4374,15 @@ class RepositoryContractTest(unittest.TestCase):
             clean_review_without_children,
         )
         add("finding-positive", "top-level finding", "none", "findings", finding)
+        finding_with_disclosure = clone(finding)
+        finding_with_disclosure["body"] = f"{finding['body']}\n\n{disclosure}"
+        add(
+            "finding-with-disclosure-positive",
+            "top-level finding",
+            "exact provider disclosure suffix",
+            "findings",
+            finding_with_disclosure,
+        )
         add(
             "inline-parent-positive",
             "inline-parent review",
@@ -6253,6 +6281,20 @@ class RepositoryContractTest(unittest.TestCase):
             "normalized_body",
             "user",
         }
+        self.assertEqual(len(request_fields), 8)
+        self.assertEqual(
+            request_fields,
+            {
+                "id",
+                "url",
+                "created_at",
+                "updated_at",
+                "request_server_time",
+                "request_server_time_field",
+                "normalized_body",
+                "user",
+            },
+        )
         request_scope_receipt_fields = {
             "kind",
             "request_id",
@@ -9375,6 +9417,21 @@ class RepositoryContractTest(unittest.TestCase):
                 for tracker in trackers
             )
 
+        def inventory_validation_context_has_no_failures(
+            context: dict[str, object],
+            *,
+            ignore_sidecar_failure: bool = False,
+        ) -> bool:
+            parts = inventory_validation_context_parts(context)
+            if parts is None or type(ignore_sidecar_failure) is not bool:
+                return False
+            trackers = (
+                (parts[1], parts[3]["resource_tracker"])
+                if ignore_sidecar_failure
+                else (parts[1], parts[2], parts[3]["resource_tracker"])
+            )
+            return all(tracker.get("failed") is False for tracker in trackers)
+
         def resource_budget_charge(
             tracker: dict[str, object],
             *,
@@ -11700,15 +11757,17 @@ class RepositoryContractTest(unittest.TestCase):
                         terminal_looking = _github_codex_issue_terminal_looking(
                             normalized_issue
                         )
-                        if (
+                        is_declaration_match = (
                             actor == "exact"
                             and expected_declaration_raw is not None
                             and typed_json_equal(
                                 raw_issue,
                                 expected_declaration_raw,
                             )
-                        ):
+                        )
+                        if is_declaration_match:
                             declaration_match_count += 1
+                        if is_declaration_match and not terminal_looking:
                             continue
                         if actor == "different":
                             nonterminal_records.append(
@@ -13459,6 +13518,7 @@ class RepositoryContractTest(unittest.TestCase):
             raw_scopes: list[dict[str, object]],
             candidates: list[dict[str, object]],
             *,
+            provider_declaration: object = declaration,
             _monotonic_clock: object = time.monotonic,
         ) -> dict[str, object]:
             inventory_context = new_inventory_validation_context(
@@ -13483,7 +13543,7 @@ class RepositoryContractTest(unittest.TestCase):
             projection = parse_discovery_endpoint_transcript(
                 transcript,
                 request_scope_receipts=request_scope_receipts,
-                provider_declaration=declaration,
+                provider_declaration=provider_declaration,
                 _inventory_validation_context=inventory_context,
             )
             scope_classifications = (
@@ -13813,6 +13873,28 @@ class RepositoryContractTest(unittest.TestCase):
                 else None
             )
 
+        def reset_report_inventory_validation_context_fields(
+            value: object,
+            fields: set[str],
+        ) -> bool:
+            if (
+                not report_inventory_validation_contexts_are_valid(value)
+                or type(fields) is not set
+                or not fields.issubset(report_inventory_context_fields)
+            ):
+                return False
+            assert isinstance(value, dict)
+            contexts = value["contexts"]
+            phase_order = value["phase_order"]
+            assert isinstance(contexts, dict)
+            assert isinstance(phase_order, list)
+            for field in fields:
+                contexts.pop(field, None)
+            value["phase_order"] = [
+                field for field in phase_order if field not in fields
+            ]
+            return report_inventory_validation_contexts_are_valid(value)
+
         def current_ancestry_mapping(
             candidate_history: object,
         ) -> dict[str, int] | None:
@@ -13856,6 +13938,7 @@ class RepositoryContractTest(unittest.TestCase):
         def _validate_history_universe_complete(
             candidate_history: dict[str, object],
             *,
+            provider_declaration: object = declaration,
             artifact_validation_context: dict[str, object] | None = None,
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
@@ -13913,7 +13996,7 @@ class RepositoryContractTest(unittest.TestCase):
                 projection = parse_discovery_endpoint_transcript(
                     value.get("discovery_endpoint_transcript"),
                     request_scope_receipts=value.get("request_scope_receipts"),
-                    provider_declaration=declaration,
+                    provider_declaration=provider_declaration,
                     _inventory_validation_context=inventory_context,
                 )
                 if not isinstance(projection, dict):
@@ -14075,7 +14158,7 @@ class RepositoryContractTest(unittest.TestCase):
                     return parse_discovery_endpoint_transcript(
                         transcript,
                         request_scope_receipts=value.get("request_scope_receipts"),
-                        provider_declaration=declaration,
+                        provider_declaration=provider_declaration,
                         _endpoint_plane_only=True,
                         _inventory_validation_context=inventory_context,
                     )
@@ -14602,6 +14685,7 @@ class RepositoryContractTest(unittest.TestCase):
         def _validate_history_universe_sidecar_blind(
             candidate_history: dict[str, object],
             *,
+            provider_declaration: object = declaration,
             inventory_validation_contexts: dict[str, object],
         ) -> dict[str, object] | None:
             initial_candidates = candidate_history.get("initial_candidates")
@@ -14704,7 +14788,7 @@ class RepositoryContractTest(unittest.TestCase):
                     producer=lambda: parse_discovery_endpoint_transcript(
                         transcript,
                         request_scope_receipts=inventory.get("request_scope_receipts"),
-                        provider_declaration=declaration,
+                        provider_declaration=provider_declaration,
                         _endpoint_plane_only=True,
                         _sidecar_blind_audit=True,
                         _inventory_validation_context=inventory_context,
@@ -15121,6 +15205,7 @@ class RepositoryContractTest(unittest.TestCase):
         def validate_history_universe_result(
             candidate_history: dict[str, object],
             *,
+            provider_declaration: object = declaration,
             artifact_validation_context: dict[str, object] | None = None,
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
@@ -15134,6 +15219,7 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             complete_candidates = _validate_history_universe_complete(
                 candidate_history,
+                provider_declaration=provider_declaration,
                 artifact_validation_context=(
                     artifact_validation_context
                     if caller_provided_inventory_contexts
@@ -15149,17 +15235,20 @@ class RepositoryContractTest(unittest.TestCase):
                 }
             return _validate_history_universe_sidecar_blind(
                 candidate_history,
+                provider_declaration=provider_declaration,
                 inventory_validation_contexts=inventory_contexts,
             )
 
         def validate_history_universe(
             candidate_history: dict[str, object],
             *,
+            provider_declaration: object = declaration,
             artifact_validation_context: dict[str, object] | None = None,
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             result = validate_history_universe_result(
                 candidate_history,
+                provider_declaration=provider_declaration,
                 artifact_validation_context=artifact_validation_context,
                 inventory_validation_contexts=inventory_validation_contexts,
             )
@@ -15814,13 +15903,6 @@ class RepositoryContractTest(unittest.TestCase):
                 "initial_candidates",
                 "final_candidates",
             }
-            if (
-                not isinstance(candidate_history, dict)
-                or set(candidate_history) != expected_history_fields
-                or candidate_history.get("complete") is not True
-                or candidate_history.get("repository") != current_repository
-            ):
-                return "unknown"
 
             def carrier_kind(basis_kind: object) -> str | None:
                 if basis_kind == "reaction":
@@ -15833,18 +15915,66 @@ class RepositoryContractTest(unittest.TestCase):
                     return "terminal-payload"
                 return None
 
-            current_ancestry = current_ancestry_mapping(candidate_history)
             current_basis = current.get("candidate_basis")
             current_carrier = (
                 carrier_kind(current_basis.get("kind"))
                 if isinstance(current_basis, dict)
                 else None
             )
+            if not isinstance(current_basis, dict) or current_carrier is None:
+                return "unknown"
+
+            terminal_fallback = (
+                "terminal-payload"
+                if current_carrier == "terminal-payload"
+                else "unknown"
+            )
+            profile_as_of: int | None = None
+            final_candidates: list[dict[str, object]] | None = None
+            history_phase_context: dict[str, object] | None = None
+            history_artifact_context: dict[str, object] | None = None
+            if (
+                isinstance(candidate_history, dict)
+                and set(candidate_history) == expected_history_fields
+                and candidate_history.get("complete") is True
+                and candidate_history.get("repository") == current_repository
+            ):
+                profile_as_of = history_window_is_authoritative(
+                    provider_declaration,
+                    candidate_history,
+                )
+                if profile_as_of is not None:
+                    history_validation = validate_history_universe_result(
+                        candidate_history,
+                        provider_declaration=provider_declaration,
+                        inventory_validation_contexts=contexts,
+                    )
+                    if (
+                        isinstance(history_validation, dict)
+                        and history_validation.get("status") == "complete"
+                        and isinstance(history_validation.get("candidates"), list)
+                    ):
+                        final_candidates = history_validation["candidates"]
+                        history_phase_context = (
+                            report_inventory_validation_context_for(
+                                contexts,
+                                "final_inventory",
+                            )
+                            if contexts is not None
+                            else None
+                        )
+                        history_inventory_parts = inventory_validation_context_parts(
+                            history_phase_context
+                        )
+                        if contexts is not None and history_inventory_parts is None:
+                            final_candidates = None
+                        elif history_inventory_parts is not None:
+                            history_artifact_context = history_inventory_parts[3]
+
+            current_ancestry = current_ancestry_mapping(candidate_history)
             if (
                 not current_lifecycle_is_eligible(current)
                 or scope_key(current) != current_scope_key
-                or not isinstance(current_basis, dict)
-                or current_carrier is None
                 or not current_raw_authority_matches(
                     candidate_history,
                     current,
@@ -15881,47 +16011,11 @@ class RepositoryContractTest(unittest.TestCase):
             )
             if context is None or current_ordering_key is None:
                 return "unknown"
-
-            profile_as_of = history_window_is_authoritative(
-                provider_declaration,
-                candidate_history,
-            )
-            if profile_as_of is None:
-                return "unknown"
+            if final_candidates is None or profile_as_of is None:
+                return terminal_fallback
+            if history_artifact_context is None:
+                history_artifact_context = context
             profile_start = profile_as_of - history_window_seconds
-            history_validation = validate_history_universe_result(
-                candidate_history,
-                inventory_validation_contexts=contexts,
-            )
-            if not isinstance(history_validation, dict):
-                return "unknown"
-            if history_validation.get("status") == "unused-sidecar-unavailable":
-                return (
-                    "terminal-payload"
-                    if current_carrier == "terminal-payload"
-                    else "unknown"
-                )
-            if history_validation.get("status") != "complete":
-                return "unknown"
-            final_candidates = history_validation.get("candidates")
-            if not isinstance(final_candidates, list):
-                return "unknown"
-            history_phase_context = (
-                report_inventory_validation_context_for(
-                    contexts,
-                    "final_inventory",
-                )
-                if contexts is not None
-                else None
-            )
-            history_inventory_parts = inventory_validation_context_parts(
-                history_phase_context
-            )
-            history_artifact_context = (
-                history_inventory_parts[3]
-                if history_inventory_parts is not None
-                else context
-            )
 
             ordering_keys: set[tuple[int, int]] = set()
             scope_keys: set[tuple[object, ...]] = set()
@@ -15929,7 +16023,7 @@ class RepositoryContractTest(unittest.TestCase):
 
             for candidate in final_candidates:
                 if not isinstance(candidate, dict):
-                    return "unknown"
+                    return terminal_fallback
                 candidate_scope_key = scope_key(candidate)
                 ordering_key = candidate_order_basis(
                     candidate,
@@ -15950,7 +16044,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or not isinstance(basis, dict)
                     or candidate_carrier is None
                 ):
-                    return "unknown"
+                    return terminal_fallback
                 scope_keys.add(candidate_scope_key)
                 ordering_keys.add(ordering_key)
                 ordered.append((ordering_key, candidate_carrier, candidate))
@@ -17264,6 +17358,48 @@ class RepositoryContractTest(unittest.TestCase):
                     isinstance(current_basis, dict)
                     and current_basis.get("kind") == "reaction"
                 )
+                terminal_lane = lane_state in {
+                    "accepted-terminal-clean",
+                    "accepted-terminal-findings",
+                }
+                if (
+                    terminal_lane
+                    and not reset_report_inventory_validation_context_fields(
+                        inventory_validation_contexts,
+                        {
+                            "initial_current_raw_inventory",
+                            "final_current_raw_inventory",
+                        },
+                    )
+                ):
+                    return None
+                if not terminal_lane:
+                    history_validation = validate_history_universe_result(
+                        candidate_history,
+                        provider_declaration=provider_declaration,
+                        inventory_validation_contexts=(inventory_validation_contexts),
+                    )
+                    if not isinstance(history_validation, dict):
+                        return None
+                    history_validation_status = history_validation.get("status")
+                    if history_validation_status != "complete":
+                        return None
+                provider_profile = compute_provider_profile(
+                    provider_declaration,
+                    candidate_history,
+                    current_record,
+                    inventory_validation_contexts=inventory_validation_contexts,
+                )
+                current_phase_context = report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                current_inventory_parts = inventory_validation_context_parts(
+                    current_phase_context
+                )
+                if current_inventory_parts is None:
+                    return None
+                artifact_validation_context = current_inventory_parts[3]
                 if (
                     current_raw_authority_basis(
                         candidate_history,
@@ -17291,44 +17427,6 @@ class RepositoryContractTest(unittest.TestCase):
                     and not normalized_authority_matches
                 ):
                     return None
-                history_validation = validate_history_universe_result(
-                    candidate_history,
-                    inventory_validation_contexts=(inventory_validation_contexts),
-                )
-                if not isinstance(history_validation, dict):
-                    return None
-                history_validation_status = history_validation.get("status")
-                if history_validation_status not in {
-                    "complete",
-                    "unused-sidecar-unavailable",
-                }:
-                    return None
-                if (
-                    history_validation_status == "unused-sidecar-unavailable"
-                    and lane_state
-                    not in {
-                        "accepted-terminal-clean",
-                        "accepted-terminal-findings",
-                    }
-                ):
-                    return None
-                current_phase_context = report_inventory_validation_context_for(
-                    inventory_validation_contexts,
-                    "final_current_raw_inventory",
-                )
-                current_inventory_parts = inventory_validation_context_parts(
-                    current_phase_context
-                )
-                if current_inventory_parts is None:
-                    return None
-                artifact_validation_context = current_inventory_parts[3]
-                provider_profile = compute_provider_profile(
-                    provider_declaration,
-                    candidate_history,
-                    current_record,
-                    artifact_validation_context=artifact_validation_context,
-                    inventory_validation_contexts=inventory_validation_contexts,
-                )
                 evidence_basis = None
                 if lane_state in {
                     "accepted-terminal-clean",
@@ -17399,34 +17497,43 @@ class RepositoryContractTest(unittest.TestCase):
                 request_policy = {"status": "unknown", "warnings": []}
             if not report_inventory_validation_contexts_are_valid(
                 inventory_validation_contexts,
-                require_complete=True,
             ):
                 return None
             assert isinstance(inventory_validation_contexts, dict)
             report_phase_contexts = inventory_validation_contexts["contexts"]
-            if not isinstance(report_phase_contexts, dict) or any(
-                not inventory_validation_deadlines_hold(
-                    report_phase_contexts[field],
-                    ignore_sidecar_failure=(
-                        (
-                            history_validation_status == "unused-sidecar-unavailable"
-                            and field in {"initial_inventory", "final_inventory"}
-                        )
-                        or (
-                            lane_state
-                            in {
-                                "accepted-terminal-clean",
-                                "accepted-terminal-findings",
-                            }
+            terminal_lane = lane_state in {
+                "accepted-terminal-clean",
+                "accepted-terminal-findings",
+            }
+            required_context_fields = (
+                {
+                    "initial_current_raw_inventory",
+                    "final_current_raw_inventory",
+                }
+                if terminal_lane and provider_profile == "terminal-payload"
+                else report_inventory_context_fields
+            )
+            if (
+                not isinstance(report_phase_contexts, dict)
+                or not required_context_fields.issubset(report_phase_contexts)
+                or any(
+                    not inventory_validation_context_has_no_failures(
+                        report_phase_contexts[field],
+                        ignore_sidecar_failure=(
+                            terminal_lane
                             and field
                             in {
                                 "initial_current_raw_inventory",
                                 "final_current_raw_inventory",
                             }
-                        )
-                    ),
+                        ),
+                    )
+                    for field in required_context_fields
                 )
-                for field in report_inventory_context_fields
+                or not inventory_validation_deadlines_hold(
+                    report_phase_contexts["final_current_raw_inventory"],
+                    ignore_sidecar_failure=terminal_lane,
+                )
             ):
                 return None
             return {
@@ -20009,6 +20116,294 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_current = clone(current)
         assert isinstance(terminal_current, dict)
         with_terminal_payload(terminal_current, 80_100)
+
+        dual_role_scope = sample(declaration_pr)
+        dual_role_scope["requests"] = []
+        dual_role_scope["request_scope_receipts"] = []
+        dual_role_scope["reactions"] = []
+        dual_role_scope["selected_request_id"] = None
+        dual_role_scope["selected_reaction_id"] = None
+        dual_role_time = history_start_exclusive + 100
+        dual_role_artifact = complete_issue_comment_artifact(
+            dual_role_scope,
+            declaration_artifact_id,
+            dual_role_time,
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            dual_role_snapshot = dual_role_artifact[snapshot_name]
+            assert isinstance(dual_role_snapshot, dict)
+            dual_role_body = (
+                f"{dual_role_snapshot['body']}\n\n{_GITHUB_CODEX_DISCLOSURE}"
+            )
+            dual_role_snapshot["body"] = dual_role_body
+            dual_role_snapshot["normalized_body"] = dual_role_body
+        dual_role_final_snapshot = dual_role_artifact["final_snapshot"]
+        assert isinstance(dual_role_final_snapshot, dict)
+        dual_role_artifact["artifact_scope_receipt"] = artifact_scope_receipt(
+            dual_role_final_snapshot
+        )
+        dual_role_scope["evidence_state"]["terminal_payloads"] = [dual_role_artifact]
+        dual_role_scope["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": dual_role_time,
+            "stable_artifact_id": declaration_artifact_id,
+        }
+        restamp(dual_role_scope)
+        dual_role_raw_record = raw_issue_artifact_record(dual_role_final_snapshot)
+
+        dual_role_declaration = clone(declaration)
+        assert isinstance(dual_role_declaration, dict)
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            declaration_snapshot = dual_role_declaration[snapshot_name]
+            assert isinstance(declaration_snapshot, dict)
+            declaration_snapshot["created_at"] = dual_role_time
+            declaration_snapshot["updated_at"] = dual_role_time
+            declaration_snapshot["server_time"] = dual_role_time
+            declaration_snapshot["body"] = dual_role_final_snapshot["body"]
+        for receipt_name in ("initial_fetch_receipt", "final_fetch_receipt"):
+            declaration_receipt = dual_role_declaration[receipt_name]
+            assert isinstance(declaration_receipt, dict)
+            replace_raw_json_body(
+                declaration_receipt,
+                canonical_raw_body(dual_role_raw_record),
+            )
+        self.assertTrue(declaration_is_authoritative(dual_role_declaration))
+
+        dual_role_candidates = [*clone(samples), clone(dual_role_scope)]
+        assert all(isinstance(candidate, dict) for candidate in dual_role_candidates)
+        dual_role_raw_scopes = [
+            *clone(samples),
+            clone(current),
+            clone(dual_role_scope),
+        ]
+        assert all(isinstance(scope, dict) for scope in dual_role_raw_scopes)
+        dual_role_initial_inventory = universe_inventory(
+            dual_role_raw_scopes,
+            dual_role_candidates,
+            provider_declaration=dual_role_declaration,
+        )
+        dual_role_final_inventory = universe_inventory(
+            dual_role_raw_scopes,
+            dual_role_candidates,
+            provider_declaration=dual_role_declaration,
+        )
+        dual_role_history = {
+            "complete": True,
+            "repository": current_repository,
+            "as_of_source": "github-response-date-header",
+            "as_of_api_url": declaration_api_url,
+            "as_of_server_time": history_as_of_server_time,
+            "as_of_receipt": clone(dual_role_declaration["initial_fetch_receipt"]),
+            "window_seconds": history_window_seconds,
+            "window_start_exclusive": history_start_exclusive,
+            "window_end_inclusive": history_as_of_server_time,
+            "candidate_universe_count": len(dual_role_candidates),
+            "initial_inventory": dual_role_initial_inventory,
+            "final_inventory": dual_role_final_inventory,
+            "initial_current_raw_inventory": current_endpoint_inventory(
+                current,
+                observation_marker="initial",
+            ),
+            "final_current_raw_inventory": current_endpoint_inventory(
+                current,
+                observation_marker="final",
+            ),
+            "initial_current_ancestry": [],
+            "final_current_ancestry": [],
+            "initial_candidates": clone(dual_role_candidates),
+            "final_candidates": clone(dual_role_candidates),
+        }
+        dual_role_validation = validate_history_universe_result(
+            dual_role_history,
+            provider_declaration=dual_role_declaration,
+        )
+        self.assertIsNotNone(dual_role_validation)
+        assert isinstance(dual_role_validation, dict)
+        self.assertEqual(dual_role_validation["status"], "complete")
+        dual_role_entry = next(
+            entry
+            for entry in dual_role_initial_inventory["entries"]
+            if entry.get("scope_key") == list(scope_key(dual_role_scope) or ())
+        )
+        self.assertEqual(
+            dual_role_entry["source_evidence"]["semantic"],
+            "clean",
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                dual_role_declaration,
+                dual_role_history,
+                current,
+            ),
+            "mixed",
+        )
+        self.assertEqual(
+            classify_fallback(
+                dual_role_declaration,
+                dual_role_history,
+                current,
+            ),
+            "not-clean",
+        )
+
+        def assert_additional_declaration_terminal_role(
+            artifact_outcome: str,
+            expected_semantic: str,
+            expected_profile: str,
+            time_offset: int,
+        ) -> None:
+            role_scope = sample(declaration_pr)
+            role_scope["requests"] = []
+            role_scope["request_scope_receipts"] = []
+            role_scope["reactions"] = []
+            role_scope["selected_request_id"] = None
+            role_scope["selected_reaction_id"] = None
+            role_time = history_start_exclusive + time_offset
+            role_artifact = complete_issue_comment_artifact(
+                role_scope,
+                declaration_artifact_id,
+                role_time,
+                outcome=artifact_outcome,
+            )
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                role_snapshot = role_artifact[snapshot_name]
+                assert isinstance(role_snapshot, dict)
+                role_body = f"{role_snapshot['body']}\n\n{_GITHUB_CODEX_DISCLOSURE}"
+                role_snapshot["body"] = role_body
+                role_snapshot["normalized_body"] = role_body
+            role_final_snapshot = role_artifact["final_snapshot"]
+            assert isinstance(role_final_snapshot, dict)
+            role_artifact["artifact_scope_receipt"] = artifact_scope_receipt(
+                role_final_snapshot
+            )
+            evidence_field = (
+                "malformed_terminal_artifacts"
+                if artifact_outcome == "malformed"
+                else "terminal_payloads"
+            )
+            basis_kind = (
+                "malformed-terminal-artifact"
+                if artifact_outcome == "malformed"
+                else "terminal-payload"
+            )
+            role_scope["evidence_state"][evidence_field] = [role_artifact]
+            role_scope["candidate_basis"] = {
+                "kind": basis_kind,
+                "server_time": role_time,
+                "stable_artifact_id": declaration_artifact_id,
+            }
+            restamp(role_scope)
+
+            role_declaration = clone(declaration)
+            assert isinstance(role_declaration, dict)
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                declaration_snapshot = role_declaration[snapshot_name]
+                assert isinstance(declaration_snapshot, dict)
+                declaration_snapshot["created_at"] = role_time
+                declaration_snapshot["updated_at"] = role_time
+                declaration_snapshot["server_time"] = role_time
+                declaration_snapshot["body"] = role_final_snapshot["body"]
+            role_raw_record = raw_issue_artifact_record(role_final_snapshot)
+            for receipt_name in ("initial_fetch_receipt", "final_fetch_receipt"):
+                declaration_receipt = role_declaration[receipt_name]
+                assert isinstance(declaration_receipt, dict)
+                replace_raw_json_body(
+                    declaration_receipt,
+                    canonical_raw_body(role_raw_record),
+                )
+            self.assertTrue(declaration_is_authoritative(role_declaration))
+
+            role_candidates = [*clone(samples), clone(role_scope)]
+            role_raw_scopes = [*clone(samples), clone(current), clone(role_scope)]
+            role_initial_inventory = universe_inventory(
+                role_raw_scopes,
+                role_candidates,
+                provider_declaration=role_declaration,
+            )
+            role_final_inventory = universe_inventory(
+                role_raw_scopes,
+                role_candidates,
+                provider_declaration=role_declaration,
+            )
+            role_history = {
+                "complete": True,
+                "repository": current_repository,
+                "as_of_source": "github-response-date-header",
+                "as_of_api_url": declaration_api_url,
+                "as_of_server_time": history_as_of_server_time,
+                "as_of_receipt": clone(role_declaration["initial_fetch_receipt"]),
+                "window_seconds": history_window_seconds,
+                "window_start_exclusive": history_start_exclusive,
+                "window_end_inclusive": history_as_of_server_time,
+                "candidate_universe_count": len(role_candidates),
+                "initial_inventory": role_initial_inventory,
+                "final_inventory": role_final_inventory,
+                "initial_current_raw_inventory": current_endpoint_inventory(
+                    current,
+                    observation_marker="initial",
+                ),
+                "final_current_raw_inventory": current_endpoint_inventory(
+                    current,
+                    observation_marker="final",
+                ),
+                "initial_current_ancestry": [],
+                "final_current_ancestry": [],
+                "initial_candidates": clone(role_candidates),
+                "final_candidates": clone(role_candidates),
+            }
+            role_validation = validate_history_universe_result(
+                role_history,
+                provider_declaration=role_declaration,
+            )
+            if expected_semantic == "malformed":
+                self.assertIsNone(role_validation)
+            else:
+                self.assertIsNotNone(role_validation)
+            role_projection = parse_discovery_endpoint_transcript(
+                role_initial_inventory["discovery_endpoint_transcript"],
+                request_scope_receipts=role_initial_inventory["request_scope_receipts"],
+                provider_declaration=role_declaration,
+            )
+            self.assertIsNotNone(role_projection)
+            assert isinstance(role_projection, dict)
+            role_entry = next(
+                entry
+                for entry in role_projection["entries"]
+                if entry.get("scope_key") == list(scope_key(role_scope) or ())
+            )
+            self.assertEqual(
+                role_entry["source_evidence"]["semantic"],
+                expected_semantic,
+            )
+            self.assertEqual(
+                compute_provider_profile(
+                    role_declaration,
+                    role_history,
+                    current,
+                ),
+                expected_profile,
+            )
+            self.assertNotEqual(
+                classify_fallback(
+                    role_declaration,
+                    role_history,
+                    current,
+                ),
+                "clean",
+            )
+
+        assert_additional_declaration_terminal_role(
+            "findings",
+            "findings",
+            "mixed",
+            200,
+        )
+        assert_additional_declaration_terminal_role(
+            "malformed",
+            "malformed",
+            "unknown",
+            300,
+        )
         issue_terminal_history = clone(samples)
         assert isinstance(issue_terminal_history, list)
         for index, historical_record in enumerate(issue_terminal_history, start=1):
@@ -21777,6 +22172,353 @@ class RepositoryContractTest(unittest.TestCase):
             }
 
         normal_lane_timing = lane_timing(1, 2)
+
+        strong_terminal_history = history(
+            samples,
+            current_raw=terminal_current,
+        )
+        strong_findings_current = clone(current)
+        assert isinstance(strong_findings_current, dict)
+        with_terminal_payload(
+            strong_findings_current,
+            82_900,
+            artifact_outcome="findings",
+        )
+        strong_findings_history = history(
+            samples,
+            current_raw=strong_findings_current,
+            current_ancestry={current_head: 0},
+        )
+        for lane_state, strong_current, strong_history in (
+            (
+                "accepted-terminal-clean",
+                terminal_current,
+                strong_terminal_history,
+            ),
+            (
+                "accepted-terminal-findings",
+                strong_findings_current,
+                strong_findings_history,
+            ),
+        ):
+            without_declaration_report = expected_report_from_inputs(
+                lane_state,
+                None,
+                strong_history,
+                strong_current,
+                normal_lane_timing,
+            )
+            with self.subTest(strong_terminal_without_declaration=lane_state):
+                self.assertEqual(
+                    compute_provider_profile(
+                        None,
+                        strong_history,
+                        strong_current,
+                    ),
+                    "terminal-payload",
+                )
+                self.assertIsNotNone(without_declaration_report)
+                assert isinstance(without_declaration_report, dict)
+                self.assertEqual(
+                    without_declaration_report["provider_profile"],
+                    "terminal-payload",
+                )
+                self.assertIsNotNone(without_declaration_report["evidence_basis"])
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                None,
+                history(samples),
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        incomplete_adaptation_history = clone(strong_terminal_history)
+        assert isinstance(incomplete_adaptation_history, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            incomplete_adaptation_history[inventory_name]["pagination"][
+                "pull_requests"
+            ] = False
+        incomplete_adaptation_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            incomplete_adaptation_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(incomplete_adaptation_report)
+        assert isinstance(incomplete_adaptation_report, dict)
+        self.assertEqual(
+            incomplete_adaptation_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                incomplete_adaptation_history,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        def contexts_with_failed_history_plane(
+            plane: str,
+        ) -> dict[str, object]:
+            if plane not in {"endpoint", "artifact"}:
+                raise AssertionError("unknown history resource plane")
+            contexts = new_report_inventory_validation_contexts()
+            if not isinstance(contexts, dict):
+                raise AssertionError("report contexts are unavailable")
+            for inventory_name in ("initial_inventory", "final_inventory"):
+                context = report_inventory_validation_context_for(
+                    contexts,
+                    inventory_name,
+                )
+                parts = inventory_validation_context_parts(context)
+                if parts is None:
+                    raise AssertionError("history context is unavailable")
+                failed_tracker = (
+                    parts[1] if plane == "endpoint" else parts[3]["resource_tracker"]
+                )
+                self.assertFalse(
+                    resource_budget_charge(
+                        failed_tracker,
+                        records=evidence_resource_budget_v1["max_records"] + 1,
+                    )
+                )
+            return contexts
+
+        terminal_artifact_adaptation_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        findings_artifact_adaptation_history = history(
+            terminal_history,
+            current_raw=strong_findings_current,
+            current_ancestry={current_head: 0},
+        )
+        for history_plane in ("endpoint", "artifact"):
+            for lane_state, strong_current, strong_history in (
+                (
+                    "accepted-terminal-clean",
+                    terminal_current,
+                    (
+                        terminal_artifact_adaptation_history
+                        if history_plane == "artifact"
+                        else strong_terminal_history
+                    ),
+                ),
+                (
+                    "accepted-terminal-findings",
+                    strong_findings_current,
+                    (
+                        findings_artifact_adaptation_history
+                        if history_plane == "artifact"
+                        else strong_findings_history
+                    ),
+                ),
+            ):
+                overflow_report = expected_report_from_inputs(
+                    lane_state,
+                    declaration,
+                    strong_history,
+                    strong_current,
+                    normal_lane_timing,
+                    _inventory_validation_contexts=(
+                        contexts_with_failed_history_plane(history_plane)
+                    ),
+                )
+                with self.subTest(
+                    history_resource_overflow=(history_plane, lane_state)
+                ):
+                    self.assertIsNotNone(overflow_report)
+                    assert isinstance(overflow_report, dict)
+                    self.assertEqual(
+                        overflow_report["provider_profile"],
+                        "terminal-payload",
+                    )
+            self.assertIsNone(
+                expected_report_from_inputs(
+                    "accepted-reaction-clean",
+                    declaration,
+                    history(
+                        terminal_history if history_plane == "artifact" else samples
+                    ),
+                    current,
+                    normal_lane_timing,
+                    _inventory_validation_contexts=(
+                        contexts_with_failed_history_plane(history_plane)
+                    ),
+                )
+            )
+
+        def contexts_with_expired_history_and_stale_current() -> tuple[
+            dict[str, object], list[float]
+        ]:
+            clock_value = [0.0]
+
+            def controlled_clock() -> float:
+                return clock_value[0]
+
+            contexts = new_report_inventory_validation_contexts(
+                monotonic_clock=controlled_clock,
+            )
+            if not isinstance(contexts, dict):
+                raise AssertionError("report contexts are unavailable")
+            for inventory_name in (
+                "initial_current_raw_inventory",
+                "final_current_raw_inventory",
+                "initial_inventory",
+                "final_inventory",
+            ):
+                if (
+                    report_inventory_validation_context_for(
+                        contexts,
+                        inventory_name,
+                    )
+                    is None
+                ):
+                    raise AssertionError("report phase context is unavailable")
+            clock_value[0] = 900.001
+            for inventory_name in ("initial_inventory", "final_inventory"):
+                context = report_inventory_validation_context_for(
+                    contexts,
+                    inventory_name,
+                )
+                parts = inventory_validation_context_parts(context)
+                if parts is None:
+                    raise AssertionError("history context is unavailable")
+                self.assertFalse(resource_budget_charge(parts[1]))
+            return contexts, clock_value
+
+        deadline_isolation_contexts, deadline_isolation_clock = (
+            contexts_with_expired_history_and_stale_current()
+        )
+        self.assertTrue(
+            reset_report_inventory_validation_context_fields(
+                deadline_isolation_contexts,
+                {
+                    "initial_current_raw_inventory",
+                    "final_current_raw_inventory",
+                },
+            )
+        )
+        for inventory_name in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            phase_context = report_inventory_validation_context_for(
+                deadline_isolation_contexts,
+                inventory_name,
+            )
+            self.assertIsNotNone(
+                parse_current_endpoint_inventory(
+                    strong_terminal_history[inventory_name],
+                    current_ancestry={},
+                    _inventory_validation_context=phase_context,
+                )
+            )
+        deadline_current_basis = current_raw_authority_basis(
+            strong_terminal_history,
+            require_request_reaction_stability=False,
+            inventory_validation_contexts=deadline_isolation_contexts,
+        )
+        self.assertIsNotNone(deadline_current_basis)
+        self.assertTrue(
+            current_raw_authority_matches(
+                strong_terminal_history,
+                terminal_current,
+                require_request_reaction_stability=False,
+                inventory_validation_contexts=deadline_isolation_contexts,
+            )
+        )
+        deadline_current_context = report_inventory_validation_context_for(
+            deadline_isolation_contexts,
+            "final_current_raw_inventory",
+        )
+        deadline_current_parts = inventory_validation_context_parts(
+            deadline_current_context
+        )
+        self.assertIsNotNone(deadline_current_parts)
+        assert deadline_current_parts is not None
+        self.assertIsNotNone(
+            candidate_order_basis(
+                terminal_current,
+                finding_ancestry={},
+                artifact_validation_context=deadline_current_parts[3],
+                inventory_validation_context=deadline_current_context,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                strong_terminal_history,
+                terminal_current,
+                inventory_validation_contexts=deadline_isolation_contexts,
+            ),
+            "terminal-payload",
+        )
+        self.assertIsNotNone(
+            current_raw_authority_basis(
+                strong_terminal_history,
+                require_request_reaction_stability=False,
+                inventory_validation_contexts=deadline_isolation_contexts,
+            )
+        )
+        deadline_isolation_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            strong_terminal_history,
+            terminal_current,
+            normal_lane_timing,
+            _inventory_validation_contexts=deadline_isolation_contexts,
+        )
+        self.assertIsNotNone(deadline_isolation_report)
+        assert isinstance(deadline_isolation_report, dict)
+        self.assertEqual(
+            deadline_isolation_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(deadline_isolation_clock, [900.001])
+        deadline_isolation_phase_contexts = deadline_isolation_contexts["contexts"]
+        assert isinstance(deadline_isolation_phase_contexts, dict)
+        for inventory_name in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            self.assertEqual(
+                deadline_isolation_phase_contexts[inventory_name]["root_tracker"][
+                    "started"
+                ],
+                900.001,
+            )
+
+        reaction_deadline_contexts, _ = (
+            contexts_with_expired_history_and_stale_current()
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                history(samples),
+                current,
+                normal_lane_timing,
+                _inventory_validation_contexts=reaction_deadline_contexts,
+            )
+        )
+
+        restored_mixed_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            strong_terminal_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(restored_mixed_report)
+        assert isinstance(restored_mixed_report, dict)
+        self.assertEqual(restored_mixed_report["provider_profile"], "mixed")
 
         artifact_budget_history = history(
             terminal_history,
@@ -24608,6 +25350,160 @@ class RepositoryContractTest(unittest.TestCase):
             )
         )
 
+        terminal_with_final_request_actor_drift = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        final_actor_receipt = terminal_with_final_request_actor_drift[
+            "final_current_raw_inventory"
+        ]["request_scope_receipts"][0]["request_comment_receipt"]
+        final_actor_body = strict_json_loads(final_actor_receipt["body_utf8"])
+        assert isinstance(final_actor_body, dict)
+        final_actor_body["user"] = {
+            "login": "different-requester",
+            "type": "User",
+            "node_id": "U_different_requester",
+        }
+        replace_raw_json_body(
+            final_actor_receipt,
+            canonical_raw_body(final_actor_body),
+        )
+        terminal_with_final_request_actor_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_with_final_request_actor_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_with_final_request_actor_drift_report)
+        assert isinstance(terminal_with_final_request_actor_drift_report, dict)
+        self.assertEqual(
+            terminal_with_final_request_actor_drift_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            terminal_with_final_request_actor_drift_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+
+        reaction_with_final_request_actor_drift = history(samples)
+        final_reaction_actor_receipt = reaction_with_final_request_actor_drift[
+            "final_current_raw_inventory"
+        ]["request_scope_receipts"][0]["request_comment_receipt"]
+        final_reaction_actor_body = strict_json_loads(
+            final_reaction_actor_receipt["body_utf8"]
+        )
+        assert isinstance(final_reaction_actor_body, dict)
+        final_reaction_actor_body["user"] = {
+            "login": "different-requester",
+            "type": "User",
+            "node_id": "U_different_requester",
+        }
+        replace_raw_json_body(
+            final_reaction_actor_receipt,
+            canonical_raw_body(final_reaction_actor_body),
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                reaction_with_final_request_actor_drift,
+                current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                reaction_with_final_request_actor_drift,
+                current,
+                normal_lane_timing,
+            )
+        )
+
+        synchronized_wrong_actor_current = clone(current)
+        assert isinstance(synchronized_wrong_actor_current, dict)
+        synchronized_wrong_actor_request = synchronized_wrong_actor_current["requests"][
+            0
+        ]
+        assert isinstance(synchronized_wrong_actor_request, dict)
+        synchronized_wrong_actor_request["user"] = {
+            "login": "different-requester",
+            "type": "User",
+        }
+        synchronized_wrong_actor_current["request_scope_receipts"] = [
+            request_scope_receipt(
+                synchronized_wrong_actor_request,
+                synchronized_wrong_actor_current["scope"],
+            )
+        ]
+        restamp(synchronized_wrong_actor_current)
+        self.assertIsNone(
+            request_scope_receipt_mapping(
+                synchronized_wrong_actor_current["request_scope_receipts"]
+            )
+        )
+        synchronized_wrong_actor_history = history(
+            samples,
+            current_raw=synchronized_wrong_actor_current,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                synchronized_wrong_actor_history,
+                synchronized_wrong_actor_current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-reaction-clean",
+                declaration,
+                synchronized_wrong_actor_history,
+                synchronized_wrong_actor_current,
+                normal_lane_timing,
+            )
+        )
+
+        synchronized_wrong_actor_terminal = clone(terminal_current)
+        assert isinstance(synchronized_wrong_actor_terminal, dict)
+        synchronized_wrong_actor_terminal_request = synchronized_wrong_actor_terminal[
+            "requests"
+        ][0]
+        assert isinstance(synchronized_wrong_actor_terminal_request, dict)
+        synchronized_wrong_actor_terminal_request["user"] = {
+            "login": "different-requester",
+            "type": "User",
+        }
+        synchronized_wrong_actor_terminal["request_scope_receipts"] = [
+            request_scope_receipt(
+                synchronized_wrong_actor_terminal_request,
+                synchronized_wrong_actor_terminal["scope"],
+            )
+        ]
+        restamp(synchronized_wrong_actor_terminal)
+        synchronized_wrong_actor_terminal_history = history(
+            terminal_history,
+            current_raw=synchronized_wrong_actor_terminal,
+        )
+        synchronized_wrong_actor_terminal_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            synchronized_wrong_actor_terminal_history,
+            synchronized_wrong_actor_terminal,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(synchronized_wrong_actor_terminal_report)
+        assert isinstance(synchronized_wrong_actor_terminal_report, dict)
+        self.assertEqual(
+            synchronized_wrong_actor_terminal_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            synchronized_wrong_actor_terminal_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+
         terminal_with_stable_raw_sidecar_mismatch = history(
             terminal_history,
             current_raw=terminal_current,
@@ -24802,14 +25698,18 @@ class RepositoryContractTest(unittest.TestCase):
                 terminal_bad_sidecar_with_classification_drift
             )
         )
-        self.assertIsNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                terminal_bad_sidecar_with_classification_drift,
-                terminal_current,
-                normal_lane_timing,
-            )
+        classification_drift_terminal_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_bad_sidecar_with_classification_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(classification_drift_terminal_report)
+        assert isinstance(classification_drift_terminal_report, dict)
+        self.assertEqual(
+            classification_drift_terminal_report["provider_profile"],
+            "terminal-payload",
         )
         reaction_with_bad_historical_receipt_history = (
             history_with_malformed_historical_reaction_receipt(current)
@@ -24871,14 +25771,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIsNone(
             validate_history_universe_result(synchronized_request_time_mutation)
         )
-        self.assertIsNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                synchronized_request_time_mutation,
-                terminal_current,
-                normal_lane_timing,
-            )
+        synchronized_mutation_terminal_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            synchronized_request_time_mutation,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(synchronized_mutation_terminal_report)
+        assert isinstance(synchronized_mutation_terminal_report, dict)
+        self.assertEqual(
+            synchronized_mutation_terminal_report["provider_profile"],
+            "terminal-payload",
         )
 
         audit_candidates = clone(samples)
@@ -24887,7 +25791,6 @@ class RepositoryContractTest(unittest.TestCase):
         audit_scope = audit_candidate["scope"]
         audit_pr = audit_scope["pr"]
         selected_request_id = audit_candidate["selected_request_id"]
-        selected_reaction_id = audit_candidate["selected_reaction_id"]
         selected_request = audit_candidate["requests"][0]
         selected_request_time = selected_request["request_server_time"]
         unselected_request = request(
@@ -25006,14 +25909,18 @@ class RepositoryContractTest(unittest.TestCase):
             attacked_history = mutate_closed_audit_candidates(closed_audit_mutation)
             with self.subTest(closed_audit_mutation=closed_audit_mutation):
                 self.assertIsNone(validate_history_universe_result(attacked_history))
-                self.assertIsNone(
-                    expected_report_from_inputs(
-                        "accepted-terminal-clean",
-                        declaration,
-                        attacked_history,
-                        terminal_current,
-                        normal_lane_timing,
-                    )
+                attacked_terminal_report = expected_report_from_inputs(
+                    "accepted-terminal-clean",
+                    declaration,
+                    attacked_history,
+                    terminal_current,
+                    normal_lane_timing,
+                )
+                self.assertIsNotNone(attacked_terminal_report)
+                assert isinstance(attacked_terminal_report, dict)
+                self.assertEqual(
+                    attacked_terminal_report["provider_profile"],
+                    "terminal-payload",
                 )
 
         raw_category_history = history(
@@ -25241,14 +26148,18 @@ class RepositoryContractTest(unittest.TestCase):
         }.items():
             with self.subTest(sidecar_blind_nonterminal_drift=drift_name):
                 self.assertIsNone(validate_history_universe_result(drift_history))
-                self.assertIsNone(
-                    expected_report_from_inputs(
-                        "accepted-terminal-clean",
-                        declaration,
-                        drift_history,
-                        terminal_current,
-                        normal_lane_timing,
-                    )
+                drift_terminal_report = expected_report_from_inputs(
+                    "accepted-terminal-clean",
+                    declaration,
+                    drift_history,
+                    terminal_current,
+                    normal_lane_timing,
+                )
+                self.assertIsNotNone(drift_terminal_report)
+                assert isinstance(drift_terminal_report, dict)
+                self.assertEqual(
+                    drift_terminal_report["provider_profile"],
+                    "terminal-payload",
                 )
 
         def synchronized_normalized_omission(
@@ -25307,14 +26218,18 @@ class RepositoryContractTest(unittest.TestCase):
             )
             with self.subTest(synchronized_omission=case_name):
                 self.assertIsNone(validate_history_universe_result(omitted_history))
-                self.assertIsNone(
-                    expected_report_from_inputs(
-                        "accepted-terminal-clean",
-                        declaration,
-                        omitted_history,
-                        terminal_current,
-                        normal_lane_timing,
-                    )
+                omitted_terminal_report = expected_report_from_inputs(
+                    "accepted-terminal-clean",
+                    declaration,
+                    omitted_history,
+                    terminal_current,
+                    normal_lane_timing,
+                )
+                self.assertIsNotNone(omitted_terminal_report)
+                assert isinstance(omitted_terminal_report, dict)
+                self.assertEqual(
+                    omitted_terminal_report["provider_profile"],
+                    "terminal-payload",
                 )
 
         memo_history = history(
@@ -26882,6 +27797,20 @@ class RepositoryContractTest(unittest.TestCase):
         report_near_misses["current-missing-same-scope-request-audit"] = (
             missing_current_audit
         )
+        missing_current_request_user = clone(complete_report)
+        assert isinstance(missing_current_request_user, dict)
+        del missing_current_request_user["evidence_basis"]["current"]["request"]["user"]
+        report_near_misses["current-request-missing-user"] = (
+            missing_current_request_user
+        )
+        mutated_current_audit_request_user = clone(complete_report)
+        assert isinstance(mutated_current_audit_request_user, dict)
+        mutated_current_audit_request_user["evidence_basis"]["current"][
+            "same_scope_request_audit"
+        ][0]["request"]["user"]["login"] = "different-requester"
+        report_near_misses["current-audit-request-user-mutation"] = (
+            mutated_current_audit_request_user
+        )
         for field in current_raw_authority_fields:
             missing_current_raw_authority = clone(complete_report)
             assert isinstance(missing_current_raw_authority, dict)
@@ -26909,6 +27838,12 @@ class RepositoryContractTest(unittest.TestCase):
         report_near_misses["sample-missing-same-scope-request-audit"] = (
             missing_sample_audit
         )
+        mutated_sample_request_user = clone(complete_report)
+        assert isinstance(mutated_sample_request_user, dict)
+        mutated_sample_request_user["evidence_basis"]["samples"][0]["request"]["user"][
+            "type"
+        ] = "Bot"
+        report_near_misses["sample-request-user-mutation"] = mutated_sample_request_user
         missing_universe_audit = clone(complete_report)
         assert isinstance(missing_universe_audit, dict)
         del missing_universe_audit["evidence_basis"]["historical_universe"][
@@ -27563,14 +28498,18 @@ class RepositoryContractTest(unittest.TestCase):
         )
         terminal_history_count_drift["candidate_universe_count"] += 1
         self.assertIsNone(validate_history_universe(terminal_history_count_drift))
-        self.assertIsNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                terminal_history_count_drift,
-                terminal_current,
-                normal_lane_timing,
-            )
+        terminal_count_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_history_count_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_count_drift_report)
+        assert isinstance(terminal_count_drift_report, dict)
+        self.assertEqual(
+            terminal_count_drift_report["provider_profile"],
+            "terminal-payload",
         )
 
         terminal_history_entries_drift = history(
@@ -27581,14 +28520,18 @@ class RepositoryContractTest(unittest.TestCase):
             drifted_entry = terminal_history_entries_drift[snapshot_name]["entries"][0]
             drifted_entry["source_ordering_key"][0] += 1
         self.assertIsNone(validate_history_universe(terminal_history_entries_drift))
-        self.assertIsNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                terminal_history_entries_drift,
-                terminal_current,
-                normal_lane_timing,
-            )
+        terminal_entries_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_history_entries_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_entries_drift_report)
+        assert isinstance(terminal_entries_drift_report, dict)
+        self.assertEqual(
+            terminal_entries_drift_report["provider_profile"],
+            "terminal-payload",
         )
 
         terminal_history_classification_drift = history(
@@ -27607,14 +28550,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIsNone(
             validate_history_universe(terminal_history_classification_drift)
         )
-        self.assertIsNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                terminal_history_classification_drift,
-                terminal_current,
-                normal_lane_timing,
-            )
+        terminal_classification_drift_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            terminal_history_classification_drift,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(terminal_classification_drift_report)
+        assert isinstance(terminal_classification_drift_report, dict)
+        self.assertEqual(
+            terminal_classification_drift_report["provider_profile"],
+            "terminal-payload",
         )
 
         incomplete_discovery_pagination = history(samples)
@@ -29670,6 +30617,31 @@ class RepositoryContractTest(unittest.TestCase):
             history(samples),
             extended_request_schema,
         )
+
+        request_user_schema_defects = {
+            "missing-request-user": None,
+            "request-user-extra-key": {
+                "login": "fixture-requester",
+                "type": "User",
+                "node_id": "U_requester",
+            },
+            "request-user-wrong-type": "fixture-requester",
+        }
+        for case_name, malformed_user in request_user_schema_defects.items():
+            malformed_request_user = clone(current)
+            assert isinstance(malformed_request_user, dict)
+            malformed_request = malformed_request_user["requests"][0]
+            assert isinstance(malformed_request, dict)
+            if malformed_user is None:
+                malformed_request.pop("user")
+            else:
+                malformed_request["user"] = clone(malformed_user)
+            restamp(malformed_request_user)
+            invalid_cases[case_name] = (
+                declaration,
+                history(samples),
+                malformed_request_user,
+            )
 
         missing_request_server_time = clone(current)
         assert isinstance(missing_request_server_time, dict)
@@ -31743,6 +32715,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "scope_receipt_fields",
                 "response_receipt_fields",
                 "request_projection_fields",
+                "request_user_fields",
                 "required_scope_fields",
                 "raw_transcript_schema_version",
                 "raw_transcript_unchanged",
@@ -31756,6 +32729,23 @@ class RepositoryContractTest(unittest.TestCase):
                 "proves_continuous_scope_stability",
                 "proves_no_intermediate_aba",
             },
+        )
+        self.assertEqual(
+            request_scope_sidecar["request_projection_fields"],
+            [
+                "id",
+                "url",
+                "created_at",
+                "updated_at",
+                "request_server_time",
+                "request_server_time_field",
+                "normalized_body",
+                "user",
+            ],
+        )
+        self.assertEqual(
+            request_scope_sidecar["request_user_fields"],
+            ["login", "type"],
         )
         self.assertEqual(
             request_scope_sidecar["pre_post_scope_binding"],

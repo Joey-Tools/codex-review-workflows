@@ -248,7 +248,7 @@ For each pre-request and post-request phase:
 `request_comment_receipt` is the exact authenticated response to parent-owned
 `POST` of `https://api.github.com/repos/<owner>/<repo>/issues/<pr>/comments`
 with integer status `201` and exact submitted body `@codex review`. Independently
-project its raw response body to the controlled request's seven-field record:
+project its raw response body to the controlled request's eight-field record:
 
 ```yaml
 id: <positive issue-comment ID>
@@ -258,6 +258,9 @@ updated_at: <same canonical server time as created_at>
 request_server_time: <created_at>
 request_server_time_field: created_at
 normalized_body: "@codex review"
+user:
+  login: <authenticated parent login>
+  type: <exact REST user type>
 ```
 
 The raw POST body must also bind the canonical REST issue-comment URL, exact
@@ -266,7 +269,8 @@ request rule. Version `parent-recorded-request-scope-v1` accepts only the
 unedited creation response (`created_at == updated_at` and
 `request_server_time_field: created_at`); authority for a later edit would
 require a separately predeclared receipt version. `request_id` must equal the
-projected `id`; the projected seven fields must type-preservingly equal the
+projected `id`; the projected eight top-level fields—including the closed
+`user: {login, type}` actor projection—must type-preservingly equal the
 independently fetched request record in the complete issue-comment traversal;
 and the request semantic server time must fall between every pre-read `Date`
 and the POST response `Date`.
@@ -656,7 +660,9 @@ Only the following terminal payloads are accepted:
    under this stricter playbook grammar.
 3. **Top-level finding.** Require a normalized body with the exact first line
    `### 💡 Codex Review` followed by one or more nonempty LF-delimited finding
-   lines and no other lines. Each finding line has this exact grammar:
+   lines. The body either ends after the final finding line or appends exactly
+   two LF characters plus the exact disclosure block above; no other suffix or
+   intervening line is accepted. Each finding line has this exact grammar:
 
    ```text
    - [P<SEVERITY>] <TITLE> — <BLOB_URL>
@@ -843,6 +849,7 @@ The contract fixture matrix is normative:
 | `clean-review-with-inline-finding` | clean pull-request review | associated inline finding | `findings` |
 | `clean-review-unread-children` | clean pull-request review | associated inline set unavailable | `malformed` |
 | `finding-positive` | top-level finding | none | `findings` |
+| `finding-with-disclosure-positive` | top-level finding | exact provider disclosure suffix | `findings` |
 | `inline-parent-positive` | inline-parent review | none | `findings` |
 | `inline-parent-nonempty-positive` | inline-parent review | exact container body and disclosure | `findings` |
 | `clean-issue-short-sha` | clean issue comment | 10-character marker | `malformed` |
@@ -1000,12 +1007,29 @@ inferred from one convenient reaction.
 The bounded history is mandatory before reaction-only clean can pass and before
 reaction behaviour can upgrade a profile to `mixed`. It is not a veto over an
 independently complete current-scope terminal artifact. If historical
-request-scope sidecars are missing, malformed, or unstable but the final
-current endpoint traversal still proves a trustworthy stable terminal clean or
-findings payload, select `terminal-payload`, set the affected request policy to
-`unknown`, and reject only reaction-derived authority. Do not report `mixed`
-from unverifiable reaction history, and do not turn a strong terminal result
-into `unknown` merely because the weaker adaptation plane failed.
+provider declaration is missing, a historical traversal or pagination chain is
+incomplete, a historical endpoint or artifact ledger exceeds its budget, or
+historical request-scope sidecars are missing, malformed, or unstable, but the
+independent initial/final **current** endpoint traversals and current artifact
+receipts still prove a trustworthy stable terminal clean or findings payload,
+select `terminal-payload`, set affected request policy to `unknown` where
+applicable, and reject only `mixed` plus reaction-derived authority. Do not
+report `mixed` from unverifiable reaction history, and do not turn a strong
+current terminal result into `unknown` merely because the weaker adaptation
+plane failed. This exception is plane-scoped: a failed current endpoint
+traversal or current artifact ledger/receipt, or any current identity, scope,
+lifecycle, thread, ancestry, grammar, selection, or final-stability failure,
+still blocks that terminal result.
+
+Evaluate optional historical adaptation before the final current-evidence
+reread. Allocate fresh current endpoint/sidecar/artifact trackers after that
+history attempt, even if an earlier current probe already exists. Each
+inventory deadline bounds that inventory's active validation and is sealed
+when the phase completes; elapsed time spent in another inventory must not age
+out an already completed phase. Immediately before report success, recheck the
+fresh final-current deadline and require every retained phase tracker to have
+completed without failure. This ordering keeps a historical timeout from
+leaking into current authority while preserving the current final-reread gate.
 
 For dynamic history, first collapse evidence to at most one final candidate
 outcome per distinct immutable scope key: repository identity, PR number,
@@ -1203,18 +1227,23 @@ receipts. The direct declaration GET remains declaration authority; discovery
 proves only that the authenticated artifact also exists in its repository/PR
 context.
 
-The one exact authenticated declaration record is audit-only nonterminal
-evidence. If its seeded PR contains no other provider behaviour, that scope is
-`confirmed-non-candidate`; the declaration neither enters `entries` nor
-increases `candidate_universe_count`. A comment accepted by the exact closed
-progress-only grammar is likewise retained in `nonterminal_records` and is
-audit-only. No other exact-provider free-form issue-comment prose may be
-downgraded to a confirmed non-candidate: prose that is neither the one exact
-declaration record nor closed progress-only syntax fails the projection and
-selects `unknown`. A terminal-looking exact-provider record that misses every
-accepted terminal branch remains a `malformed` historical candidate under
-ordinary terminal precedence when its final basis is inside the frozen
-interval; it is never hidden by the declaration or progress exceptions. A
+Declaration authority and terminal classification are orthogonal roles. The
+same raw issue-comment artifact may prove the exact provider declaration and,
+independently, classify under the ordinary terminal grammar as clean, findings,
+or malformed. Matching the declaration line never suppresses terminal-looking
+classification. Only a declaration record independently classified as
+nonterminal is audit-only; if its seeded PR contains no other provider
+behaviour, that declaration-only scope is `confirmed-non-candidate`, the record
+does not enter `entries`, and it does not increase `candidate_universe_count`.
+A comment accepted by the exact closed progress-only grammar is likewise
+retained in `nonterminal_records` and is audit-only. No other exact-provider
+free-form issue-comment prose may be downgraded to a confirmed non-candidate:
+prose that is neither an authenticated declaration-role match nor closed
+progress-only syntax fails the projection and selects `unknown`. A
+terminal-looking exact-provider record that misses every accepted terminal
+branch remains a `malformed` historical candidate under ordinary terminal
+precedence when its final basis is inside the frozen interval; it is never
+hidden by its simultaneous declaration role or by the progress exception. A
 fully parsed malformed terminal record at or before the exclusive lower
 boundary remains visible audit evidence under the temporal classification rule
 below, but does not become an in-window candidate.
@@ -1286,7 +1315,7 @@ threads into provider result authority. An independent scope-level
 `review-thread-audit` bundle hashes every non-excluded semantic GraphQL thread
 projection and enters `nonterminal_records`, so changes to those audit-only
 threads still fail initial/final convergence. Issue-comment digests bind the
-projected comment; reaction digests bind the seven-field parent request, its
+projected comment; reaction digests bind the eight-field parent request, its
 exact request-time scope sidecar, and the projected child reaction. Same time
 and numeric ID alone therefore cannot substitute one carrier, channel, scope
 epoch, or semantic result for another.
@@ -1470,10 +1499,11 @@ immutable scope, plus an individual exact-bot `+1` reaction fetched from that
 request comment's fully paginated reactions endpoint. Enumerate every accepted
 same-scope controlled request parent, not just the parent selected as the
 `+1` basis, and fully paginate each parent's individual reactions. Record each
-request's closed seven-field projection and its exact one-to-one
+request's closed eight-field projection and its exact one-to-one
 `parent-recorded-request-scope-v1` sidecar. Both pre/post raw scope projections
 must equal this candidate's immutable scope, and the POST response must project
-type-preservingly to those seven request fields. This sidecar version accepts
+type-preservingly to those eight request fields, including exact
+`user.login`/`user.type`. This sidecar version accepts
 only the unedited creation response: require `updated_at == created_at`, use
 that value as the request semantic time, and record
 `request_server_time_field: created_at`. A later edited request remains audit
@@ -1577,10 +1607,12 @@ and both identical snapshots use the closed, predeclared field set above;
 unknown fields and JSON type aliases are not forward-compatible authority.
 Both independent repository-wide discovery traversals must also seed and fully
 traverse the declaration's bound PR and find exactly that raw issue-comment
-record once. In discovery it is audit-only nonterminal evidence and, by itself,
-leaves that PR `confirmed-non-candidate`; this contextual check does not replace
-either direct declaration GET receipt or turn the declaration into a provider
-result.
+record once. Declaration matching does not consume or suppress terminal
+classification: the same artifact remains eligible for ordinary
+clean/findings/malformed classification. Only when that record is independently
+nonterminal is it audit-only and, by itself, leaves that PR
+`confirmed-non-candidate`; this contextual check does not replace either direct
+declaration GET receipt or manufacture a provider result.
 Expanding the declaration
 authority set later requires a predeclared source kind, authentication and
 issuer binding, closed schema, exact accepted text/digest, final re-read, and
@@ -1707,7 +1739,7 @@ second deadline, or mutate retained bytes after budget validation.
    inventory/count, and every pre-sort candidate basis also satisfy the window
    contract above.
 4. The parent recorded the exact accepted request comment for the exact
-   current whole-PR scope, including its closed seven-field projection and
+   current whole-PR scope, including its closed eight-field projection and
    one-to-one `parent-recorded-request-scope-v1` sidecar. The sidecar contains
    complete pre/post pull-detail and compare raw receipts plus the exact POST
    response, and both scope projections equal the current immutable tuple,
@@ -2144,6 +2176,9 @@ evidence_basis:
       request_server_time: <created_at>
       request_server_time_field: created_at
       normalized_body: "@codex review"
+      user:
+        login: <authenticated parent login>
+        type: <exact REST user type>
     request_scope_receipt: <the unique matching sidecar for request.id>
     reaction:
       id: 789012
@@ -2156,7 +2191,7 @@ evidence_basis:
     selected_request_id: 123456
     selected_reaction_id: 789012
     same_scope_request_audit:
-      - request: <same seven request fields>
+      - request: <same eight request fields>
         request_scope_receipt: <the unique matching sidecar>
         reactions:
           - <same seven reaction fields>
@@ -2170,11 +2205,11 @@ evidence_basis:
         kind: reaction | terminal-payload | malformed-terminal-artifact | active-top-level-finding | unresolved-thread-finding
         server_time: <trusted semantic server time after scope-local precedence>
         stable_artifact_id: <positive native numeric ID>
-      request: <same seven request fields>
+      request: <same eight request fields>
       request_scope_receipt: <the unique matching sidecar>
       reaction: <same seven reaction fields>
       same_scope_request_audit:
-        - request: <same seven request fields>
+        - request: <same eight request fields>
           request_scope_receipt: <the unique matching sidecar>
           reactions:
             - <same seven reaction fields>
@@ -2190,7 +2225,9 @@ The report embeds both independently fetched schema-version-3 raw historical
 discovery endpoint transcripts, including each complete repository-wide pull
 seed, every seeded PR traversal, and every current/candidate/non-candidate
 classification. The seed/detail closure includes the authenticated declaration
-PR and retains its exact declaration record as audit-only nonterminal evidence.
+PR and retains its exact declaration record in its declaration role. That role
+does not suppress terminal classification; only an independently nonterminal
+declaration record is audit-only evidence.
 Each historical inventory stores the parent-owned request-time scope sidecar
 array beside—not inside—its unchanged version-3 transcript. It also embeds both
 raw-derived source-authority inventories and both independently validated
@@ -2271,7 +2308,7 @@ current `terminal-payload` or `mixed` basis is outside this reaction-history
 cutoff.
 
 Each `samples[]` entry independently proves exact request/sidecar/reaction
-identity, both receipt-derived scope tuples, the seven-field POST projection,
+identity, both receipt-derived scope tuples, the eight-field POST projection,
 and `reaction.created_at > request.request_server_time`, and its
 `same_scope_request_audit` enumerates every accepted request parent plus every
 fully paginated reaction for that scope. The selected request and its exact

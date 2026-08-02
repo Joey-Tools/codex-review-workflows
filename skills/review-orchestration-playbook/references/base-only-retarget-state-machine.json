@@ -29,7 +29,12 @@
       "updated_at",
       "request_server_time",
       "request_server_time_field",
-      "normalized_body"
+      "normalized_body",
+      "user"
+    ],
+    "request_user_fields": [
+      "login",
+      "type"
     ],
     "required_scope_fields": [
       "repository",
