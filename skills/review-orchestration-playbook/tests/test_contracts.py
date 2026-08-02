@@ -2411,7 +2411,7 @@ class RepositoryContractTest(unittest.TestCase):
             guard = guarded_block(source, marker, occurrence)
             injected = subprocess.run(
                 [
-                    "/bin/zsh",
+                    "/bin/bash",
                     "-c",
                     "set -o pipefail\n" + guard + "\nprintf guarded-tail-reached\n",
                 ],
