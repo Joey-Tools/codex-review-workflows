@@ -271,6 +271,57 @@ def _github_codex_issue_body_semantic(
     return ("malformed", None)
 
 
+def _github_codex_inline_parent_container(commit_id: str) -> str:
+    return "\n".join(
+        (
+            "### 💡 Codex Review",
+            "Here are some automated review suggestions for this pull request.",
+            f"**Reviewed commit:** `{commit_id}`",
+            "",
+            _GITHUB_CODEX_DISCLOSURE,
+        )
+    )
+
+
+def _github_codex_review_body_semantic(
+    raw_body: object,
+    *,
+    repository: str,
+    state: object,
+    commit_id: str,
+    current_head: str,
+    has_target_children: bool,
+) -> tuple[str, str | None]:
+    body = _normalize_github_codex_body(raw_body)
+    if body is None:
+        return ("malformed", None)
+    if state == "APPROVED":
+        if body == "No findings." and has_target_children:
+            return ("findings", commit_id)
+        if commit_id == current_head and body == "No findings.":
+            return ("clean", commit_id)
+        return ("malformed", None)
+    top_level_semantic, finding_commit = _github_codex_issue_body_semantic(
+        body,
+        repository=repository,
+        head=commit_id,
+        allow_foreign_finding_sha=True,
+    )
+    if (
+        top_level_semantic == "findings"
+        and finding_commit == commit_id
+        and state in {"COMMENTED", "CHANGES_REQUESTED"}
+    ):
+        return ("findings", finding_commit)
+    if (
+        state == "COMMENTED"
+        and has_target_children
+        and body in {"", _github_codex_inline_parent_container(commit_id)}
+    ):
+        return ("findings", commit_id)
+    return ("malformed", None)
+
+
 def _format_github_rfc3339_seconds(value: object) -> object:
     if type(value) is not int or value <= 0:
         return value
@@ -310,9 +361,16 @@ def _review_thread_pages(
     *,
     parent_review_id: int,
     resolved: bool = False,
+    resolutions: list[bool] | None = None,
 ) -> dict[str, object]:
+    if resolutions is None:
+        resolutions = [resolved for _ in children]
+    if len(resolutions) != len(children) or any(
+        type(item) is not bool for item in resolutions
+    ):
+        raise AssertionError("thread resolutions must match children")
     nodes: list[dict[str, object]] = []
-    for child in children:
+    for child, child_resolved in zip(children, resolutions, strict=True):
         child_id = child["id"]
         child_url = child["url"]
         assert type(child_id) is int
@@ -320,7 +378,7 @@ def _review_thread_pages(
         nodes.append(
             {
                 "id": f"PRRT_{child_id}",
-                "isResolved": resolved,
+                "isResolved": child_resolved,
                 "isOutdated": False,
                 "comments": {
                     "pagination_complete": True,
@@ -3196,7 +3254,8 @@ class RepositoryContractTest(unittest.TestCase):
             normalized_readiness_text,
         )
         self.assertIn(
-            "terminal-decision projection, and selected artifact remained stable",
+            "terminal-decision projection, selected artifact, artifact get binding, "
+            "and pre/artifact/post receipt envelope remained stable",
             normalized_readiness_text,
         )
         malformed_window_documents = {
@@ -3640,6 +3699,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("extension", normalized_document)
         resource_plane_documents = {
             "authority": authority,
+            "README": malformed_window_documents["README"],
             "skill": anti_drift_documents["skill"],
             "PR readiness": malformed_window_documents["PR readiness"],
             "lane contracts": malformed_window_documents["lane contracts"],
@@ -3655,6 +3715,25 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("raw responses", normalized_document)
                 self.assertIn("synthetic", normalized_document)
                 self.assertIn("sidecar", normalized_document)
+                self.assertIn("artifact", normalized_document)
+                self.assertIn("wrapper", normalized_document)
+                self.assertTrue(
+                    "memoized" in normalized_document
+                    or "memoize" in normalized_document
+                )
+                self.assertTrue(
+                    "per-candidate" in normalized_document
+                    or "per candidate" in normalized_document
+                )
+                self.assertIn("recomputation", normalized_document)
+                self.assertTrue(
+                    "reset" in normalized_document
+                    or "fresh tracker" in normalized_document
+                    or (
+                        "never create" in normalized_document
+                        and "tracker" in normalized_document
+                    )
+                )
         self.assertIn(
             "in-cutoff confirmed-different and fully fetched null-parent/unrelated "
             "audit context",
@@ -3796,8 +3875,9 @@ class RepositoryContractTest(unittest.TestCase):
             "pr-readiness": (
                 "only provider-result authority is inherited",
                 "raw thread proof, whole-pr lifecycle/scope, the closed "
-                "issue-comment carrier, request-time scope sidecars, declaration "
-                "discovery, and +1 fallback are playbook extensions",
+                "issue-comment carrier, request-time and artifact-time scope "
+                "receipts, ancestor-finding projection, declaration discovery, "
+                "and +1 fallback are playbook extensions",
             ),
             "project-journal": (
                 "the action alignment is intentionally asymmetric. provider-result "
@@ -4032,7 +4112,9 @@ class RepositoryContractTest(unittest.TestCase):
             if thread_findings is None:
                 return "malformed"
             if state == "APPROVED":
-                if commit_id != current_sha or body != "No findings.":
+                if body != "No findings." or (
+                    not target_children and commit_id != current_sha
+                ):
                     return "malformed"
                 child_ids: set[int] = set()
                 for child_record in target_children:
@@ -5944,6 +6026,106 @@ class RepositoryContractTest(unittest.TestCase):
                 "post_request_scope_receipts": scope_receipts(request_time + 1),
             }
 
+        def artifact_scope_receipt(
+            snapshot: dict[str, object],
+        ) -> dict[str, object]:
+            scope = snapshot.get("scope")
+            if not isinstance(scope, dict):
+                raise AssertionError("artifact scope fixture is malformed")
+            repository = scope.get("repository")
+            pr = scope.get("pr")
+            merge_base = scope.get("pr_merge_base")
+            head = scope.get("head")
+            artifact_id = snapshot.get("id")
+            artifact_time = snapshot.get("server_time")
+            channel = snapshot.get("channel")
+            artifact_commit = (
+                snapshot.get("commit_id")
+                if channel == "pull-request-review"
+                else snapshot.get("parsed_commit")
+            )
+            receipt_head = (
+                artifact_commit if snapshot.get("outcome") == "findings" else head
+            )
+            if (
+                not isinstance(repository, str)
+                or type(pr) is not int
+                or not isinstance(merge_base, str)
+                or not isinstance(head, str)
+                or not isinstance(receipt_head, str)
+                or type(artifact_id) is not int
+                or type(artifact_time) is not int
+            ):
+                raise AssertionError("artifact scope fixture is malformed")
+            base_oid = "89abcdef0123456789abcdef0123456789abcdef"
+            api_root = f"https://api.github.com/repos/{repository}"
+
+            def response_receipt(
+                *,
+                request_url: str,
+                server_time: int,
+                body: object,
+            ) -> dict[str, object]:
+                body_utf8 = canonical_raw_body(body)
+                return {
+                    "method": "GET",
+                    "request_url": request_url,
+                    "status": 200,
+                    "date_header": email.utils.format_datetime(
+                        datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                        usegmt=True,
+                    ),
+                    "body_utf8": body_utf8,
+                    "body_sha256": hashlib.sha256(
+                        body_utf8.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+            def scope_receipts(server_time: int) -> dict[str, object]:
+                return {
+                    "pull": response_receipt(
+                        request_url=f"{api_root}/pulls/{pr}",
+                        server_time=server_time,
+                        body={
+                            "number": pr,
+                            "base": {"sha": base_oid},
+                            "head": {"sha": receipt_head},
+                        },
+                    ),
+                    "compare": response_receipt(
+                        request_url=(f"{api_root}/compare/{base_oid}...{receipt_head}"),
+                        server_time=server_time,
+                        body={
+                            "base_commit": {"sha": base_oid},
+                            "head_commit": {"sha": receipt_head},
+                            "merge_base_commit": {"sha": merge_base},
+                        },
+                    ),
+                }
+
+            if channel == "pull-request-review":
+                artifact_url = f"{api_root}/pulls/{pr}/reviews/{artifact_id}"
+                artifact_body = raw_review_record(snapshot)
+            elif channel == "issue-comment":
+                artifact_url = snapshot.get("api_url")
+                artifact_body = raw_issue_artifact_record(snapshot)
+                if not isinstance(artifact_url, str):
+                    raise AssertionError("artifact URL fixture is malformed")
+            else:
+                raise AssertionError("artifact channel fixture is malformed")
+            return {
+                "kind": "parent-recorded-terminal-artifact-scope-v1",
+                "pre_artifact_scope_receipts": scope_receipts(
+                    max(1, artifact_time - 1)
+                ),
+                "artifact_get_receipt": response_receipt(
+                    request_url=artifact_url,
+                    server_time=artifact_time + 1,
+                    body=artifact_body,
+                ),
+                "post_artifact_scope_receipts": scope_receipts(artifact_time + 2),
+            }
+
         def set_response_date(
             response: dict[str, object],
             server_time: int,
@@ -5993,6 +6175,12 @@ class RepositoryContractTest(unittest.TestCase):
             "date_header",
             "body_utf8",
             "body_sha256",
+        }
+        artifact_scope_receipt_fields = {
+            "kind",
+            "pre_artifact_scope_receipts",
+            "artifact_get_receipt",
+            "post_artifact_scope_receipts",
         }
         reaction_fields = {
             "id",
@@ -6460,6 +6648,10 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             artifact_kind: str = "terminal-payload",
             outcome: str = "clean",
+            artifact_commit: str | None = None,
+            thread_resolved: bool = False,
+            thread_resolutions: list[bool] | None = None,
+            inline_parent_shape: str = "empty",
             user_login: str = exact_login,
             user_type: str = "Bot",
         ) -> dict[str, object]:
@@ -6467,11 +6659,30 @@ class RepositoryContractTest(unittest.TestCase):
             assert isinstance(scope, dict)
             pr = scope["pr"]
             head = scope["head"]
-            if artifact_kind == "unresolved-thread-finding":
+            resolved_artifact_commit = (
+                head if artifact_commit is None else artifact_commit
+            )
+            has_thread_findings = (
+                artifact_kind == "unresolved-thread-finding"
+                or thread_resolved
+                or thread_resolutions is not None
+            )
+            if has_thread_findings:
                 if outcome != "findings":
-                    raise AssertionError("unresolved thread fixture must be findings")
-                state = "COMMENTED"
-                body = ""
+                    raise AssertionError("thread fixture must be findings")
+                if inline_parent_shape == "empty":
+                    state = "COMMENTED"
+                    body = ""
+                elif inline_parent_shape == "nonempty":
+                    state = "COMMENTED"
+                    body = _github_codex_inline_parent_container(
+                        resolved_artifact_commit
+                    )
+                elif inline_parent_shape == "approved-clean-parent":
+                    state = "APPROVED"
+                    body = "No findings."
+                else:
+                    raise AssertionError("unsupported inline parent shape")
                 grammar_status = "accepted"
                 terminal_looking = True
             elif outcome == "clean":
@@ -6484,7 +6695,8 @@ class RepositoryContractTest(unittest.TestCase):
                 body = (
                     "### 💡 Codex Review\n"
                     "- [P1] Fixture finding — "
-                    f"https://github.com/{current_repository}/blob/{head}/"
+                    f"https://github.com/{current_repository}/blob/"
+                    f"{resolved_artifact_commit}/"
                     "src/example.py#L1"
                 )
                 grammar_status = "accepted"
@@ -6496,30 +6708,47 @@ class RepositoryContractTest(unittest.TestCase):
                 terminal_looking = True
             else:
                 raise AssertionError(f"unsupported fixture outcome: {outcome}")
-            if artifact_kind == "unresolved-thread-finding":
-                child_id = (artifact_id * 10) + 1
+            if has_thread_findings:
+                effective_resolutions = (
+                    [thread_resolved]
+                    if thread_resolutions is None
+                    else clone(thread_resolutions)
+                )
+                assert isinstance(effective_resolutions, list)
+                if not effective_resolutions or any(
+                    type(item) is not bool for item in effective_resolutions
+                ):
+                    raise AssertionError("thread fixture requires resolutions")
+                if artifact_kind == "unresolved-thread-finding" and all(
+                    effective_resolutions
+                ):
+                    raise AssertionError("unresolved fixture needs an open thread")
                 associated_inline_comments = {
                     "pagination_complete": True,
                     "records": [
                         {
-                            "id": child_id,
+                            "id": (artifact_id * 10) + offset,
                             "url": (
                                 f"https://github.com/{current_repository}/pull/{pr}"
-                                f"#discussion_r{child_id}"
+                                f"#discussion_r{(artifact_id * 10) + offset}"
                             ),
                             "user_login": exact_login,
                             "user_type": "Bot",
                             "pull_request_review_id": artifact_id,
-                            "commit_id": head,
-                            "original_commit_id": head,
-                            "body": "[P1] Fixture inline finding",
-                            "normalized_body": "[P1] Fixture inline finding",
+                            "commit_id": resolved_artifact_commit,
+                            "original_commit_id": resolved_artifact_commit,
+                            "body": f"[P1] Fixture inline finding {offset}",
+                            "normalized_body": (
+                                f"[P1] Fixture inline finding {offset}"
+                            ),
                         }
+                        for offset in range(1, len(effective_resolutions) + 1)
                     ],
                 }
                 review_thread_pages = _review_thread_pages(
                     associated_inline_comments["records"],
                     parent_review_id=artifact_id,
+                    resolutions=effective_resolutions,
                 )
             else:
                 associated_inline_comments = {
@@ -6551,15 +6780,17 @@ class RepositoryContractTest(unittest.TestCase):
                 "submitted_at": server_time,
                 "server_time": server_time,
                 "server_time_field": "submitted_at",
-                "commit_id": head,
+                "commit_id": resolved_artifact_commit,
                 "scope": scope,
                 "associated_inline_comments": associated_inline_comments,
                 "review_thread_pages": review_thread_pages,
             }
-            return {
+            wrapper = {
                 "initial_snapshot": clone(snapshot),
                 "final_snapshot": clone(snapshot),
+                "artifact_scope_receipt": artifact_scope_receipt(snapshot),
             }
+            return wrapper
 
         def complete_issue_comment_artifact(
             record: dict[str, object],
@@ -6568,6 +6799,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             artifact_kind: str = "terminal-payload",
             outcome: str = "clean",
+            artifact_commit: str | None = None,
             edited: bool = False,
             user_login: str = exact_login,
             user_type: str = "Bot",
@@ -6577,22 +6809,29 @@ class RepositoryContractTest(unittest.TestCase):
             assert isinstance(scope, dict)
             pr = scope["pr"]
             head = scope["head"]
+            resolved_artifact_commit = (
+                head if artifact_commit is None else artifact_commit
+            )
             if outcome == "clean":
                 body = (
                     "Codex Review: Didn't find any major issues.\n\n"
-                    f"**Reviewed commit:** `{head}`"
+                    f"**Reviewed commit:** `{resolved_artifact_commit}`"
                 )
                 grammar_status = "accepted"
             elif outcome == "findings":
                 body = (
                     "### 💡 Codex Review\n"
                     "- [P1] Fixture finding — "
-                    f"https://github.com/{current_repository}/blob/{head}/"
+                    f"https://github.com/{current_repository}/blob/"
+                    f"{resolved_artifact_commit}/"
                     "src/example.py#L1"
                 )
                 grammar_status = "accepted"
             elif outcome == "malformed":
-                body = f"Codex Review: Finished.\n\n**Reviewed commit:** `{head}`"
+                body = (
+                    "Codex Review: Finished.\n\n"
+                    f"**Reviewed commit:** `{resolved_artifact_commit}`"
+                )
                 grammar_status = "malformed"
             else:
                 raise AssertionError(f"unsupported fixture outcome: {outcome}")
@@ -6623,29 +6862,253 @@ class RepositoryContractTest(unittest.TestCase):
                 "updated_at": server_time,
                 "server_time": server_time,
                 "server_time_field": "updated_at" if edited else "created_at",
-                "parsed_commit": head,
+                "parsed_commit": resolved_artifact_commit,
                 "scope": scope,
             }
-            return {
+            wrapper = {
                 "initial_snapshot": clone(snapshot),
                 "final_snapshot": clone(snapshot),
+                "artifact_scope_receipt": artifact_scope_receipt(snapshot),
             }
+            return wrapper
 
-        def validate_candidate_artifact(
+        def artifact_scope_receipt_matches(
+            value: object,
+            snapshot: dict[str, object],
+            *,
+            expected_scope: tuple[object, ...],
+            resource_tracker: dict[str, object] | None = None,
+        ) -> bool:
+            repository, pr, merge_base, head = expected_scope
+            artifact_id = snapshot.get("id")
+            artifact_time = snapshot.get("server_time")
+            channel = snapshot.get("channel")
+            artifact_commit = (
+                snapshot.get("commit_id")
+                if channel == "pull-request-review"
+                else snapshot.get("parsed_commit")
+            )
+            receipt_head = (
+                artifact_commit if snapshot.get("outcome") == "findings" else head
+            )
+            tracker = (
+                resource_tracker
+                if resource_tracker is not None
+                else new_resource_tracker()
+            )
+            if (
+                not isinstance(value, dict)
+                or len(value) != len(artifact_scope_receipt_fields)
+                or set(value) != artifact_scope_receipt_fields
+                or value.get("kind") != "parent-recorded-terminal-artifact-scope-v1"
+                or not isinstance(repository, str)
+                or type(pr) is not int
+                or not isinstance(merge_base, str)
+                or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
+                or not isinstance(head, str)
+                or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                or type(artifact_id) is not int
+                or type(artifact_time) is not int
+                or not isinstance(receipt_head, str)
+                or re.fullmatch(r"[0-9a-f]{40}", receipt_head) is None
+                or tracker is None
+            ):
+                return False
+            api_root = f"https://api.github.com/repos/{repository}"
+
+            def parse_response(
+                response: object,
+                *,
+                request_url: str,
+            ) -> tuple[object, int] | None:
+                if (
+                    not isinstance(response, dict)
+                    or len(response) != len(request_scope_response_fields)
+                    or set(response) != request_scope_response_fields
+                    or response.get("method") != "GET"
+                    or response.get("request_url") != request_url
+                    or type(response.get("status")) is not int
+                    or response.get("status") != 200
+                    or not isinstance(response.get("body_utf8"), str)
+                    or not isinstance(response.get("body_sha256"), str)
+                    or not charge_request_scope_response_resource(response, tracker)
+                ):
+                    return None
+                body_utf8 = response["body_utf8"]
+                try:
+                    body_bytes = body_utf8.encode("utf-8", errors="strict")
+                    body = strict_json_loads(body_utf8)
+                except (TypeError, UnicodeEncodeError, ValueError):
+                    return None
+                response_time = parse_http_date(response.get("date_header"))
+                if (
+                    response.get("body_sha256")
+                    != hashlib.sha256(body_bytes).hexdigest()
+                    or response_time is None
+                ):
+                    return None
+                return (body, response_time)
+
+            def parse_scope_receipts(
+                responses: object,
+            ) -> tuple[tuple[object, ...], tuple[int, int]] | None:
+                if (
+                    not isinstance(responses, dict)
+                    or len(responses) != 2
+                    or set(responses) != {"pull", "compare"}
+                ):
+                    return None
+                parsed_pull = parse_response(
+                    responses["pull"],
+                    request_url=f"{api_root}/pulls/{pr}",
+                )
+                if parsed_pull is None:
+                    return None
+                pull_body, pull_time = parsed_pull
+                pull_number = (
+                    pull_body.get("number") if isinstance(pull_body, dict) else None
+                )
+                pull_base = (
+                    pull_body.get("base") if isinstance(pull_body, dict) else None
+                )
+                pull_head = (
+                    pull_body.get("head") if isinstance(pull_body, dict) else None
+                )
+                pull_base_sha = (
+                    pull_base.get("sha") if isinstance(pull_base, dict) else None
+                )
+                pull_head_sha = (
+                    pull_head.get("sha") if isinstance(pull_head, dict) else None
+                )
+                if (
+                    type(pull_number) is not int
+                    or pull_number != pr
+                    or not isinstance(pull_base_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", pull_base_sha) is None
+                    or not isinstance(pull_head_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", pull_head_sha) is None
+                    or pull_head_sha != receipt_head
+                ):
+                    return None
+                parsed_compare = parse_response(
+                    responses["compare"],
+                    request_url=(
+                        f"{api_root}/compare/{pull_base_sha}...{pull_head_sha}"
+                    ),
+                )
+                if parsed_compare is None:
+                    return None
+                compare_body, compare_time = parsed_compare
+                compare_base = (
+                    compare_body.get("base_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
+                compare_head = (
+                    compare_body.get("head_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
+                compare_merge_base = (
+                    compare_body.get("merge_base_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
+                if (
+                    not isinstance(compare_base, dict)
+                    or compare_base.get("sha") != pull_base_sha
+                    or not isinstance(compare_head, dict)
+                    or compare_head.get("sha") != pull_head_sha
+                    or not isinstance(compare_merge_base, dict)
+                    or compare_merge_base.get("sha") != merge_base
+                ):
+                    return None
+                return (
+                    (
+                        repository,
+                        pr,
+                        pull_base_sha,
+                        merge_base,
+                        receipt_head,
+                    ),
+                    (pull_time, compare_time),
+                )
+
+            parsed_pre = parse_scope_receipts(value.get("pre_artifact_scope_receipts"))
+            parsed_post = parse_scope_receipts(
+                value.get("post_artifact_scope_receipts")
+            )
+            if channel == "pull-request-review":
+                artifact_url = f"{api_root}/pulls/{pr}/reviews/{artifact_id}"
+                expected_raw_artifact = raw_review_record(snapshot)
+                expected_projection = project_raw_review_record(expected_raw_artifact)
+            elif channel == "issue-comment":
+                artifact_url = snapshot.get("api_url")
+                expected_raw_artifact = raw_issue_artifact_record(snapshot)
+                expected_projection = project_raw_issue_record(expected_raw_artifact)
+            else:
+                return False
+            if not isinstance(artifact_url, str) or expected_projection is None:
+                return False
+            parsed_get = parse_response(
+                value.get("artifact_get_receipt"),
+                request_url=artifact_url,
+            )
+            if parsed_pre is None or parsed_post is None or parsed_get is None:
+                return False
+            artifact_body, artifact_get_time = parsed_get
+            actual_projection = (
+                project_raw_review_record(artifact_body)
+                if channel == "pull-request-review"
+                else project_raw_issue_record(artifact_body)
+            )
+            receipt_scope = parsed_pre[0]
+            scope_is_eligible = (
+                receipt_scope[:2] == expected_scope[:2]
+                and receipt_scope[3] == expected_scope[2]
+                and receipt_scope[4] == receipt_head
+                and (
+                    snapshot.get("outcome") == "findings"
+                    or receipt_head == expected_scope[3]
+                )
+            )
+            return (
+                scope_is_eligible
+                and parsed_post[0] == receipt_scope
+                and typed_json_equal(actual_projection, expected_projection)
+                and max(parsed_pre[1]) <= artifact_time
+                and artifact_time <= artifact_get_time
+                and artifact_get_time <= min(parsed_post[1])
+                and resource_budget_charge(tracker)
+            )
+
+        def _validate_candidate_artifact_uncached(
             value: object,
             *,
             expected_kind: str,
             expected_scope: tuple[object, ...],
-        ) -> tuple[int, int, str, str, str] | None:
+            artifact_receipt_resource_tracker: dict[str, object] | None = None,
+        ) -> tuple[int, int, str, str, str, str] | None:
             if not isinstance(value, dict):
                 return None
             initial = value.get("initial_snapshot")
             final = value.get("final_snapshot")
             if (
-                set(value) != {"initial_snapshot", "final_snapshot"}
+                set(value)
+                != {
+                    "initial_snapshot",
+                    "final_snapshot",
+                    "artifact_scope_receipt",
+                }
                 or not isinstance(initial, dict)
                 or not isinstance(final, dict)
                 or not typed_json_equal(initial, final)
+                or not artifact_scope_receipt_matches(
+                    value.get("artifact_scope_receipt"),
+                    final,
+                    expected_scope=expected_scope,
+                    resource_tracker=artifact_receipt_resource_tracker,
+                )
             ):
                 return None
             repository, pr, merge_base, head = expected_scope
@@ -6698,7 +7161,6 @@ class RepositoryContractTest(unittest.TestCase):
                 or final.get("user_type") != "Bot"
                 or type(server_time) is not int
                 or server_time <= 0
-                or server_time > history_as_of_server_time
                 or not typed_json_equal(
                     final.get("scope"),
                     {
@@ -6715,6 +7177,7 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             if channel == "pull-request-review":
+                artifact_commit = final.get("commit_id")
                 if (
                     set(final) != review_snapshot_keys
                     or final.get("url")
@@ -6725,10 +7188,12 @@ class RepositoryContractTest(unittest.TestCase):
                     or type(final.get("submitted_at")) is not int
                     or final.get("submitted_at") != server_time
                     or final.get("server_time_field") != "submitted_at"
-                    or final.get("commit_id") != head
+                    or not isinstance(artifact_commit, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", artifact_commit) is None
                 ):
                     return None
             elif channel == "issue-comment":
+                artifact_commit = final.get("parsed_commit")
                 created_at = final.get("created_at")
                 updated_at = final.get("updated_at")
                 expected_time = created_at if updated_at == created_at else updated_at
@@ -6754,71 +7219,95 @@ class RepositoryContractTest(unittest.TestCase):
                     or updated_at < created_at
                     or expected_time != server_time
                     or final.get("server_time_field") != expected_time_field
-                    or final.get("parsed_commit") != head
+                    or not isinstance(artifact_commit, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", artifact_commit) is None
                     or not _github_codex_issue_terminal_looking(normalized_body)
                 ):
                     return None
             else:
                 return None
 
-            expected_finding = (
-                "### 💡 Codex Review\n"
-                "- [P1] Fixture finding — "
-                f"https://github.com/{repository}/blob/{head}/"
-                "src/example.py#L1"
+            preliminary_review_targets: list[dict[str, object]] | None = []
+            if channel == "pull-request-review":
+                associated = final.get("associated_inline_comments")
+                preliminary_children = (
+                    associated.get("records") if isinstance(associated, dict) else None
+                )
+                preliminary_review_targets = _selected_review_target_children(
+                    preliminary_children,
+                    repository=str(repository),
+                    pull_request=int(pr),
+                    parent_review_id=artifact_id,
+                )
+                if preliminary_review_targets is None:
+                    return None
+            review_semantic, review_commit = (
+                _github_codex_review_body_semantic(
+                    body,
+                    repository=str(repository),
+                    state=final.get("state"),
+                    commit_id=artifact_commit,
+                    current_head=str(head),
+                    has_target_children=bool(preliminary_review_targets),
+                )
+                if channel == "pull-request-review"
+                else ("nonterminal", None)
             )
             issue_semantic, issue_commit = (
                 _github_codex_issue_body_semantic(
                     body,
                     repository=str(repository),
                     head=str(head),
+                    allow_foreign_finding_sha=True,
                 )
                 if channel == "issue-comment"
                 else ("nonterminal", None)
             )
-            clean_grammar = outcome == "clean" and (
-                (
-                    channel == "pull-request-review"
-                    and final.get("state") == "APPROVED"
-                    and body == "No findings."
-                    and final.get("grammar_status") == "accepted"
+            clean_grammar = (
+                outcome == "clean"
+                and (
+                    (
+                        channel == "pull-request-review"
+                        and review_semantic == "clean"
+                        and review_commit == artifact_commit
+                        and final.get("grammar_status") == "accepted"
+                    )
+                    or (
+                        channel == "issue-comment"
+                        and issue_semantic == "clean"
+                        and issue_commit == head
+                        and final.get("grammar_status") == "accepted"
+                    )
                 )
-                or (
-                    channel == "issue-comment"
-                    and issue_semantic == "clean"
-                    and issue_commit == head
-                    and final.get("grammar_status") == "accepted"
-                )
+                and artifact_commit == head
             )
             finding_grammar = (
                 outcome == "findings"
                 and (
                     (
                         channel == "pull-request-review"
-                        and final.get("state") in {"COMMENTED", "CHANGES_REQUESTED"}
+                        and review_semantic == "findings"
+                        and review_commit == artifact_commit
                     )
                     or (
                         channel == "issue-comment"
                         and issue_semantic == "findings"
-                        and issue_commit == head
+                        and issue_commit == artifact_commit
                     )
-                )
-                and (
-                    body == expected_finding
-                    if channel == "pull-request-review"
-                    else True
                 )
                 and final.get("grammar_status") == "accepted"
             )
             inline_finding_grammar = (
                 channel == "pull-request-review"
                 and outcome == "findings"
-                and final.get("state") == "COMMENTED"
-                and body == ""
+                and review_semantic == "findings"
+                and review_commit == artifact_commit
+                and bool(preliminary_review_targets)
                 and final.get("grammar_status") == "accepted"
             )
             malformed_grammar = (
                 outcome == "malformed"
+                and artifact_commit == head
                 and (
                     (
                         channel == "pull-request-review"
@@ -6833,8 +7322,70 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 and final.get("grammar_status") == "malformed"
             )
+
+            def review_thread_evidence() -> (
+                tuple[list[dict[str, object]], list[dict[str, object]]] | None
+            ):
+                associated = final.get("associated_inline_comments")
+                children = (
+                    associated.get("records") if isinstance(associated, dict) else None
+                )
+                if (
+                    not isinstance(associated, dict)
+                    or set(associated) != {"pagination_complete", "records"}
+                    or associated.get("pagination_complete") is not True
+                    or not isinstance(children, list)
+                    or len(children) > evidence_resource_budget_v1["max_records"]
+                ):
+                    return None
+                target_children = _selected_review_target_children(
+                    children,
+                    repository=str(repository),
+                    pull_request=int(pr),
+                    parent_review_id=artifact_id,
+                )
+                thread_findings = _review_thread_findings_from_raw(
+                    children,
+                    final.get("review_thread_pages"),
+                    repository=str(repository),
+                    pull_request=int(pr),
+                    parent_review_id=artifact_id,
+                )
+                child_fields = {
+                    "id",
+                    "url",
+                    "user_login",
+                    "user_type",
+                    "pull_request_review_id",
+                    "commit_id",
+                    "original_commit_id",
+                    "body",
+                    "normalized_body",
+                }
+
+                def valid_target_child(child: dict[str, object]) -> bool:
+                    raw_child_body = child.get("body")
+                    normalized_child_body = _normalize_github_codex_body(raw_child_body)
+                    return (
+                        set(child) == child_fields
+                        and child.get("commit_id") == artifact_commit
+                        and child.get("original_commit_id") == artifact_commit
+                        and isinstance(raw_child_body, str)
+                        and bool(normalized_child_body)
+                        and child.get("normalized_body") == normalized_child_body
+                    )
+
+                if (
+                    target_children is None
+                    or thread_findings is None
+                    or len(target_children) != len(thread_findings)
+                    or any(not valid_target_child(child) for child in target_children)
+                ):
+                    return None
+                return (target_children, thread_findings)
+
             if expected_kind == "terminal-payload":
-                if not (clean_grammar or finding_grammar):
+                if not (clean_grammar or finding_grammar or inline_finding_grammar):
                     return None
             elif expected_kind == "malformed-terminal-artifact":
                 if not malformed_grammar:
@@ -6845,71 +7396,92 @@ class RepositoryContractTest(unittest.TestCase):
             elif expected_kind == "unresolved-thread-finding":
                 if channel != "pull-request-review":
                     return None
-                child_id = (artifact_id * 10) + 1
-                associated = final.get("associated_inline_comments")
-                children = (
-                    associated.get("records") if isinstance(associated, dict) else None
-                )
-                thread_findings = _review_thread_findings_from_raw(
-                    children,
-                    final.get("review_thread_pages"),
-                    repository=str(repository),
-                    pull_request=int(pr),
-                    parent_review_id=artifact_id,
-                )
+                thread_evidence = review_thread_evidence()
                 if (
                     not inline_finding_grammar
-                    or not typed_json_equal(
-                        associated,
-                        {
-                            "pagination_complete": True,
-                            "records": [
-                                {
-                                    "id": child_id,
-                                    "url": (
-                                        f"https://github.com/{repository}/pull/{pr}"
-                                        f"#discussion_r{child_id}"
-                                    ),
-                                    "user_login": exact_login,
-                                    "user_type": "Bot",
-                                    "pull_request_review_id": artifact_id,
-                                    "commit_id": head,
-                                    "original_commit_id": head,
-                                    "body": "[P1] Fixture inline finding",
-                                    "normalized_body": "[P1] Fixture inline finding",
-                                }
-                            ],
-                        },
+                    or thread_evidence is None
+                    or not thread_evidence[0]
+                    or not any(
+                        finding["is_resolved"] is False
+                        for finding in thread_evidence[1]
                     )
-                    or not isinstance(thread_findings, list)
-                    or len(thread_findings) != 1
-                    or thread_findings[0]["is_resolved"] is not False
                 ):
                     return None
             else:
                 return None
-            if (
-                channel == "pull-request-review"
-                and expected_kind != "unresolved-thread-finding"
-                and (
-                    not typed_json_equal(
-                        final.get("associated_inline_comments"),
-                        {"pagination_complete": True, "records": []},
-                    )
-                    or not typed_json_equal(
-                        _review_thread_findings_from_raw(
-                            [],
-                            final.get("review_thread_pages"),
-                            repository=str(repository),
-                            pull_request=int(pr),
-                            parent_review_id=artifact_id,
-                        ),
-                        [],
+            if channel == "pull-request-review" and expected_kind != (
+                "unresolved-thread-finding"
+            ):
+                thread_evidence = review_thread_evidence()
+                resolved_thread_payload = (
+                    expected_kind == "terminal-payload"
+                    and inline_finding_grammar
+                    and thread_evidence is not None
+                    and bool(thread_evidence[0])
+                    and all(
+                        finding["is_resolved"] is True for finding in thread_evidence[1]
                     )
                 )
-            ):
+                empty_thread_payload = (
+                    thread_evidence is not None
+                    and not thread_evidence[0]
+                    and not thread_evidence[1]
+                )
+                if not (resolved_thread_payload or empty_thread_payload):
+                    return None
+            return (
+                server_time,
+                artifact_id,
+                expected_kind,
+                outcome,
+                channel,
+                artifact_commit,
+            )
+
+        def validate_candidate_artifact(
+            value: object,
+            *,
+            expected_kind: str,
+            expected_scope: tuple[object, ...],
+            artifact_validation_context: dict[str, object] | None = None,
+        ) -> tuple[int, int, str, str, str, str] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
+            context_parts = artifact_validation_context_parts(context)
+            if context_parts is None:
                 return None
-            return (server_time, artifact_id, expected_kind, outcome, channel)
+            resource_tracker, validated_artifacts = context_parts
+            if resource_tracker.get("failed") is not False:
+                return None
+            if not isinstance(value, dict) or not isinstance(expected_scope, tuple):
+                return None
+            cache_key = (id(value), expected_kind, expected_scope)
+            try:
+                hash(cache_key)
+            except TypeError:
+                return None
+            if cache_key in validated_artifacts:
+                cache_entry = validated_artifacts[cache_key]
+                if (
+                    not isinstance(cache_entry, dict)
+                    or set(cache_entry) != {"wrapper", "validated"}
+                    or cache_entry.get("wrapper") is not value
+                ):
+                    return None
+                cached = cache_entry["validated"]
+                return cached if isinstance(cached, tuple) else None
+            validated = _validate_candidate_artifact_uncached(
+                value,
+                expected_kind=expected_kind,
+                expected_scope=expected_scope,
+                artifact_receipt_resource_tracker=resource_tracker,
+            )
+            validated_artifacts[cache_key] = {
+                "wrapper": value,
+                "validated": validated,
+            }
+            return validated
 
         def classify_reaction_scope(
             record: dict[str, object],
@@ -7126,16 +7698,88 @@ class RepositoryContractTest(unittest.TestCase):
             record: dict[str, object],
             *,
             prefer_unresolved_thread_blocker: bool = False,
+            finding_ancestry: dict[str, int] | None = None,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> tuple[int, int] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
+            context_parts = artifact_validation_context_parts(context)
             initial_snapshot = record.get("initial_snapshot")
             final_snapshot = record.get("final_snapshot")
+            evidence_state = record.get("evidence_state")
+            artifact_fields = {
+                "terminal_payloads": "terminal-payload",
+                "malformed_terminal_artifacts": "malformed-terminal-artifact",
+                "active_top_level_findings": "active-top-level-finding",
+                "unresolved_thread_findings": "unresolved-thread-finding",
+            }
             if (
-                set(record) != record_fields
+                context is None
+                or context_parts is None
+                or set(record) != record_fields
                 or not isinstance(initial_snapshot, dict)
                 or not isinstance(final_snapshot, dict)
-                or not typed_json_equal(initial_snapshot, final_snapshot)
-                or not typed_json_equal(final_snapshot, record_snapshot(record))
+                or not isinstance(evidence_state, dict)
+                or set(evidence_state) != set(artifact_fields)
             ):
+                return None
+            resource_tracker, validated_artifacts = context_parts
+            artifact_arrays: dict[str, list[object]] = {}
+            artifact_counts: dict[str, int] = {}
+            wrapper_array_headers: list[tuple[str, int, int]] = []
+            wrapper_entry_count = 0
+            for field in artifact_fields:
+                artifacts = evidence_state.get(field)
+                if not isinstance(artifacts, list):
+                    return None
+                try:
+                    artifact_count = len(artifacts)
+                except (OverflowError, TypeError, ValueError):
+                    return None
+                artifact_arrays[field] = artifacts
+                artifact_counts[field] = artifact_count
+                wrapper_entry_count += artifact_count
+                wrapper_array_headers.append((field, id(artifacts), artifact_count))
+            wrapper_ledger_key = ("artifact-wrapper-array-entries", id(record))
+            wrapper_ledger_entry = validated_artifacts.get(wrapper_ledger_key)
+            if wrapper_ledger_entry is None:
+                if wrapper_entry_count and not resource_budget_charge(
+                    resource_tracker, records=wrapper_entry_count
+                ):
+                    return None
+            elif (
+                not isinstance(wrapper_ledger_entry, dict)
+                or set(wrapper_ledger_entry)
+                != {"record", "array_headers", "entry_identity"}
+                or wrapper_ledger_entry.get("record") is not record
+                or wrapper_ledger_entry.get("array_headers")
+                != tuple(wrapper_array_headers)
+            ):
+                return None
+            try:
+                wrapper_entry_identity_parts: list[tuple[str, tuple[int, ...]]] = []
+                for field in artifact_fields:
+                    entry_identity = tuple(
+                        id(artifact) for artifact in artifact_arrays[field]
+                    )
+                    if len(entry_identity) != artifact_counts[field]:
+                        return None
+                    wrapper_entry_identity_parts.append((field, entry_identity))
+                wrapper_entry_identity = tuple(wrapper_entry_identity_parts)
+            except Exception:
+                return None
+            if wrapper_ledger_entry is None:
+                validated_artifacts[wrapper_ledger_key] = {
+                    "record": record,
+                    "array_headers": tuple(wrapper_array_headers),
+                    "entry_identity": wrapper_entry_identity,
+                }
+            elif wrapper_ledger_entry.get("entry_identity") != wrapper_entry_identity:
+                return None
+            if not typed_json_equal(
+                initial_snapshot, final_snapshot
+            ) or not typed_json_equal(final_snapshot, record_snapshot(record)):
                 return None
             record_scope_key = scope_key(record)
             if (
@@ -7145,31 +7789,19 @@ class RepositoryContractTest(unittest.TestCase):
                 or not lifecycle_is_typed(record, require_open=False)
             ):
                 return None
-            evidence_state = record.get("evidence_state")
-            if not isinstance(evidence_state, dict):
-                return None
-            artifact_fields = {
-                "terminal_payloads": "terminal-payload",
-                "malformed_terminal_artifacts": "malformed-terminal-artifact",
-                "active_top_level_findings": "active-top-level-finding",
-                "unresolved_thread_findings": "unresolved-thread-finding",
-            }
-            if set(evidence_state) != set(artifact_fields):
-                return None
-            artifact_bases: list[tuple[int, int, str, str, str]] = []
+            artifact_bases: list[tuple[int, int, str, str, str, str]] = []
             artifacts_by_native_id: dict[tuple[str, int], dict[str, object]] = {}
             artifact_semantics_by_time_id: dict[
                 tuple[str, int, int], tuple[str, str]
             ] = {}
             for field, kind in artifact_fields.items():
-                artifacts = evidence_state.get(field)
-                if not isinstance(artifacts, list):
-                    return None
+                artifacts = artifact_arrays[field]
                 for artifact in artifacts:
                     validated_artifact = validate_candidate_artifact(
                         artifact,
                         expected_kind=kind,
                         expected_scope=record_scope_key,
+                        artifact_validation_context=context,
                     )
                     if validated_artifact is None:
                         return None
@@ -7179,7 +7811,17 @@ class RepositoryContractTest(unittest.TestCase):
                         validated_kind,
                         outcome,
                         channel,
+                        _artifact_commit,
                     ) = validated_artifact
+                    if (
+                        outcome == "findings"
+                        and _artifact_commit != record_scope_key[3]
+                        and (
+                            not isinstance(finding_ancestry, dict)
+                            or finding_ancestry.get(_artifact_commit) != 0
+                        )
+                    ):
+                        return None
                     native_key = (channel, stable_artifact_id)
                     final_artifact_snapshot = artifact["final_snapshot"]
                     assert isinstance(final_artifact_snapshot, dict)
@@ -7211,7 +7853,7 @@ class RepositoryContractTest(unittest.TestCase):
                         if item[2] == "unresolved-thread-finding"
                     ]
                     if unresolved_artifact_bases:
-                        server_time, stable_artifact_id, _, _, _ = max(
+                        server_time, stable_artifact_id, _, _, _, _ = max(
                             unresolved_artifact_bases,
                             key=lambda item: (item[0], item[1]),
                         )
@@ -7224,9 +7866,9 @@ class RepositoryContractTest(unittest.TestCase):
                     return None
 
                 def artifact_precedence(
-                    item: tuple[int, int, str, str, str],
+                    item: tuple[int, int, str, str, str, str],
                 ) -> int:
-                    _, _, artifact_kind, outcome, _ = item
+                    _, _, artifact_kind, outcome, _, _ = item
                     if artifact_kind == "malformed-terminal-artifact":
                         return 3
                     if outcome == "findings":
@@ -7241,7 +7883,7 @@ class RepositoryContractTest(unittest.TestCase):
                     for item in latest_artifacts
                     if artifact_precedence(item) == highest_priority
                 ]
-                server_time, stable_artifact_id, kind, _, _ = max(
+                server_time, stable_artifact_id, kind, _, _, _ = max(
                     priority_artifacts,
                     key=lambda item: item[1],
                 )
@@ -7548,6 +8190,8 @@ class RepositoryContractTest(unittest.TestCase):
         def candidate_source_evidence(
             candidate: dict[str, object],
             ordering_key: tuple[int, int] | None,
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             basis = candidate.get("candidate_basis")
             if ordering_key is None or not isinstance(basis, dict):
@@ -7656,6 +8300,7 @@ class RepositoryContractTest(unittest.TestCase):
                     artifact,
                     expected_kind=str(basis_kind),
                     expected_scope=candidate_scope_key,
+                    artifact_validation_context=artifact_validation_context,
                 )
                 if (
                     validated is None
@@ -7687,7 +8332,12 @@ class RepositoryContractTest(unittest.TestCase):
 
         def candidate_scope_authority_audit(
             candidate: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             candidate_scope_key = scope_key(candidate)
             lifecycle = candidate.get("lifecycle")
             requests = candidate.get("requests")
@@ -7695,7 +8345,12 @@ class RepositoryContractTest(unittest.TestCase):
             evidence_state = candidate.get("evidence_state")
             candidate_basis = candidate.get("candidate_basis")
             if (
-                candidate_order_basis(candidate) is None
+                context is None
+                or candidate_order_basis(
+                    candidate,
+                    artifact_validation_context=context,
+                )
+                is None
                 or candidate_scope_key is None
                 or not isinstance(lifecycle, dict)
                 or not isinstance(requests, list)
@@ -7783,6 +8438,7 @@ class RepositoryContractTest(unittest.TestCase):
                         artifact,
                         expected_kind=kind,
                         expected_scope=candidate_scope_key,
+                        artifact_validation_context=context,
                     )
                     if (
                         validated is None
@@ -7790,13 +8446,25 @@ class RepositoryContractTest(unittest.TestCase):
                         or not isinstance(artifact.get("final_snapshot"), dict)
                     ):
                         return None
-                    server_time, artifact_id, _, semantic, channel = validated
+                    (
+                        server_time,
+                        artifact_id,
+                        _,
+                        semantic,
+                        channel,
+                        artifact_commit,
+                    ) = validated
                     source_bundle = artifact_source_bundle(artifact["final_snapshot"])
                     audit_entry = {
                         "server_time": server_time,
                         "id": artifact_id,
                         "channel": channel,
                         "semantic": semantic,
+                        "artifact_commit": (
+                            None
+                            if channel == "issue-comment" and semantic == "malformed"
+                            else artifact_commit
+                        ),
                         "source_record_sha256": hashlib.sha256(
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
@@ -7824,11 +8492,23 @@ class RepositoryContractTest(unittest.TestCase):
 
         def derived_inventory_entries(
             candidates: list[dict[str, object]],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]]:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             entries: list[dict[str, object]] = []
             for candidate in candidates:
                 candidate_scope_key = scope_key(candidate)
-                ordering_key = candidate_order_basis(candidate)
+                ordering_key = (
+                    candidate_order_basis(
+                        candidate,
+                        artifact_validation_context=context,
+                    )
+                    if context is not None
+                    else None
+                )
                 entries.append(
                     {
                         "scope_key": (
@@ -7842,6 +8522,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "source_evidence": candidate_source_evidence(
                             candidate,
                             ordering_key,
+                            artifact_validation_context=context,
                         ),
                     }
                 )
@@ -7922,7 +8603,40 @@ class RepositoryContractTest(unittest.TestCase):
                 "retained_pages": 0,
                 "records": 0,
                 "retained_utf8_bytes": 0,
+                "failed": False,
             }
+
+        def new_artifact_validation_context(
+            *,
+            tightened_limits: dict[str, int] | None = None,
+            monotonic_clock: object = time.monotonic,
+        ) -> dict[str, object] | None:
+            resource_tracker = new_resource_tracker(
+                tightened_limits=tightened_limits,
+                monotonic_clock=monotonic_clock,
+            )
+            if resource_tracker is None:
+                return None
+            return {
+                "resource_tracker": resource_tracker,
+                "validated_artifacts": {},
+            }
+
+        def artifact_validation_context_parts(
+            value: object,
+        ) -> tuple[dict[str, object], dict[object, object]] | None:
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"resource_tracker", "validated_artifacts"}
+                or not isinstance(value.get("resource_tracker"), dict)
+                or not isinstance(value.get("validated_artifacts"), dict)
+            ):
+                return None
+            resource_tracker = value["resource_tracker"]
+            validated_artifacts = value["validated_artifacts"]
+            assert isinstance(resource_tracker, dict)
+            assert isinstance(validated_artifacts, dict)
+            return (resource_tracker, validated_artifacts)
 
         def new_sibling_resource_tracker(
             parent: dict[str, object],
@@ -7951,6 +8665,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "retained_pages": 0,
                 "records": 0,
                 "retained_utf8_bytes": 0,
+                "failed": False,
             }
 
         def resource_budget_charge(
@@ -7963,20 +8678,28 @@ class RepositoryContractTest(unittest.TestCase):
             retained_utf8_bytes: int = 0,
             page_body_bytes: int | None = None,
         ) -> bool:
-            if any(
-                type(value) is not int or value < 0
-                for value in (
-                    controlled_requests,
-                    fetch_attempts,
-                    retained_pages,
-                    records,
-                    retained_utf8_bytes,
-                )
-            ) or (
-                page_body_bytes is not None
-                and (type(page_body_bytes) is not int or page_body_bytes < 0)
-            ):
+            def fail() -> bool:
+                tracker["failed"] = True
                 return False
+
+            if (
+                tracker.get("failed") is not False
+                or any(
+                    type(value) is not int or value < 0
+                    for value in (
+                        controlled_requests,
+                        fetch_attempts,
+                        retained_pages,
+                        records,
+                        retained_utf8_bytes,
+                    )
+                )
+                or (
+                    page_body_bytes is not None
+                    and (type(page_body_bytes) is not int or page_body_bytes < 0)
+                )
+            ):
+                return fail()
             limits = tracker.get("limits")
             clock = tracker.get("clock")
             started = tracker.get("started")
@@ -7987,11 +8710,11 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(started, float)
                 or not isinstance(max_observed, float)
             ):
-                return False
+                return fail()
             try:
                 observed = clock()
             except Exception:
-                return False
+                return fail()
             if (
                 isinstance(observed, bool)
                 or not isinstance(observed, (int, float))
@@ -8003,7 +8726,7 @@ class RepositoryContractTest(unittest.TestCase):
                     and page_body_bytes > limits["max_page_body_bytes"]
                 )
             ):
-                return False
+                return fail()
             charges = {
                 "controlled_requests": controlled_requests,
                 "fetch_attempts": fetch_attempts,
@@ -8022,10 +8745,10 @@ class RepositoryContractTest(unittest.TestCase):
             for counter, charge in charges.items():
                 current = tracker.get(counter)
                 if type(current) is not int:
-                    return False
+                    return fail()
                 next_value = current + charge
                 if next_value > limits[limit_names[counter]]:
-                    return False
+                    return fail()
                 next_values[counter] = next_value
             tracker.update(next_values)
             tracker["max_observed"] = float(observed)
@@ -9446,7 +10169,7 @@ class RepositoryContractTest(unittest.TestCase):
                 '"isResolved":false,"isResolved":false',
                 1,
             ),
-            "nonstandard-constant": lambda body: (f'{body[:-1]},"ignored":NaN}}'),
+            "nonstandard-constant": lambda body: f'{body[:-1]},"ignored":NaN}}',
         }.items():
             malformed_graphql_json = clone(graphql_shape_fetch)
             assert isinstance(malformed_graphql_json, dict)
@@ -9562,6 +10285,7 @@ class RepositoryContractTest(unittest.TestCase):
             _monotonic_clock: object = time.monotonic,
             _single_scope_pull_number: int | None = None,
             _allow_post_as_of_requests: bool = False,
+            _allow_post_as_of_artifacts: bool = False,
         ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
@@ -9574,6 +10298,7 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(value.get("scopes"), list)
                 or type(prefer_unresolved_thread_blocker) is not bool
                 or type(_allow_post_as_of_requests) is not bool
+                or type(_allow_post_as_of_artifacts) is not bool
                 or (
                     _single_scope_pull_number is not None
                     and (
@@ -9958,8 +10683,12 @@ class RepositoryContractTest(unittest.TestCase):
                         if created_at > history_as_of_server_time:
                             if actor == "different":
                                 continue
-                            return None
-                        if updated_at > history_as_of_server_time:
+                            if not _allow_post_as_of_artifacts:
+                                return None
+                        if (
+                            updated_at > history_as_of_server_time
+                            and not _allow_post_as_of_artifacts
+                        ):
                             return None
                         terminal_looking = _github_codex_issue_terminal_looking(
                             normalized_issue
@@ -10080,12 +10809,13 @@ class RepositoryContractTest(unittest.TestCase):
                         type(submitted_at) is int
                         and submitted_at > history_as_of_server_time
                     ):
-                        if actor != "different":
+                        if actor == "different":
+                            other_review_ids.add(review_id)
+                            excluded_future_review_ids.add(review_id)
+                            excluded_future_review_by_id[review_id] = projected_review
+                            continue
+                        if not _allow_post_as_of_artifacts:
                             return None
-                        other_review_ids.add(review_id)
-                        excluded_future_review_ids.add(review_id)
-                        excluded_future_review_by_id[review_id] = projected_review
-                        continue
                     if actor == "different":
                         other_review_ids.add(review_id)
                         nonterminal_records.append(
@@ -10383,8 +11113,10 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     )
 
-                artifact_bases: list[tuple[int, int, str, str, str]] = []
-                unresolved_artifact_bases: list[tuple[int, int, str, str, str]] = []
+                artifact_bases: list[tuple[int, int, str, str, str, str | None]] = []
+                unresolved_artifact_bases: list[
+                    tuple[int, int, str, str, str, str | None]
+                ] = []
                 for review_id, raw_review in review_by_id.items():
                     user = raw_review.get("user")
                     submitted_at = raw_review.get("submitted_at")
@@ -10393,7 +11125,10 @@ class RepositoryContractTest(unittest.TestCase):
                         raw_actor(user) != "exact"
                         or type(submitted_at) is not int
                         or submitted_at <= 0
-                        or submitted_at > history_as_of_server_time
+                        or (
+                            submitted_at > history_as_of_server_time
+                            and not _allow_post_as_of_artifacts
+                        )
                         or raw_review.get("html_url")
                         != (
                             f"https://github.com/{repository}/pull/{pr}"
@@ -10428,18 +11163,27 @@ class RepositoryContractTest(unittest.TestCase):
                         return None
                     body = raw_review.get("body")
                     state = raw_review.get("state")
-                    if joined:
-                        semantic = "findings"
-                    elif body == "No findings." and state == "APPROVED":
-                        semantic = "clean"
-                    elif (
-                        isinstance(body, str)
-                        and body.startswith("### 💡 Codex Review\n")
-                        and state in {"COMMENTED", "CHANGES_REQUESTED"}
-                    ):
-                        semantic = "findings"
-                    else:
-                        semantic = "malformed"
+                    for child in inline_by_review[review_id]:
+                        normalized_child_body = _normalize_github_codex_body(
+                            child.get("body")
+                        )
+                        if (
+                            child.get("commit_id") != review_commit
+                            or child.get("original_commit_id") != review_commit
+                            or not normalized_child_body
+                            or child.get("normalized_body") != normalized_child_body
+                        ):
+                            return None
+                    semantic, semantic_commit = _github_codex_review_body_semantic(
+                        body,
+                        repository=repository,
+                        state=state,
+                        commit_id=review_commit,
+                        current_head=head,
+                        has_target_children=bool(joined),
+                    )
+                    if semantic_commit not in {None, review_commit}:
+                        return None
                     if (
                         parsed_scope == current_scope_key
                         and semantic == "findings"
@@ -10470,6 +11214,7 @@ class RepositoryContractTest(unittest.TestCase):
                         hashlib.sha256(
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
+                        review_commit,
                     )
                     artifact_bases.append(artifact_basis)
                     if any(finding.get("is_resolved") is False for finding in joined):
@@ -10543,6 +11288,7 @@ class RepositoryContractTest(unittest.TestCase):
                             hashlib.sha256(
                                 canonical_raw_body(raw_issue).encode("utf-8")
                             ).hexdigest(),
+                            parsed_commit,
                         )
                     )
 
@@ -10568,7 +11314,12 @@ class RepositoryContractTest(unittest.TestCase):
                     if created_at > history_as_of_server_time:
                         if actor == "different":
                             continue
-                        return None
+                        if not (
+                            _allow_post_as_of_artifacts
+                            and parsed_scope == current_scope_key
+                            and artifact_bases
+                        ):
+                            return None
                     semantic_reaction_records.append(raw_reaction)
                     if actor == "different":
                         continue
@@ -10638,6 +11389,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "channel": channel,
                         "semantic": semantic,
                         "source_record_sha256": source_digest,
+                        "artifact_commit": artifact_commit,
                     }
                     for (
                         server_time,
@@ -10645,6 +11397,7 @@ class RepositoryContractTest(unittest.TestCase):
                         channel,
                         semantic,
                         source_digest,
+                        artifact_commit,
                     ) in sorted(artifact_bases)
                 ]
                 scope_audit_nonterminal = [
@@ -10898,6 +11651,7 @@ class RepositoryContractTest(unittest.TestCase):
                                 "channel": channel,
                                 "semantic": semantic,
                                 "source_record_sha256": source_digest,
+                                "artifact_commit": artifact_commit,
                             }
                             for (
                                 server_time,
@@ -10905,6 +11659,7 @@ class RepositoryContractTest(unittest.TestCase):
                                 channel,
                                 semantic,
                                 source_digest,
+                                artifact_commit,
                             ) in sorted(artifact_bases)
                         ],
                         "provider_reactions": [
@@ -11184,6 +11939,7 @@ class RepositoryContractTest(unittest.TestCase):
                 _monotonic_clock=_monotonic_clock,
                 _single_scope_pull_number=current_pr,
                 _allow_post_as_of_requests=True,
+                _allow_post_as_of_artifacts=True,
             )
             entries = (
                 parsed_transcript.get("entries")
@@ -11271,13 +12027,19 @@ class RepositoryContractTest(unittest.TestCase):
 
         def validate_history_universe(
             candidate_history: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             initial_candidates = candidate_history.get("initial_candidates")
             final_candidates = candidate_history.get("final_candidates")
             initial_inventory = candidate_history.get("initial_inventory")
             final_inventory = candidate_history.get("final_inventory")
             if (
-                not isinstance(initial_candidates, list)
+                context is None
+                or not isinstance(initial_candidates, list)
                 or not isinstance(final_candidates, list)
                 or not typed_json_equal(initial_candidates, final_candidates)
                 or not isinstance(initial_inventory, dict)
@@ -11397,7 +12159,10 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             initial_projection, initial_historical_entries = initial_validated
             final_projection, final_historical_entries = final_validated
-            candidate_entries = derived_inventory_entries(final_candidates)
+            candidate_entries = derived_inventory_entries(
+                final_candidates,
+                artifact_validation_context=context,
+            )
             final_scope_audits = final_projection.get("scope_authority_audit")
             if not isinstance(final_scope_audits, list):
                 return None
@@ -11415,7 +12180,10 @@ class RepositoryContractTest(unittest.TestCase):
             for candidate in final_candidates:
                 if not isinstance(candidate, dict):
                     return None
-                candidate_audit = candidate_scope_authority_audit(candidate)
+                candidate_audit = candidate_scope_authority_audit(
+                    candidate,
+                    artifact_validation_context=context,
+                )
                 candidate_scope_key = scope_key(candidate)
                 raw_audit = raw_audits_by_scope.get(candidate_scope_key or ())
                 if candidate_audit is None or not isinstance(raw_audit, dict):
@@ -11760,7 +12528,12 @@ class RepositoryContractTest(unittest.TestCase):
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
             current: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> str:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             expected_history_fields = {
                 "complete",
                 "repository",
@@ -11782,7 +12555,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "final_candidates",
             }
             if (
-                not isinstance(candidate_history, dict)
+                context is None
+                or not isinstance(candidate_history, dict)
                 or set(candidate_history) != expected_history_fields
                 or candidate_history.get("complete") is not True
                 or candidate_history.get("repository") != current_repository
@@ -11800,7 +12574,12 @@ class RepositoryContractTest(unittest.TestCase):
                     return "terminal-payload"
                 return None
 
-            current_ordering_key = candidate_order_basis(current)
+            current_ancestry = current_ancestry_mapping(candidate_history)
+            current_ordering_key = candidate_order_basis(
+                current,
+                finding_ancestry=current_ancestry,
+                artifact_validation_context=context,
+            )
             current_basis = current.get("candidate_basis")
             current_carrier = (
                 carrier_kind(current_basis.get("kind"))
@@ -11830,10 +12609,13 @@ class RepositoryContractTest(unittest.TestCase):
                 provider_declaration,
                 candidate_history,
             )
-            if profile_as_of is None or current_ordering_key[0] > profile_as_of:
+            if profile_as_of is None:
                 return terminal_only_fallback
             profile_start = profile_as_of - history_window_seconds
-            final_candidates = validate_history_universe(candidate_history)
+            final_candidates = validate_history_universe(
+                candidate_history,
+                artifact_validation_context=context,
+            )
             if final_candidates is None:
                 return terminal_only_fallback
 
@@ -11845,7 +12627,10 @@ class RepositoryContractTest(unittest.TestCase):
                 if not isinstance(candidate, dict):
                     return terminal_only_fallback
                 candidate_scope_key = scope_key(candidate)
-                ordering_key = candidate_order_basis(candidate)
+                ordering_key = candidate_order_basis(
+                    candidate,
+                    artifact_validation_context=context,
+                )
                 basis = candidate.get("candidate_basis")
                 candidate_carrier = (
                     carrier_kind(basis.get("kind")) if isinstance(basis, dict) else None
@@ -11893,11 +12678,19 @@ class RepositoryContractTest(unittest.TestCase):
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
             current: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> str:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
+            if context is None:
+                return "unknown"
             profile = compute_provider_profile(
                 provider_declaration,
                 candidate_history,
                 current,
+                artifact_validation_context=context,
             )
             if profile in {"terminal-payload", "mixed"}:
                 return "not-clean"
@@ -11937,7 +12730,10 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return "unknown"
             fallback_start = fallback_as_of - history_window_seconds
-            candidates = validate_history_universe(candidate_history)
+            candidates = validate_history_universe(
+                candidate_history,
+                artifact_validation_context=context,
+            )
             if candidates is None or not current_raw_authority_matches(
                 candidate_history, current
             ):
@@ -12067,7 +12863,10 @@ class RepositoryContractTest(unittest.TestCase):
                 if not isinstance(candidate, dict):
                     return "unknown"
                 candidate_scope_key = scope_key(candidate)
-                ordering_key = candidate_order_basis(candidate)
+                ordering_key = candidate_order_basis(
+                    candidate,
+                    artifact_validation_context=context,
+                )
                 if (
                     candidate_scope_key is None
                     or candidate_scope_key == current_scope_key
@@ -12095,7 +12894,11 @@ class RepositoryContractTest(unittest.TestCase):
             for _, sample in selected:
                 if classify_reaction_scope(sample) != "clean":
                     return "unknown"
-            current_ordering_key = candidate_order_basis(current)
+            current_ordering_key = candidate_order_basis(
+                current,
+                finding_ancestry=current_ancestry_mapping(candidate_history),
+                artifact_validation_context=context,
+            )
             if (
                 not current_lifecycle_is_eligible(current)
                 or classify_reaction_scope(
@@ -12304,15 +13107,23 @@ class RepositoryContractTest(unittest.TestCase):
 
         def ordered_selected_history(
             candidate_history: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             final_candidates = candidate_history.get("final_candidates")
-            if not isinstance(final_candidates, list):
+            if context is None or not isinstance(final_candidates, list):
                 return None
             ordered: list[tuple[tuple[int, int], dict[str, object]]] = []
             for candidate in final_candidates:
                 if not isinstance(candidate, dict):
                     return None
-                ordering_key = candidate_order_basis(candidate)
+                ordering_key = candidate_order_basis(
+                    candidate,
+                    artifact_validation_context=context,
+                )
                 if ordering_key is None:
                     return None
                 ordered.append((ordering_key, candidate))
@@ -12407,25 +13218,36 @@ class RepositoryContractTest(unittest.TestCase):
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
             current_record: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
+            context = artifact_validation_context
+            if context is None:
+                context = new_artifact_validation_context()
             if (
-                compute_provider_profile(
+                context is None
+                or compute_provider_profile(
                     provider_declaration,
                     candidate_history,
                     current_record,
+                    artifact_validation_context=context,
                 )
                 != "thumbs-up-clean"
                 or classify_fallback(
                     provider_declaration,
                     candidate_history,
                     current_record,
+                    artifact_validation_context=context,
                 )
                 != "clean"
                 or not isinstance(provider_declaration, dict)
             ):
                 return None
             declaration_final = provider_declaration.get("final_snapshot")
-            selected_history = ordered_selected_history(candidate_history)
+            selected_history = ordered_selected_history(
+                candidate_history,
+                artifact_validation_context=context,
+            )
             current_provenance = selected_reaction_provenance(current_record)
             current_audit = same_scope_request_audit(current_record)
             initial_report_candidates = report_candidate_snapshots(
@@ -12667,10 +13489,16 @@ class RepositoryContractTest(unittest.TestCase):
             current_record: dict[str, object],
             *,
             expected_outcome: str,
+            finding_ancestry: dict[str, int] | None = None,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             if expected_outcome not in {"clean", "findings"}:
                 return None
-            ordering_key = candidate_order_basis(current_record)
+            ordering_key = candidate_order_basis(
+                current_record,
+                finding_ancestry=finding_ancestry,
+                artifact_validation_context=artifact_validation_context,
+            )
             candidate_basis = current_record.get("candidate_basis")
             evidence_state = current_record.get("evidence_state")
             current_scope = scope_key(current_record)
@@ -12706,6 +13534,7 @@ class RepositoryContractTest(unittest.TestCase):
                     artifact,
                     expected_kind=str(basis_kind),
                     expected_scope=current_scope,
+                    artifact_validation_context=artifact_validation_context,
                 )
                 if (
                     validated is not None
@@ -12754,6 +13583,9 @@ class RepositoryContractTest(unittest.TestCase):
         def stable_blocking_evidence_basis_from_inputs(
             candidate_history: dict[str, object],
             current_record: dict[str, object],
+            *,
+            finding_ancestry: dict[str, int] | None = None,
+            artifact_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             evidence_state = current_record.get("evidence_state")
             current_scope = scope_key(current_record)
@@ -12778,6 +13610,8 @@ class RepositoryContractTest(unittest.TestCase):
                 ordering_key = candidate_order_basis(
                     current_record,
                     prefer_unresolved_thread_blocker=True,
+                    finding_ancestry=finding_ancestry,
+                    artifact_validation_context=artifact_validation_context,
                 )
                 if ordering_key is None:
                     return None
@@ -12789,6 +13623,7 @@ class RepositoryContractTest(unittest.TestCase):
                         artifact,
                         expected_kind="unresolved-thread-finding",
                         expected_scope=current_scope,
+                        artifact_validation_context=artifact_validation_context,
                     )
                     if (
                         validated is None
@@ -12807,7 +13642,11 @@ class RepositoryContractTest(unittest.TestCase):
                 if ordering_key != selected_ordering_key:
                     return None
             else:
-                ordering_key = candidate_order_basis(current_record)
+                ordering_key = candidate_order_basis(
+                    current_record,
+                    finding_ancestry=finding_ancestry,
+                    artifact_validation_context=artifact_validation_context,
+                )
                 candidate_basis = current_record.get("candidate_basis")
                 malformed = evidence_state.get("malformed_terminal_artifacts")
                 if (
@@ -12823,6 +13662,7 @@ class RepositoryContractTest(unittest.TestCase):
                         artifact,
                         expected_kind="malformed-terminal-artifact",
                         expected_scope=current_scope,
+                        artifact_validation_context=artifact_validation_context,
                     )
                     if (
                         validated is not None
@@ -12871,15 +13711,27 @@ class RepositoryContractTest(unittest.TestCase):
             candidate_history: dict[str, object],
             current_record: dict[str, object],
             local_lane_timing: object,
+            *,
+            _artifact_receipt_tightened_resource_limits: dict[str, int] | None = None,
+            _artifact_receipt_monotonic_clock: object = time.monotonic,
         ) -> dict[str, object] | None:
-            if lane_state not in {
-                "pre-provider-ineligible",
-                "eligible-waiting",
-                "accepted-terminal-clean",
-                "accepted-terminal-findings",
-                "accepted-reaction-clean",
-                "inconclusive",
-            }:
+            artifact_validation_context = new_artifact_validation_context(
+                tightened_limits=_artifact_receipt_tightened_resource_limits,
+                monotonic_clock=_artifact_receipt_monotonic_clock,
+            )
+            finding_ancestry = current_ancestry_mapping(candidate_history)
+            if (
+                lane_state
+                not in {
+                    "pre-provider-ineligible",
+                    "eligible-waiting",
+                    "accepted-terminal-clean",
+                    "accepted-terminal-findings",
+                    "accepted-reaction-clean",
+                    "inconclusive",
+                }
+                or artifact_validation_context is None
+            ):
                 return None
             if lane_state == "pre-provider-ineligible":
                 provider_profile: str | None = None
@@ -12889,6 +13741,7 @@ class RepositoryContractTest(unittest.TestCase):
                     provider_declaration,
                     candidate_history,
                     current_record,
+                    artifact_validation_context=artifact_validation_context,
                 )
                 evidence_basis = None
                 if lane_state in {
@@ -12905,6 +13758,8 @@ class RepositoryContractTest(unittest.TestCase):
                             if lane_state == "accepted-terminal-clean"
                             else "findings"
                         ),
+                        finding_ancestry=finding_ancestry,
+                        artifact_validation_context=artifact_validation_context,
                     )
                     if evidence_basis is None:
                         return None
@@ -12915,6 +13770,7 @@ class RepositoryContractTest(unittest.TestCase):
                             provider_declaration,
                             candidate_history,
                             current_record,
+                            artifact_validation_context=(artifact_validation_context),
                         )
                         != "clean"
                     ):
@@ -12923,6 +13779,7 @@ class RepositoryContractTest(unittest.TestCase):
                         provider_declaration,
                         candidate_history,
                         current_record,
+                        artifact_validation_context=artifact_validation_context,
                     )
                     if evidence_basis is None:
                         return None
@@ -12930,6 +13787,8 @@ class RepositoryContractTest(unittest.TestCase):
                     evidence_basis = stable_blocking_evidence_basis_from_inputs(
                         candidate_history,
                         current_record,
+                        finding_ancestry=finding_ancestry,
+                        artifact_validation_context=artifact_validation_context,
                     )
             request_policy = request_policy_from_inputs(
                 lane_state,
@@ -12944,6 +13803,15 @@ class RepositoryContractTest(unittest.TestCase):
                 current_record,
             ):
                 request_policy = {"status": "unknown", "warnings": []}
+            context_parts = artifact_validation_context_parts(
+                artifact_validation_context
+            )
+            if (
+                context_parts is None
+                or context_parts[0].get("failed") is not False
+                or not resource_budget_charge(context_parts[0])
+            ):
+                return None
             return {
                 "request_policy": request_policy,
                 "provider_profile": provider_profile,
@@ -13651,6 +14519,358 @@ class RepositoryContractTest(unittest.TestCase):
                             expected_scope=thread_scope,
                         )
                     )
+
+            receipt_near_misses: dict[str, dict[str, object]] = {}
+            missing_artifact_receipt = clone(valid_terminal_artifact)
+            assert isinstance(missing_artifact_receipt, dict)
+            missing_artifact_receipt.pop("artifact_scope_receipt")
+            receipt_near_misses["missing-receipt"] = missing_artifact_receipt
+
+            extended_artifact_receipt = clone(valid_terminal_artifact)
+            assert isinstance(extended_artifact_receipt, dict)
+            extended_artifact_receipt["artifact_scope_receipt"][
+                "authority_override"
+            ] = True
+            receipt_near_misses["extended-receipt"] = extended_artifact_receipt
+
+            wrong_artifact_get_url = clone(valid_terminal_artifact)
+            assert isinstance(wrong_artifact_get_url, dict)
+            wrong_artifact_get_url["artifact_scope_receipt"]["artifact_get_receipt"][
+                "request_url"
+            ] += "/wrong"
+            receipt_near_misses["wrong-get-url"] = wrong_artifact_get_url
+
+            wrong_artifact_digest = clone(valid_terminal_artifact)
+            assert isinstance(wrong_artifact_digest, dict)
+            wrong_artifact_digest["artifact_scope_receipt"]["artifact_get_receipt"][
+                "body_sha256"
+            ] = "0" * 64
+            receipt_near_misses["wrong-get-digest"] = wrong_artifact_digest
+
+            pre_after_artifact = clone(valid_terminal_artifact)
+            assert isinstance(pre_after_artifact, dict)
+            valid_final = valid_terminal_artifact["final_snapshot"]
+            assert isinstance(valid_final, dict)
+            artifact_time = valid_final["server_time"]
+            assert isinstance(artifact_time, int)
+            for response in pre_after_artifact["artifact_scope_receipt"][
+                "pre_artifact_scope_receipts"
+            ].values():
+                set_response_date(response, artifact_time + 1)
+            receipt_near_misses["pre-after-artifact"] = pre_after_artifact
+
+            get_before_artifact = clone(valid_terminal_artifact)
+            assert isinstance(get_before_artifact, dict)
+            set_response_date(
+                get_before_artifact["artifact_scope_receipt"]["artifact_get_receipt"],
+                artifact_time - 1,
+            )
+            receipt_near_misses["get-before-artifact"] = get_before_artifact
+
+            post_before_get = clone(valid_terminal_artifact)
+            assert isinstance(post_before_get, dict)
+            for response in post_before_get["artifact_scope_receipt"][
+                "post_artifact_scope_receipts"
+            ].values():
+                set_response_date(response, artifact_time)
+            receipt_near_misses["post-before-get"] = post_before_get
+
+            for case_name, near_miss in receipt_near_misses.items():
+                with self.subTest(
+                    terminal_artifact_scope_receipt=(f"{channel}-{case_name}"),
+                ):
+                    self.assertIsNone(
+                        validate_candidate_artifact(
+                            near_miss,
+                            expected_kind="terminal-payload",
+                            expected_scope=thread_scope,
+                        )
+                    )
+
+            realistic_extra_fields = clone(valid_terminal_artifact)
+            assert isinstance(realistic_extra_fields, dict)
+            extra_receipt = realistic_extra_fields["artifact_scope_receipt"]
+            actual_base_sha = "76543210fedcba9876543210fedcba9876543210"
+            actual_head_sha = thread_scope[3]
+            assert isinstance(actual_head_sha, str)
+            for scope_receipt_name in (
+                "pre_artifact_scope_receipts",
+                "post_artifact_scope_receipts",
+            ):
+                pull_response = extra_receipt[scope_receipt_name]["pull"]
+                pull_body = strict_json_loads(pull_response["body_utf8"])
+                assert isinstance(pull_body, dict)
+                pull_body["url"] = "https://api.github.com/pulls/fixture"
+                pull_body["base"]["sha"] = actual_base_sha
+                pull_body["base"]["ref"] = "master"
+                pull_body["head"]["repo"] = {"full_name": current_repository}
+                replace_raw_json_body(pull_response, canonical_raw_body(pull_body))
+
+                compare_response = extra_receipt[scope_receipt_name]["compare"]
+                compare_response["request_url"] = (
+                    f"https://api.github.com/repos/{thread_scope[0]}/compare/"
+                    f"{actual_base_sha}...{actual_head_sha}"
+                )
+                compare_body = strict_json_loads(compare_response["body_utf8"])
+                assert isinstance(compare_body, dict)
+                compare_body["status"] = "ahead"
+                compare_body["base_commit"]["sha"] = actual_base_sha
+                compare_body["base_commit"]["url"] = "https://api.github.com/base"
+                compare_body["head_commit"]["url"] = "https://api.github.com/head"
+                compare_body["merge_base_commit"]["parents"] = []
+                replace_raw_json_body(
+                    compare_response,
+                    canonical_raw_body(compare_body),
+                )
+
+            artifact_get_response = extra_receipt["artifact_get_receipt"]
+            artifact_get_body = strict_json_loads(artifact_get_response["body_utf8"])
+            assert isinstance(artifact_get_body, dict)
+            artifact_get_body["author_association"] = "NONE"
+            artifact_get_body["user"]["avatar_url"] = (
+                "https://avatars.githubusercontent.com/u/1"
+            )
+            if channel == "pull-request-review":
+                artifact_get_body["_links"] = {"html": {"href": "fixture"}}
+            else:
+                artifact_get_body["performed_via_github_app"]["id"] = 1
+                artifact_get_body["reactions"] = {"total_count": 0}
+            replace_raw_json_body(
+                artifact_get_response,
+                canonical_raw_body(artifact_get_body),
+            )
+            with self.subTest(artifact_receipt_realistic_extras=channel):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        realistic_extra_fields,
+                        expected_kind="terminal-payload",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+            def mutate_receipt_body(
+                artifact: dict[str, object],
+                receipt_path: tuple[str, ...],
+                body_path: tuple[str, ...],
+                replacement: object,
+            ) -> None:
+                cursor: object = artifact["artifact_scope_receipt"]
+                for path_part in receipt_path:
+                    assert isinstance(cursor, dict)
+                    cursor = cursor[path_part]
+                assert isinstance(cursor, dict)
+                body_value = strict_json_loads(cursor["body_utf8"])
+                assert isinstance(body_value, dict)
+                body_cursor = body_value
+                for path_part in body_path[:-1]:
+                    nested = body_cursor[path_part]
+                    assert isinstance(nested, dict)
+                    body_cursor = nested
+                body_cursor[body_path[-1]] = replacement
+                replace_raw_json_body(cursor, canonical_raw_body(body_value))
+
+            projected_scope_mutations = {
+                "pull-number": (
+                    ("pre_artifact_scope_receipts", "pull"),
+                    ("number",),
+                    3,
+                ),
+                "pull-base-sha": (
+                    ("pre_artifact_scope_receipts", "pull"),
+                    ("base", "sha"),
+                    "a" * 40,
+                ),
+                "pull-head-sha": (
+                    ("pre_artifact_scope_receipts", "pull"),
+                    ("head", "sha"),
+                    "b" * 40,
+                ),
+                "compare-base-sha": (
+                    ("pre_artifact_scope_receipts", "compare"),
+                    ("base_commit", "sha"),
+                    "c" * 40,
+                ),
+                "compare-head-sha": (
+                    ("pre_artifact_scope_receipts", "compare"),
+                    ("head_commit", "sha"),
+                    "b" * 40,
+                ),
+                "compare-merge-base-sha": (
+                    ("pre_artifact_scope_receipts", "compare"),
+                    ("merge_base_commit", "sha"),
+                    "d" * 40,
+                ),
+            }
+            for mutation_name, mutation in projected_scope_mutations.items():
+                projected_mutation = clone(valid_terminal_artifact)
+                assert isinstance(projected_mutation, dict)
+                mutate_receipt_body(projected_mutation, *mutation)
+                with self.subTest(
+                    artifact_receipt_projected_scope_mutation=(
+                        f"{channel}-{mutation_name}"
+                    ),
+                ):
+                    self.assertIsNone(
+                        validate_candidate_artifact(
+                            projected_mutation,
+                            expected_kind="terminal-payload",
+                            expected_scope=thread_scope,
+                        )
+                    )
+
+            compare_url_mutation = clone(valid_terminal_artifact)
+            assert isinstance(compare_url_mutation, dict)
+            compare_url_mutation["artifact_scope_receipt"][
+                "pre_artifact_scope_receipts"
+            ]["compare"]["request_url"] += "/wrong"
+            with self.subTest(artifact_receipt_compare_url_mutation=channel):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        compare_url_mutation,
+                        expected_kind="terminal-payload",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+            post_base_drift = clone(valid_terminal_artifact)
+            assert isinstance(post_base_drift, dict)
+            post_base_sha = "abcdef0123456789abcdef0123456789abcdef01"
+            mutate_receipt_body(
+                post_base_drift,
+                ("post_artifact_scope_receipts", "pull"),
+                ("base", "sha"),
+                post_base_sha,
+            )
+            post_compare = post_base_drift["artifact_scope_receipt"][
+                "post_artifact_scope_receipts"
+            ]["compare"]
+            post_pull = post_base_drift["artifact_scope_receipt"][
+                "post_artifact_scope_receipts"
+            ]["pull"]
+            post_pull_body = strict_json_loads(post_pull["body_utf8"])
+            assert isinstance(post_pull_body, dict)
+            post_head_sha = post_pull_body["head"]["sha"]
+            post_compare["request_url"] = (
+                f"https://api.github.com/repos/{thread_scope[0]}/compare/"
+                f"{post_base_sha}...{post_head_sha}"
+            )
+            mutate_receipt_body(
+                post_base_drift,
+                ("post_artifact_scope_receipts", "compare"),
+                ("base_commit", "sha"),
+                post_base_sha,
+            )
+            with self.subTest(artifact_receipt_pre_post_base_drift=channel):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        post_base_drift,
+                        expected_kind="terminal-payload",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+            actual_head_artifact = artifact_builder(
+                samples[0],
+                76_200 if channel == "pull-request-review" else 76_201,
+                2_700_010,
+                outcome="findings",
+                artifact_commit="6543210fedcba9876543210fedcba9876543210f",
+            )
+            with self.subTest(artifact_receipt_actual_pull_compare_head=channel):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        actual_head_artifact,
+                        expected_kind="terminal-payload",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+            if channel == "pull-request-review":
+                projected_artifact_mutations = {
+                    "id": (("id",), 999_001),
+                    "html-url": (("html_url",), "https://github.com/wrong"),
+                    "user-login": (("user", "login"), "other[bot]"),
+                    "user-type": (("user", "type"), "User"),
+                    "state": (("state",), "COMMENTED"),
+                    "body": (("body",), "Different terminal body"),
+                    "submitted-at": (("submitted_at",), "1970-02-01T00:00:00Z"),
+                    "commit-id": (("commit_id",), "e" * 40),
+                }
+            else:
+                projected_artifact_mutations = {
+                    "id": (("id",), 999_002),
+                    "api-url": (("url",), "https://api.github.com/wrong"),
+                    "html-url": (("html_url",), "https://github.com/wrong"),
+                    "user-login": (("user", "login"), "other[bot]"),
+                    "user-type": (("user", "type"), "User"),
+                    "app-slug": (
+                        ("performed_via_github_app", "slug"),
+                        "other-app",
+                    ),
+                    "body": (("body",), "Different terminal body"),
+                    "created-at": (("created_at",), "1970-02-01T00:00:00Z"),
+                    "updated-at": (("updated_at",), "1970-02-02T00:00:00Z"),
+                }
+            for mutation_name, (
+                body_path,
+                replacement,
+            ) in projected_artifact_mutations.items():
+                projected_mutation = clone(valid_terminal_artifact)
+                assert isinstance(projected_mutation, dict)
+                mutate_receipt_body(
+                    projected_mutation,
+                    ("artifact_get_receipt",),
+                    body_path,
+                    replacement,
+                )
+                with self.subTest(
+                    artifact_receipt_projected_artifact_mutation=(
+                        f"{channel}-{mutation_name}"
+                    ),
+                ):
+                    self.assertIsNone(
+                        validate_candidate_artifact(
+                            projected_mutation,
+                            expected_kind="terminal-payload",
+                            expected_scope=thread_scope,
+                        )
+                    )
+
+            post_as_of_receipt = artifact_builder(
+                samples[0],
+                76_100 if channel == "pull-request-review" else 76_101,
+                history_as_of_server_time,
+            )
+            with self.subTest(artifact_receipt_collected_post_as_of=channel):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        post_as_of_receipt,
+                        expected_kind="terminal-payload",
+                        expected_scope=thread_scope,
+                    )
+                )
+
+        same_head_retarget = clone(
+            complete_review_artifact(samples[0], 76_003, 2_700_000)
+        )
+        assert isinstance(same_head_retarget, dict)
+        retargeted_scope = clone(samples[0]["scope"])
+        assert isinstance(retargeted_scope, dict)
+        retargeted_scope["pr_merge_base"] = "e" * 40
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            same_head_retarget[snapshot_name]["scope"] = clone(retargeted_scope)
+        self.assertIsNone(
+            validate_candidate_artifact(
+                same_head_retarget,
+                expected_kind="terminal-payload",
+                expected_scope=(
+                    thread_scope[0],
+                    thread_scope[1],
+                    "e" * 40,
+                    thread_scope[3],
+                ),
+            )
+        )
 
         valid_thread_artifact = complete_review_artifact(
             samples[0],
@@ -14806,6 +16026,202 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(terminal_basis, dict)
         terminal_server_time = terminal_basis["server_time"]
         assert isinstance(terminal_server_time, int)
+        post_as_of_lane_snapshot = {
+            "codex_terminal_time": 1,
+            "claude_terminal_time": 2,
+        }
+        post_as_of_lane_timing = {
+            "initial_snapshot": clone(post_as_of_lane_snapshot),
+            "final_snapshot": clone(post_as_of_lane_snapshot),
+        }
+
+        for post_as_of_offset, (
+            post_as_of_channel,
+            post_as_of_builder,
+        ) in enumerate(terminal_artifact_builders.items(), start=1):
+            post_as_of_current = clone(current)
+            assert isinstance(post_as_of_current, dict)
+            post_as_of_artifact_id = 82_500 + post_as_of_offset
+            post_as_of_artifact_time = (
+                history_as_of_server_time + 10 + post_as_of_offset
+            )
+            post_as_of_artifact = post_as_of_builder(
+                post_as_of_current,
+                post_as_of_artifact_id,
+                post_as_of_artifact_time,
+                outcome="clean",
+            )
+            post_as_of_current["evidence_state"]["terminal_payloads"] = [
+                post_as_of_artifact
+            ]
+            post_as_of_current["candidate_basis"] = {
+                "kind": "terminal-payload",
+                "server_time": post_as_of_artifact_time,
+                "stable_artifact_id": post_as_of_artifact_id,
+            }
+            restamp(post_as_of_current)
+            post_as_of_history = history(
+                samples,
+                current_raw=post_as_of_current,
+            )
+            post_as_of_raw = parse_current_endpoint_inventory(
+                post_as_of_history["initial_current_raw_inventory"],
+                current_ancestry={},
+            )
+            post_as_of_report = expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                post_as_of_history,
+                post_as_of_current,
+                post_as_of_lane_timing,
+            )
+            with self.subTest(
+                current_terminal_artifact_after_declaration_as_of=(post_as_of_channel)
+            ):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        post_as_of_artifact,
+                        expected_kind="terminal-payload",
+                        expected_scope=current_scope_key,
+                    )
+                )
+                self.assertIsNotNone(post_as_of_raw)
+                self.assertIsNotNone(post_as_of_report)
+                assert isinstance(post_as_of_report, dict)
+                self.assertEqual(post_as_of_report["provider_profile"], "mixed")
+
+        post_as_of_historical_candidates = clone(samples)
+        assert isinstance(post_as_of_historical_candidates, list)
+        post_as_of_historical = post_as_of_historical_candidates[0]
+        post_as_of_historical_time = history_as_of_server_time + 20
+        post_as_of_historical_artifact = complete_review_artifact(
+            post_as_of_historical,
+            82_510,
+            post_as_of_historical_time,
+            outcome="clean",
+        )
+        post_as_of_historical["evidence_state"]["terminal_payloads"] = [
+            post_as_of_historical_artifact
+        ]
+        post_as_of_historical["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": post_as_of_historical_time,
+            "stable_artifact_id": 82_510,
+        }
+        restamp(post_as_of_historical)
+        post_as_of_historical_history = history(post_as_of_historical_candidates)
+        historical_scope_key = scope_key(post_as_of_historical)
+        assert historical_scope_key is not None
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                post_as_of_historical_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=historical_scope_key,
+            )
+        )
+        self.assertIsNone(validate_history_universe(post_as_of_historical_history))
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                post_as_of_historical_history,
+                current,
+            ),
+            "unknown",
+        )
+
+        post_as_of_reaction_current = clone(current)
+        assert isinstance(post_as_of_reaction_current, dict)
+        retime_sample(
+            post_as_of_reaction_current,
+            request_time=history_as_of_server_time,
+            reaction_time=history_as_of_server_time + 1,
+        )
+        post_as_of_reaction_history = history(
+            samples,
+            current_raw=post_as_of_reaction_current,
+        )
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                post_as_of_reaction_history["initial_current_raw_inventory"],
+                current_ancestry={},
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                post_as_of_reaction_history,
+                post_as_of_reaction_current,
+            ),
+            "unknown",
+        )
+
+        terminal_by_channel = {
+            "pull-request-review": terminal_current,
+            "issue-comment": issue_terminal_current,
+        }
+        coexistence_case = 0
+        for terminal_channel, terminal_record in terminal_by_channel.items():
+            for reaction_content in ("eyes", "+1"):
+                coexistence_case += 1
+                coexistence_current = clone(terminal_record)
+                assert isinstance(coexistence_current, dict)
+                coexistence_request_id = coexistence_current["selected_request_id"]
+                assert isinstance(coexistence_request_id, int)
+                coexistence_reaction_id = 82_520 + coexistence_case
+                coexistence_current["reactions"].append(
+                    reaction(
+                        coexistence_reaction_id,
+                        coexistence_request_id,
+                        history_as_of_server_time + coexistence_case,
+                        content=reaction_content,
+                    )
+                )
+                restamp(coexistence_current)
+                coexistence_history = history(
+                    samples,
+                    current_raw=coexistence_current,
+                )
+                coexistence_raw = parse_current_endpoint_inventory(
+                    coexistence_history["initial_current_raw_inventory"],
+                    current_ancestry={},
+                )
+                coexistence_report = expected_report_from_inputs(
+                    "accepted-terminal-clean",
+                    declaration,
+                    coexistence_history,
+                    coexistence_current,
+                    post_as_of_lane_timing,
+                )
+                with self.subTest(
+                    post_as_of_reaction_with_terminal=(
+                        terminal_channel,
+                        reaction_content,
+                    )
+                ):
+                    self.assertIsNotNone(coexistence_raw)
+                    assert isinstance(coexistence_raw, dict)
+                    coexistence_authority = coexistence_raw[
+                        "current_authority_projection"
+                    ]
+                    self.assertTrue(coexistence_authority["requests"])
+                    self.assertIn(
+                        {
+                            "created_at": (
+                                history_as_of_server_time + coexistence_case
+                            ),
+                            "id": coexistence_reaction_id,
+                            "parent_comment_id": coexistence_request_id,
+                            "content": reaction_content,
+                        },
+                        coexistence_authority["provider_reactions"],
+                    )
+                    self.assertIsNotNone(coexistence_report)
+                    assert isinstance(coexistence_report, dict)
+                    self.assertIn(
+                        coexistence_report["provider_profile"],
+                        {"terminal-payload", "mixed"},
+                    )
+
         pending_review_records: list[dict[str, object]] = []
         progress_issue_records: list[dict[str, object]] = []
         for offset, record_id in ((-1, 82_001), (2, 82_002)):
@@ -15228,6 +16644,983 @@ class RepositoryContractTest(unittest.TestCase):
             }
 
         normal_lane_timing = lane_timing(1, 2)
+
+        artifact_budget_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        artifact_budget_probe = new_artifact_validation_context()
+        self.assertIsNotNone(artifact_budget_probe)
+        assert artifact_budget_probe is not None
+        for artifact_candidate in [*terminal_history, terminal_current]:
+            self.assertIsNotNone(
+                candidate_order_basis(
+                    artifact_candidate,
+                    finding_ancestry={},
+                    artifact_validation_context=artifact_budget_probe,
+                )
+            )
+        artifact_budget_parts = artifact_validation_context_parts(artifact_budget_probe)
+        self.assertIsNotNone(artifact_budget_parts)
+        assert artifact_budget_parts is not None
+        artifact_budget_tracker = artifact_budget_parts[0]
+        aggregate_artifact_pages = artifact_budget_tracker["retained_pages"]
+        aggregate_artifact_records = artifact_budget_tracker["records"]
+        aggregate_artifact_bytes = artifact_budget_tracker["retained_utf8_bytes"]
+        self.assertEqual(aggregate_artifact_pages, 20)
+        self.assertEqual(aggregate_artifact_records, 24)
+        self.assertIsInstance(aggregate_artifact_bytes, int)
+        assert isinstance(aggregate_artifact_bytes, int)
+        self.assertGreater(aggregate_artifact_bytes, 0)
+        memoized_counters = {
+            counter: artifact_budget_tracker[counter]
+            for counter in (
+                "fetch_attempts",
+                "retained_pages",
+                "records",
+                "retained_utf8_bytes",
+            )
+        }
+        self.assertIsNotNone(
+            candidate_order_basis(
+                terminal_current,
+                finding_ancestry={},
+                artifact_validation_context=artifact_budget_probe,
+            )
+        )
+        self.assertEqual(
+            {
+                counter: artifact_budget_tracker[counter]
+                for counter in memoized_counters
+            },
+            memoized_counters,
+        )
+
+        duplicate_wrapper_current = clone(terminal_current)
+        assert isinstance(duplicate_wrapper_current, dict)
+        duplicate_wrapper = duplicate_wrapper_current["evidence_state"][
+            "terminal_payloads"
+        ][0]
+        duplicate_wrapper_current["evidence_state"]["terminal_payloads"].append(
+            duplicate_wrapper
+        )
+        restamp(duplicate_wrapper_current)
+        duplicate_wrapper_context = new_artifact_validation_context()
+        self.assertIsNotNone(duplicate_wrapper_context)
+        assert duplicate_wrapper_context is not None
+        self.assertIsNotNone(
+            candidate_order_basis(
+                duplicate_wrapper_current,
+                finding_ancestry={},
+                artifact_validation_context=duplicate_wrapper_context,
+            )
+        )
+        duplicate_wrapper_parts = artifact_validation_context_parts(
+            duplicate_wrapper_context
+        )
+        assert duplicate_wrapper_parts is not None
+        self.assertEqual(duplicate_wrapper_parts[0]["records"], 7)
+        self.assertEqual(duplicate_wrapper_parts[0]["retained_pages"], 5)
+
+        wrapper_iteration_attempts: dict[str, int] = {
+            "over-budget": 0,
+            "cache-header-mismatch": 0,
+        }
+
+        class RaisingWrapperList(list[object]):
+            def __init__(
+                self,
+                values: list[object],
+                *,
+                reported_length: int,
+                probe: str,
+            ) -> None:
+                super().__init__(values)
+                self.reported_length = reported_length
+                self.probe = probe
+
+            def __len__(self) -> int:
+                return self.reported_length
+
+            def __iter__(self):
+                wrapper_iteration_attempts[self.probe] += 1
+                raise AssertionError("wrapper entries iterated before admission")
+
+        over_budget_wrapper_current = clone(terminal_current)
+        assert isinstance(over_budget_wrapper_current, dict)
+        over_budget_wrapper = over_budget_wrapper_current["evidence_state"][
+            "terminal_payloads"
+        ][0]
+        over_budget_wrapper_current["evidence_state"]["terminal_payloads"] = (
+            RaisingWrapperList(
+                [over_budget_wrapper],
+                reported_length=evidence_resource_budget_v1["max_records"] + 1,
+                probe="over-budget",
+            )
+        )
+        over_budget_context = new_artifact_validation_context()
+        self.assertIsNotNone(over_budget_context)
+        assert over_budget_context is not None
+        self.assertIsNone(
+            candidate_order_basis(
+                over_budget_wrapper_current,
+                finding_ancestry={},
+                artifact_validation_context=over_budget_context,
+            )
+        )
+        self.assertEqual(wrapper_iteration_attempts["over-budget"], 0)
+
+        cache_header_current = clone(terminal_current)
+        assert isinstance(cache_header_current, dict)
+        cache_header_context = new_artifact_validation_context()
+        self.assertIsNotNone(cache_header_context)
+        assert cache_header_context is not None
+        self.assertIsNotNone(
+            candidate_order_basis(
+                cache_header_current,
+                finding_ancestry={},
+                artifact_validation_context=cache_header_context,
+            )
+        )
+        cache_header_wrapper = cache_header_current["evidence_state"][
+            "terminal_payloads"
+        ][0]
+        cache_header_current["evidence_state"]["terminal_payloads"] = (
+            RaisingWrapperList(
+                [cache_header_wrapper],
+                reported_length=1,
+                probe="cache-header-mismatch",
+            )
+        )
+        self.assertIsNone(
+            candidate_order_basis(
+                cache_header_current,
+                finding_ancestry={},
+                artifact_validation_context=cache_header_context,
+            )
+        )
+        self.assertEqual(wrapper_iteration_attempts["cache-header-mismatch"], 0)
+
+        decision_clock_calls = 0
+
+        def decision_audit_clock() -> float:
+            nonlocal decision_clock_calls
+            decision_clock_calls += 1
+            return float(decision_clock_calls)
+
+        decision_audit_limits = tightened_resource_limits(deadline_seconds=100)
+        decision_audit_context = new_artifact_validation_context(
+            tightened_limits=decision_audit_limits,
+            monotonic_clock=decision_audit_clock,
+        )
+        self.assertIsNotNone(decision_audit_context)
+        assert decision_audit_context is not None
+        self.assertIsNotNone(
+            candidate_order_basis(
+                terminal_current,
+                finding_ancestry={},
+                artifact_validation_context=decision_audit_context,
+            )
+        )
+        decision_audit_parts = artifact_validation_context_parts(decision_audit_context)
+        assert decision_audit_parts is not None
+        decision_audit_tracker = decision_audit_parts[0]
+        before_audit_tracker = {
+            key: decision_audit_tracker[key]
+            for key in (
+                "started",
+                "max_observed",
+                "controlled_requests",
+                "fetch_attempts",
+                "retained_pages",
+                "records",
+                "retained_utf8_bytes",
+                "failed",
+            )
+        }
+        before_audit_clock_calls = decision_clock_calls
+        self.assertIsNotNone(
+            candidate_scope_authority_audit(
+                terminal_current,
+                artifact_validation_context=decision_audit_context,
+            )
+        )
+        self.assertEqual(
+            {key: decision_audit_tracker[key] for key in before_audit_tracker},
+            before_audit_tracker,
+        )
+        self.assertEqual(decision_clock_calls, before_audit_clock_calls)
+
+        exact_artifact_decision_limits = tightened_resource_limits(
+            max_fetch_attempts=20,
+            max_retained_pages=20,
+            max_records=24,
+            max_retained_utf8_bytes=aggregate_artifact_bytes,
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                artifact_budget_history,
+                terminal_current,
+                normal_lane_timing,
+                _artifact_receipt_tightened_resource_limits=(
+                    exact_artifact_decision_limits
+                ),
+            )
+        )
+        for limit_name, overflow_value in (
+            ("max_retained_pages", 19),
+            ("max_records", 23),
+            ("max_retained_utf8_bytes", aggregate_artifact_bytes - 1),
+        ):
+            overflow_limits = clone(exact_artifact_decision_limits)
+            assert isinstance(overflow_limits, dict)
+            overflow_limits[limit_name] = overflow_value
+            with self.subTest(aggregate_artifact_receipt_overflow=limit_name):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        artifact_budget_history,
+                        terminal_current,
+                        normal_lane_timing,
+                        _artifact_receipt_tightened_resource_limits=overflow_limits,
+                    )
+                )
+
+        def artifact_decision_clock(*, expired_after_first: bool) -> object:
+            calls = 0
+
+            def observe() -> float:
+                nonlocal calls
+                calls += 1
+                if calls <= 12:
+                    return 0.0
+                return 1.001 if expired_after_first else 1.0
+
+            return observe
+
+        deadline_artifact_limits = clone(exact_artifact_decision_limits)
+        assert isinstance(deadline_artifact_limits, dict)
+        deadline_artifact_limits["deadline_seconds"] = 1
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                artifact_budget_history,
+                terminal_current,
+                normal_lane_timing,
+                _artifact_receipt_tightened_resource_limits=(deadline_artifact_limits),
+                _artifact_receipt_monotonic_clock=artifact_decision_clock(
+                    expired_after_first=False
+                ),
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                artifact_budget_history,
+                terminal_current,
+                normal_lane_timing,
+                _artifact_receipt_tightened_resource_limits=(deadline_artifact_limits),
+                _artifact_receipt_monotonic_clock=artifact_decision_clock(
+                    expired_after_first=True
+                ),
+            )
+        )
+
+        terminal_without_artifact_receipt = clone(terminal_current)
+        assert isinstance(terminal_without_artifact_receipt, dict)
+        terminal_without_artifact_receipt["evidence_state"]["terminal_payloads"][0].pop(
+            "artifact_scope_receipt"
+        )
+        restamp(terminal_without_artifact_receipt)
+        terminal_without_artifact_receipt_history = history(
+            samples,
+            current_raw=terminal_without_artifact_receipt,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                terminal_without_artifact_receipt_history,
+                terminal_without_artifact_receipt,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_without_artifact_receipt_history,
+                terminal_without_artifact_receipt,
+                normal_lane_timing,
+            )
+        )
+
+        clean_with_old_base_receipt = clone(terminal_current)
+        assert isinstance(clean_with_old_base_receipt, dict)
+        clean_receipt = clean_with_old_base_receipt["evidence_state"][
+            "terminal_payloads"
+        ][0]["artifact_scope_receipt"]
+        for scope_receipt_name in (
+            "pre_artifact_scope_receipts",
+            "post_artifact_scope_receipts",
+        ):
+            compare_response = clean_receipt[scope_receipt_name]["compare"]
+            compare_body = strict_json_loads(compare_response["body_utf8"])
+            assert isinstance(compare_body, dict)
+            compare_body["merge_base_commit"]["sha"] = "e" * 40
+            replace_raw_json_body(
+                compare_response,
+                canonical_raw_body(compare_body),
+            )
+        restamp(clean_with_old_base_receipt)
+        old_base_receipt_history = history(
+            samples,
+            current_raw=clean_with_old_base_receipt,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                old_base_receipt_history,
+                clean_with_old_base_receipt,
+                normal_lane_timing,
+            )
+        )
+
+        ancestor_finding_commit = "a" * 40
+
+        ancestor_top_level_current = clone(terminal_current)
+        assert isinstance(ancestor_top_level_current, dict)
+        ancestor_top_level = complete_issue_comment_artifact(
+            ancestor_top_level_current,
+            83_001,
+            int(terminal_server_time) - 2,
+            artifact_kind="active-top-level-finding",
+            outcome="findings",
+            artifact_commit=ancestor_finding_commit,
+        )
+        ancestor_with_old_base_receipt = clone(ancestor_top_level)
+        assert isinstance(ancestor_with_old_base_receipt, dict)
+        ancestor_artifact_receipt = ancestor_with_old_base_receipt[
+            "artifact_scope_receipt"
+        ]
+        for scope_receipt_name in (
+            "pre_artifact_scope_receipts",
+            "post_artifact_scope_receipts",
+        ):
+            compare_response = ancestor_artifact_receipt[scope_receipt_name]["compare"]
+            compare_body = strict_json_loads(compare_response["body_utf8"])
+            assert isinstance(compare_body, dict)
+            compare_body["merge_base_commit"]["sha"] = "b" * 40
+            replace_raw_json_body(
+                compare_response,
+                canonical_raw_body(compare_body),
+            )
+        self.assertIsNone(
+            validate_candidate_artifact(
+                ancestor_with_old_base_receipt,
+                expected_kind="active-top-level-finding",
+                expected_scope=current_scope_key,
+            )
+        )
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                ancestor_top_level,
+                expected_kind="active-top-level-finding",
+                expected_scope=current_scope_key,
+            )
+        )
+        ancestor_top_level_current["evidence_state"]["active_top_level_findings"] = [
+            ancestor_top_level
+        ]
+        restamp(ancestor_top_level_current)
+        ancestor_top_level_history = history(
+            samples,
+            current_raw=ancestor_top_level_current,
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        ancestor_top_level_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            ancestor_top_level_history,
+            ancestor_top_level_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(ancestor_top_level_report)
+        parsed_ancestor_top_level = parse_current_endpoint_inventory(
+            ancestor_top_level_history["initial_current_raw_inventory"],
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        self.assertIsNotNone(parsed_ancestor_top_level)
+        assert isinstance(parsed_ancestor_top_level, dict)
+        top_level_audit = parsed_ancestor_top_level["current_authority_projection"][
+            "applicable_artifacts"
+        ]
+        self.assertTrue(
+            any(
+                item.get("artifact_commit") == ancestor_finding_commit
+                and item.get("semantic") == "findings"
+                for item in top_level_audit
+            )
+        )
+
+        resolved_ancestor_thread_current = clone(terminal_current)
+        assert isinstance(resolved_ancestor_thread_current, dict)
+        resolved_ancestor_thread = complete_review_artifact(
+            resolved_ancestor_thread_current,
+            83_002,
+            int(terminal_server_time) - 1,
+            outcome="findings",
+            artifact_commit=ancestor_finding_commit,
+            thread_resolved=True,
+            inline_parent_shape="nonempty",
+        )
+        resolved_ancestor_thread_current["evidence_state"]["terminal_payloads"].insert(
+            0, resolved_ancestor_thread
+        )
+        restamp(resolved_ancestor_thread_current)
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                resolved_ancestor_thread,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+            )
+        )
+        resolved_ancestor_history = history(
+            samples,
+            current_raw=resolved_ancestor_thread_current,
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        resolved_ancestor_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            resolved_ancestor_history,
+            resolved_ancestor_thread_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(resolved_ancestor_report)
+        assert isinstance(resolved_ancestor_report, dict)
+        self.assertEqual(
+            resolved_ancestor_report["evidence_basis"]["artifact"]["final_snapshot"][
+                "id"
+            ],
+            80_100,
+        )
+
+        approved_ancestor_current = clone(terminal_current)
+        assert isinstance(approved_ancestor_current, dict)
+        approved_ancestor_artifact = complete_review_artifact(
+            approved_ancestor_current,
+            83_019,
+            int(terminal_server_time) - 1,
+            outcome="findings",
+            artifact_commit=ancestor_finding_commit,
+            thread_resolved=True,
+            inline_parent_shape="approved-clean-parent",
+        )
+        approved_ancestor_current["evidence_state"]["terminal_payloads"].insert(
+            0, approved_ancestor_artifact
+        )
+        restamp(approved_ancestor_current)
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                approved_ancestor_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+            )
+        )
+        approved_ancestor_history = history(
+            samples,
+            current_raw=approved_ancestor_current,
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        approved_ancestor_raw = parse_current_endpoint_inventory(
+            approved_ancestor_history["initial_current_raw_inventory"],
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        self.assertIsNotNone(approved_ancestor_raw)
+        assert isinstance(approved_ancestor_raw, dict)
+        self.assertTrue(
+            any(
+                artifact.get("id") == 83_019
+                and artifact.get("semantic") == "findings"
+                and artifact.get("artifact_commit") == ancestor_finding_commit
+                for artifact in approved_ancestor_raw["current_authority_projection"][
+                    "applicable_artifacts"
+                ]
+            )
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                approved_ancestor_history,
+                approved_ancestor_current,
+                normal_lane_timing,
+            )
+        )
+
+        multiple_resolved_ancestor_current = clone(terminal_current)
+        assert isinstance(multiple_resolved_ancestor_current, dict)
+        multiple_resolved_ancestor = complete_review_artifact(
+            multiple_resolved_ancestor_current,
+            83_020,
+            int(terminal_server_time) - 1,
+            outcome="findings",
+            artifact_commit=ancestor_finding_commit,
+            thread_resolutions=[True, True],
+        )
+        multiple_resolved_ancestor_current["evidence_state"][
+            "terminal_payloads"
+        ].insert(0, multiple_resolved_ancestor)
+        restamp(multiple_resolved_ancestor_current)
+        multiple_resolved_ancestor_history = history(
+            samples,
+            current_raw=multiple_resolved_ancestor_current,
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                multiple_resolved_ancestor_history,
+                multiple_resolved_ancestor_current,
+                normal_lane_timing,
+            )
+        )
+
+        for parent_offset, parent_shape in enumerate(
+            ("nonempty", "approved-clean-parent")
+        ):
+            resolved_current = clone(terminal_current)
+            assert isinstance(resolved_current, dict)
+            resolved_artifact_id = 83_200 + parent_offset * 2
+            resolved_artifact = complete_review_artifact(
+                resolved_current,
+                resolved_artifact_id,
+                int(terminal_server_time) - 1,
+                outcome="findings",
+                thread_resolutions=[True, True],
+                inline_parent_shape=parent_shape,
+            )
+            if parent_shape == "nonempty":
+                for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                    resolved_snapshot = resolved_artifact[snapshot_name]
+                    assert isinstance(resolved_snapshot, dict)
+                    associated = resolved_snapshot["associated_inline_comments"]
+                    assert isinstance(associated, dict)
+                    child = associated["records"][0]
+                    child["body"] = "Suggestion without severity.  \r\n"
+                    child["normalized_body"] = "Suggestion without severity."
+            resolved_current["evidence_state"]["terminal_payloads"].insert(
+                0, resolved_artifact
+            )
+            restamp(resolved_current)
+            self.assertIsNotNone(
+                validate_candidate_artifact(
+                    resolved_artifact,
+                    expected_kind="terminal-payload",
+                    expected_scope=current_scope_key,
+                )
+            )
+            resolved_history = history(
+                samples,
+                current_raw=resolved_current,
+                current_ancestry={current_head: 0},
+            )
+            resolved_report = expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                resolved_history,
+                resolved_current,
+                normal_lane_timing,
+            )
+            with self.subTest(current_resolved_inline_parent=parent_shape):
+                self.assertIsNotNone(resolved_report)
+                assert isinstance(resolved_report, dict)
+                self.assertEqual(
+                    resolved_report["evidence_basis"]["artifact"]["final_snapshot"][
+                        "id"
+                    ],
+                    80_100,
+                )
+
+            unresolved_current = clone(terminal_current)
+            assert isinstance(unresolved_current, dict)
+            unresolved_artifact_id = resolved_artifact_id + 1
+            unresolved_artifact = complete_review_artifact(
+                unresolved_current,
+                unresolved_artifact_id,
+                int(terminal_server_time) - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+                inline_parent_shape=parent_shape,
+            )
+            unresolved_current["evidence_state"]["unresolved_thread_findings"] = [
+                unresolved_artifact
+            ]
+            restamp(unresolved_current)
+            unresolved_history = history(
+                samples,
+                current_raw=unresolved_current,
+                current_ancestry={current_head: 0},
+            )
+            unresolved_report = expected_report_from_inputs(
+                "inconclusive",
+                declaration,
+                unresolved_history,
+                unresolved_current,
+                normal_lane_timing,
+            )
+            with self.subTest(current_unresolved_inline_parent=parent_shape):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        unresolved_history,
+                        unresolved_current,
+                        normal_lane_timing,
+                    )
+                )
+                self.assertIsNotNone(unresolved_report)
+                assert isinstance(unresolved_report, dict)
+                self.assertEqual(
+                    unresolved_report["evidence_basis"]["artifact"]["final_snapshot"][
+                        "id"
+                    ],
+                    unresolved_artifact_id,
+                )
+
+        generic_review_body = "\n".join(
+            (
+                "### 💡 Codex Review",
+                "- [P0] Critical title — "
+                f"https://github.com/{current_repository}/blob/{current_head}/"
+                "src/core.py#L2-L8",
+                "- [P3] Documentation title — "
+                f"https://github.com/{current_repository}/blob/{current_head}/"
+                "docs/review%20guide.md#L10",
+            )
+        )
+        for state_offset, review_state in enumerate(("COMMENTED", "CHANGES_REQUESTED")):
+            generic_review_current = clone(current)
+            assert isinstance(generic_review_current, dict)
+            generic_review_id = 83_210 + state_offset
+            generic_review_time = int(terminal_server_time) + 10 + state_offset
+            generic_review = complete_review_artifact(
+                generic_review_current,
+                generic_review_id,
+                generic_review_time,
+                outcome="findings",
+            )
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                generic_snapshot = generic_review[snapshot_name]
+                assert isinstance(generic_snapshot, dict)
+                generic_snapshot["state"] = review_state
+                generic_snapshot["body"] = generic_review_body
+                generic_snapshot["normalized_body"] = generic_review_body
+            generic_final = generic_review["final_snapshot"]
+            assert isinstance(generic_final, dict)
+            generic_review["artifact_scope_receipt"] = artifact_scope_receipt(
+                generic_final
+            )
+            generic_review_current["evidence_state"]["terminal_payloads"] = [
+                generic_review
+            ]
+            generic_review_current["candidate_basis"] = {
+                "kind": "terminal-payload",
+                "server_time": generic_review_time,
+                "stable_artifact_id": generic_review_id,
+            }
+            restamp(generic_review_current)
+            generic_review_history = history(
+                samples,
+                current_raw=generic_review_current,
+                current_ancestry={current_head: 0},
+            )
+            with self.subTest(generic_top_level_review_state=review_state):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        generic_review,
+                        expected_kind="terminal-payload",
+                        expected_scope=current_scope_key,
+                    )
+                )
+                self.assertIsNotNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-findings",
+                        declaration,
+                        generic_review_history,
+                        generic_review_current,
+                        normal_lane_timing,
+                    )
+                )
+
+        unresolved_ancestor_thread_current = clone(terminal_current)
+        assert isinstance(unresolved_ancestor_thread_current, dict)
+        unresolved_ancestor_thread = complete_review_artifact(
+            unresolved_ancestor_thread_current,
+            83_003,
+            int(terminal_server_time) - 1,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+            artifact_commit=ancestor_finding_commit,
+            inline_parent_shape="nonempty",
+        )
+        unresolved_ancestor_thread_current["evidence_state"][
+            "unresolved_thread_findings"
+        ] = [unresolved_ancestor_thread]
+        restamp(unresolved_ancestor_thread_current)
+        unresolved_ancestor_history = history(
+            samples,
+            current_raw=unresolved_ancestor_thread_current,
+            current_ancestry={ancestor_finding_commit: 0},
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                unresolved_ancestor_history,
+                unresolved_ancestor_thread_current,
+                normal_lane_timing,
+            )
+        )
+        unresolved_ancestor_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            unresolved_ancestor_history,
+            unresolved_ancestor_thread_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(unresolved_ancestor_report)
+        assert isinstance(unresolved_ancestor_report, dict)
+        self.assertEqual(
+            unresolved_ancestor_report["evidence_basis"]["artifact"]["final_snapshot"][
+                "id"
+            ],
+            83_003,
+        )
+
+        for resolution_case, resolutions in (
+            ("multiple-unresolved", [False, False]),
+            ("mixed", [True, False]),
+        ):
+            multiple_unresolved_current = clone(terminal_current)
+            assert isinstance(multiple_unresolved_current, dict)
+            multiple_unresolved = complete_review_artifact(
+                multiple_unresolved_current,
+                83_030 if resolution_case == "multiple-unresolved" else 83_031,
+                int(terminal_server_time) - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+                artifact_commit=ancestor_finding_commit,
+                thread_resolutions=resolutions,
+            )
+            multiple_unresolved_current["evidence_state"][
+                "unresolved_thread_findings"
+            ] = [multiple_unresolved]
+            restamp(multiple_unresolved_current)
+            multiple_unresolved_history = history(
+                samples,
+                current_raw=multiple_unresolved_current,
+                current_ancestry={ancestor_finding_commit: 0},
+            )
+            with self.subTest(multiple_inline_thread_blocker=resolution_case):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        multiple_unresolved_history,
+                        multiple_unresolved_current,
+                        normal_lane_timing,
+                    )
+                )
+                self.assertIsNotNone(
+                    expected_report_from_inputs(
+                        "inconclusive",
+                        declaration,
+                        multiple_unresolved_history,
+                        multiple_unresolved_current,
+                        normal_lane_timing,
+                    )
+                )
+
+        normalized_nonancestor_top_level = clone(terminal_current)
+        assert isinstance(normalized_nonancestor_top_level, dict)
+        normalized_nonancestor_top_level["evidence_state"][
+            "active_top_level_findings"
+        ] = [
+            complete_issue_comment_artifact(
+                normalized_nonancestor_top_level,
+                83_010,
+                int(terminal_server_time) - 1,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+                artifact_commit=foreign_finding_head,
+            )
+        ]
+        restamp(normalized_nonancestor_top_level)
+        nonancestor_top_level_history = history(
+            samples,
+            current_raw=normalized_nonancestor_top_level,
+            current_ancestry={foreign_finding_head: 1},
+        )
+        self.assertIsNone(
+            candidate_order_basis(
+                normalized_nonancestor_top_level,
+                finding_ancestry={foreign_finding_head: 1},
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                nonancestor_top_level_history,
+                normalized_nonancestor_top_level,
+                normal_lane_timing,
+            )
+        )
+
+        normalized_nonancestor_unresolved = clone(terminal_current)
+        assert isinstance(normalized_nonancestor_unresolved, dict)
+        normalized_nonancestor_unresolved["evidence_state"][
+            "unresolved_thread_findings"
+        ] = [
+            complete_review_artifact(
+                normalized_nonancestor_unresolved,
+                83_011,
+                int(terminal_server_time) - 1,
+                artifact_kind="unresolved-thread-finding",
+                outcome="findings",
+                artifact_commit=foreign_finding_head,
+            )
+        ]
+        restamp(normalized_nonancestor_unresolved)
+        nonancestor_unresolved_history = history(
+            samples,
+            current_raw=normalized_nonancestor_unresolved,
+            current_ancestry={foreign_finding_head: 1},
+        )
+        self.assertIsNone(
+            candidate_order_basis(
+                normalized_nonancestor_unresolved,
+                prefer_unresolved_thread_blocker=True,
+                finding_ancestry={foreign_finding_head: 1},
+            )
+        )
+        nonancestor_unresolved_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            nonancestor_unresolved_history,
+            normalized_nonancestor_unresolved,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(nonancestor_unresolved_report)
+        assert isinstance(nonancestor_unresolved_report, dict)
+        self.assertIsNone(nonancestor_unresolved_report["evidence_basis"])
+
+        nonancestor_terminal_builders = {
+            "issue-comment": lambda record: complete_issue_comment_artifact(
+                record,
+                83_012,
+                int(terminal_server_time) + 1,
+                outcome="findings",
+                artifact_commit=foreign_finding_head,
+            ),
+            "resolved-inline-review": lambda record: complete_review_artifact(
+                record,
+                83_013,
+                int(terminal_server_time) + 2,
+                outcome="findings",
+                artifact_commit=foreign_finding_head,
+                thread_resolved=True,
+                inline_parent_shape="nonempty",
+            ),
+            "approved-resolved-inline-review": lambda record: complete_review_artifact(
+                record,
+                83_014,
+                int(terminal_server_time) + 3,
+                outcome="findings",
+                artifact_commit=foreign_finding_head,
+                thread_resolved=True,
+                inline_parent_shape="approved-clean-parent",
+            ),
+        }
+        for (
+            case_name,
+            build_nonancestor_terminal,
+        ) in nonancestor_terminal_builders.items():
+            nonancestor_terminal_current = clone(terminal_current)
+            assert isinstance(nonancestor_terminal_current, dict)
+            nonancestor_terminal = build_nonancestor_terminal(
+                nonancestor_terminal_current
+            )
+            nonancestor_terminal_current["evidence_state"]["terminal_payloads"].append(
+                nonancestor_terminal
+            )
+            restamp(nonancestor_terminal_current)
+            nonancestor_terminal_history = history(
+                samples,
+                current_raw=nonancestor_terminal_current,
+                current_ancestry={foreign_finding_head: 1},
+            )
+            inconclusive_nonancestor_terminal = expected_report_from_inputs(
+                "inconclusive",
+                declaration,
+                nonancestor_terminal_history,
+                nonancestor_terminal_current,
+                normal_lane_timing,
+            )
+            with self.subTest(
+                newer_nonancestor_terminal_payload=case_name,
+            ):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        nonancestor_terminal,
+                        expected_kind="terminal-payload",
+                        expected_scope=current_scope_key,
+                    )
+                )
+                self.assertIsNone(
+                    candidate_order_basis(
+                        nonancestor_terminal_current,
+                        finding_ancestry={foreign_finding_head: 1},
+                    )
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        nonancestor_terminal_history,
+                        nonancestor_terminal_current,
+                        normal_lane_timing,
+                    )
+                )
+                self.assertIsNotNone(inconclusive_nonancestor_terminal)
+                assert isinstance(inconclusive_nonancestor_terminal, dict)
+                self.assertIsNone(inconclusive_nonancestor_terminal["evidence_basis"])
+
+        for channel, artifact_builder in terminal_artifact_builders.items():
+            prior_head_clean = artifact_builder(
+                terminal_current,
+                83_100 if channel == "pull-request-review" else 83_101,
+                int(terminal_server_time) - 1,
+                outcome="clean",
+                artifact_commit=ancestor_finding_commit,
+            )
+            with self.subTest(prior_head_clean_rejected=channel):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        prior_head_clean,
+                        expected_kind="terminal-payload",
+                        expected_scope=current_scope_key,
+                    )
+                )
+
         terminal_without_receipt_report = expected_report_from_inputs(
             "accepted-terminal-clean",
             declaration,
@@ -21693,7 +24086,7 @@ class RepositoryContractTest(unittest.TestCase):
         machine_path = SKILL_ROOT / "references/base-only-retarget-state-machine.json"
         machine = json.loads(machine_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(machine["version"], 1)
+        self.assertEqual(machine["version"], 2)
         self.assertEqual(
             machine["event"],
             "request-time-merge-base-changed-with-same-head",
@@ -21753,7 +24146,57 @@ class RepositoryContractTest(unittest.TestCase):
                 "post_action": "forbid-another-post",
                 "reaction_action": "exclude",
                 "local_lane_action": "independent-scope-gates",
-                "terminal_payload_action": "independent-result-gates",
+                "terminal_payload_action": (
+                    "independent-artifact-scope-receipt-and-result-gates"
+                ),
+            },
+        )
+        self.assertEqual(
+            machine["terminal_artifact_scope_receipt"],
+            {
+                "wrapper_field": "artifact_scope_receipt",
+                "kind": "parent-recorded-terminal-artifact-scope-v1",
+                "closed_fields": [
+                    "kind",
+                    "pre_artifact_scope_receipts",
+                    "artifact_get_receipt",
+                    "post_artifact_scope_receipts",
+                ],
+                "scope_receipt_fields": ["pull", "compare"],
+                "response_receipt_fields": [
+                    "method",
+                    "request_url",
+                    "status",
+                    "date_header",
+                    "body_utf8",
+                    "body_sha256",
+                ],
+                "storage_relation": "independent-parent-owned-artifact-wrapper",
+                "artifact_get_binding": (
+                    "exact-repository-pr-channel-native-id-provider-projection"
+                ),
+                "pre_post_scope_binding": (
+                    "type-preserving-equal-base-head-merge-base"
+                ),
+                "lifecycle_binding": "independent-mandatory-snapshots",
+                "time_envelope": (
+                    "pre-date-at-or-before-artifact-semantic-time-at-or-before-"
+                    "artifact-get-date-at-or-before-post-date"
+                ),
+                "may_reuse_prior_persisted_receipt": True,
+                "artifact_older_than_all_trustworthy_pre_observations": (
+                    "triple-inconclusive"
+                ),
+                "missing_or_malformed": {
+                    "terminal_payload_action": (
+                        "exclude-from-current-scope-precedence"
+                    ),
+                    "status": "triple-inconclusive",
+                },
+                "independent_of_request_scope_sidecar": True,
+                "proves_request_run_artifact_lineage": False,
+                "proves_continuous_scope_stability": False,
+                "proves_no_intermediate_aba": False,
             },
         )
         self.assertEqual(

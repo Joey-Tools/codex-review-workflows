@@ -76,6 +76,13 @@ gh api --hostname <host> --method GET --include \
 gh api --hostname <host> --method GET --include \
   'repos/<owner>/<repo>/compare/<post_base_oid>...<post_head_oid>'
 
+# Before waiting for a new terminal artifact, capture the artifact-scope pre pair.
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/pulls/<number>
+
+gh api --hostname <host> --method GET --include \
+  'repos/<owner>/<repo>/compare/<artifact_pre_base_oid>...<artifact_pre_head_oid>'
+
 gh api --hostname <host> --method GET --paginate --slurp \
   'repos/<owner>/<repo>/pulls/<number>/reviews?per_page=100' \
   --jq '[.[][] | {id,user:{login:.user.login,type:.user.type},commit_id,submitted_at,state,html_url,body}]'
@@ -83,6 +90,20 @@ gh api --hostname <host> --method GET --paginate --slurp \
 gh api --hostname <host> --method GET --paginate --slurp \
   'repos/<owner>/<repo>/issues/<number>/comments?per_page=100' \
   --jq '[.[][] | {id,user:{login:.user.login,type:.user.type},app_slug:.performed_via_github_app.slug,created_at,updated_at,html_url,body}]'
+
+# After observing a bracketed candidate, fetch that exact artifact and the post pair.
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/issues/comments/<artifact_comment_id>
+
+# For a review candidate, use this exact GET instead of the issue-comment GET.
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/pulls/<number>/reviews/<artifact_review_id>
+
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/pulls/<number>
+
+gh api --hostname <host> --method GET --include \
+  'repos/<owner>/<repo>/compare/<artifact_post_base_oid>...<artifact_post_head_oid>'
 
 gh api --hostname <host> --method GET --paginate --slurp \
   'repos/<owner>/<repo>/issues/comments/<request_comment_id>/reactions?per_page=100' \
@@ -117,7 +138,53 @@ to `discovery_endpoint_transcript` schema version 3 or invent another fetch
 kind. If any observed request lacks a valid one-to-one sidecar, set
 `request_policy.status: unknown`, do not POST again, and exclude that request
 and its reactions from reaction-profile authority. Continue to evaluate an
-independently complete terminal payload normally.
+independently complete terminal payload normally, but only through its own
+artifact-time scope receipt below.
+
+For each terminal-looking exact-provider artifact admitted to current-scope
+precedence, retain one singular closed artifact-wrapper field
+`artifact_scope_receipt`. Its object contains exactly `kind`,
+`pre_artifact_scope_receipts`, `artifact_get_receipt`, and
+`post_artifact_scope_receipts`, with kind
+`parent-recorded-terminal-artifact-scope-v1`. Convert each raw response to the
+same six-field receipt shape used above. The pre/post pull+compare bodies must
+independently project the same artifact-time head and merge base. Clean and
+malformed evidence require the exact current tuple; a finding may preserve a
+proved-ancestor artifact-time head while normalized `scope.head` remains
+current. The exact artifact GET must
+bind repository/PR, issue-comment or review channel, native ID, exact provider
+projection, raw body/digest, trusted semantic time, grammar, and artifact
+commit. Lifecycle is still proved by the separate mandatory snapshots; do not
+invent it from these receipt bodies.
+
+Parse the actual full base/head OIDs from each pull response and use those
+values—not a fixture-derived or PR-number-derived SHA—to construct its exact
+compare URL. The compare response must repeat both as `base_commit.sha` and
+`head_commit.sha` and supply the unique `merge_base_commit.sha`; a body for a
+different head is not scope evidence.
+
+Require every pre response `Date` to be no later than the artifact semantic
+server time, that time to be no later than the artifact GET response `Date`,
+and every post response `Date` to be no earlier than the artifact GET response
+`Date`. Capture the pre pair before waiting for the result. If the candidate
+already predates every trustworthy pre observation, it is inconclusive unless
+the parent reuses a previously persisted, still-identical receipt that already
+bracketed that exact artifact. Never create a retrospective pre boundary from
+current PR metadata. The receipt is independent of request sidecars and proves
+neither request/run/artifact lineage nor an ABA-free interval. A missing
+request sidecar still closes only request/reaction authority; a missing or
+unstable artifact receipt blocks the wrapped terminal artifact.
+
+Do not apply the frozen reaction-history `as_of_server_time` to artifact
+receipt collection `Date` values. It bounds eligible historical artifact
+semantic times; the exact artifact GET and post-scope reads may occur later as
+part of the bounded decision/final reread, provided the receipt envelope and
+all other stability checks hold.
+
+Do not apply that history cutoff to the semantic time of a strong current
+`terminal-payload` or `mixed` artifact either. It may arrive during the bounded
+provider wait after declaration discovery. The as-of still bounds historical
+samples and the separate current reaction-only basis for `thumbs-up-clean`.
 
 A fully sidecar-bound request for the same repository and PR but a different
 head is old-epoch audit evidence. When a seeded scope has no current-epoch
@@ -256,8 +323,10 @@ complete trustworthy current-scope results decide without request/run
 attribution, and early or duplicate requests remain outcome-neutral producer
 warnings. Repository-wide discovery schema version 3, raw target-thread proof,
 exact whole-PR lifecycle/scope, the closed terminal carrier, request-time scope
-sidecars, declaration discovery, and conditional `+1` fallback are deliberate
-playbook extensions, not behaviour attributed to the fixed Action. Findings, malformed terminal artifacts, unresolved
+sidecars, independent artifact-time whole-PR scope receipts,
+ancestor-finding projection, declaration discovery, and conditional `+1`
+fallback are deliberate playbook extensions, not behaviour attributed to the
+fixed Action. Findings, malformed terminal artifacts, unresolved
 applicable target threads, incomplete pagination, stale scope, and unstable
 final evidence still fail closed.
 
@@ -272,9 +341,12 @@ Build one complete current-scope snapshot from:
   records remain audit context;
 - every fully paginated reaction list relevant to a controlled request, plus
   that request's exact one-to-one parent-owned request-time scope sidecar; and
+- every terminal-looking exact-provider artifact's singular closed
+  `artifact_scope_receipt`, including its pre pull/compare, exact artifact GET,
+  and post pull/compare raw responses; and
 - the lifecycle, base/head, merge-base, and check/run observations needed to validate scope and distinguish liveness from terminal evidence.
 
-Normalize stable API IDs, source channel, exact provider identity, native commit binding or explicit full current-head binding, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full commit, and immutable scope; review-only fields are rejected. Apply only the authority's fixed terminal-payload grammar: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase full-SHA `Reviewed commit` marker; clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
+Normalize stable API IDs, source channel, exact provider identity, artifact commit, enclosing current `scope.head`, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full artifact commit, and immutable current scope; review-only fields are rejected. Clean must bind the exact current `scope.head`. A finding keeps its parsed/native commit and may remain applicable when local ancestry receipts prove it is current or an ancestor; never rewrite it to current head or omit it from the complete projection. Apply only the authority's fixed terminal-payload grammar: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase full-SHA `Reviewed commit` marker; clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
 
 Apply the evidence in this order:
 
@@ -284,7 +356,7 @@ Apply the evidence in this order:
    resolution.
 2. Discard progress messages and acknowledgements from terminal selection. An untrusted-identity or stale-scope artifact cannot win selection, but retain every terminal-looking instance as fail-closed evidence; do the same for malformed terminal-looking artifacts. Never drop one and expose an older clean as the apparent winner.
 3. Select the latest trustworthy terminal artifact by server time. If the latest equal-time set spans more than one source channel, fail closed before comparing outcomes or numeric IDs. Within one channel, malformed or scope-conflicting evidence blocks, then finding wins over clean, and only a same-channel positive ID may break a remaining tie. A newer malformed terminal artifact is also `triple-inconclusive`.
-4. A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when no associated thread remains unresolved and no newer finding or malformed terminal artifact exists. Reaction-only clean never supersedes a finding.
+4. A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when the ancestor finding remains in the complete projection, no associated thread remains unresolved, and no newer finding or malformed terminal artifact exists. A resolved applicable thread may cease blocking under the thread rule; an unresolved one never does. Reaction-only clean never supersedes a finding.
 5. A request or progress artifact after the selected terminal does not replace it. In particular, `R1 -> clean1 -> R2 pending`, `R1 -> clean1 -> R2 -> clean2`, and `R1 -> R2 -> clean1 -> clean2` may all select clean and pass with a request-policy warning. No request/run association is required.
 
 Recompute and report `request_policy`, `provider_profile`, and `evidence_basis` from the final complete snapshot and bounded same-repository history, using this predeclared profile set:
@@ -327,11 +399,18 @@ max_retained_utf8_bytes: 67108864
 deadline_seconds: 900
 ```
 
-Apply those maxima to non-borrowing endpoint and request-scope-sidecar ledgers
-that share one inventory start/deadline. Pre-count the sidecar array and each
-controlled request's five raw responses. Sidecar overflow makes request policy
-unknown and disables reaction authority without erasing an independently
-complete terminal payload. For endpoint evidence, charge every REST or GraphQL
+Apply those maxima to three non-borrowing endpoint,
+request-scope-sidecar, and terminal-artifact-scope-receipt ledgers that share
+one inventory start/deadline. Pre-count each sidecar or artifact-wrapper array
+and each wrapper's five raw responses. Create the artifact ledger once per
+inventory decision pass, validate each immutable wrapper once, and thread its
+memoized result through candidate ordering, audit, profile, outcome, and report
+projection; a consumer must never create a per-candidate, per-scope, or
+recomputation tracker or recharge the same wrapper. Sidecar overflow makes
+request policy unknown and disables reaction authority without erasing an
+independently complete terminal payload. Aggregate artifact-ledger overflow
+invalidates the complete terminal-artifact projection and selects `unknown`,
+never a validated prefix. For endpoint evidence, charge every REST or GraphQL
 attempt, including retries, before the request; charge known page/record counts
 before cloning or serialization, bytes before hashing, decoding, or
 accumulation, and check the 900-second monotonic deadline again before success.
@@ -493,6 +572,10 @@ parseable. Stable or changing duplicate/pending requests and reactions stay on
 their own audit/policy plane and do not veto terminal selection. The complete
 raw artifact/thread projection must type-preservingly equal the normalized
 current record; a raw-only omitted finding makes the profile `unknown`. Any
+proved non-ancestor remains raw audit-only and must be absent from normalized
+`active_top_level_findings` and `unresolved_thread_findings`; an injected
+normalized non-ancestor is likewise a projection mismatch selecting `unknown`.
+Any
 raw-derived applicable top-level finding blocks reaction clean. Any unresolved
 applicable exact-provider selected-review target-thread finding blocks every
 clean path; terminal precedence may supersede an older top-level finding only
@@ -510,7 +593,10 @@ cross-channel ambiguity rule for terminal acceptance.
 
 For a terminal payload, retain identical initial/final selection and selected
 artifact snapshots plus the complete raw-current authority above in
-`evidence_basis`. Review snapshots include exact
+`evidence_basis`. Every terminal-looking artifact wrapper also retains its
+singular closed `artifact_scope_receipt`; its raw pre/artifact/post response
+receipts, time envelope, artifact GET projection, and scope projection are
+part of type-preserving initial/final equality. Review snapshots include exact
 actor/state/raw and normalized body/native commit plus complete raw REST inline
 pages, complete raw GraphQL thread/comment pages, and the canonical derived
 target-only join. Human, unrelated-bot, null-parent, and unrelated-only
@@ -519,16 +605,20 @@ resolution fields are forbidden. Issue-comment
 snapshots use the authority's full closed schema: canonical API/HTML identity,
 exact actor/App, raw/normalized body, grammar status, `created_at`,
 `updated_at`, edit-aware server time/field, parsed commit, and immutable scope.
+The scope head is current; clean requires its commit to equal that head, while
+an applicable finding may preserve a proved-ancestor artifact commit.
 REST request, reaction, parent, selected, and artifact IDs remain exact
 positive JSON integers; quoted decimal strings are invalid. An
 ID/time/commit summary alone is not acceptance evidence.
 
-Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, and commit binding—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-3 repository-wide seed plus every seeded PR traversal, including the declaration PR. Rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every request-time scope sidecar and complete candidate projection, and revalidate every ordered historical `samples[]` request/sidecar/reaction record. For terminal clean/findings and reaction clean, independently re-fetch the final raw current endpoint inventory, rederive its artifact/thread projection and finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code, projection equality, and initial/final stability. A missing sidecar changes only request/reaction authority; a missing provider record, budget overflow, other ancestry return code, or terminal projection drift is `unknown` for the provider result. Field-by-field normalized current equality alone cannot pass.
+Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, every applicable artifact-time scope receipt, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, artifact commit, receipt-bound current scope, and exact artifact GET body/digest/identity—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-3 repository-wide seed plus every seeded PR traversal, including the declaration PR. Rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every request-time scope sidecar and complete candidate projection, and revalidate every ordered historical `samples[]` request/sidecar/reaction record. For terminal clean/findings and reaction clean, independently re-fetch the final raw current endpoint inventory, rederive its artifact/thread projection and finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code, projection equality, and initial/final stability. A missing request sidecar changes only request/reaction authority; a missing or unstable artifact-scope receipt blocks the wrapped terminal artifact. A missing provider record, budget overflow, other ancestry return code, or terminal projection drift is `unknown` for the provider result. Field-by-field normalized current equality alone cannot pass.
 
 Before applying the generic same-head/different-base `scope-mismatch` branch,
 compare an accepted same-head request's receipt-derived request-time merge base
 with current `pr_merge_base` and apply
 [base-only-retarget-state-machine.json](base-only-retarget-state-machine.json).
+Version 2 adds the independent terminal-artifact scope receipt while preserving
+version 1's request-sidecar event semantics.
 If it changed while `headRefOid` remained unchanged, the old request/result no
 longer covers the whole PR and the same-head request limit prevents a
 replacement. Never relabel that old-epoch request or reaction into the current
@@ -537,16 +627,17 @@ stop before local lanes as specified by the state-machine input contract. A
 missing or malformed sidecar cannot prove this retarget event and therefore
 does not invoke that transition; it instead closes only the request/reaction
 planes, makes request policy unknown, and forbids another POST while
-independently scoped local lanes and terminal evidence keep their own gates. An
+independently scoped local lanes and terminal evidence keep their own gates;
+terminal evidence still requires its separate artifact-time receipt. An
 exact current range newly supplied by the caller recovers local lanes for
 caller-origin state; normal exact-current rederivation recovers them for
 PR-derived state. Either recovery proceeds to local lanes but keeps readiness
 `blocked-input` (`base-changed-same-head`) plus `requested: triple`, `effective:
 triple-inconclusive`, and neither permits another same-head request. Eligibility
 returns only after a separately authorized ordinary change produces a new
-head, and no empty or anchor commit may manufacture that epoch. The sidecar's
-matching pre/post point reads do not prove that an intermediate ABA transition
-did not occur.
+head, and no empty or anchor commit may manufacture that epoch. Neither the
+request sidecar nor an artifact receipt's matching point reads prove that an
+intermediate ABA transition did not occur.
 
 Posting `@codex review` is request transport, not completion or proof that the service started. Accept strong terminal payloads only from exact REST `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`. When app/check evidence is used for service-start detection, accept only exact `app.slug == "chatgpt-codex-connector"`, exact current `head_sha`, and non-null `started_at` after an observed request. A check/run is service-start evidence only and never completes triple or proves no findings, even when `status == "completed"` and `conclusion == "success"`. Unknown or lookalike identities prove neither start nor completion.
 
