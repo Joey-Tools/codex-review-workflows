@@ -283,6 +283,24 @@ def _github_codex_inline_parent_container(commit_id: str) -> str:
     )
 
 
+def _github_codex_invalid_review_state_terminal_signal(
+    raw_body: object,
+    *,
+    state: object,
+    has_associated_children: bool,
+) -> bool:
+    if state == "PENDING" or state in {
+        "APPROVED",
+        "COMMENTED",
+        "CHANGES_REQUESTED",
+    }:
+        return False
+    if state == "DISMISSED":
+        return True
+    body = _normalize_github_codex_body(raw_body)
+    return body != "" or has_associated_children
+
+
 def _github_codex_review_body_semantic(
     raw_body: object,
     *,
@@ -296,22 +314,18 @@ def _github_codex_review_body_semantic(
     body = _normalize_github_codex_body(raw_body)
     if body is None:
         return ("malformed", None)
-    recognized_states = {
+    if _github_codex_invalid_review_state_terminal_signal(
+        body,
+        state=state,
+        has_associated_children=has_associated_children,
+    ):
+        return ("malformed", None)
+    if state == "PENDING" or state not in {
         "APPROVED",
         "COMMENTED",
         "CHANGES_REQUESTED",
-        "PENDING",
-        "DISMISSED",
-    }
-    unknown_state = state is None or (
-        isinstance(state, str) and state not in recognized_states
-    )
-    if unknown_state:
-        return (
-            ("nonterminal", None)
-            if body == "" and not has_associated_children
-            else ("malformed", None)
-        )
+    }:
+        return ("nonterminal", None)
     if state == "APPROVED":
         if body == "No findings." and has_target_children:
             return ("findings", commit_id)
@@ -4094,14 +4108,14 @@ class RepositoryContractTest(unittest.TestCase):
             if channel != "review":
                 return "malformed"
             children = record.get("children")
-            if state == "DISMISSED":
+            if _github_codex_invalid_review_state_terminal_signal(
+                body,
+                state=state,
+                has_associated_children=(isinstance(children, list) and bool(children)),
+            ):
                 return "malformed"
             if state not in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED"):
-                return (
-                    "malformed"
-                    if body or (isinstance(children, list) and bool(children))
-                    else "nonterminal"
-                )
+                return "nonterminal"
             commit_id = record.get("commit_id")
             parent_id = record.get("id")
             children = record.get("children")
@@ -4601,26 +4615,20 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(classify(resolved_child), "findings")
 
-        def invalid_state_terminal_signal(record: dict[str, object]) -> bool:
-            if record.get("channel") != "review" or not exact_provider(record):
-                return False
-            state = record.get("state")
-            if state == "PENDING" or state in (
-                "APPROVED",
-                "COMMENTED",
-                "CHANGES_REQUESTED",
-            ):
-                return False
-            body = normalize_body(record.get("body"))
-            children = record.get("children")
-            return (
-                state == "DISMISSED"
-                or bool(body)
-                or (isinstance(children, list) and bool(children))
-            )
-
         def select_terminal(records: list[dict[str, object]]) -> str:
-            if any(invalid_state_terminal_signal(record) for record in records):
+            if any(
+                record.get("channel") == "review"
+                and exact_provider(record)
+                and _github_codex_invalid_review_state_terminal_signal(
+                    record.get("body"),
+                    state=record.get("state"),
+                    has_associated_children=(
+                        isinstance(record.get("children"), list)
+                        and bool(record["children"])
+                    ),
+                )
+                for record in records
+            ):
                 return "inconclusive"
             terminal = [
                 (record["submitted_at"], classify(record))
@@ -5937,6 +5945,10 @@ class RepositoryContractTest(unittest.TestCase):
                     else "updated_at"
                 ),
                 "normalized_body": "@codex review",
+                "user": {
+                    "login": "fixture-requester",
+                    "type": "User",
+                },
             }
 
         def reaction(
@@ -6177,6 +6189,7 @@ class RepositoryContractTest(unittest.TestCase):
             "request_server_time",
             "request_server_time_field",
             "normalized_body",
+            "user",
         }
         request_scope_receipt_fields = {
             "kind",
@@ -6571,6 +6584,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "request_server_time": request_server_time,
                     "request_server_time_field": request_server_time_field,
                     "normalized_body": projected_comment.get("body"),
+                    "user": clone(projected_comment.get("user")),
                 }
                 if (
                     type(request_id) is not int
@@ -7345,8 +7359,16 @@ class RepositoryContractTest(unittest.TestCase):
                 and (
                     (
                         channel == "pull-request-review"
-                        and final.get("state") == "APPROVED"
-                        and body == "Looks good."
+                        and (
+                            (final.get("state") == "APPROVED" and body == "Looks good.")
+                            or _github_codex_invalid_review_state_terminal_signal(
+                                body,
+                                state=final.get("state"),
+                                has_associated_children=(
+                                    preliminary_has_associated_children
+                                ),
+                            )
+                        )
                     )
                     or (
                         channel == "issue-comment"
@@ -7447,6 +7469,16 @@ class RepositoryContractTest(unittest.TestCase):
                 "unresolved-thread-finding"
             ):
                 thread_evidence = review_thread_evidence()
+                invalid_state_thread_payload = (
+                    expected_kind == "malformed-terminal-artifact"
+                    and _github_codex_invalid_review_state_terminal_signal(
+                        body,
+                        state=final.get("state"),
+                        has_associated_children=(preliminary_has_associated_children),
+                    )
+                    and thread_evidence is not None
+                    and bool(thread_evidence[0])
+                )
                 resolved_thread_payload = (
                     expected_kind == "terminal-payload"
                     and inline_finding_grammar
@@ -7461,7 +7493,11 @@ class RepositoryContractTest(unittest.TestCase):
                     and not thread_evidence[0]
                     and not thread_evidence[1]
                 )
-                if not (resolved_thread_payload or empty_thread_payload):
+                if not (
+                    invalid_state_thread_payload
+                    or resolved_thread_payload
+                    or empty_thread_payload
+                ):
                     return None
             return (
                 server_time,
@@ -7490,6 +7526,29 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             if not isinstance(value, dict) or not isinstance(expected_scope, tuple):
                 return None
+            try:
+                wrapper_body = canonical_raw_body(value)
+                wrapper_digest = hashlib.sha256(
+                    wrapper_body.encode("utf-8")
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            wrapper_header = (
+                "dict",
+                tuple(sorted(value)),
+                tuple(
+                    (
+                        key,
+                        type(value[key]).__name__,
+                        (
+                            len(value[key])
+                            if isinstance(value[key], (dict, list, str))
+                            else None
+                        ),
+                    )
+                    for key in sorted(value)
+                ),
+            )
             cache_key = (id(value), expected_kind, expected_scope)
             try:
                 hash(cache_key)
@@ -7499,8 +7558,10 @@ class RepositoryContractTest(unittest.TestCase):
                 cache_entry = validated_artifacts[cache_key]
                 if (
                     not isinstance(cache_entry, dict)
-                    or set(cache_entry) != {"wrapper", "validated"}
+                    or set(cache_entry) != {"wrapper", "header", "digest", "validated"}
                     or cache_entry.get("wrapper") is not value
+                    or cache_entry.get("header") != wrapper_header
+                    or cache_entry.get("digest") != wrapper_digest
                 ):
                     return None
                 cached = cache_entry["validated"]
@@ -7513,6 +7574,8 @@ class RepositoryContractTest(unittest.TestCase):
             )
             validated_artifacts[cache_key] = {
                 "wrapper": value,
+                "header": wrapper_header,
+                "digest": wrapper_digest,
                 "validated": validated,
             }
             return validated
@@ -7521,6 +7584,7 @@ class RepositoryContractTest(unittest.TestCase):
             record: dict[str, object],
             *,
             expected_scope: tuple[object, ...] | None = None,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> str:
             initial_snapshot = record.get("initial_snapshot")
             final_snapshot = record.get("final_snapshot")
@@ -7546,8 +7610,10 @@ class RepositoryContractTest(unittest.TestCase):
             pr = record_scope_key[1]
             raw_requests = record.get("requests")
             raw_reactions = record.get("reactions")
-            receipt_scopes = request_scope_receipt_mapping(
-                record.get("request_scope_receipts")
+            receipt_scopes = memoized_request_scope_receipt_mapping(
+                record,
+                inventory_validation_context=inventory_validation_context,
+                namespace="normalized-record-request-scope-receipts-v1",
             )
             if (
                 not isinstance(raw_requests, list)
@@ -7734,6 +7800,7 @@ class RepositoryContractTest(unittest.TestCase):
             prefer_unresolved_thread_blocker: bool = False,
             finding_ancestry: dict[str, int] | None = None,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> tuple[int, int] | None:
             context = artifact_validation_context
             if context is None:
@@ -7824,6 +7891,9 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             artifact_bases: list[tuple[int, int, str, str, str, str]] = []
+            invalid_review_state_blockers: list[
+                tuple[int, int, str, str, str, str]
+            ] = []
             artifacts_by_native_id: dict[tuple[str, int], dict[str, object]] = {}
             artifact_semantics_by_time_id: dict[
                 tuple[str, int, int], tuple[str, str]
@@ -7878,6 +7948,33 @@ class RepositoryContractTest(unittest.TestCase):
                         artifacts_by_native_id[native_key] = final_artifact_snapshot
                         artifact_semantics_by_time_id[semantics_key] = semantics
                         artifact_bases.append(validated_artifact)
+                        associated = final_artifact_snapshot.get(
+                            "associated_inline_comments"
+                        )
+                        associated_records = (
+                            associated.get("records")
+                            if isinstance(associated, dict)
+                            else None
+                        )
+                        has_associated_children = isinstance(
+                            associated_records, list
+                        ) and any(
+                            isinstance(child, dict)
+                            and child.get("pull_request_review_id")
+                            == stable_artifact_id
+                            for child in associated_records
+                        )
+                        if (
+                            channel == "pull-request-review"
+                            and _github_codex_invalid_review_state_terminal_signal(
+                                final_artifact_snapshot.get("body"),
+                                state=final_artifact_snapshot.get("state"),
+                                has_associated_children=has_associated_children,
+                            )
+                        ):
+                            if validated_kind != "malformed-terminal-artifact":
+                                return None
+                            invalid_review_state_blockers.append(validated_artifact)
 
             if artifact_bases:
                 if prefer_unresolved_thread_blocker:
@@ -7892,6 +7989,30 @@ class RepositoryContractTest(unittest.TestCase):
                             key=lambda item: (item[0], item[1]),
                         )
                         return (server_time, stable_artifact_id)
+                if invalid_review_state_blockers:
+                    (
+                        blocker_time,
+                        blocker_id,
+                        blocker_kind,
+                        _,
+                        _,
+                        _,
+                    ) = max(
+                        invalid_review_state_blockers,
+                        key=lambda item: (item[4], item[1]),
+                    )
+                    expected_basis = {
+                        "kind": blocker_kind,
+                        "server_time": blocker_time,
+                        "stable_artifact_id": blocker_id,
+                    }
+                    actual_basis = record.get("candidate_basis")
+                    if not isinstance(actual_basis, dict) or not typed_json_equal(
+                        actual_basis,
+                        expected_basis,
+                    ):
+                        return None
+                    return (blocker_time, blocker_id)
                 latest_artifact_time = max(item[0] for item in artifact_bases)
                 latest_artifacts = [
                     item for item in artifact_bases if item[0] == latest_artifact_time
@@ -7943,8 +8064,10 @@ class RepositoryContractTest(unittest.TestCase):
             pr = record_scope_key[1]
             raw_requests = record.get("requests")
             reactions = record.get("reactions")
-            receipt_scopes = request_scope_receipt_mapping(
-                record.get("request_scope_receipts")
+            receipt_scopes = memoized_request_scope_receipt_mapping(
+                record,
+                inventory_validation_context=inventory_validation_context,
+                namespace="normalized-record-request-scope-receipts-v1",
             )
             if not isinstance(raw_requests, list) or not isinstance(reactions, list):
                 return None
@@ -8199,7 +8322,41 @@ class RepositoryContractTest(unittest.TestCase):
                 if isinstance(inline_comments, list)
                 else None
             )
+            scope = snapshot.get("scope")
+            repository = scope.get("repository") if isinstance(scope, dict) else None
+            pull_request = scope.get("pr") if isinstance(scope, dict) else None
+            parent_review_id = snapshot.get("id")
             thread_pages = snapshot.get("review_thread_pages")
+            target_inline_comments = (
+                _selected_review_target_children(
+                    projected_inline_comments,
+                    repository=repository,
+                    pull_request=pull_request,
+                    parent_review_id=parent_review_id,
+                )
+                if isinstance(repository, str)
+                and type(pull_request) is int
+                and type(parent_review_id) is int
+                else None
+            )
+            joined_findings = (
+                _review_thread_findings_from_raw(
+                    projected_inline_comments,
+                    thread_pages,
+                    repository=repository,
+                    pull_request=pull_request,
+                    parent_review_id=parent_review_id,
+                )
+                if isinstance(repository, str)
+                and type(pull_request) is int
+                and type(parent_review_id) is int
+                else None
+            )
+            if target_inline_comments is None or joined_findings is None:
+                return {
+                    "invalid_review_policy_projection": clone(snapshot),
+                }
+            target_thread_ids = {finding["thread_id"] for finding in joined_findings}
             pages = (
                 thread_pages.get("pages") if isinstance(thread_pages, dict) else None
             )
@@ -8208,7 +8365,12 @@ class RepositoryContractTest(unittest.TestCase):
                 for page in pages:
                     nodes = page.get("nodes") if isinstance(page, dict) else None
                     if isinstance(nodes, list):
-                        thread_nodes.extend(clone(nodes))
+                        thread_nodes.extend(
+                            clone(node)
+                            for node in nodes
+                            if isinstance(node, dict)
+                            and node.get("id") in target_thread_ids
+                        )
                     else:
                         thread_nodes.append({"invalid_nodes": clone(nodes)})
             return {
@@ -8217,7 +8379,7 @@ class RepositoryContractTest(unittest.TestCase):
                     if projected_review is not None
                     else {"invalid_review_projection": clone(snapshot)}
                 ),
-                "inline_comments": clone(projected_inline_comments),
+                "inline_comments": clone(target_inline_comments),
                 "review_threads": thread_nodes,
             }
 
@@ -8226,17 +8388,25 @@ class RepositoryContractTest(unittest.TestCase):
             ordering_key: tuple[int, int] | None,
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_context: dict[str, object] | None = None,
+            basis_kind_override: str | None = None,
         ) -> dict[str, object] | None:
             basis = candidate.get("candidate_basis")
             if ordering_key is None or not isinstance(basis, dict):
                 return None
-            basis_kind = basis.get("kind")
+            basis_kind = (
+                basis_kind_override
+                if basis_kind_override is not None
+                else basis.get("kind")
+            )
             server_time, stable_artifact_id = ordering_key
             if basis_kind == "reaction":
                 reactions = candidate.get("reactions")
                 raw_requests = candidate.get("requests")
-                receipt_mapping = request_scope_receipt_mapping(
-                    candidate.get("request_scope_receipts")
+                receipt_mapping = memoized_request_scope_receipt_mapping(
+                    candidate,
+                    inventory_validation_context=inventory_validation_context,
+                    namespace="normalized-record-request-scope-receipts-v1",
                 )
                 candidate_scope_key = scope_key(candidate)
                 if (
@@ -8367,7 +8537,10 @@ class RepositoryContractTest(unittest.TestCase):
         def candidate_scope_authority_audit(
             candidate: dict[str, object],
             *,
+            prefer_unresolved_thread_blocker: bool = False,
+            finding_ancestry: dict[str, int] | None = None,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             context = artifact_validation_context
             if context is None:
@@ -8382,7 +8555,10 @@ class RepositoryContractTest(unittest.TestCase):
                 context is None
                 or candidate_order_basis(
                     candidate,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                    finding_ancestry=finding_ancestry,
                     artifact_validation_context=context,
+                    inventory_validation_context=inventory_validation_context,
                 )
                 is None
                 or candidate_scope_key is None
@@ -8398,8 +8574,10 @@ class RepositoryContractTest(unittest.TestCase):
             audited_requests = requests if reaction_authority else []
             audited_reactions = reactions if reaction_authority else []
 
-            receipt_mapping = request_scope_receipt_mapping(
-                candidate.get("request_scope_receipts")
+            receipt_mapping = memoized_request_scope_receipt_mapping(
+                candidate,
+                inventory_validation_context=inventory_validation_context,
+                namespace="normalized-record-request-scope-receipts-v1",
             )
             request_audit: list[dict[str, object]] = []
             for raw_request in audited_requests:
@@ -8528,6 +8706,7 @@ class RepositoryContractTest(unittest.TestCase):
             candidates: list[dict[str, object]],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]]:
             context = artifact_validation_context
             if context is None:
@@ -8539,6 +8718,7 @@ class RepositoryContractTest(unittest.TestCase):
                     candidate_order_basis(
                         candidate,
                         artifact_validation_context=context,
+                        inventory_validation_context=inventory_validation_context,
                     )
                     if context is not None
                     else None
@@ -8557,6 +8737,7 @@ class RepositoryContractTest(unittest.TestCase):
                             candidate,
                             ordering_key,
                             artifact_validation_context=context,
+                            inventory_validation_context=inventory_validation_context,
                         ),
                     }
                 )
@@ -8644,15 +8825,23 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             tightened_limits: dict[str, int] | None = None,
             monotonic_clock: object = time.monotonic,
+            resource_tracker: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
-            resource_tracker = new_resource_tracker(
-                tightened_limits=tightened_limits,
-                monotonic_clock=monotonic_clock,
-            )
-            if resource_tracker is None:
+            tracker = resource_tracker
+            if tracker is None:
+                tracker = new_resource_tracker(
+                    tightened_limits=tightened_limits,
+                    monotonic_clock=monotonic_clock,
+                )
+            expected_limits = effective_resource_limits(tightened_limits)
+            if (
+                tracker is None
+                or expected_limits is None
+                or not typed_json_equal(tracker.get("limits"), expected_limits)
+            ):
                 return None
             return {
-                "resource_tracker": resource_tracker,
+                "resource_tracker": tracker,
                 "validated_artifacts": {},
             }
 
@@ -8701,6 +8890,185 @@ class RepositoryContractTest(unittest.TestCase):
                 "retained_utf8_bytes": 0,
                 "failed": False,
             }
+
+        def new_inventory_validation_context(
+            *,
+            tightened_limits: dict[str, int] | None = None,
+            monotonic_clock: object = time.monotonic,
+        ) -> dict[str, object] | None:
+            root_tracker = new_resource_tracker(
+                tightened_limits=tightened_limits,
+                monotonic_clock=monotonic_clock,
+            )
+            if root_tracker is None:
+                return None
+            endpoint_tracker = new_sibling_resource_tracker(root_tracker)
+            sidecar_tracker = new_sibling_resource_tracker(root_tracker)
+            artifact_tracker = new_sibling_resource_tracker(root_tracker)
+            if (
+                endpoint_tracker is None
+                or sidecar_tracker is None
+                or artifact_tracker is None
+            ):
+                return None
+            artifact_context = new_artifact_validation_context(
+                tightened_limits=tightened_limits,
+                monotonic_clock=monotonic_clock,
+                resource_tracker=artifact_tracker,
+            )
+            if artifact_context is None:
+                return None
+            return {
+                "root_tracker": root_tracker,
+                "endpoint_tracker": endpoint_tracker,
+                "sidecar_tracker": sidecar_tracker,
+                "artifact_validation_context": artifact_context,
+                "memo": {},
+            }
+
+        def inventory_validation_context_parts(
+            value: object,
+        ) -> (
+            tuple[
+                dict[str, object],
+                dict[str, object],
+                dict[str, object],
+                dict[str, object],
+                dict[object, object],
+            ]
+            | None
+        ):
+            if not isinstance(value, dict) or set(value) != {
+                "root_tracker",
+                "endpoint_tracker",
+                "sidecar_tracker",
+                "artifact_validation_context",
+                "memo",
+            }:
+                return None
+            root = value.get("root_tracker")
+            endpoint = value.get("endpoint_tracker")
+            sidecar = value.get("sidecar_tracker")
+            artifact_context = value.get("artifact_validation_context")
+            memo = value.get("memo")
+            artifact_parts = artifact_validation_context_parts(artifact_context)
+            if (
+                not isinstance(root, dict)
+                or not isinstance(endpoint, dict)
+                or not isinstance(sidecar, dict)
+                or artifact_parts is None
+                or not isinstance(memo, dict)
+            ):
+                return None
+            artifact = artifact_parts[0]
+            trackers = (root, endpoint, sidecar, artifact)
+            root_clock = root.get("clock")
+            root_started = root.get("started")
+            root_limits = root.get("limits")
+            if (
+                not callable(root_clock)
+                or not isinstance(root_started, float)
+                or not isinstance(root_limits, dict)
+                or len({id(item) for item in trackers}) != len(trackers)
+                or any(item.get("clock") is not root_clock for item in trackers[1:])
+                or any(item.get("started") != root_started for item in trackers[1:])
+                or any(
+                    not typed_json_equal(item.get("limits"), root_limits)
+                    for item in trackers[1:]
+                )
+            ):
+                return None
+            return (root, endpoint, sidecar, artifact_context, memo)
+
+        def inventory_validation_memoized(
+            context: dict[str, object],
+            *,
+            namespace: str,
+            inventory: object,
+            producer: object,
+        ) -> object:
+            parts = inventory_validation_context_parts(context)
+            if (
+                parts is None
+                or not isinstance(namespace, str)
+                or not callable(producer)
+            ):
+                return None
+            memo = parts[4]
+            try:
+                body = canonical_raw_body(inventory)
+                digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            header = (
+                type(inventory).__name__,
+                len(inventory) if isinstance(inventory, (dict, list)) else None,
+            )
+            cache_key = (namespace, id(inventory))
+            cached = memo.get(cache_key)
+            if cached is not None:
+                if (
+                    not isinstance(cached, dict)
+                    or set(cached) != {"inventory", "header", "digest", "result"}
+                    or cached.get("inventory") is not inventory
+                    or cached.get("header") != header
+                    or cached.get("digest") != digest
+                ):
+                    return None
+                return cached.get("result")
+            result = producer()
+            memo[cache_key] = {
+                "inventory": inventory,
+                "header": header,
+                "digest": digest,
+                "result": result,
+            }
+            return result
+
+        def memoized_request_scope_receipt_mapping(
+            record: dict[str, object],
+            *,
+            inventory_validation_context: dict[str, object] | None,
+            namespace: str,
+            maximum_server_time: int | None = history_as_of_server_time,
+        ) -> dict[int, dict[str, object]] | None:
+            if inventory_validation_context is None:
+                return request_scope_receipt_mapping(
+                    record.get("request_scope_receipts"),
+                    maximum_server_time=maximum_server_time,
+                )
+            parts = inventory_validation_context_parts(inventory_validation_context)
+            if parts is None:
+                return None
+            memoized = inventory_validation_memoized(
+                inventory_validation_context,
+                namespace=f"{namespace}:{maximum_server_time}",
+                inventory=record,
+                producer=lambda: request_scope_receipt_mapping(
+                    record.get("request_scope_receipts"),
+                    resource_tracker=parts[2],
+                    maximum_server_time=maximum_server_time,
+                ),
+            )
+            return memoized if isinstance(memoized, dict) else None
+
+        def inventory_validation_deadlines_hold(
+            context: dict[str, object],
+            *,
+            ignore_sidecar_failure: bool = False,
+        ) -> bool:
+            parts = inventory_validation_context_parts(context)
+            if parts is None or type(ignore_sidecar_failure) is not bool:
+                return False
+            trackers = (
+                (parts[1], parts[3]["resource_tracker"])
+                if ignore_sidecar_failure
+                else (parts[1], parts[2], parts[3]["resource_tracker"])
+            )
+            return all(
+                tracker.get("failed") is False and resource_budget_charge(tracker)
+                for tracker in trackers
+            )
 
         def resource_budget_charge(
             tracker: dict[str, object],
@@ -9162,6 +9530,8 @@ class RepositoryContractTest(unittest.TestCase):
         def raw_request_record(value: object) -> dict[str, object]:
             if not isinstance(value, dict):
                 return {"invalid_request": value}
+            raw_user = value.get("user")
+            user = raw_user if isinstance(raw_user, dict) else {}
             return {
                 "id": value.get("id"),
                 "node_id": f"IC_{value.get('id')}",
@@ -9174,8 +9544,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
                 "updated_at": _format_github_rfc3339_seconds(value.get("updated_at")),
                 "user": {
-                    "login": "fixture-requester",
-                    "type": "User",
+                    "login": user.get("login"),
+                    "type": user.get("type"),
                     "node_id": "U_requester",
                 },
                 "performed_via_github_app": None,
@@ -10317,19 +10687,18 @@ class RepositoryContractTest(unittest.TestCase):
         ).hexdigest()
         self.assertIsNone(parse_graphql_thread_pages(incomplete_nested_graphql))
 
-        def parse_discovery_endpoint_transcript(
+        def produce_raw_semantic_dataset(
             value: object,
             *,
-            request_scope_receipts: object = None,
             provider_declaration: object = None,
             current_ancestry: dict[str, int] | None = None,
             require_current_ancestry_exact: bool = True,
-            prefer_unresolved_thread_blocker: bool = False,
             _tightened_resource_limits: dict[str, int] | None = None,
             _monotonic_clock: object = time.monotonic,
             _single_scope_pull_number: int | None = None,
             _allow_post_as_of_requests: bool = False,
             _allow_post_as_of_artifacts: bool = False,
+            _inventory_validation_context: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             if (
                 not isinstance(value, dict)
@@ -10340,7 +10709,6 @@ class RepositoryContractTest(unittest.TestCase):
                 or value.get("schema_version") != 3
                 or value.get("repository") != current_repository
                 or not isinstance(value.get("scopes"), list)
-                or type(prefer_unresolved_thread_blocker) is not bool
                 or type(_allow_post_as_of_requests) is not bool
                 or type(_allow_post_as_of_artifacts) is not bool
                 or (
@@ -10352,31 +10720,25 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return None
-            resource_tracker = new_resource_tracker(
-                tightened_limits=_tightened_resource_limits,
-                monotonic_clock=_monotonic_clock,
-            )
+            inventory_context = _inventory_validation_context
+            if inventory_context is None:
+                inventory_context = new_inventory_validation_context(
+                    tightened_limits=_tightened_resource_limits,
+                    monotonic_clock=_monotonic_clock,
+                )
+            inventory_parts = inventory_validation_context_parts(inventory_context)
             effective_limits = effective_resource_limits(_tightened_resource_limits)
             if (
-                resource_tracker is None
+                inventory_parts is None
                 or effective_limits is None
+                or not typed_json_equal(
+                    inventory_parts[1].get("limits"),
+                    effective_limits,
+                )
                 or len(value["scopes"]) > effective_limits["max_seeded_pull_requests"]
             ):
                 return None
-            receipt_resource_tracker = new_sibling_resource_tracker(resource_tracker)
-            receipt_mapping = (
-                request_scope_receipt_mapping(
-                    request_scope_receipts,
-                    resource_tracker=receipt_resource_tracker,
-                    maximum_server_time=(
-                        None
-                        if _allow_post_as_of_requests
-                        else history_as_of_server_time
-                    ),
-                )
-                if receipt_resource_tracker is not None
-                else None
-            )
+            resource_tracker = inventory_parts[1]
             expected_declaration_raw: dict[str, object] | None = None
             if provider_declaration is not None:
                 if not declaration_is_authoritative(
@@ -10451,15 +10813,11 @@ class RepositoryContractTest(unittest.TestCase):
                     return None
                 discovered_pulls[_single_scope_pull_number] = None
 
-            entries: list[dict[str, object]] = []
-            scope_classifications: list[dict[str, object]] = []
-            scope_authority_audit: list[dict[str, object]] = []
+            raw_semantic_scopes: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
-            used_receipt_ids: set[int] = set()
             declaration_match_count = 0
-            request_receipt_closure_required = False
             ancestry = current_ancestry if current_ancestry is not None else {}
             if not isinstance(ancestry, dict) or any(
                 not isinstance(candidate, str)
@@ -10649,7 +11007,6 @@ class RepositoryContractTest(unittest.TestCase):
 
                 request_times: dict[int, int] = {}
                 request_records: dict[int, dict[str, object]] = {}
-                request_receipt_bindings: dict[int, dict[str, object]] = {}
                 issue_artifacts: list[dict[str, object]] = []
                 nonterminal_records: list[tuple[str, int, int | None, str]] = []
                 seen_issue_ids: set[int] = set()
@@ -10710,16 +11067,9 @@ class RepositoryContractTest(unittest.TestCase):
                                 else "updated_at"
                             ),
                             "normalized_body": body,
+                            "user": clone(projected_issue.get("user")),
                         }
                         request_records[issue_id] = normalized_request
-                        if receipt_mapping is not None:
-                            binding = receipt_mapping.get(issue_id)
-                            if isinstance(binding, dict) and typed_json_equal(
-                                binding.get("request"),
-                                normalized_request,
-                            ):
-                                request_receipt_bindings[issue_id] = binding
-                                used_receipt_ids.add(issue_id)
                     else:
                         normalized_issue = _normalize_github_codex_body(body)
                         if normalized_issue is None:
@@ -10903,6 +11253,7 @@ class RepositoryContractTest(unittest.TestCase):
                     review_id: [] for review_id in nonterminal_review_by_id
                 }
                 target_review_by_child_id: dict[str, int] = {}
+                associated_review_by_child_id: dict[str, int] = {}
                 nonterminal_review_by_child_id: dict[str, int] = {}
                 excluded_future_review_by_child_id: dict[
                     str, tuple[int, dict[str, object]]
@@ -10956,6 +11307,10 @@ class RepositoryContractTest(unittest.TestCase):
                         continue
                     if parent_id in associated_inline_by_review:
                         associated_inline_by_review[parent_id].append(projected_inline)
+                        associated_child_id = str(projected_inline["id"])
+                        if associated_child_id in associated_review_by_child_id:
+                            return None
+                        associated_review_by_child_id[associated_child_id] = parent_id
                     if actor == "different":
                         nonterminal_records.append(
                             (
@@ -11010,6 +11365,9 @@ class RepositoryContractTest(unittest.TestCase):
                 thread_nodes_by_review: dict[int, list[dict[str, object]]] = {
                     review_id: [] for review_id in review_by_id
                 }
+                associated_thread_nodes_by_review: dict[
+                    int, list[dict[str, object]]
+                ] = {review_id: [] for review_id in review_by_id}
                 nonterminal_thread_nodes_by_review: dict[
                     int, list[dict[str, object]]
                 ] = {review_id: [] for review_id in nonterminal_review_by_id}
@@ -11024,6 +11382,7 @@ class RepositoryContractTest(unittest.TestCase):
                         comments.get("pages") if isinstance(comments, dict) else None
                     )
                     target_review_ids: set[int] = set()
+                    associated_review_ids: set[int] = set()
                     nonterminal_review_ids: set[int] = set()
                     excluded_future_child_ids_in_thread: set[str] = set()
                     if not isinstance(pages, list):
@@ -11071,6 +11430,11 @@ class RepositoryContractTest(unittest.TestCase):
                             target_review_id = target_review_by_child_id.get(child_id)
                             if target_review_id is not None:
                                 target_review_ids.add(target_review_id)
+                            associated_review_id = associated_review_by_child_id.get(
+                                child_id
+                            )
+                            if associated_review_id is not None:
+                                associated_review_ids.add(associated_review_id)
                             nonterminal_review_id = nonterminal_review_by_child_id.get(
                                 child_id
                             )
@@ -11132,6 +11496,10 @@ class RepositoryContractTest(unittest.TestCase):
                             ]
                     for target_review_id in target_review_ids:
                         thread_nodes_by_review[target_review_id].append(semantic_thread)
+                    for associated_review_id in associated_review_ids:
+                        associated_thread_nodes_by_review[associated_review_id].append(
+                            semantic_thread
+                        )
                     for nonterminal_review_id in nonterminal_review_ids:
                         nonterminal_thread_nodes_by_review[
                             nonterminal_review_id
@@ -11164,6 +11532,9 @@ class RepositoryContractTest(unittest.TestCase):
 
                 artifact_bases: list[tuple[int, int, str, str, str, str | None]] = []
                 unresolved_artifact_bases: list[
+                    tuple[int, int, str, str, str, str | None]
+                ] = []
+                invalid_review_state_blockers: list[
                     tuple[int, int, str, str, str, str | None]
                 ] = []
                 for review_id, raw_review in review_by_id.items():
@@ -11281,7 +11652,17 @@ class RepositoryContractTest(unittest.TestCase):
                         review_commit,
                     )
                     artifact_bases.append(artifact_basis)
-                    if any(finding.get("is_resolved") is False for finding in joined):
+                    if _github_codex_invalid_review_state_terminal_signal(
+                        body,
+                        state=state,
+                        has_associated_children=bool(
+                            associated_inline_by_review[review_id]
+                        ),
+                    ):
+                        invalid_review_state_blockers.append(artifact_basis)
+                    if semantic == "findings" and any(
+                        finding.get("is_resolved") is False for finding in joined
+                    ):
                         unresolved_artifact_bases.append(artifact_basis)
 
                 for raw_issue in issue_artifacts:
@@ -11401,106 +11782,593 @@ class RepositoryContractTest(unittest.TestCase):
                         )
                     )
 
-                scope_audit_requests: list[dict[str, object]] = []
-                for request_id in sorted(request_times):
-                    binding = request_receipt_bindings.get(request_id)
-                    scope_audit_requests.append(
-                        {
-                            "request": clone(request_records[request_id]),
-                            "request_scope": (
-                                list(binding["scope"])
-                                if isinstance(binding, dict)
-                                else None
-                            ),
-                            "request_scope_receipt": (
-                                clone(binding["receipt"])
-                                if isinstance(binding, dict)
-                                else None
-                            ),
-                        }
-                    )
-                scope_audit_reactions: list[dict[str, object]] = []
-                for raw_reaction in sorted(
-                    semantic_reaction_records,
-                    key=lambda item: (
-                        int(item["created_at"]),
-                        int(item["id"]),
-                        int(item["parent_comment_id"]),
-                    ),
-                ):
-                    raw_user = raw_reaction.get("user")
-                    if not isinstance(raw_user, dict):
-                        return None
-                    parent_comment_id = raw_reaction["parent_comment_id"]
-                    scope_audit_reactions.append(
-                        {
-                            "id": raw_reaction["id"],
-                            "parent_request_id": parent_comment_id,
-                            "parent_reactions_api_url": (
-                                f"{api_root}/issues/comments/{parent_comment_id}/"
-                                "reactions?per_page=100"
-                            ),
-                            "created_at": raw_reaction["created_at"],
-                            "content": raw_reaction["content"],
-                            "user_login": raw_user.get("login"),
-                            "user_type": raw_user.get("type"),
-                        }
-                    )
-                scope_audit_artifacts = [
+                raw_semantic_scopes.append(
                     {
-                        "server_time": server_time,
-                        "id": artifact_id,
-                        "channel": channel,
-                        "semantic": semantic,
-                        "source_record_sha256": source_digest,
-                        "artifact_commit": artifact_commit,
+                        "pull_number": pr,
+                        "scope_key": parsed_scope,
+                        "repository": repository,
+                        "base_oid": base_oid,
+                        "merge_base": merge_base,
+                        "head": head,
+                        "lifecycle": {
+                            "state": clone(pull_record.get("state")),
+                            "merged": clone(pull_record.get("merged")),
+                            "merged_at": clone(pull_record.get("merged_at")),
+                        },
+                        "request_times": dict(request_times),
+                        "request_records": {
+                            request_id: clone(request_record)
+                            for request_id, request_record in request_records.items()
+                        },
+                        "provider_reactions": list(provider_reactions),
+                        "reaction_records": [
+                            clone(reaction_record)
+                            for reaction_record in semantic_reaction_records
+                        ],
+                        "artifact_bases": list(artifact_bases),
+                        "unresolved_artifact_bases": list(unresolved_artifact_bases),
+                        "invalid_review_state_blockers": list(
+                            invalid_review_state_blockers
+                        ),
+                        "nonterminal_records": list(nonterminal_records),
                     }
-                    for (
-                        server_time,
-                        artifact_id,
-                        channel,
-                        semantic,
-                        source_digest,
-                        artifact_commit,
-                    ) in sorted(artifact_bases)
-                ]
-                scope_audit_nonterminal = [
-                    {
-                        "channel": channel,
-                        "id": record_id,
-                        "server_time": server_time,
-                        "source_record_sha256": source_digest,
-                    }
-                    for (
-                        channel,
-                        record_id,
-                        server_time,
-                        source_digest,
-                    ) in sorted(nonterminal_records)
-                ]
-                if any(
-                    (
-                        scope_audit_requests,
-                        scope_audit_reactions,
-                        scope_audit_artifacts,
-                        scope_audit_nonterminal,
-                    )
-                ):
-                    scope_authority_audit.append(
-                        {
-                            "scope_key": list(parsed_scope),
-                            "lifecycle": {
-                                "state": clone(pull_record.get("state")),
-                                "merged": clone(pull_record.get("merged")),
-                                "merged_at": clone(pull_record.get("merged_at")),
-                            },
-                            "requests": scope_audit_requests,
-                            "reactions": scope_audit_reactions,
-                            "applicable_artifacts": scope_audit_artifacts,
-                            "nonterminal_records": scope_audit_nonterminal,
-                        }
-                    )
+                )
+            if (
+                seen_detail_pulls != set(discovered_pulls)
+                or current_scope_key not in seen_scopes
+                or (
+                    expected_declaration_raw is not None
+                    and declaration_match_count != 1
+                )
+                or (
+                    current_ancestry is not None
+                    and require_current_ancestry_exact
+                    and set(ancestry) != observed_current_finding_heads
+                )
+            ):
+                return None
+            if not resource_budget_charge(resource_tracker):
+                return None
+            try:
+                transcript_digest = hashlib.sha256(
+                    canonical_raw_body(value).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            return {
+                "raw_semantic_dataset_version": 1,
+                "transcript_sha256": transcript_digest,
+                "scopes": raw_semantic_scopes,
+            }
 
+        def select_raw_terminal_artifact(
+            raw_scope: dict[str, object],
+            *,
+            prefer_unresolved_thread_blocker: bool,
+        ) -> tuple[bool, tuple[object, ...] | None]:
+            artifact_bases = raw_scope.get("artifact_bases")
+            unresolved_artifact_bases = raw_scope.get("unresolved_artifact_bases")
+            invalid_review_state_blockers = raw_scope.get(
+                "invalid_review_state_blockers"
+            )
+            if (
+                not isinstance(artifact_bases, list)
+                or not isinstance(unresolved_artifact_bases, list)
+                or not isinstance(invalid_review_state_blockers, list)
+            ):
+                return (False, None)
+            if not artifact_bases:
+                return (True, None)
+            if prefer_unresolved_thread_blocker and unresolved_artifact_bases:
+                return (
+                    True,
+                    tuple(
+                        max(
+                            unresolved_artifact_bases,
+                            key=lambda item: (item[0], item[1]),
+                        )
+                    ),
+                )
+            if invalid_review_state_blockers:
+                return (
+                    True,
+                    tuple(
+                        max(
+                            invalid_review_state_blockers,
+                            key=lambda item: (item[2], item[1]),
+                        )
+                    ),
+                )
+            latest_time = max(item[0] for item in artifact_bases)
+            latest = [item for item in artifact_bases if item[0] == latest_time]
+            if len({item[2] for item in latest}) != 1:
+                return (False, None)
+            priority = {"clean": 1, "findings": 2, "malformed": 3}
+            if any(item[3] not in priority for item in latest):
+                return (False, None)
+            highest = max(priority[item[3]] for item in latest)
+            return (
+                True,
+                tuple(
+                    max(
+                        (item for item in latest if priority[item[3]] == highest),
+                        key=lambda item: item[1],
+                    )
+                ),
+            )
+
+        def select_raw_reaction(
+            raw_scope: dict[str, object],
+        ) -> tuple[bool, tuple[int, int, int, str] | None]:
+            request_times = raw_scope.get("request_times")
+            provider_reactions = raw_scope.get("provider_reactions")
+            if not isinstance(request_times, dict) or not isinstance(
+                provider_reactions, list
+            ):
+                return (False, None)
+            if not provider_reactions:
+                return (True, None)
+            if any(
+                type(request_id) is not int
+                or type(request_time) is not int
+                or request_time <= 0
+                for request_id, request_time in request_times.items()
+            ):
+                return (False, None)
+            if any(
+                not isinstance(item, tuple)
+                or len(item) != 4
+                or type(item[0]) is not int
+                or type(item[1]) is not int
+                or type(item[2]) is not int
+                or item[2] not in request_times
+                or item[3] not in ("+1", "eyes")
+                or item[0] <= request_times[item[2]]
+                for item in provider_reactions
+            ):
+                return (False, None)
+            if not request_times:
+                return (False, None)
+            selected_reaction = max(provider_reactions)
+            latest_request_time = max(request_times.values())
+            latest_request_ids = [
+                request_id
+                for request_id, server_time in request_times.items()
+                if server_time == latest_request_time
+            ]
+            if (
+                len(latest_request_ids) != 1
+                or selected_reaction[2] != latest_request_ids[0]
+            ):
+                return (False, None)
+            return (True, selected_reaction)
+
+        def raw_scope_authority_audit(
+            raw_scope: dict[str, object],
+            *,
+            request_receipt_bindings: dict[int, dict[str, object]] | None,
+        ) -> dict[str, object] | None:
+            scope_value = raw_scope.get("scope_key")
+            lifecycle = raw_scope.get("lifecycle")
+            request_times = raw_scope.get("request_times")
+            request_records = raw_scope.get("request_records")
+            reaction_records = raw_scope.get("reaction_records")
+            artifact_bases = raw_scope.get("artifact_bases")
+            nonterminal_records = raw_scope.get("nonterminal_records")
+            if (
+                not isinstance(scope_value, tuple)
+                or len(scope_value) != 4
+                or not isinstance(lifecycle, dict)
+                or not isinstance(request_times, dict)
+                or not isinstance(request_records, dict)
+                or not isinstance(reaction_records, list)
+                or not isinstance(artifact_bases, list)
+                or not isinstance(nonterminal_records, list)
+            ):
+                return None
+            scope_audit_requests: list[dict[str, object]] = []
+            for request_id in sorted(request_times):
+                request_record = request_records.get(request_id)
+                if not isinstance(request_record, dict):
+                    return None
+                binding = (
+                    request_receipt_bindings.get(request_id)
+                    if isinstance(request_receipt_bindings, dict)
+                    else None
+                )
+                scope_audit_requests.append(
+                    {
+                        "request": clone(request_record),
+                        "request_scope": (
+                            list(binding["scope"])
+                            if isinstance(binding, dict)
+                            else None
+                        ),
+                        "request_scope_receipt": (
+                            clone(binding["receipt"])
+                            if isinstance(binding, dict)
+                            else None
+                        ),
+                    }
+                )
+            scope_audit_reactions: list[dict[str, object]] = []
+            for raw_reaction in sorted(
+                reaction_records,
+                key=lambda item: (
+                    int(item["created_at"]),
+                    int(item["id"]),
+                    int(item["parent_comment_id"]),
+                ),
+            ):
+                if not isinstance(raw_reaction, dict):
+                    return None
+                raw_user = raw_reaction.get("user")
+                if not isinstance(raw_user, dict):
+                    return None
+                parent_comment_id = raw_reaction.get("parent_comment_id")
+                if type(parent_comment_id) is not int:
+                    return None
+                scope_audit_reactions.append(
+                    {
+                        "id": raw_reaction["id"],
+                        "parent_request_id": parent_comment_id,
+                        "parent_reactions_api_url": (
+                            "https://api.github.com/repos/"
+                            f"{current_repository}/issues/comments/"
+                            f"{parent_comment_id}/reactions?per_page=100"
+                        ),
+                        "created_at": raw_reaction["created_at"],
+                        "content": raw_reaction["content"],
+                        "user_login": raw_user.get("login"),
+                        "user_type": raw_user.get("type"),
+                    }
+                )
+            scope_audit_artifacts = [
+                {
+                    "server_time": server_time,
+                    "id": artifact_id,
+                    "channel": channel,
+                    "semantic": semantic,
+                    "source_record_sha256": source_digest,
+                    "artifact_commit": artifact_commit,
+                }
+                for (
+                    server_time,
+                    artifact_id,
+                    channel,
+                    semantic,
+                    source_digest,
+                    artifact_commit,
+                ) in sorted(artifact_bases)
+            ]
+            scope_audit_nonterminal = [
+                {
+                    "channel": channel,
+                    "id": record_id,
+                    "server_time": server_time,
+                    "source_record_sha256": source_digest,
+                }
+                for (
+                    channel,
+                    record_id,
+                    server_time,
+                    source_digest,
+                ) in sorted(nonterminal_records)
+            ]
+            if not any(
+                (
+                    scope_audit_requests,
+                    scope_audit_reactions,
+                    scope_audit_artifacts,
+                    scope_audit_nonterminal,
+                )
+            ):
+                return None
+            return {
+                "scope_key": list(scope_value),
+                "lifecycle": clone(lifecycle),
+                "requests": scope_audit_requests,
+                "reactions": scope_audit_reactions,
+                "applicable_artifacts": scope_audit_artifacts,
+                "nonterminal_records": scope_audit_nonterminal,
+            }
+
+        def sidecar_independent_reaction_source_evidence(
+            request_record: object,
+            reaction_record: object,
+        ) -> dict[str, object] | None:
+            if (
+                not isinstance(request_record, dict)
+                or set(request_record) != request_fields
+                or not isinstance(reaction_record, dict)
+                or set(reaction_record) != reaction_fields
+                or type(request_record.get("id")) is not int
+                or reaction_record.get("parent_request_id") != request_record.get("id")
+                or type(reaction_record.get("id")) is not int
+                or not isinstance(reaction_record.get("parent_reactions_api_url"), str)
+            ):
+                return None
+            source_bundle = {
+                "request": clone(request_record),
+                "reaction": clone(reaction_record),
+            }
+            try:
+                source_digest = hashlib.sha256(
+                    canonical_raw_body(source_bundle).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            return {
+                "carrier": "reaction",
+                "channel": "request-reaction",
+                "semantic": reaction_record.get("content"),
+                "native_identity": [
+                    reaction_record["parent_reactions_api_url"],
+                    reaction_record["id"],
+                ],
+                "source_record_sha256": source_digest,
+            }
+
+        def project_raw_semantic_dataset(
+            raw_dataset: object,
+            *,
+            request_scope_receipts: object,
+            current_ancestry: dict[str, int] | None,
+            prefer_unresolved_thread_blocker: bool,
+            allow_post_as_of_requests: bool,
+            endpoint_plane_only: bool,
+            sidecar_blind_audit: bool,
+            inventory_validation_context: dict[str, object],
+        ) -> dict[str, object] | None:
+            if (
+                not isinstance(raw_dataset, dict)
+                or set(raw_dataset)
+                != {
+                    "raw_semantic_dataset_version",
+                    "transcript_sha256",
+                    "scopes",
+                }
+                or raw_dataset.get("raw_semantic_dataset_version") != 1
+                or not isinstance(raw_dataset.get("transcript_sha256"), str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(raw_dataset.get("transcript_sha256"))
+                )
+                is None
+                or not isinstance(raw_dataset.get("scopes"), list)
+            ):
+                return None
+            raw_scopes = raw_dataset["scopes"]
+            if endpoint_plane_only:
+                endpoint_result: dict[str, object] = {
+                    "endpoint_complete": True,
+                    "transcript_sha256": raw_dataset["transcript_sha256"],
+                }
+                if not sidecar_blind_audit:
+                    return endpoint_result
+                scope_summaries: list[dict[str, object]] = []
+                projected_audits: list[dict[str, object]] = []
+                for raw_scope in raw_scopes:
+                    if not isinstance(raw_scope, dict):
+                        return None
+                    scope_value = raw_scope.get("scope_key")
+                    pull_number = raw_scope.get("pull_number")
+                    lifecycle = raw_scope.get("lifecycle")
+                    if (
+                        not isinstance(scope_value, tuple)
+                        or len(scope_value) != 4
+                        or type(pull_number) is not int
+                        or not isinstance(lifecycle, dict)
+                    ):
+                        return None
+                    raw_audit = raw_scope_authority_audit(
+                        raw_scope,
+                        request_receipt_bindings=None,
+                    )
+                    terminal_ok, selected = select_raw_terminal_artifact(
+                        raw_scope,
+                        prefer_unresolved_thread_blocker=(
+                            prefer_unresolved_thread_blocker
+                        ),
+                    )
+                    if not terminal_ok:
+                        return None
+                    source_ordering_key: list[int] | None = None
+                    source_evidence: dict[str, object] | None = None
+                    category = "not-candidate"
+                    if selected is not None:
+                        source_ordering_key = [int(selected[0]), int(selected[1])]
+                        source_evidence = {
+                            "carrier": "terminal-artifact",
+                            "channel": selected[2],
+                            "semantic": selected[3],
+                            "native_identity": [selected[2], selected[1]],
+                            "source_record_sha256": selected[4],
+                        }
+                        if (
+                            tuple(scope_value) != current_scope_key
+                            and history_start_exclusive
+                            < source_ordering_key[0]
+                            <= history_as_of_server_time
+                        ):
+                            category = "required-terminal"
+                    else:
+                        reaction_ok, selected_reaction = select_raw_reaction(raw_scope)
+                        if not reaction_ok:
+                            return None
+                        if selected_reaction is not None:
+                            source_ordering_key = [
+                                selected_reaction[0],
+                                selected_reaction[1],
+                            ]
+                            parent_comment_id = selected_reaction[2]
+                            if not isinstance(raw_audit, dict):
+                                return None
+                            selected_audit_requests = [
+                                item.get("request")
+                                for item in raw_audit.get("requests", [])
+                                if isinstance(item, dict)
+                                and isinstance(item.get("request"), dict)
+                                and item["request"].get("id") == parent_comment_id
+                            ]
+                            selected_audit_reactions = [
+                                item
+                                for item in raw_audit.get("reactions", [])
+                                if isinstance(item, dict)
+                                and item.get("id") == selected_reaction[1]
+                                and item.get("parent_request_id") == parent_comment_id
+                            ]
+                            if (
+                                len(selected_audit_requests) != 1
+                                or len(selected_audit_reactions) != 1
+                            ):
+                                return None
+                            source_evidence = (
+                                sidecar_independent_reaction_source_evidence(
+                                    selected_audit_requests[0],
+                                    selected_audit_reactions[0],
+                                )
+                            )
+                            if source_evidence is None:
+                                return None
+                            if (
+                                tuple(scope_value) != current_scope_key
+                                and selected_reaction[3] == "+1"
+                                and history_start_exclusive
+                                < source_ordering_key[0]
+                                <= history_as_of_server_time
+                            ):
+                                category = "required-reaction-epoch-unknown"
+                    raw_classification = (
+                        "current"
+                        if tuple(scope_value) == current_scope_key
+                        else (
+                            "historical-candidate"
+                            if category
+                            in {
+                                "required-terminal",
+                                "required-reaction-epoch-unknown",
+                            }
+                            else "confirmed-non-candidate"
+                        )
+                    )
+                    scope_summaries.append(
+                        {
+                            "pull_number": pull_number,
+                            "scope_key": list(scope_value),
+                            "lifecycle": clone(lifecycle),
+                            "raw_scope_category": category,
+                            "raw_classification": raw_classification,
+                            "source_ordering_key": source_ordering_key,
+                            "source_evidence": source_evidence,
+                        }
+                    )
+                    if raw_audit is not None:
+                        projected_audit = clone(raw_audit)
+                        assert isinstance(projected_audit, dict)
+                        projected_requests = projected_audit.get("requests")
+                        if not isinstance(projected_requests, list):
+                            return None
+                        for projected_request in projected_requests:
+                            if not isinstance(projected_request, dict):
+                                return None
+                            projected_request.pop("request_scope", None)
+                            projected_request.pop("request_scope_receipt", None)
+                        projected_audit.pop("nonterminal_records", None)
+                        projected_audits.append(projected_audit)
+                endpoint_result["sidecar_blind_scope_summaries"] = sorted(
+                    scope_summaries,
+                    key=lambda item: int(item["pull_number"]),
+                )
+                endpoint_result["sidecar_blind_authority_audit"] = sorted(
+                    projected_audits,
+                    key=lambda item: int(item["scope_key"][1]),
+                )
+                return endpoint_result
+
+            context_parts = inventory_validation_context_parts(
+                inventory_validation_context
+            )
+            if context_parts is None:
+                return None
+            receipt_mapping_result = inventory_validation_memoized(
+                inventory_validation_context,
+                namespace=(
+                    f"raw-request-scope-receipts-v1:{allow_post_as_of_requests}"
+                ),
+                inventory=request_scope_receipts,
+                producer=lambda: request_scope_receipt_mapping(
+                    request_scope_receipts,
+                    resource_tracker=context_parts[2],
+                    maximum_server_time=(
+                        None if allow_post_as_of_requests else history_as_of_server_time
+                    ),
+                ),
+            )
+            receipt_mapping = (
+                receipt_mapping_result
+                if isinstance(receipt_mapping_result, dict)
+                else None
+            )
+            entries: list[dict[str, object]] = []
+            scope_authority_audit: list[dict[str, object]] = []
+            scope_classifications: list[dict[str, object]] = []
+            used_receipt_ids: set[int] = set()
+            request_receipt_closure_required = False
+            for raw_scope in raw_scopes:
+                if not isinstance(raw_scope, dict):
+                    return None
+                parsed_scope = raw_scope.get("scope_key")
+                repository = raw_scope.get("repository")
+                pr = raw_scope.get("pull_number")
+                base_oid = raw_scope.get("base_oid")
+                merge_base = raw_scope.get("merge_base")
+                head = raw_scope.get("head")
+                lifecycle = raw_scope.get("lifecycle")
+                request_times = raw_scope.get("request_times")
+                request_records = raw_scope.get("request_records")
+                provider_reactions = raw_scope.get("provider_reactions")
+                reaction_records = raw_scope.get("reaction_records")
+                artifact_bases = raw_scope.get("artifact_bases")
+                nonterminal_records = raw_scope.get("nonterminal_records")
+                if (
+                    not isinstance(parsed_scope, tuple)
+                    or len(parsed_scope) != 4
+                    or repository != current_repository
+                    or type(pr) is not int
+                    or not isinstance(base_oid, str)
+                    or not isinstance(merge_base, str)
+                    or not isinstance(head, str)
+                    or not isinstance(lifecycle, dict)
+                    or not isinstance(request_times, dict)
+                    or not isinstance(request_records, dict)
+                    or not isinstance(provider_reactions, list)
+                    or not isinstance(reaction_records, list)
+                    or not isinstance(artifact_bases, list)
+                    or not isinstance(nonterminal_records, list)
+                ):
+                    return None
+                request_receipt_bindings: dict[int, dict[str, object]] = {}
+                for request_id, normalized_request in request_records.items():
+                    if type(request_id) is not int or not isinstance(
+                        normalized_request, dict
+                    ):
+                        return None
+                    binding = (
+                        receipt_mapping.get(request_id)
+                        if isinstance(receipt_mapping, dict)
+                        else None
+                    )
+                    if isinstance(binding, dict) and typed_json_equal(
+                        binding.get("request"), normalized_request
+                    ):
+                        request_receipt_bindings[request_id] = binding
+                        used_receipt_ids.add(request_id)
+                raw_audit = raw_scope_authority_audit(
+                    raw_scope,
+                    request_receipt_bindings=request_receipt_bindings,
+                )
+                if raw_audit is not None:
+                    scope_authority_audit.append(raw_audit)
                 current_request_times = {
                     request_id: request_time
                     for request_id, request_time in request_times.items()
@@ -11515,7 +12383,6 @@ class RepositoryContractTest(unittest.TestCase):
                     for item in provider_reactions
                     if item[2] in current_request_times
                 ]
-
                 request_scope_kinds: dict[int, str] = {}
                 for request_id in request_times:
                     binding = request_receipt_bindings.get(request_id)
@@ -11539,28 +12406,15 @@ class RepositoryContractTest(unittest.TestCase):
                         request_scope_kinds[request_id] = "base-changed-same-head"
                     else:
                         request_scope_kinds[request_id] = "invalid"
-
                 if "base-changed-same-head" in request_scope_kinds.values():
                     return None
-                if artifact_bases:
-                    if prefer_unresolved_thread_blocker and unresolved_artifact_bases:
-                        selected = max(
-                            unresolved_artifact_bases,
-                            key=lambda item: (item[0], item[1]),
-                        )
-                    else:
-                        latest_time = max(item[0] for item in artifact_bases)
-                        latest = [
-                            item for item in artifact_bases if item[0] == latest_time
-                        ]
-                        if len({item[2] for item in latest}) != 1:
-                            return None
-                        priority = {"clean": 1, "findings": 2, "malformed": 3}
-                        highest = max(priority[item[3]] for item in latest)
-                        selected = max(
-                            (item for item in latest if priority[item[3]] == highest),
-                            key=lambda item: item[1],
-                        )
+                terminal_ok, selected = select_raw_terminal_artifact(
+                    raw_scope,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                )
+                if not terminal_ok:
+                    return None
+                if selected is not None:
                     source_ordering_key = [selected[0], selected[1]]
                     source_evidence = {
                         "carrier": "terminal-artifact",
@@ -11650,8 +12504,9 @@ class RepositoryContractTest(unittest.TestCase):
                         "reaction": raw_reaction_without_parent,
                     }
                     parent_api_url = (
-                        f"{api_root}/issues/comments/{parent_comment_id}/"
-                        "reactions?per_page=100"
+                        "https://api.github.com/repos/"
+                        f"{current_repository}/issues/comments/"
+                        f"{parent_comment_id}/reactions?per_page=100"
                     )
                     source_evidence = {
                         "carrier": "reaction",
@@ -11680,11 +12535,7 @@ class RepositoryContractTest(unittest.TestCase):
                             "merge_base": merge_base,
                             "head": head,
                         },
-                        "lifecycle": {
-                            "state": clone(pull_record.get("state")),
-                            "merged": clone(pull_record.get("merged")),
-                            "merged_at": clone(pull_record.get("merged_at")),
-                        },
+                        "lifecycle": clone(lifecycle),
                         "requests": [
                             {
                                 "request": clone(request_records[request_id]),
@@ -11779,42 +12630,113 @@ class RepositoryContractTest(unittest.TestCase):
                 )
                 if classification != "confirmed-non-candidate":
                     entries.append(entry)
-            if (
-                seen_detail_pulls != set(discovered_pulls)
-                or current_scope_key not in seen_scopes
-                or (
-                    expected_declaration_raw is not None
-                    and declaration_match_count != 1
-                )
-                or (
-                    request_receipt_closure_required
-                    and (
-                        receipt_mapping is None
-                        or set(receipt_mapping) != used_receipt_ids
-                    )
-                )
-                or (
-                    current_ancestry is not None
-                    and require_current_ancestry_exact
-                    and set(ancestry) != observed_current_finding_heads
-                )
+            if request_receipt_closure_required and (
+                receipt_mapping is None or set(receipt_mapping) != used_receipt_ids
             ):
-                return None
-            sorted_scope_authority_audit = sorted(
-                scope_authority_audit,
-                key=lambda item: int(item["scope_key"][1]),
-            )
-            sorted_scope_classifications = sorted(
-                scope_classifications,
-                key=lambda item: int(item["pull_number"]),
-            )
-            if not resource_budget_charge(resource_tracker):
                 return None
             return {
                 "entries": entries,
-                "scope_authority_audit": sorted_scope_authority_audit,
-                "scope_classifications": sorted_scope_classifications,
+                "scope_authority_audit": sorted(
+                    scope_authority_audit,
+                    key=lambda item: int(item["scope_key"][1]),
+                ),
+                "scope_classifications": sorted(
+                    scope_classifications,
+                    key=lambda item: int(item["pull_number"]),
+                ),
             }
+
+        def parse_discovery_endpoint_transcript(
+            value: object,
+            *,
+            request_scope_receipts: object = None,
+            provider_declaration: object = None,
+            current_ancestry: dict[str, int] | None = None,
+            require_current_ancestry_exact: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
+            _tightened_resource_limits: dict[str, int] | None = None,
+            _monotonic_clock: object = time.monotonic,
+            _single_scope_pull_number: int | None = None,
+            _allow_post_as_of_requests: bool = False,
+            _allow_post_as_of_artifacts: bool = False,
+            _endpoint_plane_only: bool = False,
+            _sidecar_blind_audit: bool = False,
+            _inventory_validation_context: dict[str, object] | None = None,
+        ) -> dict[str, object] | None:
+            if (
+                type(prefer_unresolved_thread_blocker) is not bool
+                or type(require_current_ancestry_exact) is not bool
+                or type(_allow_post_as_of_requests) is not bool
+                or type(_allow_post_as_of_artifacts) is not bool
+                or type(_endpoint_plane_only) is not bool
+                or type(_sidecar_blind_audit) is not bool
+                or (_sidecar_blind_audit and not _endpoint_plane_only)
+            ):
+                return None
+            inventory_context = _inventory_validation_context
+            if inventory_context is None:
+                inventory_context = new_inventory_validation_context(
+                    tightened_limits=_tightened_resource_limits,
+                    monotonic_clock=_monotonic_clock,
+                )
+            inventory_parts = inventory_validation_context_parts(inventory_context)
+            effective_limits = effective_resource_limits(_tightened_resource_limits)
+            if (
+                inventory_parts is None
+                or effective_limits is None
+                or not typed_json_equal(
+                    inventory_parts[1].get("limits"), effective_limits
+                )
+            ):
+                return None
+            try:
+                policy_binding = {
+                    "provider_declaration_sha256": hashlib.sha256(
+                        canonical_raw_body(provider_declaration).encode("utf-8")
+                    ).hexdigest(),
+                    "current_ancestry_sha256": hashlib.sha256(
+                        canonical_raw_body(current_ancestry).encode("utf-8")
+                    ).hexdigest(),
+                    "require_current_ancestry_exact": (require_current_ancestry_exact),
+                    "history_start_exclusive": history_start_exclusive,
+                    "history_as_of_server_time": history_as_of_server_time,
+                    "single_scope_pull_number": _single_scope_pull_number,
+                    "allow_post_as_of_requests": _allow_post_as_of_requests,
+                    "allow_post_as_of_artifacts": _allow_post_as_of_artifacts,
+                    "resource_limits": effective_limits,
+                }
+                policy_digest = hashlib.sha256(
+                    canonical_raw_body(policy_binding).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            raw_dataset = inventory_validation_memoized(
+                inventory_context,
+                namespace=f"raw_semantic_dataset_v1:{policy_digest}",
+                inventory=value,
+                producer=lambda: produce_raw_semantic_dataset(
+                    value,
+                    provider_declaration=provider_declaration,
+                    current_ancestry=current_ancestry,
+                    require_current_ancestry_exact=(require_current_ancestry_exact),
+                    _tightened_resource_limits=_tightened_resource_limits,
+                    _monotonic_clock=_monotonic_clock,
+                    _single_scope_pull_number=_single_scope_pull_number,
+                    _allow_post_as_of_requests=_allow_post_as_of_requests,
+                    _allow_post_as_of_artifacts=_allow_post_as_of_artifacts,
+                    _inventory_validation_context=inventory_context,
+                ),
+            )
+            return project_raw_semantic_dataset(
+                raw_dataset,
+                request_scope_receipts=request_scope_receipts,
+                current_ancestry=current_ancestry,
+                prefer_unresolved_thread_blocker=prefer_unresolved_thread_blocker,
+                allow_post_as_of_requests=_allow_post_as_of_requests,
+                endpoint_plane_only=_endpoint_plane_only,
+                sidecar_blind_audit=_sidecar_blind_audit,
+                inventory_validation_context=inventory_context,
+            )
 
         def fixture_scope_classifications(
             raw_scopes: list[dict[str, object]],
@@ -11854,18 +12776,17 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             _monotonic_clock: object = time.monotonic,
         ) -> dict[str, object]:
-            endpoint_tracker = new_resource_tracker(
+            inventory_context = new_inventory_validation_context(
                 monotonic_clock=_monotonic_clock,
             )
-            sidecar_tracker = (
-                new_sibling_resource_tracker(endpoint_tracker)
-                if endpoint_tracker is not None
-                else None
-            )
-            if endpoint_tracker is None or sidecar_tracker is None:
+            context_parts = inventory_validation_context_parts(inventory_context)
+            if context_parts is None:
                 raise EvidenceResourceBudgetExceeded(
                     "inventory resource trackers unavailable"
                 )
+            endpoint_tracker = context_parts[1]
+            sidecar_tracker = context_parts[2]
+            artifact_validation_context = context_parts[3]
             transcript = build_discovery_endpoint_transcript(
                 raw_scopes,
                 _resource_tracker=endpoint_tracker,
@@ -11878,6 +12799,7 @@ class RepositoryContractTest(unittest.TestCase):
                 transcript,
                 request_scope_receipts=request_scope_receipts,
                 provider_declaration=declaration,
+                _inventory_validation_context=inventory_context,
             )
             scope_classifications = (
                 clone(projection["scope_classifications"])
@@ -11885,7 +12807,7 @@ class RepositoryContractTest(unittest.TestCase):
                 and isinstance(projection.get("scope_classifications"), list)
                 else fixture_scope_classifications(raw_scopes, candidates)
             )
-            return {
+            result = {
                 "complete": True,
                 "repository": current_repository,
                 "resource_budget": clone(evidence_resource_budget_v1),
@@ -11893,8 +12815,16 @@ class RepositoryContractTest(unittest.TestCase):
                 "discovery_endpoint_transcript": transcript,
                 "request_scope_receipts": request_scope_receipts,
                 "scope_classifications": scope_classifications,
-                "entries": derived_inventory_entries(candidates),
+                "entries": derived_inventory_entries(
+                    candidates,
+                    artifact_validation_context=artifact_validation_context,
+                ),
             }
+            if not inventory_validation_deadlines_hold(inventory_context):
+                raise EvidenceResourceBudgetExceeded(
+                    "inventory shared deadline exceeded"
+                )
+            return result
 
         def current_endpoint_inventory(
             raw_current: dict[str, object],
@@ -11903,19 +12833,17 @@ class RepositoryContractTest(unittest.TestCase):
             _monotonic_clock: object = time.monotonic,
             _tightened_resource_limits: dict[str, int] | None = None,
         ) -> dict[str, object]:
-            endpoint_tracker = new_resource_tracker(
+            inventory_context = new_inventory_validation_context(
                 monotonic_clock=_monotonic_clock,
                 tightened_limits=_tightened_resource_limits,
             )
-            sidecar_tracker = (
-                new_sibling_resource_tracker(endpoint_tracker)
-                if endpoint_tracker is not None
-                else None
-            )
-            if endpoint_tracker is None or sidecar_tracker is None:
+            context_parts = inventory_validation_context_parts(inventory_context)
+            if context_parts is None:
                 raise EvidenceResourceBudgetExceeded(
                     "current inventory resource trackers unavailable"
                 )
+            endpoint_tracker = context_parts[1]
+            sidecar_tracker = context_parts[2]
             transcript = build_discovery_endpoint_transcript(
                 [raw_current],
                 _pull_node_id_suffix_by_pr={
@@ -11936,7 +12864,7 @@ class RepositoryContractTest(unittest.TestCase):
             assert len(pull_fetches) == 1
             raw_scope = raw_current.get("scope")
             assert isinstance(raw_scope, dict)
-            return {
+            result = {
                 "repository": current_repository,
                 "pull_number": current_pr,
                 "head": raw_scope.get("head"),
@@ -11947,8 +12875,13 @@ class RepositoryContractTest(unittest.TestCase):
                     _resource_tracker=sidecar_tracker,
                 ),
             }
+            if not inventory_validation_deadlines_hold(inventory_context):
+                raise EvidenceResourceBudgetExceeded(
+                    "current inventory shared deadline exceeded"
+                )
+            return result
 
-        def parse_current_endpoint_inventory(
+        def _parse_current_endpoint_inventory_uncached(
             value: object,
             *,
             current_ancestry: dict[str, int],
@@ -11956,6 +12889,7 @@ class RepositoryContractTest(unittest.TestCase):
             prefer_unresolved_thread_blocker: bool = False,
             _tightened_resource_limits: dict[str, int] | None = None,
             _monotonic_clock: object = time.monotonic,
+            _inventory_validation_context: dict[str, object],
         ) -> dict[str, object] | None:
             base_inventory_fields = {
                 "repository",
@@ -12004,6 +12938,7 @@ class RepositoryContractTest(unittest.TestCase):
                 _single_scope_pull_number=current_pr,
                 _allow_post_as_of_requests=True,
                 _allow_post_as_of_artifacts=True,
+                _inventory_validation_context=_inventory_validation_context,
             )
             entries = (
                 parsed_transcript.get("entries")
@@ -12036,6 +12971,51 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             return entries[0]
 
+        def parse_current_endpoint_inventory(
+            value: object,
+            *,
+            current_ancestry: dict[str, int],
+            require_current_ancestry_exact: bool = True,
+            prefer_unresolved_thread_blocker: bool = False,
+            _tightened_resource_limits: dict[str, int] | None = None,
+            _monotonic_clock: object = time.monotonic,
+            _inventory_validation_context: dict[str, object] | None = None,
+        ) -> dict[str, object] | None:
+            inventory_context = _inventory_validation_context
+            if inventory_context is None:
+                inventory_context = new_inventory_validation_context(
+                    tightened_limits=_tightened_resource_limits,
+                    monotonic_clock=_monotonic_clock,
+                )
+            if inventory_context is None:
+                return None
+            try:
+                ancestry_digest = hashlib.sha256(
+                    canonical_raw_body(current_ancestry).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return None
+            result = inventory_validation_memoized(
+                inventory_context,
+                namespace=(
+                    "current-endpoint-inventory-v1:"
+                    f"{ancestry_digest}:"
+                    f"{require_current_ancestry_exact}:"
+                    f"{prefer_unresolved_thread_blocker}"
+                ),
+                inventory=value,
+                producer=lambda: _parse_current_endpoint_inventory_uncached(
+                    value,
+                    current_ancestry=current_ancestry,
+                    require_current_ancestry_exact=require_current_ancestry_exact,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                    _tightened_resource_limits=_tightened_resource_limits,
+                    _monotonic_clock=_monotonic_clock,
+                    _inventory_validation_context=inventory_context,
+                ),
+            )
+            return result if isinstance(result, dict) else None
+
         def current_ancestry_snapshot(
             returncodes: dict[str, int],
         ) -> list[dict[str, object]]:
@@ -12048,6 +13028,113 @@ class RepositoryContractTest(unittest.TestCase):
                 }
                 for candidate in sorted(returncodes)
             ]
+
+        report_inventory_context_fields = {
+            "initial_inventory",
+            "final_inventory",
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        }
+        report_inventory_context_manager_fields = {
+            "limits",
+            "clock",
+            "contexts",
+            "phase_order",
+        }
+
+        def new_report_inventory_validation_contexts(
+            *,
+            tightened_limits: dict[str, int] | None = None,
+            monotonic_clock: object = time.monotonic,
+        ) -> dict[str, object] | None:
+            limits = effective_resource_limits(tightened_limits)
+            if limits is None or not callable(monotonic_clock):
+                return None
+            return {
+                "limits": limits,
+                "clock": monotonic_clock,
+                "contexts": {},
+                "phase_order": [],
+            }
+
+        def report_inventory_validation_contexts_are_valid(
+            value: object,
+            *,
+            require_complete: bool = False,
+        ) -> bool:
+            if (
+                not isinstance(value, dict)
+                or set(value) != report_inventory_context_manager_fields
+                or not isinstance(value.get("limits"), dict)
+                or not callable(value.get("clock"))
+                or not isinstance(value.get("contexts"), dict)
+                or not isinstance(value.get("phase_order"), list)
+            ):
+                return False
+            limits = value["limits"]
+            clock = value["clock"]
+            contexts = value["contexts"]
+            phase_order = value["phase_order"]
+            assert isinstance(limits, dict)
+            assert isinstance(contexts, dict)
+            assert isinstance(phase_order, list)
+            if (
+                effective_resource_limits(limits) is None
+                or not set(contexts).issubset(report_inventory_context_fields)
+                or phase_order != list(contexts)
+                or len(set(phase_order)) != len(phase_order)
+                or (
+                    require_complete
+                    and set(contexts) != report_inventory_context_fields
+                )
+                or len({id(context) for context in contexts.values()}) != len(contexts)
+            ):
+                return False
+            for context in contexts.values():
+                parts = inventory_validation_context_parts(context)
+                if (
+                    parts is None
+                    or parts[0].get("clock") is not clock
+                    or not typed_json_equal(parts[0].get("limits"), limits)
+                ):
+                    return False
+            return True
+
+        def report_inventory_validation_context_for(
+            value: object,
+            field: str,
+        ) -> dict[str, object] | None:
+            if (
+                field not in report_inventory_context_fields
+                or not report_inventory_validation_contexts_are_valid(value)
+            ):
+                return None
+            assert isinstance(value, dict)
+            contexts = value["contexts"]
+            phase_order = value["phase_order"]
+            assert isinstance(contexts, dict)
+            assert isinstance(phase_order, list)
+            existing = contexts.get(field)
+            if existing is not None:
+                return (
+                    existing
+                    if isinstance(existing, dict)
+                    and inventory_validation_context_parts(existing) is not None
+                    else None
+                )
+            context = new_inventory_validation_context(
+                tightened_limits=value["limits"],
+                monotonic_clock=value["clock"],
+            )
+            if context is None:
+                return None
+            contexts[field] = context
+            phase_order.append(field)
+            return (
+                context
+                if report_inventory_validation_contexts_are_valid(value)
+                else None
+            )
 
         def current_ancestry_mapping(
             candidate_history: object,
@@ -12089,21 +13176,24 @@ class RepositoryContractTest(unittest.TestCase):
                 mapping[candidate] = ancestry_return_code
             return mapping
 
-        def validate_history_universe(
+        def _validate_history_universe_complete(
             candidate_history: dict[str, object],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
-            context = artifact_validation_context
-            if context is None:
-                context = new_artifact_validation_context()
+            inventory_contexts = inventory_validation_contexts
+            if inventory_contexts is None:
+                inventory_contexts = new_report_inventory_validation_contexts()
+            if not report_inventory_validation_contexts_are_valid(inventory_contexts):
+                return None
+            assert isinstance(inventory_contexts, dict)
             initial_candidates = candidate_history.get("initial_candidates")
             final_candidates = candidate_history.get("final_candidates")
             initial_inventory = candidate_history.get("initial_inventory")
             final_inventory = candidate_history.get("final_inventory")
             if (
-                context is None
-                or not isinstance(initial_candidates, list)
+                not isinstance(initial_candidates, list)
                 or not isinstance(final_candidates, list)
                 or not typed_json_equal(initial_candidates, final_candidates)
                 or not isinstance(initial_inventory, dict)
@@ -12121,8 +13211,9 @@ class RepositoryContractTest(unittest.TestCase):
                 "entries",
             }
 
-            def validate_inventory_projection(
+            def validate_inventory_projection_uncached(
                 value: object,
+                inventory_context: dict[str, object],
             ) -> tuple[dict[str, object], list[dict[str, object]]] | None:
                 if (
                     not isinstance(value, dict)
@@ -12143,6 +13234,7 @@ class RepositoryContractTest(unittest.TestCase):
                     value.get("discovery_endpoint_transcript"),
                     request_scope_receipts=value.get("request_scope_receipts"),
                     provider_declaration=declaration,
+                    _inventory_validation_context=inventory_context,
                 )
                 if not isinstance(projection, dict):
                     return None
@@ -12210,8 +13302,155 @@ class RepositoryContractTest(unittest.TestCase):
                     return None
                 return projection, historical_transcript_entries
 
-            initial_validated = validate_inventory_projection(initial_inventory)
-            final_validated = validate_inventory_projection(final_inventory)
+            def validate_inventory_projection(
+                value: object,
+                *,
+                field: str,
+                candidates: list[object],
+            ) -> tuple[dict[str, object], list[dict[str, object]]] | None:
+                inventory_context = report_inventory_validation_context_for(
+                    inventory_contexts,
+                    field,
+                )
+                parts = inventory_validation_context_parts(inventory_context)
+                if (
+                    inventory_context is None
+                    or parts is None
+                    or not isinstance(value, dict)
+                    or set(value) != expected_inventory_fields
+                    or value.get("complete") is not True
+                    or value.get("repository") != current_repository
+                    or not typed_json_equal(
+                        value.get("resource_budget"),
+                        evidence_resource_budget_v1,
+                    )
+                    or not exact_true_flags(
+                        value.get("pagination"),
+                        required_universe_pagination,
+                    )
+                ):
+                    return None
+                artifact_context = parts[3]
+
+                def validate_artifact_plane() -> bool:
+                    artifact_kinds = {
+                        "terminal_payloads": "terminal-payload",
+                        "malformed_terminal_artifacts": ("malformed-terminal-artifact"),
+                        "active_top_level_findings": ("active-top-level-finding"),
+                        "unresolved_thread_findings": ("unresolved-thread-finding"),
+                    }
+                    for candidate in candidates:
+                        if not isinstance(candidate, dict):
+                            return False
+                        candidate_scope = scope_key(candidate)
+                        evidence_state = candidate.get("evidence_state")
+                        if (
+                            candidate_scope is None
+                            or not isinstance(evidence_state, dict)
+                            or set(evidence_state) != set(artifact_kinds)
+                        ):
+                            return False
+                        for artifact_field, artifact_kind in artifact_kinds.items():
+                            artifacts = evidence_state.get(artifact_field)
+                            if not isinstance(artifacts, list):
+                                return False
+                            for artifact in artifacts:
+                                if (
+                                    validate_candidate_artifact(
+                                        artifact,
+                                        expected_kind=artifact_kind,
+                                        expected_scope=candidate_scope,
+                                        artifact_validation_context=artifact_context,
+                                    )
+                                    is None
+                                ):
+                                    return False
+                    return True
+
+                artifact_plane_result = inventory_validation_memoized(
+                    inventory_context,
+                    namespace=f"historical-artifact-plane-v1:{field}",
+                    inventory=candidates,
+                    producer=validate_artifact_plane,
+                )
+                if artifact_plane_result is not True:
+                    return None
+                memoized = inventory_validation_memoized(
+                    inventory_context,
+                    namespace=f"historical-universe-inventory-v1:{field}",
+                    inventory=value,
+                    producer=lambda: validate_inventory_projection_uncached(
+                        value,
+                        inventory_context,
+                    ),
+                )
+                transcript = value.get("discovery_endpoint_transcript")
+                if not isinstance(transcript, dict):
+                    return None
+
+                def endpoint_plane_result() -> object:
+                    if (
+                        isinstance(memoized, tuple)
+                        and len(memoized) == 2
+                        and isinstance(memoized[0], dict)
+                        and isinstance(memoized[1], list)
+                    ):
+                        try:
+                            transcript_digest = hashlib.sha256(
+                                canonical_raw_body(transcript).encode("utf-8")
+                            ).hexdigest()
+                        except (TypeError, UnicodeEncodeError, ValueError):
+                            return None
+                        return {
+                            "endpoint_complete": True,
+                            "transcript_sha256": transcript_digest,
+                        }
+                    return parse_discovery_endpoint_transcript(
+                        transcript,
+                        request_scope_receipts=value.get("request_scope_receipts"),
+                        provider_declaration=declaration,
+                        _endpoint_plane_only=True,
+                        _inventory_validation_context=inventory_context,
+                    )
+
+                endpoint_result = inventory_validation_memoized(
+                    inventory_context,
+                    namespace=f"historical-endpoint-plane-v1:{field}",
+                    inventory=transcript,
+                    producer=endpoint_plane_result,
+                )
+                if (
+                    not isinstance(endpoint_result, dict)
+                    or set(endpoint_result)
+                    != {"endpoint_complete", "transcript_sha256"}
+                    or endpoint_result.get("endpoint_complete") is not True
+                    or not isinstance(endpoint_result.get("transcript_sha256"), str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        endpoint_result["transcript_sha256"],
+                    )
+                    is None
+                ):
+                    return None
+                if (
+                    not isinstance(memoized, tuple)
+                    or len(memoized) != 2
+                    or not isinstance(memoized[0], dict)
+                    or not isinstance(memoized[1], list)
+                ):
+                    return None
+                return memoized
+
+            initial_validated = validate_inventory_projection(
+                initial_inventory,
+                field="initial_inventory",
+                candidates=initial_candidates,
+            )
+            final_validated = validate_inventory_projection(
+                final_inventory,
+                field="final_inventory",
+                candidates=final_candidates,
+            )
             if (
                 initial_validated is None
                 or final_validated is None
@@ -12223,56 +13462,114 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             initial_projection, initial_historical_entries = initial_validated
             final_projection, final_historical_entries = final_validated
-            candidate_entries = derived_inventory_entries(
-                final_candidates,
-                artifact_validation_context=context,
+            initial_context = report_inventory_validation_context_for(
+                inventory_contexts,
+                "initial_inventory",
             )
-            final_scope_audits = final_projection.get("scope_authority_audit")
-            if not isinstance(final_scope_audits, list):
+            final_context = report_inventory_validation_context_for(
+                inventory_contexts,
+                "final_inventory",
+            )
+            initial_parts = inventory_validation_context_parts(initial_context)
+            final_parts = inventory_validation_context_parts(final_context)
+            if initial_parts is None or final_parts is None:
                 return None
-            raw_audits_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
-            for raw_audit in final_scope_audits:
-                raw_scope_key = (
-                    raw_audit.get("scope_key") if isinstance(raw_audit, dict) else None
-                )
-                if not isinstance(raw_scope_key, list):
-                    return None
-                raw_scope_tuple = tuple(raw_scope_key)
-                if raw_scope_tuple in raw_audits_by_scope:
-                    return None
-                raw_audits_by_scope[raw_scope_tuple] = raw_audit
-            for candidate in final_candidates:
-                if not isinstance(candidate, dict):
-                    return None
-                candidate_audit = candidate_scope_authority_audit(
-                    candidate,
-                    artifact_validation_context=context,
-                )
-                candidate_scope_key = scope_key(candidate)
-                raw_audit = raw_audits_by_scope.get(candidate_scope_key or ())
-                if candidate_audit is None or not isinstance(raw_audit, dict):
-                    return None
-                comparable_raw_audit = clone(raw_audit)
-                assert isinstance(comparable_raw_audit, dict)
-                comparable_raw_audit.pop("nonterminal_records", None)
-                candidate_basis = candidate.get("candidate_basis")
-                if (
-                    isinstance(candidate_basis, dict)
-                    and candidate_basis.get("kind") != "reaction"
-                ):
-                    comparable_raw_audit.pop("requests", None)
-                    comparable_raw_audit.pop("reactions", None)
-                    candidate_audit.pop("requests", None)
-                    candidate_audit.pop("reactions", None)
-                if not typed_json_equal(candidate_audit, comparable_raw_audit):
-                    return None
+            initial_artifact_context = initial_parts[3]
+            final_artifact_context = final_parts[3]
+            if (
+                inventory_validation_contexts is not None
+                and artifact_validation_context is not None
+                and artifact_validation_context is not final_artifact_context
+            ):
+                return None
+            initial_candidate_entries = derived_inventory_entries(
+                initial_candidates,
+                artifact_validation_context=initial_artifact_context,
+                inventory_validation_context=initial_context,
+            )
+            final_candidate_entries = derived_inventory_entries(
+                final_candidates,
+                artifact_validation_context=final_artifact_context,
+                inventory_validation_context=final_context,
+            )
+
+            def authority_audits_match(
+                candidates: list[object],
+                projection: dict[str, object],
+                artifact_context: dict[str, object],
+            ) -> bool:
+                scope_audits = projection.get("scope_authority_audit")
+                if not isinstance(scope_audits, list):
+                    return False
+                raw_audits_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+                for raw_audit in scope_audits:
+                    raw_scope_key = (
+                        raw_audit.get("scope_key")
+                        if isinstance(raw_audit, dict)
+                        else None
+                    )
+                    if not isinstance(raw_scope_key, list):
+                        return False
+                    raw_scope_tuple = tuple(raw_scope_key)
+                    if raw_scope_tuple in raw_audits_by_scope:
+                        return False
+                    raw_audits_by_scope[raw_scope_tuple] = raw_audit
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        return False
+                    candidate_audit = candidate_scope_authority_audit(
+                        candidate,
+                        artifact_validation_context=artifact_context,
+                        inventory_validation_context=(
+                            initial_context
+                            if artifact_context is initial_artifact_context
+                            else final_context
+                        ),
+                    )
+                    candidate_scope_key = scope_key(candidate)
+                    raw_audit = raw_audits_by_scope.get(candidate_scope_key or ())
+                    if candidate_audit is None or not isinstance(raw_audit, dict):
+                        return False
+                    comparable_raw_audit = clone(raw_audit)
+                    assert isinstance(comparable_raw_audit, dict)
+                    comparable_raw_audit.pop("nonterminal_records", None)
+                    candidate_basis = candidate.get("candidate_basis")
+                    if (
+                        isinstance(candidate_basis, dict)
+                        and candidate_basis.get("kind") != "reaction"
+                    ):
+                        comparable_raw_audit.pop("requests", None)
+                        comparable_raw_audit.pop("reactions", None)
+                        candidate_audit.pop("requests", None)
+                        candidate_audit.pop("reactions", None)
+                    if not typed_json_equal(candidate_audit, comparable_raw_audit):
+                        return False
+                return True
+
             if (
                 not typed_json_equal(initial_projection, final_projection)
                 or not typed_json_equal(
                     initial_historical_entries,
                     final_historical_entries,
                 )
-                or not typed_json_equal(final_historical_entries, candidate_entries)
+                or not typed_json_equal(
+                    initial_historical_entries,
+                    initial_candidate_entries,
+                )
+                or not typed_json_equal(
+                    final_historical_entries,
+                    final_candidate_entries,
+                )
+                or not authority_audits_match(
+                    initial_candidates,
+                    initial_projection,
+                    initial_artifact_context,
+                )
+                or not authority_audits_match(
+                    final_candidates,
+                    final_projection,
+                    final_artifact_context,
+                )
                 or type(candidate_history.get("candidate_universe_count")) is not int
                 or candidate_history.get("candidate_universe_count")
                 != len(final_historical_entries)
@@ -12280,6 +13577,888 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 return None
             return final_candidates
+
+        def _sidecar_blind_candidate_projection(
+            candidate: object,
+            stored_entry: object,
+            *,
+            artifact_validation_context: dict[str, object],
+        ) -> dict[str, object] | None:
+            if not isinstance(candidate, dict) or not isinstance(stored_entry, dict):
+                return None
+            allowed_record_fields = {
+                frozenset(record_fields),
+                frozenset(record_fields - {"request_scope_receipts"}),
+            }
+            allowed_snapshot_fields = {
+                frozenset(snapshot_fields),
+                frozenset(set(snapshot_fields) - {"request_scope_receipts"}),
+            }
+            initial_snapshot = candidate.get("initial_snapshot")
+            final_snapshot = candidate.get("final_snapshot")
+            if (
+                frozenset(candidate) not in allowed_record_fields
+                or not isinstance(initial_snapshot, dict)
+                or not isinstance(final_snapshot, dict)
+                or frozenset(initial_snapshot) not in allowed_snapshot_fields
+                or frozenset(final_snapshot) not in allowed_snapshot_fields
+            ):
+                return None
+            request_reaction_fields = {
+                "requests",
+                "request_scope_receipts",
+                "reactions",
+                "selected_request_id",
+                "selected_reaction_id",
+            }
+            stable_fields = set(snapshot_fields) - request_reaction_fields
+
+            def stable_snapshot_projection(value: dict[str, object]) -> object:
+                return {field: clone(value.get(field)) for field in stable_fields}
+
+            outer_projection = stable_snapshot_projection(candidate)
+            if (
+                not typed_json_equal(
+                    outer_projection,
+                    stable_snapshot_projection(initial_snapshot),
+                )
+                or not typed_json_equal(
+                    outer_projection,
+                    stable_snapshot_projection(final_snapshot),
+                )
+                or candidate.get("complete") is not True
+                or not exact_true_flags(
+                    candidate.get("pagination"),
+                    required_pagination,
+                )
+                or not current_lifecycle_is_eligible(candidate)
+            ):
+                return None
+            candidate_scope_key = scope_key(candidate)
+            basis = candidate.get("candidate_basis")
+            if (
+                candidate_scope_key is None
+                or not isinstance(basis, dict)
+                or set(basis) != {"kind", "server_time", "stable_artifact_id"}
+                or not isinstance(basis.get("kind"), str)
+                or type(basis.get("server_time")) is not int
+                or basis["server_time"] <= 0
+                or type(basis.get("stable_artifact_id")) is not int
+                or basis["stable_artifact_id"] <= 0
+                or set(stored_entry)
+                != {"scope_key", "source_ordering_key", "source_evidence"}
+                or not typed_json_equal(
+                    stored_entry.get("scope_key"),
+                    list(candidate_scope_key),
+                )
+                or not typed_json_equal(
+                    stored_entry.get("source_ordering_key"),
+                    [basis["server_time"], basis["stable_artifact_id"]],
+                )
+            ):
+                return None
+
+            evidence_state = candidate.get("evidence_state")
+            artifact_fields = {
+                "terminal_payloads": "terminal-payload",
+                "malformed_terminal_artifacts": "malformed-terminal-artifact",
+                "active_top_level_findings": "active-top-level-finding",
+                "unresolved_thread_findings": "unresolved-thread-finding",
+            }
+            if not isinstance(evidence_state, dict) or set(evidence_state) != set(
+                artifact_fields
+            ):
+                return None
+            artifact_audit_by_identity: dict[tuple[str, int], dict[str, object]] = {}
+            for artifact_field, artifact_kind in artifact_fields.items():
+                artifacts = evidence_state.get(artifact_field)
+                if not isinstance(artifacts, list):
+                    return None
+                for artifact in artifacts:
+                    validated = validate_candidate_artifact(
+                        artifact,
+                        expected_kind=artifact_kind,
+                        expected_scope=candidate_scope_key,
+                        artifact_validation_context=artifact_validation_context,
+                    )
+                    if (
+                        validated is None
+                        or not isinstance(artifact, dict)
+                        or not isinstance(artifact.get("final_snapshot"), dict)
+                    ):
+                        return None
+                    (
+                        server_time,
+                        artifact_id,
+                        _,
+                        semantic,
+                        channel,
+                        artifact_commit,
+                    ) = validated
+                    native_identity = (channel, artifact_id)
+                    if native_identity in artifact_audit_by_identity:
+                        return None
+                    source_bundle = artifact_source_bundle(artifact["final_snapshot"])
+                    artifact_audit_by_identity[native_identity] = {
+                        "server_time": server_time,
+                        "id": artifact_id,
+                        "channel": channel,
+                        "semantic": semantic,
+                        "artifact_commit": (
+                            None
+                            if channel == "issue-comment" and semantic == "malformed"
+                            else artifact_commit
+                        ),
+                        "source_record_sha256": hashlib.sha256(
+                            canonical_raw_body(source_bundle).encode("utf-8")
+                        ).hexdigest(),
+                    }
+
+            source_evidence = stored_entry.get("source_evidence")
+            ordering_key = (basis["server_time"], basis["stable_artifact_id"])
+            requests = candidate.get("requests")
+            reactions = candidate.get("reactions")
+            if not isinstance(requests, list) or not isinstance(reactions, list):
+                return None
+            if any(
+                not typed_json_equal(snapshot.get("requests"), requests)
+                or not typed_json_equal(snapshot.get("reactions"), reactions)
+                or snapshot.get("selected_request_id")
+                != candidate.get("selected_request_id")
+                or snapshot.get("selected_reaction_id")
+                != candidate.get("selected_reaction_id")
+                for snapshot in (initial_snapshot, final_snapshot)
+            ):
+                return None
+            request_by_id: dict[int, dict[str, object]] = {}
+            normalized_audit_requests: list[dict[str, object]] = []
+            for raw_request in requests:
+                if (
+                    not isinstance(raw_request, dict)
+                    or set(raw_request) != request_fields
+                ):
+                    return None
+                request_id = raw_request.get("id")
+                created_at = raw_request.get("created_at")
+                updated_at = raw_request.get("updated_at")
+                request_server_time = raw_request.get("request_server_time")
+                request_user = raw_request.get("user")
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in request_by_id
+                    or type(created_at) is not int
+                    or type(updated_at) is not int
+                    or type(request_server_time) is not int
+                    or updated_at < created_at
+                    or request_server_time
+                    != (created_at if updated_at == created_at else updated_at)
+                    or raw_request.get("request_server_time_field")
+                    != ("created_at" if updated_at == created_at else "updated_at")
+                    or raw_request.get("normalized_body") != "@codex review"
+                    or raw_request.get("url")
+                    != (
+                        f"https://github.com/{candidate_scope_key[0]}/pull/"
+                        f"{candidate_scope_key[1]}#issuecomment-{request_id}"
+                    )
+                    or not isinstance(request_user, dict)
+                    or set(request_user) != {"login", "type"}
+                    or not isinstance(request_user.get("login"), str)
+                    or not request_user["login"]
+                    or not isinstance(request_user.get("type"), str)
+                    or not request_user["type"]
+                ):
+                    return None
+                request_by_id[request_id] = raw_request
+                normalized_audit_requests.append({"request": clone(raw_request)})
+            provider_reactions: list[dict[str, object]] = []
+            normalized_audit_reactions: list[dict[str, object]] = []
+            seen_reaction_ids: set[int] = set()
+            for raw_reaction in reactions:
+                if (
+                    not isinstance(raw_reaction, dict)
+                    or set(raw_reaction) != reaction_fields
+                ):
+                    return None
+                reaction_id = raw_reaction.get("id")
+                parent_request_id = raw_reaction.get("parent_request_id")
+                created_at = raw_reaction.get("created_at")
+                user_login = raw_reaction.get("user_login")
+                user_type = raw_reaction.get("user_type")
+                if (
+                    type(reaction_id) is not int
+                    or reaction_id <= 0
+                    or reaction_id in seen_reaction_ids
+                    or type(parent_request_id) is not int
+                    or parent_request_id not in request_by_id
+                    or type(created_at) is not int
+                    or created_at
+                    <= request_by_id[parent_request_id]["request_server_time"]
+                    or raw_reaction.get("parent_reactions_api_url")
+                    != (
+                        f"https://api.github.com/repos/{candidate_scope_key[0]}/"
+                        f"issues/comments/{parent_request_id}/reactions?per_page=100"
+                    )
+                    or not isinstance(user_login, str)
+                    or not user_login
+                    or not isinstance(user_type, str)
+                    or not user_type
+                    or raw_reaction.get("content") not in github_reaction_contents
+                ):
+                    return None
+                seen_reaction_ids.add(reaction_id)
+                normalized_audit_reactions.append(clone(raw_reaction))
+                if user_login == exact_login and user_type == "Bot":
+                    provider_reactions.append(raw_reaction)
+
+            sidecar_independent_source_evidence: dict[str, object] | None = None
+            if basis["kind"] == "reaction":
+                selected_request_id = candidate.get("selected_request_id")
+                selected_reaction_id = candidate.get("selected_reaction_id")
+                if (
+                    type(selected_request_id) is not int
+                    or type(selected_reaction_id) is not int
+                ):
+                    return None
+                selected_reactions = [
+                    reaction_record
+                    for reaction_record in provider_reactions
+                    if reaction_record.get("id") == selected_reaction_id
+                    and reaction_record.get("created_at") == basis["server_time"]
+                    and reaction_record.get("id") == basis["stable_artifact_id"]
+                    and reaction_record.get("parent_request_id") == selected_request_id
+                    and reaction_record.get("content") in {"+1", "eyes"}
+                ]
+                if (
+                    len(selected_reactions) != 1
+                    or selected_request_id not in request_by_id
+                    or not provider_reactions
+                    or max(
+                        (
+                            int(reaction_record["created_at"]),
+                            int(reaction_record["id"]),
+                        )
+                        for reaction_record in provider_reactions
+                    )
+                    != ordering_key
+                ):
+                    return None
+                selected_reaction = selected_reactions[0]
+                sidecar_independent_source_evidence = (
+                    sidecar_independent_reaction_source_evidence(
+                        request_by_id[selected_request_id],
+                        selected_reaction,
+                    )
+                )
+                expected_source_without_digest = (
+                    {
+                        key: clone(value)
+                        for key, value in sidecar_independent_source_evidence.items()
+                        if key != "source_record_sha256"
+                    }
+                    if isinstance(sidecar_independent_source_evidence, dict)
+                    else None
+                )
+                if (
+                    not isinstance(expected_source_without_digest, dict)
+                    or not isinstance(source_evidence, dict)
+                    or set(source_evidence)
+                    != set(expected_source_without_digest) | {"source_record_sha256"}
+                    or not all(
+                        typed_json_equal(source_evidence.get(key), value)
+                        for key, value in expected_source_without_digest.items()
+                    )
+                    or not isinstance(source_evidence.get("source_record_sha256"), str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        source_evidence["source_record_sha256"],
+                    )
+                    is None
+                ):
+                    return None
+            else:
+                expected_source_evidence = candidate_source_evidence(
+                    candidate,
+                    ordering_key,
+                    artifact_validation_context=artifact_validation_context,
+                    basis_kind_override=str(basis["kind"]),
+                )
+                if expected_source_evidence is None or not typed_json_equal(
+                    source_evidence,
+                    expected_source_evidence,
+                ):
+                    return None
+
+            lifecycle = candidate.get("lifecycle")
+            assert isinstance(lifecycle, dict)
+            return {
+                "candidate_projection": outer_projection,
+                "entry": clone(stored_entry),
+                "sidecar_independent_source_evidence": clone(
+                    sidecar_independent_source_evidence
+                ),
+                "authority_audit": {
+                    "scope_key": list(candidate_scope_key),
+                    "lifecycle": clone(lifecycle),
+                    "requests": sorted(
+                        normalized_audit_requests,
+                        key=lambda item: int(item["request"]["id"]),
+                    ),
+                    "reactions": sorted(
+                        normalized_audit_reactions,
+                        key=lambda item: (
+                            int(item["created_at"]),
+                            int(item["id"]),
+                            int(item["parent_request_id"]),
+                        ),
+                    ),
+                    "applicable_artifacts": sorted(
+                        artifact_audit_by_identity.values(),
+                        key=lambda item: (
+                            int(item["server_time"]),
+                            int(item["id"]),
+                            str(item["channel"]),
+                        ),
+                    ),
+                },
+            }
+
+        def _validate_history_universe_sidecar_blind(
+            candidate_history: dict[str, object],
+            *,
+            inventory_validation_contexts: dict[str, object],
+        ) -> dict[str, object] | None:
+            initial_candidates = candidate_history.get("initial_candidates")
+            final_candidates = candidate_history.get("final_candidates")
+            if not isinstance(initial_candidates, list) or not isinstance(
+                final_candidates, list
+            ):
+                return None
+            expected_inventory_fields = {
+                "complete",
+                "repository",
+                "resource_budget",
+                "pagination",
+                "discovery_endpoint_transcript",
+                "request_scope_receipts",
+                "scope_classifications",
+                "entries",
+            }
+            allowed_inventory_fields = {
+                frozenset(expected_inventory_fields),
+                frozenset(expected_inventory_fields - {"request_scope_receipts"}),
+            }
+
+            def validate_phase(
+                inventory_field: str,
+                candidates: list[object],
+            ) -> dict[str, object] | None:
+                inventory = candidate_history.get(inventory_field)
+                inventory_context = report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    inventory_field,
+                )
+                context_parts = inventory_validation_context_parts(inventory_context)
+                if (
+                    not isinstance(inventory, dict)
+                    or frozenset(inventory) not in allowed_inventory_fields
+                    or inventory.get("complete") is not True
+                    or inventory.get("repository") != current_repository
+                    or not typed_json_equal(
+                        inventory.get("resource_budget"),
+                        evidence_resource_budget_v1,
+                    )
+                    or not exact_true_flags(
+                        inventory.get("pagination"),
+                        required_universe_pagination,
+                    )
+                    or context_parts is None
+                ):
+                    return None
+                transcript = inventory.get("discovery_endpoint_transcript")
+                entries = inventory.get("entries")
+                scope_classifications = inventory.get("scope_classifications")
+                if (
+                    not isinstance(transcript, dict)
+                    or not isinstance(entries, list)
+                    or not isinstance(scope_classifications, list)
+                    or candidate_history.get("candidate_universe_count")
+                    != len(candidates)
+                    or len(entries) != len(candidates)
+                ):
+                    return None
+                artifact_context = context_parts[3]
+                candidate_projections: list[dict[str, object]] = []
+                seen_candidate_scopes: set[tuple[object, ...]] = set()
+                candidate_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+                projection_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+                for candidate, entry in zip(candidates, entries, strict=True):
+                    projection = _sidecar_blind_candidate_projection(
+                        candidate,
+                        entry,
+                        artifact_validation_context=artifact_context,
+                    )
+                    candidate_scope = (
+                        scope_key(candidate) if isinstance(candidate, dict) else None
+                    )
+                    if (
+                        projection is None
+                        or candidate_scope is None
+                        or candidate_scope == current_scope_key
+                        or candidate_scope in seen_candidate_scopes
+                    ):
+                        return None
+                    seen_candidate_scopes.add(candidate_scope)
+                    assert isinstance(candidate, dict)
+                    candidate_by_scope[candidate_scope] = candidate
+                    projection_by_scope[candidate_scope] = projection
+                    candidate_projections.append(projection)
+
+                endpoint_result = inventory_validation_memoized(
+                    inventory_context,
+                    namespace=(
+                        f"historical-sidecar-blind-endpoint-v1:{inventory_field}"
+                    ),
+                    inventory=transcript,
+                    producer=lambda: parse_discovery_endpoint_transcript(
+                        transcript,
+                        request_scope_receipts=inventory.get("request_scope_receipts"),
+                        provider_declaration=declaration,
+                        _endpoint_plane_only=True,
+                        _sidecar_blind_audit=True,
+                        _inventory_validation_context=inventory_context,
+                    ),
+                )
+                if (
+                    not isinstance(endpoint_result, dict)
+                    or set(endpoint_result)
+                    != {
+                        "endpoint_complete",
+                        "transcript_sha256",
+                        "sidecar_blind_scope_summaries",
+                        "sidecar_blind_authority_audit",
+                    }
+                    or endpoint_result.get("endpoint_complete") is not True
+                    or not isinstance(endpoint_result.get("transcript_sha256"), str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        endpoint_result["transcript_sha256"],
+                    )
+                    is None
+                    or not isinstance(
+                        endpoint_result.get("sidecar_blind_scope_summaries"),
+                        list,
+                    )
+                    or not isinstance(
+                        endpoint_result.get("sidecar_blind_authority_audit"),
+                        list,
+                    )
+                ):
+                    return None
+                raw_scope_summaries = endpoint_result["sidecar_blind_scope_summaries"]
+                raw_scope_by_pull: dict[int, dict[str, object]] = {}
+                raw_scope_by_key: dict[tuple[object, ...], dict[str, object]] = {}
+                required_categories = {
+                    "required-terminal",
+                    "required-reaction-epoch-unknown",
+                }
+                expected_summary_fields = {
+                    "pull_number",
+                    "scope_key",
+                    "lifecycle",
+                    "raw_scope_category",
+                    "raw_classification",
+                    "source_ordering_key",
+                    "source_evidence",
+                }
+                for raw_scope_summary in raw_scope_summaries:
+                    if (
+                        not isinstance(raw_scope_summary, dict)
+                        or set(raw_scope_summary) != expected_summary_fields
+                    ):
+                        return None
+                    pull_number = raw_scope_summary.get("pull_number")
+                    raw_scope_key = raw_scope_summary.get("scope_key")
+                    category = raw_scope_summary.get("raw_scope_category")
+                    raw_classification = raw_scope_summary.get("raw_classification")
+                    source_ordering_key = raw_scope_summary.get("source_ordering_key")
+                    source_evidence = raw_scope_summary.get("source_evidence")
+                    if (
+                        type(pull_number) is not int
+                        or pull_number in raw_scope_by_pull
+                        or not isinstance(raw_scope_key, list)
+                        or len(raw_scope_key) != 4
+                        or raw_scope_key[1] != pull_number
+                        or category not in required_categories | {"not-candidate"}
+                    ):
+                        return None
+                    raw_scope_tuple = tuple(raw_scope_key)
+                    if raw_scope_tuple in raw_scope_by_key:
+                        return None
+                    expected_raw_classification = (
+                        "current"
+                        if raw_scope_tuple == current_scope_key
+                        else (
+                            "historical-candidate"
+                            if category in required_categories
+                            else "confirmed-non-candidate"
+                        )
+                    )
+                    if raw_classification != expected_raw_classification:
+                        return None
+                    if category in required_categories:
+                        if (
+                            not isinstance(source_ordering_key, list)
+                            or len(source_ordering_key) != 2
+                            or any(
+                                type(item) is not int for item in source_ordering_key
+                            )
+                            or not isinstance(source_evidence, dict)
+                            or set(source_evidence)
+                            != {
+                                "carrier",
+                                "channel",
+                                "semantic",
+                                "native_identity",
+                                "source_record_sha256",
+                            }
+                            or not (
+                                history_start_exclusive
+                                < source_ordering_key[0]
+                                <= history_as_of_server_time
+                            )
+                            or not isinstance(
+                                source_evidence.get("source_record_sha256"), str
+                            )
+                            or re.fullmatch(
+                                r"[0-9a-f]{64}",
+                                source_evidence["source_record_sha256"],
+                            )
+                            is None
+                        ):
+                            return None
+                        expected_carrier = (
+                            "terminal-artifact"
+                            if category == "required-terminal"
+                            else "reaction"
+                        )
+                        if source_evidence.get("carrier") != expected_carrier:
+                            return None
+                        if category == "required-reaction-epoch-unknown" and (
+                            source_evidence.get("channel") != "request-reaction"
+                            or source_evidence.get("semantic") != "+1"
+                        ):
+                            return None
+                    raw_scope_by_pull[pull_number] = raw_scope_summary
+                    raw_scope_by_key[raw_scope_tuple] = raw_scope_summary
+
+                required_scopes = {
+                    raw_scope_key
+                    for raw_scope_key, raw_scope_summary in raw_scope_by_key.items()
+                    if raw_scope_summary["raw_scope_category"] in required_categories
+                }
+                if required_scopes != seen_candidate_scopes:
+                    return None
+                expected_classifications = [
+                    {
+                        "pull_number": pull_number,
+                        "scope_key": clone(raw_scope_summary["scope_key"]),
+                        "classification": raw_scope_summary["raw_classification"],
+                    }
+                    for pull_number, raw_scope_summary in sorted(
+                        raw_scope_by_pull.items()
+                    )
+                ]
+                if (
+                    not typed_json_equal(
+                        scope_classifications,
+                        expected_classifications,
+                    )
+                    or len(
+                        [
+                            item
+                            for item in scope_classifications
+                            if isinstance(item, dict)
+                            and item.get("classification") == "current"
+                        ]
+                    )
+                    != 1
+                ):
+                    return None
+
+                for required_scope in required_scopes:
+                    raw_scope_summary = raw_scope_by_key[required_scope]
+                    projection = projection_by_scope.get(required_scope)
+                    candidate = candidate_by_scope.get(required_scope)
+                    if not isinstance(projection, dict) or not isinstance(
+                        candidate, dict
+                    ):
+                        return None
+                    normalized_entry = projection.get("entry")
+                    raw_source_evidence = raw_scope_summary.get("source_evidence")
+                    if (
+                        not isinstance(normalized_entry, dict)
+                        or not typed_json_equal(
+                            normalized_entry.get("scope_key"),
+                            raw_scope_summary["scope_key"],
+                        )
+                        or not typed_json_equal(
+                            normalized_entry.get("source_ordering_key"),
+                            raw_scope_summary["source_ordering_key"],
+                        )
+                        or not isinstance(raw_source_evidence, dict)
+                    ):
+                        return None
+                    normalized_source_evidence = normalized_entry.get("source_evidence")
+                    category = raw_scope_summary["raw_scope_category"]
+                    basis = candidate.get("candidate_basis")
+                    if not isinstance(basis, dict):
+                        return None
+                    if category == "required-terminal":
+                        if basis.get("kind") == "reaction" or not typed_json_equal(
+                            normalized_source_evidence,
+                            raw_source_evidence,
+                        ):
+                            return None
+                    else:
+                        sidecar_independent_source_evidence = projection.get(
+                            "sidecar_independent_source_evidence"
+                        )
+                        if (
+                            basis.get("kind") != "reaction"
+                            or not typed_json_equal(
+                                sidecar_independent_source_evidence,
+                                raw_source_evidence,
+                            )
+                            or not isinstance(normalized_source_evidence, dict)
+                            or any(
+                                not typed_json_equal(
+                                    normalized_source_evidence.get(key),
+                                    raw_source_evidence.get(key),
+                                )
+                                for key in {
+                                    "carrier",
+                                    "channel",
+                                    "semantic",
+                                    "native_identity",
+                                }
+                            )
+                            or not isinstance(
+                                normalized_source_evidence.get("source_record_sha256"),
+                                str,
+                            )
+                            or re.fullmatch(
+                                r"[0-9a-f]{64}",
+                                normalized_source_evidence["source_record_sha256"],
+                            )
+                            is None
+                        ):
+                            return None
+
+                raw_audits_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+                for raw_audit in endpoint_result["sidecar_blind_authority_audit"]:
+                    raw_scope_key = (
+                        raw_audit.get("scope_key")
+                        if isinstance(raw_audit, dict)
+                        else None
+                    )
+                    if not isinstance(raw_scope_key, list):
+                        return None
+                    raw_scope_tuple = tuple(raw_scope_key)
+                    if raw_scope_tuple in raw_audits_by_scope:
+                        return None
+                    raw_audits_by_scope[raw_scope_tuple] = raw_audit
+                required_raw_audits = {
+                    raw_scope_key: raw_audits_by_scope[raw_scope_key]
+                    for raw_scope_key in required_scopes
+                    if raw_scope_key in raw_audits_by_scope
+                }
+                normalized_audits_by_scope: dict[
+                    tuple[object, ...], dict[str, object]
+                ] = {}
+                for projection in candidate_projections:
+                    normalized_audit = projection.get("authority_audit")
+                    normalized_scope = (
+                        normalized_audit.get("scope_key")
+                        if isinstance(normalized_audit, dict)
+                        else None
+                    )
+                    if not isinstance(normalized_scope, list):
+                        return None
+                    normalized_scope_tuple = tuple(normalized_scope)
+                    if normalized_scope_tuple in normalized_audits_by_scope:
+                        return None
+                    normalized_audits_by_scope[normalized_scope_tuple] = (
+                        normalized_audit
+                    )
+                if (
+                    set(required_raw_audits) != required_scopes
+                    or set(normalized_audits_by_scope) != required_scopes
+                    or any(
+                        not typed_json_equal(
+                            required_raw_audits[required_scope],
+                            normalized_audits_by_scope[required_scope],
+                        )
+                        for required_scope in required_scopes
+                    )
+                ):
+                    return None
+
+                sidecar_value = inventory.get("request_scope_receipts")
+                inventory_mapping = inventory_validation_memoized(
+                    inventory_context,
+                    namespace="raw-request-scope-receipts-v1:False",
+                    inventory=sidecar_value,
+                    producer=lambda: request_scope_receipt_mapping(
+                        sidecar_value,
+                        resource_tracker=context_parts[2],
+                    ),
+                )
+                candidate_mapping_available = True
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        return None
+                    if (
+                        memoized_request_scope_receipt_mapping(
+                            candidate,
+                            inventory_validation_context=inventory_context,
+                            namespace=("normalized-record-request-scope-receipts-v1"),
+                        )
+                        is None
+                    ):
+                        candidate_mapping_available = False
+                audit_summary = {
+                    "candidate_projections": candidate_projections,
+                    "scope_classifications": clone(scope_classifications),
+                    "raw_scope_summaries": clone(raw_scope_summaries),
+                    "raw_authority_audit": [
+                        raw_audits_by_scope[scope_key_value]
+                        for scope_key_value in sorted(
+                            seen_candidate_scopes,
+                            key=lambda item: int(item[1]),
+                        )
+                    ],
+                }
+                try:
+                    audit_sha256 = hashlib.sha256(
+                        canonical_raw_body(audit_summary).encode("utf-8")
+                    ).hexdigest()
+                except (TypeError, UnicodeEncodeError, ValueError):
+                    return None
+                return {
+                    "transcript_sha256": endpoint_result["transcript_sha256"],
+                    "audit_sha256": audit_sha256,
+                    "audit_summary": audit_summary,
+                    "inventory_sidecar": clone(sidecar_value),
+                    "inventory_mapping_available": isinstance(inventory_mapping, dict),
+                    "candidate_mapping_available": candidate_mapping_available,
+                    "candidate_sidecars": [
+                        clone(candidate.get("request_scope_receipts"))
+                        if isinstance(candidate, dict)
+                        else None
+                        for candidate in candidates
+                    ],
+                }
+
+            initial_phase = validate_phase(
+                "initial_inventory",
+                initial_candidates,
+            )
+            final_phase = validate_phase(
+                "final_inventory",
+                final_candidates,
+            )
+            if initial_phase is None or final_phase is None:
+                return None
+            initial_stable_summary = clone(initial_phase["audit_summary"])
+            final_stable_summary = clone(final_phase["audit_summary"])
+            if (
+                not typed_json_equal(initial_stable_summary, final_stable_summary)
+                or initial_phase["transcript_sha256"]
+                != final_phase["transcript_sha256"]
+                or initial_phase["audit_sha256"] != final_phase["audit_sha256"]
+            ):
+                return None
+            sidecar_unavailable = (
+                initial_phase["inventory_mapping_available"] is not True
+                or final_phase["inventory_mapping_available"] is not True
+                or initial_phase["candidate_mapping_available"] is not True
+                or final_phase["candidate_mapping_available"] is not True
+                or not typed_json_equal(
+                    initial_phase["inventory_sidecar"],
+                    final_phase["inventory_sidecar"],
+                )
+                or not typed_json_equal(
+                    initial_phase["candidate_sidecars"],
+                    final_phase["candidate_sidecars"],
+                )
+            )
+            if not sidecar_unavailable:
+                return None
+            return {
+                "status": "unused-sidecar-unavailable",
+                "candidates": clone(final_candidates),
+                "phase_bindings": {
+                    "initial_inventory": {
+                        "transcript_sha256": initial_phase["transcript_sha256"],
+                        "audit_sha256": initial_phase["audit_sha256"],
+                    },
+                    "final_inventory": {
+                        "transcript_sha256": final_phase["transcript_sha256"],
+                        "audit_sha256": final_phase["audit_sha256"],
+                    },
+                },
+            }
+
+        def validate_history_universe_result(
+            candidate_history: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
+        ) -> dict[str, object] | None:
+            caller_provided_inventory_contexts = (
+                inventory_validation_contexts is not None
+            )
+            inventory_contexts = inventory_validation_contexts
+            if inventory_contexts is None:
+                inventory_contexts = new_report_inventory_validation_contexts()
+            if not report_inventory_validation_contexts_are_valid(inventory_contexts):
+                return None
+            complete_candidates = _validate_history_universe_complete(
+                candidate_history,
+                artifact_validation_context=(
+                    artifact_validation_context
+                    if caller_provided_inventory_contexts
+                    else None
+                ),
+                inventory_validation_contexts=inventory_contexts,
+            )
+            if complete_candidates is not None:
+                return {
+                    "status": "complete",
+                    "candidates": complete_candidates,
+                    "phase_bindings": None,
+                }
+            return _validate_history_universe_sidecar_blind(
+                candidate_history,
+                inventory_validation_contexts=inventory_contexts,
+            )
+
+        def validate_history_universe(
+            candidate_history: dict[str, object],
+            *,
+            artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
+        ) -> list[dict[str, object]] | None:
+            result = validate_history_universe_result(
+                candidate_history,
+                artifact_validation_context=artifact_validation_context,
+                inventory_validation_contexts=inventory_validation_contexts,
+            )
+            if not isinstance(result, dict) or result.get("status") != "complete":
+                return None
+            candidates = result.get("candidates")
+            return candidates if isinstance(candidates, list) else None
 
         def current_decision_authority_entry(
             value: object,
@@ -12307,12 +14486,243 @@ class RepositoryContractTest(unittest.TestCase):
                 del authority["provider_reactions"]
             return projected
 
+        def normalized_current_decision_entry(
+            record: dict[str, object],
+            raw_entry: dict[str, object],
+            *,
+            prefer_unresolved_thread_blocker: bool,
+            retain_request_reaction_records: bool,
+            finding_ancestry: dict[str, int],
+            inventory_validation_context: dict[str, object],
+        ) -> dict[str, object] | None:
+            parts = inventory_validation_context_parts(inventory_validation_context)
+            if parts is None:
+                return None
+            artifact_context = parts[3]
+            authority_record = record
+            record_evidence_state = record.get("evidence_state")
+            if isinstance(record_evidence_state, dict) and finding_ancestry:
+                artifact_kinds = {
+                    "terminal_payloads": "terminal-payload",
+                    "malformed_terminal_artifacts": ("malformed-terminal-artifact"),
+                    "active_top_level_findings": "active-top-level-finding",
+                    "unresolved_thread_findings": "unresolved-thread-finding",
+                }
+                projected_evidence_state: dict[str, list[object]] = {}
+                filtered_nonancestor = False
+                record_scope_for_filter = scope_key(record)
+                if record_scope_for_filter is None:
+                    return None
+                for field, artifact_kind in artifact_kinds.items():
+                    artifacts = record_evidence_state.get(field)
+                    if not isinstance(artifacts, list):
+                        return None
+                    projected_artifacts: list[object] = []
+                    for artifact in artifacts:
+                        validated = validate_candidate_artifact(
+                            artifact,
+                            expected_kind=artifact_kind,
+                            expected_scope=record_scope_for_filter,
+                            artifact_validation_context=artifact_context,
+                        )
+                        if validated is None:
+                            return None
+                        if (
+                            validated[3] == "findings"
+                            and finding_ancestry.get(validated[5]) == 1
+                        ):
+                            filtered_nonancestor = True
+                            continue
+                        projected_artifacts.append(artifact)
+                    projected_evidence_state[field] = projected_artifacts
+                if filtered_nonancestor:
+                    authority_record = dict(record)
+                    authority_record["evidence_state"] = projected_evidence_state
+                    authority_snapshot = record_snapshot(authority_record)
+                    authority_record["initial_snapshot"] = clone(authority_snapshot)
+                    authority_record["final_snapshot"] = clone(authority_snapshot)
+            ordering_key = candidate_order_basis(
+                authority_record,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                finding_ancestry=finding_ancestry,
+                artifact_validation_context=artifact_context,
+                inventory_validation_context=inventory_validation_context,
+            )
+            evidence_state = authority_record.get("evidence_state")
+            selected_kind_override = (
+                "unresolved-thread-finding"
+                if prefer_unresolved_thread_blocker
+                and isinstance(evidence_state, dict)
+                and bool(evidence_state.get("unresolved_thread_findings"))
+                else None
+            )
+            source_evidence = candidate_source_evidence(
+                authority_record,
+                ordering_key,
+                artifact_validation_context=artifact_context,
+                inventory_validation_context=inventory_validation_context,
+                basis_kind_override=selected_kind_override,
+            )
+            normalized_audit = candidate_scope_authority_audit(
+                authority_record,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                finding_ancestry=finding_ancestry,
+                artifact_validation_context=artifact_context,
+                inventory_validation_context=inventory_validation_context,
+            )
+            record_scope = scope_key(authority_record)
+            raw_authority = raw_entry.get("current_authority_projection")
+            raw_scope = (
+                raw_authority.get("scope") if isinstance(raw_authority, dict) else None
+            )
+            lifecycle = authority_record.get("lifecycle")
+            if (
+                ordering_key is None
+                or source_evidence is None
+                or normalized_audit is None
+                or record_scope is None
+                or not isinstance(raw_scope, dict)
+                or set(raw_scope)
+                != {
+                    "repository",
+                    "pull_request",
+                    "base_oid",
+                    "merge_base",
+                    "head",
+                }
+                or raw_scope.get("repository") != record_scope[0]
+                or raw_scope.get("pull_request") != record_scope[1]
+                or not isinstance(raw_scope.get("base_oid"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", raw_scope["base_oid"]) is None
+                or raw_scope.get("merge_base") != record_scope[2]
+                or raw_scope.get("head") != record_scope[3]
+                or not isinstance(lifecycle, dict)
+            ):
+                return None
+            expected_authority: dict[str, object] = {
+                "scope": clone(raw_scope),
+                "lifecycle": clone(lifecycle),
+                "applicable_artifacts": clone(normalized_audit["applicable_artifacts"]),
+            }
+            if retain_request_reaction_records:
+                raw_requests = record.get("requests")
+                raw_reactions = record.get("reactions")
+                receipt_mapping = memoized_request_scope_receipt_mapping(
+                    record,
+                    inventory_validation_context=inventory_validation_context,
+                    namespace="normalized-record-request-scope-receipts-v1",
+                    maximum_server_time=None,
+                )
+                if (
+                    not isinstance(raw_requests, list)
+                    or not isinstance(raw_reactions, list)
+                    or receipt_mapping is None
+                ):
+                    return None
+                request_ids: set[int] = set()
+                expected_requests: list[dict[str, object]] = []
+                for raw_request in raw_requests:
+                    request_id = (
+                        raw_request.get("id") if isinstance(raw_request, dict) else None
+                    )
+                    binding = (
+                        receipt_mapping.get(request_id)
+                        if type(request_id) is int
+                        else None
+                    )
+                    if (
+                        type(request_id) is not int
+                        or request_id in request_ids
+                        or not isinstance(binding, dict)
+                        or not typed_json_equal(
+                            binding.get("request"),
+                            raw_request,
+                        )
+                        or not isinstance(binding.get("scope"), tuple)
+                    ):
+                        return None
+                    request_ids.add(request_id)
+                    expected_requests.append(
+                        {
+                            "request": clone(raw_request),
+                            "request_scope": list(binding["scope"]),
+                            "request_scope_receipt": clone(binding["receipt"]),
+                        }
+                    )
+                if set(receipt_mapping) != request_ids:
+                    return None
+                expected_requests.sort(key=lambda item: int(item["request"]["id"]))
+                expected_provider_reactions: list[dict[str, object]] = []
+                seen_reaction_ids: set[int] = set()
+                for raw_reaction in raw_reactions:
+                    if not isinstance(raw_reaction, dict):
+                        return None
+                    reaction_id = raw_reaction.get("id")
+                    parent_request_id = raw_reaction.get("parent_request_id")
+                    created_at = raw_reaction.get("created_at")
+                    content = raw_reaction.get("content")
+                    user_login = raw_reaction.get("user_login")
+                    user_type = raw_reaction.get("user_type")
+                    if (
+                        type(reaction_id) is not int
+                        or reaction_id in seen_reaction_ids
+                        or type(parent_request_id) is not int
+                        or parent_request_id not in request_ids
+                        or type(created_at) is not int
+                    ):
+                        return None
+                    seen_reaction_ids.add(reaction_id)
+                    confirmed_different_actor = (
+                        isinstance(user_login, str)
+                        and bool(user_login)
+                        and user_login != exact_login
+                        and (
+                            user_type == "User"
+                            or (
+                                user_type == "Bot"
+                                and "codex" not in user_login.casefold()
+                            )
+                        )
+                    )
+                    if confirmed_different_actor:
+                        continue
+                    if (
+                        user_login != exact_login
+                        or user_type != "Bot"
+                        or content not in github_reaction_contents
+                    ):
+                        return None
+                    expected_provider_reactions.append(
+                        {
+                            "created_at": created_at,
+                            "id": reaction_id,
+                            "parent_comment_id": parent_request_id,
+                            "content": content,
+                        }
+                    )
+                expected_provider_reactions.sort(
+                    key=lambda item: (
+                        int(item["created_at"]),
+                        int(item["id"]),
+                        int(item["parent_comment_id"]),
+                    )
+                )
+                expected_authority["requests"] = expected_requests
+                expected_authority["provider_reactions"] = expected_provider_reactions
+            return {
+                "scope_key": list(record_scope),
+                "source_ordering_key": list(ordering_key),
+                "source_evidence": source_evidence,
+                "current_authority_projection": expected_authority,
+            }
+
         def current_raw_authority_matches(
             candidate_history: dict[str, object],
             current_record: dict[str, object],
             *,
             require_request_reaction_stability: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
             initial_inventory = candidate_history.get("initial_current_raw_inventory")
@@ -12323,15 +14733,43 @@ class RepositoryContractTest(unittest.TestCase):
                 or not isinstance(final_inventory, dict)
             ):
                 return False
+            if inventory_validation_contexts is not None and not (
+                report_inventory_validation_contexts_are_valid(
+                    inventory_validation_contexts
+                )
+            ):
+                return False
+            initial_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "initial_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            if inventory_validation_contexts is not None and initial_context is None:
+                return False
             initial_entry = parse_current_endpoint_inventory(
                 initial_inventory,
                 current_ancestry=ancestry,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                _inventory_validation_context=initial_context,
             )
+            final_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            if inventory_validation_contexts is not None and final_context is None:
+                return False
             final_entry = parse_current_endpoint_inventory(
                 final_inventory,
                 current_ancestry=ancestry,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                _inventory_validation_context=final_context,
             )
             if initial_entry is None or final_entry is None:
                 return False
@@ -12392,71 +14830,96 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ):
                 return False
-            expected_initial = parse_current_endpoint_inventory(
-                current_endpoint_inventory(
-                    current_record,
-                    observation_marker="initial",
-                ),
-                current_ancestry=ancestry,
-                require_current_ancestry_exact=False,
-                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
-            )
-            expected_final = parse_current_endpoint_inventory(
-                current_endpoint_inventory(
-                    current_record,
-                    observation_marker="final",
-                ),
-                current_ancestry=ancestry,
-                require_current_ancestry_exact=False,
-                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
-            )
+            if initial_context is None:
+                initial_context = new_inventory_validation_context()
+            if final_context is None:
+                final_context = new_inventory_validation_context()
+            if initial_context is None or final_context is None:
+                return False
             if require_request_reaction_stability:
                 initial_decision_entry = current_decision_authority_entry(
                     initial_entry,
                     retain_request_reaction_records=True,
                 )
-                expected_initial_decision_entry = current_decision_authority_entry(
-                    expected_initial,
+                expected_initial_decision_entry = normalized_current_decision_entry(
+                    current_record,
+                    initial_entry,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     retain_request_reaction_records=True,
+                    finding_ancestry=ancestry,
+                    inventory_validation_context=initial_context,
                 )
             else:
                 initial_decision_entry = current_decision_authority_entry(initial_entry)
-                expected_initial_decision_entry = current_decision_authority_entry(
-                    expected_initial
+                expected_initial_decision_entry = normalized_current_decision_entry(
+                    current_record,
+                    initial_entry,
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                    retain_request_reaction_records=False,
+                    finding_ancestry=ancestry,
+                    inventory_validation_context=initial_context,
                 )
+            expected_final_decision_entry = normalized_current_decision_entry(
+                current_record,
+                final_entry,
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                retain_request_reaction_records=require_request_reaction_stability,
+                finding_ancestry=ancestry,
+                inventory_validation_context=final_context,
+            )
             return (
-                expected_initial is not None
-                and expected_final is not None
-                and typed_json_equal(expected_initial, expected_final)
-                and initial_decision_entry is not None
+                initial_decision_entry is not None
                 and expected_initial_decision_entry is not None
+                and expected_final_decision_entry is not None
                 and typed_json_equal(
                     initial_decision_entry,
                     expected_initial_decision_entry,
+                )
+                and typed_json_equal(
+                    current_decision_authority_entry(
+                        final_entry,
+                        retain_request_reaction_records=(
+                            require_request_reaction_stability
+                        ),
+                    ),
+                    expected_final_decision_entry,
                 )
             )
 
         def current_final_request_authority_matches(
             candidate_history: dict[str, object],
             current_record: dict[str, object],
+            *,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
             final_inventory = candidate_history.get("final_current_raw_inventory")
             if ancestry is None or not isinstance(final_inventory, dict):
                 return False
+            final_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else new_inventory_validation_context()
+            )
+            if final_context is None:
+                return False
             final_entry = parse_current_endpoint_inventory(
                 final_inventory,
                 current_ancestry=ancestry,
+                _inventory_validation_context=final_context,
             )
-            expected_final = parse_current_endpoint_inventory(
-                current_endpoint_inventory(
-                    current_record,
-                    observation_marker="final",
-                ),
-                current_ancestry=ancestry,
-                require_current_ancestry_exact=False,
+            expected_final_decision_entry = normalized_current_decision_entry(
+                current_record,
+                final_entry if isinstance(final_entry, dict) else {},
+                prefer_unresolved_thread_blocker=False,
+                retain_request_reaction_records=True,
+                finding_ancestry=ancestry,
+                inventory_validation_context=final_context,
             )
-            if final_entry is None or expected_final is None:
+            if final_entry is None or expected_final_decision_entry is None:
                 return False
             final_authority = final_entry.get("current_authority_projection")
             final_requests = (
@@ -12480,10 +14943,6 @@ class RepositoryContractTest(unittest.TestCase):
                 return False
             final_decision_entry = current_decision_authority_entry(
                 final_entry,
-                retain_request_reaction_records=True,
-            )
-            expected_final_decision_entry = current_decision_authority_entry(
-                expected_final,
                 retain_request_reaction_records=True,
             )
             return (
@@ -12594,10 +15053,14 @@ class RepositoryContractTest(unittest.TestCase):
             current: dict[str, object],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> str:
-            context = artifact_validation_context
-            if context is None:
-                context = new_artifact_validation_context()
+            contexts = inventory_validation_contexts
+            if (
+                contexts is not None
+                and not report_inventory_validation_contexts_are_valid(contexts)
+            ):
+                return "unknown"
             expected_history_fields = {
                 "complete",
                 "repository",
@@ -12619,8 +15082,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "final_candidates",
             }
             if (
-                context is None
-                or not isinstance(candidate_history, dict)
+                not isinstance(candidate_history, dict)
                 or set(candidate_history) != expected_history_fields
                 or candidate_history.get("complete") is not True
                 or candidate_history.get("repository") != current_repository
@@ -12639,11 +15101,6 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
 
             current_ancestry = current_ancestry_mapping(candidate_history)
-            current_ordering_key = candidate_order_basis(
-                current,
-                finding_ancestry=current_ancestry,
-                artifact_validation_context=context,
-            )
             current_basis = current.get("candidate_basis")
             current_carrier = (
                 carrier_kind(current_basis.get("kind"))
@@ -12653,35 +15110,85 @@ class RepositoryContractTest(unittest.TestCase):
             if (
                 not current_lifecycle_is_eligible(current)
                 or scope_key(current) != current_scope_key
-                or current_ordering_key is None
                 or not isinstance(current_basis, dict)
                 or current_carrier is None
                 or not current_raw_authority_matches(
                     candidate_history,
                     current,
                     require_request_reaction_stability=(current_carrier == "reaction"),
+                    inventory_validation_contexts=contexts,
                 )
             ):
                 return "unknown"
-
-            terminal_only_fallback = (
-                "terminal-payload"
-                if current_carrier == "terminal-payload"
-                else "unknown"
+            current_phase_context = (
+                report_inventory_validation_context_for(
+                    contexts,
+                    "final_current_raw_inventory",
+                )
+                if contexts is not None
+                else None
             )
+            current_inventory_parts = inventory_validation_context_parts(
+                current_phase_context
+            )
+            context = artifact_validation_context
+            if contexts is not None:
+                if current_inventory_parts is None or (
+                    context is not None and context is not current_inventory_parts[3]
+                ):
+                    return "unknown"
+                context = current_inventory_parts[3]
+            elif context is None:
+                context = new_artifact_validation_context()
+            current_ordering_key = candidate_order_basis(
+                current,
+                finding_ancestry=current_ancestry,
+                artifact_validation_context=context,
+                inventory_validation_context=current_phase_context,
+            )
+            if context is None or current_ordering_key is None:
+                return "unknown"
+
             profile_as_of = history_window_is_authoritative(
                 provider_declaration,
                 candidate_history,
             )
             if profile_as_of is None:
-                return terminal_only_fallback
+                return "unknown"
             profile_start = profile_as_of - history_window_seconds
-            final_candidates = validate_history_universe(
+            history_validation = validate_history_universe_result(
                 candidate_history,
-                artifact_validation_context=context,
+                inventory_validation_contexts=contexts,
             )
-            if final_candidates is None:
-                return terminal_only_fallback
+            if not isinstance(history_validation, dict):
+                return "unknown"
+            if history_validation.get("status") == "unused-sidecar-unavailable":
+                return (
+                    "terminal-payload"
+                    if current_carrier == "terminal-payload"
+                    else "unknown"
+                )
+            if history_validation.get("status") != "complete":
+                return "unknown"
+            final_candidates = history_validation.get("candidates")
+            if not isinstance(final_candidates, list):
+                return "unknown"
+            history_phase_context = (
+                report_inventory_validation_context_for(
+                    contexts,
+                    "final_inventory",
+                )
+                if contexts is not None
+                else None
+            )
+            history_inventory_parts = inventory_validation_context_parts(
+                history_phase_context
+            )
+            history_artifact_context = (
+                history_inventory_parts[3]
+                if history_inventory_parts is not None
+                else context
+            )
 
             ordering_keys: set[tuple[int, int]] = set()
             scope_keys: set[tuple[object, ...]] = set()
@@ -12689,11 +15196,12 @@ class RepositoryContractTest(unittest.TestCase):
 
             for candidate in final_candidates:
                 if not isinstance(candidate, dict):
-                    return terminal_only_fallback
+                    return "unknown"
                 candidate_scope_key = scope_key(candidate)
                 ordering_key = candidate_order_basis(
                     candidate,
-                    artifact_validation_context=context,
+                    artifact_validation_context=history_artifact_context,
+                    inventory_validation_context=history_phase_context,
                 )
                 basis = candidate.get("candidate_basis")
                 candidate_carrier = (
@@ -12709,7 +15217,7 @@ class RepositoryContractTest(unittest.TestCase):
                     or not isinstance(basis, dict)
                     or candidate_carrier is None
                 ):
-                    return terminal_only_fallback
+                    return "unknown"
                 scope_keys.add(candidate_scope_key)
                 ordering_keys.add(ordering_key)
                 ordered.append((ordering_key, candidate_carrier, candidate))
@@ -12726,12 +15234,17 @@ class RepositoryContractTest(unittest.TestCase):
                 len(selected) < 3
                 or not declaration_is_authoritative(provider_declaration)
                 or any(
-                    classify_reaction_scope(candidate) != "clean"
+                    classify_reaction_scope(
+                        candidate,
+                        inventory_validation_context=history_phase_context,
+                    )
+                    != "clean"
                     for _, _, candidate in selected
                 )
                 or classify_reaction_scope(
                     current,
                     expected_scope=current_scope_key,
+                    inventory_validation_context=current_phase_context,
                 )
                 != "clean"
             ):
@@ -12744,21 +15257,54 @@ class RepositoryContractTest(unittest.TestCase):
             current: dict[str, object],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> str:
-            context = artifact_validation_context
-            if context is None:
-                context = new_artifact_validation_context()
-            if context is None:
+            contexts = inventory_validation_contexts
+            if (
+                contexts is not None
+                and not report_inventory_validation_contexts_are_valid(contexts)
+            ):
                 return "unknown"
+            context = artifact_validation_context
             profile = compute_provider_profile(
                 provider_declaration,
                 candidate_history,
                 current,
                 artifact_validation_context=context,
+                inventory_validation_contexts=contexts,
             )
             if profile in {"terminal-payload", "mixed"}:
                 return "not-clean"
             if profile != "thumbs-up-clean":
+                return "unknown"
+            current_phase_context = (
+                report_inventory_validation_context_for(
+                    contexts,
+                    "final_current_raw_inventory",
+                )
+                if contexts is not None
+                else None
+            )
+            history_phase_context = (
+                report_inventory_validation_context_for(
+                    contexts,
+                    "final_inventory",
+                )
+                if contexts is not None
+                else None
+            )
+            current_parts = inventory_validation_context_parts(current_phase_context)
+            history_parts = inventory_validation_context_parts(history_phase_context)
+            if contexts is not None:
+                if current_parts is None or history_parts is None:
+                    return "unknown"
+                context = current_parts[3]
+                history_artifact_context = history_parts[3]
+            else:
+                if context is None:
+                    context = new_artifact_validation_context()
+                history_artifact_context = context
+            if context is None or history_artifact_context is None:
                 return "unknown"
             if not declaration_is_authoritative(provider_declaration):
                 return "unknown"
@@ -12796,10 +15342,13 @@ class RepositoryContractTest(unittest.TestCase):
             fallback_start = fallback_as_of - history_window_seconds
             candidates = validate_history_universe(
                 candidate_history,
-                artifact_validation_context=context,
+                artifact_validation_context=history_artifact_context,
+                inventory_validation_contexts=contexts,
             )
             if candidates is None or not current_raw_authority_matches(
-                candidate_history, current
+                candidate_history,
+                current,
+                inventory_validation_contexts=contexts,
             ):
                 return "unknown"
 
@@ -12827,9 +15376,12 @@ class RepositoryContractTest(unittest.TestCase):
             def register_global_native_records(
                 candidate: dict[str, object],
                 candidate_scope_key: tuple[object, ...],
+                inventory_validation_context: dict[str, object] | None,
             ) -> bool:
-                receipt_mapping = request_scope_receipt_mapping(
-                    candidate.get("request_scope_receipts")
+                receipt_mapping = memoized_request_scope_receipt_mapping(
+                    candidate,
+                    inventory_validation_context=inventory_validation_context,
+                    namespace="normalized-record-request-scope-receipts-v1",
                 )
                 if receipt_mapping is None:
                     return False
@@ -12929,7 +15481,8 @@ class RepositoryContractTest(unittest.TestCase):
                 candidate_scope_key = scope_key(candidate)
                 ordering_key = candidate_order_basis(
                     candidate,
-                    artifact_validation_context=context,
+                    artifact_validation_context=history_artifact_context,
+                    inventory_validation_context=history_phase_context,
                 )
                 if (
                     candidate_scope_key is None
@@ -12940,7 +15493,11 @@ class RepositoryContractTest(unittest.TestCase):
                 ):
                     return "unknown"
                 historical_scope_keys.add(candidate_scope_key)
-                if not register_global_native_records(candidate, candidate_scope_key):
+                if not register_global_native_records(
+                    candidate,
+                    candidate_scope_key,
+                    history_phase_context,
+                ):
                     return "unknown"
                 if ordering_key in ordering_keys:
                     return "unknown"
@@ -12956,23 +15513,35 @@ class RepositoryContractTest(unittest.TestCase):
             if len(selected) < 3:
                 return "unknown"
             for _, sample in selected:
-                if classify_reaction_scope(sample) != "clean":
+                if (
+                    classify_reaction_scope(
+                        sample,
+                        inventory_validation_context=history_phase_context,
+                    )
+                    != "clean"
+                ):
                     return "unknown"
             current_ordering_key = candidate_order_basis(
                 current,
                 finding_ancestry=current_ancestry_mapping(candidate_history),
                 artifact_validation_context=context,
+                inventory_validation_context=current_phase_context,
             )
             if (
                 not current_lifecycle_is_eligible(current)
                 or classify_reaction_scope(
                     current,
                     expected_scope=current_scope_key,
+                    inventory_validation_context=current_phase_context,
                 )
                 != "clean"
                 or current_ordering_key is None
                 or current_ordering_key[0] > fallback_as_of
-                or not register_global_native_records(current, current_scope_key)
+                or not register_global_native_records(
+                    current,
+                    current_scope_key,
+                    current_phase_context,
+                )
             ):
                 return "unknown"
             return "clean"
@@ -13050,12 +15619,18 @@ class RepositoryContractTest(unittest.TestCase):
 
         def same_scope_request_audit(
             record: dict[str, object],
+            *,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             raw_requests = record.get("requests")
             raw_reactions = record.get("reactions")
             raw_receipts = record.get("request_scope_receipts")
             record_scope = scope_key(record)
-            receipt_scopes = request_scope_receipt_mapping(raw_receipts)
+            receipt_scopes = memoized_request_scope_receipt_mapping(
+                record,
+                inventory_validation_context=inventory_validation_context,
+                namespace="normalized-record-request-scope-receipts-v1",
+            )
             if (
                 not isinstance(raw_requests, list)
                 or not isinstance(
@@ -13111,6 +15686,8 @@ class RepositoryContractTest(unittest.TestCase):
 
         def selected_reaction_provenance(
             record: dict[str, object],
+            *,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> tuple[dict[str, object], dict[str, object], dict[str, object]] | None:
             selected_request_id = record.get("selected_request_id")
             selected_reaction_id = record.get("selected_reaction_id")
@@ -13118,7 +15695,11 @@ class RepositoryContractTest(unittest.TestCase):
             raw_reactions = record.get("reactions")
             raw_receipts = record.get("request_scope_receipts")
             record_scope = scope_key(record)
-            receipt_scopes = request_scope_receipt_mapping(raw_receipts)
+            receipt_scopes = memoized_request_scope_receipt_mapping(
+                record,
+                inventory_validation_context=inventory_validation_context,
+                namespace="normalized-record-request-scope-receipts-v1",
+            )
             if (
                 type(selected_request_id) is not int
                 or type(selected_reaction_id) is not int
@@ -13173,10 +15754,26 @@ class RepositoryContractTest(unittest.TestCase):
             candidate_history: dict[str, object],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             context = artifact_validation_context
+            history_phase_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
             if context is None:
-                context = new_artifact_validation_context()
+                history_parts = inventory_validation_context_parts(
+                    history_phase_context
+                )
+                context = (
+                    history_parts[3]
+                    if history_parts is not None
+                    else new_artifact_validation_context()
+                )
             final_candidates = candidate_history.get("final_candidates")
             if context is None or not isinstance(final_candidates, list):
                 return None
@@ -13187,6 +15784,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ordering_key = candidate_order_basis(
                     candidate,
                     artifact_validation_context=context,
+                    inventory_validation_context=history_phase_context,
                 )
                 if ordering_key is None:
                     return None
@@ -13196,6 +15794,8 @@ class RepositoryContractTest(unittest.TestCase):
 
         def report_candidate_snapshots(
             candidates: object,
+            *,
+            inventory_validation_context: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             if not isinstance(candidates, list):
                 return None
@@ -13203,7 +15803,10 @@ class RepositoryContractTest(unittest.TestCase):
             for candidate in candidates:
                 if not isinstance(candidate, dict):
                     return None
-                audit = same_scope_request_audit(candidate)
+                audit = same_scope_request_audit(
+                    candidate,
+                    inventory_validation_context=inventory_validation_context,
+                )
                 if audit is None:
                     return None
                 snapshots.append(
@@ -13219,6 +15822,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             require_request_reaction_stability: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             ancestry = current_ancestry_mapping(candidate_history)
             if ancestry is None:
@@ -13233,6 +15837,14 @@ class RepositoryContractTest(unittest.TestCase):
                     inventory,
                     current_ancestry=ancestry,
                     prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                    _inventory_validation_context=(
+                        report_inventory_validation_context_for(
+                            inventory_validation_contexts,
+                            f"{phase}_current_raw_inventory",
+                        )
+                        if inventory_validation_contexts is not None
+                        else None
+                    ),
                 )
                 if projected_entry is None:
                     return None
@@ -13284,17 +15896,16 @@ class RepositoryContractTest(unittest.TestCase):
             current_record: dict[str, object],
             *,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             context = artifact_validation_context
-            if context is None:
-                context = new_artifact_validation_context()
             if (
-                context is None
-                or compute_provider_profile(
+                compute_provider_profile(
                     provider_declaration,
                     candidate_history,
                     current_record,
                     artifact_validation_context=context,
+                    inventory_validation_contexts=inventory_validation_contexts,
                 )
                 != "thumbs-up-clean"
                 or classify_fallback(
@@ -13302,25 +15913,62 @@ class RepositoryContractTest(unittest.TestCase):
                     candidate_history,
                     current_record,
                     artifact_validation_context=context,
+                    inventory_validation_contexts=inventory_validation_contexts,
                 )
                 != "clean"
                 or not isinstance(provider_declaration, dict)
             ):
                 return None
+            current_phase_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            history_phase_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            current_parts = inventory_validation_context_parts(current_phase_context)
+            if context is None:
+                context = (
+                    current_parts[3]
+                    if current_parts is not None
+                    else new_artifact_validation_context()
+                )
+            if context is None:
+                return None
             declaration_final = provider_declaration.get("final_snapshot")
             selected_history = ordered_selected_history(
                 candidate_history,
-                artifact_validation_context=context,
+                inventory_validation_contexts=inventory_validation_contexts,
             )
-            current_provenance = selected_reaction_provenance(current_record)
-            current_audit = same_scope_request_audit(current_record)
+            current_provenance = selected_reaction_provenance(
+                current_record,
+                inventory_validation_context=current_phase_context,
+            )
+            current_audit = same_scope_request_audit(
+                current_record,
+                inventory_validation_context=current_phase_context,
+            )
             initial_report_candidates = report_candidate_snapshots(
-                candidate_history.get("initial_candidates")
+                candidate_history.get("initial_candidates"),
+                inventory_validation_context=history_phase_context,
             )
             final_report_candidates = report_candidate_snapshots(
-                candidate_history.get("final_candidates")
+                candidate_history.get("final_candidates"),
+                inventory_validation_context=history_phase_context,
             )
-            current_raw_authority = current_raw_authority_basis(candidate_history)
+            current_raw_authority = current_raw_authority_basis(
+                candidate_history,
+                inventory_validation_contexts=inventory_validation_contexts,
+            )
             if (
                 not isinstance(declaration_final, dict)
                 or candidate_history.get("as_of_api_url")
@@ -13386,8 +16034,14 @@ class RepositoryContractTest(unittest.TestCase):
 
             sample_bases: list[dict[str, object]] = []
             for historical_record in selected_history:
-                provenance = selected_reaction_provenance(historical_record)
-                audit = same_scope_request_audit(historical_record)
+                provenance = selected_reaction_provenance(
+                    historical_record,
+                    inventory_validation_context=history_phase_context,
+                )
+                audit = same_scope_request_audit(
+                    historical_record,
+                    inventory_validation_context=history_phase_context,
+                )
                 historical_scope = historical_record.get("scope")
                 historical_basis = historical_record.get("candidate_basis")
                 if (
@@ -13427,6 +16081,8 @@ class RepositoryContractTest(unittest.TestCase):
             lane_state: str,
             current_record: dict[str, object],
             local_lane_timing: object,
+            *,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object]:
             if lane_state == "pre-provider-ineligible":
                 return {"status": "not-applicable", "warnings": []}
@@ -13454,8 +16110,18 @@ class RepositoryContractTest(unittest.TestCase):
                 return {"status": "unknown", "warnings": []}
             raw_requests = current_record.get("requests")
             current_scope = scope_key(current_record)
-            receipt_scopes = request_scope_receipt_mapping(
-                current_record.get("request_scope_receipts"),
+            current_inventory_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            receipt_scopes = memoized_request_scope_receipt_mapping(
+                current_record,
+                inventory_validation_context=current_inventory_context,
+                namespace="normalized-record-request-scope-receipts-v1",
                 maximum_server_time=None,
             )
             if (
@@ -13555,13 +16221,27 @@ class RepositoryContractTest(unittest.TestCase):
             expected_outcome: str,
             finding_ancestry: dict[str, int] | None = None,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             if expected_outcome not in {"clean", "findings"}:
                 return None
+            current_phase_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            current_parts = inventory_validation_context_parts(current_phase_context)
+            context = artifact_validation_context
+            if context is None and current_parts is not None:
+                context = current_parts[3]
             ordering_key = candidate_order_basis(
                 current_record,
                 finding_ancestry=finding_ancestry,
-                artifact_validation_context=artifact_validation_context,
+                artifact_validation_context=context,
+                inventory_validation_context=current_phase_context,
             )
             candidate_basis = current_record.get("candidate_basis")
             evidence_state = current_record.get("evidence_state")
@@ -13598,7 +16278,7 @@ class RepositoryContractTest(unittest.TestCase):
                     artifact,
                     expected_kind=str(basis_kind),
                     expected_scope=current_scope,
-                    artifact_validation_context=artifact_validation_context,
+                    artifact_validation_context=context,
                 )
                 if (
                     validated is not None
@@ -13623,6 +16303,7 @@ class RepositoryContractTest(unittest.TestCase):
             current_raw_authority = current_raw_authority_basis(
                 candidate_history,
                 require_request_reaction_stability=False,
+                inventory_validation_contexts=inventory_validation_contexts,
             )
             if (
                 not isinstance(selected_final, dict)
@@ -13631,6 +16312,7 @@ class RepositoryContractTest(unittest.TestCase):
                     candidate_history,
                     current_record,
                     require_request_reaction_stability=False,
+                    inventory_validation_contexts=inventory_validation_contexts,
                 )
             ):
                 return None
@@ -13650,6 +16332,7 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             finding_ancestry: dict[str, int] | None = None,
             artifact_validation_context: dict[str, object] | None = None,
+            inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             evidence_state = current_record.get("evidence_state")
             current_scope = scope_key(current_record)
@@ -13670,12 +16353,25 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             selected_artifact: dict[str, object] | None = None
             prefer_unresolved_thread_blocker = bool(unresolved)
+            current_phase_context = (
+                report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                if inventory_validation_contexts is not None
+                else None
+            )
+            current_parts = inventory_validation_context_parts(current_phase_context)
+            context = artifact_validation_context
+            if context is None and current_parts is not None:
+                context = current_parts[3]
             if unresolved:
                 ordering_key = candidate_order_basis(
                     current_record,
                     prefer_unresolved_thread_blocker=True,
                     finding_ancestry=finding_ancestry,
-                    artifact_validation_context=artifact_validation_context,
+                    artifact_validation_context=context,
+                    inventory_validation_context=current_phase_context,
                 )
                 if ordering_key is None:
                     return None
@@ -13687,7 +16383,7 @@ class RepositoryContractTest(unittest.TestCase):
                         artifact,
                         expected_kind="unresolved-thread-finding",
                         expected_scope=current_scope,
-                        artifact_validation_context=artifact_validation_context,
+                        artifact_validation_context=context,
                     )
                     if (
                         validated is None
@@ -13709,7 +16405,8 @@ class RepositoryContractTest(unittest.TestCase):
                 ordering_key = candidate_order_basis(
                     current_record,
                     finding_ancestry=finding_ancestry,
-                    artifact_validation_context=artifact_validation_context,
+                    artifact_validation_context=context,
+                    inventory_validation_context=current_phase_context,
                 )
                 candidate_basis = current_record.get("candidate_basis")
                 malformed = evidence_state.get("malformed_terminal_artifacts")
@@ -13726,7 +16423,7 @@ class RepositoryContractTest(unittest.TestCase):
                         artifact,
                         expected_kind="malformed-terminal-artifact",
                         expected_scope=current_scope,
-                        artifact_validation_context=artifact_validation_context,
+                        artifact_validation_context=context,
                     )
                     if (
                         validated is not None
@@ -13747,6 +16444,7 @@ class RepositoryContractTest(unittest.TestCase):
                 candidate_history,
                 require_request_reaction_stability=False,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                inventory_validation_contexts=inventory_validation_contexts,
             )
             if (
                 not isinstance(selected_final, dict)
@@ -13756,6 +16454,7 @@ class RepositoryContractTest(unittest.TestCase):
                     current_record,
                     require_request_reaction_stability=False,
                     prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
+                    inventory_validation_contexts=inventory_validation_contexts,
                 )
             ):
                 return None
@@ -13778,34 +16477,124 @@ class RepositoryContractTest(unittest.TestCase):
             *,
             _artifact_receipt_tightened_resource_limits: dict[str, int] | None = None,
             _artifact_receipt_monotonic_clock: object = time.monotonic,
+            _inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
-            artifact_validation_context = new_artifact_validation_context(
-                tightened_limits=_artifact_receipt_tightened_resource_limits,
-                monotonic_clock=_artifact_receipt_monotonic_clock,
-            )
-            finding_ancestry = current_ancestry_mapping(candidate_history)
-            if (
-                lane_state
-                not in {
-                    "pre-provider-ineligible",
-                    "eligible-waiting",
-                    "accepted-terminal-clean",
-                    "accepted-terminal-findings",
-                    "accepted-reaction-clean",
-                    "inconclusive",
-                }
-                or artifact_validation_context is None
+            history_validation_status: str | None = None
+            inventory_validation_contexts = _inventory_validation_contexts
+            if inventory_validation_contexts is None:
+                inventory_validation_contexts = (
+                    new_report_inventory_validation_contexts(
+                        tightened_limits=(_artifact_receipt_tightened_resource_limits),
+                        monotonic_clock=_artifact_receipt_monotonic_clock,
+                    )
+                )
+            elif not report_inventory_validation_contexts_are_valid(
+                inventory_validation_contexts
             ):
                 return None
+            finding_ancestry = current_ancestry_mapping(candidate_history)
+            if lane_state not in {
+                "pre-provider-ineligible",
+                "eligible-waiting",
+                "accepted-terminal-clean",
+                "accepted-terminal-findings",
+                "accepted-reaction-clean",
+                "inconclusive",
+            }:
+                return None
             if lane_state == "pre-provider-ineligible":
+                for field in (
+                    "initial_inventory",
+                    "final_inventory",
+                    "initial_current_raw_inventory",
+                    "final_current_raw_inventory",
+                ):
+                    if (
+                        report_inventory_validation_context_for(
+                            inventory_validation_contexts,
+                            field,
+                        )
+                        is None
+                    ):
+                        return None
                 provider_profile: str | None = None
                 evidence_basis: dict[str, object] | None = None
             else:
+                evidence_state = current_record.get("evidence_state")
+                prefer_unresolved = (
+                    lane_state == "inconclusive"
+                    and isinstance(evidence_state, dict)
+                    and bool(evidence_state.get("unresolved_thread_findings"))
+                )
+                current_basis = current_record.get("candidate_basis")
+                reaction_authority = (
+                    isinstance(current_basis, dict)
+                    and current_basis.get("kind") == "reaction"
+                )
+                if (
+                    current_raw_authority_basis(
+                        candidate_history,
+                        require_request_reaction_stability=reaction_authority,
+                        prefer_unresolved_thread_blocker=prefer_unresolved,
+                        inventory_validation_contexts=(inventory_validation_contexts),
+                    )
+                    is None
+                ):
+                    return None
+                normalized_authority_matches = current_raw_authority_matches(
+                    candidate_history,
+                    current_record,
+                    require_request_reaction_stability=reaction_authority,
+                    prefer_unresolved_thread_blocker=prefer_unresolved,
+                    inventory_validation_contexts=inventory_validation_contexts,
+                )
+                if (
+                    lane_state
+                    in {
+                        "accepted-terminal-clean",
+                        "accepted-terminal-findings",
+                        "accepted-reaction-clean",
+                    }
+                    and not normalized_authority_matches
+                ):
+                    return None
+                history_validation = validate_history_universe_result(
+                    candidate_history,
+                    inventory_validation_contexts=(inventory_validation_contexts),
+                )
+                if not isinstance(history_validation, dict):
+                    return None
+                history_validation_status = history_validation.get("status")
+                if history_validation_status not in {
+                    "complete",
+                    "unused-sidecar-unavailable",
+                }:
+                    return None
+                if (
+                    history_validation_status == "unused-sidecar-unavailable"
+                    and lane_state
+                    not in {
+                        "accepted-terminal-clean",
+                        "accepted-terminal-findings",
+                    }
+                ):
+                    return None
+                current_phase_context = report_inventory_validation_context_for(
+                    inventory_validation_contexts,
+                    "final_current_raw_inventory",
+                )
+                current_inventory_parts = inventory_validation_context_parts(
+                    current_phase_context
+                )
+                if current_inventory_parts is None:
+                    return None
+                artifact_validation_context = current_inventory_parts[3]
                 provider_profile = compute_provider_profile(
                     provider_declaration,
                     candidate_history,
                     current_record,
                     artifact_validation_context=artifact_validation_context,
+                    inventory_validation_contexts=inventory_validation_contexts,
                 )
                 evidence_basis = None
                 if lane_state in {
@@ -13824,6 +16613,7 @@ class RepositoryContractTest(unittest.TestCase):
                         ),
                         finding_ancestry=finding_ancestry,
                         artifact_validation_context=artifact_validation_context,
+                        inventory_validation_contexts=(inventory_validation_contexts),
                     )
                     if evidence_basis is None:
                         return None
@@ -13835,6 +16625,9 @@ class RepositoryContractTest(unittest.TestCase):
                             candidate_history,
                             current_record,
                             artifact_validation_context=(artifact_validation_context),
+                            inventory_validation_contexts=(
+                                inventory_validation_contexts
+                            ),
                         )
                         != "clean"
                     ):
@@ -13844,6 +16637,7 @@ class RepositoryContractTest(unittest.TestCase):
                         candidate_history,
                         current_record,
                         artifact_validation_context=artifact_validation_context,
+                        inventory_validation_contexts=(inventory_validation_contexts),
                     )
                     if evidence_basis is None:
                         return None
@@ -13853,11 +16647,13 @@ class RepositoryContractTest(unittest.TestCase):
                         current_record,
                         finding_ancestry=finding_ancestry,
                         artifact_validation_context=artifact_validation_context,
+                        inventory_validation_contexts=(inventory_validation_contexts),
                     )
             request_policy = request_policy_from_inputs(
                 lane_state,
                 current_record,
                 local_lane_timing,
+                inventory_validation_contexts=inventory_validation_contexts,
             )
             if lane_state in {
                 "accepted-terminal-clean",
@@ -13865,15 +16661,25 @@ class RepositoryContractTest(unittest.TestCase):
             } and not current_final_request_authority_matches(
                 candidate_history,
                 current_record,
+                inventory_validation_contexts=inventory_validation_contexts,
             ):
                 request_policy = {"status": "unknown", "warnings": []}
-            context_parts = artifact_validation_context_parts(
-                artifact_validation_context
-            )
-            if (
-                context_parts is None
-                or context_parts[0].get("failed") is not False
-                or not resource_budget_charge(context_parts[0])
+            if not report_inventory_validation_contexts_are_valid(
+                inventory_validation_contexts,
+                require_complete=True,
+            ):
+                return None
+            assert isinstance(inventory_validation_contexts, dict)
+            report_phase_contexts = inventory_validation_contexts["contexts"]
+            if not isinstance(report_phase_contexts, dict) or any(
+                not inventory_validation_deadlines_hold(
+                    report_phase_contexts[field],
+                    ignore_sidecar_failure=(
+                        history_validation_status == "unused-sidecar-unavailable"
+                        and field in {"initial_inventory", "final_inventory"}
+                    ),
+                )
+                for field in report_inventory_context_fields
             ):
                 return None
             return {
@@ -13945,13 +16751,38 @@ class RepositoryContractTest(unittest.TestCase):
         for inventory_builder in (universe_inventory, current_endpoint_inventory):
             inventory_builder_source = inspect.getsource(inventory_builder)
             self.assertIn(
-                "new_sibling_resource_tracker(endpoint_tracker)",
+                "new_inventory_validation_context(",
+                inventory_builder_source,
+            )
+            self.assertIn(
+                "inventory_validation_context_parts(inventory_context)",
                 inventory_builder_source,
             )
             self.assertIn(
                 "_resource_tracker=endpoint_tracker", inventory_builder_source
             )
             self.assertIn("_resource_tracker=sidecar_tracker", inventory_builder_source)
+            self.assertIn(
+                "inventory_validation_deadlines_hold(inventory_context)",
+                inventory_builder_source,
+            )
+        inventory_context_source = inspect.getsource(new_inventory_validation_context)
+        self.assertEqual(
+            inventory_context_source.count(
+                "new_sibling_resource_tracker(root_tracker)"
+            ),
+            3,
+        )
+        self.assertIn("resource_tracker=artifact_tracker", inventory_context_source)
+        expected_report_source = inspect.getsource(expected_report_from_inputs)
+        self.assertIn(
+            "new_report_inventory_validation_contexts(",
+            expected_report_source,
+        )
+        self.assertNotIn(
+            "new_artifact_validation_context(",
+            expected_report_source,
+        )
         self.assertIn(
             "_single_scope_detail_only=True",
             inspect.getsource(current_endpoint_inventory),
@@ -16841,6 +19672,389 @@ class RepositoryContractTest(unittest.TestCase):
                     )
                 )
 
+        def invalid_state_blocker_artifact(
+            artifact_id: int,
+            state: object,
+            *,
+            body: str,
+            different_actor_child: bool = False,
+        ) -> dict[str, object]:
+            artifact = complete_review_artifact(
+                terminal_current,
+                artifact_id,
+                int(terminal_server_time) - 10,
+                artifact_kind="malformed-terminal-artifact",
+                outcome="malformed",
+            )
+            final_snapshot = artifact["final_snapshot"]
+            assert isinstance(final_snapshot, dict)
+            final_snapshot["state"] = state
+            final_snapshot["body"] = body
+            final_snapshot["normalized_body"] = body
+            if different_actor_child:
+                associated = final_snapshot["associated_inline_comments"]
+                assert isinstance(associated, dict)
+                associated["records"] = [
+                    {
+                        "id": artifact_id * 10,
+                        "url": (
+                            f"https://github.com/{current_repository}/pull/"
+                            f"{current_pr}#discussion_r{artifact_id * 10}"
+                        ),
+                        "user_login": "octocat",
+                        "user_type": "User",
+                        "pull_request_review_id": artifact_id,
+                        "commit_id": current_head,
+                        "original_commit_id": current_head,
+                        "body": "Human side discussion",
+                        "normalized_body": "Human side discussion",
+                    }
+                ]
+            artifact["initial_snapshot"] = clone(final_snapshot)
+            artifact["artifact_scope_receipt"] = artifact_scope_receipt(final_snapshot)
+            return artifact
+
+        invalid_state_blocker_cases = {
+            "missing-state-nonempty": (None, "No findings.", False),
+            "unknown-state-nonempty": ("QUEUED", "No findings.", False),
+            "dismissed-empty": ("DISMISSED", "", False),
+            "unknown-state-different-actor-child": ("QUEUED", "", True),
+        }
+        for blocker_offset, (
+            blocker_case,
+            (blocker_state, blocker_body, different_actor_child),
+        ) in enumerate(invalid_state_blocker_cases.items(), start=1):
+            blocker_id = 82_200 + blocker_offset
+            blocker_artifact = invalid_state_blocker_artifact(
+                blocker_id,
+                blocker_state,
+                body=blocker_body,
+                different_actor_child=different_actor_child,
+            )
+            blocked_current = clone(terminal_current)
+            assert isinstance(blocked_current, dict)
+            blocked_current["evidence_state"]["malformed_terminal_artifacts"] = [
+                blocker_artifact
+            ]
+            blocked_current["candidate_basis"] = {
+                "kind": "malformed-terminal-artifact",
+                "server_time": int(terminal_server_time) - 10,
+                "stable_artifact_id": blocker_id,
+            }
+            restamp(blocked_current)
+            blocked_history = history(samples, current_raw=blocked_current)
+            parsed_blocked_current = parse_current_endpoint_inventory(
+                blocked_history["initial_current_raw_inventory"],
+                current_ancestry={},
+            )
+            with self.subTest(invalid_state_global_blocker_parity=blocker_case):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        blocker_artifact,
+                        expected_kind="malformed-terminal-artifact",
+                        expected_scope=current_scope_key,
+                    )
+                )
+                self.assertEqual(
+                    candidate_order_basis(blocked_current),
+                    (int(terminal_server_time) - 10, blocker_id),
+                )
+                self.assertIsNotNone(parsed_blocked_current)
+                assert isinstance(parsed_blocked_current, dict)
+                self.assertEqual(
+                    parsed_blocked_current["source_ordering_key"],
+                    [int(terminal_server_time) - 10, blocker_id],
+                )
+                self.assertEqual(
+                    parsed_blocked_current["source_evidence"]["semantic"],
+                    "malformed",
+                )
+                self.assertTrue(
+                    current_raw_authority_matches(
+                        blocked_history,
+                        blocked_current,
+                        require_request_reaction_stability=False,
+                    )
+                )
+                blocked_report = expected_report_from_inputs(
+                    "inconclusive",
+                    declaration,
+                    blocked_history,
+                    blocked_current,
+                    post_as_of_lane_timing,
+                )
+                self.assertIsNotNone(blocked_report)
+                assert isinstance(blocked_report, dict)
+                blocked_basis = blocked_report["evidence_basis"]
+                self.assertIsInstance(blocked_basis, dict)
+                assert isinstance(blocked_basis, dict)
+                self.assertEqual(
+                    blocked_basis["artifact"]["final_snapshot"]["id"],
+                    blocker_id,
+                )
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        blocked_history,
+                        blocked_current,
+                        post_as_of_lane_timing,
+                    )
+                )
+                incorrect_clean_basis = clone(blocked_current)
+                assert isinstance(incorrect_clean_basis, dict)
+                incorrect_clean_basis["candidate_basis"] = clone(
+                    terminal_current["candidate_basis"]
+                )
+                restamp(incorrect_clean_basis)
+                self.assertIsNone(candidate_order_basis(incorrect_clean_basis))
+
+        for child_offset, child_resolved in enumerate((False, True), start=1):
+            child_parent_id = 82_230 + child_offset
+            child_parent_time = int(terminal_server_time) - 8
+            child_parent_artifact = complete_review_artifact(
+                terminal_current,
+                child_parent_id,
+                child_parent_time,
+                artifact_kind=(
+                    "terminal-payload"
+                    if child_resolved
+                    else "unresolved-thread-finding"
+                ),
+                outcome="findings",
+                thread_resolved=child_resolved,
+            )
+            child_parent_final = child_parent_artifact["final_snapshot"]
+            assert isinstance(child_parent_final, dict)
+            child_parent_final.update(
+                {
+                    "artifact_kind": "malformed-terminal-artifact",
+                    "outcome": "malformed",
+                    "state": "QUEUED",
+                    "body": "",
+                    "normalized_body": "",
+                    "grammar_status": "malformed",
+                }
+            )
+            child_parent_artifact["initial_snapshot"] = clone(child_parent_final)
+            child_parent_artifact["artifact_scope_receipt"] = artifact_scope_receipt(
+                child_parent_final
+            )
+            child_blocked_current = clone(terminal_current)
+            assert isinstance(child_blocked_current, dict)
+            child_blocked_current["evidence_state"]["malformed_terminal_artifacts"] = [
+                child_parent_artifact
+            ]
+            child_blocked_current["candidate_basis"] = {
+                "kind": "malformed-terminal-artifact",
+                "server_time": child_parent_time,
+                "stable_artifact_id": child_parent_id,
+            }
+            restamp(child_blocked_current)
+            child_blocked_history = history(
+                samples,
+                current_raw=child_blocked_current,
+            )
+            child_blocked_report = expected_report_from_inputs(
+                "inconclusive",
+                declaration,
+                child_blocked_history,
+                child_blocked_current,
+                post_as_of_lane_timing,
+            )
+            with self.subTest(
+                invalid_state_exact_provider_child_resolved=child_resolved
+            ):
+                self.assertIsNotNone(
+                    validate_candidate_artifact(
+                        child_parent_artifact,
+                        expected_kind="malformed-terminal-artifact",
+                        expected_scope=current_scope_key,
+                    )
+                )
+                self.assertEqual(
+                    candidate_order_basis(child_blocked_current),
+                    (child_parent_time, child_parent_id),
+                )
+                self.assertTrue(
+                    current_raw_authority_matches(
+                        child_blocked_history,
+                        child_blocked_current,
+                        require_request_reaction_stability=False,
+                    )
+                )
+                self.assertIsNotNone(child_blocked_report)
+                assert isinstance(child_blocked_report, dict)
+                child_blocked_basis = child_blocked_report["evidence_basis"]
+                self.assertIsInstance(child_blocked_basis, dict)
+                assert isinstance(child_blocked_basis, dict)
+                self.assertEqual(
+                    child_blocked_basis["artifact"]["final_snapshot"]["id"],
+                    child_parent_id,
+                )
+
+        priority_invalid_id = 82_240
+        priority_invalid = invalid_state_blocker_artifact(
+            priority_invalid_id,
+            "QUEUED",
+            body="No findings.",
+        )
+        priority_unresolved_id = 82_241
+        priority_unresolved_time = int(terminal_server_time) - 5
+        priority_unresolved = complete_review_artifact(
+            terminal_current,
+            priority_unresolved_id,
+            priority_unresolved_time,
+            artifact_kind="unresolved-thread-finding",
+            outcome="findings",
+        )
+        priority_current = clone(terminal_current)
+        assert isinstance(priority_current, dict)
+        priority_current["evidence_state"]["malformed_terminal_artifacts"] = [
+            priority_invalid
+        ]
+        priority_current["evidence_state"]["unresolved_thread_findings"] = [
+            priority_unresolved
+        ]
+        priority_current["candidate_basis"] = {
+            "kind": "malformed-terminal-artifact",
+            "server_time": int(terminal_server_time) - 10,
+            "stable_artifact_id": priority_invalid_id,
+        }
+        restamp(priority_current)
+        priority_history = history(
+            samples,
+            current_raw=priority_current,
+            current_ancestry={current_head: 0},
+        )
+        priority_raw = parse_current_endpoint_inventory(
+            priority_history["initial_current_raw_inventory"],
+            current_ancestry={current_head: 0},
+            prefer_unresolved_thread_blocker=True,
+        )
+        self.assertEqual(
+            candidate_order_basis(priority_current),
+            (int(terminal_server_time) - 10, priority_invalid_id),
+        )
+        self.assertEqual(
+            candidate_order_basis(
+                priority_current,
+                prefer_unresolved_thread_blocker=True,
+                finding_ancestry={current_head: 0},
+            ),
+            (priority_unresolved_time, priority_unresolved_id),
+        )
+        self.assertIsNotNone(priority_raw)
+        assert isinstance(priority_raw, dict)
+        self.assertEqual(
+            priority_raw["source_ordering_key"],
+            [priority_unresolved_time, priority_unresolved_id],
+        )
+        self.assertTrue(
+            current_raw_authority_matches(
+                priority_history,
+                priority_current,
+                require_request_reaction_stability=False,
+                prefer_unresolved_thread_blocker=True,
+            )
+        )
+        priority_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            priority_history,
+            priority_current,
+            post_as_of_lane_timing,
+        )
+        self.assertIsNotNone(priority_report)
+        assert isinstance(priority_report, dict)
+        priority_basis = priority_report["evidence_basis"]
+        self.assertIsInstance(priority_basis, dict)
+        assert isinstance(priority_basis, dict)
+        self.assertEqual(
+            priority_basis["artifact"]["final_snapshot"]["id"],
+            priority_unresolved_id,
+        )
+
+        deterministic_invalid_artifacts: list[dict[str, object]] = []
+        deterministic_invalid_times = {
+            82_250: int(terminal_server_time) - 2,
+            82_251: int(terminal_server_time) - 20,
+        }
+        for deterministic_id, deterministic_time in deterministic_invalid_times.items():
+            deterministic_artifact = invalid_state_blocker_artifact(
+                deterministic_id,
+                "QUEUED",
+                body="No findings.",
+            )
+            deterministic_final = deterministic_artifact["final_snapshot"]
+            assert isinstance(deterministic_final, dict)
+            deterministic_final["submitted_at"] = deterministic_time
+            deterministic_final["server_time"] = deterministic_time
+            deterministic_artifact["initial_snapshot"] = clone(deterministic_final)
+            deterministic_artifact["artifact_scope_receipt"] = artifact_scope_receipt(
+                deterministic_final
+            )
+            deterministic_invalid_artifacts.append(deterministic_artifact)
+        deterministic_current = clone(terminal_current)
+        assert isinstance(deterministic_current, dict)
+        deterministic_current["evidence_state"]["malformed_terminal_artifacts"] = (
+            deterministic_invalid_artifacts
+        )
+        deterministic_current["candidate_basis"] = {
+            "kind": "malformed-terminal-artifact",
+            "server_time": deterministic_invalid_times[82_251],
+            "stable_artifact_id": 82_251,
+        }
+        restamp(deterministic_current)
+        deterministic_history = history(
+            samples,
+            current_raw=deterministic_current,
+        )
+        deterministic_raw = parse_current_endpoint_inventory(
+            deterministic_history["initial_current_raw_inventory"],
+            current_ancestry={},
+        )
+        self.assertEqual(
+            candidate_order_basis(deterministic_current),
+            (deterministic_invalid_times[82_251], 82_251),
+        )
+        self.assertIsNotNone(deterministic_raw)
+        assert isinstance(deterministic_raw, dict)
+        self.assertEqual(
+            deterministic_raw["source_ordering_key"],
+            [deterministic_invalid_times[82_251], 82_251],
+        )
+
+        ordinary_old_malformed = clone(terminal_current)
+        assert isinstance(ordinary_old_malformed, dict)
+        ordinary_old_malformed["evidence_state"]["malformed_terminal_artifacts"] = [
+            complete_review_artifact(
+                ordinary_old_malformed,
+                82_210,
+                int(terminal_server_time) - 10,
+                artifact_kind="malformed-terminal-artifact",
+                outcome="malformed",
+            )
+        ]
+        restamp(ordinary_old_malformed)
+        self.assertEqual(
+            candidate_order_basis(ordinary_old_malformed),
+            candidate_order_basis(terminal_current),
+        )
+        ordinary_old_malformed_history = history(
+            samples,
+            current_raw=ordinary_old_malformed,
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                ordinary_old_malformed_history,
+                ordinary_old_malformed,
+                post_as_of_lane_timing,
+            )
+        )
+
         nonterminal_drift_cases: dict[
             str, tuple[dict[str, object], dict[str, object]]
         ] = {}
@@ -17323,6 +20537,59 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(wrapper_iteration_attempts["cache-header-mismatch"], 0)
 
+        mutable_cached_artifact = clone(
+            terminal_current["evidence_state"]["terminal_payloads"][0]
+        )
+        assert isinstance(mutable_cached_artifact, dict)
+        mutable_cache_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 50.0
+        )
+        assert mutable_cache_context is not None
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                mutable_cached_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=mutable_cache_context,
+            )
+        )
+        mutable_cache_parts = artifact_validation_context_parts(mutable_cache_context)
+        assert mutable_cache_parts is not None
+        mutable_cache_tracker = mutable_cache_parts[0]
+        mutable_cache_counters = {
+            key: mutable_cache_tracker[key]
+            for key in (
+                "started",
+                "max_observed",
+                "controlled_requests",
+                "fetch_attempts",
+                "retained_pages",
+                "records",
+                "retained_utf8_bytes",
+                "failed",
+            )
+        }
+        mutable_final_snapshot = mutable_cached_artifact["final_snapshot"]
+        mutable_scope_receipt = mutable_cached_artifact["artifact_scope_receipt"]
+        assert isinstance(mutable_final_snapshot, dict)
+        assert isinstance(mutable_scope_receipt, dict)
+        mutable_final_snapshot["body"] = "No findings. Mutated after validation."
+        mutable_get_receipt = mutable_scope_receipt["artifact_get_receipt"]
+        assert isinstance(mutable_get_receipt, dict)
+        mutable_get_receipt["body_sha256"] = "0" * 64
+        self.assertIsNone(
+            validate_candidate_artifact(
+                mutable_cached_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=mutable_cache_context,
+            )
+        )
+        self.assertEqual(
+            {key: mutable_cache_tracker[key] for key in mutable_cache_counters},
+            mutable_cache_counters,
+        )
+
         decision_clock_calls = 0
 
         def decision_audit_clock() -> float:
@@ -17373,12 +20640,9 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(decision_clock_calls, before_audit_clock_calls)
 
-        exact_artifact_decision_limits = tightened_resource_limits(
-            max_fetch_attempts=20,
-            max_retained_pages=20,
-            max_records=24,
-            max_retained_utf8_bytes=aggregate_artifact_bytes,
-        )
+        report_budget_probe = new_report_inventory_validation_contexts()
+        self.assertIsNotNone(report_budget_probe)
+        assert report_budget_probe is not None
         self.assertIsNotNone(
             expected_report_from_inputs(
                 "accepted-terminal-clean",
@@ -17386,46 +20650,337 @@ class RepositoryContractTest(unittest.TestCase):
                 artifact_budget_history,
                 terminal_current,
                 normal_lane_timing,
-                _artifact_receipt_tightened_resource_limits=(
-                    exact_artifact_decision_limits
-                ),
+                _inventory_validation_contexts=report_budget_probe,
             )
         )
-        for limit_name, overflow_value in (
-            ("max_retained_pages", 19),
-            ("max_records", 23),
-            ("max_retained_utf8_bytes", aggregate_artifact_bytes - 1),
-        ):
-            overflow_limits = clone(exact_artifact_decision_limits)
-            assert isinstance(overflow_limits, dict)
-            overflow_limits[limit_name] = overflow_value
-            with self.subTest(aggregate_artifact_receipt_overflow=limit_name):
-                self.assertIsNone(
-                    expected_report_from_inputs(
-                        "accepted-terminal-clean",
-                        declaration,
-                        artifact_budget_history,
-                        terminal_current,
-                        normal_lane_timing,
-                        _artifact_receipt_tightened_resource_limits=overflow_limits,
+        report_plane_trackers: list[dict[str, object]] = []
+        report_budget_contexts = report_budget_probe["contexts"]
+        self.assertIsInstance(report_budget_contexts, dict)
+        assert isinstance(report_budget_contexts, dict)
+        self.assertEqual(set(report_budget_contexts), report_inventory_context_fields)
+        for inventory_field in report_inventory_context_fields:
+            report_context_parts = inventory_validation_context_parts(
+                report_budget_contexts[inventory_field]
+            )
+            self.assertIsNotNone(report_context_parts)
+            assert report_context_parts is not None
+            artifact_context_parts = artifact_validation_context_parts(
+                report_context_parts[3]
+            )
+            assert artifact_context_parts is not None
+            report_plane_trackers.extend(
+                [
+                    report_context_parts[1],
+                    report_context_parts[2],
+                    artifact_context_parts[0],
+                ]
+            )
+        sibling_probe = new_inventory_validation_context(monotonic_clock=lambda: 10.0)
+        self.assertIsNotNone(sibling_probe)
+        assert sibling_probe is not None
+        sibling_parts = inventory_validation_context_parts(sibling_probe)
+        self.assertIsNotNone(sibling_parts)
+        assert sibling_parts is not None
+        sibling_artifact_parts = artifact_validation_context_parts(sibling_parts[3])
+        assert sibling_artifact_parts is not None
+        sibling_trackers = [
+            sibling_parts[1],
+            sibling_parts[2],
+            sibling_artifact_parts[0],
+        ]
+        self.assertEqual(len({id(tracker) for tracker in sibling_trackers}), 3)
+        self.assertTrue(
+            all(
+                tracker["clock"] is sibling_parts[0]["clock"]
+                and tracker["started"] == sibling_parts[0]["started"]
+                and typed_json_equal(
+                    tracker["limits"],
+                    sibling_parts[0]["limits"],
+                )
+                for tracker in sibling_trackers
+            )
+        )
+        self.assertTrue(resource_budget_charge(sibling_trackers[0], records=1))
+        self.assertEqual(
+            [tracker["records"] for tracker in sibling_trackers],
+            [1, 0, 0],
+        )
+
+        start_observation = 0
+
+        def distinct_start_clock() -> float:
+            nonlocal start_observation
+            start_observation += 1
+            return float(start_observation)
+
+        distinct_report_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=distinct_start_clock
+        )
+        self.assertIsNotNone(distinct_report_contexts)
+        assert distinct_report_contexts is not None
+        self.assertEqual(distinct_report_contexts["contexts"], {})
+        self.assertEqual(distinct_report_contexts["phase_order"], [])
+        ordered_phase_fields = [
+            "initial_inventory",
+            "final_inventory",
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ]
+        for expected_phase_count, field in enumerate(ordered_phase_fields, start=1):
+            self.assertIsNotNone(
+                report_inventory_validation_context_for(
+                    distinct_report_contexts,
+                    field,
+                )
+            )
+            self.assertEqual(start_observation, expected_phase_count)
+            self.assertEqual(
+                distinct_report_contexts["phase_order"],
+                ordered_phase_fields[:expected_phase_count],
+            )
+        distinct_phase_contexts = distinct_report_contexts["contexts"]
+        assert isinstance(distinct_phase_contexts, dict)
+        distinct_starts = {
+            field: distinct_phase_contexts[field]["root_tracker"]["started"]
+            for field in report_inventory_context_fields
+        }
+        self.assertEqual(len(set(distinct_starts.values())), 4)
+        self.assertNotEqual(
+            distinct_starts["initial_inventory"],
+            distinct_starts["final_inventory"],
+        )
+        for field in ordered_phase_fields:
+            phase_parts = inventory_validation_context_parts(
+                distinct_phase_contexts[field]
+            )
+            self.assertIsNotNone(phase_parts)
+            assert phase_parts is not None
+            phase_artifact_parts = artifact_validation_context_parts(phase_parts[3])
+            assert phase_artifact_parts is not None
+            self.assertTrue(
+                all(
+                    tracker["started"] == phase_parts[0]["started"]
+                    and tracker["clock"] is phase_parts[0]["clock"]
+                    for tracker in (
+                        phase_parts[1],
+                        phase_parts[2],
+                        phase_artifact_parts[0],
                     )
                 )
+            )
 
-        def artifact_decision_clock(*, expired_after_first: bool) -> object:
-            calls = 0
+        late_sibling_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=lambda: 10.0
+        )
+        assert late_sibling_contexts is not None
+        late_phase = report_inventory_validation_context_for(
+            late_sibling_contexts,
+            "initial_inventory",
+        )
+        assert late_phase is not None
+        late_parts = inventory_validation_context_parts(late_phase)
+        assert late_parts is not None
+        late_artifact_parts = artifact_validation_context_parts(late_parts[3])
+        assert late_artifact_parts is not None
+        late_artifact_parts[0]["started"] = 11.0
+        self.assertIsNone(inventory_validation_context_parts(late_phase))
+        self.assertFalse(
+            report_inventory_validation_contexts_are_valid(late_sibling_contexts)
+        )
+
+        different_clock_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=lambda: 20.0
+        )
+        assert different_clock_contexts is not None
+        different_clock_phase = report_inventory_validation_context_for(
+            different_clock_contexts,
+            "initial_inventory",
+        )
+        assert different_clock_phase is not None
+        different_clock_parts = inventory_validation_context_parts(
+            different_clock_phase
+        )
+        assert different_clock_parts is not None
+        different_clock_artifact_parts = artifact_validation_context_parts(
+            different_clock_parts[3]
+        )
+        assert different_clock_artifact_parts is not None
+        different_clock_artifact_parts[0]["clock"] = lambda: 20.0
+        self.assertIsNone(inventory_validation_context_parts(different_clock_phase))
+        self.assertFalse(
+            report_inventory_validation_contexts_are_valid(different_clock_contexts)
+        )
+
+        memo_inventory = clone(artifact_budget_history["final_current_raw_inventory"])
+        memo_context = new_inventory_validation_context(monotonic_clock=lambda: 0.0)
+        self.assertIsNotNone(memo_context)
+        assert memo_context is not None
+        self.assertIsNotNone(
+            parse_current_endpoint_inventory(
+                memo_inventory,
+                current_ancestry={},
+                _inventory_validation_context=memo_context,
+            )
+        )
+        memo_parts = inventory_validation_context_parts(memo_context)
+        assert memo_parts is not None
+        memo_counters = [
+            {
+                counter: tracker[counter]
+                for counter in (
+                    "controlled_requests",
+                    "fetch_attempts",
+                    "retained_pages",
+                    "records",
+                    "retained_utf8_bytes",
+                )
+            }
+            for tracker in (memo_parts[1], memo_parts[2])
+        ]
+        self.assertIsNotNone(
+            parse_current_endpoint_inventory(
+                memo_inventory,
+                current_ancestry={},
+                _inventory_validation_context=memo_context,
+            )
+        )
+        self.assertEqual(
+            [
+                {counter: tracker[counter] for counter in counters}
+                for tracker, counters in zip(
+                    (memo_parts[1], memo_parts[2]),
+                    memo_counters,
+                    strict=True,
+                )
+            ],
+            memo_counters,
+        )
+        memo_inventory["head"] = "f" * 40
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                memo_inventory,
+                current_ancestry={},
+                _inventory_validation_context=memo_context,
+            )
+        )
+
+        deadline_now = 0.0
+        deadline_clock_observations: list[float] = []
+
+        def controlled_deadline_clock() -> float:
+            deadline_clock_observations.append(deadline_now)
+            return deadline_now
+
+        unified_deadline_context = new_inventory_validation_context(
+            monotonic_clock=controlled_deadline_clock
+        )
+        self.assertIsNotNone(unified_deadline_context)
+        assert unified_deadline_context is not None
+        unified_deadline_parts = inventory_validation_context_parts(
+            unified_deadline_context
+        )
+        self.assertIsNotNone(unified_deadline_parts)
+        assert unified_deadline_parts is not None
+        unified_deadline_artifact_parts = artifact_validation_context_parts(
+            unified_deadline_parts[3]
+        )
+        assert unified_deadline_artifact_parts is not None
+        unified_artifact_tracker = unified_deadline_artifact_parts[0]
+        self.assertEqual(deadline_clock_observations, [0.0])
+        self.assertTrue(
+            all(
+                tracker["started"] == 0.0
+                for tracker in (
+                    unified_deadline_parts[0],
+                    unified_deadline_parts[1],
+                    unified_deadline_parts[2],
+                    unified_artifact_tracker,
+                )
+            )
+        )
+
+        deadline_now = 800.0
+        old_like_artifact_context = new_artifact_validation_context(
+            monotonic_clock=controlled_deadline_clock
+        )
+        self.assertIsNotNone(old_like_artifact_context)
+        assert old_like_artifact_context is not None
+        old_like_artifact_parts = artifact_validation_context_parts(
+            old_like_artifact_context
+        )
+        assert old_like_artifact_parts is not None
+        old_like_artifact_tracker = old_like_artifact_parts[0]
+        self.assertEqual(deadline_clock_observations, [0.0, 800.0])
+        self.assertEqual(old_like_artifact_tracker["started"], 800.0)
+        self.assertEqual(
+            unified_artifact_tracker["started"],
+            unified_deadline_parts[0]["started"],
+        )
+
+        deadline_now = 900.001
+        self.assertTrue(resource_budget_charge(old_like_artifact_tracker))
+        self.assertFalse(old_like_artifact_tracker["failed"])
+        self.assertFalse(resource_budget_charge(unified_artifact_tracker))
+        self.assertTrue(unified_artifact_tracker["failed"])
+        self.assertEqual(
+            deadline_clock_observations,
+            [0.0, 800.0, 900.001, 900.001],
+        )
+
+        def plane_clock(
+            artifact_observation: float,
+        ) -> tuple[object, list[float], list[float]]:
+            phase_root_creation_times: list[float] = []
+            standalone_root_creation_times: list[float] = []
 
             def observe() -> float:
-                nonlocal calls
-                calls += 1
-                if calls <= 12:
-                    return 0.0
-                return 1.001 if expired_after_first else 1.0
+                callers = {frame.function for frame in inspect.stack(context=0)}
+                if "new_resource_tracker" in callers:
+                    if "new_inventory_validation_context" in callers:
+                        phase_root_creation_times.append(0.0)
+                        return 0.0
+                    standalone_root_creation_times.append(800.0)
+                    return 800.0
+                if "inventory_validation_deadlines_hold" in callers:
+                    return 900.0
+                if callers.intersection(
+                    {
+                        "artifact_scope_receipt_matches",
+                        "candidate_order_basis",
+                        "validate_candidate_artifact",
+                        "_validate_candidate_artifact_uncached",
+                    }
+                ):
+                    return artifact_observation
+                if "request_scope_receipt_mapping" in callers:
+                    return 800.0
+                return 400.0
 
-            return observe
+            return (
+                observe,
+                phase_root_creation_times,
+                standalone_root_creation_times,
+            )
 
-        deadline_artifact_limits = clone(exact_artifact_decision_limits)
-        assert isinstance(deadline_artifact_limits, dict)
-        deadline_artifact_limits["deadline_seconds"] = 1
+        (
+            shared_deadline_pass_clock,
+            shared_deadline_pass_phase_roots,
+            shared_deadline_pass_standalone_roots,
+        ) = plane_clock(900.0)
+        (
+            shared_deadline_fail_clock,
+            shared_deadline_fail_phase_roots,
+            shared_deadline_fail_standalone_roots,
+        ) = plane_clock(900.001)
+
+        shared_deadline_pass_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=shared_deadline_pass_clock
+        )
+        shared_deadline_fail_contexts = new_report_inventory_validation_contexts(
+            monotonic_clock=shared_deadline_fail_clock
+        )
+        assert shared_deadline_pass_contexts is not None
+        assert shared_deadline_fail_contexts is not None
         self.assertIsNotNone(
             expected_report_from_inputs(
                 "accepted-terminal-clean",
@@ -17433,10 +20988,7 @@ class RepositoryContractTest(unittest.TestCase):
                 artifact_budget_history,
                 terminal_current,
                 normal_lane_timing,
-                _artifact_receipt_tightened_resource_limits=(deadline_artifact_limits),
-                _artifact_receipt_monotonic_clock=artifact_decision_clock(
-                    expired_after_first=False
-                ),
+                _inventory_validation_contexts=shared_deadline_pass_contexts,
             )
         )
         self.assertIsNone(
@@ -17446,11 +20998,39 @@ class RepositoryContractTest(unittest.TestCase):
                 artifact_budget_history,
                 terminal_current,
                 normal_lane_timing,
-                _artifact_receipt_tightened_resource_limits=(deadline_artifact_limits),
-                _artifact_receipt_monotonic_clock=artifact_decision_clock(
-                    expired_after_first=True
-                ),
+                _inventory_validation_contexts=shared_deadline_fail_contexts,
             )
+        )
+        self.assertEqual(shared_deadline_pass_phase_roots, [0.0] * 4)
+        self.assertGreaterEqual(len(shared_deadline_fail_phase_roots), 1)
+        self.assertTrue(
+            all(started == 0.0 for started in shared_deadline_fail_phase_roots)
+        )
+        self.assertEqual(shared_deadline_pass_standalone_roots, [])
+        self.assertEqual(shared_deadline_fail_standalone_roots, [])
+        for report_contexts in (
+            shared_deadline_pass_contexts,
+            shared_deadline_fail_contexts,
+        ):
+            phase_contexts = report_contexts["contexts"]
+            assert isinstance(phase_contexts, dict)
+            self.assertEqual(
+                list(phase_contexts),
+                report_contexts["phase_order"],
+            )
+            self.assertTrue(
+                set(phase_contexts).issubset(report_inventory_context_fields)
+            )
+            for phase_context in phase_contexts.values():
+                phase_parts = inventory_validation_context_parts(phase_context)
+                assert phase_parts is not None
+                phase_artifact_parts = artifact_validation_context_parts(phase_parts[3])
+                assert phase_artifact_parts is not None
+                self.assertEqual(phase_parts[0]["started"], 0.0)
+                self.assertEqual(phase_artifact_parts[0]["started"], 0.0)
+        self.assertEqual(
+            set(shared_deadline_pass_contexts["contexts"]),
+            report_inventory_context_fields,
         )
 
         terminal_without_artifact_receipt = clone(terminal_current)
@@ -18492,6 +22072,15 @@ class RepositoryContractTest(unittest.TestCase):
         terminal_with_bad_historical_receipt_history = (
             history_with_malformed_historical_reaction_receipt(terminal_current)
         )
+        terminal_bad_sidecar_validation = validate_history_universe_result(
+            terminal_with_bad_historical_receipt_history
+        )
+        self.assertIsNotNone(terminal_bad_sidecar_validation)
+        assert isinstance(terminal_bad_sidecar_validation, dict)
+        self.assertEqual(
+            terminal_bad_sidecar_validation["status"],
+            "unused-sidecar-unavailable",
+        )
         self.assertEqual(
             compute_provider_profile(
                 declaration,
@@ -18505,6 +22094,33 @@ class RepositoryContractTest(unittest.TestCase):
                 "accepted-terminal-clean",
                 declaration,
                 terminal_with_bad_historical_receipt_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+        terminal_bad_sidecar_with_classification_drift = clone(
+            terminal_with_bad_historical_receipt_history
+        )
+        assert isinstance(terminal_bad_sidecar_with_classification_drift, dict)
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            historical_classification = next(
+                item
+                for item in terminal_bad_sidecar_with_classification_drift[
+                    snapshot_name
+                ]["scope_classifications"]
+                if item.get("classification") == "historical-candidate"
+            )
+            historical_classification["classification"] = "confirmed-non-candidate"
+        self.assertIsNone(
+            validate_history_universe_result(
+                terminal_bad_sidecar_with_classification_drift
+            )
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_bad_sidecar_with_classification_drift,
                 terminal_current,
                 normal_lane_timing,
             )
@@ -18529,6 +22145,597 @@ class RepositoryContractTest(unittest.TestCase):
                 normal_lane_timing,
             )
         )
+
+        synchronized_request_time_mutation = clone(
+            terminal_with_bad_historical_receipt_history
+        )
+        assert isinstance(synchronized_request_time_mutation, dict)
+        request_time_mutation_scope = scope_key(samples[0])
+        self.assertIsNotNone(request_time_mutation_scope)
+        assert request_time_mutation_scope is not None
+        request_time_raw_transcripts = {
+            phase: clone(
+                synchronized_request_time_mutation[f"{phase}_inventory"][
+                    "discovery_endpoint_transcript"
+                ]
+            )
+            for phase in ("initial", "final")
+        }
+        for phase in ("initial", "final"):
+            mutated_candidate = next(
+                candidate
+                for candidate in synchronized_request_time_mutation[
+                    f"{phase}_candidates"
+                ]
+                if scope_key(candidate) == request_time_mutation_scope
+            )
+            mutated_request = mutated_candidate["requests"][0]
+            mutated_request["created_at"] -= 1
+            mutated_request["updated_at"] -= 1
+            mutated_request["request_server_time"] -= 1
+            restamp(mutated_candidate)
+            self.assertTrue(
+                typed_json_equal(
+                    synchronized_request_time_mutation[f"{phase}_inventory"][
+                        "discovery_endpoint_transcript"
+                    ],
+                    request_time_raw_transcripts[phase],
+                )
+            )
+        self.assertIsNone(
+            validate_history_universe_result(synchronized_request_time_mutation)
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                synchronized_request_time_mutation,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        audit_candidates = clone(samples)
+        assert isinstance(audit_candidates, list)
+        audit_candidate = audit_candidates[0]
+        audit_scope = audit_candidate["scope"]
+        audit_pr = audit_scope["pr"]
+        selected_request_id = audit_candidate["selected_request_id"]
+        selected_reaction_id = audit_candidate["selected_reaction_id"]
+        selected_request = audit_candidate["requests"][0]
+        selected_request_time = selected_request["request_server_time"]
+        unselected_request = request(
+            91_001,
+            selected_request_time - 10,
+            pr=audit_pr,
+        )
+        audit_candidate["requests"].append(unselected_request)
+        audit_candidate["request_scope_receipts"].append(
+            request_scope_receipt(unselected_request, audit_scope)
+        )
+        selected_reaction = audit_candidate["reactions"][0]
+        selected_reaction["created_at"] = selected_request_time + 10
+        audit_candidate["candidate_basis"]["server_time"] = selected_request_time + 10
+        unselected_reaction = reaction(
+            91_002,
+            selected_request_id,
+            selected_request_time + 5,
+            content="eyes",
+        )
+        audit_candidate["reactions"].append(unselected_reaction)
+        restamp(audit_candidate)
+        closed_audit_history = history(
+            audit_candidates,
+            current_raw=terminal_current,
+        )
+        for phase in ("initial", "final"):
+            normalized_audit_candidate = next(
+                candidate
+                for candidate in closed_audit_history[f"{phase}_candidates"]
+                if scope_key(candidate) == scope_key(audit_candidate)
+            )
+            normalized_audit_candidate["request_scope_receipts"][0][
+                "authority_override"
+            ] = True
+            restamp(normalized_audit_candidate)
+            inventory_receipt = next(
+                receipt
+                for receipt in closed_audit_history[f"{phase}_inventory"][
+                    "request_scope_receipts"
+                ]
+                if receipt.get("request_id") == selected_request_id
+            )
+            inventory_receipt["authority_override"] = True
+        closed_audit_validation = validate_history_universe_result(closed_audit_history)
+        self.assertIsNotNone(closed_audit_validation)
+        assert isinstance(closed_audit_validation, dict)
+        self.assertEqual(
+            closed_audit_validation["status"],
+            "unused-sidecar-unavailable",
+        )
+
+        def mutate_closed_audit_candidates(
+            mutation: str,
+        ) -> dict[str, object]:
+            attacked = clone(closed_audit_history)
+            assert isinstance(attacked, dict)
+            raw_transcripts = {
+                phase: clone(
+                    attacked[f"{phase}_inventory"]["discovery_endpoint_transcript"]
+                )
+                for phase in ("initial", "final")
+            }
+            for phase in ("initial", "final"):
+                attacked_candidate = next(
+                    candidate
+                    for candidate in attacked[f"{phase}_candidates"]
+                    if scope_key(candidate) == scope_key(audit_candidate)
+                )
+                if mutation == "add-unselected-request":
+                    attacked_candidate["requests"].append(
+                        request(
+                            91_003,
+                            selected_request_time - 20,
+                            pr=audit_pr,
+                        )
+                    )
+                elif mutation == "remove-unselected-request":
+                    attacked_candidate["requests"] = [
+                        item
+                        for item in attacked_candidate["requests"]
+                        if item.get("id") != unselected_request["id"]
+                    ]
+                elif mutation == "add-unselected-reaction":
+                    attacked_candidate["reactions"].append(
+                        reaction(
+                            91_004,
+                            selected_request_id,
+                            selected_request_time + 6,
+                            content="eyes",
+                        )
+                    )
+                elif mutation == "remove-unselected-reaction":
+                    attacked_candidate["reactions"] = [
+                        item
+                        for item in attacked_candidate["reactions"]
+                        if item.get("id") != unselected_reaction["id"]
+                    ]
+                else:
+                    raise AssertionError("unknown closed-audit mutation")
+                restamp(attacked_candidate)
+                self.assertTrue(
+                    typed_json_equal(
+                        attacked[f"{phase}_inventory"]["discovery_endpoint_transcript"],
+                        raw_transcripts[phase],
+                    )
+                )
+            return attacked
+
+        for closed_audit_mutation in (
+            "add-unselected-request",
+            "remove-unselected-request",
+            "add-unselected-reaction",
+            "remove-unselected-reaction",
+        ):
+            attacked_history = mutate_closed_audit_candidates(closed_audit_mutation)
+            with self.subTest(closed_audit_mutation=closed_audit_mutation):
+                self.assertIsNone(validate_history_universe_result(attacked_history))
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        attacked_history,
+                        terminal_current,
+                        normal_lane_timing,
+                    )
+                )
+
+        raw_category_history = history(
+            [terminal_history[0], samples[1]],
+            confirmed_noncandidate_scopes=[expired_provider_scope],
+            current_raw=terminal_current,
+        )
+        raw_category_context = new_inventory_validation_context()
+        self.assertIsNotNone(raw_category_context)
+        assert isinstance(raw_category_context, dict)
+        raw_category_result = parse_discovery_endpoint_transcript(
+            raw_category_history["initial_inventory"]["discovery_endpoint_transcript"],
+            request_scope_receipts=None,
+            provider_declaration=declaration,
+            _endpoint_plane_only=True,
+            _sidecar_blind_audit=True,
+            _inventory_validation_context=raw_category_context,
+        )
+        self.assertIsNotNone(raw_category_result)
+        assert isinstance(raw_category_result, dict)
+        raw_categories_by_pull = {
+            item["pull_number"]: item["raw_scope_category"]
+            for item in raw_category_result["sidecar_blind_scope_summaries"]
+        }
+        self.assertEqual(raw_categories_by_pull[2], "required-terminal")
+        self.assertEqual(
+            raw_categories_by_pull[3],
+            "required-reaction-epoch-unknown",
+        )
+        self.assertEqual(raw_categories_by_pull[5], "not-candidate")
+
+        terminal_sidecar_blind_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        terminal_victim_scope = scope_key(terminal_history[0])
+        reaction_victim_scope = scope_key(samples[0])
+        self.assertIsNotNone(terminal_victim_scope)
+        self.assertIsNotNone(reaction_victim_scope)
+        assert terminal_victim_scope is not None
+        assert reaction_victim_scope is not None
+        terminal_victim_request_id = terminal_history[0]["requests"][0]["id"]
+        for phase in ("initial", "final"):
+            terminal_candidate = next(
+                candidate
+                for candidate in terminal_sidecar_blind_history[f"{phase}_candidates"]
+                if scope_key(candidate) == terminal_victim_scope
+            )
+            terminal_candidate["request_scope_receipts"][0]["authority_override"] = True
+            restamp(terminal_candidate)
+            terminal_inventory_receipt = next(
+                receipt
+                for receipt in terminal_sidecar_blind_history[f"{phase}_inventory"][
+                    "request_scope_receipts"
+                ]
+                if receipt.get("request_id") == terminal_victim_request_id
+            )
+            terminal_inventory_receipt["authority_override"] = True
+        terminal_sidecar_blind_validation = validate_history_universe_result(
+            terminal_sidecar_blind_history
+        )
+        self.assertIsNotNone(terminal_sidecar_blind_validation)
+        assert isinstance(terminal_sidecar_blind_validation, dict)
+        self.assertEqual(
+            terminal_sidecar_blind_validation["status"],
+            "unused-sidecar-unavailable",
+        )
+
+        def synchronized_normalized_omission(
+            candidate_history: dict[str, object],
+            victim_scope: tuple[object, ...],
+        ) -> dict[str, object]:
+            omitted = clone(candidate_history)
+            assert isinstance(omitted, dict)
+            raw_transcripts_before = {
+                phase: clone(
+                    omitted[f"{phase}_inventory"]["discovery_endpoint_transcript"]
+                )
+                for phase in ("initial", "final")
+            }
+            for phase in ("initial", "final"):
+                omitted[f"{phase}_candidates"] = [
+                    candidate
+                    for candidate in omitted[f"{phase}_candidates"]
+                    if scope_key(candidate) != victim_scope
+                ]
+                inventory = omitted[f"{phase}_inventory"]
+                inventory["entries"] = [
+                    entry
+                    for entry in inventory["entries"]
+                    if tuple(entry["scope_key"]) != victim_scope
+                ]
+                victim_classification = next(
+                    item
+                    for item in inventory["scope_classifications"]
+                    if tuple(item["scope_key"]) == victim_scope
+                )
+                victim_classification["classification"] = "confirmed-non-candidate"
+                self.assertTrue(
+                    typed_json_equal(
+                        inventory["discovery_endpoint_transcript"],
+                        raw_transcripts_before[phase],
+                    )
+                )
+            omitted["candidate_universe_count"] -= 1
+            return omitted
+
+        omission_attack_cases = {
+            "required-terminal": (
+                terminal_sidecar_blind_history,
+                terminal_victim_scope,
+            ),
+            "required-reaction-epoch-unknown": (
+                terminal_with_bad_historical_receipt_history,
+                reaction_victim_scope,
+            ),
+        }
+        for case_name, (source_history, victim_scope) in omission_attack_cases.items():
+            omitted_history = synchronized_normalized_omission(
+                source_history,
+                victim_scope,
+            )
+            with self.subTest(synchronized_omission=case_name):
+                self.assertIsNone(validate_history_universe_result(omitted_history))
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        omitted_history,
+                        terminal_current,
+                        normal_lane_timing,
+                    )
+                )
+
+        memo_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        memo_inventory = memo_history["initial_inventory"]
+        memo_transcript_template = clone(
+            memo_inventory["discovery_endpoint_transcript"]
+        )
+        memo_sidecar_template = clone(memo_inventory["request_scope_receipts"])
+        tracker_counter_fields = {
+            "controlled_requests",
+            "fetch_attempts",
+            "retained_pages",
+            "records",
+            "retained_utf8_bytes",
+            "max_observed",
+            "failed",
+        }
+
+        def tracker_counter_snapshot(
+            tracker: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                field: clone(tracker.get(field)) for field in tracker_counter_fields
+            }
+
+        original_raw_semantic_producer = produce_raw_semantic_dataset
+        raw_semantic_producer_calls = 0
+
+        def counted_raw_semantic_producer(
+            *args: object,
+            **kwargs: object,
+        ) -> dict[str, object] | None:
+            nonlocal raw_semantic_producer_calls
+            raw_semantic_producer_calls += 1
+            return original_raw_semantic_producer(*args, **kwargs)
+
+        produce_raw_semantic_dataset = counted_raw_semantic_producer
+        try:
+            for projection_order in (
+                ("endpoint", "full", "blind"),
+                ("full", "endpoint", "blind"),
+            ):
+                transcript = clone(memo_transcript_template)
+                sidecar = clone(memo_sidecar_template)
+                projection_context = new_inventory_validation_context()
+                self.assertIsNotNone(projection_context)
+                assert isinstance(projection_context, dict)
+                projection_parts = inventory_validation_context_parts(
+                    projection_context
+                )
+                self.assertIsNotNone(projection_parts)
+                assert projection_parts is not None
+                endpoint_tracker = projection_parts[1]
+                sidecar_tracker = projection_parts[2]
+                producer_calls_before = raw_semantic_producer_calls
+                endpoint_after_first: dict[str, object] | None = None
+                sidecar_after_first: dict[str, object] | None = None
+                endpoint_after_full: dict[str, object] | None = None
+                sidecar_after_full: dict[str, object] | None = None
+                for projection_kind in projection_order:
+                    projection_kwargs: dict[str, object] = {}
+                    if projection_kind == "endpoint":
+                        projection_kwargs["_endpoint_plane_only"] = True
+                    elif projection_kind == "blind":
+                        projection_kwargs.update(
+                            {
+                                "_endpoint_plane_only": True,
+                                "_sidecar_blind_audit": True,
+                            }
+                        )
+                    projection_result = parse_discovery_endpoint_transcript(
+                        transcript,
+                        request_scope_receipts=sidecar,
+                        provider_declaration=declaration,
+                        _inventory_validation_context=projection_context,
+                        **projection_kwargs,
+                    )
+                    self.assertIsNotNone(projection_result)
+                    if endpoint_after_first is None:
+                        endpoint_after_first = tracker_counter_snapshot(
+                            endpoint_tracker
+                        )
+                        sidecar_after_first = tracker_counter_snapshot(sidecar_tracker)
+                    if projection_kind == "full":
+                        endpoint_after_full = tracker_counter_snapshot(endpoint_tracker)
+                        sidecar_after_full = tracker_counter_snapshot(sidecar_tracker)
+                self.assertEqual(
+                    raw_semantic_producer_calls - producer_calls_before,
+                    1,
+                )
+                self.assertIsNotNone(endpoint_after_first)
+                self.assertIsNotNone(sidecar_after_first)
+                self.assertIsNotNone(endpoint_after_full)
+                self.assertIsNotNone(sidecar_after_full)
+                assert endpoint_after_first is not None
+                assert sidecar_after_first is not None
+                assert endpoint_after_full is not None
+                assert sidecar_after_full is not None
+                self.assertTrue(
+                    typed_json_equal(endpoint_after_first, endpoint_after_full)
+                )
+                if projection_order[0] == "endpoint":
+                    self.assertEqual(sidecar_after_first["records"], 0)
+                    self.assertGreater(sidecar_after_full["records"], 0)
+                else:
+                    self.assertTrue(
+                        typed_json_equal(sidecar_after_first, sidecar_after_full)
+                    )
+                stable_endpoint = tracker_counter_snapshot(endpoint_tracker)
+                stable_sidecar = tracker_counter_snapshot(sidecar_tracker)
+                for repeat_kind in ("endpoint", "full", "blind"):
+                    repeat_kwargs: dict[str, object] = {}
+                    if repeat_kind == "endpoint":
+                        repeat_kwargs["_endpoint_plane_only"] = True
+                    elif repeat_kind == "blind":
+                        repeat_kwargs.update(
+                            {
+                                "_endpoint_plane_only": True,
+                                "_sidecar_blind_audit": True,
+                            }
+                        )
+                    self.assertIsNotNone(
+                        parse_discovery_endpoint_transcript(
+                            transcript,
+                            request_scope_receipts=sidecar,
+                            provider_declaration=declaration,
+                            _inventory_validation_context=projection_context,
+                            **repeat_kwargs,
+                        )
+                    )
+                self.assertTrue(
+                    typed_json_equal(
+                        stable_endpoint,
+                        tracker_counter_snapshot(endpoint_tracker),
+                    )
+                )
+                self.assertTrue(
+                    typed_json_equal(
+                        stable_sidecar,
+                        tracker_counter_snapshot(sidecar_tracker),
+                    )
+                )
+
+            mutation_transcript = clone(memo_transcript_template)
+            mutation_context = new_inventory_validation_context()
+            self.assertIsNotNone(mutation_context)
+            assert isinstance(mutation_context, dict)
+            mutation_parts = inventory_validation_context_parts(mutation_context)
+            self.assertIsNotNone(mutation_parts)
+            assert mutation_parts is not None
+            self.assertIsNotNone(
+                parse_discovery_endpoint_transcript(
+                    mutation_transcript,
+                    provider_declaration=declaration,
+                    _endpoint_plane_only=True,
+                    _sidecar_blind_audit=True,
+                    _inventory_validation_context=mutation_context,
+                )
+            )
+            mutation_calls = raw_semantic_producer_calls
+            mutation_endpoint_snapshot = tracker_counter_snapshot(mutation_parts[1])
+            mutation_sidecar_snapshot = tracker_counter_snapshot(mutation_parts[2])
+            mutation_page = mutation_transcript["scope_discovery"]["pages"][0]
+            mutation_body = strict_json_loads(mutation_page["body_utf8"])
+            self.assertIsInstance(mutation_body, list)
+            assert isinstance(mutation_body, list)
+            mutation_body[0]["futureMemoMutation"] = True
+            replace_raw_json_body(
+                mutation_page,
+                canonical_raw_body(mutation_body),
+            )
+            self.assertIsNone(
+                parse_discovery_endpoint_transcript(
+                    mutation_transcript,
+                    provider_declaration=declaration,
+                    _endpoint_plane_only=True,
+                    _sidecar_blind_audit=True,
+                    _inventory_validation_context=mutation_context,
+                )
+            )
+            self.assertEqual(raw_semantic_producer_calls, mutation_calls)
+            self.assertTrue(
+                typed_json_equal(
+                    mutation_endpoint_snapshot,
+                    tracker_counter_snapshot(mutation_parts[1]),
+                )
+            )
+            self.assertTrue(
+                typed_json_equal(
+                    mutation_sidecar_snapshot,
+                    tracker_counter_snapshot(mutation_parts[2]),
+                )
+            )
+
+            invalid_transcript = clone(memo_transcript_template)
+            invalid_transcript["schema_version"] = 4
+            invalid_context = new_inventory_validation_context()
+            self.assertIsNotNone(invalid_context)
+            assert isinstance(invalid_context, dict)
+            invalid_calls_before = raw_semantic_producer_calls
+            for _ in range(2):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_transcript,
+                        provider_declaration=declaration,
+                        _endpoint_plane_only=True,
+                        _inventory_validation_context=invalid_context,
+                    )
+                )
+            self.assertEqual(
+                raw_semantic_producer_calls - invalid_calls_before,
+                1,
+            )
+
+            policy_transcript = clone(memo_transcript_template)
+            policy_context = new_inventory_validation_context()
+            self.assertIsNotNone(policy_context)
+            assert isinstance(policy_context, dict)
+            policy_parts = inventory_validation_context_parts(policy_context)
+            self.assertIsNotNone(policy_parts)
+            assert policy_parts is not None
+            policy_calls_before = raw_semantic_producer_calls
+            policy_ancestry = {"a" * 40: 1}
+            self.assertIsNone(
+                parse_discovery_endpoint_transcript(
+                    policy_transcript,
+                    provider_declaration=declaration,
+                    current_ancestry=policy_ancestry,
+                    require_current_ancestry_exact=True,
+                    _endpoint_plane_only=True,
+                    _inventory_validation_context=policy_context,
+                )
+            )
+            endpoint_after_strict_policy = tracker_counter_snapshot(policy_parts[1])
+            self.assertIsNotNone(
+                parse_discovery_endpoint_transcript(
+                    policy_transcript,
+                    provider_declaration=declaration,
+                    current_ancestry=policy_ancestry,
+                    require_current_ancestry_exact=False,
+                    _endpoint_plane_only=True,
+                    _inventory_validation_context=policy_context,
+                )
+            )
+            endpoint_after_relaxed_policy = tracker_counter_snapshot(policy_parts[1])
+            self.assertFalse(
+                typed_json_equal(
+                    endpoint_after_strict_policy,
+                    endpoint_after_relaxed_policy,
+                )
+            )
+            self.assertEqual(
+                raw_semantic_producer_calls - policy_calls_before,
+                2,
+            )
+            for require_exact, expected_none in ((True, True), (False, False)):
+                repeated_policy_result = parse_discovery_endpoint_transcript(
+                    policy_transcript,
+                    provider_declaration=declaration,
+                    current_ancestry=policy_ancestry,
+                    require_current_ancestry_exact=require_exact,
+                    _endpoint_plane_only=True,
+                    _inventory_validation_context=policy_context,
+                )
+                self.assertEqual(repeated_policy_result is None, expected_none)
+            self.assertEqual(
+                raw_semantic_producer_calls - policy_calls_before,
+                2,
+            )
+            self.assertEqual(policy_parts[2]["records"], 0)
+        finally:
+            produce_raw_semantic_dataset = original_raw_semantic_producer
+
         terminal_report_cases = {
             "terminal-payload": (
                 history(terminal_history, current_raw=terminal_current),
@@ -20494,6 +24701,66 @@ class RepositoryContractTest(unittest.TestCase):
             declaration,
             wrong_history_count,
             current,
+        )
+
+        terminal_history_count_drift = history(
+            samples,
+            current_raw=terminal_current,
+        )
+        terminal_history_count_drift["candidate_universe_count"] += 1
+        self.assertIsNone(validate_history_universe(terminal_history_count_drift))
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_history_count_drift,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_history_entries_drift = history(
+            samples,
+            current_raw=terminal_current,
+        )
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            drifted_entry = terminal_history_entries_drift[snapshot_name]["entries"][0]
+            drifted_entry["source_ordering_key"][0] += 1
+        self.assertIsNone(validate_history_universe(terminal_history_entries_drift))
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_history_entries_drift,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        terminal_history_classification_drift = history(
+            samples,
+            current_raw=terminal_current,
+        )
+        for snapshot_name in ("initial_inventory", "final_inventory"):
+            historical_classification = next(
+                item
+                for item in terminal_history_classification_drift[snapshot_name][
+                    "scope_classifications"
+                ]
+                if item.get("classification") == "historical-candidate"
+            )
+            historical_classification["classification"] = "confirmed-non-candidate"
+        self.assertIsNone(
+            validate_history_universe(terminal_history_classification_drift)
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                terminal_history_classification_drift,
+                terminal_current,
+                normal_lane_timing,
+            )
         )
 
         incomplete_discovery_pagination = history(samples)
