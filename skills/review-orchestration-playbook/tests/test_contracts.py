@@ -14374,8 +14374,6 @@ class RepositoryContractTest(unittest.TestCase):
             final_stable_summary = clone(final_phase["audit_summary"])
             if (
                 not typed_json_equal(initial_stable_summary, final_stable_summary)
-                or initial_phase["transcript_sha256"]
-                != final_phase["transcript_sha256"]
                 or initial_phase["audit_sha256"] != final_phase["audit_sha256"]
             ):
                 return None
@@ -22394,6 +22392,68 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             terminal_sidecar_blind_validation["status"],
             "unused-sidecar-unavailable",
+        )
+
+        semantically_stable_raw_history = clone(terminal_sidecar_blind_history)
+        assert isinstance(semantically_stable_raw_history, dict)
+        final_raw_transcript = semantically_stable_raw_history["final_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        final_scope_discovery = final_raw_transcript["scope_discovery"]
+        final_scope_page = final_scope_discovery["pages"][0]
+        final_scope_body = strict_json_loads(final_scope_page["body_utf8"])
+        assert isinstance(final_scope_body, list)
+        assert isinstance(final_scope_body[0], dict)
+        final_scope_body[0]["future_repository_field"] = {
+            "request_id": "semantically-stable-final-snapshot"
+        }
+        replace_raw_json_body(
+            final_scope_page,
+            canonical_raw_body(final_scope_body),
+        )
+        semantically_stable_raw_validation = validate_history_universe_result(
+            semantically_stable_raw_history
+        )
+        self.assertIsNotNone(semantically_stable_raw_validation)
+        assert isinstance(semantically_stable_raw_validation, dict)
+        self.assertEqual(
+            semantically_stable_raw_validation["status"],
+            "unused-sidecar-unavailable",
+        )
+        semantic_phase_bindings = semantically_stable_raw_validation["phase_bindings"]
+        initial_raw_transcript = semantically_stable_raw_history["initial_inventory"][
+            "discovery_endpoint_transcript"
+        ]
+        expected_initial_transcript_sha256 = hashlib.sha256(
+            canonical_raw_body(initial_raw_transcript).encode("utf-8")
+        ).hexdigest()
+        expected_final_transcript_sha256 = hashlib.sha256(
+            canonical_raw_body(final_raw_transcript).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            semantic_phase_bindings["initial_inventory"]["transcript_sha256"],
+            expected_initial_transcript_sha256,
+        )
+        self.assertEqual(
+            semantic_phase_bindings["final_inventory"]["transcript_sha256"],
+            expected_final_transcript_sha256,
+        )
+        self.assertNotEqual(
+            semantic_phase_bindings["initial_inventory"]["transcript_sha256"],
+            semantic_phase_bindings["final_inventory"]["transcript_sha256"],
+        )
+        self.assertEqual(
+            semantic_phase_bindings["initial_inventory"]["audit_sha256"],
+            semantic_phase_bindings["final_inventory"]["audit_sha256"],
+        )
+        self.assertIsNotNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                semantically_stable_raw_history,
+                terminal_current,
+                normal_lane_timing,
+            )
         )
 
         def synchronized_normalized_omission(
