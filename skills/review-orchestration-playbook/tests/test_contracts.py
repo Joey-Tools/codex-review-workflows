@@ -529,8 +529,11 @@ def _selected_review_target_children(
         else:
             return None
 
-        if actor == "exact" and parent_id == parent_review_id:
-            targets.append(child)
+        if actor == "exact":
+            if parent_id is not None and parent_id != parent_review_id:
+                return None
+            if parent_id == parent_review_id:
+                targets.append(child)
     return targets
 
 
@@ -5432,6 +5435,17 @@ printf '%s\n' "$trusted_uv"
             "malformed",
             clean_review_without_children,
         )
+        clean_review_wrong_parent = clone(clean_review)
+        wrong_parent_child = clone(child)
+        wrong_parent_child["pull_request_review_id"] = review_id + 1
+        clean_review_wrong_parent["children"] = [wrong_parent_child]
+        add(
+            "clean-review-wrong-parent-child",
+            "clean pull-request review",
+            "exact-provider child bound to a different review",
+            "malformed",
+            clean_review_wrong_parent,
+        )
         add("finding-positive", "top-level finding", "none", "findings", finding)
         finding_with_disclosure = clone(finding)
         finding_with_disclosure["body"] = f"{finding['body']}\n\n{disclosure}"
@@ -6184,6 +6198,18 @@ printf '%s\n' "$trusted_uv"
                 terminal_report(clean_with_audit_children, "clean")
             ),
             "clean",
+        )
+
+        clean_wrong_parent_report = terminal_report(clean_review, "clean")
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            artifact_snapshot = clean_wrong_parent_report["artifact"][snapshot_name]
+            artifact_snapshot["children"] = [clone(wrong_parent_child)]
+            artifact_snapshot["associated_inline_comments"]["records"] = [
+                clone(wrong_parent_child)
+            ]
+        self.assertEqual(
+            classify_terminal_report(clean_wrong_parent_report),
+            "inconclusive",
         )
 
         boolean_child_parent_report = clone(inline_finding_report)

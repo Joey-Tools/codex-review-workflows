@@ -859,6 +859,7 @@ The contract fixture matrix is normative:
 | `clean-review-positive` | clean pull-request review | none | `clean` |
 | `clean-review-with-inline-finding` | clean pull-request review | associated inline finding | `findings` |
 | `clean-review-unread-children` | clean pull-request review | associated inline set unavailable | `malformed` |
+| `clean-review-wrong-parent-child` | clean pull-request review | exact-provider child bound to a different review | `malformed` |
 | `finding-positive` | top-level finding | none | `findings` |
 | `finding-with-disclosure-positive` | top-level finding | exact provider disclosure suffix | `findings` |
 | `inline-parent-positive` | inline-parent review | none | `findings` |
