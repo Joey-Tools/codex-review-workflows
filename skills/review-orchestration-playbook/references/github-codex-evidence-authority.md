@@ -798,6 +798,15 @@ from `scope.head` only when current raw authority proves it is an ancestor;
 the enclosing scope remains current. Apply the same distinction to a review's
 native `commit_id` and to its joined inline children.
 
+Before actor or parent classification, validate every associated inline record
+against the same closed nine-field schema: `id`, `url`, `user_login`,
+`user_type`, `pull_request_review_id`, `commit_id`, `original_commit_id`,
+`body`, and `normalized_body`. Reject unknown or missing fields, non-full-SHA
+commit IDs, invalid parent IDs, and body-normalization mismatches. Only after
+that validation may a complete human, unrelated-bot, or exact-provider
+null-parent record remain audit context rather than target finding evidence.
+Audit-only status never permits malformed evidence to disappear.
+
 All other terminal-looking exact-provider comments or reviews are malformed.
 In particular, these near misses never complete clean: a missing or duplicate
 reviewed-commit marker, a 10-character SHA, a mixed-case or mismatched SHA,
@@ -860,6 +869,9 @@ The contract fixture matrix is normative:
 | `clean-review-with-inline-finding` | clean pull-request review | associated inline finding | `findings` |
 | `clean-review-unread-children` | clean pull-request review | associated inline set unavailable | `malformed` |
 | `clean-review-wrong-parent-child` | clean pull-request review | exact-provider child bound to a different review | `malformed` |
+| `clean-review-malformed-human-audit-child` | clean pull-request review | human audit child missing `commit_id` | `malformed` |
+| `clean-review-malformed-unrelated-bot-audit-child` | clean pull-request review | unrelated-bot audit child with an unknown field | `malformed` |
+| `clean-review-malformed-null-parent-audit-child` | clean pull-request review | null-parent audit child with mismatched normalization | `malformed` |
 | `finding-positive` | top-level finding | none | `findings` |
 | `finding-with-disclosure-positive` | top-level finding | exact provider disclosure suffix | `findings` |
 | `inline-parent-positive` | inline-parent review | none | `findings` |

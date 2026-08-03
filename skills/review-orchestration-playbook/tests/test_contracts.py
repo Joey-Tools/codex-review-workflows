@@ -491,6 +491,17 @@ def _selected_review_target_children(
     if not isinstance(children, list):
         return None
     exact_login = "chatgpt-codex-connector[bot]"
+    child_fields = {
+        "id",
+        "url",
+        "user_login",
+        "user_type",
+        "pull_request_review_id",
+        "commit_id",
+        "original_commit_id",
+        "body",
+        "normalized_body",
+    }
     seen_child_ids: set[int] = set()
     targets: list[dict[str, object]] = []
     for child in children:
@@ -500,8 +511,11 @@ def _selected_review_target_children(
         parent_id = child.get("pull_request_review_id")
         login = child.get("user_login")
         user_type = child.get("user_type")
+        body = child.get("body")
+        normalized_body = _normalize_github_codex_body(body)
         if (
-            type(child_id) is not int
+            set(child) != child_fields
+            or type(child_id) is not int
             or child_id <= 0
             or child_id in seen_child_ids
             or child.get("url")
@@ -512,6 +526,13 @@ def _selected_review_target_children(
             or (
                 parent_id is not None and (type(parent_id) is not int or parent_id <= 0)
             )
+            or not isinstance(child.get("commit_id"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", child["commit_id"]) is None
+            or not isinstance(child.get("original_commit_id"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", child["original_commit_id"]) is None
+            or not isinstance(body, str)
+            or normalized_body is None
+            or child.get("normalized_body") != normalized_body
         ):
             return None
         seen_child_ids.add(child_id)
@@ -5446,6 +5467,56 @@ printf '%s\n' "$trusted_uv"
             "malformed",
             clean_review_wrong_parent,
         )
+        malformed_human_audit_child = clone(child)
+        malformed_human_audit_child.update(
+            {
+                "user_login": "octocat",
+                "user_type": "User",
+            }
+        )
+        malformed_human_audit_child.pop("commit_id")
+        clean_review_malformed_human_audit = clone(clean_review)
+        clean_review_malformed_human_audit["children"] = [malformed_human_audit_child]
+        add(
+            "clean-review-malformed-human-audit-child",
+            "clean pull-request review",
+            "human audit child missing `commit_id`",
+            "malformed",
+            clean_review_malformed_human_audit,
+        )
+        malformed_unrelated_bot_audit_child = clone(child)
+        malformed_unrelated_bot_audit_child.update(
+            {
+                "user_login": "dependabot[bot]",
+                "user_type": "Bot",
+                "unexpected": "field",
+            }
+        )
+        clean_review_malformed_unrelated_bot_audit = clone(clean_review)
+        clean_review_malformed_unrelated_bot_audit["children"] = [
+            malformed_unrelated_bot_audit_child
+        ]
+        add(
+            "clean-review-malformed-unrelated-bot-audit-child",
+            "clean pull-request review",
+            "unrelated-bot audit child with an unknown field",
+            "malformed",
+            clean_review_malformed_unrelated_bot_audit,
+        )
+        malformed_null_parent_audit_child = clone(child)
+        malformed_null_parent_audit_child["pull_request_review_id"] = None
+        malformed_null_parent_audit_child["normalized_body"] = "different"
+        clean_review_malformed_null_parent_audit = clone(clean_review)
+        clean_review_malformed_null_parent_audit["children"] = [
+            malformed_null_parent_audit_child
+        ]
+        add(
+            "clean-review-malformed-null-parent-audit-child",
+            "clean pull-request review",
+            "null-parent audit child with mismatched normalization",
+            "malformed",
+            clean_review_malformed_null_parent_audit,
+        )
         add("finding-positive", "top-level finding", "none", "findings", finding)
         finding_with_disclosure = clone(finding)
         finding_with_disclosure["body"] = f"{finding['body']}\n\n{disclosure}"
@@ -6211,6 +6282,24 @@ printf '%s\n' "$trusted_uv"
             classify_terminal_report(clean_wrong_parent_report),
             "inconclusive",
         )
+
+        for name, malformed_audit_child in (
+            ("human", malformed_human_audit_child),
+            ("unrelated-bot", malformed_unrelated_bot_audit_child),
+            ("null-parent", malformed_null_parent_audit_child),
+        ):
+            malformed_audit_report = terminal_report(clean_review, "clean")
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                artifact_snapshot = malformed_audit_report["artifact"][snapshot_name]
+                artifact_snapshot["children"] = [clone(malformed_audit_child)]
+                artifact_snapshot["associated_inline_comments"]["records"] = [
+                    clone(malformed_audit_child)
+                ]
+            with self.subTest(malformed_audit_child=name):
+                self.assertEqual(
+                    classify_terminal_report(malformed_audit_report),
+                    "inconclusive",
+                )
 
         boolean_child_parent_report = clone(inline_finding_report)
         for snapshot_name in ("initial_snapshot", "final_snapshot"):
