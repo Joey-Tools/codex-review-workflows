@@ -7342,9 +7342,14 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             "stderr=subprocess.DEVNULL)\n"
             "time.sleep(300)\n"
         )
+        # This fixture targets real process-group settlement before deferred
+        # signal delivery. Account-wide same-UID census has independent
+        # coverage and can observe unrelated hosted-runner process churn.
         worker_script = (
             "import os,pathlib,sys\n"
             "from tests import run_readonly_install_deterministic_supervisor as runner\n"
+            "runner._stable_same_uid_processes=lambda: ()\n"
+            "runner._require_no_new_same_uid_processes=lambda _baseline: None\n"
             "root=pathlib.Path(sys.argv[1])\n"
             "try:\n"
             " runner._run_bounded_child("
