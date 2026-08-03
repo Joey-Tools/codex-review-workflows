@@ -35370,7 +35370,7 @@ printf '%s\n' "$trusted_uv"
             f"{request_scope_sidecar['raw_transcript_schema_version']}"
         )
         for path in (
-            REPO_ROOT / "README.md",
+            SKILL_SCOPE_ROOT / "README.md",
             SKILL_ROOT / "references/github-codex-evidence-authority.md",
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
