@@ -13679,7 +13679,15 @@ printf '%s\n' "$trusted_uv"
                     if projected_inline is None:
                         return None
                     inline_id = projected_inline.get("id")
-                    if type(inline_id) is not int or inline_id in seen_inline_ids:
+                    if (
+                        type(inline_id) is not int
+                        or inline_id in seen_inline_ids
+                        or projected_inline.get("url")
+                        != (
+                            f"https://github.com/{repository}/pull/{pr}"
+                            f"#discussion_r{inline_id}"
+                        )
+                    ):
                         return None
                     seen_inline_ids.add(inline_id)
                     parent_id = projected_inline.get("pull_request_review_id")
@@ -31729,24 +31737,48 @@ printf '%s\n' "$trusted_uv"
                 derived_inventory_entries([ordinary_replies_candidate, current]),
             )
         )
-        for actor_kind, inline_id, field, invalid_sha in (
+        for near_miss, actor_kind, inline_id, field, invalid_value in (
             (
+                "invalid-sha",
                 "human",
                 920_011,
                 "commit_id",
                 selected_review_commit[:10],
             ),
             (
+                "invalid-sha",
                 "unrelated-bot",
                 920_012,
                 "original_commit_id",
                 "g" * 40,
             ),
             (
+                "invalid-sha",
                 "null-parent",
                 920_013,
                 "commit_id",
                 "A" * 40,
+            ),
+            (
+                "invalid-url",
+                "human",
+                920_011,
+                "html_url",
+                "https://example.invalid/human",
+            ),
+            (
+                "invalid-url",
+                "unrelated-bot",
+                920_012,
+                "html_url",
+                "https://example.invalid/unrelated-bot",
+            ),
+            (
+                "invalid-url",
+                "null-parent",
+                920_013,
+                "html_url",
+                "https://example.invalid/null-parent",
             ),
         ):
             malformed_audit_transcript = clone(ordinary_replies_transcript)
@@ -31763,13 +31795,15 @@ printf '%s\n' "$trusted_uv"
                 for record in malformed_inline_records
                 if isinstance(record, dict) and record.get("id") == inline_id
             )
-            malformed_record[field] = invalid_sha
+            malformed_record[field] = invalid_value
             malformed_fetches[malformed_inline_index] = rest_fetch(
                 "inline_comments",
                 malformed_inline_fetch["pages"][0]["request_url"],
                 malformed_inline_records,
             )
-            with self.subTest(raw_audit_child_invalid_sha=actor_kind):
+            with self.subTest(
+                raw_audit_child_near_miss=f"{actor_kind}-{near_miss}",
+            ):
                 self.assertIsNone(
                     parse_discovery_endpoint_transcript(
                         malformed_audit_transcript,
