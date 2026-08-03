@@ -13660,6 +13660,75 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             return result
 
+        current_endpoint_inventory_base_fields = {
+            "repository",
+            "pull_number",
+            "head",
+            "resource_budget",
+            "fetches",
+        }
+        documented_current_shape = re.search(
+            r"Each inventory has the closed endpoint shape\s+`\{([^`]+)\}`",
+            authority,
+        )
+        self.assertIsNotNone(documented_current_shape)
+        assert documented_current_shape is not None
+        self.assertEqual(
+            {field.strip() for field in documented_current_shape.group(1).split(",")},
+            current_endpoint_inventory_base_fields,
+        )
+        documented_optional_shape = re.search(
+            r"and may additionally\s+carry the separate `([^`]+)` sibling",
+            authority,
+        )
+        self.assertIsNotNone(documented_optional_shape)
+        assert documented_optional_shape is not None
+        current_endpoint_inventory_optional_fields = {
+            documented_optional_shape.group(1)
+        }
+        self.assertEqual(
+            current_endpoint_inventory_optional_fields,
+            {"request_scope_receipts"},
+        )
+        current_endpoint_inventory_allowed_field_sets = {
+            frozenset(current_endpoint_inventory_base_fields),
+            frozenset(
+                current_endpoint_inventory_base_fields
+                | current_endpoint_inventory_optional_fields
+            ),
+        }
+        reaction_report_example = authority.split(
+            "For reaction fallback, `evidence_basis` uses this field-level shape.",
+            1,
+        )[1].split("## Alignment And Intentional Differences", 1)[0]
+        documented_current_inventory_json = reaction_report_example.split(
+            "  current:\n    raw_endpoint_inventories:\n      initial: ", 1
+        )[1].split("\n      final:", 1)[0]
+        documented_current_inventory = strict_json_loads(
+            documented_current_inventory_json
+        )
+        self.assertEqual(
+            frozenset(documented_current_inventory),
+            max(current_endpoint_inventory_allowed_field_sets, key=len),
+        )
+        duplicate_current_head = documented_current_inventory_json.replace(
+            '"head": "__FULL_LOWERCASE_CURRENT_HEAD_SHA__",',
+            (
+                '"head": "0000000000000000000000000000000000000000", '
+                '"head": "__FULL_LOWERCASE_CURRENT_HEAD_SHA__",'
+            ),
+            1,
+        )
+        self.assertNotEqual(
+            duplicate_current_head,
+            documented_current_inventory_json,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "duplicate JSON object key: head",
+        ):
+            strict_json_loads(duplicate_current_head)
+
         def _parse_current_endpoint_inventory_uncached(
             value: object,
             *,
@@ -13670,20 +13739,9 @@ class RepositoryContractTest(unittest.TestCase):
             _monotonic_clock: object = time.monotonic,
             _inventory_validation_context: dict[str, object],
         ) -> dict[str, object] | None:
-            base_inventory_fields = {
-                "repository",
-                "pull_number",
-                "head",
-                "resource_budget",
-                "fetches",
-            }
             if (
                 type(value) is not dict
-                or set(value)
-                not in {
-                    frozenset(base_inventory_fields),
-                    frozenset(base_inventory_fields | {"request_scope_receipts"}),
-                }
+                or set(value) not in current_endpoint_inventory_allowed_field_sets
                 or type(value.get("repository")) is not str
                 or value.get("repository") != current_repository
                 or type(value.get("pull_number")) is not int
@@ -17619,6 +17677,26 @@ class RepositoryContractTest(unittest.TestCase):
             selected_request_id=10,
             selected_reaction_id=100,
             merge_base=current_merge_base,
+        )
+        actual_documented_current_inventory = current_endpoint_inventory(
+            current,
+            observation_marker="documented-current-inventory",
+        )
+        for field, sentinel in {
+            "head": "__FULL_LOWERCASE_CURRENT_HEAD_SHA__",
+            "resource_budget": ("__EXACT_GITHUB_CODEX_EVIDENCE_RESOURCE_BUDGET_V1__"),
+            "fetches": "__COMPLETE_CLOSED_CURRENT_FETCHES__",
+            "request_scope_receipts": ("__COMPLETE_CLOSED_REQUEST_SCOPE_RECEIPTS__"),
+        }.items():
+            self.assertEqual(documented_current_inventory[field], sentinel)
+            documented_current_inventory[field] = clone(
+                actual_documented_current_inventory[field]
+            )
+        self.assertTrue(
+            typed_json_equal(
+                documented_current_inventory,
+                actual_documented_current_inventory,
+            )
         )
 
         historical_merged_time = history_as_of_server_time - 100

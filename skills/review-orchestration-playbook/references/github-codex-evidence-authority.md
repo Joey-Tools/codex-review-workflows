@@ -1645,24 +1645,25 @@ Before accepting any current terminal clean/findings result or current
 reaction-only clean, the parent independently fetches two complete raw current
 endpoint inventories: one initial traversal and a new final traversal
 immediately before acceptance. Each inventory has the closed endpoint shape
-`{repository, pull_number, head, fetches}` and may additionally carry the
-separate `request_scope_receipts` sibling used by request/reaction authority;
-no other root field is accepted. Its `fetches` use the same closed fetch/page
-records, pagination rules, raw bodies, and digests as discovery schema version
-3 and cover the current pull detail, compare, issue comments, reviews,
-associated inline comments, raw GraphQL review threads/comments, and every
-controlled-request reaction endpoint. `request_scope_receipts` is
-parent-owned sidecar evidence, not a member of or new kind inside those
-fetches. The two inventories are independent API traversals, not aliases,
-copies of one body, normalized snapshots, or projections supplied by the
-caller. Both must independently derive the same complete provider-artifact,
-target-thread, and finding-commit sets. Request/reaction set equivalence and
-sidecar stability are additionally mandatory only when classifying request
-policy or reaction evidence. Missing pages, over-budget traversal, provider
-artifact/thread drift, or finding-commit drift still blocks terminal authority;
-a missing, malformed, or sidecar-only drift instead makes request policy and
-the affected reaction authority `unknown` without erasing an independently
-stable terminal payload.
+`{repository, pull_number, head, resource_budget, fetches}` and may additionally
+carry the separate `request_scope_receipts` sibling used by request/reaction
+authority; no other root field is accepted. `resource_budget` is mandatory and
+must type-preservingly equal the fixed profile above. Its `fetches` use the same
+closed fetch/page records, pagination rules, raw bodies, and digests as
+discovery schema version 3 and cover the current pull detail, compare, issue
+comments, reviews, associated inline comments, raw GraphQL review
+threads/comments, and every controlled-request reaction endpoint.
+`request_scope_receipts` is parent-owned sidecar evidence, not a member of or
+new kind inside those fetches. The two inventories are independent API
+traversals, not aliases, copies of one body, normalized snapshots, or
+projections supplied by the caller. Both must independently derive the same
+complete provider-artifact, target-thread, and finding-commit sets.
+Request/reaction set equivalence and sidecar stability are additionally
+mandatory only when classifying request policy or reaction evidence. Missing
+pages, over-budget traversal, provider artifact/thread drift, or finding-commit
+drift still blocks terminal authority; a missing, malformed, or sidecar-only
+drift instead makes request policy and the affected reaction authority
+`unknown` without erasing an independently stable terminal payload.
 
 From each raw inventory, before applying ancestry or resolution filtering, the
 fixed projector derives every distinct lowercase full finding commit exposed
@@ -2168,19 +2169,14 @@ evidence_basis:
       - <repeat every complete initial candidate snapshot in the same order>
   current:
     raw_endpoint_inventories:
-      initial:
-        repository: OWNER/REPO
-        pull_number: 123
-        head: <full lowercase SHA>
-        resource_budget: <exact github-codex-evidence-resource-budget-v1 profile above>
-        fetches:
-          - kind: pull_requests | compare | issue_comments | reviews | inline_comments | review_threads | request_reactions
-            transport: rest | graphql
-            parent_comment_id: <positive request-comment ID or null>
-            pages:
-              - <same closed raw page shape used by discovery schema version 3>
-        request_scope_receipts:
-          - <one closed parent-owned request-time scope sidecar for every current controlled request>
+      initial: {
+        "repository": "OWNER/REPO",
+        "pull_number": 1,
+        "head": "__FULL_LOWERCASE_CURRENT_HEAD_SHA__",
+        "resource_budget": "__EXACT_GITHUB_CODEX_EVIDENCE_RESOURCE_BUDGET_V1__",
+        "fetches": "__COMPLETE_CLOSED_CURRENT_FETCHES__",
+        "request_scope_receipts": "__COMPLETE_CLOSED_REQUEST_SCOPE_RECEIPTS__"
+      }
       final: <independently re-fetched complete current inventory with identical authority projection>
     finding_commits:
       initial:
@@ -2265,6 +2261,13 @@ evidence_basis:
           reactions:
             - <same seven reaction fields>
 ```
+
+Within the reaction report example, `__...__` sentinel-string leaves in the
+JSON `current.raw_endpoint_inventories.initial` value abbreviate the complete
+closed budget, fetch, and sidecar objects. The executable contract parses that
+exact heading-bounded JSON fragment with duplicate-key rejection, substitutes
+only those named leaves, and requires type-preserving equality with the fixed
+current-inventory producer and parser schema.
 
 Every REST request ID, reaction ID, reaction parent ID, and selected
 request/reaction ID in this report is an exact positive JSON integer, never a
