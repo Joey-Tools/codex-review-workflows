@@ -3983,7 +3983,7 @@ printf '%s\n' "$trusted_uv"
             "`pre_request_scope_receipts`",
             "`request_comment_receipt`",
             "`post_request_scope_receipts`",
-            "this sidecar does **not** change `discovery_endpoint_transcript` schema version 3",
+            "this sidecar does **not** change `discovery_endpoint_transcript` schema version 4",
             "does not erase a separately complete, trustworthy current-scope terminal payload",
             "neither request/run lineage nor continuous scope stability",
             "the seed/detail closure includes the authenticated declaration pr",
@@ -4061,7 +4061,7 @@ printf '%s\n' "$trusted_uv"
                 "the only clean-completion path that deliberately has no terminal "
                 "review/comment payload"
             ),
-            "`schema_version: 3`",
+            "`schema_version: 4`",
             "`merge_base_commit.sha`",
             "`source_evidence`",
             "raw github rest timestamps remain canonical whole-second rfc3339",
@@ -4390,7 +4390,7 @@ printf '%s\n' "$trusted_uv"
             normalized_words = normalized_markdown_section(document, heading)
             return " ".join(normalized_words)
 
-        schema_v3_sections = {
+        discovery_v4_sections = {
             "authority": section_text(
                 authority,
                 "## Dynamic Provider Profiles",
@@ -4409,99 +4409,167 @@ printf '%s\n' "$trusted_uv"
             ),
             "project-journal": section_text(
                 journal,
-                "## Final Formal-Review Authority Hardening",
+                "## Bounded Dual-Source Discovery Superseding Decision",
             ),
         }
-        schema_v3_contracts = {
+        discovery_v4_contracts = {
             "authority": (
-                "schema-version-3 repository-wide seed",
-                "every canonical pull number returned anywhere in the "
-                "repository-wide list must seed exactly one complete pr-detail "
-                "traversal",
-                "excludes the exact current scope only after every seeded "
-                "pr—including current and confirmed non-candidates—was fully "
-                "traversed and parsed",
-                "a version-2 transcript has no independent repository-wide seed "
-                "and therefore cannot prove thumbs-up-clean",
+                "{schema_version: 4, repository, scope_discovery, scopes}",
+                "scope_discovery is exactly "
+                "{recent_pull_requests, recent_request_comments, anchors}",
+                "max_seeded_pull_requests: 512 counts only that union and its "
+                "detail traversals, never boundary witnesses or cumulative "
+                "repository pr count",
+                "a version-3 transcript lacks this bounded dual-source "
+                "completeness proof and cannot prove reaction fallback",
             ),
             "skill": (
-                "schema-version-3 discovery_endpoint_transcript",
-                "seed drives exactly one complete detail traversal for every pr, "
-                "including current, confirmed non-candidates, and the "
-                "authenticated declaration pr",
-                "exclude current only after all seeded prs are fully parsed",
-                "version 2 cannot prove the fallback",
+                "schema-version-4 discovery_endpoint_transcript",
+                "updated-desc pull pages retained through the first page "
+                "containing updated_at <= window_start_exclusive",
+                "the 512 seeded-pr cap counts only union/detail prs, not boundary "
+                "witnesses or cumulative old prs",
+                "version 3 cannot prove the fallback",
             ),
             "github-pr-probes": (
-                "schema-version-3 discovery inventory",
-                "complete repository-wide state-all pull-list traversal plus "
-                "exactly one complete detail traversal for every seeded pr number",
-                "the fixed parser excludes current from historical candidates only "
-                "after every seeded traversal is fully parsed and classified",
-                "a version-2 transcript lacks the independent repository-wide seed "
-                "and cannot prove reaction fallback",
+                "schema-version-4 discovery inventory",
+                "updated-desc pull traversal through its first cutoff-boundary "
+                "page or natural end",
+                "boundary witnesses and cumulative old prs do not consume the "
+                "512 union cap",
+                "a version-3 transcript cannot prove reaction fallback",
             ),
             "pr-readiness": (
-                "schema-version-3 raw discovery transcript",
-                "seed drives exactly one complete detail traversal for every pr, "
-                "including the current pr, the declaration pr, and confirmed "
-                "non-candidates",
-                "excludes current from the historical candidate set only after "
-                "full parsing",
-                "a version-2 transcript cannot prove reaction fallback",
+                "schema-version-4 raw discovery transcript",
+                "bounded updated-desc pull traversal stops after the first full "
+                "page containing a row at or before the cutoff",
+                "boundary witnesses do not consume the 512 union-seeded-pr cap",
+                "a version-3 transcript cannot prove reaction fallback",
             ),
             "project-journal": (
-                "schema version 3",
-                "every seeded pr drives exactly one complete detail traversal, "
-                "including current and confirmed non-candidates",
-                "current is excluded from historical candidates only after full "
-                "parsing",
-                "version 2 cannot prove fallback",
+                "schema-version-4 bounded dual-source discovery",
+                "an updated-desc pull-list traversal retains complete pages "
+                "through the first updated_at <= window_start_exclusive boundary",
+                "the 512 cap now counts only this union and its detail traversals",
+                "version 3 cannot prove reaction fallback",
             ),
         }
-        for document_name, anchors in schema_v3_contracts.items():
+        for document_name, anchors in discovery_v4_contracts.items():
             for anchor in anchors:
                 with self.subTest(
-                    schema_v3_document=document_name,
-                    schema_v3_contract=anchor,
+                    discovery_v4_document=document_name,
+                    discovery_v4_contract=anchor,
                 ):
-                    self.assertIn(anchor, schema_v3_sections[document_name])
-        schema_v3_version_markers = {
+                    self.assertIn(anchor, discovery_v4_sections[document_name])
+
+        authority_report_section = section_text(
+            authority,
+            "## Required Report Fields",
+        )
+        report_projection_markers = (
+            "request_scope_receipts:",
+            "scope_discovery_projection:",
+            "cutoff_rfc3339:",
+            "stop_reason: window-boundary-complete | natural-end-complete",
+            "recent_pull_requests:",
+            "recent_request_comments:",
+            "anchors:",
+            "union_pull_numbers:",
+            "scope_classifications:",
+            "identical scope_discovery_projection",
+        )
+        for marker in report_projection_markers:
+            with self.subTest(report_projection_marker=marker):
+                self.assertIn(marker, authority_report_section)
+        self.assertLess(
+            authority_report_section.index("request_scope_receipts:"),
+            authority_report_section.index("scope_discovery_projection:"),
+        )
+        self.assertLess(
+            authority_report_section.index("scope_discovery_projection:"),
+            authority_report_section.index("scope_classifications:"),
+        )
+        current_state_section = section_text(journal, "## Current State")
+        for marker in (
+            "schema-version-4 discovery transcripts",
+            "updated-desc pull boundary",
+            "since-cutoff controlled request-comment feed",
+            "version 3 cannot prove reaction fallback",
+            "boundary witnesses and cumulative old prs consume endpoint budgets "
+            "but do not consume the 512 union/detail cap",
+        ):
+            with self.subTest(project_journal_current_state_marker=marker):
+                self.assertIn(marker, current_state_section)
+        self.assertNotIn(
+            "state=all&sort=created&direction=asc&per_page=100",
+            current_state_section,
+        )
+        self.assertIn(
+            "schema version 4 records no independent inline-child timestamp",
+            github_pr_probes.lower(),
+        )
+        self.assertNotIn(
+            "schema version 3 records no independent inline-child timestamp",
+            github_pr_probes.lower(),
+        )
+        authority_non_goals = section_text(authority, "## Non-Goals")
+        self.assertIn(
+            "request-time scope receipts into raw transcript schema version 4",
+            authority_non_goals,
+        )
+        self.assertNotIn(
+            "request-time scope receipts into raw transcript schema version 3",
+            authority_non_goals,
+        )
+        discovery_v4_version_markers = {
             document_name: anchors[0]
-            for document_name, anchors in schema_v3_contracts.items()
+            for document_name, anchors in discovery_v4_contracts.items()
         }
 
-        def assert_schema_v3_version(section: str, marker: str) -> None:
+        def assert_discovery_v4_version(section: str, marker: str) -> None:
             self.assertIn(marker, section)
 
-        for document_name, marker in schema_v3_version_markers.items():
-            assert_schema_v3_version(schema_v3_sections[document_name], marker)
-            drifted_section = schema_v3_sections[document_name].replace(
+        for document_name, marker in discovery_v4_version_markers.items():
+            assert_discovery_v4_version(discovery_v4_sections[document_name], marker)
+            drifted_section = discovery_v4_sections[document_name].replace(
                 marker,
-                marker.replace("3", "4", 1),
+                marker.replace("4", "3", 1),
                 1,
             )
             with self.subTest(schema_version_drift_document=document_name):
                 with self.assertRaises(AssertionError):
-                    assert_schema_v3_version(drifted_section, marker)
+                    assert_discovery_v4_version(drifted_section, marker)
         normalized_github_pr_probes_text = " ".join(
             github_pr_probes.lower().replace("`", "").split()
         )
         self.assertIn(
-            "schema version 3 cannot encode a child-cursor fetch",
+            "schema version 4 cannot encode a child-cursor fetch",
             normalized_github_pr_probes_text,
         )
         self.assertIn(
             "a nested hasnextpage == true requires a separately bound "
             "child-cursor fetch shape that this schema does not define, so the "
             "profile is unknown",
-            schema_v3_sections["authority"],
+            discovery_v4_sections["authority"],
         )
         self.assertNotIn(
             "exhaust every nested comments cursor",
             normalized_github_pr_probes_text,
         )
         normalized_authority_text = " ".join(authority.lower().replace("`", "").split())
+        for raw_rest_shape_marker in (
+            "every accepted rest status is an exact integer 200, never a "
+            "boolean or float alias",
+            "pull-detail and compare are direct-object endpoints: each has "
+            "exactly one retained page, a null link header, and a json object root",
+            "every rest collection page has an array root; its unique canonical "
+            "pagination relations preserve the fixed endpoint/query and advance "
+            "only through the consecutive page=n parameter",
+            "for updated-desc pull discovery, last is stable across retained "
+            "pages and cannot claim a page after a no-next natural end or before "
+            "the current next",
+        ):
+            self.assertIn(raw_rest_shape_marker, normalized_authority_text)
         strict_json_contracts = {
             "authority": (
                 normalized_authority_text,
@@ -4635,7 +4703,7 @@ printf '%s\n' "$trusted_uv"
             normalized_readiness_text,
         )
         self.assertIn(
-            "schema version 3 has no independent inline-child timestamp",
+            "schema version 4 has no independent inline-child timestamp",
             normalized_readiness_text,
         )
         self.assertIn(
@@ -4868,9 +4936,9 @@ printf '%s\n' "$trusted_uv"
                 authority,
                 "### Why Result-Present Acceptance Is Deliberate",
             ),
-            "skill": schema_v3_sections["skill"],
-            "github-pr-probes": schema_v3_sections["github-pr-probes"],
-            "pr-readiness": schema_v3_sections["pr-readiness"],
+            "skill": discovery_v4_sections["skill"],
+            "github-pr-probes": discovery_v4_sections["github-pr-probes"],
+            "pr-readiness": discovery_v4_sections["pr-readiness"],
             "project-journal": section_text(
                 journal,
                 "## Decision Rationale",
@@ -4948,9 +5016,9 @@ printf '%s\n' "$trusted_uv"
                 authority,
                 "## Alignment And Intentional Differences From The Fixed Action Baseline",
             ),
-            "skill": schema_v3_sections["skill"],
-            "github-pr-probes": schema_v3_sections["github-pr-probes"],
-            "pr-readiness": schema_v3_sections["pr-readiness"],
+            "skill": discovery_v4_sections["skill"],
+            "github-pr-probes": discovery_v4_sections["github-pr-probes"],
+            "pr-readiness": discovery_v4_sections["pr-readiness"],
             "project-journal": result_present_sections["project-journal"],
         }
         action_boundary_contracts = {
@@ -6629,7 +6697,8 @@ printf '%s\n' "$trusted_uv"
             "review_threads": True,
         }
         required_universe_pagination = {
-            "repository_pull_requests": True,
+            "recent_pull_requests": True,
+            "recent_request_comments": True,
             "pull_requests": True,
             "compare": True,
             "issue_comments": True,
@@ -7119,6 +7188,7 @@ printf '%s\n' "$trusted_uv"
                         server_time=server_time,
                         body={
                             "base_commit": {"sha": base_oid},
+                            "head_commit": {"sha": head},
                             "merge_base_commit": {"sha": merge_base},
                         },
                     ),
@@ -7607,6 +7677,11 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(compare_body, dict)
                     else None
                 )
+                head_commit = (
+                    compare_body.get("head_commit")
+                    if isinstance(compare_body, dict)
+                    else None
+                )
                 merge_base_commit = (
                     compare_body.get("merge_base_commit")
                     if isinstance(compare_body, dict)
@@ -7627,6 +7702,8 @@ printf '%s\n' "$trusted_uv"
                 if (
                     not isinstance(base_commit, dict)
                     or base_commit.get("sha") != base_oid
+                    or not isinstance(head_commit, dict)
+                    or head_commit.get("sha") != head
                     or parsed_scope is None
                 ):
                     return None
@@ -11195,6 +11272,10 @@ printf '%s\n' "$trusted_uv"
                     f"{value.get('id')}"
                 ),
                 "html_url": value.get("url"),
+                "issue_url": (
+                    "https://api.github.com/repos/OWNER/REPO/issues/"
+                    f"{str(value.get('url')).split('/pull/')[-1].split('#')[0]}"
+                ),
                 "body": value.get("normalized_body"),
                 "created_at": _format_github_rfc3339_seconds(value.get("created_at")),
                 "updated_at": _format_github_rfc3339_seconds(value.get("updated_at")),
@@ -11361,6 +11442,8 @@ printf '%s\n' "$trusted_uv"
             _pull_node_id_suffix_by_pr: dict[int, str] | None = None,
             _resource_tracker: dict[str, object] | None = None,
             _single_scope_detail_only: bool = False,
+            _pull_updated_at_by_pr: dict[int, int] | None = None,
+            _repository_historical_pull_records: list[dict[str, object]] | None = None,
         ) -> dict[str, object]:
             effective_limits = effective_resource_limits(_tightened_resource_limits)
             resource_tracker = (
@@ -11378,6 +11461,14 @@ printf '%s\n' "$trusted_uv"
             )
             node_id_suffixes = (
                 {} if _pull_node_id_suffix_by_pr is None else _pull_node_id_suffix_by_pr
+            )
+            pull_updated_at_by_pr = (
+                {} if _pull_updated_at_by_pr is None else _pull_updated_at_by_pr
+            )
+            historical_pull_records = (
+                []
+                if _repository_historical_pull_records is None
+                else _repository_historical_pull_records
             )
             suffixes_valid = isinstance(node_id_suffixes, dict)
             if suffixes_valid:
@@ -11397,20 +11488,23 @@ printf '%s\n' "$trusted_uv"
                 or not typed_json_equal(tracker_limits, effective_limits)
                 or len(raw_scopes) > effective_limits["max_seeded_pull_requests"]
                 or not suffixes_valid
+                or not isinstance(pull_updated_at_by_pr, dict)
+                or any(
+                    type(pr) is not int
+                    or pr <= 0
+                    or type(updated_at) is not int
+                    or updated_at <= 0
+                    for pr, updated_at in pull_updated_at_by_pr.items()
+                )
+                or not isinstance(historical_pull_records, list)
                 or type(_single_scope_detail_only) is not bool
                 or (_single_scope_detail_only and len(raw_scopes) != 1)
             ):
                 raise EvidenceResourceBudgetExceeded("repository scope budget exceeded")
-            if not _single_scope_detail_only and not resource_budget_charge(
-                resource_tracker,
-                records=len(raw_scopes),
-            ):
-                raise EvidenceResourceBudgetExceeded(
-                    "repository discovery record budget exceeded"
-                )
             repository_pull_records: list[dict[str, object]] = []
+            repository_request_records: list[dict[str, object]] = []
             scope_transcripts: list[dict[str, object]] = []
-            for raw_scope_record in raw_scopes:
+            for scope_index, raw_scope_record in enumerate(raw_scopes):
                 if not resource_budget_charge(resource_tracker, records=2):
                     raise EvidenceResourceBudgetExceeded(
                         "pull and compare record budget exceeded"
@@ -11446,6 +11540,7 @@ printf '%s\n' "$trusted_uv"
                 }
                 compare_record = {
                     "base_commit": {"sha": base_oid},
+                    "head_commit": {"sha": head},
                     "merge_base_commit": {"sha": merge_base},
                     "status": "ahead",
                     "ahead_by": 1,
@@ -11456,6 +11551,10 @@ printf '%s\n' "$trusted_uv"
                     api_root = "https://api.github.com/repos/INVALID/INVALID"
                 pull_api_url = f"{api_root}/pulls/{pr}"
                 if not _single_scope_detail_only:
+                    pull_updated_at = pull_updated_at_by_pr.get(
+                        pr,
+                        history_as_of_server_time - scope_index - 1,
+                    )
                     repository_pull_records.append(
                         {
                             "number": pr,
@@ -11470,6 +11569,9 @@ printf '%s\n' "$trusted_uv"
                             },
                             "state": lifecycle.get("state"),
                             "node_id": f"PR_{pr}",
+                            "updated_at": _format_github_rfc3339_seconds(
+                                pull_updated_at
+                            ),
                         }
                     )
                 requests = raw_scope_record.get("requests")
@@ -11485,6 +11587,23 @@ printf '%s\n' "$trusted_uv"
                 reactions = raw_scope_record.get("reactions")
                 raw_reactions = reactions if isinstance(reactions, list) else []
                 issue_records = [raw_request_record(item) for item in raw_requests]
+                if not _single_scope_detail_only:
+                    repository_request_records.extend(
+                        clone(raw_record)
+                        for raw_record in issue_records
+                        if (
+                            isinstance(raw_record, dict)
+                            and (
+                                parsed_updated_at := _parse_github_rfc3339_seconds(
+                                    raw_record.get("updated_at")
+                                )
+                            )
+                            is not None
+                            and history_start_exclusive
+                            < parsed_updated_at
+                            <= history_as_of_server_time
+                        )
+                    )
                 extra_issue_records = raw_scope_record.get("raw_issue_records")
                 if isinstance(extra_issue_records, list):
                     if not resource_budget_charge(
@@ -11637,7 +11756,7 @@ printf '%s\n' "$trusted_uv"
                                                 )
                                             thread_nodes.extend(nodes)
 
-                pull_url = f"{api_root}/pulls/{pr}?per_page=100"
+                pull_url = f"{api_root}/pulls/{pr}"
                 compare_url = f"{api_root}/compare/{base_oid}...{head}"
                 issue_url = f"{api_root}/issues/{pr}/comments?per_page=100"
                 reviews_url = f"{api_root}/pulls/{pr}/reviews?per_page=100"
@@ -11743,23 +11862,138 @@ printf '%s\n' "$trusted_uv"
                         "fetches": fetches,
                     }
                 )
-            scope_discovery_url = (
+            recent_pull_requests_url = (
                 f"https://api.github.com/repos/{current_repository}/pulls"
-                "?state=all&sort=created&direction=asc&per_page=100"
+                "?state=all&sort=updated&direction=desc&per_page=100"
             )
+            recent_request_comments_url = (
+                f"https://api.github.com/repos/{current_repository}/issues/comments"
+                "?sort=updated&direction=desc&since="
+                f"{_format_github_rfc3339_seconds(history_start_exclusive)}"
+                "&per_page=100"
+            )
+
+            def build_recent_pull_pages() -> dict[str, object]:
+                all_records = [
+                    clone(record)
+                    for record in repository_pull_records + historical_pull_records
+                ]
+                try:
+                    all_records.sort(
+                        key=lambda record: (
+                            _parse_github_rfc3339_seconds(record.get("updated_at"))
+                            if isinstance(record, dict)
+                            else -1
+                        ),
+                        reverse=True,
+                    )
+                except TypeError as exc:
+                    raise EvidenceResourceBudgetExceeded(
+                        "recent pull discovery ordering unavailable"
+                    ) from exc
+                pages: list[dict[str, object]] = []
+                chunks = [
+                    all_records[index : index + 100]
+                    for index in range(0, len(all_records), 100)
+                ] or [[]]
+                for index, chunk in enumerate(chunks):
+                    page_number = index + 1
+                    page_url = (
+                        recent_pull_requests_url
+                        if page_number == 1
+                        else f"{recent_pull_requests_url}&page={page_number}"
+                    )
+                    next_url = (
+                        f"{recent_pull_requests_url}&page={page_number + 1}"
+                        if index + 1 < len(chunks)
+                        else None
+                    )
+                    if not resource_budget_charge(
+                        resource_tracker,
+                        fetch_attempts=1,
+                        retained_pages=1,
+                        records=len(chunk),
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "recent pull discovery page budget exceeded"
+                        )
+                    page = raw_page(
+                        request_url=page_url,
+                        body=chunk,
+                        link_header=(
+                            f'<{next_url}>; rel="next"'
+                            if next_url is not None
+                            else None
+                        ),
+                    )
+                    sizes = retained_page_utf8_sizes(page)
+                    if sizes is None or not resource_budget_charge(
+                        resource_tracker,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    ):
+                        raise EvidenceResourceBudgetExceeded(
+                            "recent pull discovery retained evidence budget exceeded"
+                        )
+                    pages.append(page)
+                    if any(
+                        isinstance(record, dict)
+                        and (
+                            updated_at := _parse_github_rfc3339_seconds(
+                                record.get("updated_at")
+                            )
+                        )
+                        is not None
+                        and updated_at <= history_start_exclusive
+                        for record in chunk
+                    ):
+                        break
+                return {
+                    "kind": "recent_pull_requests",
+                    "transport": "rest",
+                    "parent_comment_id": None,
+                    "pages": pages,
+                }
+
+            repository_request_records.sort(
+                key=lambda record: (
+                    _parse_github_rfc3339_seconds(record.get("updated_at")) or -1,
+                    int(record.get("id", -1)),
+                ),
+                reverse=True,
+            )
+            raw_scope_prs = {
+                raw_scope.get("scope", {}).get("pr")
+                for raw_scope in raw_scopes
+                if isinstance(raw_scope, dict)
+                and isinstance(raw_scope.get("scope"), dict)
+            }
             transcript = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "repository": current_repository,
                 "scope_discovery": (
                     None
                     if _single_scope_detail_only
-                    else rest_fetch(
-                        "repository_pull_requests",
-                        scope_discovery_url,
-                        repository_pull_records,
-                        resource_tracker=resource_tracker,
-                        records_precharged=True,
-                    )
+                    else {
+                        "recent_pull_requests": build_recent_pull_pages(),
+                        "recent_request_comments": rest_fetch(
+                            "recent_request_comments",
+                            recent_request_comments_url,
+                            repository_request_records,
+                            resource_tracker=resource_tracker,
+                            records_precharged=False,
+                        ),
+                        "anchors": {
+                            "current_pull_number": (
+                                current_pr if current_pr in raw_scope_prs else None
+                            ),
+                            "declaration_pull_number": (
+                                declaration_pr
+                                if declaration_pr in raw_scope_prs
+                                else None
+                            ),
+                        },
+                    }
                 ),
                 "scopes": scope_transcripts,
             }
@@ -11875,6 +12109,7 @@ printf '%s\n' "$trusted_uv"
             *,
             expected_kind: str,
             expected_url: str,
+            response_shape: str = "collection",
             resource_tracker: dict[str, object] | None = None,
             retained_record_limit: int | None = None,
         ) -> list[object] | None:
@@ -11886,6 +12121,8 @@ printf '%s\n' "$trusted_uv"
                 or fetch.get("transport") != "rest"
                 or not isinstance(fetch.get("pages"), list)
                 or not fetch["pages"]
+                or response_shape not in {"collection", "direct-object"}
+                or (response_shape == "direct-object" and len(fetch["pages"]) != 1)
             ):
                 return None
             tracker = resource_tracker
@@ -11899,11 +12136,11 @@ printf '%s\n' "$trusted_uv"
             ):
                 return None
 
-            def next_link(value: object) -> str | None | bool:
+            def link_relations(value: object) -> dict[str, str] | None:
                 if value is None:
-                    return None
+                    return {}
                 if not isinstance(value, str) or not value:
-                    return False
+                    return None
                 links: dict[str, str] = {}
                 for raw_part in value.split(","):
                     match = re.fullmatch(
@@ -11911,12 +12148,16 @@ printf '%s\n' "$trusted_uv"
                         raw_part,
                     )
                     if match is None:
-                        return False
+                        return None
                     link_url, relation = match.groups()
-                    if relation in links or not link_url:
-                        return False
+                    if (
+                        relation in links
+                        or relation not in {"next", "last", "prev", "first"}
+                        or not link_url
+                    ):
+                        return None
                     links[relation] = link_url
-                return links.get("next")
+                return links
 
             records: list[object] = []
             pages = fetch["pages"]
@@ -11943,6 +12184,10 @@ printf '%s\n' "$trusted_uv"
                     or page.get("status") != 200
                     or page.get("request_after") is not None
                     or not isinstance(page.get("body_utf8"), str)
+                    or (
+                        response_shape == "direct-object"
+                        and page.get("link_header") is not None
+                    )
                 ):
                     return None
                 sizes = retained_page_utf8_sizes(page)
@@ -11958,25 +12203,54 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 seen_page_urls.add(page_url)
-                next_url = next_link(page.get("link_header"))
-                if (
-                    next_url is False
-                    or (index < len(pages) - 1 and not isinstance(next_url, str))
-                    or (index == len(pages) - 1 and next_url is not None)
-                ):
+                links = link_relations(page.get("link_header"))
+                if links is None:
                     return None
                 try:
                     body = strict_json_loads(page["body_utf8"])
                 except (TypeError, ValueError):
                     return None
-                if isinstance(body, list):
+                if response_shape == "collection":
+                    if (
+                        not isinstance(body, list)
+                        or (
+                            index < len(pages) - 1
+                            and links.get("next") != f"{expected_url}&page={index + 2}"
+                        )
+                        or (index == len(pages) - 1 and "next" in links)
+                        or ("first" in links and links["first"] != expected_url)
+                        or (
+                            "prev" in links
+                            and (
+                                index == 0
+                                or links["prev"]
+                                != (
+                                    expected_url
+                                    if index == 1
+                                    else f"{expected_url}&page={index}"
+                                )
+                            )
+                        )
+                        or (
+                            "last" in links
+                            and links["last"]
+                            != (
+                                expected_url
+                                if len(pages) == 1
+                                else f"{expected_url}&page={len(pages)}"
+                            )
+                        )
+                    ):
+                        return None
                     if (
                         retained_record_limit is not None
                         and len(records) + len(body) > retained_record_limit
                     ) or not resource_budget_charge(tracker, records=len(body)):
                         return None
                     records.extend(body)
-                elif len(pages) == 1:
+                    if index < len(pages) - 1:
+                        page_url = f"{expected_url}&page={index + 2}"
+                elif isinstance(body, dict):
                     if (
                         retained_record_limit is not None
                         and len(records) + 1 > retained_record_limit
@@ -11985,8 +12259,6 @@ printf '%s\n' "$trusted_uv"
                     records.append(body)
                 else:
                     return None
-                if isinstance(next_url, str):
-                    page_url = next_url
             return records if resource_budget_charge(tracker) else None
 
         strict_rest_url = "https://api.github.com/repos/OWNER/REPO/strict?per_page=100"
@@ -12344,6 +12616,303 @@ printf '%s\n' "$trusted_uv"
         ).hexdigest()
         self.assertIsNone(parse_graphql_thread_pages(incomplete_nested_graphql))
 
+        def parse_recent_pull_discovery(
+            fetch: object,
+            *,
+            expected_url: str,
+            resource_tracker: dict[str, object],
+        ) -> (
+            tuple[
+                dict[int, tuple[str, str]],
+                list[dict[str, object]],
+                str,
+            ]
+            | None
+        ):
+            if (
+                not isinstance(fetch, dict)
+                or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
+                or fetch.get("kind") != "recent_pull_requests"
+                or fetch.get("transport") != "rest"
+                or fetch.get("parent_comment_id") is not None
+                or not isinstance(fetch.get("pages"), list)
+                or not fetch["pages"]
+            ):
+                return None
+            pages = fetch["pages"]
+            recent_pulls: dict[int, tuple[str, str]] = {}
+            projection: list[dict[str, object]] = []
+            seen_all_pull_numbers: set[int] = set()
+            previous_updated_at: int | None = None
+            boundary_seen = False
+            expected_page_url = expected_url
+            observed_last_url: str | None = None
+            observed_last_page_number: int | None = None
+            for page_index, page in enumerate(pages):
+                if (
+                    boundary_seen
+                    or not resource_budget_charge(resource_tracker, fetch_attempts=1)
+                    or not isinstance(page, dict)
+                    or set(page)
+                    != {
+                        "request_url",
+                        "status",
+                        "link_header",
+                        "request_after",
+                        "body_utf8",
+                        "body_sha256",
+                    }
+                    or page.get("request_url") != expected_page_url
+                    or type(page.get("status")) is not int
+                    or page.get("status") != 200
+                    or page.get("request_after") is not None
+                    or not isinstance(page.get("body_utf8"), str)
+                ):
+                    return None
+                sizes = retained_page_utf8_sizes(page)
+                if (
+                    sizes is None
+                    or not resource_budget_charge(
+                        resource_tracker,
+                        retained_pages=1,
+                        retained_utf8_bytes=sizes[1],
+                        page_body_bytes=sizes[0],
+                    )
+                    or page.get("body_sha256") != strict_utf8_sha256(page["body_utf8"])
+                ):
+                    return None
+                try:
+                    records = strict_json_loads(page["body_utf8"])
+                except (TypeError, ValueError):
+                    return None
+                if (
+                    not isinstance(records, list)
+                    or len(records) > 100
+                    or not resource_budget_charge(
+                        resource_tracker,
+                        records=len(records),
+                    )
+                ):
+                    return None
+                page_boundary_seen = False
+                for raw_pull in records:
+                    if not isinstance(raw_pull, dict):
+                        return None
+                    pull_number = raw_pull.get("number")
+                    base = raw_pull.get("base")
+                    head = raw_pull.get("head")
+                    base_oid = base.get("sha") if isinstance(base, dict) else None
+                    head_oid = head.get("sha") if isinstance(head, dict) else None
+                    updated_at = _parse_github_rfc3339_seconds(
+                        raw_pull.get("updated_at")
+                    )
+                    if (
+                        type(pull_number) is not int
+                        or pull_number <= 0
+                        or pull_number in seen_all_pull_numbers
+                        or raw_pull.get("url")
+                        != (
+                            "https://api.github.com/repos/"
+                            f"{current_repository}/pulls/{pull_number}"
+                        )
+                        or not isinstance(base_oid, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                        or not isinstance(head_oid, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", head_oid) is None
+                        or updated_at is None
+                        or updated_at > history_as_of_server_time
+                        or (
+                            previous_updated_at is not None
+                            and updated_at > previous_updated_at
+                        )
+                    ):
+                        return None
+                    seen_all_pull_numbers.add(pull_number)
+                    previous_updated_at = updated_at
+                    if updated_at <= history_start_exclusive:
+                        page_boundary_seen = True
+                        boundary_seen = True
+                        continue
+                    if page_boundary_seen:
+                        return None
+                    recent_pulls[pull_number] = (base_oid, head_oid)
+                    projection.append(
+                        {
+                            "pull_number": pull_number,
+                            "updated_at": updated_at,
+                            "source_record_sha256": hashlib.sha256(
+                                canonical_raw_body(raw_pull).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                    )
+                raw_link_header = page.get("link_header")
+                links: dict[str, str] = {}
+                if raw_link_header is not None:
+                    if not isinstance(raw_link_header, str) or not raw_link_header:
+                        return None
+                    for raw_part in raw_link_header.split(","):
+                        match = re.fullmatch(
+                            r'\s*<([^<>]+)>\s*;\s*rel="([^" ]+)"\s*',
+                            raw_part,
+                        )
+                        if (
+                            match is None
+                            or match.group(2) in links
+                            or match.group(2) not in {"next", "last", "prev", "first"}
+                        ):
+                            return None
+                        links[match.group(2)] = match.group(1)
+                canonical_next_url = f"{expected_url}&page={page_index + 2}"
+                next_url = links.get("next")
+                if next_url is not None and next_url != canonical_next_url:
+                    return None
+                last_url = links.get("last")
+                last_page_number: int | None = None
+                if last_url is not None:
+                    if last_url == expected_url:
+                        last_page_number = 1
+                    else:
+                        last_match = re.fullmatch(
+                            re.escape(expected_url) + r"&page=([1-9][0-9]*)",
+                            last_url,
+                        )
+                        if last_match is not None:
+                            candidate_last_page_number = int(last_match.group(1))
+                            if candidate_last_page_number >= 2:
+                                last_page_number = candidate_last_page_number
+                    if last_page_number is None or (
+                        observed_last_url is not None and observed_last_url != last_url
+                    ):
+                        return None
+                    observed_last_url = last_url
+                    observed_last_page_number = last_page_number
+                if observed_last_page_number is not None and (
+                    (next_url is None and observed_last_page_number != page_index + 1)
+                    or (
+                        next_url is not None
+                        and observed_last_page_number < page_index + 2
+                    )
+                ):
+                    return None
+                canonical_first_url = expected_url
+                canonical_previous_url = (
+                    expected_url
+                    if page_index == 1
+                    else f"{expected_url}&page={page_index}"
+                )
+                if ("first" in links and links["first"] != canonical_first_url) or (
+                    "prev" in links
+                    and (page_index == 0 or links["prev"] != canonical_previous_url)
+                ):
+                    return None
+                if page_index + 1 < len(pages):
+                    if page_boundary_seen or next_url != canonical_next_url:
+                        return None
+                    expected_page_url = canonical_next_url
+                elif next_url is not None and not page_boundary_seen:
+                    return None
+            stop_reason = (
+                "window-boundary-complete"
+                if next_url is not None
+                else "natural-end-complete"
+            )
+            return recent_pulls, projection, stop_reason
+
+        def parse_recent_request_discovery(
+            fetch: object,
+            *,
+            expected_url: str,
+            resource_tracker: dict[str, object],
+        ) -> (
+            tuple[
+                dict[int, tuple[int, dict[str, object]]],
+                list[dict[str, object]],
+            ]
+            | None
+        ):
+            raw_records = parse_rest_pages(
+                fetch,
+                expected_kind="recent_request_comments",
+                expected_url=expected_url,
+                resource_tracker=resource_tracker,
+            )
+            if not isinstance(raw_records, list):
+                return None
+            by_id: dict[int, tuple[int, dict[str, object]]] = {}
+            projection: list[dict[str, object]] = []
+            previous_updated_at: int | None = None
+            for raw_record in raw_records:
+                projected = project_raw_issue_record(raw_record)
+                if projected is None or not isinstance(raw_record, dict):
+                    return None
+                updated_at = projected["updated_at"]
+                if (
+                    type(updated_at) is not int
+                    or updated_at <= history_start_exclusive
+                    or updated_at > history_as_of_server_time
+                    or (
+                        previous_updated_at is not None
+                        and updated_at > previous_updated_at
+                    )
+                ):
+                    return None
+                previous_updated_at = updated_at
+                user = projected.get("user")
+                if not (
+                    projected.get("body") == "@codex review"
+                    and isinstance(user, dict)
+                    and user.get("type") == "User"
+                    and isinstance(user.get("login"), str)
+                    and user["login"]
+                    and projected.get("app_slug") is None
+                ):
+                    continue
+                request_id = projected.get("id")
+                issue_url = raw_record.get("issue_url")
+                match = (
+                    re.fullmatch(
+                        (
+                            r"https://api\.github\.com/repos/"
+                            + re.escape(current_repository)
+                            + r"/issues/([1-9][0-9]*)"
+                        ),
+                        issue_url,
+                    )
+                    if isinstance(issue_url, str)
+                    else None
+                )
+                pull_number = int(match.group(1)) if match is not None else None
+                if (
+                    type(request_id) is not int
+                    or request_id <= 0
+                    or request_id in by_id
+                    or type(pull_number) is not int
+                    or projected.get("url")
+                    != (
+                        "https://api.github.com/repos/"
+                        f"{current_repository}/issues/comments/{request_id}"
+                    )
+                    or projected.get("html_url")
+                    != (
+                        f"https://github.com/{current_repository}/pull/"
+                        f"{pull_number}#issuecomment-{request_id}"
+                    )
+                ):
+                    return None
+                raw_digest = hashlib.sha256(
+                    canonical_raw_body(raw_record).encode("utf-8")
+                ).hexdigest()
+                by_id[request_id] = (pull_number, clone(raw_record))
+                projection.append(
+                    {
+                        "request_id": request_id,
+                        "pull_number": pull_number,
+                        "updated_at": updated_at,
+                        "source_record_sha256": raw_digest,
+                    }
+                )
+            return by_id, projection
+
         def produce_raw_semantic_dataset(
             value: object,
             *,
@@ -12363,7 +12932,7 @@ printf '%s\n' "$trusted_uv"
                 or set(value)
                 != {"schema_version", "repository", "scope_discovery", "scopes"}
                 or type(value.get("schema_version")) is not int
-                or value.get("schema_version") != 3
+                or value.get("schema_version") != 4
                 or value.get("repository") != current_repository
                 or not isinstance(value.get("scopes"), list)
                 or type(_allow_post_as_of_requests) is not bool
@@ -12415,50 +12984,83 @@ printf '%s\n' "$trusted_uv"
                     return None
                 expected_declaration_raw = fetched_declaration
             api_root = f"https://api.github.com/repos/{current_repository}"
-            scope_discovery_url = (
-                f"{api_root}/pulls?state=all&sort=created&direction=asc&per_page=100"
+            recent_pull_requests_url = (
+                f"{api_root}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+            )
+            recent_request_comments_url = (
+                f"{api_root}/issues/comments?sort=updated&direction=desc&since="
+                f"{_format_github_rfc3339_seconds(history_start_exclusive)}"
+                "&per_page=100"
             )
             scope_discovery = value.get("scope_discovery")
             discovered_pulls: dict[int, tuple[str, str] | None] = {}
+            recent_request_by_id: dict[int, tuple[int, dict[str, object]]] = {}
+            scope_discovery_projection: dict[str, object] | None = None
             if _single_scope_pull_number is None:
                 if (
                     not isinstance(scope_discovery, dict)
-                    or scope_discovery.get("parent_comment_id") is not None
+                    or set(scope_discovery)
+                    != {"recent_pull_requests", "recent_request_comments", "anchors"}
+                    or not isinstance(scope_discovery.get("anchors"), dict)
+                    or set(scope_discovery["anchors"])
+                    != {"current_pull_number", "declaration_pull_number"}
                 ):
                     return None
-                repository_pull_records = parse_rest_pages(
-                    scope_discovery,
-                    expected_kind="repository_pull_requests",
-                    expected_url=scope_discovery_url,
+                recent_pull_result = parse_recent_pull_discovery(
+                    scope_discovery.get("recent_pull_requests"),
+                    expected_url=recent_pull_requests_url,
                     resource_tracker=resource_tracker,
-                    retained_record_limit=effective_limits["max_seeded_pull_requests"],
                 )
+                recent_request_result = parse_recent_request_discovery(
+                    scope_discovery.get("recent_request_comments"),
+                    expected_url=recent_request_comments_url,
+                    resource_tracker=resource_tracker,
+                )
+                if recent_pull_result is None or recent_request_result is None:
+                    return None
+                recent_pulls, recent_pull_projection, stop_reason = recent_pull_result
+                recent_request_by_id, recent_request_projection = recent_request_result
+                anchors = scope_discovery["anchors"]
+                anchor_values: list[int] = []
+                for anchor_name in (
+                    "current_pull_number",
+                    "declaration_pull_number",
+                ):
+                    anchor = anchors.get(anchor_name)
+                    if anchor is not None and (type(anchor) is not int or anchor <= 0):
+                        return None
+                    if type(anchor) is int:
+                        anchor_values.append(anchor)
+                if anchors.get("current_pull_number") != current_pr:
+                    return None
                 if (
-                    not isinstance(repository_pull_records, list)
-                    or len(repository_pull_records)
-                    > effective_limits["max_seeded_pull_requests"]
+                    expected_declaration_raw is not None
+                    and anchors.get("declaration_pull_number") != declaration_pr
                 ):
                     return None
-                for raw_pull in repository_pull_records:
-                    if not isinstance(raw_pull, dict):
-                        return None
-                    pr = raw_pull.get("number")
-                    base = raw_pull.get("base")
-                    pull_head = raw_pull.get("head")
-                    base_oid = base.get("sha") if isinstance(base, dict) else None
-                    head = pull_head.get("sha") if isinstance(pull_head, dict) else None
-                    if (
-                        type(pr) is not int
-                        or pr <= 0
-                        or pr in discovered_pulls
-                        or raw_pull.get("url") != f"{api_root}/pulls/{pr}"
-                        or not isinstance(base_oid, str)
-                        or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
-                        or not isinstance(head, str)
-                        or re.fullmatch(r"[0-9a-f]{40}", head) is None
-                    ):
-                        return None
-                    discovered_pulls[pr] = (base_oid, head)
+                union_pull_numbers = sorted(
+                    set(recent_pulls)
+                    | {pull_number for pull_number, _ in recent_request_by_id.values()}
+                    | set(anchor_values)
+                )
+                if len(union_pull_numbers) > effective_limits[
+                    "max_seeded_pull_requests"
+                ] or len(value["scopes"]) != len(union_pull_numbers):
+                    return None
+                discovered_pulls = {
+                    pull_number: recent_pulls.get(pull_number)
+                    for pull_number in union_pull_numbers
+                }
+                scope_discovery_projection = {
+                    "cutoff_rfc3339": _format_github_rfc3339_seconds(
+                        history_start_exclusive
+                    ),
+                    "stop_reason": stop_reason,
+                    "recent_pull_requests": recent_pull_projection,
+                    "recent_request_comments": recent_request_projection,
+                    "anchors": clone(anchors),
+                    "union_pull_numbers": union_pull_numbers,
+                }
             else:
                 if (
                     scope_discovery is not None
@@ -12485,7 +13087,8 @@ printf '%s\n' "$trusted_uv"
             ):
                 return None
             detail_kinds = set(required_universe_pagination) - {
-                "repository_pull_requests"
+                "recent_pull_requests",
+                "recent_request_comments",
             }
             for scope_transcript in value["scopes"]:
                 if (
@@ -12532,7 +13135,8 @@ printf '%s\n' "$trusted_uv"
                 pull_records = parse_rest_pages(
                     pull_fetch,
                     expected_kind="pull_requests",
-                    expected_url=f"{api_root}/pulls/{pr}?per_page=100",
+                    expected_url=f"{api_root}/pulls/{pr}",
+                    response_shape="direct-object",
                     resource_tracker=resource_tracker,
                 )
                 if (
@@ -12581,6 +13185,7 @@ printf '%s\n' "$trusted_uv"
                     by_kind["compare"][0],
                     expected_kind="compare",
                     expected_url=f"{api_root}/compare/{base_oid}...{head}",
+                    response_shape="direct-object",
                     resource_tracker=resource_tracker,
                 )
                 if (
@@ -12591,6 +13196,7 @@ printf '%s\n' "$trusted_uv"
                     return None
                 compare_record = compare_records[0]
                 base_commit = compare_record.get("base_commit")
+                head_commit = compare_record.get("head_commit")
                 merge_base_commit = compare_record.get("merge_base_commit")
                 merge_base = (
                     merge_base_commit.get("sha")
@@ -12600,6 +13206,8 @@ printf '%s\n' "$trusted_uv"
                 if (
                     not isinstance(base_commit, dict)
                     or base_commit.get("sha") != base_oid
+                    or not isinstance(head_commit, dict)
+                    or head_commit.get("sha") != head
                     or not isinstance(merge_base, str)
                     or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
                 ):
@@ -12645,6 +13253,15 @@ printf '%s\n' "$trusted_uv"
                 assert review_records is not None
                 assert inline_records is not None
                 assert thread_nodes is not None
+                feed_request_records = {
+                    request_id: raw_record
+                    for request_id, (
+                        feed_pr,
+                        raw_record,
+                    ) in recent_request_by_id.items()
+                    if feed_pr == pr
+                }
+                matched_feed_request_ids: set[int] = set()
 
                 def raw_actor(value: object) -> str:
                     if not isinstance(value, dict):
@@ -12676,6 +13293,17 @@ printf '%s\n' "$trusted_uv"
                 nonterminal_records: list[tuple[str, int, int | None, str]] = []
                 seen_issue_ids: set[int] = set()
                 for raw_issue in issue_records:
+                    raw_issue_id = (
+                        raw_issue.get("id") if isinstance(raw_issue, dict) else None
+                    )
+                    expected_feed_record = feed_request_records.get(raw_issue_id)
+                    if expected_feed_record is not None:
+                        if (
+                            raw_issue_id in matched_feed_request_ids
+                            or not typed_json_equal(raw_issue, expected_feed_record)
+                        ):
+                            return None
+                        matched_feed_request_ids.add(raw_issue_id)
                     projected_issue = project_raw_issue_record(raw_issue)
                     if projected_issue is None:
                         return None
@@ -12794,6 +13422,8 @@ printf '%s\n' "$trusted_uv"
                         ):
                             return None
                         issue_artifacts.append(projected_issue)
+                if matched_feed_request_ids != set(feed_request_records):
+                    return None
 
                 reaction_records: list[dict[str, object]] = []
                 reaction_fetches = by_kind.get("request_reactions", [])
@@ -13477,6 +14107,12 @@ printf '%s\n' "$trusted_uv"
                             request_id: clone(request_record)
                             for request_id, request_record in request_records.items()
                         },
+                        "feed_request_ids": (
+                            None
+                            if _single_scope_pull_number is not None
+                            or parsed_scope == current_scope_key
+                            else sorted(feed_request_records)
+                        ),
                         "provider_reactions": list(provider_reactions),
                         "reaction_records": [
                             clone(reaction_record)
@@ -13515,6 +14151,7 @@ printf '%s\n' "$trusted_uv"
             return {
                 "raw_semantic_dataset_version": 1,
                 "transcript_sha256": transcript_digest,
+                "scope_discovery_projection": clone(scope_discovery_projection),
                 "scopes": raw_semantic_scopes,
             }
 
@@ -13579,12 +14216,23 @@ printf '%s\n' "$trusted_uv"
         ) -> tuple[bool, tuple[int, int, int, str] | None]:
             request_times = raw_scope.get("request_times")
             provider_reactions = raw_scope.get("provider_reactions")
-            if not isinstance(request_times, dict) or not isinstance(
-                provider_reactions, list
+            feed_request_ids = raw_scope.get("feed_request_ids")
+            if (
+                not isinstance(request_times, dict)
+                or not isinstance(provider_reactions, list)
+                or (
+                    feed_request_ids is not None
+                    and (
+                        not isinstance(feed_request_ids, list)
+                        or any(
+                            type(request_id) is not int
+                            for request_id in feed_request_ids
+                        )
+                        or len(set(feed_request_ids)) != len(feed_request_ids)
+                    )
+                )
             ):
                 return (False, None)
-            if not provider_reactions:
-                return (True, None)
             if any(
                 type(request_id) is not int
                 or type(request_time) is not int
@@ -13604,18 +14252,53 @@ printf '%s\n' "$trusted_uv"
                 for item in provider_reactions
             ):
                 return (False, None)
-            if not request_times:
+            eligible_provider_reactions = list(provider_reactions)
+            eligible_request_ids: set[int]
+            if feed_request_ids is not None:
+                if any(
+                    request_id not in request_times for request_id in feed_request_ids
+                ):
+                    return (False, None)
+                eligible_request_ids = {
+                    request_id
+                    for request_id in feed_request_ids
+                    if history_start_exclusive
+                    < request_times[request_id]
+                    <= history_as_of_server_time
+                }
+                eligible_provider_reactions = []
+                for item in provider_reactions:
+                    if (
+                        request_times[item[2]] <= history_start_exclusive
+                        or item[0] <= history_start_exclusive
+                    ):
+                        continue
+                    if (
+                        item[0] > history_as_of_server_time
+                        or item[2] not in feed_request_ids
+                    ):
+                        return (False, None)
+                    eligible_provider_reactions.append(item)
+            else:
+                eligible_request_ids = {item[2] for item in eligible_provider_reactions}
+            if not eligible_provider_reactions:
+                return (not eligible_request_ids, None)
+            if not eligible_request_ids:
                 return (False, None)
-            selected_reaction = max(provider_reactions)
-            latest_request_time = max(request_times.values())
+            selected_reaction = max(eligible_provider_reactions)
+            latest_request_time = max(
+                request_times[request_id] for request_id in eligible_request_ids
+            )
             latest_request_ids = [
                 request_id
-                for request_id, server_time in request_times.items()
+                for request_id in eligible_request_ids
+                if (server_time := request_times[request_id])
                 if server_time == latest_request_time
             ]
             if (
                 len(latest_request_ids) != 1
                 or selected_reaction[2] != latest_request_ids[0]
+                or selected_reaction[3] != "+1"
             ):
                 return (False, None)
             return (True, selected_reaction)
@@ -13803,6 +14486,7 @@ printf '%s\n' "$trusted_uv"
                 != {
                     "raw_semantic_dataset_version",
                     "transcript_sha256",
+                    "scope_discovery_projection",
                     "scopes",
                 }
                 or raw_dataset.get("raw_semantic_dataset_version") != 1
@@ -13966,6 +14650,9 @@ printf '%s\n' "$trusted_uv"
                     projected_audits,
                     key=lambda item: int(item["scope_key"][1]),
                 )
+                endpoint_result["scope_discovery_projection"] = clone(
+                    raw_dataset["scope_discovery_projection"]
+                )
                 return endpoint_result
 
             context_parts = inventory_validation_context_parts(
@@ -14010,6 +14697,7 @@ printf '%s\n' "$trusted_uv"
                 lifecycle = raw_scope.get("lifecycle")
                 request_times = raw_scope.get("request_times")
                 request_records = raw_scope.get("request_records")
+                feed_request_ids = raw_scope.get("feed_request_ids")
                 provider_reactions = raw_scope.get("provider_reactions")
                 reaction_records = raw_scope.get("reaction_records")
                 artifact_bases = raw_scope.get("artifact_bases")
@@ -14025,6 +14713,17 @@ printf '%s\n' "$trusted_uv"
                     or not isinstance(lifecycle, dict)
                     or not isinstance(request_times, dict)
                     or not isinstance(request_records, dict)
+                    or (
+                        feed_request_ids is not None
+                        and (
+                            not isinstance(feed_request_ids, list)
+                            or any(
+                                type(request_id) is not int
+                                for request_id in feed_request_ids
+                            )
+                            or len(set(feed_request_ids)) != len(feed_request_ids)
+                        )
+                    )
                     or not isinstance(provider_reactions, list)
                     or not isinstance(reaction_records, list)
                     or not isinstance(artifact_bases, list)
@@ -14067,6 +14766,32 @@ printf '%s\n' "$trusted_uv"
                     for item in provider_reactions
                     if item[2] in current_request_times
                 ]
+                eligible_current_provider_reactions = list(current_provider_reactions)
+                eligible_exact_request_ids = {
+                    item[2] for item in eligible_current_provider_reactions
+                }
+                if feed_request_ids is not None:
+                    eligible_exact_request_ids = {
+                        request_id
+                        for request_id in feed_request_ids
+                        if request_id in current_request_times
+                        and history_start_exclusive
+                        < current_request_times[request_id]
+                        <= history_as_of_server_time
+                    }
+                    eligible_current_provider_reactions = []
+                    for item in current_provider_reactions:
+                        if (
+                            request_times[item[2]] <= history_start_exclusive
+                            or item[0] <= history_start_exclusive
+                        ):
+                            continue
+                        if (
+                            item[0] > history_as_of_server_time
+                            or item[2] not in feed_request_ids
+                        ):
+                            return None
+                        eligible_current_provider_reactions.append(item)
                 request_scope_kinds: dict[int, str] = {}
                 for request_id in request_times:
                     binding = request_receipt_bindings.get(request_id)
@@ -14118,11 +14843,8 @@ printf '%s\n' "$trusted_uv"
                     source_ordering_key = None
                     source_evidence = None
                 else:
-                    if not current_provider_reactions:
-                        if any(
-                            request_scope_kinds[request_id] != "old-epoch"
-                            for request_id in request_times
-                        ):
+                    if not eligible_current_provider_reactions:
+                        if eligible_exact_request_ids:
                             return None
                         if request_times:
                             request_receipt_closure_required = True
@@ -14140,12 +14862,12 @@ printf '%s\n' "$trusted_uv"
                         continue
                     if any(
                         item[0] <= request_times[item[2]]
-                        for item in current_provider_reactions
+                        for item in eligible_current_provider_reactions
                     ):
                         return None
                     if any(
                         item[3] not in ("+1", "eyes")
-                        for item in current_provider_reactions
+                        for item in eligible_current_provider_reactions
                     ):
                         return None
                     if (
@@ -14154,16 +14876,21 @@ printf '%s\n' "$trusted_uv"
                         or set(request_receipt_bindings) != set(request_times)
                     ):
                         return None
-                    selected_reaction = max(current_provider_reactions)
-                    latest_request_time = max(current_request_times.values())
+                    selected_reaction = max(eligible_current_provider_reactions)
+                    latest_request_time = max(
+                        current_request_times[request_id]
+                        for request_id in eligible_exact_request_ids
+                    )
                     latest_request_ids = [
                         request_id
-                        for request_id, server_time in current_request_times.items()
+                        for request_id in eligible_exact_request_ids
+                        if (server_time := current_request_times[request_id])
                         if server_time == latest_request_time
                     ]
                     if (
                         len(latest_request_ids) != 1
                         or selected_reaction[2] != latest_request_ids[0]
+                        or selected_reaction[3] != "+1"
                     ):
                         return None
                     source_ordering_key = [
@@ -14331,6 +15058,9 @@ printf '%s\n' "$trusted_uv"
                 return None
             return {
                 "entries": entries,
+                "scope_discovery_projection": clone(
+                    raw_dataset["scope_discovery_projection"]
+                ),
                 "scope_authority_audit": sorted(
                     scope_authority_audit,
                     key=lambda item: int(item["scope_key"][1]),
@@ -14401,7 +15131,7 @@ printf '%s\n' "$trusted_uv"
                     or set(value)
                     != {"schema_version", "repository", "scope_discovery", "scopes"}
                     or type(value.get("schema_version")) is not int
-                    or value.get("schema_version") != 3
+                    or value.get("schema_version") != 4
                     or type(value.get("repository")) is not str
                     or value.get("repository") != current_repository
                     or type(_single_scope_pull_number) is not int
@@ -14554,6 +15284,11 @@ printf '%s\n' "$trusted_uv"
                 "pagination": clone(required_universe_pagination),
                 "discovery_endpoint_transcript": transcript,
                 "request_scope_receipts": request_scope_receipts,
+                "scope_discovery_projection": (
+                    clone(projection["scope_discovery_projection"])
+                    if isinstance(projection, dict)
+                    else None
+                ),
                 "scope_classifications": scope_classifications,
                 "entries": derived_inventory_entries(
                     candidates,
@@ -14719,7 +15454,7 @@ printf '%s\n' "$trusted_uv"
                 return None
             fetches = value["fetches"]
             transcript = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "repository": current_repository,
                 "scope_discovery": None,
                 "scopes": [
@@ -15023,6 +15758,7 @@ printf '%s\n' "$trusted_uv"
                 "pagination",
                 "discovery_endpoint_transcript",
                 "request_scope_receipts",
+                "scope_discovery_projection",
                 "scope_classifications",
                 "entries",
             }
@@ -15055,6 +15791,9 @@ printf '%s\n' "$trusted_uv"
                 if not isinstance(projection, dict):
                     return None
                 transcript_entries = projection.get("entries")
+                raw_scope_discovery_projection = projection.get(
+                    "scope_discovery_projection"
+                )
                 raw_scope_classifications = projection.get("scope_classifications")
                 if not isinstance(transcript_entries, list) or not isinstance(
                     raw_scope_classifications, list
@@ -15093,6 +15832,10 @@ printf '%s\n' "$trusted_uv"
                 ]
                 if (
                     not typed_json_equal(
+                        value.get("scope_discovery_projection"),
+                        raw_scope_discovery_projection,
+                    )
+                    or not typed_json_equal(
                         value.get("scope_classifications"),
                         raw_scope_classifications,
                     )
@@ -15759,6 +16502,7 @@ printf '%s\n' "$trusted_uv"
                 "pagination",
                 "discovery_endpoint_transcript",
                 "request_scope_receipts",
+                "scope_discovery_projection",
                 "scope_classifications",
                 "entries",
             }
@@ -15856,6 +16600,7 @@ printf '%s\n' "$trusted_uv"
                         "transcript_sha256",
                         "sidecar_blind_scope_summaries",
                         "sidecar_blind_authority_audit",
+                        "scope_discovery_projection",
                     }
                     or endpoint_result.get("endpoint_complete") is not True
                     or not isinstance(endpoint_result.get("transcript_sha256"), str)
@@ -15871,6 +16616,14 @@ printf '%s\n' "$trusted_uv"
                     or not isinstance(
                         endpoint_result.get("sidecar_blind_authority_audit"),
                         list,
+                    )
+                    or not isinstance(
+                        endpoint_result.get("scope_discovery_projection"),
+                        dict,
+                    )
+                    or not typed_json_equal(
+                        inventory.get("scope_discovery_projection"),
+                        endpoint_result["scope_discovery_projection"],
                     )
                 ):
                     return None
@@ -16176,6 +16929,9 @@ printf '%s\n' "$trusted_uv"
                         candidate_mapping_available = False
                 audit_summary = {
                     "candidate_projections": candidate_projections,
+                    "scope_discovery_projection": clone(
+                        endpoint_result["scope_discovery_projection"]
+                    ),
                     "scope_classifications": clone(scope_classifications),
                     "raw_scope_summaries": clone(raw_scope_summaries),
                     "raw_authority_audit": [
@@ -18929,8 +19685,8 @@ printf '%s\n' "$trusted_uv"
         exact_current_resource_limits = tightened_resource_limits(
             max_seeded_pull_requests=1,
             max_controlled_requests=1,
-            max_fetch_attempts=8,
-            max_retained_pages=8,
+            max_fetch_attempts=9,
+            max_retained_pages=9,
             max_records=6,
         )
         self.assertIsNotNone(
@@ -18941,8 +19697,8 @@ printf '%s\n' "$trusted_uv"
             )
         )
         for limit_name, overflow_value in (
-            ("max_fetch_attempts", 7),
-            ("max_retained_pages", 7),
+            ("max_fetch_attempts", 8),
+            ("max_retained_pages", 8),
             ("max_records", 5),
         ):
             overflow_limits = clone(exact_current_resource_limits)
@@ -20662,18 +21418,19 @@ printf '%s\n' "$trusted_uv"
         complete_scope_transcript = complete_scope_history["initial_inventory"][
             "discovery_endpoint_transcript"
         ]
-        complete_scope_roots = parse_rest_pages(
-            complete_scope_transcript["scope_discovery"],
-            expected_kind="repository_pull_requests",
+        complete_scope_roots_result = parse_recent_pull_discovery(
+            complete_scope_transcript["scope_discovery"]["recent_pull_requests"],
             expected_url=(
                 f"https://api.github.com/repos/{current_repository}/pulls"
-                "?state=all&sort=created&direction=asc&per_page=100"
+                "?state=all&sort=updated&direction=desc&per_page=100"
             ),
+            resource_tracker=new_resource_tracker(),
         )
-        self.assertIsNotNone(complete_scope_roots)
-        assert complete_scope_roots is not None
+        self.assertIsNotNone(complete_scope_roots_result)
+        assert complete_scope_roots_result is not None
+        complete_scope_roots = complete_scope_roots_result[0]
         self.assertEqual(
-            {record["number"] for record in complete_scope_roots},
+            set(complete_scope_roots),
             {current_pr, 2, 3, 4, 5, declaration_pr},
         )
         self.assertEqual(len(complete_scope_transcript["scopes"]), 6)
@@ -20686,6 +21443,600 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIsNotNone(complete_scope_projection)
         assert isinstance(complete_scope_projection, dict)
+        complete_discovery_projection = complete_scope_projection[
+            "scope_discovery_projection"
+        ]
+        self.assertEqual(
+            complete_discovery_projection["anchors"],
+            {
+                "current_pull_number": current_pr,
+                "declaration_pull_number": declaration_pr,
+            },
+        )
+        self.assertEqual(
+            complete_discovery_projection["union_pull_numbers"],
+            [current_pr, 2, 3, 4, 5, declaration_pr],
+        )
+
+        def synthetic_pull_discovery_record(
+            pull_number: int,
+            updated_at: int,
+        ) -> dict[str, object]:
+            return {
+                "number": pull_number,
+                "url": (
+                    "https://api.github.com/repos/"
+                    f"{current_repository}/pulls/{pull_number}"
+                ),
+                "base": {"sha": f"{pull_number + 100_000:040x}"},
+                "head": {"sha": f"{pull_number + 200_000:040x}"},
+                "updated_at": _format_github_rfc3339_seconds(updated_at),
+            }
+
+        complete_raw_scopes = [clone(candidate) for candidate in samples] + [
+            clone(current),
+            clone(human_only_scope),
+            provider_declaration_scope(),
+        ]
+        cumulative_old_pull_records = [
+            synthetic_pull_discovery_record(
+                10_000 + offset,
+                history_start_exclusive - offset,
+            )
+            for offset in range(1, 514)
+        ]
+        cumulative_old_transcript = build_discovery_endpoint_transcript(
+            complete_raw_scopes,
+            _repository_historical_pull_records=cumulative_old_pull_records,
+        )
+        cumulative_old_pull_fetch = cumulative_old_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]
+        self.assertEqual(len(cumulative_old_pull_fetch["pages"]), 1)
+        self.assertIn(
+            'rel="next"', cumulative_old_pull_fetch["pages"][0]["link_header"]
+        )
+        cumulative_old_projection = parse_discovery_endpoint_transcript(
+            cumulative_old_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                complete_raw_scopes
+            ),
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(cumulative_old_projection)
+        assert isinstance(cumulative_old_projection, dict)
+        self.assertEqual(
+            cumulative_old_projection["scope_discovery_projection"]["stop_reason"],
+            "window-boundary-complete",
+        )
+        self.assertEqual(
+            cumulative_old_projection["scope_discovery_projection"][
+                "union_pull_numbers"
+            ],
+            [current_pr, 2, 3, 4, 5, declaration_pr],
+        )
+
+        boundary_with_complete_relations = clone(cumulative_old_transcript)
+        assert isinstance(boundary_with_complete_relations, dict)
+        boundary_page = boundary_with_complete_relations["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        canonical_next = (
+            f"https://api.github.com/repos/{current_repository}/pulls"
+            "?state=all&sort=updated&direction=desc&per_page=100&page=2"
+        )
+        canonical_last_page_10 = (
+            f"https://api.github.com/repos/{current_repository}/pulls"
+            "?state=all&sort=updated&direction=desc&per_page=100&page=10"
+        )
+        boundary_page["link_header"] = (
+            f'<{canonical_next}>; rel="next", <{canonical_last_page_10}>; rel="last"'
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                boundary_with_complete_relations,
+                request_scope_receipts=request_scope_receipts_for_scopes(
+                    complete_raw_scopes
+                ),
+                provider_declaration=declaration,
+            )
+        )
+
+        recent_pull_url = (
+            f"https://api.github.com/repos/{current_repository}/pulls"
+            "?state=all&sort=updated&direction=desc&per_page=100"
+        )
+        canonical_page_2 = f"{recent_pull_url}&page=2"
+        canonical_page_3 = f"{recent_pull_url}&page=3"
+        for (
+            omitted_last_kind,
+            first_page_last_url,
+            second_page_updated_at,
+            second_page_link_header,
+        ) in (
+            (
+                "natural-end",
+                canonical_page_3,
+                history_as_of_server_time - 2,
+                None,
+            ),
+            (
+                "boundary-next",
+                canonical_page_2,
+                history_start_exclusive,
+                f'<{canonical_page_3}>; rel="next"',
+            ),
+        ):
+            omitted_last_fetch = {
+                "kind": "recent_pull_requests",
+                "transport": "rest",
+                "parent_comment_id": None,
+                "pages": [
+                    raw_page(
+                        request_url=recent_pull_url,
+                        body=[
+                            synthetic_pull_discovery_record(
+                                20_001,
+                                history_as_of_server_time - 1,
+                            )
+                        ],
+                        link_header=(
+                            f'<{canonical_page_2}>; rel="next", '
+                            f'<{first_page_last_url}>; rel="last"'
+                        ),
+                    ),
+                    raw_page(
+                        request_url=canonical_page_2,
+                        body=[
+                            synthetic_pull_discovery_record(
+                                20_002,
+                                second_page_updated_at,
+                            )
+                        ],
+                        link_header=second_page_link_header,
+                    ),
+                ],
+            }
+            with self.subTest(recent_pull_omitted_last=omitted_last_kind):
+                self.assertIsNone(
+                    parse_recent_pull_discovery(
+                        omitted_last_fetch,
+                        expected_url=recent_pull_url,
+                        resource_tracker=new_resource_tracker(),
+                    )
+                )
+
+        for contradictory_last_kind, contradictory_last_url in {
+            "natural-end-claims-future-page": canonical_next,
+            "next-points-after-last": (
+                f"https://api.github.com/repos/{current_repository}/pulls"
+                "?state=all&sort=updated&direction=desc&per_page=100"
+            ),
+        }.items():
+            contradictory_last = clone(
+                complete_scope_transcript
+                if contradictory_last_kind == "natural-end-claims-future-page"
+                else cumulative_old_transcript
+            )
+            assert isinstance(contradictory_last, dict)
+            contradictory_page = contradictory_last["scope_discovery"][
+                "recent_pull_requests"
+            ]["pages"][0]
+            if contradictory_last_kind == "natural-end-claims-future-page":
+                contradictory_page["link_header"] = (
+                    f'<{contradictory_last_url}>; rel="last"'
+                )
+            else:
+                contradictory_page["link_header"] = (
+                    f'<{canonical_next}>; rel="next", '
+                    f'<{contradictory_last_url}>; rel="last"'
+                )
+            with self.subTest(recent_pull_last=contradictory_last_kind):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        contradictory_last,
+                        request_scope_receipts=request_scope_receipts_for_scopes(
+                            complete_raw_scopes
+                        ),
+                        provider_declaration=declaration,
+                    )
+                )
+
+        float_status_pull_discovery = clone(complete_scope_transcript)
+        assert isinstance(float_status_pull_discovery, dict)
+        float_status_pull_discovery["scope_discovery"]["recent_pull_requests"]["pages"][
+            0
+        ]["status"] = 200.0
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                float_status_pull_discovery,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        next_without_boundary = clone(complete_scope_transcript)
+        assert isinstance(next_without_boundary, dict)
+        next_without_boundary_page = next_without_boundary["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][-1]
+        next_without_boundary_page["link_header"] = f'<{canonical_next}>; rel="next"'
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                next_without_boundary,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        for malformed_kind in ("order", "timestamp"):
+            malformed_recent_order = clone(complete_scope_transcript)
+            assert isinstance(malformed_recent_order, dict)
+            malformed_page = malformed_recent_order["scope_discovery"][
+                "recent_pull_requests"
+            ]["pages"][0]
+            malformed_records = strict_json_loads(malformed_page["body_utf8"])
+            assert isinstance(malformed_records, list)
+            if malformed_kind == "order":
+                malformed_records[1]["updated_at"] = _format_github_rfc3339_seconds(
+                    history_as_of_server_time
+                )
+            else:
+                malformed_records[0]["updated_at"] = "not-rfc3339"
+            replace_raw_json_body(
+                malformed_page,
+                canonical_raw_body(malformed_records),
+            )
+            with self.subTest(recent_pull_discovery=malformed_kind):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        malformed_recent_order,
+                        request_scope_receipts=complete_scope_history[
+                            "initial_inventory"
+                        ]["request_scope_receipts"],
+                        provider_declaration=declaration,
+                    )
+                )
+
+        old_updated_request_scope = sample(2)
+        request_seed_raw_scopes = [
+            old_updated_request_scope,
+            clone(current),
+            provider_declaration_scope(),
+        ]
+        request_seed_transcript = build_discovery_endpoint_transcript(
+            request_seed_raw_scopes,
+            _pull_updated_at_by_pr={2: history_start_exclusive},
+        )
+        request_seed_receipts = request_scope_receipts_for_scopes(
+            request_seed_raw_scopes
+        )
+        request_seed_projection = parse_discovery_endpoint_transcript(
+            request_seed_transcript,
+            request_scope_receipts=request_seed_receipts,
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(request_seed_projection)
+        assert isinstance(request_seed_projection, dict)
+        request_seed_discovery = request_seed_projection["scope_discovery_projection"]
+        self.assertNotIn(
+            2,
+            {
+                item["pull_number"]
+                for item in request_seed_discovery["recent_pull_requests"]
+            },
+        )
+        self.assertIn(
+            2,
+            {
+                item["pull_number"]
+                for item in request_seed_discovery["recent_request_comments"]
+            },
+        )
+        self.assertIn(2, request_seed_discovery["union_pull_numbers"])
+
+        malicious_request_next = clone(request_seed_transcript)
+        assert isinstance(malicious_request_next, dict)
+        malicious_request_feed = malicious_request_next["scope_discovery"][
+            "recent_request_comments"
+        ]
+        malicious_request_page = malicious_request_feed["pages"][0]
+        malicious_next_url = (
+            f"https://api.github.com/repos/{current_repository}/issues/comments"
+            "?sort=created&direction=asc&since=1970-01-01T00:00:00Z"
+            "&per_page=1&page=2"
+        )
+        malicious_request_page["link_header"] = f'<{malicious_next_url}>; rel="next"'
+        malicious_request_feed["pages"].append(
+            raw_page(request_url=malicious_next_url, body=[])
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                malicious_request_next,
+                request_scope_receipts=request_seed_receipts,
+                provider_declaration=declaration,
+            )
+        )
+
+        for request_feed_failure in ("missing", "mismatch", "incomplete"):
+            invalid_request_feed = clone(request_seed_transcript)
+            assert isinstance(invalid_request_feed, dict)
+            request_feed = invalid_request_feed["scope_discovery"][
+                "recent_request_comments"
+            ]
+            request_page = request_feed["pages"][0]
+            if request_feed_failure == "missing":
+                replace_raw_json_body(request_page, "[]")
+            elif request_feed_failure == "mismatch":
+                request_body = strict_json_loads(request_page["body_utf8"])
+                assert isinstance(request_body, list)
+                request_body[0]["feed_only_field"] = True
+                replace_raw_json_body(
+                    request_page,
+                    canonical_raw_body(request_body),
+                )
+            else:
+                request_page["link_header"] = (
+                    "<https://api.github.com/repos/OWNER/REPO/issues/comments"
+                    "?sort=updated&direction=desc&since="
+                    f"{_format_github_rfc3339_seconds(history_start_exclusive)}"
+                    '&per_page=100&page=2>; rel="next"'
+                )
+            with self.subTest(recent_request_feed=request_feed_failure):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_request_feed,
+                        request_scope_receipts=request_seed_receipts,
+                        provider_declaration=declaration,
+                    )
+                )
+
+        pending_only_scope = sample(6)
+        pending_only_scope["reactions"] = []
+        pending_only_scope["selected_request_id"] = None
+        pending_only_scope["selected_reaction_id"] = None
+        pending_only_scope["candidate_basis"] = None
+        restamp(pending_only_scope)
+
+        old_plus_newer_pending_scope = sample(6)
+        existing_reaction_time = old_plus_newer_pending_scope["reactions"][0][
+            "created_at"
+        ]
+        assert type(existing_reaction_time) is int
+        newer_pending_request = request(
+            60_006,
+            existing_reaction_time + 1,
+            pr=6,
+        )
+        add_scoped_request(
+            old_plus_newer_pending_scope,
+            newer_pending_request,
+            request_scope_receipt(
+                newer_pending_request,
+                old_plus_newer_pending_scope["scope"],
+            ),
+        )
+        restamp(old_plus_newer_pending_scope)
+
+        for pending_history_kind, pending_scope in {
+            "pending-only": pending_only_scope,
+            "old-plus-one-newer-pending": old_plus_newer_pending_scope,
+        }.items():
+            pending_raw_scopes = [
+                clone(pending_scope),
+                clone(current),
+                provider_declaration_scope(),
+            ]
+            pending_transcript = build_discovery_endpoint_transcript(pending_raw_scopes)
+            pending_receipts = request_scope_receipts_for_scopes(pending_raw_scopes)
+            with self.subTest(
+                historical_pending=pending_history_kind,
+                projection="full",
+            ):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        pending_transcript,
+                        request_scope_receipts=pending_receipts,
+                        provider_declaration=declaration,
+                    )
+                )
+            with self.subTest(
+                historical_pending=pending_history_kind,
+                projection="sidecar-blind",
+            ):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        pending_transcript,
+                        request_scope_receipts=None,
+                        provider_declaration=declaration,
+                        _endpoint_plane_only=True,
+                        _sidecar_blind_audit=True,
+                    )
+                )
+
+        recent_union_overflow_records = [
+            synthetic_pull_discovery_record(
+                20_000 + offset,
+                history_as_of_server_time - 1,
+            )
+            for offset in range(512)
+        ]
+        recent_union_overflow = build_discovery_endpoint_transcript(
+            [clone(current)],
+            _repository_historical_pull_records=recent_union_overflow_records,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                recent_union_overflow,
+                request_scope_receipts=request_scope_receipts_for_scopes([current]),
+            )
+        )
+
+        anchor_missing = clone(complete_scope_transcript)
+        assert isinstance(anchor_missing, dict)
+        anchor_missing["scope_discovery"]["anchors"]["declaration_pull_number"] = None
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                anchor_missing,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        scope_projection_drift = clone(complete_scope_history)
+        assert isinstance(scope_projection_drift, dict)
+        scope_projection_drift["final_inventory"]["scope_discovery_projection"][
+            "stop_reason"
+        ] = "window-boundary-complete"
+        self.assertIsNone(validate_history_universe(scope_projection_drift))
+
+        pull_query_url = clone(complete_scope_transcript)
+        assert isinstance(pull_query_url, dict)
+        current_scope_fetches = next(
+            scope["fetches"]
+            for scope in pull_query_url["scopes"]
+            if scope.get("pull_number") == current_pr
+        )
+        current_pull_fetch = next(
+            fetch
+            for fetch in current_scope_fetches
+            if fetch.get("kind") == "pull_requests"
+        )
+        current_pull_fetch["pages"][0]["request_url"] += "?per_page=100"
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                pull_query_url,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        for direct_kind in ("pull_requests", "compare"):
+            for direct_shape_attack in (
+                "list-wrapped-single-page",
+                "empty-first-arbitrary-next-list-wrapped-second",
+            ):
+                invalid_direct_shape = clone(complete_scope_transcript)
+                assert isinstance(invalid_direct_shape, dict)
+                direct_fetches = next(
+                    scope["fetches"]
+                    for scope in invalid_direct_shape["scopes"]
+                    if scope.get("pull_number") == current_pr
+                )
+                direct_fetch = next(
+                    fetch
+                    for fetch in direct_fetches
+                    if fetch.get("kind") == direct_kind
+                )
+                direct_page = direct_fetch["pages"][0]
+                direct_body = strict_json_loads(direct_page["body_utf8"])
+                assert isinstance(direct_body, dict)
+                if direct_shape_attack == "list-wrapped-single-page":
+                    replace_raw_json_body(
+                        direct_page,
+                        canonical_raw_body([direct_body]),
+                    )
+                else:
+                    arbitrary_next_url = (
+                        f"https://api.github.com/repos/{current_repository}/"
+                        f"arbitrary/{direct_kind}?page=2"
+                    )
+                    replace_raw_json_body(direct_page, "[]")
+                    direct_page["link_header"] = f'<{arbitrary_next_url}>; rel="next"'
+                    direct_fetch["pages"].append(
+                        raw_page(
+                            request_url=arbitrary_next_url,
+                            body=[direct_body],
+                        )
+                    )
+                with self.subTest(
+                    direct_endpoint=direct_kind,
+                    response_shape=direct_shape_attack,
+                ):
+                    self.assertIsNone(
+                        parse_discovery_endpoint_transcript(
+                            invalid_direct_shape,
+                            request_scope_receipts=complete_scope_history[
+                                "initial_inventory"
+                            ]["request_scope_receipts"],
+                            provider_declaration=declaration,
+                        )
+                    )
+
+        for compare_failure in ("missing", "mismatch"):
+            invalid_compare = clone(complete_scope_transcript)
+            assert isinstance(invalid_compare, dict)
+            current_fetches = next(
+                scope["fetches"]
+                for scope in invalid_compare["scopes"]
+                if scope.get("pull_number") == current_pr
+            )
+            compare_fetch = next(
+                fetch for fetch in current_fetches if fetch.get("kind") == "compare"
+            )
+            compare_page = compare_fetch["pages"][0]
+            compare_body = strict_json_loads(compare_page["body_utf8"])
+            assert isinstance(compare_body, dict)
+            if compare_failure == "missing":
+                compare_body.pop("head_commit")
+            else:
+                compare_body["head_commit"]["sha"] = "e" * 40
+            replace_raw_json_body(compare_page, canonical_raw_body(compare_body))
+            with self.subTest(raw_compare_head=compare_failure):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_compare,
+                        request_scope_receipts=complete_scope_history[
+                            "initial_inventory"
+                        ]["request_scope_receipts"],
+                        provider_declaration=declaration,
+                    )
+                )
+
+        for sidecar_compare_failure in ("missing", "mismatch"):
+            invalid_sidecars = clone(
+                complete_scope_history["initial_inventory"]["request_scope_receipts"]
+            )
+            assert isinstance(invalid_sidecars, list)
+            compare_receipt = invalid_sidecars[0]["pre_request_scope_receipts"][
+                "compare"
+            ]
+            compare_body = strict_json_loads(compare_receipt["body_utf8"])
+            assert isinstance(compare_body, dict)
+            if sidecar_compare_failure == "missing":
+                compare_body.pop("head_commit")
+            else:
+                compare_body["head_commit"]["sha"] = "d" * 40
+            compare_receipt["body_utf8"] = canonical_raw_body(compare_body)
+            compare_receipt["body_sha256"] = hashlib.sha256(
+                compare_receipt["body_utf8"].encode("utf-8")
+            ).hexdigest()
+            with self.subTest(request_sidecar_compare_head=sidecar_compare_failure):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        complete_scope_transcript,
+                        request_scope_receipts=invalid_sidecars,
+                        provider_declaration=declaration,
+                    )
+                )
+
+        readme_contract = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "fully paginated exact-provider selected-review target-child set",
+            readme_contract,
+        )
+        self.assertNotIn(
+            "fully paginated associated inline set is present and empty",
+            readme_contract,
+        )
         declaration_scope_transcript = next(
             item
             for item in complete_scope_transcript["scopes"]
@@ -21045,13 +22396,36 @@ printf '%s\n' "$trusted_uv"
         current_exact_pending = clone(current)
         assert isinstance(current_exact_pending, dict)
         current_exact_pending["reactions"] = []
-        self.assertIsNone(
-            parse_discovery_endpoint_transcript(
-                build_discovery_endpoint_transcript([current_exact_pending]),
-                request_scope_receipts=request_scope_receipts_for_scopes(
-                    [current_exact_pending]
-                ),
-            )
+        current_exact_pending_projection = parse_discovery_endpoint_transcript(
+            build_discovery_endpoint_transcript([current_exact_pending]),
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                [current_exact_pending]
+            ),
+        )
+        self.assertIsNotNone(current_exact_pending_projection)
+        assert isinstance(current_exact_pending_projection, dict)
+        self.assertEqual(current_exact_pending_projection["entries"], [])
+        self.assertEqual(
+            current_exact_pending_projection["scope_classifications"][0][
+                "classification"
+            ],
+            "current",
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                history(samples, current_raw=current_exact_pending),
+                current_exact_pending,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                history(samples, current_raw=current_exact_pending),
+                current_exact_pending,
+            ),
+            "unknown",
         )
 
         current_same_head_different_base = clone(current)
@@ -24553,7 +25927,7 @@ printf '%s\n' "$trusted_uv"
         single_scope_receipts = current_detail_inventory["request_scope_receipts"]
         assert isinstance(single_scope_fetches, list)
         single_scope_scaffold = {
-            "schema_version": 3,
+            "schema_version": 4,
             "repository": current_repository,
             "scope_discovery": None,
             "scopes": [
@@ -24687,9 +26061,9 @@ printf '%s\n' "$trusted_uv"
             assert isinstance(malformed_scaffold, dict)
             malformed_scaffold["scopes"][0]["fetches"] = single_scope_fetches
             if scaffold_mutation == "schema-version":
-                malformed_scaffold["schema_version"] = 4
+                malformed_scaffold["schema_version"] = 5
             elif scaffold_mutation == "schema-version-float-alias":
-                malformed_scaffold["schema_version"] = 3.0
+                malformed_scaffold["schema_version"] = 4.0
             elif scaffold_mutation == "repository":
                 malformed_scaffold["repository"] = "other/repository"
             elif scaffold_mutation == "top-level-field":
@@ -27167,13 +28541,22 @@ printf '%s\n' "$trusted_uv"
             "unused-sidecar-unavailable",
         )
 
-        semantically_stable_raw_history = clone(terminal_sidecar_blind_history)
-        assert isinstance(semantically_stable_raw_history, dict)
-        final_raw_transcript = semantically_stable_raw_history["final_inventory"][
+        sidecar_blind_projection_drift = clone(terminal_sidecar_blind_history)
+        assert isinstance(sidecar_blind_projection_drift, dict)
+        sidecar_blind_projection_drift["final_inventory"]["scope_discovery_projection"][
+            "stop_reason"
+        ] = "window-boundary-complete"
+        self.assertIsNone(
+            validate_history_universe_result(sidecar_blind_projection_drift)
+        )
+
+        scope_source_digest_drift_history = clone(terminal_sidecar_blind_history)
+        assert isinstance(scope_source_digest_drift_history, dict)
+        final_raw_transcript = scope_source_digest_drift_history["final_inventory"][
             "discovery_endpoint_transcript"
         ]
         final_scope_discovery = final_raw_transcript["scope_discovery"]
-        final_scope_page = final_scope_discovery["pages"][0]
+        final_scope_page = final_scope_discovery["recent_pull_requests"]["pages"][0]
         final_scope_body = strict_json_loads(final_scope_page["body_utf8"])
         assert isinstance(final_scope_body, list)
         assert isinstance(final_scope_body[0], dict)
@@ -27184,49 +28567,8 @@ printf '%s\n' "$trusted_uv"
             final_scope_page,
             canonical_raw_body(final_scope_body),
         )
-        semantically_stable_raw_validation = validate_history_universe_result(
-            semantically_stable_raw_history
-        )
-        self.assertIsNotNone(semantically_stable_raw_validation)
-        assert isinstance(semantically_stable_raw_validation, dict)
-        self.assertEqual(
-            semantically_stable_raw_validation["status"],
-            "unused-sidecar-unavailable",
-        )
-        semantic_phase_bindings = semantically_stable_raw_validation["phase_bindings"]
-        initial_raw_transcript = semantically_stable_raw_history["initial_inventory"][
-            "discovery_endpoint_transcript"
-        ]
-        expected_initial_transcript_sha256 = hashlib.sha256(
-            canonical_raw_body(initial_raw_transcript).encode("utf-8")
-        ).hexdigest()
-        expected_final_transcript_sha256 = hashlib.sha256(
-            canonical_raw_body(final_raw_transcript).encode("utf-8")
-        ).hexdigest()
-        self.assertEqual(
-            semantic_phase_bindings["initial_inventory"]["transcript_sha256"],
-            expected_initial_transcript_sha256,
-        )
-        self.assertEqual(
-            semantic_phase_bindings["final_inventory"]["transcript_sha256"],
-            expected_final_transcript_sha256,
-        )
-        self.assertNotEqual(
-            semantic_phase_bindings["initial_inventory"]["transcript_sha256"],
-            semantic_phase_bindings["final_inventory"]["transcript_sha256"],
-        )
-        self.assertEqual(
-            semantic_phase_bindings["initial_inventory"]["audit_sha256"],
-            semantic_phase_bindings["final_inventory"]["audit_sha256"],
-        )
-        self.assertIsNotNone(
-            expected_report_from_inputs(
-                "accepted-terminal-clean",
-                declaration,
-                semantically_stable_raw_history,
-                terminal_current,
-                normal_lane_timing,
-            )
+        self.assertIsNone(
+            validate_history_universe_result(scope_source_digest_drift_history)
         )
 
         def append_scope_rest_record(
@@ -27572,7 +28914,9 @@ printf '%s\n' "$trusted_uv"
             mutation_calls = raw_semantic_producer_calls
             mutation_endpoint_snapshot = tracker_counter_snapshot(mutation_parts[1])
             mutation_sidecar_snapshot = tracker_counter_snapshot(mutation_parts[2])
-            mutation_page = mutation_transcript["scope_discovery"]["pages"][0]
+            mutation_page = mutation_transcript["scope_discovery"][
+                "recent_pull_requests"
+            ]["pages"][0]
             mutation_body = strict_json_loads(mutation_page["body_utf8"])
             self.assertIsInstance(mutation_body, list)
             assert isinstance(mutation_body, list)
@@ -27605,7 +28949,7 @@ printf '%s\n' "$trusted_uv"
             )
 
             invalid_transcript = clone(memo_transcript_template)
-            invalid_transcript["schema_version"] = 4
+            invalid_transcript["schema_version"] = 5
             invalid_context = new_inventory_validation_context()
             self.assertIsNotNone(invalid_context)
             assert isinstance(invalid_context, dict)
@@ -29842,8 +31186,8 @@ printf '%s\n' "$trusted_uv"
         for snapshot_name in ("initial_inventory", "final_inventory"):
             downgraded_discovery_schema[snapshot_name]["discovery_endpoint_transcript"][
                 "schema_version"
-            ] = 2
-        invalid_cases["history-discovery-schema-v2-downgrade"] = (
+            ] = 3
+        invalid_cases["history-discovery-schema-v3-downgrade"] = (
             declaration,
             downgraded_discovery_schema,
             current,
@@ -29860,10 +31204,14 @@ printf '%s\n' "$trusted_uv"
         for snapshot_name in ("initial_inventory", "final_inventory"):
             scope_discovery_pages = missing_scope_discovery_page[snapshot_name][
                 "discovery_endpoint_transcript"
-            ]["scope_discovery"]["pages"]
-            self.assertGreater(len(scope_discovery_pages), 1)
-            scope_discovery_pages.pop()
-        invalid_cases["history-root-scope-discovery-page-missing"] = (
+            ]["scope_discovery"]["recent_pull_requests"]["pages"]
+            self.assertEqual(len(scope_discovery_pages), 1)
+            scope_discovery_pages[0]["link_header"] = (
+                "<https://api.github.com/repos/OWNER/REPO/pulls"
+                "?state=all&sort=updated&direction=desc&per_page=100&page=2>; "
+                'rel="next"'
+            )
+        invalid_cases["history-root-scope-discovery-next-without-boundary"] = (
             declaration,
             missing_scope_discovery_page,
             current,
@@ -29935,19 +31283,19 @@ printf '%s\n' "$trusted_uv"
             root_retained_after_synchronized_omission,
             current,
         )
-        retained_root_records = parse_rest_pages(
+        retained_root_result = parse_recent_pull_discovery(
             root_retained_after_synchronized_omission["initial_inventory"][
                 "discovery_endpoint_transcript"
-            ]["scope_discovery"],
-            expected_kind="repository_pull_requests",
+            ]["scope_discovery"]["recent_pull_requests"],
             expected_url=(
                 f"https://api.github.com/repos/{current_repository}/pulls"
-                "?state=all&sort=created&direction=asc&per_page=100"
+                "?state=all&sort=updated&direction=desc&per_page=100"
             ),
+            resource_tracker=new_resource_tracker(),
         )
-        self.assertIsNotNone(retained_root_records)
-        assert retained_root_records is not None
-        self.assertIn(5, {record["number"] for record in retained_root_records})
+        self.assertIsNotNone(retained_root_result)
+        assert retained_root_result is not None
+        self.assertIn(5, retained_root_result[0])
         self.assertEqual(
             compute_provider_profile(
                 declaration,
@@ -32281,8 +33629,8 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(first_in_window_samples, list)
         retime_sample(
             first_in_window_samples[0],
-            request_time=history_start_exclusive,
-            reaction_time=history_start_exclusive + 1,
+            request_time=history_start_exclusive + 1,
+            reaction_time=history_start_exclusive + 2,
         )
         self.assertEqual(
             classify_fallback(
@@ -32291,6 +33639,22 @@ printf '%s\n' "$trusted_uv"
                 current,
             ),
             "clean",
+        )
+
+        request_at_exclusive_boundary_samples = clone(samples)
+        assert isinstance(request_at_exclusive_boundary_samples, list)
+        retime_sample(
+            request_at_exclusive_boundary_samples[0],
+            request_time=history_start_exclusive,
+            reaction_time=history_start_exclusive + 1,
+        )
+        self.assertEqual(
+            classify_fallback(
+                declaration,
+                history(request_at_exclusive_boundary_samples),
+                current,
+            ),
+            "unknown",
         )
 
         as_of_boundary_samples = clone(samples)

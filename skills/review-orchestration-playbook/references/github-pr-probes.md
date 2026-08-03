@@ -15,10 +15,10 @@ Before requesting the third lane, record the PR URL, host, authenticated/operati
 
 Resolve the local range and PR selector independently. Preserve an explicit frozen `base_sha..head_sha` as the authoritative local-lane range before any PR probe. Explicit-range-only standalone single/double needs no PR probe. A frozen range never selects a PR: PR-specific work and triple use an explicitly named PR, otherwise the complete set of open PRs associated with the exact current head repository/branch. Exactly one associated PR selects it. More than one is `blocked-input` for the GitHub/PR-specific lane because the required explicit PR selector is absent; the caller must name the PR, and a frozen range does not cure that ambiguity. Fully scoped local lanes may still run, while any lane that still depends on PR selection stays blocked. Do not select a candidate by recency, base, number, draft state, or title. Once a PR is selected, its explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`.
 
-This narrow open-PR selector is not the repository-wide discovery authority
-for `thumbs-up-clean`. It cannot replace the independent state-all raw seed,
-all-PR detail traversals, or post-parse current-scope exclusion required by
-discovery transcript schema version 3 below.
+This narrow open-PR selector is not historical discovery authority for
+`thumbs-up-clean`. It cannot replace schema-version-4 updated-desc boundary
+discovery, the since-cutoff repository request-comment feed, the two anchors,
+their union/detail closure, or post-parse current-scope exclusion.
 
 First obtain the exact current branch and head repository owner. A detached HEAD or unknown head owner cannot drive implicit PR association. Then use an authenticated, paginated lookup and retain the returned candidate array:
 
@@ -135,7 +135,7 @@ Store the resulting `parent-recorded-request-scope-v1` object in the
 parent-owned `request_scope_receipts` sidecar. Every accepted request has
 exactly one matching receipt and every receipt matches exactly one request.
 This sidecar is a sibling of the raw discovery/current inventory; do not add it
-to `discovery_endpoint_transcript` schema version 3 or invent another fetch
+to `discovery_endpoint_transcript` schema version 4 or invent another fetch
 kind. If any observed request lacks a valid one-to-one sidecar, set
 `request_policy.status: unknown`, do not POST again, and exclude that request
 and its reactions from reaction-profile authority. Continue to evaluate an
@@ -238,22 +238,35 @@ move the window. A current-PR endpoint, local clock, caller-supplied declaration
 object, or bare `window_days: 30` label is not evidence.
 
 After freezing that receipt and before classifying any historical candidate,
-independently fetch the complete repository-wide raw PR seed for each initial
-and final inventory:
+independently fetch schema-version-4 bounded dual-source discovery for each
+initial and final inventory:
 
 ```bash
+gh api --hostname github.com --method GET --include \
+  'repos/<owner>/<repo>/pulls?state=all&sort=updated&direction=desc&per_page=100'
 gh api --hostname github.com --method GET --include --paginate \
-  'repos/<owner>/<repo>/pulls?state=all&sort=created&direction=asc&per_page=100'
+  'repos/<owner>/<repo>/issues/comments?sort=updated&direction=desc&since=<RFC3339-cutoff>&per_page=100'
 ```
 
 The trusted parent fetch path must preserve every page separately with its
-exact request URL, integer status, raw `Link` header or null, raw UTF-8 body,
-and recomputed body digest. A `--jq` projection, `gh pr list`, open-only
-branch selector, slurped candidate array, or reuse of the initial bytes for the
-final inventory is not raw discovery authority. Every canonical PR number in
-the seed starts exactly one complete detail traversal, including the current
-PR, the authenticated declaration's bound PR, and PRs later classified as
-confirmed non-candidates. Both traversals must find the exact declaration raw
+exact request URL, exact integer status, raw `Link` header or null, raw UTF-8
+body, and recomputed body digest. Pull detail and compare are unpaginated
+direct-object responses: each has exactly one page, a null `Link`, and a JSON
+object root. Collection responses use an array root on every page; each
+canonical `next` preserves the fixed path and query and advances only through
+the consecutive `page=N` parameter. For updated-desc pulls, a stable canonical
+`last` cannot point after a no-`next` natural end or before the current `next`.
+The fetch path follows updated-desc pull pages only through the
+first retained page containing an exact `updated_at <= window_start_exclusive`
+witness, or through natural end; blindly paginating cumulative repository
+history is forbidden. The repository issue-comment source is fully paginated
+from the frozen cutoff. A `--jq` projection, `gh pr list`, open-only branch
+selector, slurped candidate array, or reuse of the initial bytes for the final
+inventory is not raw discovery authority. Newer pull rows, strict controlled
+request parents from the comment feed, and exact current/declaration anchors
+form the detail union. Every canonical PR number in that union starts exactly
+one complete detail traversal, including the current PR and PRs later
+classified as confirmed non-candidates. Both traversals must find the exact declaration raw
 record once in that PR's fully paginated issue comments while still treating
 the direct canonical declaration GET as declaration authority. Declaration
 authority and terminal classification are orthogonal: the same artifact may
@@ -263,7 +276,9 @@ progress-only grammar are audit-only; a declaration-only nonterminal scope is
 a confirmed non-candidate. Any other exact-provider free-form prose fails
 closed, and an in-window terminal-looking malformed record remains a historical
 candidate. A fully parsed malformed record at or before the exclusive lower
-boundary remains audit-only `confirmed-non-candidate` evidence. Any seed,
+boundary remains audit-only `confirmed-non-candidate` evidence. Only the
+union/detail PRs count toward `max_seeded_pull_requests: 512`; boundary
+witnesses and cumulative old PRs do not. A 513th union member or any source,
 detail, child-page, count, byte, or time budget overflow makes the historical
 adaptation plane unavailable; never truncate and continue. Reaction-only
 authority therefore uses `unknown`. An independently trustworthy strong
@@ -278,13 +293,13 @@ from a minimal query that pages
 `id`, typed `isResolved`, typed `isOutdated`, and
 `pageInfo { hasNextPage endCursor }`. For every paginated thread-comment node,
 record GraphQL `id`, REST-compatible `fullDatabaseId: BigInt`, `url`, and
-`pullRequestReview { id fullDatabaseId }`. Schema version 3 paginates only the
+`pullRequestReview { id fullDatabaseId }`. Schema version 4 paginates only the
 outer `reviewThreads` connection: it starts with a null cursor, requires each
 next request cursor to equal the previous raw `endCursor`, and ends only at
 typed `hasNextPage == false`. Each nested `comments` connection must be
 complete in its first raw response with typed `hasNextPage == false` and
 `endCursor == null`. If any nested response reports another page, fail closed
-as profile `unknown`; schema version 3 cannot encode a child-cursor fetch. A
+as profile `unknown`; schema version 4 cannot encode a child-cursor fetch. A
 future schema version must define and bind that fetch instead of flattening
 multiple normalized pages into one fabricated raw response.
 
@@ -334,7 +349,7 @@ Floating refs, prose-only comparisons, and partial runtime diffs are not
 anti-drift evidence. The inherited decision is:
 complete trustworthy current-scope results decide without request/run
 attribution, and early or duplicate requests remain outcome-neutral producer
-warnings. Repository-wide discovery schema version 3, raw target-thread proof,
+warnings. Bounded dual-source discovery schema version 4, raw target-thread proof,
 exact whole-PR lifecycle/scope, the closed terminal carrier, request-time scope
 sidecars, independent artifact-time whole-PR scope receipts,
 ancestor-finding projection, declaration discovery, and conditional `+1`
@@ -391,22 +406,25 @@ final-stability failure still blocks.
 
 For `thumbs-up-clean`, accept declaration authority only from a directly fetched and finally stable canonical GitHub REST issue-comment artifact with exact provider Bot/App identity and the predeclared line `If Codex has suggestions, it will comment; otherwise it will react with 👍.`. Record its exact repository/PR/API/HTML identity, artifact ID, server times, asserted text, GitHub `+1` mapping, normalization, and digest; arbitrary issuer/source labels, copied prose, self-hashed paraphrases, and caller-synthesized records are not authority. Preserve closed initial/final GET receipts with exact method/URL/integer status/canonical Date/raw body/body digest, independently project each declaration snapshot from its receipt body, and reject unknown receipt fields such as self-reported TLS booleans. Build the complete deterministic 30-day same-repository historical candidate universe before profile selection. Freeze the exact `(as_of - 2592000, as_of]` interval from the initial receipt: `as_of_receipt` is that exact receipt, `as_of_api_url` is its canonical URL, and `as_of_server_time` is its parsed Date. A final declaration re-read must be no earlier and never moves the window. Exclude the exact current scope and collapse duplicate records to one final outcome per repository/PR/`pr_merge_base`/head key.
 
-Each independently fetched initial/final schema-version-3 discovery inventory
+Each independently fetched initial/final schema-version-4 discovery inventory
 embeds the raw `discovery_endpoint_transcript`. Its closed root contains the
-complete repository-wide state-all pull-list traversal plus exactly one
-complete detail traversal for every seeded PR number. Each detail traversal
+updated-desc pull traversal through its first cutoff-boundary page or natural
+end, the fully paginated since-cutoff repository issue-comment feed, exact
+current/declaration anchors, and one complete detail traversal for every union
+member. Each detail traversal
 contains the policy-required pull detail, compare, issue-comment, review,
 inline-comment, raw GraphQL thread/comment, and controlled-request reaction
-fetches. It includes the exact current PR and every confirmed non-candidate PR;
-the fixed parser excludes current from historical candidates only after every
-seeded traversal is fully parsed and classified. A version-2 transcript lacks
-the independent repository-wide seed and cannot prove reaction fallback.
-Missing seed/detail coverage or any page/count/byte/time budget overflow makes
+fetches. The fixed parser excludes current only after every union-seeded scope
+is fully parsed and classified. Historical reaction-only eligibility requires
+the raw-equal request parent in the repository feed and both request/response
+inside the interval. Boundary witnesses and cumulative old PRs do not consume
+the 512 union cap. A version-3 transcript cannot prove reaction fallback.
+Missing source/union/detail coverage or any budget overflow makes
 the profile `unknown`; truncation is forbidden.
 
 Each historical discovery inventory and each current raw endpoint inventory
 stores a parent-owned `resource_budget` sibling beside, never inside, the
-unchanged version-3 transcript. It must type-preservingly equal this closed
+unchanged version-4 transcript. It must type-preservingly equal this closed
 profile:
 
 ```yaml
@@ -469,12 +487,12 @@ mutation. The initial and final inventories are independent fresh traversals
 with independent starts. The `20000`-record, `8388608`-byte
 per-response, and `67108864`-byte aggregate caps deliberately align with the
 fixed Action baseline above (20,000 items, 8 MiB per response, and 64 MiB per
-work unit). The 512 seeded PRs, 512 controlled requests, 8192 attempts, 4096
-retained pages, and 900-second deadline are playbook extensions for
-repository-wide evidence; do not attribute them to the pinned Action.
+work unit). The 512 union-seeded PRs, 512 controlled requests, 8192 attempts,
+4096 retained pages, and 900-second deadline are playbook extensions for
+bounded discovery evidence; do not attribute them to the pinned Action.
 
 The inventory stores `request_scope_receipts` beside that raw transcript. The
-version-3 root remains exactly
+version-4 root remains exactly
 `{schema_version, repository, scope_discovery, scopes}` and its fetch-kind set
 is unchanged. The fixed projector joins each eight-field request projection to
 exactly one parent-owned sidecar only when evaluating request/reaction
@@ -493,7 +511,7 @@ hashing and rejects numeric, offset, fractional, invalid, or noncanonical
 substitutes. GraphQL pages retain the exact requested cursor and raw body from
 which the fixed parser validates `pageInfo`. A raw thread node contains the
 real GraphQL `comments { nodes pageInfo }` connection, never the normalized
-report `comments.pages` envelope. Version 3 accepts nested comments only when
+report `comments.pages` envelope. Version 4 accepts nested comments only when
 that first connection is complete (`hasNextPage == false`,
 `endCursor == null`); a child cursor requires a future schema version and
 therefore makes the current profile `unknown`. Endpoint JSON may gain
@@ -508,8 +526,9 @@ and surrogate code points in values or member names. Only after that syntax and
 scalar gate may endpoint objects retain unrelated forward-compatible GitHub
 fields; a digest paired with a permissive decoder is not sufficient authority.
 
-The parser independently proves seed-to-detail one-to-one coverage, classifies
-every seeded PR as current, historical candidate, or confirmed non-candidate,
+The parser independently proves source-to-union and union-to-detail one-to-one
+coverage, classifies every union-seeded PR as current, historical candidate,
+or confirmed non-candidate,
 and derives every candidate entry's scope/order plus carrier, channel,
 semantic, native identity, projected-source digest, and candidate count. The
 closed candidate evaluator separately validates complete candidate arrays and
@@ -521,7 +540,7 @@ exclusive lower boundary stays in the raw transcript and classifications as
 entries or the count. A post-as-of record, malformed projection, ambiguous
 identity, or incomplete traversal remains fail-closed rather than becoming an
 expired non-candidate.
-Deleting an entire seeded scope, deleting an in-window candidate plus its entry
+Deleting an entire union-seeded scope, deleting an in-window candidate plus its entry
 and decrementing the count, or substituting the same time/ID with a different
 carrier or semantic must fail closed. Confirmed-different human activity
 remains raw audit-only after full classification, while ambiguous
@@ -531,7 +550,8 @@ trusted; the offline transcript and digest preserve its inputs but do not
 cryptographically attest GitHub's TLS origin.
 
 Validate the initial and final discovery traversals independently, including
-every body digest, REST Link chain, GraphQL cursor chain, and seed/detail join.
+every body digest, REST Link chain, GraphQL cursor chain, source/union join, and
+union/detail join.
 Do not require the raw inventories or opaque cursor bytes to be identical:
 GitHub may issue different valid cursors on the final reread. Require instead
 type-preserving equality of the fixed semantic projection, scope
@@ -582,7 +602,7 @@ records also remain policy-bearing; a post-cutoff instance selects `unknown`.
 An issue comment created at or before the cutoff but edited after it is
 fail-closed because the cutoff body cannot be reconstructed. An exact or
 ambiguous child may not be hidden with an otherwise confirmed-different future
-review. Schema version 3 records no independent inline-child timestamp, so it
+review. Schema version 4 records no independent inline-child timestamp, so it
 cannot infer that a human reply on an in-cutoff provider review is a removable
 later suffix; that child remains semantic drift.
 
@@ -663,7 +683,7 @@ REST request, reaction, parent, selected, and artifact IDs remain exact
 positive JSON integers; quoted decimal strings are invalid. An
 ID/time/commit summary alone is not acceptance evidence.
 
-Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, every applicable artifact-time scope receipt, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, artifact commit, receipt-bound current scope, and exact artifact GET body/digest/identity—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-3 repository-wide seed plus every seeded PR traversal, including the declaration PR. Rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every request-time scope sidecar and complete candidate projection, and revalidate every ordered historical `samples[]` request/sidecar/reaction record. For terminal clean/findings and reaction clean, independently re-fetch the final raw current endpoint inventory, rederive its artifact/thread projection and finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code, projection equality, and initial/final stability. A missing request sidecar changes only request/reaction authority; a missing or unstable artifact-scope receipt blocks the wrapped terminal artifact. A missing provider record, budget overflow, other ancestry return code, or terminal projection drift is `unknown` for the provider result. Field-by-field normalized current equality alone cannot pass.
+Immediately before success, repeat the lifecycle, base/head, unique merge-base, complete evidence, pagination, every applicable artifact-time scope receipt, and selected-artifact reads. Require the exact whole-PR scope and the recorded `evidence_basis`—source channel, stable ID/URL, server time, artifact commit, receipt-bound current scope, and exact artifact GET body/digest/identity—to remain unchanged. For `thumbs-up-clean`, also re-fetch the authoritative provider declaration source/version/text without moving the initial-receipt as-of window, recompute its recorded normalization digest, and independently re-fetch each final schema-version-4 updated-desc pull boundary, since-cutoff request-comment feed, current/declaration anchors, and every union-seeded PR traversal. Rederive and compare the fixed `scope_discovery_projection`, including cutoff, stop reason, recent PR rows, request IDs/PRs/digests, anchors, and union. Then rederive the complete current/historical/non-candidate classification, exclude current only after parsing, rederive inventory scope/order/source-evidence entries and count, revalidate every request-time scope sidecar and complete candidate projection, and revalidate every ordered historical `samples[]` request/sidecar/reaction record. For terminal clean/findings and reaction clean, independently re-fetch the final raw current endpoint inventory, rederive its artifact/thread projection and finding-commit set, rerun every parent-owned local Git object/ancestry receipt, and require exact return-code, projection equality, and initial/final stability. A missing request sidecar changes only request/reaction authority; a missing or unstable artifact-scope receipt blocks the wrapped terminal artifact. A missing provider record, budget overflow, other ancestry return code, or terminal projection drift is `unknown` for the provider result. Field-by-field normalized current equality alone cannot pass.
 
 The provider-result budget-overflow clause in the preceding paragraph applies
 to the current endpoint/artifact authority. An overflow confined to historical

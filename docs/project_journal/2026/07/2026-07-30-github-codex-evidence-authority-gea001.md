@@ -1,11 +1,11 @@
 ---
 id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
-status: active
+status: completed
 created: 2026-07-30
-updated: 2026-08-02
+updated: 2026-08-03
 branch: wip/github-codex-evidence-authority
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
 superseded_by:
 ---
@@ -57,8 +57,8 @@ superseded_by:
   sidecar. Its closed raw pre/post PR-detail and compare receipts plus exact
   request-comment response bind the eight request fields—including closed
   `user: {login, type}` actor identity—to the immutable
-  repository/PR/merge-base/head scope. The raw discovery transcript remains
-  schema version 3; final PR metadata can never regenerate or relabel an older
+  repository/PR/merge-base/head scope. The raw discovery transcript uses
+  schema version 4; final PR metadata can never regenerate or relabel an older
   request receipt. Missing or malformed receipts close only the weaker
   request/reaction plane and make `request_policy` unknown; they do not veto an
   independently valid terminal provider payload. Complete raw request/reaction
@@ -181,39 +181,40 @@ superseded_by:
   unresolved exact-provider selected-review target-thread finding whose
   `ancestry_return_code` is exact `0` blocks reaction clean.
   The reaction report embeds independently fetched initial/final
-    schema-version-3 discovery transcripts, raw-derived source-authority
-    inventories, and independently validated complete candidate arrays, not
-    just the selected samples or a caller-adjustable count. Each transcript
-    begins with a fully paginated repository-wide
-    `state=all&sort=created&direction=asc&per_page=100` PR seed and drives one
-    complete detail traversal for every seeded PR, including current and
-    confirmed non-candidates. Current is excluded from historical candidates
-    only after full parsing. Version 2 cannot prove fallback, and any
-    seed/detail/page/count/byte/time budget overflow selects `unknown`. Each
-    inventory entry binds scope/order plus carrier, channel, semantic result,
-    native identity, and canonical source-record digest; same time/ID cannot
-    substitute a reaction for a terminal artifact. Pull scope uses a canonical
-    compare fetch, and only `merge_base_commit.sha` supplies `pr_merge_base`.
-    Repository discovery uses the closed
-    `github-codex-evidence-resource-budget-v1` profile: at most 512 seeded pull
-    requests, 512 controlled requests, 8,192 fetch attempts, 4,096 retained
-    pages, 20,000 records, 8,388,608 UTF-8 bytes in one page, 67,108,864
-    retained UTF-8 bytes in one traversal, and 900 monotonic seconds. Every
-    overflow selects `unknown`; no prefix may be treated as complete.
-    Actor identity is validated before applying the frozen as-of projection.
-    A fully new post-cutoff issue comment, review, or reaction from a confirmed
-    different human or clearly unrelated bot remains in the raw transcript but
-    may be excluded from the semantic projection only after its carrier schema,
-    canonical URL, commit/scope fields, and actor all validate. A controlled
-    exact `@codex review` request is always policy-relevant and must be within
-    the cutoff. Any post-cutoff exact-provider or identity-ambiguous record,
-    cross-cutoff issue-comment edit, or unproved carrier selects `unknown`.
-    Schema version 3 has no per-inline-child server timestamp, so it cannot
-    infer that a human reply attached to an in-cutoff provider review is a
-    safely excludable suffix. A provider terminal artifact can form a candidate
-    without an observed request, while reaction-only evidence always requires
-    its exact controlled parent. `mixed` always requires terminal payload for
-    a clean result.
+  schema-version-4 discovery transcripts, raw-derived source-authority
+  inventories, and independently validated complete candidate arrays, not
+  just the selected samples or a caller-adjustable count. Each transcript uses
+  the updated-desc pull boundary, the fully paginated since-cutoff controlled
+  request-comment feed, and exact current/declaration anchors, then drives one
+  complete detail traversal for every PR in their deduplicated union. Current
+  is excluded from historical candidates only after full parsing. Version 3
+  cannot prove reaction fallback, and any source/union/detail/page/count/byte/
+  time budget overflow selects `unknown`. Boundary witnesses and cumulative
+  old PRs consume endpoint budgets but do not consume the 512 union/detail cap.
+  Each inventory entry binds scope/order plus carrier, channel, semantic result,
+  native identity, and canonical source-record digest; same time/ID cannot
+  substitute a reaction for a terminal artifact. Pull scope uses the canonical
+  bare pull-detail request plus a compare response whose `base_commit.sha`,
+  `head_commit.sha`, and `merge_base_commit.sha` bind the exact scope.
+  Discovery uses the closed `github-codex-evidence-resource-budget-v1`
+  profile: at most 512 union-seeded pull requests, 512 controlled requests,
+  8,192 fetch attempts, 4,096 retained pages, 20,000 records, 8,388,608 UTF-8
+  bytes in one page, 67,108,864 retained UTF-8 bytes in one traversal, and 900
+  monotonic seconds. Every overflow selects `unknown`; no prefix may be treated
+  as complete. Actor identity is validated before applying the frozen as-of
+  projection. A fully new post-cutoff issue comment, review, or reaction from a
+  confirmed different human or clearly unrelated bot remains in the raw
+  transcript but may be excluded from the semantic projection only after its
+  carrier schema, canonical URL, commit/scope fields, and actor all validate. A
+  controlled exact `@codex review` request is always policy-relevant and must
+  be within the cutoff. Any post-cutoff exact-provider or identity-ambiguous
+  record, cross-cutoff issue-comment edit, or unproved carrier selects
+  `unknown`. Schema version 4 has no per-inline-child server timestamp, so it
+  cannot infer that a human reply attached to an in-cutoff provider review is a
+  safely excludable suffix. A provider terminal artifact can form a candidate
+  without an observed request, while reaction-only evidence always requires
+  its exact controlled parent. `mixed` always requires terminal payload for a
+  clean result.
 - A no-start rejection would be availability evidence, not clean evidence, but
   the fixed authority baseline has no accepted no-start body grammar. Free-form exact-bot
   prose therefore remains inconclusive. A future policy may activate
@@ -1124,10 +1125,100 @@ the stricter triple lane:
   serialization of untrusted wrappers, repeat charges, and validated-prefix
   acceptance are forbidden.
 
-These corrections remain part of the active candidate until the final focused
-and complete suites, validators, signed commit, and successor exact-range
-named-single review complete. Their eventual receipts remain parent-owned so
-recording them cannot move the bytes they attest.
+## Bounded Dual-Source Discovery Superseding Decision
+
+The final review exposed a separate availability failure in the weak `+1`
+adaptation plane: schema version 3 enumerated every PR ever created and applied
+`max_seeded_pull_requests: 512` to that cumulative list. A repository's 513th
+historical PR would therefore disable the fallback forever, even when the
+frozen 30-day evidence window contained only a few eligible outcomes. That is
+not a protective bound on the decision scope; it is an accidental repository
+lifetime limit.
+
+Schema-version-4 bounded dual-source discovery supersedes that model with two
+independent bounded sources plus exact anchors. Version 3 cannot prove reaction
+fallback under the new completeness contract:
+
+- An updated-desc pull-list traversal retains complete pages through the first
+  `updated_at <= window_start_exclusive` boundary. A boundary page may still
+  carry `rel="next"`; the canonical descending order then proves that later
+  pages cannot re-enter the window. Without either that witness or a natural
+  terminal page, the traversal is incomplete and fails closed.
+- A fully paginated repository issue-comment feed uses the exact cutoff and
+  selects only strict controlled `@codex review` parents. This second source is
+  necessary because adding a reaction does not imply that GitHub advances the
+  PR's `updated_at`; a recent request on an otherwise old PR must remain
+  discoverable. Every retained request is raw-equal joined back to the complete
+  PR-detail issue-comment inventory before it can seed or support evidence.
+- The exact current PR and authenticated provider-declaration PR are explicit
+  anchors. The current reaction-only basis is validated by its independent
+  current-scope traversal and is not counted among the 3–10 historical
+  outcomes; historical reaction samples require both their parent request and
+  reaction to fall inside the frozen interval.
+
+The detail scope is the deduplicated union of recent pull rows, recent
+controlled-request PRs, and the two anchors. The 512 cap now counts only this
+union and its detail traversals. Old boundary witnesses still consume endpoint
+page/record/byte budgets, but neither they nor cumulative repository history
+consume the seeded-PR cap. A real 513-member union, an incomplete source,
+initial/final union drift, or any budget overflow remains `unknown`; prefix
+acceptance and caller-selected truncation remain forbidden.
+
+This correction does not weaken the earlier result-authority decision. The
+pinned `codex-review-gate` source and released `codex-review-gate-action`
+baseline establish that a stable provider result can be consumed without
+request/run attribution. Duplicate or pending requests remain producer-policy
+warnings and reaction-plane audit state, not contrary verdict evidence. The
+schema-v4 discovery machinery is a conditional playbook extension used only to
+prove the lower-information reaction fallback; failure in that historical
+adaptation plane cannot veto an independently trustworthy current terminal
+payload.
+
+The same review also closed two scope-binding mismatches: canonical pull-detail
+requests use the bare `/pulls/{number}` URL, while collection endpoints retain
+their explicit pagination query; and every pull/compare receipt now requires
+`compare.head_commit.sha` to equal the pull detail's exact head in addition to
+binding the base and unique merge base. These fields are authority signals, not
+fixture conveniences. Future changes to this decision must update the schema,
+all agent/lane/readiness mirrors, executable anti-drift contracts, and this
+journal together, and must state whether the pinned Action baseline or a
+playbook-only extension changed.
+
+## Schema-v4 Pre-Commit Audit Corrections
+
+The stable pre-commit audit found six additional fail-closed obligations that
+the first schema-v4 implementation did not yet enforce:
+
+- Historical reaction selection ranges over every exact-epoch controlled
+  request in the recent request feed, not only parents that already have a
+  reaction. A pending-only scope is not a confirmed non-candidate, and a newer
+  pending request prevents an older parent's `+1` from proving the unique latest
+  request outcome. The sidecar-blind audit path applies the same rule.
+- Sidecar failure cannot make discovery semantics disappear. The sidecar-blind
+  endpoint result carries the raw-derived `scope_discovery_projection`; each
+  phase requires the stored projection to match it, and initial/final stability
+  includes that projection before returning an adaptation-plane-unavailable
+  result.
+- REST transport shape is part of evidence authority. Pull detail and compare
+  are single-page, null-`Link`, direct-object responses. Collection pages have
+  array roots and canonical consecutive pagination URLs that preserve the fixed
+  path and query. An empty first page cannot redirect scope authority to an
+  arbitrary second URL.
+- Updated-desc pull discovery accepts only exact integer status `200`. Its
+  canonical `last` relation remains consistent across retained pages, equals the
+  current page at a natural no-`next` end, and never precedes the next page.
+
+These are not new provider policy. They make the retained bytes prove the
+already-declared discovery, ordering, and scope properties instead of allowing
+fixture/parser self-consistency to substitute for the real GitHub endpoint
+contract. Regression tests cover pending-only and newer-pending histories,
+sidecar-blind projection drift, arbitrary pagination URLs, multi-page
+direct-object substitution, contradictory `last`, and numeric type aliases.
+
+These corrections are part of the completed landing contract. Test, validator,
+signed-commit, exact-range review, CI, and merge receipts remain parent-owned
+delivery evidence rather than mutable authority data in this journal, so
+recording those receipts cannot move the bytes they attest.
 
 ## Evidence
 

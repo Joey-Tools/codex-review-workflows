@@ -131,7 +131,7 @@ A qualifying third-lane result must prove all of the following:
 
 - The PR host is exact `github.com`, the operating identity is not `hoteng` or `hoteng_cisco`, and accepted current-scope provider evidence proves that the lane ran. No separate integration/service availability claim is required. Every other host, including `sqbu-github.cisco.com` and all enterprise hosts, is unsupported.
 - Authenticated PR metadata supplied `baseRefName`, `baseRefOid`, and `headRefOid`; local object validation produced exactly one `pr_merge_base`; and the frozen local range was exactly `pr_merge_base..headRefOid`. A same-head/different-base range cannot supply whole-PR or third-lane evidence.
-- Every request used for request-policy or reaction authority has exactly one closed `parent-recorded-request-scope-v1` sidecar. Its pre/post raw pull-detail and compare receipts derive that request's immutable scope, its exact `201` POST response projects the same eight request fields—including closed `user: {login, type}` actor identity—and no extra or unmatched receipt exists. Only receipts whose tuple equals the evaluated scope enter that scope's request/reaction authority. A valid old-head receipt remains old-epoch audit evidence; a valid same-head/different-merge-base receipt takes `base-changed-same-head`. The sidecar remains outside raw transcript schema version 3 and proves neither request/run lineage nor an ABA-free interval. Missing or malformed sidecars make request policy unknown and disable reactions without vetoing independently complete terminal evidence.
+- Every request used for request-policy or reaction authority has exactly one closed `parent-recorded-request-scope-v1` sidecar. Its pre/post raw pull-detail and compare receipts derive that request's immutable scope, its exact `201` POST response projects the same eight request fields—including closed `user: {login, type}` actor identity—and no extra or unmatched receipt exists. Only receipts whose tuple equals the evaluated scope enter that scope's request/reaction authority. A valid old-head receipt remains old-epoch audit evidence; a valid same-head/different-merge-base receipt takes `base-changed-same-head`. The sidecar remains outside raw transcript schema version 4 and proves neither request/run lineage nor an ABA-free interval. Missing or malformed sidecars make request policy unknown and disable reactions without vetoing independently complete terminal evidence.
 - Every terminal-looking exact-provider artifact used in current-scope precedence has a singular closed `artifact_scope_receipt` with kind `parent-recorded-terminal-artifact-scope-v1` and exactly the fields `kind`, `pre_artifact_scope_receipts`, `artifact_get_receipt`, and `post_artifact_scope_receipts`. The raw pre/post pull+compare projections bind artifact-time head and merge base; independent mandatory snapshots bind lifecycle; the canonical exact-artifact GET binds repository/PR, channel/native ID, provider projection, semantic time, body/digest, grammar, and artifact commit. Clean and malformed evidence require the exact current tuple. A finding may instead preserve a proved-ancestor artifact-time head while repository, PR, and merge base still match the enclosing scope and normalized `scope.head` remains current. Every pre `Date` is strictly earlier than artifact semantic time, which is no later than artifact GET `Date`, which is no later than every post `Date`. Whole-second equality at the pre edge is inconclusive because it cannot order an old-scope artifact against a same-second same-head base retarget. An old artifact can reuse only a previously persisted identical receipt that already bracketed it. If it does not strictly follow every trustworthy pre observation, or the receipt is missing, malformed, unmatched, unstable, or over budget, the artifact is inconclusive; current metadata cannot scope it retroactively. The receipt is independent of request sidecars, supplies no request/run/artifact lineage, and does not prove an ABA-free interval.
 - The frozen reaction-history `as_of_server_time` bounds eligible historical artifact semantic times, not receipt collection time. An exact artifact GET or post-scope receipt may have a later `Date` when collected during the bounded decision/final reread; do not reject it solely for being observed after that cutoff.
 - A strong current `terminal-payload` or `mixed` result may also have semantic time after declaration discovery when it arrives during the bounded provider wait. The frozen as-of bounds historical samples and the separate current reaction-only basis for `thumbs-up-clean`, not strong current terminal evidence.
@@ -169,8 +169,8 @@ both declaration snapshots, and freeze the exact
 `(as_of - 2592000, as_of]` interval from the initial receipt; the final receipt
 never moves it.
 
-Both repository-wide discovery passes also seed and fully traverse the
-declaration's bound PR and find the exact raw declaration record once in its
+Both bounded dual-source discovery passes also include the declaration's bound
+PR as an explicit anchor, fully traverse it, and find the exact raw declaration record once in its
 issue comments. Declaration authority and terminal classification are
 orthogonal: the same artifact may prove the declaration and independently
 classify as clean, findings, or malformed. Only an independently nonterminal
@@ -182,20 +182,25 @@ parsed artifact at or before the exclusive lower boundary remains audit-only
 `confirmed-non-candidate` evidence.
 
 Each initial/final historical inventory independently embeds the closed
-schema-version-3 raw discovery transcript. Its fully paginated repository-wide
-`GET /repos/<owner>/<repo>/pulls?state=all&sort=created&direction=asc&per_page=100`
-seed drives exactly one complete detail traversal for every PR, including the
-current PR, the declaration PR, and confirmed non-candidates. The fixed parser classifies every
-seeded PR and excludes current from the historical candidate set only after
-full parsing. A version-2 transcript cannot prove reaction fallback. Missing
-seed/detail/child coverage or any predeclared page/count/byte/time budget
-overflow selects `unknown`; do not truncate and continue. Only
+schema-version-4 raw discovery transcript. Its bounded updated-desc pull
+traversal stops after the first full page containing a row at or before the
+cutoff (or at natural end), while its fully paginated since-cutoff repository
+issue-comments feed discovers strict controlled request parents whose reactions
+may not update PR metadata. Newer pull rows, request-bound PRs, and exact
+current/declaration anchors form the detail union. Historical reaction-only
+eligibility requires the parent in that feed and both request and response in
+the frozen interval. The fixed parser classifies every union-seeded PR and
+excludes current only after full parsing. Boundary witnesses do not consume the
+512 union-seeded-PR cap; union member 513, incomplete source/detail closure, or any
+budget overflow selects `unknown` without truncation. A version-3 transcript
+cannot prove reaction fallback. Only
 `compare.merge_base_commit.sha` supplies `pr_merge_base`. The fixed projector
 derives scope/order/source-evidence entries and count, while the closed
 candidate evaluator independently validates every complete candidate.
 Self-consistent summaries or selected samples do not prove completeness. The
-parent-owned `request_scope_receipts` array is stored beside the transcript;
-the version-3 root and fetch-kind set remain unchanged.
+parent-owned `request_scope_receipts` array and fixed
+`scope_discovery_projection` are stored beside the transcript; the latter binds
+cutoff, stop reason, recent PRs, request IDs/PRs/digests, anchors, and union.
 
 Each historical inventory and each current raw endpoint inventory also stores
 a parent-owned `resource_budget` sibling beside, never inside, that unchanged
@@ -263,7 +268,7 @@ mutation. The initial and final inventories must be independent fresh fetches
 with independent 900-second starts. The `20000`-record, `8388608`-byte
 per-response, and `67108864`-byte aggregate caps intentionally align with the
 pinned `codex-review-gate-action` baseline above (20,000 items, 8 MiB per
-response, and 64 MiB per work unit). The 512 seeded PRs, 512 controlled
+response, and 64 MiB per work unit). The 512 union-seeded PRs, 512 controlled
 requests, 8192 attempts, 4096 retained pages, and 900-second deadline are
 playbook extensions and are not attributed to that Action.
 
@@ -279,11 +284,11 @@ cutoff. Exact-provider and ambiguous/provider-like records also remain
 policy-bearing, so a post-cutoff instance selects `unknown`. A cross-cutoff
 issue-comment edit remains fail-closed because its earlier body cannot be
 reconstructed. An exact or ambiguous child cannot be hidden with an otherwise
-confirmed-different future review. Schema version 3 has no independent
+confirmed-different future review. Schema version 4 has no independent
 inline-child timestamp, so it cannot infer that a human reply on an in-cutoff
 provider review is a removable later suffix; the child remains semantic drift.
 
-Validate every seeded PR before sorting, including candidates outside the
+Validate every union-seeded PR before sorting, including candidates outside the
 newest 10 and scopes that become confirmed non-candidates. Validate current
 separately and never count it toward the three-outcome history minimum. Every
 historical sample and current reaction record binds the exact
