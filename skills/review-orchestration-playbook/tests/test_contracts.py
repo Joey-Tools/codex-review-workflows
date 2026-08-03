@@ -20151,6 +20151,52 @@ class RepositoryContractTest(unittest.TestCase):
         assert isinstance(terminal_current, dict)
         with_terminal_payload(terminal_current, 80_100)
 
+        if CI_PROFILE == "canonical":
+            normalized_readme = " ".join(
+                (REPO_ROOT / "README.md").read_text(encoding="utf-8").split()
+            ).lower()
+            self.assertIn(
+                "declaration authority and terminal classification are orthogonal roles",
+                normalized_readme,
+            )
+            self.assertIn(
+                "only an independently nonterminal declaration record is audit-only",
+                normalized_readme,
+            )
+            self.assertIn(
+                "if that same exact-provider comment also matches clean, findings, or malformed terminal grammar, retain and rank its terminal role normally",
+                normalized_readme,
+            )
+            self.assertNotIn(
+                "the declaration and closed progress-only grammar are audit-only",
+                normalized_readme,
+            )
+            normalized_authority = " ".join(authority.split()).lower()
+            self.assertIn(
+                "only the independently nonterminal role of the one authenticated declaration",
+                normalized_authority,
+            )
+            self.assertIn(
+                "a declaration-bearing record that also matches clean, findings, or malformed terminal grammar retains and is ranked by that terminal role",
+                normalized_authority,
+            )
+            self.assertIn(
+                "only the independently nonterminal declaration role and closed progress-only grammar are audit-only",
+                normalized_authority,
+            )
+            self.assertIn(
+                "a declaration-bearing record that also matches clean, findings, or malformed terminal grammar retains its terminal classification",
+                normalized_authority,
+            )
+            self.assertNotIn(
+                "the one authenticated declaration and closed progress-only records remain audit-only exceptions",
+                normalized_authority,
+            )
+            self.assertNotIn(
+                "the one exact declaration and closed progress-only grammar are audit-only",
+                normalized_authority,
+            )
+
         dual_role_scope = sample(declaration_pr)
         dual_role_scope["requests"] = []
         dual_role_scope["request_scope_receipts"] = []
@@ -26655,6 +26701,81 @@ class RepositoryContractTest(unittest.TestCase):
                         terminal_report_basis["artifact"]["final_snapshot"],
                     )
                 )
+                if case_name == "terminal-payload":
+                    report_example = authority.split("## Required Report Fields", 1)[
+                        1
+                    ].split("| Lane state", 1)[0]
+                    actual_artifact = terminal_report_basis["artifact"]
+                    documented_artifact_json = report_example.split("  artifact: ", 1)[
+                        1
+                    ].split("\n  current_raw_authority:", 1)[0]
+                    documented_artifact = strict_json_loads(documented_artifact_json)
+                    duplicate_scope_key = documented_artifact_json.replace(
+                        '"pr": 1,',
+                        '"pr": 999, "pr": 1,',
+                        1,
+                    )
+                    self.assertNotEqual(
+                        duplicate_scope_key,
+                        documented_artifact_json,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "duplicate JSON object key: pr",
+                    ):
+                        strict_json_loads(duplicate_scope_key)
+                    self.assertEqual(
+                        documented_artifact["final_snapshot"],
+                        "__TYPE_PRESERVING_EXACT_COPY_OF_INITIAL_SNAPSHOT__",
+                    )
+                    documented_artifact["final_snapshot"] = clone(
+                        documented_artifact["initial_snapshot"]
+                    )
+                    documented_receipt = documented_artifact["artifact_scope_receipt"]
+                    actual_receipt = actual_artifact["artifact_scope_receipt"]
+                    sentinel_receipt_paths = {
+                        ("pre_artifact_scope_receipts", "pull"): (
+                            "__CLOSED_RAW_PRE_PULL_DETAIL_RESPONSE_RECEIPT__"
+                        ),
+                        ("pre_artifact_scope_receipts", "compare"): (
+                            "__CLOSED_RAW_PRE_COMPARE_RESPONSE_RECEIPT__"
+                        ),
+                        ("artifact_get_receipt",): (
+                            "__CLOSED_EXACT_REVIEW_GET_RESPONSE_RECEIPT__"
+                        ),
+                        ("post_artifact_scope_receipts", "pull"): (
+                            "__CLOSED_RAW_POST_PULL_DETAIL_RESPONSE_RECEIPT__"
+                        ),
+                        ("post_artifact_scope_receipts", "compare"): (
+                            "__CLOSED_RAW_POST_COMPARE_RESPONSE_RECEIPT__"
+                        ),
+                    }
+                    for path, sentinel in sentinel_receipt_paths.items():
+                        documented_parent = documented_receipt
+                        actual_parent = actual_receipt
+                        for field in path[:-1]:
+                            documented_parent = documented_parent[field]
+                            actual_parent = actual_parent[field]
+                        self.assertEqual(documented_parent[path[-1]], sentinel)
+                        documented_parent[path[-1]] = clone(actual_parent[path[-1]])
+                    self.assertTrue(
+                        typed_json_equal(documented_artifact, actual_artifact)
+                    )
+                    documented_round_trip = clone(terminal_report)
+                    assert isinstance(documented_round_trip, dict)
+                    documented_round_trip["evidence_basis"]["artifact"] = clone(
+                        documented_artifact
+                    )
+                    self.assertTrue(
+                        validate_complete_report(
+                            documented_round_trip,
+                            lane_state="accepted-terminal-clean",
+                            provider_declaration=declaration,
+                            candidate_history=terminal_report_history,
+                            current_record=terminal_report_current,
+                            local_lane_timing=normal_lane_timing,
+                        )
+                    )
                 terminal_current_raw_authority = terminal_report_basis[
                     "current_raw_authority"
                 ]

@@ -1429,17 +1429,19 @@ minimum. A historical scope is a candidate when it contains a terminal-looking
 provider record (including a malformed one), an exact-bot reaction on a
 receipt-bound controlled request, or a provider-like record whose identity is
 missing or ambiguous. Historical candidates exclude the exact current scope.
-The one authenticated declaration and closed progress-only records remain
-audit-only exceptions; any other exact-provider free-form prose fails closed
-rather than silently confirming a non-candidate. A scope containing only
-confirmed different actors is not provider behaviour and becomes a confirmed
-non-candidate only after full parsing; its raw scope and bounded records remain
-in discovery audit evidence. They cannot cause ordinary human comments,
-reviews, inline threads, or reactions to masquerade as provider behaviour. A
-confirmed different actor is not provider behaviour. A provider terminal
-artifact may form a candidate even when no controlled request was observed.
-Reaction-only evidence still requires the exact controlled parent and its
-matching request-time scope sidecar.
+Only the independently nonterminal role of the one authenticated declaration
+and independently nonterminal closed progress-only records remain audit-only
+exceptions. A declaration-bearing record that also matches clean, findings,
+or malformed terminal grammar retains and is ranked by that terminal role. Any
+other exact-provider free-form prose fails closed rather than silently
+confirming a non-candidate. A scope containing only confirmed different actors
+is not provider behaviour and becomes a confirmed non-candidate only after full
+parsing; its raw scope and bounded records remain in discovery audit evidence.
+They cannot cause ordinary human comments, reviews, inline threads, or
+reactions to masquerade as provider behaviour. A confirmed different actor is
+not provider behaviour. A provider terminal artifact may form a candidate even
+when no controlled request was observed. Reaction-only evidence still requires
+the exact controlled parent and its matching request-time scope sidecar.
 Complete pagination and scope inventory must prove that universe and its
 recorded count by derivation from the raw transcript. The initial and final
 enumerations must be semantically identical for the same frozen interval.
@@ -1860,25 +1862,65 @@ evidence_basis:
   selection_snapshots:
     initial: <complete lifecycle/scope/pagination/candidate/thread snapshot>
     final: <repeat the complete identical selection snapshot>
-  artifact:
-    initial_snapshot: <complete selected review record>
-    final_snapshot: <repeat the complete identical review record>
-    source_channel: reviews
-    id: 123456789
-    url: https://github.com/OWNER/REPO/pull/123#pullrequestreview-123456789
-    user_login: chatgpt-codex-connector[bot]
-    user_type: Bot
-    state: APPROVED
-    body: No findings.
-    normalized_body: No findings.
-    server_time: 2026-07-30T00:00:00Z
-    server_time_field: submitted_at
-    commit_id: 0123456789abcdef0123456789abcdef01234567
-    associated_inline_comments:
-      pagination_complete: true
-      records: []
-    review_thread_pages: <complete raw GraphQL pages and nested comment pages>
-    thread_findings: []
+  artifact: {
+    "initial_snapshot": {
+      "complete": true,
+      "artifact_kind": "terminal-payload",
+      "outcome": "clean",
+      "channel": "pull-request-review",
+      "id": 80100,
+      "stable_artifact_id": 80100,
+      "url": "https://github.com/OWNER/REPO/pull/1#pullrequestreview-80100",
+      "user_login": "chatgpt-codex-connector[bot]",
+      "user_type": "Bot",
+      "state": "APPROVED",
+      "body": "No findings.",
+      "normalized_body": "No findings.",
+      "grammar_status": "accepted",
+      "terminal_looking": true,
+      "submitted_at": 21,
+      "server_time": 21,
+      "server_time_field": "submitted_at",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "scope": {
+        "repository": "OWNER/REPO",
+        "pr": 1,
+        "pr_merge_base": "1111111111111111111111111111111111111111",
+        "head": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "associated_inline_comments": {
+        "pagination_complete": true,
+        "records": []
+      },
+      "review_thread_pages": {
+        "endpoint": "https://api.github.com/graphql",
+        "pagination_complete": true,
+        "pages": [
+          {
+            "after": null,
+            "nodes": [],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        ]
+      }
+    },
+    "final_snapshot": "__TYPE_PRESERVING_EXACT_COPY_OF_INITIAL_SNAPSHOT__",
+    "artifact_scope_receipt": {
+      "kind": "parent-recorded-terminal-artifact-scope-v1",
+      "pre_artifact_scope_receipts": {
+        "pull": "__CLOSED_RAW_PRE_PULL_DETAIL_RESPONSE_RECEIPT__",
+        "compare": "__CLOSED_RAW_PRE_COMPARE_RESPONSE_RECEIPT__"
+      },
+      "artifact_get_receipt": "__CLOSED_EXACT_REVIEW_GET_RESPONSE_RECEIPT__",
+      "post_artifact_scope_receipts": {
+        "pull": "__CLOSED_RAW_POST_PULL_DETAIL_RESPONSE_RECEIPT__",
+        "compare": "__CLOSED_RAW_POST_COMPARE_RESPONSE_RECEIPT__"
+      }
+    }
+  }
   current_raw_authority:
     raw_endpoint_inventories:
       initial: <complete independently fetched raw current endpoint inventory>
@@ -1890,6 +1932,15 @@ evidence_basis:
       initial: <complete parent-owned object/ancestry receipt array>
       final: <repeat the complete type-preserving identical receipt array>
 ```
+
+Angle-bracket leaves in the surrounding YAML and `__...__` sentinel-string
+leaves inside the JSON `artifact` value abbreviate complete closed subobjects;
+they do not permit omitted or additional fields. In particular, `artifact` is
+closed to exactly `initial_snapshot`, `final_snapshot`, and
+`artifact_scope_receipt`. The executable contract fixture parses this JSON
+fragment, replaces only the named sentinel leaves with the exact copy and raw
+response receipts, requires type-preserving equality with the generated closed
+artifact, and round-trips the complete report through the closed validator.
 
 | Lane state | `provider_profile` | `evidence_basis` |
 | --- | --- | --- |
@@ -1921,7 +1972,7 @@ changes only the reported blocker selection; ordinary terminal acceptance
 continues to fail closed on equal-time cross-channel ambiguity.
 
 For a pull-request review, `server_time` is the exact REST `submitted_at` and
-`server_time_field` is `submitted_at`. For an unedited issue comment, use exact
+use `server_time_field: submitted_at`. For an unedited issue comment, use exact
 REST `created_at` and `server_time_field: created_at`; for an edited issue
 comment, use exact REST `updated_at` and `server_time_field: updated_at`. A
 reaction always uses exact REST `created_at` and
@@ -2427,11 +2478,12 @@ implementation mechanically:
     intermediate ABA transition.
 12. **Declaration discovery is a playbook extension.** The authenticated
     declaration PR participates in the complete repository seed/detail
-    traversal. The one exact declaration and closed progress-only grammar are
-    audit-only; other exact-provider free-form prose fails closed, and
-    in-window terminal-looking malformed artifacts remain candidates. This
-    classification is not behaviour attributed to either fixed upstream
-    commit.
+    traversal. Only the independently nonterminal declaration role and closed
+    progress-only grammar are audit-only. A declaration-bearing record that
+    also matches clean, findings, or malformed terminal grammar retains its
+    terminal classification; other exact-provider free-form prose fails closed,
+    and in-window terminal-looking malformed artifacts remain candidates. This
+    classification is not behaviour attributed to either fixed upstream commit.
 
 ## Non-Goals
 
