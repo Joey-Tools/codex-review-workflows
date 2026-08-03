@@ -146,6 +146,413 @@ def _macos_directory_metadata_binding(
     )
 
 
+_LEAF_METADATA_DIGEST_DOMAIN = b"targeted-cleanup-leaf-metadata-v2\0"
+MAX_LEAF_XATTR_VALUE_BYTES = 64 * 1024
+MAX_LEAF_XATTR_TOTAL_BYTES = 1024 * 1024
+_LEAF_CONTENT_DIGEST_DOMAIN = b"targeted-cleanup-leaf-content-v1\0"
+LEAF_CONTENT_STATE_REGULAR = 1
+LEAF_CONTENT_STATE_SYMLINK = 2
+LEAF_CONTENT_STATE_FIFO = 3
+LEAF_CONTENT_STATE_SOCKET = 4
+LEAF_CONTENT_STATE_CHARACTER_DEVICE = 5
+LEAF_CONTENT_STATE_BLOCK_DEVICE = 6
+LEAF_CONTENT_STATE_OTHER = 7
+LEAF_CONTENT_STATES = frozenset(
+    {
+        LEAF_CONTENT_STATE_REGULAR,
+        LEAF_CONTENT_STATE_SYMLINK,
+        LEAF_CONTENT_STATE_FIFO,
+        LEAF_CONTENT_STATE_SOCKET,
+        LEAF_CONTENT_STATE_CHARACTER_DEVICE,
+        LEAF_CONTENT_STATE_BLOCK_DEVICE,
+        LEAF_CONTENT_STATE_OTHER,
+    }
+)
+MAX_LEAF_CONTENT_BYTES = 512 * 1024 * 1024
+_LEAF_CONTENT_READ_BYTES = 64 * 1024
+_LEAF_CONTENT_ZEROES = bytes(_LEAF_CONTENT_READ_BYTES)
+
+
+class LeafContentDeadlineExpired(TimeoutError):
+    """The cleanup's own monotonic deadline expired between content reads."""
+
+
+def _update_digest_string(
+    digest: Any,
+    value: str,
+    *,
+    encoding: str,
+) -> None:
+    encoded = value.encode(encoding)
+    digest.update(len(encoded).to_bytes(4, "big"))
+    digest.update(encoded)
+
+
+def _update_digest_bytes(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _leaf_metadata_digest_prefix(
+    metadata: MacOSDirectoryMetadataBinding | None,
+) -> tuple[int, Any, tuple[str, ...]]:
+    state = 0 if metadata is None else 1
+    digest = hashlib.sha256()
+    digest.update(_LEAF_METADATA_DIGEST_DOMAIN)
+    digest.update(bytes((state,)))
+    _update_digest_string(
+        digest,
+        "not-applicable" if metadata is None else "darwin",
+        encoding="ascii",
+    )
+    if metadata is None:
+        digest.update((0).to_bytes(4, "big") * 2)
+        digest.update(b"\0")
+        return state, digest, ()
+
+    acl_entries = tuple(metadata.acl_entries)
+    xattrs = tuple(sorted(metadata.xattrs))
+    if (
+        type(metadata.acl_entry_count) is not int
+        or metadata.acl_entry_count != len(acl_entries)
+        or not 0 <= metadata.acl_entry_count <= 128
+        or any(
+            not isinstance(entry, str)
+            or not entry
+            or "\0" in entry
+            or "\n" in entry
+            or "\r" in entry
+            or len(entry.encode("ascii")) > 1024
+            for entry in acl_entries
+        )
+        or len(set(acl_entries)) != len(acl_entries)
+        or len(xattrs) > 128
+        or any(
+            not isinstance(name, str)
+            or not name
+            or "\0" in name
+            or len(name.encode("utf-8")) > 4096
+            for name in xattrs
+        )
+        or len(set(xattrs)) != len(xattrs)
+        or sum(len(name.encode("utf-8")) for name in xattrs) > 4096
+        or type(metadata.quarantine_present) is not bool
+        or metadata.quarantine_present != ("com.apple.quarantine" in xattrs)
+    ):
+        raise ValueError("filesystem metadata binding is malformed")
+    digest.update(len(acl_entries).to_bytes(4, "big"))
+    digest.update(len(xattrs).to_bytes(4, "big"))
+    digest.update(bytes((int(metadata.quarantine_present),)))
+    for entry in acl_entries:
+        _update_digest_string(digest, entry, encoding="ascii")
+    return state, digest, xattrs
+
+
+def macos_leaf_metadata_digest(
+    metadata: MacOSDirectoryMetadataBinding | None,
+    *,
+    xattr_values: Iterable[tuple[str, bytes]] = (),
+) -> tuple[int, bytes]:
+    """Hash one normalized leaf metadata observation including xattr values."""
+
+    state, digest, xattrs = _leaf_metadata_digest_prefix(metadata)
+    value_iterator = iter(xattr_values)
+    if metadata is None:
+        try:
+            next(value_iterator)
+        except StopIteration:
+            return state, digest.digest()
+        raise ValueError("non-Darwin leaf metadata has xattr values")
+    total_value_bytes = 0
+    for expected_name in xattrs:
+        try:
+            name, value = next(value_iterator)
+        except StopIteration as error:
+            raise ValueError("leaf xattr value observation is incomplete") from error
+        if name != expected_name or not isinstance(value, bytes):
+            raise ValueError("leaf xattr value observation is inconsistent")
+        if len(value) > MAX_LEAF_XATTR_VALUE_BYTES:
+            raise ValueError("leaf xattr value exceeds its byte bound")
+        total_value_bytes += len(value)
+        if total_value_bytes > MAX_LEAF_XATTR_TOTAL_BYTES:
+            raise ValueError("leaf xattr values exceed their aggregate byte bound")
+        _update_digest_string(digest, name, encoding="utf-8")
+        _update_digest_bytes(digest, value)
+    try:
+        next(value_iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("leaf xattr value observation contains an extra entry")
+    return state, digest.digest()
+
+
+def _update_macos_leaf_xattr_digest(
+    fd: int,
+    names: tuple[str, ...],
+    digest: Any,
+) -> None:
+    """Hash one bounded FD-relative value snapshot without returning raw bytes."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fgetxattr = libc.fgetxattr
+    fgetxattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    ]
+    fgetxattr.restype = ctypes.c_ssize_t
+    total_value_bytes = 0
+
+    def required_size(name: bytes) -> int:
+        ctypes.set_errno(0)
+        value = fgetxattr(fd, name, None, 0, 0, 0)
+        if value < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot size leaf extended attribute value",
+            )
+        if value > MAX_LEAF_XATTR_VALUE_BYTES:
+            raise ValueError("leaf xattr value exceeds its byte bound")
+        return int(value)
+
+    for name in names:
+        raw_name = name.encode("utf-8")
+        size = required_size(raw_name)
+        next_total = total_value_bytes + size
+        if next_total > MAX_LEAF_XATTR_TOTAL_BYTES:
+            raise ValueError("leaf xattr values exceed their aggregate byte bound")
+        total_value_bytes = next_total
+        buffer: Any | None = None
+        try:
+            if size:
+                buffer = ctypes.create_string_buffer(size)
+                ctypes.set_errno(0)
+                read_size = fgetxattr(fd, raw_name, buffer, size, 0, 0)
+                if read_size < 0:
+                    raise OSError(
+                        ctypes.get_errno() or errno.EIO,
+                        "cannot read leaf extended attribute value",
+                    )
+                if read_size != size:
+                    raise OSError(
+                        errno.ESTALE,
+                        "leaf extended attribute value changed during inspection",
+                    )
+            if required_size(raw_name) != size:
+                raise OSError(
+                    errno.ESTALE,
+                    "leaf extended attribute value changed during inspection",
+                )
+            _update_digest_string(digest, name, encoding="utf-8")
+            digest.update(size.to_bytes(8, "big"))
+            if buffer is not None:
+                digest.update(memoryview(buffer).cast("B")[:size])
+        finally:
+            if buffer is not None:
+                try:
+                    ctypes.memset(buffer, 0, size)
+                finally:
+                    buffer = None
+
+
+def _macos_leaf_metadata_digest_from_fd(
+    fd: int,
+    metadata: MacOSDirectoryMetadataBinding,
+) -> tuple[int, bytes]:
+    state, digest, xattrs = _leaf_metadata_digest_prefix(metadata)
+    _update_macos_leaf_xattr_digest(fd, xattrs, digest)
+    return state, digest.digest()
+
+
+def _leaf_stat_policy_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+        metadata.st_size,
+        metadata.st_nlink,
+    )
+
+
+def inspect_macos_leaf_metadata_digest(fd: int) -> tuple[int, bytes]:
+    """Double-observe and immediately hash descriptor-bound leaf metadata.
+
+    Callers that bind an already-admitted filesystem object need its exact ACL
+    plus complete xattr value state even when that state is not the private-root
+    policy. Keep the parser lazy so ``codex_executable`` can continue importing
+    the recovery module without creating a module-import cycle.
+    """
+
+    if sys.platform != "darwin":
+        return macos_leaf_metadata_digest(None)
+    from .codex_executable import inspect_macos_filesystem_metadata
+
+    before = os.fstat(fd)
+    first_evidence = inspect_macos_filesystem_metadata(fd, "file")
+    first_metadata = _macos_directory_metadata_binding(first_evidence)
+    assert first_metadata is not None
+    first = _macos_leaf_metadata_digest_from_fd(fd, first_metadata)
+    middle = os.fstat(fd)
+    second_evidence = inspect_macos_filesystem_metadata(fd, "file")
+    second_metadata = _macos_directory_metadata_binding(second_evidence)
+    assert second_metadata is not None
+    second = _macos_leaf_metadata_digest_from_fd(fd, second_metadata)
+    after = os.fstat(fd)
+    if (
+        _leaf_stat_policy_binding(before) != _leaf_stat_policy_binding(middle)
+        or _leaf_stat_policy_binding(middle) != _leaf_stat_policy_binding(after)
+        or first != second
+    ):
+        raise OSError(errno.ESTALE, "leaf metadata changed during inspection")
+    return second
+
+
+def leaf_content_state_for_file_type(file_type: int) -> int:
+    if stat.S_ISREG(file_type):
+        return LEAF_CONTENT_STATE_REGULAR
+    if stat.S_ISLNK(file_type):
+        return LEAF_CONTENT_STATE_SYMLINK
+    if stat.S_ISFIFO(file_type):
+        return LEAF_CONTENT_STATE_FIFO
+    if stat.S_ISSOCK(file_type):
+        return LEAF_CONTENT_STATE_SOCKET
+    if stat.S_ISCHR(file_type):
+        return LEAF_CONTENT_STATE_CHARACTER_DEVICE
+    if stat.S_ISBLK(file_type):
+        return LEAF_CONTENT_STATE_BLOCK_DEVICE
+    if stat.S_ISDIR(file_type):
+        raise ValueError("directory content cannot be bound as a leaf")
+    return LEAF_CONTENT_STATE_OTHER
+
+
+def _leaf_content_stat_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_size,
+    )
+
+
+def _leaf_content_digest_once(
+    fd: int,
+    metadata: os.stat_result,
+    *,
+    deadline: float,
+) -> tuple[int, bytes]:
+    """Hash one bounded leaf-content observation without retaining raw chunks."""
+
+    if time.monotonic() >= deadline:
+        raise LeafContentDeadlineExpired("targeted cleanup monotonic deadline expired")
+    file_type = stat.S_IFMT(metadata.st_mode)
+    state = leaf_content_state_for_file_type(file_type)
+    digest = hashlib.sha256()
+    digest.update(_LEAF_CONTENT_DIGEST_DOMAIN)
+    digest.update(bytes((state,)))
+    digest.update(file_type.to_bytes(4, "big"))
+    size = metadata.st_size
+    if type(size) is not int or size < 0:
+        raise ValueError("leaf content size is invalid")
+    digest.update(size.to_bytes(8, "big"))
+    if state != LEAF_CONTENT_STATE_REGULAR:
+        return state, digest.digest()
+    if size > MAX_LEAF_CONTENT_BYTES:
+        raise ValueError("regular leaf content exceeds its byte bound")
+    preadv = getattr(os, "preadv", None)
+    if preadv is None:
+        raise OSError(errno.ENOSYS, "descriptor-relative content reads are unavailable")
+    offset = 0
+    buffer: bytearray | None = bytearray(_LEAF_CONTENT_READ_BYTES)
+    view: memoryview | None = memoryview(buffer)
+    read_view: memoryview | None = None
+    digest_view: memoryview | None = None
+    try:
+        while offset < size:
+            if time.monotonic() >= deadline:
+                raise LeafContentDeadlineExpired(
+                    "targeted cleanup monotonic deadline expired"
+                )
+            remaining = size - offset
+            assert view is not None
+            requested = min(_LEAF_CONTENT_READ_BYTES, remaining)
+            read_view = view[:requested]
+            try:
+                read_size = preadv(fd, [read_view], offset)
+            finally:
+                read_view.release()
+                read_view = None
+            if type(read_size) is not int or read_size <= 0:
+                raise OSError(
+                    errno.ESTALE,
+                    "regular leaf content ended during inspection",
+                )
+            if read_size > requested:
+                raise OSError(
+                    errno.ESTALE,
+                    "regular leaf content read exceeded its observed size",
+                )
+            digest_view = view[:read_size]
+            try:
+                digest.update(digest_view)
+            finally:
+                digest_view.release()
+                digest_view = None
+            offset += read_size
+        return state, digest.digest()
+    finally:
+        try:
+            if digest_view is not None:
+                digest_view.release()
+        finally:
+            digest_view = None
+            try:
+                if read_view is not None:
+                    read_view.release()
+            finally:
+                read_view = None
+                try:
+                    if view is not None:
+                        view.release()
+                finally:
+                    view = None
+                    if buffer is not None:
+                        try:
+                            buffer[:] = _LEAF_CONTENT_ZEROES
+                        finally:
+                            buffer = None
+
+
+def inspect_leaf_content_digest(
+    fd: int,
+    *,
+    deadline: float,
+) -> tuple[int, bytes]:
+    """Double-observe the complete bounded content property of one leaf FD."""
+
+    before = os.fstat(fd)
+    first = _leaf_content_digest_once(fd, before, deadline=deadline)
+    middle = os.fstat(fd)
+    second = _leaf_content_digest_once(fd, middle, deadline=deadline)
+    after = os.fstat(fd)
+    if (
+        _leaf_content_stat_binding(before) != _leaf_content_stat_binding(middle)
+        or _leaf_content_stat_binding(middle) != _leaf_content_stat_binding(after)
+        or first != second
+    ):
+        raise OSError(errno.ESTALE, "leaf content changed during inspection")
+    return second
+
+
 def _directory_policy_binding(
     metadata: os.stat_result,
     macos_metadata: Any | None,
@@ -798,6 +1205,7 @@ def open_absolute_directory_chain(
     *,
     create: bool = False,
     private_leaf: bool = False,
+    allow_sticky_writable_ancestors: bool = True,
 ) -> tuple[int, Identity]:
     if not path.is_absolute():
         raise ValueError("directory path must be absolute")
@@ -807,7 +1215,8 @@ def open_absolute_directory_chain(
         raise ValueError("directory path contains a dot component")
     active_binding = _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.get()
     selected_path = (
-        active_binding is not None
+        allow_sticky_writable_ancestors
+        and active_binding is not None
         and active_binding.matches_selected_walk_path(walk_path)
     )
     if selected_path:
@@ -819,11 +1228,18 @@ def open_absolute_directory_chain(
         fd = os.open(b"/", flags)
         current = pathlib.Path("/")
     try:
-        identity, _ = _validate_directory_fd_with_policy(
+        identity, root_policy = _validate_directory_fd_with_policy(
             fd,
             current,
             private=private_leaf and not raw_parts,
         )
+        if not allow_sticky_writable_ancestors and root_policy.mode & (
+            stat.S_IWGRP | stat.S_IWOTH
+        ):
+            raise OSError(
+                errno.EPERM,
+                f"directory ancestor is group- or world-writable: {current}",
+            )
         for index, part in enumerate(raw_parts):
             current /= os.fsdecode(part)
             created = False
@@ -845,6 +1261,13 @@ def open_absolute_directory_chain(
                         or (private_leaf and index == len(raw_parts) - 1),
                     )
                 )
+                if not allow_sticky_writable_ancestors and descriptor_policy.mode & (
+                    stat.S_IWGRP | stat.S_IWOTH
+                ):
+                    raise OSError(
+                        errno.EPERM,
+                        f"directory ancestor is group- or world-writable: {current}",
+                    )
                 path_metadata = os.stat(
                     part,
                     dir_fd=fd,

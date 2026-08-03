@@ -3,7 +3,7 @@ id: 20260727-rsr001
 title: Review Runtime State Root
 status: completed
 created: 2026-07-27
-updated: 2026-07-30
+updated: 2026-07-31
 branch: wip/review-runtime-state-no-bytecode
 pr:
 supersedes: []
@@ -110,10 +110,16 @@ superseded_by:
   diagnostic.
 - Installed-symlink preflight coverage proves the release tree inventory and
   bytes remain unchanged while runtime directories are created externally.
+- Test-runtime directories are normalized to `0700` relative to a held parent
+  descriptor and revalidated for the same object before use, so restrictive
+  process umasks cannot make valid scratch allocation fail. The read-only
+  installed runner retains the exact runtime-directory descriptor through child
+  closure, enumerates residue from that object, and revalidates the pathname
+  before cleanup; a replacement cannot be mistaken for an empty clean tree.
 - Canonical and private reviewed CI fixtures use in-memory `compile(...)`
   syntax validation and explicit zero-cache guards. Their Python 3.13
-  independent-supervisor jobs also run the installed-release immutability
-  regression explicitly.
+  workflows run the installed-release immutability regression in a dedicated
+  20-minute job, separate from the ordinary deterministic supervisor job.
 
 ## Next Steps
 
@@ -127,10 +133,10 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 1026.912 seconds.
+- The final platform suite ran 2,822 tests with 6 skips in 1051.356 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.641 seconds. The required live no-child/Seatbelt suite passed 9/9
+  in 3.056 seconds. The required live no-child/Seatbelt suite passed 9/9
   outside the parent sandbox in 7.866 seconds.
 - The complete 100-test contract module passed in 8.001 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
@@ -239,9 +245,18 @@ superseded_by:
   to a private revalidation call count. New regressions prove every acquired
   descriptor is attempted, preserve the primary mismatch, parse both public
   command matrices, and induce real catalog replacement during finalization.
-- The deterministic independent-supervisor gate passed 604/604 in 211.998
-  seconds with the reviewed 604-test selected identity and SHA-256
-  `b62309210d115ed54e9e6dc3c37f1f26ecdcbfbfc97f22cd8ba55ebb94403175`.
+- The deterministic independent-supervisor gate passed 619/619 in 278.468
+  seconds with the reviewed 619-test selected identity and SHA-256
+  `346a50ba8b68780fb7afee2e71c9c2caa9f1805d6bb7d4da96ed71cbc1401787`.
+- The current hardened runtime-parent suite passed 621/621 in 225.264 seconds
+  with the reviewed 621-test selected identity and SHA-256
+  `0203bf84f76bfe4fcb49362ac3137474753af30c4aea0a0a31c47774a6929f4d`.
+- The post-GitHub-review runtime binding and umask hardening passed 626/626 in
+  243.743 seconds with the reviewed 626-test selected identity and SHA-256
+  `135686bbf5d166fe7a050c739ea88a4d6080cd2019298762650e3372fee9fe76`.
+  The real read-only installed runner also returned proven child closure,
+  complete cleanup, an immutable release tree, no retained paths, no runtime
+  residue, and no secondary failures.
 - The post-fix CLI module passed 53/53 tests in 43.543 seconds on Python 3.13.
 - The focused post-fix CLI and secure-I/O modules passed 78/78 tests in 45.435
   seconds on Python 3.13.
@@ -250,3 +265,60 @@ superseded_by:
   and the zero-bytecode inventory passed.
 - No local Python 3.10 run is required for this delivery; local validation uses
   Python 3.13 only.
+- The process-census, inherited Seatbelt, and descriptor-custody hardening
+  passed 646/646 in 91.255 seconds on the host-level uv-managed CPython 3.13.13
+  runtime, with the reviewed 646-test selected identity and SHA-256
+  `cc1b2204ad8af6de52668bf83779aac60ec5bab00b20578e20419b5b6fe8f57e`.
+  The Darwin object identity is the exact `(PID, start seconds, start
+  microseconds)` returned by the SDK-declared `sysctl(KERN_PROC_PID)` interface:
+  PID detects the process-table slot, the start timeval distinguishes slot
+  reuse, and mutable state or credential fields are intentionally not identity
+  signals.
+- The final runtime-root reentry, parent-publication, recovery-admission,
+  child-FD settlement, recovery directory-FD custody, and delayed Darwin
+  process-visibility changes passed 785/785 deterministic tests in 101.433
+  seconds on the same uv-managed CPython 3.13.13 runtime. The
+  reviewed 785-test selected identity has SHA-256
+  `d5c05be333956ec17a9190f79044d730eab639328d1ec4e5aec5a74c903b05ef`.
+  Runtime-root custody continues to bind object identity independently from
+  access-policy evidence: directory child churn is benign, while pathname
+  replacement, content mutation, unreadable revalidation, and policy drift
+  remain distinct fail-closed outcomes. Process closure likewise retains exact
+  `(PID, start seconds, start microseconds)` identity; the numeric Darwin state
+  is diagnostic only. Empty process-group and exact-identity absence results
+  must remain stable across bounded observation windows, and terminal direct
+  children are reaped before closure can be proven. Zombies and persistent live
+  identities continue to block cleanup until exact absence is observed. A
+  terminal child remains unreaped with `WNOWAIT` while a fresh Darwin census
+  proves the complete start-time identity still occupies its PID; missing,
+  unreadable, or mismatched rebinding fails closed, and every reap step shares
+  the original five-second absolute deadline.
+- The post-CI correction rejects non-3.13 interpreters before importing the
+  supervisor package, so unsupported runtimes cannot replace the stable version
+  diagnostic with an import failure. The current complete contract module
+  passed 105/105 on the uv-managed CPython 3.13.13 runtime.
+- The final leaf-cleanup and child-outcome diagnostic hardening passed 802/802
+  deterministic tests in 103.447 seconds on the host-level uv-managed CPython
+  3.13.13 runtime. The reviewed 802-test selected identity has SHA-256
+  `d937a349ec87ffbd440be7e73734f5ea7533331c7212d5977c7661481b0a3516`.
+  Manifest v3 now binds each leaf's object identity, owner, group, mode, flags,
+  generation, normalized ACL state, and every canonical xattr name plus its
+  complete bounded value. It also binds the exact bytes of each readable
+  regular leaf with a domain-separated SHA-256 digest. Regular content is read
+  twice from the same descriptor through a fixed, cleared 64 KiB buffer under
+  one absolute deadline and a dedicated 512 MiB per-leaf cap; FIFO, symlink,
+  and other non-regular leaves use domain-separated canonical states without
+  consuming stream or target data. Raw content and xattr values never enter the
+  manifest. Oversized, unreadable, unstable, or equal-length rewritten content
+  fails closed, while the destructive unlink boundary rechecks the original
+  absolute deadline and retains the quarantined leaf when it has expired. The
+  focused recovery and secure-I/O modules passed 76/76 and 30/30,
+  respectively, under the same runtime. A separate caller-owned receipt now
+  preserves an already bounded child return code and output before same-UID
+  closure without authorizing cleanup. On the live double-fork fixture's normal
+  path, a custody receipt binds the exact PID/start-time identity before marker
+  publication, cleanup rebinds that identity before writing a task-private
+  cooperative stop, and one deadline covers stable absence proof. If marker
+  publication fails, the unreaped direct-child relationship prevents PID reuse
+  while the parent sends SIGKILL and then reaps that child; an independent
+  custody receipt and exact-identity absence proof exercise that failure path.

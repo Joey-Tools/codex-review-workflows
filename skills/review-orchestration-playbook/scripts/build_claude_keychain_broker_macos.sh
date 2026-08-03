@@ -23,7 +23,12 @@ EXPECTED_HOSTED_LD_SHA256="e412b9f2af31b1567a9eabc28f553a8f1cf34127e2107cb39c269
 EXPECTED_HOSTED_LIPO_SHA256="d8ced1b847259d388ce48178e0a908a4be87dc3f8b1b3b2c997d2a8d6936f84d"
 EXPECTED_HOSTED_VTOOL_SHA256="4fe292643e9c8c528148c5be41d8d22801a17ec1f2bdaf85665c25c5cc56e236"
 EXPECTED_HOSTED_CODESIGN_ALLOCATE_SHA256="b22f65e9f3ac39e5d64a2b88b42d4b2571926f929fc8b6b57cfc10de6d0d16ac"
-EXPECTED_HOSTED_CODESIGN_SHA256="06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337"
+EXPECTED_HOSTED_CODESIGN_SHA256="214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7"
+EXPECTED_HOSTED_LEGACY_CODESIGN_SHA256="06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337"
+EXPECTED_HOSTED_OS_VERSION="26.5.2"
+EXPECTED_HOSTED_OS_BUILD="25F84"
+EXPECTED_HOSTED_LEGACY_OS_VERSION="26.4"
+EXPECTED_HOSTED_LEGACY_OS_BUILD="25E246"
 DEFAULT_DEVELOPER_DIR="/Applications/Xcode-26.6.0.app/Contents/Developer"
 HOSTED_RUNNER_DEVELOPER_DIR="/Applications/Xcode_26.6.app/Contents/Developer"
 DEVELOPER_DIR="${DEVELOPER_DIR:-$DEFAULT_DEVELOPER_DIR}"
@@ -57,8 +62,10 @@ require_digest() {
     fail "$label is not a real regular file: $path"
   output="$("${probe_environment[@]}" /usr/bin/shasum -a 256 "$path")"
   actual="${output%% *}"
-  [[ "$actual" == "$expected" ]] ||
-    fail "$label digest does not match the reviewed pin"
+  if [[ "$actual" != "$expected" ]]; then
+    fail "$label digest does not match the reviewed pin (expected=$expected actual=$actual)"
+  fi
+  printf 'verified %s sha256=%s\n' "$label" "$actual"
 }
 
 require_artifact_pins() {
@@ -71,6 +78,23 @@ require_artifact_pins() {
 
 require_tool_digest() {
   require_digest "$1" "$2" "$3"
+}
+
+select_hosted_codesign_sha256() {
+  local os_version os_build
+  os_version="$("${probe_environment[@]}" /usr/bin/sw_vers -productVersion)"
+  os_build="$("${probe_environment[@]}" /usr/bin/sw_vers -buildVersion)"
+  case "$os_version:$os_build" in
+    "$EXPECTED_HOSTED_OS_VERSION:$EXPECTED_HOSTED_OS_BUILD")
+      printf '%s\n' "$EXPECTED_HOSTED_CODESIGN_SHA256"
+      ;;
+    "$EXPECTED_HOSTED_LEGACY_OS_VERSION:$EXPECTED_HOSTED_LEGACY_OS_BUILD")
+      printf '%s\n' "$EXPECTED_HOSTED_LEGACY_CODESIGN_SHA256"
+      ;;
+    *)
+      fail "hosted runner OS version/build is not reviewed: $os_version ($os_build)"
+      ;;
+  esac
 }
 
 initialize_expected_toolchain_paths() {
@@ -90,7 +114,7 @@ initialize_expected_tool_digests() {
     expected_lipo_sha256="$EXPECTED_HOSTED_LIPO_SHA256"
     expected_vtool_sha256="$EXPECTED_HOSTED_VTOOL_SHA256"
     expected_codesign_allocate_sha256="$EXPECTED_HOSTED_CODESIGN_ALLOCATE_SHA256"
-    expected_codesign_sha256="$EXPECTED_HOSTED_CODESIGN_SHA256"
+    expected_codesign_sha256="$(select_hosted_codesign_sha256)"
   else
     expected_clang_sha256="$EXPECTED_DEVELOPER_CLANG_SHA256"
     expected_ld_sha256="$EXPECTED_DEVELOPER_LD_SHA256"

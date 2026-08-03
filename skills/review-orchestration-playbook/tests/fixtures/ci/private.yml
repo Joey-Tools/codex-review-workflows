@@ -143,13 +143,14 @@ jobs:
       - name: Match hosted no-child blocker signature
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{ runner.temp }}
         run: |
           python3 -m tests.run_required_deterministic_supervisor
       - name: Verify installed release tree remains immutable
@@ -164,6 +165,616 @@ jobs:
         if: always()
         run: |
           python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
+
+  readonly_install_supervisor_tests:
+    name: read-only-install-supervisor (python-3.13)
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned uv
+        id: setup-uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.18"
+          enable-cache: false
+      - name: Run deterministic supervisor from read-only install
+        env:
+          REVIEW_SOURCE_RELATIVE: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+          UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
+        run: |
+          isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/codex-review-readonly.XXXXXX)"
+          echo "Read-only isolation recovery root: $isolated_root"
+          if [[ ! "$isolated_root" =~ ^/private/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
+            echo "::error::Refusing an unexpected isolation root; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /bin/chmod -N "$isolated_root"
+          /usr/bin/sudo /bin/test -d "$isolated_root"
+          /usr/bin/sudo /bin/test ! -L "$isolated_root"
+          isolated_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$isolated_root")" = "700"
+          uv_root_home="$isolated_root/uv-home"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$uv_root_home")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$uv_root_home")" = "700"
+          uv_root_tmp="$uv_root_home/tmp"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$uv_root_tmp")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$uv_root_tmp")" = "700"
+          trusted_uv_candidate="$UV_EXECUTABLE"
+          trusted_uv=""
+          if [[ "$trusted_uv_candidate" == /* ]] \
+            && ! /bin/test -L "$trusted_uv_candidate"; then
+            trusted_uv="$(cd "$(/usr/bin/dirname "$trusted_uv_candidate")" && pwd -P)/$(/usr/bin/basename "$trusted_uv_candidate")" \
+              || trusted_uv=""
+          fi
+          run_trusted_uv() {
+            /usr/bin/sudo /usr/bin/env -i \
+              HOME="$uv_root_home" \
+              LANG=C \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              TMPDIR="$uv_root_tmp" \
+              "$trusted_uv" "$@"
+          }
+          if [[ -z "$trusted_uv" ]] \
+            || ! /bin/test -f "$trusted_uv" \
+            || /bin/test -L "$trusted_uv" \
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
+            echo "::error::Pinned setup-uv executable is not the expected physical uv 0.11.18; retained at $isolated_root"
+            exit 1
+          fi
+          trusted_uv_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$trusted_uv")"
+          trusted_uv_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"
+          trusted_uv_digest="${trusted_uv_digest%% *}"
+          if [[ ! "$trusted_uv_digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Pinned setup-uv executable digest is invalid; retained at $isolated_root"
+            exit 1
+          fi
+          uv_staging_dir="$isolated_root/uv-managed-staging"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_staging_dir"
+          run_trusted_uv python install 3.13.13 \
+            --managed-python \
+            --install-dir "$uv_staging_dir" \
+            --no-bin \
+            --no-cache \
+            --no-progress \
+            --no-config
+          trusted_uv_postinstall_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$trusted_uv")"
+          trusted_uv_postinstall_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"
+          trusted_uv_postinstall_digest="${trusted_uv_postinstall_digest%% *}"
+          if [[ "$trusted_uv_postinstall_binding" != "$trusted_uv_binding" ]] \
+            || [[ "$trusted_uv_postinstall_digest" != "$trusted_uv_digest" ]] \
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
+            echo "::error::Pinned setup-uv executable changed while installing Python; retained at $isolated_root"
+            exit 1
+          fi
+          staged_runtime_root=""
+          staged_runtime_count=0
+          for runtime_candidate in \
+            "$uv_staging_dir/cpython-3.13.13-macos-aarch64-none" \
+            "$uv_staging_dir/cpython-3.13.13-macos-x86_64-none"; do
+            if /usr/bin/sudo /bin/test -e "$runtime_candidate" \
+              || /usr/bin/sudo /bin/test -L "$runtime_candidate"; then
+              staged_runtime_root="$runtime_candidate"
+              (( staged_runtime_count += 1 ))
+            fi
+          done
+          staged_runtime_alias=""
+          staged_runtime_alias_count=0
+          for runtime_alias_candidate in \
+            "$uv_staging_dir/cpython-3.13-macos-aarch64-none" \
+            "$uv_staging_dir/cpython-3.13-macos-x86_64-none"; do
+            if /usr/bin/sudo /bin/test -e "$runtime_alias_candidate" \
+              || /usr/bin/sudo /bin/test -L "$runtime_alias_candidate"; then
+              staged_runtime_alias="$runtime_alias_candidate"
+              (( staged_runtime_alias_count += 1 ))
+            fi
+          done
+          staged_runtime_alias_target=""
+          if (( staged_runtime_alias_count == 1 )) \
+            && /usr/bin/sudo /bin/test -L "$staged_runtime_alias"; then
+            staged_runtime_alias_target="$(/usr/bin/sudo /usr/bin/readlink "$staged_runtime_alias")" \
+              || staged_runtime_alias_target="<unreadable>"
+          fi
+          staging_unexpected_entry=""
+          staging_unexpected_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir" \
+            -mindepth 1 -maxdepth 1 \
+            ! -name '.lock' \
+            ! -name '.temp' \
+            ! -name '.gitignore' \
+            ! -name 'cpython-3.13-macos-aarch64-none' \
+            ! -name 'cpython-3.13-macos-x86_64-none' \
+            ! -name 'cpython-3.13.13-macos-aarch64-none' \
+            ! -name 'cpython-3.13.13-macos-x86_64-none' \
+            -print -quit)" || staging_unexpected_entry="<unreadable>"
+          staging_temp_entry=""
+          staging_temp_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir/.temp" \
+            -mindepth 1 -print -quit)" || staging_temp_entry="<unreadable>"
+          if (( staged_runtime_count != 1 )) \
+            || (( staged_runtime_alias_count != 1 )) \
+            || ! /usr/bin/sudo /bin/test -L "$staged_runtime_alias" \
+            || [[ "$staged_runtime_alias_target" != "$staged_runtime_root" ]] \
+            || [[ -n "$staging_unexpected_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -f "$uv_staging_dir/.lock" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.lock" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%z' "$uv_staging_dir/.lock")" != "0" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$uv_staging_dir/.temp" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.temp" \
+            || [[ -n "$staging_temp_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -f "$uv_staging_dir/.gitignore" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.gitignore" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%z' "$uv_staging_dir/.gitignore")" != "1" ]] \
+            || [[ "$(/usr/bin/sudo /bin/cat "$uv_staging_dir/.gitignore")" != "*" ]]; then
+            echo "::error::uv staging inventory is not the exact v0.11.18 managed-Python layout; retained at $isolated_root"
+            exit 1
+          fi
+          staged_runtime_root_physical="$(/usr/bin/sudo /bin/sh -c 'cd "$1" && pwd -P' sh "$staged_runtime_root")"
+          staged_runtime_root_name="$(/usr/bin/basename "$staged_runtime_root")"
+          if [[ "$staged_runtime_root_physical" != "$staged_runtime_root" ]] \
+            || [[ ! "$staged_runtime_root_name" =~ ^cpython-3\.13\.13-macos-(aarch64|x86_64)-none$ ]] \
+            || ! /usr/bin/sudo /bin/test -d "$staged_runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$staged_runtime_root"; then
+            echo "::error::uv staged Python root has an unexpected identity; retained at $isolated_root"
+            exit 1
+          fi
+          managed_python_dir="$isolated_root/managed-python"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$managed_python_dir"
+          runtime_root="$managed_python_dir/$staged_runtime_root_name"
+          /usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"
+          /usr/bin/sudo /bin/rm "$staged_runtime_alias" \
+            "$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"
+          /usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" "$uv_staging_dir"
+          if /usr/bin/sudo /bin/test -e "$uv_staging_dir" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir"; then
+            echo "::error::uv staging cleanup is incomplete; retained at $isolated_root"
+            exit 1
+          fi
+          managed_python_unexpected_entry=""
+          managed_python_unexpected_entry="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \
+            -mindepth 1 -maxdepth 1 \
+            ! -name "$staged_runtime_root_name" -print -quit)" \
+            || managed_python_unexpected_entry="<unreadable>"
+          if [[ -n "$managed_python_unexpected_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$runtime_root"; then
+            echo "::error::Final managed-Python parent does not contain exactly one versioned physical root; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_root_physical="$(/usr/bin/sudo /bin/sh -c 'cd "$1" && pwd -P' sh "$runtime_root")"
+          runtime_root_parent="$(/usr/bin/sudo /bin/sh -c 'cd "$1/.." && pwd -P' sh "$runtime_root")"
+          runtime_root_name="$(/usr/bin/basename "$runtime_root")"
+          if [[ "$runtime_root_physical" != "$runtime_root" ]] \
+            || [[ "$runtime_root_parent" != "$managed_python_dir" ]] \
+            || [[ ! "$runtime_root_name" =~ ^cpython-3\.13\.13-macos-(aarch64|x86_64)-none$ ]] \
+            || ! /usr/bin/sudo /bin/test -d "$runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$runtime_root"; then
+            echo "::error::uv managed Python root has an unexpected identity or layout; retained at $isolated_root"
+            exit 1
+          fi
+          isolated_python="$runtime_root/bin/python3.13"
+          if ! /usr/bin/sudo /bin/test -f "$isolated_python" \
+            || /usr/bin/sudo /bin/test -L "$isolated_python" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%HT:%l' "$isolated_python")" != "Regular File:1" ]]; then
+            echo "::error::uv managed Python interpreter is not a singly linked regular file; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_special="$(/usr/bin/sudo /usr/bin/find "$runtime_root" ! -type d ! -type f ! -type l -print -quit)"
+          runtime_hardlink="$(/usr/bin/sudo /usr/bin/find "$runtime_root" -type f -links +1 -print -quit)"
+          if [[ -n "$runtime_special" ]] \
+            || [[ -n "$runtime_hardlink" ]]; then
+            echo "::error::uv managed Python contains a special file or external hardlink alias; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_libraries="$(/usr/bin/sudo /usr/bin/otool -L "$isolated_python" | /usr/bin/sed -n '2,$p')"
+          runtime_library_violation="$(/usr/bin/printf '%s\n' "$runtime_libraries" | /usr/bin/awk '{print $1}' | /usr/bin/awk '$0 !~ "^/System/" && $0 !~ "^/usr/lib/" && !found {print; found = 1}')"
+          runtime_rpaths="$(/usr/bin/sudo /usr/bin/otool -l "$isolated_python" | /usr/bin/awk '$1 == "cmd" && $2 == "LC_RPATH" {want = 1; next} want && $1 == "path" {print $2; want = 0}')"
+          if [[ -z "$runtime_libraries" ]] \
+            || [[ -n "$runtime_library_violation" ]] \
+            || [[ "$runtime_rpaths" != "@executable_path/../lib" ]]; then
+            echo "::error::uv managed Python has an external non-system Mach-O dependency; retained at $isolated_root"
+            exit 1
+          fi
+          compute_runtime_loader_binding() {
+            {
+              /usr/bin/sudo /usr/bin/otool -L "$isolated_python"
+              /usr/bin/sudo /usr/bin/otool -l "$isolated_python"
+            } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+          }
+          compute_runtime_symlink_binding() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import hashlib, os, pathlib, sys; root = pathlib.Path(sys.argv[1]).resolve(strict=True); links = sorted((path for path in root.rglob("*") if path.is_symlink()), key=lambda path: os.fsencode(str(path.relative_to(root)))); resolved = [(path, path.resolve(strict=True)) for path in links]; escaped = [(path, target) for path, target in resolved if target != root and root not in target.parents]; records = [os.fsencode(str(path.relative_to(root))) + b"\0" + os.fsencode(os.readlink(path)) + b"\0" for path in links]; sys.exit("runtime symlink escapes versioned root: " + ", ".join(str(path) for path, _ in escaped[:10])) if escaped else print(f"{len(links)}:{hashlib.sha256(b"".join(records)).hexdigest()}")' \
+              "$runtime_root"
+          }
+          compute_runtime_tree_binding() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import hashlib, os, pathlib, stat, sys; root = pathlib.Path(sys.argv[1]).resolve(strict=True); entries = sorted(((path, path.lstat()) for path in [root, *root.rglob("*")]), key=lambda item: os.fsencode(str(item[0].relative_to(root)))); special = [path for path, metadata in entries if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode))]; content = [os.fsencode(str(path.relative_to(root))) + b"\0" + (b"D" if stat.S_ISDIR(metadata.st_mode) else b"L" + os.fsencode(os.readlink(path)) if stat.S_ISLNK(metadata.st_mode) else b"F" + hashlib.sha256(path.read_bytes()).digest()) + b"\0" for path, metadata in entries]; identity = [os.fsencode(str(path.relative_to(root))) + b"\0" + f"{metadata.st_dev}:{metadata.st_ino}:{stat.S_IFMT(metadata.st_mode)}:{metadata.st_uid}:{metadata.st_gid}:{stat.S_IMODE(metadata.st_mode)}:{getattr(metadata, "st_flags", 0)}:{metadata.st_nlink}".encode() + b"\0" for path, metadata in entries]; sys.exit("special runtime entry: " + ", ".join(str(path) for path in special[:10])) if special else print(hashlib.sha256(b"".join(content)).hexdigest() + ":" + hashlib.sha256(b"".join(identity)).hexdigest())' \
+              "$runtime_root"
+          }
+          probe_runtime_identity() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import os, sys; print("|".join((f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", os.path.realpath(sys.executable), os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix))))'
+          }
+          runtime_symlink_binding="$(compute_runtime_symlink_binding)"
+          runtime_identity="$(probe_runtime_identity)"
+          if [[ "$runtime_identity" != "3.13.13|$isolated_python|$runtime_root|$runtime_root" ]]; then
+            echo "::error::uv managed Python did not self-identify as the isolated exact runtime; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"
+          /usr/bin/sudo /bin/chmod -RN "$managed_python_dir"
+          /usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"
+          /usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"
+          runtime_root_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$runtime_root")"
+          isolated_python_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$isolated_python")"
+          isolated_python_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_python")"
+          isolated_python_digest="${isolated_python_digest%% *}"
+          runtime_loader_binding="$(compute_runtime_loader_binding)"
+          runtime_tree_binding="$(compute_runtime_tree_binding)"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$managed_python_dir")" = "0:0:555"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$runtime_root")" = "0:0:555"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp:%l' "$isolated_python")" = "0:0:555:1"
+          verify_runtime_custody() {
+            local phase="$1"
+            local current_runtime_root_binding=""
+            local current_isolated_python_binding=""
+            local current_isolated_python_digest=""
+            local current_runtime_loader_binding=""
+            local current_runtime_symlink_binding=""
+            local current_runtime_tree_binding=""
+            local current_runtime_identity=""
+            local current_runtime_special=""
+            local current_runtime_hardlink=""
+            local current_runtime_owner_violation=""
+            local current_runtime_write_violation=""
+            local current_runtime_read_violation=""
+            local current_runtime_traverse_violation=""
+            local current_runtime_xattr_violation=""
+            local current_runtime_acl_violation=""
+            local current_codesign_status=0
+            current_runtime_root_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$runtime_root")" \
+              || current_runtime_root_binding="<unreadable>"
+            current_isolated_python_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$isolated_python")" \
+              || current_isolated_python_binding="<unreadable>"
+            current_isolated_python_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_python")" \
+              || current_isolated_python_digest="<unreadable>"
+            current_isolated_python_digest="${current_isolated_python_digest%% *}"
+            current_runtime_loader_binding="$(compute_runtime_loader_binding)" \
+              || current_runtime_loader_binding="<unreadable>"
+            current_runtime_symlink_binding="$(compute_runtime_symlink_binding)" \
+              || current_runtime_symlink_binding="<unsafe>"
+            current_runtime_tree_binding="$(compute_runtime_tree_binding)" \
+              || current_runtime_tree_binding="<unreadable>"
+            current_runtime_identity="$(probe_runtime_identity)" \
+              || current_runtime_identity="<invalid>"
+            current_runtime_special="$(/usr/bin/sudo /usr/bin/find "$runtime_root" ! -type d ! -type f ! -type l -print -quit)" \
+              || current_runtime_special="<unreadable>"
+            current_runtime_hardlink="$(/usr/bin/sudo /usr/bin/find "$runtime_root" -type f -links +1 -print -quit)" \
+              || current_runtime_hardlink="<unreadable>"
+            current_runtime_owner_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \( ! -user root -o ! -group wheel \) -print -quit)" \
+              || current_runtime_owner_violation="<unreadable>"
+            current_runtime_write_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \( -perm -0200 -o -perm -0020 -o -perm -0002 \) -print -quit)" \
+              || current_runtime_write_violation="<unreadable>"
+            current_runtime_read_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" -type f ! -perm -0444 -print -quit)" \
+              || current_runtime_read_violation="<unreadable>"
+            current_runtime_traverse_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" -type d ! -perm -0555 -print -quit)" \
+              || current_runtime_traverse_violation="<unreadable>"
+            current_runtime_xattr_violation="$(/usr/bin/sudo /usr/bin/xattr -lr "$managed_python_dir" | /usr/bin/sed -n '1p')" \
+              || current_runtime_xattr_violation="<unreadable>"
+            current_runtime_acl_violation="$(/usr/bin/sudo /usr/bin/find -s "$managed_python_dir" -exec /bin/ls -lde {} \; | /usr/bin/awk 'substr($1, 11, 1) == "+" && !found {print; found = 1}')" \
+              || current_runtime_acl_violation="<unreadable>"
+            /usr/bin/sudo /usr/bin/codesign --verify --strict "$isolated_python" \
+              || current_codesign_status=$?
+            if [[ "$current_runtime_root_binding" != "$runtime_root_binding" ]] \
+              || [[ "$current_isolated_python_binding" != "$isolated_python_binding" ]] \
+              || [[ "$current_isolated_python_digest" != "$isolated_python_digest" ]] \
+              || [[ "$current_runtime_loader_binding" != "$runtime_loader_binding" ]] \
+              || [[ "$current_runtime_symlink_binding" != "$runtime_symlink_binding" ]] \
+              || [[ "$current_runtime_tree_binding" != "$runtime_tree_binding" ]] \
+              || [[ "$current_runtime_identity" != "$runtime_identity" ]] \
+              || [[ -n "$current_runtime_special" ]] \
+              || [[ -n "$current_runtime_hardlink" ]] \
+              || [[ -n "$current_runtime_owner_violation" ]] \
+              || [[ -n "$current_runtime_write_violation" ]] \
+              || [[ -n "$current_runtime_read_violation" ]] \
+              || [[ -n "$current_runtime_traverse_violation" ]] \
+              || [[ -n "$current_runtime_xattr_violation" ]] \
+              || [[ -n "$current_runtime_acl_violation" ]] \
+              || (( current_codesign_status != 0 )); then
+              echo "::error::Isolated uv-managed Python failed $phase custody validation; retained at $isolated_root"
+              return 1
+            fi
+          }
+          verify_runtime_custody post-install
+          checkout_root="$(pwd -P)"
+          source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"
+          source_review_root_physical="$(cd "$source_review_root" && pwd -P)"
+          if [[ "$source_review_root_physical" != "$source_review_root" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root"; then
+            echo "::error::Checkout review source is not the expected physical directory; retained at $isolated_root"
+            exit 1
+          fi
+          # Bind source object identity/access policy separately from copied content.
+          source_root_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_tree_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)"
+          if [[ -n "$source_tree_symlink" ]]; then
+            echo "::error::Checkout review source contains a symlink; retained at $isolated_root"
+            exit 1
+          fi
+          source_review_profile="$source_review_root/tests/readonly_child_isolation.sb"
+          /bin/test -f "$source_review_profile"
+          /bin/test ! -L "$source_review_profile"
+          source_profile_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          isolated_source="$isolated_root/source"
+          /usr/bin/sudo /bin/test ! -e "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          /usr/bin/sudo /usr/bin/ditto "$source_review_root" "$isolated_source"
+          /usr/bin/sudo /bin/test -d "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          source_tree_postcopy_symlink=""
+          source_tree_postcopy_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)" \
+            || source_tree_postcopy_symlink="<unreadable>"
+          isolated_tree_postcopy_symlink=""
+          isolated_tree_postcopy_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postcopy_symlink="<unreadable>"
+          source_root_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_review_root_postcopy_physical=""
+          source_review_root_postcopy_physical="$(cd "$source_review_root" && pwd -P)" \
+            || source_review_root_postcopy_physical="<unreadable>"
+          if [[ "$source_root_postcopy_binding" != "$source_root_binding" ]] \
+            || [[ "$source_review_root_postcopy_physical" != "$source_review_root" ]] \
+            || [[ -n "$source_tree_postcopy_symlink" ]] \
+            || [[ -n "$isolated_tree_postcopy_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null; then
+            echo "::error::Checkout review source changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"
+          /usr/bin/sudo /bin/chmod -RN "$isolated_source"
+          /usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"
+          isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
+          /usr/bin/sudo /bin/chmod 0755 "$isolated_root"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" = "0:755"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
+          /usr/bin/sudo /usr/sbin/chown nobody:nobody "$isolated_root/payload"
+          /usr/bin/sudo -u nobody /bin/test ! -w /private
+          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_root"
+          /usr/bin/sudo -u nobody /bin/test -x "$isolated_python"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$managed_python_dir"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$runtime_root"
+          /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$isolated_source"
+          /usr/bin/sudo -u nobody /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
+          isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
+          review_profile="$isolated_root/readonly_child_isolation.sb"
+          /usr/bin/sudo /bin/test ! -e "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /bin/cp "$isolated_source_profile" "$review_profile"
+          /usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"
+          /usr/bin/sudo /bin/chmod -N "$review_profile"
+          /usr/bin/sudo /bin/chmod 0444 "$review_profile"
+          /usr/bin/sudo /bin/test -f "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$isolated_source_profile" "$review_profile"
+          profile_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$review_profile")" = "0:0:444"
+          /bin/test ! -w "$review_profile"
+          /usr/bin/sudo -u nobody /bin/test -r "$review_profile"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$review_profile"
+          source_profile_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          if [[ "$source_profile_postcopy_binding" != "$source_profile_binding" ]] \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"; then
+            echo "::error::Checkout child profile changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"
+          isolated_flags="$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")"
+          (( (isolated_flags & 2) == 2 ))
+          test -n "${RUNNER_TEMP:-}"
+          /usr/bin/sudo -u nobody /bin/test ! -w "$RUNNER_TEMP"
+          summary_file="$(/usr/bin/mktemp "$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"
+          echo "Read-only supervisor summary file (retained on failure): $summary_file"
+          /bin/test -f "$summary_file"
+          /bin/test ! -L "$summary_file"
+          summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")"
+          set -o pipefail
+          literal_profile_status=0
+          /usr/bin/grep -Fq '(literal ' "$review_profile" \
+            || literal_profile_status=$?
+          if ! /usr/bin/grep -Fqx '(deny job-creation)' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '(deny process-exec*' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '  (file-mode #o4000 #o2000))' "$review_profile" \
+            || (( literal_profile_status != 1 )); then
+            echo "::error::Read-only child profile lacks required denials; retained at $isolated_root"
+            exit 1
+          fi
+          source_profile_prelaunch_binding=""
+          source_profile_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_prelaunch_binding="<unreadable>"
+          source_root_prelaunch_binding=""
+          source_root_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_prelaunch_binding="<unreadable>"
+          isolated_source_prelaunch_binding=""
+          isolated_source_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_prelaunch_binding="<unreadable>"
+          isolated_tree_prelaunch_symlink=""
+          isolated_tree_prelaunch_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_prelaunch_symlink="<unreadable>"
+          profile_prelaunch_binding=""
+          profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_prelaunch_binding="<unreadable>"
+          if [[ "$source_profile_prelaunch_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_prelaunch_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_prelaunch_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_prelaunch_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_prelaunch_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed before launch; retained at $isolated_root"
+            exit 1
+          fi
+          verify_runtime_custody prelaunch
+          runner_status=0
+          /usr/bin/sudo -u nobody /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
+            CODEX_REVIEW_TEST_RUNTIME_PARENT="$isolated_root/payload/runtime" \
+            HOME="$isolated_root/payload" \
+            LANG=C \
+            LC_ALL=C \
+            LOGNAME=nobody \
+            PATH=/usr/bin:/bin \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$isolated_source" \
+            USER=nobody \
+            "$isolated_python" -P -B -m tests.run_readonly_install_deterministic_supervisor \
+            | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
+          verify_runtime_custody postrun
+          source_profile_postrun_binding=""
+          source_profile_postrun_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_postrun_binding="<unreadable>"
+          source_root_postrun_binding=""
+          source_root_postrun_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_postrun_binding="<unreadable>"
+          isolated_source_postrun_binding=""
+          isolated_source_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_postrun_binding="<unreadable>"
+          isolated_tree_postrun_symlink=""
+          isolated_tree_postrun_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postrun_symlink="<unreadable>"
+          profile_postrun_binding=""
+          profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_postrun_binding="<unreadable>"
+          if [[ "$source_profile_postrun_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_postrun_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_postrun_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_postrun_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$isolated_source" \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_postrun_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! /usr/bin/sudo -u nobody /bin/test -r "$review_profile" \
+            || /usr/bin/sudo -u nobody /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed during launch; retained at $isolated_root"
+            exit 1
+          fi
+          current_summary_object_id=""
+          current_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || current_summary_object_id="<unreadable>"
+          if [[ "$current_summary_object_id" != "$summary_object_id" ]]; then
+            echo "::error::Supervisor summary identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          /bin/cat "$summary_file"
+          if (( runner_status != 0 )); then
+            echo "::error::Read-only supervisor exited $runner_status; retained at $isolated_root"
+            exit "$runner_status"
+          fi
+          summary_status=0
+          "$isolated_python" -I -B -S -c 'import json, pathlib, sys; raw = pathlib.Path(sys.argv[1]).read_bytes(); valid_line = raw.endswith(b"\n") and b"\n" not in raw[:-1] and b"\r" not in raw; reject_duplicates = lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else (_ for _ in ()).throw(ValueError("duplicate JSON key")); payload = json.loads(raw, object_pairs_hook=reject_duplicates) if valid_line else {}; expected = {"child_process_closure": "proven", "cleanup_failures": [], "cleanup_status": "complete", "install_parent_is_sticky_world_writable": True, "primary_failure": None, "primary_status": "complete", "release_tree_immutable": True, "release_tree_property": "object-identity-content-access-policy", "retained_paths": [], "returncode": 0, "runtime_residue": [], "secondary_failures": [], "signal_number": None, "timed_out": False}; keys_exact = isinstance(payload, dict) and set(payload) == set(expected); invalid_values = {key: payload.get(key) for key, value in expected.items() if key not in payload or type(payload[key]) is not type(value) or payload[key] != value} if isinstance(payload, dict) else {"payload_type": type(payload).__name__}; sys.exit("invalid terminal supervisor summary: " + json.dumps({"invalid_values": invalid_values, "keys_exact": keys_exact}, sort_keys=True, separators=(",", ":"))) if not valid_line or not keys_exact or invalid_values else None' \
+            "$summary_file" || summary_status=$?
+          if (( summary_status != 0 )); then
+            echo "::error::Terminal supervisor evidence was not cleanup-safe; retained at $isolated_root"
+            exit "$summary_status"
+          fi
+          current_object_id=""
+          current_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || current_object_id="<unreadable>"
+          if [[ "$current_object_id" != "$isolated_object_id" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_root" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_root" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" != "0" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$isolated_root")" != "755" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")" != "$isolated_flags" ]]; then
+            echo "::error::Isolation root identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/chflags nouchg "$isolated_root"
+          post_clear_object_id=""
+          post_clear_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || post_clear_object_id="<unreadable>"
+          if [[ "$post_clear_object_id" != "$isolated_object_id" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" != "0:755" ]]; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root changed while opening cleanup; retained at $isolated_root"
+            exit 1
+          fi
+          root_cleanup_status=0
+          /usr/bin/sudo /bin/rm -rf "$isolated_root" || root_cleanup_status=$?
+          if (( root_cleanup_status != 0 )) \
+            || /usr/bin/sudo /bin/test -e "$isolated_root" \
+            || /usr/bin/sudo /bin/test -L "$isolated_root"; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root cleanup incomplete at $isolated_root"
+            exit 1
+          fi
+          final_summary_object_id=""
+          final_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || final_summary_object_id="<unreadable>"
+          if [[ "$final_summary_object_id" != "$summary_object_id" ]] \
+            || ! /bin/test -f "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup identity changed; retained at $summary_file"
+            exit 1
+          fi
+          summary_cleanup_status=0
+          /bin/rm "$summary_file" || summary_cleanup_status=$?
+          if (( summary_cleanup_status != 0 )) \
+            || /bin/test -e "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup incomplete at $summary_file"
+            exit 1
+          fi
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          bytecode_artifact=""
+          if ! bytecode_artifact="$(/usr/bin/find . \
+            \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) \
+            -print -quit)"; then
+            echo "::error::Unable to inspect the checkout for Python bytecode artifacts"
+            exit 1
+          fi
+          if [[ -n "$bytecode_artifact" ]]; then
+            echo "::error::Python bytecode artifact: $bytecode_artifact"
+            exit 1
+          fi
 
   python-39-compatibility:
     runs-on: ubuntu-latest
@@ -220,6 +831,7 @@ jobs:
       - platform-safety
       - broker_reproducibility
       - independent_supervisor_tests
+      - readonly_install_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -229,9 +841,11 @@ jobs:
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
           BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
           test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"

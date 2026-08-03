@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dis
 import errno
@@ -58,7 +59,11 @@ from review_supervisor.recovery_cleanup import (
     CustodiedManifest,
     QuarantinedRootRecoveryEvidence,
 )
-from tests.support import owned_temporary_directory
+from tests.support import (
+    _remove_exact_test_entry,
+    _test_entry_object_identity,
+    owned_temporary_directory,
+)
 
 
 SYNTHETIC_BINARY = b"synthetic codex executable\n"
@@ -2137,15 +2142,56 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                         )
 
             fifo = fixture.source.with_name("codex-fifo")
-            os.mkfifo(fifo, 0o700)
-            changed = replace(fixture, source=fifo)
-            with self.assertRaisesRegex(CodexExecutableError, "not a regular file"):
-                _authenticate(changed, FakeRunner(changed))
-
             link = fixture.source.with_name("codex-hardlink")
-            os.link(fixture.source, link)
-            with self.assertRaisesRegex(CodexExecutableError, "hard-link count"):
-                _authenticate(fixture, FakeRunner(fixture))
+            fixture_parent_fd = os.open(
+                fixture.source.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.mkfifo(fifo, 0o700)
+                fifo_object = _test_entry_object_identity(
+                    os.stat(
+                        os.fsencode(fifo.name),
+                        dir_fd=fixture_parent_fd,
+                        follow_symlinks=False,
+                    )
+                )
+                changed = replace(fixture, source=fifo)
+                try:
+                    with self.assertRaisesRegex(
+                        CodexExecutableError,
+                        "not a regular file",
+                    ):
+                        _authenticate(changed, FakeRunner(changed))
+                finally:
+                    _remove_exact_test_entry(
+                        fixture_parent_fd,
+                        os.fsencode(fifo.name),
+                        fifo_object,
+                    )
+
+                os.link(fixture.source, link)
+                link_object = _test_entry_object_identity(
+                    os.stat(
+                        os.fsencode(link.name),
+                        dir_fd=fixture_parent_fd,
+                        follow_symlinks=False,
+                    )
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        CodexExecutableError,
+                        "hard-link count",
+                    ):
+                        _authenticate(fixture, FakeRunner(fixture))
+                finally:
+                    _remove_exact_test_entry(
+                        fixture_parent_fd,
+                        os.fsencode(link.name),
+                        link_object,
+                    )
+            finally:
+                os.close(fixture_parent_fd)
 
     def test_rejects_acl_xattrs_and_quarantine_via_injected_inspector(self) -> None:
         with owned_temporary_directory("codex-extended-metadata-") as root:
@@ -3140,10 +3186,19 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                         and getattr(frame, "f_lasti", None) == target_offset
                     ):
                         injected = True
-                        reused_fd = os.open(
+                        candidate_fd = os.open(
                             output_path,
                             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                         )
+                        if candidate_fd != original_output_fd:
+                            os.dup2(
+                                candidate_fd,
+                                original_output_fd,
+                                inheritable=False,
+                            )
+                            os.close(candidate_fd)
+                            candidate_fd = original_output_fd
+                        reused_fd = candidate_fd
                         raise interruption
                 return interrupt_and_reopen_same_root
 
@@ -4662,30 +4717,57 @@ class CodexExecutableCustodyTests(unittest.TestCase):
     def test_disappearance_hardlink_and_parent_mode_change_are_rejected(self) -> None:
         mutations = ("disappear", "hardlink", "parent-mode")
         for mutation in mutations:
-            with self.subTest(mutation=mutation):
-                with owned_temporary_directory(f"codex-{mutation}-") as root:
-                    fixture = _build_fixture(root)
-                    custody = _authenticate(fixture, FakeRunner(fixture))
-                    snapshot_path = custody.snapshot_path
-                    if mutation == "disappear":
-                        snapshot_path.unlink()
-                    elif mutation == "hardlink":
-                        os.link(snapshot_path, snapshot_path.with_name("codex-link"))
-                    else:
-                        os.chmod(fixture.snapshot_parent, 0o750)
-                    with self.assertRaises(CodexExecutableCustodyStale):
-                        custody.pre_fork_revalidate()
-                    if mutation == "parent-mode":
-                        os.chmod(fixture.snapshot_parent, 0o700)
-                    custody.confirm_process_quiescence(_quiescence())
-                    if mutation == "parent-mode":
-                        custody.cleanup()
-                    else:
-                        try:
-                            with self.assertRaises(CodexExecutableRetentionRequired):
-                                custody.cleanup()
-                        finally:
-                            codex_executable._close_staged_snapshot_fds(custody._staged)
+            with (
+                self.subTest(mutation=mutation),
+                owned_temporary_directory(f"codex-{mutation}-") as root,
+                contextlib.ExitStack() as fixture_cleanup,
+            ):
+                fixture = _build_fixture(root)
+                custody = _authenticate(fixture, FakeRunner(fixture))
+                snapshot_path = custody.snapshot_path
+                if mutation == "disappear":
+                    snapshot_path.unlink()
+                elif mutation == "hardlink":
+                    hardlink_parent_fd = os.open(
+                        snapshot_path.parent,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    )
+                    fixture_cleanup.callback(os.close, hardlink_parent_fd)
+                    os.link(
+                        os.fsencode(snapshot_path.name),
+                        b"codex-link",
+                        src_dir_fd=hardlink_parent_fd,
+                        dst_dir_fd=hardlink_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    hardlink_object = _test_entry_object_identity(
+                        os.stat(
+                            b"codex-link",
+                            dir_fd=hardlink_parent_fd,
+                            follow_symlinks=False,
+                        )
+                    )
+                    fixture_cleanup.callback(
+                        _remove_exact_test_entry,
+                        hardlink_parent_fd,
+                        b"codex-link",
+                        hardlink_object,
+                    )
+                else:
+                    os.chmod(fixture.snapshot_parent, 0o750)
+                with self.assertRaises(CodexExecutableCustodyStale):
+                    custody.pre_fork_revalidate()
+                if mutation == "parent-mode":
+                    os.chmod(fixture.snapshot_parent, 0o700)
+                custody.confirm_process_quiescence(_quiescence())
+                if mutation == "parent-mode":
+                    custody.cleanup()
+                else:
+                    try:
+                        with self.assertRaises(CodexExecutableRetentionRequired):
+                            custody.cleanup()
+                    finally:
+                        codex_executable._close_staged_snapshot_fds(custody._staged)
 
     def test_stale_handoff_token_is_rejected(self) -> None:
         with owned_temporary_directory("codex-stale-token-") as root:

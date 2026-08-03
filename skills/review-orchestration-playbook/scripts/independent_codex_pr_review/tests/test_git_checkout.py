@@ -318,6 +318,25 @@ def _kill_verified_process(pid: int, start_identity: str) -> None:
 
 
 class RawGitProtocolTests(unittest.TestCase):
+    def test_group_cleanup_requires_stable_empty_observations(self) -> None:
+        anchor = SimpleNamespace(pid=101, pgid=101)
+        with (
+            mock.patch.object(
+                gitraw,
+                "anchored_group_members",
+                side_effect=((101,), (101, 202), (101,), (101,)),
+            ) as group_members,
+            mock.patch.object(gitraw, "signal_anchored_group") as signal_group,
+            mock.patch.object(gitraw.time, "sleep"),
+        ):
+            gitraw._wait_anchored_group_without_other_members(
+                anchor,
+                deadline=time.monotonic() + 1.0,
+            )
+
+        self.assertEqual(group_members.call_count, 4)
+        signal_group.assert_called_once_with(anchor, signal.SIGKILL)
+
     def test_repository_inspection_preserves_unproven_git_closure(self) -> None:
         process = SimpleNamespace(
             pid=123,
@@ -371,20 +390,29 @@ class RawGitProtocolTests(unittest.TestCase):
                 outside = root / "outside.config"
                 outside.write_bytes(b"[core]\n\tfsmonitor = /definitely/not/executed\n")
                 outside.chmod(0o000)
-                _git(repo, "config", "--local", "--add", key, value)
-                with (
-                    mock.patch.object(gitraw, "run_bounded") as run_git,
-                    self.assertRaises(SupervisorError) as raised,
-                ):
-                    inspect_repository(
-                        repo=repo,
-                        base_sha=base,
-                        head_sha=head,
-                        git_executable=str(GIT),
+                try:
+                    _git(repo, "config", "--local", "--add", key, value)
+                    with (
+                        mock.patch.object(gitraw, "run_bounded") as run_git,
+                        self.assertRaises(SupervisorError) as raised,
+                    ):
+                        inspect_repository(
+                            repo=repo,
+                            base_sha=base,
+                            head_sha=head,
+                            git_executable=str(GIT),
+                        )
+                    run_git.assert_not_called()
+                    self.assertEqual(
+                        raised.exception.failure.stage,
+                        "git-preflight",
                     )
-                run_git.assert_not_called()
-                self.assertEqual(raised.exception.failure.stage, "git-preflight")
-                self.assertEqual(raised.exception.failure.code, "git-config-mismatch")
+                    self.assertEqual(
+                        raised.exception.failure.code,
+                        "git-config-mismatch",
+                    )
+                finally:
+                    outside.chmod(0o600)
 
         for case, relative_path, content in (
             (
@@ -581,14 +609,18 @@ class RawGitProtocolTests(unittest.TestCase):
                     config.unlink()
                 else:
                     config.chmod(0o000)
-                with self.assertRaises(SupervisorError) as raised:
-                    inspect_repository(
-                        repo=repo,
-                        base_sha=base,
-                        head_sha=head,
-                        git_executable=str(GIT),
-                    )
-                self.assertEqual(raised.exception.failure.code, expected_code)
+                try:
+                    with self.assertRaises(SupervisorError) as raised:
+                        inspect_repository(
+                            repo=repo,
+                            base_sha=base,
+                            head_sha=head,
+                            git_executable=str(GIT),
+                        )
+                    self.assertEqual(raised.exception.failure.code, expected_code)
+                finally:
+                    if case == "unreadable":
+                        config.chmod(0o600)
 
     def test_source_config_policy_and_revalidation_mismatch_are_distinct(
         self,

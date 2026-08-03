@@ -1722,21 +1722,31 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 )
             )
 
-    def test_accepts_and_revalidates_safe_system_path(self) -> None:
+    def test_system_path_acceptance_matches_root_owned_policy(self) -> None:
         candidate = next(
             path
             for path in (pathlib.Path("/usr/bin/env"), pathlib.Path("/bin/true"))
             if path.exists()
         )
-
-        identity = claude_linux._capture_trusted_path_identity(candidate)
-
-        self.assertEqual(
-            claude_linux._revalidate_trusted_path_identity(identity),
-            candidate.resolve(strict=True),
+        resolved = candidate.resolve(strict=True)
+        components = tuple(
+            path.lstat() for path in claude_linux._path_components(resolved)
         )
-        self.assertEqual(identity.components[-1].uid, 0)
-        self.assertTrue(all(not (item.mode & 0o022) for item in identity.components))
+        safe = all(
+            metadata.st_uid == 0 and not metadata.st_mode & 0o022
+            for metadata in components
+        )
+
+        if safe:
+            identity = claude_linux._capture_trusted_path_identity(candidate)
+            self.assertEqual(
+                claude_linux._revalidate_trusted_path_identity(identity),
+                resolved,
+            )
+            self.assertTrue(all(item.uid == 0 for item in identity.components))
+        else:
+            with self.assertRaises(claude_linux.LinuxRuntimeUnsafe):
+                claude_linux._capture_trusted_path_identity(candidate)
 
     def test_rejects_writable_parent_as_unsafe(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -14227,12 +14237,13 @@ class SandboxCommandTest(unittest.TestCase):
             _write_elf(self.root / "rg"),
             _write_elf(self.root / "cc"),
         )
-        self.library = next(
-            path.resolve(strict=True)
-            for path in (pathlib.Path("/usr/bin/env"), pathlib.Path("/bin/true"))
-            if path.exists()
+        self.library = _write_elf(self.root / "libexample.so").resolve(strict=True)
+        library_identity = claude_linux._capture_trusted_path_identity(
+            self.library,
+            trusted_owner_uids=frozenset({0, os.getuid()}),
+            allow_root_sticky_temp_ancestor=True,
+            ignore_parent_directory_content_changes=True,
         )
-        library_identity = claude_linux._capture_trusted_path_identity(self.library)
         self.host = claude_linux.LinuxHost(
             claude_linux.LinuxHostKind.LINUX, "x64", "6.8"
         )

@@ -1,0 +1,5 @@
+(version 1)
+(allow default)
+(deny job-creation)
+(deny process-exec*
+  (file-mode #o4000 #o2000))
