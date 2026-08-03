@@ -886,9 +886,17 @@ restore request/run binding or erase this rationale.
   of duplicating the full decision matrix.
 - Preserve the stricter playbook requirements for exact PR lifecycle and
   whole-PR base/head scope.
-- Require schema-version-3 repository-wide raw discovery, full seed-to-detail
-  coverage, post-parse current exclusion, and fail-closed budget handling
-  before reaction fallback.
+- Require schema-version-4 bounded dual-source discovery before reaction
+  fallback: retain updated-desc pull pages through the first
+  `updated_at <= window_start_exclusive` boundary or natural end; combine those
+  rows with the fully paginated controlled-request comment source and exact
+  current/declaration anchors; fully traverse and parse every union-seeded PR
+  before excluding the exact current scope.
+- Count the 512 seeded-PR cap only against that deduplicated union and its
+  detail traversals. Boundary witnesses and cumulative old PRs consume endpoint
+  budgets but not that cap; incomplete sources, projection drift, and all
+  budget overflow fail closed. A version-3 transcript cannot prove reaction
+  fallback.
 - Preserve the report matrix for unsupported/no-PR, waiting, terminal,
   reaction-fallback, reserved authenticated no-start, and inconclusive states,
   including channel-specific `server_time_field` values.
@@ -904,8 +912,16 @@ restore request/run binding or erase this rationale.
   snapshots cannot replace its complete applicable artifact/thread projection.
 - Keep REST/report IDs as exact positive JSON integers. Keep GraphQL BigInt
   canonical decimal text only at the join boundary.
-- Under schema version 3, fail closed when a nested thread-comments connection
-  needs another page; do not claim or fabricate a child-cursor traversal.
+- Under schema version 4, accept a nested thread-comments connection only when
+  its first response is complete (`hasNextPage == false` and `endCursor ==
+  null`). A later page requires a separately bound child-cursor schema; until
+  then the profile is `unknown`, and normalized or fabricated child traversal
+  is forbidden.
+- Classify issue-comment provider identity jointly: only the exact Bot actor
+  plus exact `performed_via_github_app.slug == "chatgpt-codex-connector"` is
+  exact. If either half claims the provider while the other is absent or
+  conflicts, treat it as ambiguous/provider-like and fail closed, never as a
+  removable confirmed-different suffix.
 - Require an explicit commit-bound clean payload for terminal-payload
   completion; an empty `APPROVED` review does not count, and an exact
   `No findings.` review is clean only after its complete exact-provider
@@ -953,7 +969,7 @@ restore request/run binding or erase this rationale.
   contains the corresponding policy and contract corrections. Its final full
   validation gate and successor exact-head named-single review remain pending;
   this journal does not claim either result in advance.
-- The final candidate gate reruns the focused 102-test contract module, the
+- The final candidate gate reruns the focused 107-test contract module, the
   complete review-orchestration suite, Ruff format/lint, the skill validator,
   the project-journal validator, JSON parsing when changed JSON exists, and
   `git diff --check` after the candidate bytes stop changing. The focused
@@ -1002,6 +1018,17 @@ restore request/run binding or erase this rationale.
   parent-owned evidence. The corrected exact-head review will likewise remain
   outside the candidate head because writing it back would change the reviewed
   range.
+- The successor named-single review of head
+  `49bd5067fc01de814be72dcf6a8ef7cf639da400` found two final anti-drift
+  gaps. An exact provider App combined with a conflicting non-provider actor
+  could be misclassified as removable third-party noise, and the older
+  `Implementation Intent` section still prescribed schema version 3. The
+  corrected contract jointly classifies issue-comment Bot/App identity and
+  fails closed on either-half conflicts across historical, current, and
+  post-as-of paths. The intent now prescribes schema-version-4 bounded
+  dual-source discovery and its closed nested-comment rule. Heading-scoped
+  documentation assertions plus executable regressions preserve both decisions;
+  the corrected exact-head review remains parent-owned evidence.
 - The later named-single review of
   `0f77fb7b1dd59f5eed522fa9699497aa013695fc..a1403a4f3b0bd63603591dc33c09583f8a8a69e0`
   found three P2 authority gaps: resolved target children could be

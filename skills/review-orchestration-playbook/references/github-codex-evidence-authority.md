@@ -1488,6 +1488,13 @@ cannot be inferred to be a removable suffix and remains semantic drift. A
 existing identity/nonterminal rules. Normalized candidate/current arrays may
 not inject any raw-only suffix record.
 
+Issue-comment provider identity is a joint actor/App classification. Only the
+exact Bot actor together with exact
+`performed_via_github_app.slug == "chatgpt-codex-connector"` is exact. If
+either half claims the provider while the other half is absent or conflicts,
+the record is ambiguous/provider-like and fails closed; it is never a
+confirmed-different suffix that may be ignored.
+
 Raw discovery includes the exact current scope and every confirmed
 non-candidate PR, including the PR that carries the authenticated declaration.
 The fixed parser first completes and validates every seeded detail traversal,

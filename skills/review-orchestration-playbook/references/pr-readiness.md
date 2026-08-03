@@ -277,6 +277,11 @@ playbook extensions and are not attributed to that Action.
 
 Classify actor identity and validate each carrier's complete schema, native
 IDs, canonical URLs, and joins before applying the frozen as-of cutoff. A
+terminal issue comment is classified jointly by actor and App: only the exact
+Bot actor plus exact `performed_via_github_app.slug ==
+"chatgpt-codex-connector"` is exact. If either half claims the provider while
+the other is absent or conflicts, the record is ambiguous/provider-like and
+fails closed; never classify it as a confirmed-different suffix. A
 confirmed-different non-request issue comment created wholly after the cutoff,
 submitted review after the cutoff, or reaction created after the cutoff is a
 raw-only future suffix: keep it in the transcript but exclude it from the

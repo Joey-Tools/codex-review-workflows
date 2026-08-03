@@ -4489,6 +4489,40 @@ printf '%s\n' "$trusted_uv"
                 ):
                     self.assertIn(anchor, discovery_v4_sections[document_name])
 
+        implementation_intent = section_text(journal, "## Implementation Intent")
+        for anchor in (
+            "schema-version-4 bounded dual-source discovery",
+            "updated_at <= window_start_exclusive boundary",
+            "fully traverse and parse every union-seeded pr before excluding "
+            "the exact current scope",
+            "512 seeded-pr cap only against that deduplicated union and its "
+            "detail traversals",
+            "version-3 transcript cannot prove reaction fallback",
+            "under schema version 4",
+            "hasnextpage == false",
+            "endcursor == null",
+            "separately bound child-cursor schema",
+        ):
+            self.assertIn(anchor, implementation_intent)
+        for stale in (
+            "schema-version-3 repository-wide raw discovery",
+            "under schema version 3, fail closed",
+        ):
+            self.assertNotIn(stale, implementation_intent)
+
+        provider_identity_sections = {
+            "authority": discovery_v4_sections["authority"],
+            "skill": discovery_v4_sections["skill"],
+            "github-pr-probes": discovery_v4_sections["github-pr-probes"],
+            "pr-readiness": discovery_v4_sections["pr-readiness"],
+            "project-journal": implementation_intent,
+        }
+        for document_name, section in provider_identity_sections.items():
+            with self.subTest(provider_identity_document=document_name):
+                self.assertIn("only the exact bot actor", section)
+                self.assertIn("ambiguous/provider-like", section)
+                self.assertIn("confirmed-different suffix", section)
+
         authority_report_section = section_text(
             authority,
             "## Required Report Fields",
@@ -13164,6 +13198,20 @@ printf '%s\n' "$trusted_uv"
                 return "different"
             return "ambiguous"
 
+        def raw_issue_actor(value: object) -> str:
+            if not isinstance(value, dict):
+                return "ambiguous"
+            actor = raw_actor(value.get("user"))
+            app_slug = value.get("app_slug")
+            exact_app = "chatgpt-codex-connector"
+            if actor == "exact" and app_slug == exact_app:
+                return "exact"
+            if actor == "exact" or app_slug == exact_app:
+                return "ambiguous"
+            if isinstance(app_slug, str) and "codex" in app_slug.casefold():
+                return "ambiguous"
+            return actor
+
         def parse_recent_request_discovery(
             fetch: object,
             *,
@@ -13209,7 +13257,7 @@ printf '%s\n' "$trusted_uv"
                         not is_controlled_request
                         and type(created_at) is int
                         and created_at > history_as_of_server_time
-                        and raw_actor(projected.get("user")) == "different"
+                        and raw_issue_actor(projected) == "different"
                     ):
                         continue
                     return None
@@ -13658,7 +13706,7 @@ printf '%s\n' "$trusted_uv"
                         )
                     ):
                         return None
-                    actor = raw_actor(projected_issue.get("user"))
+                    actor = raw_issue_actor(projected_issue)
                     if body == "@codex review":
                         request_user = projected_issue.get("user")
                         if (
@@ -14318,13 +14366,11 @@ printf '%s\n' "$trusted_uv"
 
                 for raw_issue in issue_artifacts:
                     issue_id = raw_issue["id"]
-                    user = raw_issue.get("user")
                     created_at = raw_issue.get("created_at")
                     updated_at = raw_issue.get("updated_at")
                     if (
                         type(issue_id) is not int
-                        or raw_actor(user) != "exact"
-                        or raw_issue.get("app_slug") != "chatgpt-codex-connector"
+                        or raw_issue_actor(raw_issue) != "exact"
                         or type(created_at) is not int
                         or type(updated_at) is not int
                         or created_at <= 0
@@ -23910,6 +23956,44 @@ printf '%s\n' "$trusted_uv"
                     )
                 )
 
+        conflicting_app_current = clone(current_with_progress_comments)
+        assert isinstance(conflicting_app_current, dict)
+        conflicting_app_current_records = conflicting_app_current["raw_issue_records"]
+        assert isinstance(conflicting_app_current_records, list)
+        for conflicting_record in conflicting_app_current_records:
+            assert isinstance(conflicting_record, dict)
+            conflicting_record["user"] = {
+                "login": "octocat",
+                "type": "User",
+            }
+        conflicting_app_current_history = history(
+            samples,
+            current_raw=conflicting_app_current,
+        )
+        self.assertIsNone(
+            parse_current_endpoint_inventory(
+                conflicting_app_current_history["initial_current_raw_inventory"],
+                current_ancestry={},
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                conflicting_app_current_history,
+                terminal_current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                conflicting_app_current_history,
+                terminal_current,
+                post_as_of_lane_timing,
+            )
+        )
+
         unknown_state_nonterminal_variants: dict[
             str, tuple[dict[str, object], int, int]
         ] = {}
@@ -32554,6 +32638,61 @@ printf '%s\n' "$trusted_uv"
             "thumbs-up-clean",
         )
 
+        conflicting_app_history = clone(background_noise_history)
+        assert isinstance(conflicting_app_history, dict)
+        for inventory_name in ("initial_inventory", "final_inventory"):
+            conflicting_inventory = conflicting_app_history[inventory_name]
+            conflicting_transcript = conflicting_inventory[
+                "discovery_endpoint_transcript"
+            ]
+            conflicting_scope = next(
+                item
+                for item in conflicting_transcript["scopes"]
+                if item.get("pull_number") == background_pr
+            )
+            conflicting_fetches = conflicting_scope["fetches"]
+            conflicting_issue_index = fetch_index(
+                conflicting_fetches,
+                "issue_comments",
+            )
+            conflicting_issue_fetch = conflicting_fetches[conflicting_issue_index]
+            conflicting_issue_records = raw_rest_records(conflicting_issue_fetch)
+            conflicting_issue = next(
+                item
+                for item in conflicting_issue_records
+                if item.get("id") == background_issue["id"]
+            )
+            conflicting_issue["performed_via_github_app"] = {
+                "slug": "chatgpt-codex-connector",
+                "id": 1,
+            }
+            conflicting_issue["body"] = (
+                "Codex Review: Didn't find any major issues.\n\n"
+                f"**Reviewed commit:** `{background_head}`"
+            )
+            conflicting_fetches[conflicting_issue_index] = rest_fetch(
+                "issue_comments",
+                conflicting_issue_fetch["pages"][0]["request_url"],
+                conflicting_issue_records,
+            )
+            self.assertIsNone(
+                parse_discovery_endpoint_transcript(
+                    conflicting_transcript,
+                    request_scope_receipts=conflicting_inventory[
+                        "request_scope_receipts"
+                    ],
+                    provider_declaration=declaration,
+                )
+            )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                conflicting_app_history,
+                current,
+            ),
+            "unknown",
+        )
+
         opaque_cursor_reread_history = clone(background_noise_history)
         assert isinstance(opaque_cursor_reread_history, dict)
         final_cursor_transcript = opaque_cursor_reread_history["final_inventory"][
@@ -33058,6 +33197,85 @@ printf '%s\n' "$trusted_uv"
                 current,
             ),
             "thumbs-up-clean",
+        )
+
+        future_conflicting_app_history = clone(future_human_review_history)
+        assert isinstance(future_conflicting_app_history, dict)
+        future_conflicting_inventory = future_conflicting_app_history["final_inventory"]
+        future_conflicting_transcript = future_conflicting_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_conflicting_scope = next(
+            item
+            for item in future_conflicting_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_conflicting_fetches = future_conflicting_scope["fetches"]
+        future_conflicting_issue_index = fetch_index(
+            future_conflicting_fetches,
+            "issue_comments",
+        )
+        future_conflicting_issue_fetch = future_conflicting_fetches[
+            future_conflicting_issue_index
+        ]
+        future_conflicting_issue_records = raw_rest_records(
+            future_conflicting_issue_fetch
+        )
+        future_conflicting_issue = next(
+            item
+            for item in future_conflicting_issue_records
+            if item.get("id") == background_issue["id"]
+        )
+        future_conflicting_issue["performed_via_github_app"] = {
+            "slug": "chatgpt-codex-connector",
+            "id": 1,
+        }
+        future_conflicting_issue["body"] = (
+            "Codex Review: Didn't find any major issues.\n\n"
+            f"**Reviewed commit:** `{background_head}`"
+        )
+        future_conflicting_fetches[future_conflicting_issue_index] = rest_fetch(
+            "issue_comments",
+            future_conflicting_issue_fetch["pages"][0]["request_url"],
+            future_conflicting_issue_records,
+        )
+        future_conflicting_feed = future_conflicting_transcript["scope_discovery"][
+            "recent_request_comments"
+        ]
+        future_conflicting_feed_records = raw_rest_records(future_conflicting_feed)
+        future_conflicting_feed_issue = next(
+            item
+            for item in future_conflicting_feed_records
+            if item.get("id") == background_issue["id"]
+        )
+        future_conflicting_feed_issue["performed_via_github_app"] = {
+            "slug": "chatgpt-codex-connector",
+            "id": 1,
+        }
+        future_conflicting_feed_issue["body"] = future_conflicting_issue["body"]
+        future_conflicting_transcript["scope_discovery"]["recent_request_comments"] = (
+            rest_fetch(
+                "recent_request_comments",
+                future_conflicting_feed["pages"][0]["request_url"],
+                future_conflicting_feed_records,
+            )
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_conflicting_transcript,
+                request_scope_receipts=future_conflicting_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                future_conflicting_app_history,
+                current,
+            ),
+            "unknown",
         )
 
         in_cutoff_human_history = clone(future_human_review_history)

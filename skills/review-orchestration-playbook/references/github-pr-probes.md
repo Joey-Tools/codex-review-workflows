@@ -601,6 +601,11 @@ The current outcome is validated separately and never counts toward the history 
 
 Classify actor identity and validate the complete carrier schema, native IDs,
 URLs, and joins before applying the frozen as-of cutoff. A confirmed-different
+issue comment exists only after jointly classifying actor and App: only the exact
+Bot actor plus exact `performed_via_github_app.slug ==
+"chatgpt-codex-connector"` is exact, while either half claiming the provider
+with the other absent or conflicting is ambiguous/provider-like and fails
+closed. It is never a removable confirmed-different suffix. A confirmed-different
 non-request issue comment created wholly after the cutoff, submitted review
 after the cutoff, or reaction created after the cutoff is a raw-only future
 suffix: retain it in the transcript but exclude it from the fixed semantic
