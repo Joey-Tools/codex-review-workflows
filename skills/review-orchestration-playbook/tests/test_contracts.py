@@ -35364,6 +35364,20 @@ printf '%s\n' "$trusted_uv"
             request_scope_sidecar["request_user_fields"],
             ["login", "type"],
         )
+        self.assertEqual(request_scope_sidecar["raw_transcript_schema_version"], 4)
+        transcript_schema_marker = (
+            "transcript schema version "
+            f"{request_scope_sidecar['raw_transcript_schema_version']}"
+        )
+        for path in (
+            REPO_ROOT / "README.md",
+            SKILL_ROOT / "references/github-codex-evidence-authority.md",
+            SKILL_ROOT / "references/pr-readiness.md",
+            SKILL_ROOT / "references/review-lane-contracts.md",
+        ):
+            with self.subTest(transcript_schema_document=str(path)):
+                normalized = " ".join(path.read_text(encoding="utf-8").split()).lower()
+                self.assertIn(transcript_schema_marker, normalized)
         self.assertEqual(
             request_scope_sidecar["pre_post_scope_binding"],
             "type-preserving-equal-to-request-time-scope",

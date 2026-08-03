@@ -42,7 +42,7 @@
       "pr_merge_base",
       "head"
     ],
-    "raw_transcript_schema_version": 3,
+    "raw_transcript_schema_version": 4,
     "raw_transcript_unchanged": true,
     "storage_relation": "independent-parent-owned-sidecar",
     "pre_post_scope_binding": "type-preserving-equal-to-request-time-scope",
