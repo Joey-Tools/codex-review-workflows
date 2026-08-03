@@ -59,9 +59,10 @@ channel/native ID, provider identity, semantic time, body/digest, grammar, and
 artifact commit. Clean and malformed evidence require the exact current tuple;
 an ancestor finding preserves its artifact-time head while normalized
 `scope.head` remains current and local ancestry proves applicability.
-The server-time envelope is `pre Date <= artifact semantic time <= artifact
-GET Date <= post Date`; lifecycle remains independently re-read. A previously
-persisted identical receipt may be reused, but an artifact older than every
+The server-time envelope is `pre Date < artifact semantic time <= artifact GET
+Date <= post Date`; whole-second equality at the pre edge is inconclusive.
+Lifecycle remains independently re-read. A previously persisted identical
+receipt may be reused, but an artifact that does not strictly follow every
 trustworthy pre observation cannot be scoped retroactively and is
 `triple-inconclusive`. This receipt is independent of request sidecars and
 creates no request/run/artifact lineage. Missing request sidecars still affect

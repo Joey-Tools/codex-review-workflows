@@ -8215,7 +8215,7 @@ printf '%s\n' "$trusted_uv"
                 scope_is_eligible
                 and parsed_post[0] == receipt_scope
                 and typed_json_equal(actual_projection, expected_projection)
-                and max(parsed_pre[1]) <= artifact_time
+                and max(parsed_pre[1]) < artifact_time
                 and artifact_time <= artifact_get_time
                 and artifact_get_time <= min(parsed_post[1])
                 and resource_budget_charge(tracker)
@@ -19752,6 +19752,65 @@ printf '%s\n' "$trusted_uv"
                 set_response_date(response, artifact_time + 1)
             receipt_near_misses["pre-after-artifact"] = pre_after_artifact
 
+            same_second_retarget = clone(valid_terminal_artifact)
+            assert isinstance(same_second_retarget, dict)
+            retarget_merge_base = "f" * 40
+            retarget_base_oid = "e" * 40
+            retarget_scope = (
+                thread_scope[0],
+                thread_scope[1],
+                retarget_merge_base,
+                thread_scope[3],
+            )
+            for snapshot_name in ("initial_snapshot", "final_snapshot"):
+                snapshot = same_second_retarget[snapshot_name]
+                assert isinstance(snapshot, dict)
+                snapshot_scope = snapshot["scope"]
+                assert isinstance(snapshot_scope, dict)
+                snapshot_scope["pr_merge_base"] = retarget_merge_base
+            retarget_receipt = same_second_retarget["artifact_scope_receipt"]
+            assert isinstance(retarget_receipt, dict)
+            for receipt_name in (
+                "pre_artifact_scope_receipts",
+                "post_artifact_scope_receipts",
+            ):
+                scope_receipts = retarget_receipt[receipt_name]
+                assert isinstance(scope_receipts, dict)
+                pull_response = scope_receipts["pull"]
+                compare_response = scope_receipts["compare"]
+                assert isinstance(pull_response, dict)
+                assert isinstance(compare_response, dict)
+                pull_body = strict_json_loads(pull_response["body_utf8"])
+                compare_body = strict_json_loads(compare_response["body_utf8"])
+                assert isinstance(pull_body, dict)
+                assert isinstance(compare_body, dict)
+                pull_body["base"]["sha"] = retarget_base_oid
+                replace_raw_json_body(pull_response, canonical_raw_body(pull_body))
+                compare_response["request_url"] = (
+                    f"https://api.github.com/repos/{thread_scope[0]}/compare/"
+                    f"{retarget_base_oid}...{thread_scope[3]}"
+                )
+                compare_body["base_commit"]["sha"] = retarget_base_oid
+                compare_body["merge_base_commit"]["sha"] = retarget_merge_base
+                replace_raw_json_body(
+                    compare_response,
+                    canonical_raw_body(compare_body),
+                )
+            for response in retarget_receipt["pre_artifact_scope_receipts"].values():
+                set_response_date(response, artifact_time)
+            with self.subTest(
+                terminal_artifact_scope_receipt=(
+                    f"{channel}-same-second-base-retarget"
+                ),
+            ):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        same_second_retarget,
+                        expected_kind="terminal-payload",
+                        expected_scope=retarget_scope,
+                    )
+                )
+
             get_before_artifact = clone(valid_terminal_artifact)
             assert isinstance(get_before_artifact, dict)
             set_response_date(
@@ -22591,7 +22650,7 @@ printf '%s\n' "$trusted_uv"
         deterministic_invalid_artifacts: list[dict[str, object]] = []
         deterministic_invalid_times = {
             82_250: int(terminal_server_time) - 2,
-            82_251: int(terminal_server_time) - 20,
+            82_251: int(terminal_server_time) - 19,
         }
         for deterministic_id, deterministic_time in deterministic_invalid_times.items():
             deterministic_artifact = invalid_state_blocker_artifact(
@@ -34007,11 +34066,11 @@ printf '%s\n' "$trusted_uv"
                 ),
                 "lifecycle_binding": "independent-mandatory-snapshots",
                 "time_envelope": (
-                    "pre-date-at-or-before-artifact-semantic-time-at-or-before-"
+                    "pre-date-strictly-before-artifact-semantic-time-at-or-before-"
                     "artifact-get-date-at-or-before-post-date"
                 ),
                 "may_reuse_prior_persisted_receipt": True,
-                "artifact_older_than_all_trustworthy_pre_observations": (
+                "artifact_not_strictly_after_every_trustworthy_pre_observation": (
                     "triple-inconclusive"
                 ),
                 "missing_or_malformed": {

@@ -73,11 +73,12 @@ superseded_by:
   `post_artifact_scope_receipts`. Raw pre/post pull+compare responses bind head
   and merge base; the exact artifact GET binds repository/PR, channel/native
   ID, provider identity, semantic time, body/digest, grammar, and artifact
-  commit. The required time envelope is `pre Date <= artifact semantic time <=
+  commit. The required time envelope is `pre Date < artifact semantic time <=
   artifact GET Date <= post Date`; lifecycle remains independently re-read.
   A previously persisted identical receipt may be reused, but an artifact that
-  predates every trustworthy pre observation is inconclusive because current
-  metadata cannot prove its creation-time whole-PR scope retroactively.
+  does not strictly follow every trustworthy pre observation is inconclusive
+  because current metadata cannot prove its creation-time whole-PR scope
+  retroactively.
   Missing request sidecars still close only request/reaction authority;
   missing or unstable artifact receipts block the wrapped terminal artifact.
   Neither receipt supplies request/run/artifact lineage, and their point reads
@@ -278,6 +279,13 @@ superseded_by:
   same whole-PR head/merge-base scope. Keeping those authorities separate
   preserves the Action-aligned no-request/run-binding decision without
   accepting an old clean after an unobserved base-only retarget.
+- GitHub gives the receipt's semantic timestamps and HTTP `Date` values only
+  whole-second authority. A pre `Date` equal to the artifact semantic time
+  cannot order “old-base artifact first” against “same-head retarget and pre
+  read later in the same second.” The artifact is therefore inconclusive at
+  equality; only a strictly earlier pre boundary can bind it to the observed
+  scope. This closes retroactive scope assignment without restoring
+  request/run coupling or weakening result-present authority.
 - Individual reactions carry less information than terminal comments/reviews:
   notably, they have no native commit-head binding. They are therefore a
   bounded fallback only when recent eligible outcomes show reaction-only

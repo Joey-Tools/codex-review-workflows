@@ -102,9 +102,9 @@
     "artifact_get_binding": "exact-repository-pr-channel-native-id-provider-projection",
     "pre_post_scope_binding": "type-preserving-equal-base-head-merge-base",
     "lifecycle_binding": "independent-mandatory-snapshots",
-    "time_envelope": "pre-date-at-or-before-artifact-semantic-time-at-or-before-artifact-get-date-at-or-before-post-date",
+    "time_envelope": "pre-date-strictly-before-artifact-semantic-time-at-or-before-artifact-get-date-at-or-before-post-date",
     "may_reuse_prior_persisted_receipt": true,
-    "artifact_older_than_all_trustworthy_pre_observations": "triple-inconclusive",
+    "artifact_not_strictly_after_every_trustworthy_pre_observation": "triple-inconclusive",
     "missing_or_malformed": {
       "terminal_payload_action": "exclude-from-current-scope-precedence",
       "status": "triple-inconclusive"

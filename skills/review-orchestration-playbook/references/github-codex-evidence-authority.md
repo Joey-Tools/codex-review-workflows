@@ -384,16 +384,26 @@ the compare body to repeat them as exact `base_commit.sha` and
 `head_commit.sha` while supplying the unique `merge_base_commit.sha`. A compare
 for another head cannot lend its merge base to this artifact scope.
 
-The time envelope is exact: every pre-scope response `Date` is no later than
-the artifact semantic server time, the artifact semantic server time is no
+The time envelope is exact: every pre-scope response `Date` is strictly earlier
+than the artifact semantic server time, the artifact semantic server time is no
 later than the exact artifact GET response `Date`, and every post-scope
 response `Date` is no earlier than that artifact GET response `Date`. An
-artifact whose semantic server time precedes every available trustworthy pre
-observation cannot be scoped retroactively. It is `triple-inconclusive` unless
+artifact whose semantic server time does not strictly follow every available
+trustworthy pre observation cannot be scoped retroactively. It is
+`triple-inconclusive` unless
 the parent can reuse a previously persisted, still-valid receipt that already
 bracketed that exact artifact and whose body, digest, identity, semantic time,
 and scope remain type-preservingly identical on the final reread. A later
 current-scope read is never a substitute for the missing earlier boundary.
+
+GitHub's relevant semantic timestamps and HTTP `Date` headers have only
+whole-second authority here. Equality between a pre-scope `Date` and the
+artifact semantic time therefore cannot prove which event happened first: an
+old-scope artifact may have been created earlier in that second, followed by a
+same-head base retarget and the pre read. Treat equality as inconclusive rather
+than binding the artifact retroactively to the later scope. This strict edge is
+specific to the pre-to-artifact causal boundary; the exact artifact GET and
+the parent-ordered post reads may share a second with the preceding event.
 
 The frozen reaction-history `as_of_server_time` constrains historical semantic
 records, not when the parent is allowed to collect or revalidate an artifact
@@ -2476,8 +2486,8 @@ implementation mechanically:
     whole-PR scope without naming a request or run. Clean and malformed
     evidence require the current tuple; a proved-ancestor finding preserves its
     artifact-time head while normalized `scope.head` remains current. An
-    artifact older than every trustworthy pre observation cannot be
-    retroactively scoped. Equal point reads still do not exclude an
+    artifact that does not strictly follow every trustworthy pre observation
+    cannot be retroactively scoped. Equal point reads still do not exclude an
     intermediate ABA transition.
 12. **Declaration discovery is a playbook extension.** The authenticated
     declaration PR participates in the complete repository seed/detail

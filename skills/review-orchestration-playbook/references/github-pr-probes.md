@@ -164,17 +164,24 @@ compare URL. The compare response must repeat both as `base_commit.sha` and
 `head_commit.sha` and supply the unique `merge_base_commit.sha`; a body for a
 different head is not scope evidence.
 
-Require every pre response `Date` to be no later than the artifact semantic
-server time, that time to be no later than the artifact GET response `Date`,
-and every post response `Date` to be no earlier than the artifact GET response
-`Date`. Capture the pre pair before waiting for the result. If the candidate
-already predates every trustworthy pre observation, it is inconclusive unless
+Require every pre response `Date` to be strictly earlier than the artifact
+semantic server time, that time to be no later than the artifact GET response
+`Date`, and every post response `Date` to be no earlier than the artifact GET
+response `Date`. Capture the pre pair before waiting for the result. If the
+candidate does not strictly postdate every trustworthy pre observation, it is
+inconclusive unless
 the parent reuses a previously persisted, still-identical receipt that already
 bracketed that exact artifact. Never create a retrospective pre boundary from
 current PR metadata. The receipt is independent of request sidecars and proves
 neither request/run/artifact lineage nor an ABA-free interval. A missing
 request sidecar still closes only request/reaction authority; a missing or
 unstable artifact receipt blocks the wrapped terminal artifact.
+
+The strict pre edge is intentional: GitHub supplies only whole-second time
+authority for these fields, so equality cannot distinguish an artifact created
+under the old base earlier in the second from a later same-head retarget and
+pre read. Equality is inconclusive unless a previously persisted receipt
+already supplied a strictly earlier pre boundary for that exact artifact.
 
 Do not apply the frozen reaction-history `as_of_server_time` to artifact
 receipt collection `Date` values. It bounds eligible historical artifact
