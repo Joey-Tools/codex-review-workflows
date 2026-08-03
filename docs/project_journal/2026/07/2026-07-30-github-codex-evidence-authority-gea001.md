@@ -1207,13 +1207,20 @@ the first schema-v4 implementation did not yet enforce:
 - Updated-desc pull discovery accepts only exact integer status `200`. Its
   canonical `last` relation remains consistent across retained pages, equals the
   current page at a natural no-`next` end, and never precedes the next page.
+- GraphQL thread completeness is scope-bound, not endpoint-bound. Every raw
+  response page repeats exact `repository.nameWithOwner` and typed positive
+  `pullRequest.number`, and both must match the selected transcript scope before
+  an empty or nonempty connection can count. The shared `/graphql` URL plus a
+  cursor and stable body digest cannot by themselves distinguish an empty
+  response collected from another owner, repository, or PR.
 
 These are not new provider policy. They make the retained bytes prove the
 already-declared discovery, ordering, and scope properties instead of allowing
 fixture/parser self-consistency to substitute for the real GitHub endpoint
 contract. Regression tests cover pending-only and newer-pending histories,
 sidecar-blind projection drift, arbitrary pagination URLs, multi-page
-direct-object substitution, contradictory `last`, and numeric type aliases.
+direct-object substitution, contradictory `last`, numeric type aliases, and
+cross-scope GraphQL empty-response substitution on first and later pages.
 
 These corrections are part of the completed landing contract. Test, validator,
 signed-commit, exact-range review, CI, and merge receipts remain parent-owned

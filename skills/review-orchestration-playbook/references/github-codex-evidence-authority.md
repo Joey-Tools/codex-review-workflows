@@ -1328,11 +1328,16 @@ SHA-256. Raw GitHub REST timestamps remain canonical whole-second RFC3339
 `YYYY-MM-DDTHH:MM:SSZ` text. Before ordering, window checks, or policy-projection
 hashing, the fixed projector converts them to positive integer Unix seconds by
 strict round trip; JSON numbers, booleans, offsets, fractional seconds, and
-noncanonical or invalid dates are rejected. A GraphQL page records exact request URL
-`https://api.github.com/graphql`, integer status, `link_header: null`, the
-exact requested `request_after` cursor or null, and the same bounded raw
-body/digest; the fixed parser reads raw `pageInfo.hasNextPage` and
-`pageInfo.endCursor` from that body. REST traversal follows raw
+noncanonical or invalid dates are rejected. A GraphQL page records exact
+request URL `https://api.github.com/graphql`, integer status,
+`link_header: null`, the exact requested `request_after` cursor or null, and
+the same bounded raw body/digest. Every response page also carries raw
+`repository.nameWithOwner` and `pullRequest.number`; the fixed parser requires
+them to equal the transcript repository and positive pull number before it
+reads raw `pageInfo.hasNextPage` and `pageInfo.endCursor`. This response-side
+scope binding is mandatory even for an empty `reviewThreads.nodes` result, so
+a complete response from another owner, repository, or PR cannot substitute
+for the selected scope. REST traversal follows raw
 `Link rel=next` until none remains.
 GraphQL traversal starts at null, requires each next `request_after` to equal
 the prior raw `endCursor`, and terminates only at typed
@@ -2200,7 +2205,7 @@ evidence_basis:
                     status: 200
                     link_header: <raw REST Link header or null for GraphQL>
                     request_after: <null for REST/first GraphQL page or prior raw endCursor>
-                    body_utf8: <bounded raw JSON response body>
+                    body_utf8: <bounded raw JSON response body; GraphQL pages include exact repository.nameWithOwner and pullRequest.number>
                     body_sha256: <recomputed lowercase SHA-256>
       request_scope_receipts:
         - <one closed parent-owned request-time scope sidecar for every controlled request in the seeded scopes>

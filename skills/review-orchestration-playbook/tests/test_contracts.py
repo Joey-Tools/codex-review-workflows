@@ -4089,6 +4089,9 @@ printf '%s\n' "$trusted_uv"
             "`merge_base_commit.sha`",
             "`source_evidence`",
             "raw github rest timestamps remain canonical whole-second rfc3339",
+            "`repository.namewithowner`",
+            "`pullrequest.number`",
+            "mandatory even for an empty `reviewthreads.nodes` result",
             "`comments { nodes pageinfo }`",
             "`hasnextpage == false`",
             "a confirmed different actor is not provider behaviour",
@@ -11190,9 +11193,19 @@ printf '%s\n' "$trusted_uv"
         def graphql_thread_fetch(
             nodes: list[dict[str, object]],
             *,
+            repository: str,
+            pull_number: int,
             resource_tracker: dict[str, object] | None = None,
             records_precharged: bool = False,
         ) -> dict[str, object]:
+            if (
+                not isinstance(repository, str)
+                or repository.count("/") != 1
+                or any(not part for part in repository.split("/"))
+                or type(pull_number) is not int
+                or pull_number <= 0
+            ):
+                raise ValueError("invalid GraphQL scope identity")
             pages: list[dict[str, object]] = []
             request_after: str | None = None
             page_count = len(nodes) or 1
@@ -11240,15 +11253,17 @@ printf '%s\n' "$trusted_uv"
                 body = {
                     "data": {
                         "repository": {
+                            "nameWithOwner": repository,
                             "pullRequest": {
+                                "number": pull_number,
                                 "reviewThreads": {
                                     "nodes": chunk,
                                     "pageInfo": {
                                         "hasNextPage": has_next,
                                         "endCursor": end_cursor,
                                     },
-                                }
-                            }
+                                },
+                            },
                         }
                     }
                 }
@@ -11918,6 +11933,8 @@ printf '%s\n' "$trusted_uv"
                     ),
                     graphql_thread_fetch(
                         thread_nodes,
+                        repository=repository,
+                        pull_number=pr,
                         resource_tracker=resource_tracker,
                         records_precharged=True,
                     ),
@@ -12420,10 +12437,17 @@ printf '%s\n' "$trusted_uv"
         def parse_graphql_thread_pages(
             fetch: object,
             *,
+            repository: str,
+            pull_number: int,
             resource_tracker: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             if (
-                not isinstance(fetch, dict)
+                not isinstance(repository, str)
+                or repository.count("/") != 1
+                or any(not part for part in repository.split("/"))
+                or type(pull_number) is not int
+                or pull_number <= 0
+                or not isinstance(fetch, dict)
                 or len(fetch) != 4
                 or set(fetch) != {"kind", "transport", "parent_comment_id", "pages"}
                 or fetch.get("kind") != "review_threads"
@@ -12484,13 +12508,18 @@ printf '%s\n' "$trusted_uv"
                         not isinstance(body["errors"], list) or body["errors"]
                     ):
                         return None
-                    connection = body["data"]["repository"]["pullRequest"][
-                        "reviewThreads"
-                    ]
+                    repository_payload = body["data"]["repository"]
+                    pull_request_payload = repository_payload["pullRequest"]
+                    connection = pull_request_payload["reviewThreads"]
                 except (KeyError, TypeError, ValueError):
                     return None
                 if (
-                    not isinstance(connection, dict)
+                    not isinstance(repository_payload, dict)
+                    or repository_payload.get("nameWithOwner") != repository
+                    or not isinstance(pull_request_payload, dict)
+                    or type(pull_request_payload.get("number")) is not int
+                    or pull_request_payload.get("number") != pull_number
+                    or not isinstance(connection, dict)
                     or not {"nodes", "pageInfo"} <= set(connection)
                     or not isinstance(connection.get("nodes"), list)
                     or not isinstance(connection.get("pageInfo"), dict)
@@ -12605,7 +12634,11 @@ printf '%s\n' "$trusted_uv"
             parent_review_id=990_002,
         )["pages"][0]["nodes"][0]
         assert isinstance(graphql_shape_internal, dict)
-        graphql_shape_fetch = graphql_thread_fetch([graphql_shape_internal])
+        graphql_shape_fetch = graphql_thread_fetch(
+            [graphql_shape_internal],
+            repository=current_repository,
+            pull_number=current_pr,
+        )
         graphql_shape_body = json.loads(graphql_shape_fetch["pages"][0]["body_utf8"])
         graphql_shape_raw_node = graphql_shape_body["data"]["repository"][
             "pullRequest"
@@ -12616,12 +12649,97 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertNotIn("pagination_complete", graphql_shape_raw_node["comments"])
         self.assertNotIn("pages", graphql_shape_raw_node["comments"])
-        parsed_graphql_shape = parse_graphql_thread_pages(graphql_shape_fetch)
+        parsed_graphql_shape = parse_graphql_thread_pages(
+            graphql_shape_fetch,
+            repository=current_repository,
+            pull_number=current_pr,
+        )
         self.assertIsNotNone(parsed_graphql_shape)
         assert parsed_graphql_shape is not None
         self.assertTrue(
             typed_json_equal(parsed_graphql_shape, [graphql_shape_internal])
         )
+        empty_graphql_scope_fetch = graphql_thread_fetch(
+            [],
+            repository=current_repository,
+            pull_number=current_pr,
+        )
+        self.assertEqual(
+            parse_graphql_thread_pages(
+                empty_graphql_scope_fetch,
+                repository=current_repository,
+                pull_number=current_pr,
+            ),
+            [],
+        )
+        for case_name, substituted_fetch in (
+            (
+                "wrong-owner",
+                graphql_thread_fetch(
+                    [],
+                    repository="OTHER/REPO",
+                    pull_number=current_pr,
+                ),
+            ),
+            (
+                "wrong-repository",
+                graphql_thread_fetch(
+                    [],
+                    repository="OWNER/OTHER",
+                    pull_number=current_pr,
+                ),
+            ),
+            (
+                "wrong-pull-number",
+                graphql_thread_fetch(
+                    [],
+                    repository=current_repository,
+                    pull_number=current_pr + 1,
+                ),
+            ),
+        ):
+            with self.subTest(graphql_empty_scope_substitution=case_name):
+                self.assertIsNone(
+                    parse_graphql_thread_pages(
+                        substituted_fetch,
+                        repository=current_repository,
+                        pull_number=current_pr,
+                    )
+                )
+
+        for case_name, field, invalid_value in (
+            ("missing-repository", "missing-nameWithOwner", None),
+            ("null-repository", "nameWithOwner", None),
+            ("missing-pull-number", "missing-number", None),
+            ("boolean-pull-number", "number", True),
+            ("float-pull-number", "number", float(current_pr)),
+            ("null-pull-number", "number", None),
+        ):
+            malformed_scope_identity = clone(empty_graphql_scope_fetch)
+            malformed_page = malformed_scope_identity["pages"][0]
+            malformed_body = json.loads(malformed_page["body_utf8"])
+            if field == "missing-nameWithOwner":
+                malformed_body["data"]["repository"].pop("nameWithOwner")
+            elif field == "missing-number":
+                malformed_body["data"]["repository"]["pullRequest"].pop("number")
+            elif field == "nameWithOwner":
+                malformed_body["data"]["repository"][field] = invalid_value
+            else:
+                malformed_body["data"]["repository"]["pullRequest"][field] = (
+                    invalid_value
+                )
+            replace_raw_json_body(
+                malformed_page,
+                canonical_raw_body(malformed_body),
+            )
+            with self.subTest(graphql_scope_identity_near_miss=case_name):
+                self.assertIsNone(
+                    parse_graphql_thread_pages(
+                        malformed_scope_identity,
+                        repository=current_repository,
+                        pull_number=current_pr,
+                    )
+                )
 
         for case_name, mutate_body in {
             "duplicate-key": lambda body: body.replace(
@@ -12639,7 +12757,13 @@ printf '%s\n' "$trusted_uv"
             assert isinstance(raw_body, str)
             replace_raw_json_body(page, mutate_body(raw_body))
             with self.subTest(strict_graphql_page_json=case_name):
-                self.assertIsNone(parse_graphql_thread_pages(malformed_graphql_json))
+                self.assertIsNone(
+                    parse_graphql_thread_pages(
+                        malformed_graphql_json,
+                        repository=current_repository,
+                        pull_number=current_pr,
+                    )
+                )
 
         for case_name, errors in {
             "partial-data": [{"message": "partial response"}],
@@ -12661,7 +12785,13 @@ printf '%s\n' "$trusted_uv"
             body["errors"] = errors
             replace_raw_json_body(page, canonical_raw_body(body))
             with self.subTest(graphql_partial_error=case_name):
-                self.assertIsNone(parse_graphql_thread_pages(partial_graphql))
+                self.assertIsNone(
+                    parse_graphql_thread_pages(
+                        partial_graphql,
+                        repository=current_repository,
+                        pull_number=current_pr,
+                    )
+                )
 
         forward_compatible_graphql = clone(graphql_shape_fetch)
         assert isinstance(forward_compatible_graphql, dict)
@@ -12683,7 +12813,11 @@ printf '%s\n' "$trusted_uv"
         forward_comment["futureCommentField"] = "ignored"
         forward_comment["pullRequestReview"]["futureParentField"] = "ignored"
         replace_raw_json_body(forward_page, canonical_raw_body(forward_body))
-        parsed_forward_graphql = parse_graphql_thread_pages(forward_compatible_graphql)
+        parsed_forward_graphql = parse_graphql_thread_pages(
+            forward_compatible_graphql,
+            repository=current_repository,
+            pull_number=current_pr,
+        )
         self.assertIsNotNone(parsed_forward_graphql)
         self.assertTrue(
             typed_json_equal(parsed_forward_graphql, [graphql_shape_internal])
@@ -12693,14 +12827,37 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(second_graphql_node, dict)
         second_graphql_node["id"] = "THREAD_990_002"
         partial_later_page = graphql_thread_fetch(
-            [graphql_shape_internal, second_graphql_node]
+            [graphql_shape_internal, second_graphql_node],
+            repository=current_repository,
+            pull_number=current_pr,
         )
         self.assertEqual(len(partial_later_page["pages"]), 2)
+        later_scope_drift = clone(partial_later_page)
+        later_scope_page = later_scope_drift["pages"][1]
+        later_scope_body = json.loads(later_scope_page["body_utf8"])
+        later_scope_body["data"]["repository"]["nameWithOwner"] = "OTHER/REPO"
+        replace_raw_json_body(
+            later_scope_page,
+            canonical_raw_body(later_scope_body),
+        )
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                later_scope_drift,
+                repository=current_repository,
+                pull_number=current_pr,
+            )
+        )
         later_page = partial_later_page["pages"][1]
         later_body = json.loads(later_page["body_utf8"])
         later_body["errors"] = [{"message": "second page partial failure"}]
         replace_raw_json_body(later_page, canonical_raw_body(later_body))
-        self.assertIsNone(parse_graphql_thread_pages(partial_later_page))
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                partial_later_page,
+                repository=current_repository,
+                pull_number=current_pr,
+            )
+        )
 
         legacy_graphql_shape = clone(graphql_shape_fetch)
         assert isinstance(legacy_graphql_shape, dict)
@@ -12714,7 +12871,13 @@ printf '%s\n' "$trusted_uv"
         legacy_page["body_sha256"] = hashlib.sha256(
             legacy_page["body_utf8"].encode("utf-8")
         ).hexdigest()
-        self.assertIsNone(parse_graphql_thread_pages(legacy_graphql_shape))
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                legacy_graphql_shape,
+                repository=current_repository,
+                pull_number=current_pr,
+            )
+        )
 
         incomplete_nested_graphql = clone(graphql_shape_fetch)
         assert isinstance(incomplete_nested_graphql, dict)
@@ -12731,7 +12894,13 @@ printf '%s\n' "$trusted_uv"
         incomplete_page["body_sha256"] = hashlib.sha256(
             incomplete_page["body_utf8"].encode("utf-8")
         ).hexdigest()
-        self.assertIsNone(parse_graphql_thread_pages(incomplete_nested_graphql))
+        self.assertIsNone(
+            parse_graphql_thread_pages(
+                incomplete_nested_graphql,
+                repository=current_repository,
+                pull_number=current_pr,
+            )
+        )
 
         def parse_recent_pull_discovery(
             fetch: object,
@@ -13354,6 +13523,8 @@ printf '%s\n' "$trusted_uv"
                 )
                 thread_nodes = parse_graphql_thread_pages(
                     by_kind["review_threads"][0],
+                    repository=current_repository,
+                    pull_number=pr,
                     resource_tracker=resource_tracker,
                 )
                 if not all(
@@ -19821,6 +19992,33 @@ printf '%s\n' "$trusted_uv"
                 _tightened_resource_limits=exact_current_resource_limits,
             )
         )
+        cross_scope_empty_transcript = clone(current_resource_transcript)
+        cross_scope_fetches = cross_scope_empty_transcript["scopes"][0]["fetches"]
+        cross_scope_thread_index = next(
+            index
+            for index, fetch in enumerate(cross_scope_fetches)
+            if isinstance(fetch, dict) and fetch.get("kind") == "review_threads"
+        )
+        original_thread_page = cross_scope_fetches[cross_scope_thread_index]["pages"][0]
+        original_thread_body = json.loads(original_thread_page["body_utf8"])
+        self.assertEqual(
+            original_thread_body["data"]["repository"]["pullRequest"]["reviewThreads"][
+                "nodes"
+            ],
+            [],
+        )
+        cross_scope_fetches[cross_scope_thread_index] = graphql_thread_fetch(
+            [],
+            repository=current_repository,
+            pull_number=current_pr + 1,
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                cross_scope_empty_transcript,
+                request_scope_receipts=current_resource_receipts,
+                _tightened_resource_limits=exact_current_resource_limits,
+            )
+        )
         for limit_name, overflow_value in (
             ("max_fetch_attempts", 8),
             ("max_retained_pages", 8),
@@ -20357,7 +20555,9 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(second_graphql_shape, dict)
         second_graphql_shape["id"] = "THREAD_990_002"
         two_page_graphql_fetch = graphql_thread_fetch(
-            [graphql_shape_internal, second_graphql_shape]
+            [graphql_shape_internal, second_graphql_shape],
+            repository=current_repository,
+            pull_number=current_pr,
         )
         two_page_graphql_tracker = new_resource_tracker(
             tightened_limits=tightened_resource_limits(
@@ -20371,6 +20571,8 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNotNone(
             parse_graphql_thread_pages(
                 two_page_graphql_fetch,
+                repository=current_repository,
+                pull_number=current_pr,
                 resource_tracker=two_page_graphql_tracker,
             )
         )
@@ -20386,11 +20588,17 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNone(
             parse_graphql_thread_pages(
                 two_page_graphql_fetch,
+                repository=current_repository,
+                pull_number=current_pr,
                 resource_tracker=too_few_graphql_attempts_tracker,
             )
         )
 
-        graphql_budget_fetch = graphql_thread_fetch([graphql_shape_internal])
+        graphql_budget_fetch = graphql_thread_fetch(
+            [graphql_shape_internal],
+            repository=current_repository,
+            pull_number=current_pr,
+        )
         graphql_exact_tracker = new_resource_tracker(
             tightened_limits=tightened_resource_limits(
                 max_fetch_attempts=1,
@@ -20403,6 +20611,8 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNotNone(
             parse_graphql_thread_pages(
                 graphql_budget_fetch,
+                repository=current_repository,
+                pull_number=current_pr,
                 resource_tracker=graphql_exact_tracker,
             )
         )
@@ -20418,6 +20628,8 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNone(
             parse_graphql_thread_pages(
                 graphql_budget_fetch,
+                repository=current_repository,
+                pull_number=current_pr,
                 resource_tracker=graphql_overflow_tracker,
             )
         )
@@ -20432,6 +20644,8 @@ printf '%s\n' "$trusted_uv"
         with self.assertRaises(EvidenceResourceBudgetExceeded):
             graphql_thread_fetch(
                 [oversized_internal_graphql],
+                repository=current_repository,
+                pull_number=current_pr,
                 resource_tracker=graphql_precharge_tracker,
             )
 
@@ -31717,11 +31931,15 @@ printf '%s\n' "$trusted_uv"
             ],
         )
         target_threads = parse_graphql_thread_pages(
-            ordinary_reply_fetches[thread_index]
+            ordinary_reply_fetches[thread_index],
+            repository=current_repository,
+            pull_number=background_pr,
         )
         assert isinstance(target_threads, list)
         ordinary_reply_fetches[thread_index] = graphql_thread_fetch(
-            [*target_threads, unrelated_only_thread]
+            [*target_threads, unrelated_only_thread],
+            repository=current_repository,
+            pull_number=background_pr,
         )
         ordinary_replies_projection = parse_discovery_endpoint_transcript(
             ordinary_replies_transcript,
@@ -31871,7 +32089,9 @@ printf '%s\n' "$trusted_uv"
             "review_threads",
         )
         mixed_future_threads = parse_graphql_thread_pages(
-            mixed_future_fetches[mixed_future_thread_index]
+            mixed_future_fetches[mixed_future_thread_index],
+            repository=current_repository,
+            pull_number=background_pr,
         )
         assert isinstance(mixed_future_threads, list) and mixed_future_threads
         mixed_future_threads[0]["comments"]["pages"][0]["nodes"].append(
@@ -31883,7 +32103,9 @@ printf '%s\n' "$trusted_uv"
             )
         )
         mixed_future_fetches[mixed_future_thread_index] = graphql_thread_fetch(
-            mixed_future_threads
+            mixed_future_threads,
+            repository=current_repository,
+            pull_number=background_pr,
         )
         mixed_future_projection = parse_discovery_endpoint_transcript(
             mixed_future_thread_transcript,
@@ -31963,10 +32185,16 @@ printf '%s\n' "$trusted_uv"
                 f"{api_root}/pulls/{background_pr}/comments?per_page=100",
                 [*raw_rest_records(fetches[inline_index]), background_inline],
             )
-            existing_thread_nodes = parse_graphql_thread_pages(fetches[thread_index])
+            existing_thread_nodes = parse_graphql_thread_pages(
+                fetches[thread_index],
+                repository=current_repository,
+                pull_number=background_pr,
+            )
             assert isinstance(existing_thread_nodes, list)
             fetches[thread_index] = graphql_thread_fetch(
-                [*existing_thread_nodes, background_thread]
+                [*existing_thread_nodes, background_thread],
+                repository=current_repository,
+                pull_number=background_pr,
             )
             fetches[reaction_index] = rest_fetch(
                 "request_reactions",
@@ -32318,7 +32546,11 @@ printf '%s\n' "$trusted_uv"
             future_initial_fetches,
             "review_threads",
         )
-        future_initial_fetches[initial_thread_index] = graphql_thread_fetch([])
+        future_initial_fetches[initial_thread_index] = graphql_thread_fetch(
+            [],
+            repository=current_repository,
+            pull_number=background_pr,
+        )
         future_review_inventory = future_human_review_history["final_inventory"]
         future_review_transcript = future_review_inventory[
             "discovery_endpoint_transcript"
@@ -32610,7 +32842,11 @@ printf '%s\n' "$trusted_uv"
             "review_threads",
         )
         future_missing_thread_fetches[future_missing_thread_index] = (
-            graphql_thread_fetch([])
+            graphql_thread_fetch(
+                [],
+                repository=current_repository,
+                pull_number=background_pr,
+            )
         )
         self.assertIsNone(
             parse_discovery_endpoint_transcript(

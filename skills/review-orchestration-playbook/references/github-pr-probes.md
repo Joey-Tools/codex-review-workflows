@@ -289,8 +289,11 @@ REST does not expose PR review-thread resolution. Preserve the fully paginated
 raw REST inline-comment records without adding `thread_id`,
 `thread_resolved`, or `is_resolved`. Separately preserve the raw GraphQL pages
 from a minimal query that pages
-`reviewThreads(first: 100, after: $cursor)` and records each thread's stable
-`id`, typed `isResolved`, typed `isOutdated`, and
+`reviewThreads(first: 100, after: $cursor)`. On every page, also request
+`repository.nameWithOwner` and `pullRequest.number`, then require both values
+to equal the exact selected repository and PR before consuming even an empty
+thread connection. Record each thread's stable `id`, typed `isResolved`, typed
+`isOutdated`, and
 `pageInfo { hasNextPage endCursor }`. For every paginated thread-comment node,
 record GraphQL `id`, REST-compatible `fullDatabaseId: BigInt`, `url`, and
 `pullRequestReview { id fullDatabaseId }`. Schema version 4 paginates only the
@@ -509,7 +512,10 @@ timestamps stay canonical whole-second RFC3339 `Z` text; the fixed projector
 strictly round-trips them to positive integer Unix seconds before ordering or
 hashing and rejects numeric, offset, fractional, invalid, or noncanonical
 substitutes. GraphQL pages retain the exact requested cursor and raw body from
-which the fixed parser validates `pageInfo`. A raw thread node contains the
+which the fixed parser validates `repository.nameWithOwner`,
+`pullRequest.number`, and `pageInfo` on every page. The first two values must
+match the exact transcript scope before an empty or nonempty connection can
+count as complete. A raw thread node contains the
 real GraphQL `comments { nodes pageInfo }` connection, never the normalized
 report `comments.pages` envelope. Version 4 accepts nested comments only when
 that first connection is complete (`hasNextPage == false`,
