@@ -2837,6 +2837,40 @@ class RepositoryContractTest(unittest.TestCase):
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         normalized = " ".join(authority.split()).lower()
 
+        request_schema = json.loads(
+            (SKILL_ROOT / "references/base-only-retarget-state-machine.json").read_text(
+                encoding="utf-8"
+            )
+        )["request_scope_receipt_sidecar"]
+        self.assertEqual(
+            request_schema["request_projection_fields"],
+            [
+                "id",
+                "url",
+                "created_at",
+                "updated_at",
+                "request_server_time",
+                "request_server_time_field",
+                "normalized_body",
+                "user",
+            ],
+        )
+        self.assertEqual(request_schema["request_user_fields"], ["login", "type"])
+        self.assertIn("eight-field record", normalized)
+        self.assertIn(
+            "same eight request fields, including closed `user: {login, type}` actor identity",
+            " ".join(skill.split()).lower(),
+        )
+        if CI_PROFILE == "canonical":
+            normalized_readme = " ".join(
+                (REPO_ROOT / "README.md").read_text(encoding="utf-8").split()
+            ).lower()
+            self.assertIn(
+                "eight normalized fields, including closed `user: {login, type}` actor identity",
+                normalized_readme,
+            )
+            self.assertNotIn("seven normalized fields", normalized_readme)
+
         scenario_outcomes = {
             "R1-clean1-R2-pending": "clean",
             "R1-clean1-R2-clean2": "clean",

@@ -33,8 +33,9 @@ artifact already exists. Do not post another request to repair either warning.
 Every request admitted by the request or reaction plane also needs one closed
 parent-owned request-time scope sidecar. It binds raw pre/post PR-detail and
 compare responses plus the exact `201` POST response one-to-one to the request's
-seven normalized fields and immutable `(repository, PR, merge base, head)`
-tuple. The sidecar is a sibling of the raw discovery/current inventories; raw
+eight normalized fields, including closed `user: {login, type}` actor identity,
+and immutable `(repository, PR, merge base, head)` tuple. The sidecar is a
+sibling of the raw discovery/current inventories; raw
 transcript schema version 3 and its fetch kinds remain unchanged. Missing,
 malformed, extra, or unmatched receipts make `request_policy` `unknown`, forbid
 another POST while same-scope history is unproved, and disable the affected
