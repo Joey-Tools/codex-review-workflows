@@ -11532,7 +11532,9 @@ printf '%s\n' "$trusted_uv"
                 or not isinstance(user.get("login"), str)
                 or not isinstance(user.get("type"), str)
                 or not isinstance(value.get("commit_id"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", value["commit_id"]) is None
                 or not isinstance(value.get("original_commit_id"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", value["original_commit_id"]) is None
                 or not isinstance(body, str)
                 or normalized_body is None
             ):
@@ -31727,6 +31729,55 @@ printf '%s\n' "$trusted_uv"
                 derived_inventory_entries([ordinary_replies_candidate, current]),
             )
         )
+        for actor_kind, inline_id, field, invalid_sha in (
+            (
+                "human",
+                920_011,
+                "commit_id",
+                selected_review_commit[:10],
+            ),
+            (
+                "unrelated-bot",
+                920_012,
+                "original_commit_id",
+                "g" * 40,
+            ),
+            (
+                "null-parent",
+                920_013,
+                "commit_id",
+                "A" * 40,
+            ),
+        ):
+            malformed_audit_transcript = clone(ordinary_replies_transcript)
+            malformed_scope = malformed_audit_transcript["scopes"][0]
+            malformed_fetches = malformed_scope["fetches"]
+            malformed_inline_index = fetch_index(
+                malformed_fetches,
+                "inline_comments",
+            )
+            malformed_inline_fetch = malformed_fetches[malformed_inline_index]
+            malformed_inline_records = raw_rest_records(malformed_inline_fetch)
+            malformed_record = next(
+                record
+                for record in malformed_inline_records
+                if isinstance(record, dict) and record.get("id") == inline_id
+            )
+            malformed_record[field] = invalid_sha
+            malformed_fetches[malformed_inline_index] = rest_fetch(
+                "inline_comments",
+                malformed_inline_fetch["pages"][0]["request_url"],
+                malformed_inline_records,
+            )
+            with self.subTest(raw_audit_child_invalid_sha=actor_kind):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        malformed_audit_transcript,
+                        request_scope_receipts=request_scope_receipts_for_scopes(
+                            [ordinary_replies_candidate, current]
+                        ),
+                    )
+                )
         mixed_future_thread_transcript = clone(ordinary_replies_transcript)
         assert isinstance(mixed_future_thread_transcript, dict)
         mixed_future_scope = mixed_future_thread_transcript["scopes"][0]
