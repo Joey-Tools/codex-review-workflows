@@ -361,7 +361,7 @@ def _format_github_rfc3339_seconds(value: object) -> object:
     if type(value) is not int or value <= 0:
         return value
     try:
-        instant = datetime.datetime.fromtimestamp(value, datetime.UTC)
+        instant = datetime.datetime.fromtimestamp(value, datetime.timezone.utc)
     except (OSError, OverflowError, ValueError):
         return value
     return instant.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -382,7 +382,7 @@ def _parse_github_rfc3339_seconds(value: object) -> int | None:
         instant = datetime.datetime.strptime(
             value,
             "%Y-%m-%dT%H:%M:%SZ",
-        ).replace(tzinfo=datetime.UTC)
+        ).replace(tzinfo=datetime.timezone.utc)
     except ValueError:
         return None
     if instant.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
@@ -5635,7 +5635,7 @@ class RepositoryContractTest(unittest.TestCase):
             server_time: int,
         ) -> dict[str, object]:
             date_header = email.utils.format_datetime(
-                datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                datetime.datetime.fromtimestamp(server_time, datetime.timezone.utc),
                 usegmt=True,
             )
             body_utf8 = json.dumps(
@@ -5805,7 +5805,7 @@ class RepositoryContractTest(unittest.TestCase):
                 return None
             if parsed is None or parsed.tzinfo is None or parsed.microsecond != 0:
                 return None
-            utc_value = parsed.astimezone(datetime.UTC)
+            utc_value = parsed.astimezone(datetime.timezone.utc)
             if email.utils.format_datetime(utc_value, usegmt=True) != value:
                 return None
             timestamp = utc_value.timestamp()
@@ -6131,7 +6131,9 @@ class RepositoryContractTest(unittest.TestCase):
                     "request_url": request_url,
                     "status": status,
                     "date_header": email.utils.format_datetime(
-                        datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                        datetime.datetime.fromtimestamp(
+                            server_time, datetime.timezone.utc
+                        ),
                         usegmt=True,
                     ),
                     "body_utf8": body_utf8,
@@ -6225,7 +6227,9 @@ class RepositoryContractTest(unittest.TestCase):
                     "request_url": request_url,
                     "status": 200,
                     "date_header": email.utils.format_datetime(
-                        datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                        datetime.datetime.fromtimestamp(
+                            server_time, datetime.timezone.utc
+                        ),
                         usegmt=True,
                     ),
                     "body_utf8": body_utf8,
@@ -6284,7 +6288,7 @@ class RepositoryContractTest(unittest.TestCase):
             server_time: int,
         ) -> None:
             response["date_header"] = email.utils.format_datetime(
-                datetime.datetime.fromtimestamp(server_time, datetime.UTC),
+                datetime.datetime.fromtimestamp(server_time, datetime.timezone.utc),
                 usegmt=True,
             )
 
@@ -28617,7 +28621,7 @@ class RepositoryContractTest(unittest.TestCase):
             email.utils.format_datetime(
                 datetime.datetime.fromtimestamp(
                     history_as_of_server_time - 1,
-                    datetime.UTC,
+                    datetime.timezone.utc,
                 ),
                 usegmt=True,
             )
