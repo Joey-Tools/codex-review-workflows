@@ -1737,7 +1737,7 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(evidence, journal)
 
-    def test_readonly_supervisor_journal_is_recovery_pointer(self) -> None:
+    def test_latest_workstream_pointer_and_readonly_supervisor_journal(self) -> None:
         if CI_PROFILE != "canonical":
             self.skipTest("canonical project journal is not mirrored")
         project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
@@ -1750,8 +1750,8 @@ class RepositoryContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(
             "Latest workstream: "
-            "`docs/project_journal/2026/07/"
-            "2026-07-30-readonly-supervisor-scratch-rss001.md`",
+            "`docs/project_journal/2026/08/"
+            "2026-08-03-claude-2-1-220-stream-schema-c22001.md`",
             project_state,
         )
         for evidence in (

@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-03
 updated: 2026-08-03
 branch: codex/claude-2-1-220-stream-schema
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/88
 supersedes: []
 superseded_by:
 ---
@@ -38,9 +38,11 @@ superseded_by:
 - `skills/review-orchestration-playbook/scripts/validate_claude_stream.py`
 - `skills/review-orchestration-playbook/tests/test_validate_claude_stream.py`
 - Focused stream-validator suite: 109 tests passed in 8.393 seconds.
-- Complete review-orchestration suite: 2,833 tests passed in 1118.221
-  seconds outside the restricted sandbox, with 6 platform-gated skips. The
-  sandboxed run reached the same 2,833-test inventory but its 18 failures were
-  all loopback or Unix-socket permission denials.
+- Complete review-orchestration suite after the recovery-pointer contract fix:
+  2,833 tests passed in 924.720 seconds outside the restricted sandbox, with 6
+  platform-gated skips and no source-tree bytecode before or after the run.
+- The first PR CI run exposed the stale exact recovery-pointer assertion on
+  both platforms; the focused repaired contract test passed while preserving
+  the historical read-only supervisor evidence checks.
 - Ruff lint/format, JSON parsing, Actionlint, skill validation, project-journal
   validation, and `git diff --check` passed.
