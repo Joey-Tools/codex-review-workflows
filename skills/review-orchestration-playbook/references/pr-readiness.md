@@ -185,11 +185,14 @@ Each initial/final historical inventory independently embeds the closed
 schema-version-4 raw discovery transcript. Its bounded updated-desc pull
 traversal stops after the first full page containing a row at or before the
 cutoff (or at natural end), while its fully paginated since-cutoff repository
-issue-comments feed discovers strict controlled request parents whose reactions
-may not update PR metadata. Newer pull rows, request-bound PRs, and exact
-current/declaration anchors form the detail union. Historical reaction-only
-eligibility requires the parent in that feed and both request and response in
-the frozen interval. The fixed parser classifies every union-seeded PR and
+issue-comments feed retains every exact-body `@codex review` record regardless
+of actor or App, because discovery must seed the PR before complete actor,
+raw-equal detail, and sidecar validation accepts the request or selects
+`unknown`. Reactions may not update PR metadata. Newer pull rows, request-bound
+PRs, and exact current/declaration anchors form the detail union. Historical
+reaction-only eligibility requires the parent in that feed and both request and
+response in the frozen interval. The fixed parser classifies every union-seeded
+PR and
 excludes current only after full parsing. Boundary witnesses do not consume the
 512 union-seeded-PR cap; union member 513, incomplete source/detail closure, or any
 budget overflow selects `unknown` without truncation. A version-3 transcript

@@ -414,12 +414,15 @@ embeds the raw `discovery_endpoint_transcript`. Its closed root contains the
 updated-desc pull traversal through its first cutoff-boundary page or natural
 end, the fully paginated since-cutoff repository issue-comment feed, exact
 current/declaration anchors, and one complete detail traversal for every union
-member. Each detail traversal
-contains the policy-required pull detail, compare, issue-comment, review,
-inline-comment, raw GraphQL thread/comment, and controlled-request reaction
-fetches. The fixed parser excludes current only after every union-seeded scope
-is fully parsed and classified. Historical reaction-only eligibility requires
-the raw-equal request parent in the repository feed and both request/response
+member. That repository feed retains every exact-body `@codex review` record
+regardless of actor or App; discovery seeds its PR before full actor, raw-equal
+detail, and sidecar validation either accepts the request or selects `unknown`.
+It never silently removes an untrusted or ambiguous strict request. Each detail
+traversal contains the policy-required pull detail, compare, issue-comment,
+review, inline-comment, raw GraphQL thread/comment, and controlled-request
+reaction fetches. The fixed parser excludes current only after every
+union-seeded scope is fully parsed and classified. Historical reaction-only
+eligibility requires the raw-equal request parent in the repository feed and both request/response
 inside the interval. Boundary witnesses and cumulative old PRs do not consume
 the 512 union cap. A version-3 transcript cannot prove reaction fallback.
 Missing source/union/detail coverage or any budget overflow makes

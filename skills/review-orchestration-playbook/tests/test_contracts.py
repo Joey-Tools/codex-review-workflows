@@ -4771,6 +4771,42 @@ printf '%s\n' "$trusted_uv"
                     normalized_document,
                 )
 
+        discovery_actor_documents = {
+            "authority": normalized_authority_text,
+            "skill": " ".join(
+                anti_drift_documents["skill"].lower().replace("`", "").split()
+            ),
+            "github-pr-probes": normalized_github_pr_probes_text,
+            "pr-readiness": " ".join(
+                anti_drift_documents["pr-readiness"].lower().replace("`", "").split()
+            ),
+            "project-journal": section_text(
+                journal,
+                "## v10 Discovery-Classification Corrections",
+            ),
+        }
+        for document_name, document in discovery_actor_documents.items():
+            with self.subTest(discovery_actor_document=document_name):
+                self.assertIn("discovery", document)
+                self.assertIn("@codex review", document)
+                self.assertIn("regardless of actor", document)
+                self.assertIn("sidecar", document)
+                self.assertIn("unknown", document)
+        journal_discovery_correction = discovery_actor_documents["project-journal"]
+        self.assertIn(
+            "the fully paginated since feed is a live traversal, not an as-of snapshot",
+            journal_discovery_correction,
+        )
+        self.assertIn(
+            "this preserves the established “result exists means pass” "
+            "provider-result rule",
+            journal_discovery_correction,
+        )
+        self.assertIn(
+            "codex-review-gate / codex-review-gate-action baseline",
+            journal_discovery_correction,
+        )
+
         exact_resource_profile_documents = {
             "authority": authority,
             "README": malformed_window_documents["README"],
@@ -13104,6 +13140,30 @@ printf '%s\n' "$trusted_uv"
             )
             return recent_pulls, projection, stop_reason
 
+        def raw_actor(value: object) -> str:
+            if not isinstance(value, dict):
+                return "ambiguous"
+            login = value.get("login")
+            user_type = value.get("type")
+            if login == exact_login and user_type == "Bot":
+                return "exact"
+            if (
+                isinstance(login, str)
+                and login
+                and login != exact_login
+                and user_type == "User"
+            ):
+                return "different"
+            if (
+                isinstance(login, str)
+                and login
+                and login != exact_login
+                and user_type == "Bot"
+                and "codex" not in login.casefold()
+            ):
+                return "different"
+            return "ambiguous"
+
         def parse_recent_request_discovery(
             fetch: object,
             *,
@@ -13135,7 +13195,6 @@ printf '%s\n' "$trusted_uv"
                 if (
                     type(updated_at) is not int
                     or updated_at <= history_start_exclusive
-                    or updated_at > history_as_of_server_time
                     or (
                         previous_updated_at is not None
                         and updated_at > previous_updated_at
@@ -13143,15 +13202,18 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 previous_updated_at = updated_at
-                user = projected.get("user")
-                if not (
-                    projected.get("body") == "@codex review"
-                    and isinstance(user, dict)
-                    and user.get("type") == "User"
-                    and isinstance(user.get("login"), str)
-                    and user["login"]
-                    and projected.get("app_slug") is None
-                ):
+                is_controlled_request = projected.get("body") == "@codex review"
+                if updated_at > history_as_of_server_time:
+                    created_at = projected.get("created_at")
+                    if (
+                        not is_controlled_request
+                        and type(created_at) is int
+                        and created_at > history_as_of_server_time
+                        and raw_actor(projected.get("user")) == "different"
+                    ):
+                        continue
+                    return None
+                if not is_controlled_request:
                     continue
                 request_id = projected.get("id")
                 issue_url = raw_record.get("issue_url")
@@ -13551,32 +13613,9 @@ printf '%s\n' "$trusted_uv"
                 }
                 matched_feed_request_ids: set[int] = set()
 
-                def raw_actor(value: object) -> str:
-                    if not isinstance(value, dict):
-                        return "ambiguous"
-                    login = value.get("login")
-                    user_type = value.get("type")
-                    if login == exact_login and user_type == "Bot":
-                        return "exact"
-                    if (
-                        isinstance(login, str)
-                        and login
-                        and login != exact_login
-                        and user_type == "User"
-                    ):
-                        return "different"
-                    if (
-                        isinstance(login, str)
-                        and login
-                        and login != exact_login
-                        and user_type == "Bot"
-                        and "codex" not in login.casefold()
-                    ):
-                        return "different"
-                    return "ambiguous"
-
                 request_times: dict[int, int] = {}
                 request_records: dict[int, dict[str, object]] = {}
+                request_actor_eligibility: dict[int, bool] = {}
                 issue_artifacts: list[dict[str, object]] = []
                 nonterminal_records: list[tuple[str, int, int | None, str]] = []
                 seen_issue_ids: set[int] = set()
@@ -13621,16 +13660,13 @@ printf '%s\n' "$trusted_uv"
                         return None
                     actor = raw_actor(projected_issue.get("user"))
                     if body == "@codex review":
+                        request_user = projected_issue.get("user")
                         if (
-                            actor != "different"
-                            or (
-                                not _allow_post_as_of_requests
-                                and updated_at > history_as_of_server_time
-                            )
-                            or not resource_budget_charge(
-                                resource_tracker,
-                                controlled_requests=1,
-                            )
+                            not _allow_post_as_of_requests
+                            and updated_at > history_as_of_server_time
+                        ) or not resource_budget_charge(
+                            resource_tracker,
+                            controlled_requests=1,
                         ):
                             return None
                         request_times[issue_id] = (
@@ -13651,6 +13687,14 @@ printf '%s\n' "$trusted_uv"
                             "user": clone(projected_issue.get("user")),
                         }
                         request_records[issue_id] = normalized_request
+                        request_actor_eligibility[issue_id] = bool(
+                            actor == "different"
+                            and isinstance(request_user, dict)
+                            and request_user.get("type") == "User"
+                            and isinstance(request_user.get("login"), str)
+                            and request_user["login"]
+                            and projected_issue.get("app_slug") is None
+                        )
                     else:
                         normalized_issue = _normalize_github_codex_body(body)
                         if normalized_issue is None:
@@ -14403,6 +14447,7 @@ printf '%s\n' "$trusted_uv"
                             request_id: clone(request_record)
                             for request_id, request_record in request_records.items()
                         },
+                        "request_actor_eligibility": dict(request_actor_eligibility),
                         "feed_request_ids": (
                             None
                             if _single_scope_pull_number is not None
@@ -14608,6 +14653,7 @@ printf '%s\n' "$trusted_uv"
             lifecycle = raw_scope.get("lifecycle")
             request_times = raw_scope.get("request_times")
             request_records = raw_scope.get("request_records")
+            request_actor_eligibility = raw_scope.get("request_actor_eligibility")
             reaction_records = raw_scope.get("reaction_records")
             artifact_bases = raw_scope.get("artifact_bases")
             nonterminal_records = raw_scope.get("nonterminal_records")
@@ -14617,6 +14663,12 @@ printf '%s\n' "$trusted_uv"
                 or not isinstance(lifecycle, dict)
                 or not isinstance(request_times, dict)
                 or not isinstance(request_records, dict)
+                or not isinstance(request_actor_eligibility, dict)
+                or set(request_actor_eligibility) != set(request_times)
+                or any(
+                    type(eligible) is not bool
+                    for eligible in request_actor_eligibility.values()
+                )
                 or not isinstance(reaction_records, list)
                 or not isinstance(artifact_bases, list)
                 or not isinstance(nonterminal_records, list)
@@ -14993,6 +15045,7 @@ printf '%s\n' "$trusted_uv"
                 lifecycle = raw_scope.get("lifecycle")
                 request_times = raw_scope.get("request_times")
                 request_records = raw_scope.get("request_records")
+                request_actor_eligibility = raw_scope.get("request_actor_eligibility")
                 feed_request_ids = raw_scope.get("feed_request_ids")
                 provider_reactions = raw_scope.get("provider_reactions")
                 reaction_records = raw_scope.get("reaction_records")
@@ -15009,6 +15062,12 @@ printf '%s\n' "$trusted_uv"
                     or not isinstance(lifecycle, dict)
                     or not isinstance(request_times, dict)
                     or not isinstance(request_records, dict)
+                    or not isinstance(request_actor_eligibility, dict)
+                    or set(request_actor_eligibility) != set(request_times)
+                    or any(
+                        type(eligible) is not bool
+                        for eligible in request_actor_eligibility.values()
+                    )
                     or (
                         feed_request_ids is not None
                         and (
@@ -15037,8 +15096,10 @@ printf '%s\n' "$trusted_uv"
                         if isinstance(receipt_mapping, dict)
                         else None
                     )
-                    if isinstance(binding, dict) and typed_json_equal(
-                        binding.get("request"), normalized_request
+                    if (
+                        request_actor_eligibility.get(request_id) is True
+                        and isinstance(binding, dict)
+                        and typed_json_equal(binding.get("request"), normalized_request)
                     ):
                         request_receipt_bindings[request_id] = binding
                         used_receipt_ids.add(request_id)
@@ -15139,6 +15200,11 @@ printf '%s\n' "$trusted_uv"
                     source_ordering_key = None
                     source_evidence = None
                 else:
+                    if request_times and (
+                        receipt_mapping is None
+                        or set(request_receipt_bindings) != set(request_times)
+                    ):
+                        return None
                     if not eligible_current_provider_reactions:
                         if eligible_exact_request_ids:
                             return None
@@ -22077,6 +22143,189 @@ printf '%s\n' "$trusted_uv"
             },
         )
         self.assertIn(2, request_seed_discovery["union_pull_numbers"])
+        request_seed_id = old_updated_request_scope["requests"][0]["id"]
+        request_seed_without_sidecar = [
+            receipt
+            for receipt in request_seed_receipts
+            if receipt.get("request_id") != request_seed_id
+        ]
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                request_seed_transcript,
+                request_scope_receipts=request_seed_without_sidecar,
+                provider_declaration=declaration,
+            )
+        )
+
+        request_discovery_url = (
+            f"https://api.github.com/repos/{current_repository}/issues/comments"
+            "?sort=updated&direction=desc&since="
+            f"{_format_github_rfc3339_seconds(history_start_exclusive)}"
+            "&per_page=100"
+        )
+        actor_independent_request_records: list[dict[str, object]] = []
+        for offset, (variant, user, app) in enumerate(
+            (
+                (
+                    "bot",
+                    {
+                        "login": "dependabot[bot]",
+                        "type": "Bot",
+                        "node_id": "BOT_dependabot",
+                    },
+                    None,
+                ),
+                (
+                    "app",
+                    {
+                        "login": "fixture-requester",
+                        "type": "User",
+                        "node_id": "U_requester",
+                    },
+                    {"slug": "request-broker", "id": 92_002},
+                ),
+                (
+                    "ambiguous",
+                    {
+                        "login": "codex-requester[bot]",
+                        "type": "Bot",
+                        "node_id": "BOT_codex_requester",
+                    },
+                    None,
+                ),
+            ),
+            start=1,
+        ):
+            variant_request = raw_request_record(
+                request(
+                    920_100 + offset,
+                    history_as_of_server_time - offset,
+                    pr=920 + offset,
+                )
+            )
+            variant_request["user"] = user
+            variant_request["performed_via_github_app"] = app
+            actor_independent_request_records.append(variant_request)
+            self.assertEqual(
+                variant_request["body"],
+                "@codex review",
+                msg=variant,
+            )
+        actor_independent_discovery = parse_recent_request_discovery(
+            rest_fetch(
+                "recent_request_comments",
+                request_discovery_url,
+                actor_independent_request_records,
+            ),
+            expected_url=request_discovery_url,
+            resource_tracker=new_resource_tracker(),
+        )
+        self.assertIsNotNone(actor_independent_discovery)
+        assert actor_independent_discovery is not None
+        discovered_requests, discovered_request_projection = actor_independent_discovery
+        self.assertEqual(
+            set(discovered_requests),
+            {920_101, 920_102, 920_103},
+        )
+        self.assertEqual(
+            [item["request_id"] for item in discovered_request_projection],
+            [920_101, 920_102, 920_103],
+        )
+
+        for variant_index, variant in enumerate(("bot", "app", "ambiguous")):
+            invalid_actor_transcript = clone(request_seed_transcript)
+            assert isinstance(invalid_actor_transcript, dict)
+            source_variant = actor_independent_request_records[variant_index]
+            source_user = clone(source_variant["user"])
+            source_app = clone(source_variant["performed_via_github_app"])
+            invalid_actor_feed = invalid_actor_transcript["scope_discovery"][
+                "recent_request_comments"
+            ]
+            feed_record_found = False
+            for feed_page in invalid_actor_feed["pages"]:
+                feed_records = strict_json_loads(feed_page["body_utf8"])
+                assert isinstance(feed_records, list)
+                for feed_record in feed_records:
+                    if (
+                        isinstance(feed_record, dict)
+                        and feed_record.get("id") == request_seed_id
+                    ):
+                        feed_record["user"] = clone(source_user)
+                        feed_record["performed_via_github_app"] = clone(source_app)
+                        feed_record_found = True
+                replace_raw_json_body(feed_page, canonical_raw_body(feed_records))
+            self.assertTrue(feed_record_found, msg=variant)
+            invalid_actor_scope = next(
+                scope
+                for scope in invalid_actor_transcript["scopes"]
+                if scope.get("pull_number") == 2
+            )
+            invalid_actor_issue_fetch = next(
+                fetch
+                for fetch in invalid_actor_scope["fetches"]
+                if fetch.get("kind") == "issue_comments"
+            )
+            detail_record_found = False
+            for detail_page in invalid_actor_issue_fetch["pages"]:
+                detail_records = strict_json_loads(detail_page["body_utf8"])
+                assert isinstance(detail_records, list)
+                for detail_record in detail_records:
+                    if (
+                        isinstance(detail_record, dict)
+                        and detail_record.get("id") == request_seed_id
+                    ):
+                        detail_record["user"] = clone(source_user)
+                        detail_record["performed_via_github_app"] = clone(source_app)
+                        detail_record_found = True
+                replace_raw_json_body(
+                    detail_page,
+                    canonical_raw_body(detail_records),
+                )
+            self.assertTrue(detail_record_found, msg=variant)
+            with self.subTest(discovered_request_actor=variant):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_actor_transcript,
+                        request_scope_receipts=request_seed_receipts,
+                        provider_declaration=declaration,
+                    )
+                )
+            no_invalid_actor_sidecar = [
+                receipt
+                for receipt in request_seed_receipts
+                if receipt.get("request_id") != request_seed_id
+            ]
+            with self.subTest(
+                discovered_request_actor=variant,
+                sidecar="missing",
+            ):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        invalid_actor_transcript,
+                        request_scope_receipts=no_invalid_actor_sidecar,
+                        provider_declaration=declaration,
+                    )
+                )
+
+        future_ambiguous_request = clone(actor_independent_request_records[-1])
+        assert isinstance(future_ambiguous_request, dict)
+        future_ambiguous_request["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        future_ambiguous_request["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        self.assertIsNone(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [future_ambiguous_request],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            )
+        )
 
         malicious_request_next = clone(request_seed_transcript)
         assert isinstance(malicious_request_next, dict)
@@ -22172,6 +22421,14 @@ printf '%s\n' "$trusted_uv"
             ]
             pending_transcript = build_discovery_endpoint_transcript(pending_raw_scopes)
             pending_receipts = request_scope_receipts_for_scopes(pending_raw_scopes)
+            pending_scope_request_ids = {
+                request_record["id"] for request_record in pending_scope["requests"]
+            }
+            pending_missing_sidecar_receipts = [
+                receipt
+                for receipt in pending_receipts
+                if receipt.get("request_id") not in pending_scope_request_ids
+            ]
             with self.subTest(
                 historical_pending=pending_history_kind,
                 projection="full",
@@ -22180,6 +22437,17 @@ printf '%s\n' "$trusted_uv"
                     parse_discovery_endpoint_transcript(
                         pending_transcript,
                         request_scope_receipts=pending_receipts,
+                        provider_declaration=declaration,
+                    )
+                )
+            with self.subTest(
+                historical_pending=pending_history_kind,
+                projection="missing-sidecar",
+            ):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        pending_transcript,
+                        request_scope_receipts=pending_missing_sidecar_receipts,
                         provider_declaration=declaration,
                     )
                 )
@@ -26637,6 +26905,59 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertEqual(
             current_plane_isolation_report["provider_profile"],
+            "terminal-payload",
+        )
+        invalid_actor_terminal_history = history(
+            terminal_history,
+            current_raw=terminal_current,
+        )
+        terminal_request_id = terminal_current["requests"][0]["id"]
+        for current_inventory_field in (
+            "initial_current_raw_inventory",
+            "final_current_raw_inventory",
+        ):
+            invalid_actor_inventory = invalid_actor_terminal_history[
+                current_inventory_field
+            ]
+            invalid_actor_issue_fetch = next(
+                fetch
+                for fetch in invalid_actor_inventory["fetches"]
+                if fetch.get("kind") == "issue_comments"
+            )
+            invalid_actor_request_found = False
+            for issue_page in invalid_actor_issue_fetch["pages"]:
+                issue_records = strict_json_loads(issue_page["body_utf8"])
+                assert isinstance(issue_records, list)
+                for issue_record in issue_records:
+                    if (
+                        isinstance(issue_record, dict)
+                        and issue_record.get("id") == terminal_request_id
+                    ):
+                        issue_record["performed_via_github_app"] = {
+                            "slug": "request-broker",
+                            "id": 92_500,
+                        }
+                        invalid_actor_request_found = True
+                replace_raw_json_body(
+                    issue_page,
+                    canonical_raw_body(issue_records),
+                )
+            self.assertTrue(invalid_actor_request_found)
+        invalid_actor_terminal_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            invalid_actor_terminal_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(invalid_actor_terminal_report)
+        assert isinstance(invalid_actor_terminal_report, dict)
+        self.assertEqual(
+            invalid_actor_terminal_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        self.assertEqual(
+            invalid_actor_terminal_report["provider_profile"],
             "terminal-payload",
         )
         reaction_plane_isolation_history = history(samples)
@@ -32604,6 +32925,39 @@ printf '%s\n' "$trusted_uv"
                 f"{background_pr}/comments?per_page=100"
             ),
             future_issue_records,
+        )
+
+        future_repository_request_fetch = future_review_transcript["scope_discovery"][
+            "recent_request_comments"
+        ]
+        future_repository_request_records = raw_rest_records(
+            future_repository_request_fetch
+        )
+        future_repository_human_issue = clone(future_human_issue)
+        assert isinstance(future_repository_human_issue, dict)
+        future_repository_human_issue["issue_url"] = (
+            f"https://api.github.com/repos/{current_repository}/issues/{background_pr}"
+        )
+        future_review_transcript["scope_discovery"]["recent_request_comments"] = (
+            rest_fetch(
+                "recent_request_comments",
+                future_repository_request_fetch["pages"][0]["request_url"],
+                [future_repository_human_issue, *future_repository_request_records],
+            )
+        )
+        final_repository_comment_records = raw_rest_records(
+            future_review_transcript["scope_discovery"]["recent_request_comments"]
+        )
+        self.assertEqual(final_repository_comment_records[0]["id"], 910_003)
+        self.assertEqual(
+            final_repository_comment_records[0]["body"],
+            "Human discussion.",
+        )
+        self.assertEqual(
+            _parse_github_rfc3339_seconds(
+                final_repository_comment_records[0]["updated_at"]
+            ),
+            history_as_of_server_time + 2,
         )
 
         future_reaction_index = fetch_index(

@@ -1242,16 +1242,21 @@ rows newer than the cutoff seed scopes; boundary and older rows are witnesses.
 
 The second source fully paginates
 `GET /repos/<owner>/<repo>/issues/comments?sort=updated&direction=desc&since=<RFC3339-cutoff>&per_page=100`.
-It extracts only strict controlled exact `@codex review` parents. Each raw
-record binds its PR through both canonical `issue_url` and exact PR-comment
-`html_url`, and must occur one-to-one, type-preserving raw-equal in that PR's
-detail issue comments. This source is necessary because a reaction does not
-imply that GitHub advances the PR's `updated_at`; a recent historical request
-can seed an otherwise old-updated PR. It proves neither request/run lineage nor
-request-time scope. A historical reaction-only outcome is eligible only when
-its parent appears in this feed and both request and response fall inside the
-frozen interval. The explicitly anchored current PR retains the independent
-single-scope current raw path and is never a historical sample.
+It retains every record whose body is the exact `@codex review` string,
+regardless of actor type or `performed_via_github_app`. Discovery is a scope
+completeness step, not an identity verdict: the full detail traversal and
+request-sidecar plane later accept a valid controlled request or select
+`unknown`, but an untrusted, App-authored, or ambiguous strict request may not
+make its PR disappear from the union. Each retained raw record binds its PR
+through both canonical `issue_url` and exact PR-comment `html_url`, and must
+occur one-to-one, type-preserving raw-equal in that PR's detail issue comments.
+This source is necessary because a reaction does not imply that GitHub advances
+the PR's `updated_at`; a recent historical request can seed an otherwise
+old-updated PR. It proves neither request/run lineage nor request-time scope. A
+historical reaction-only outcome is eligible only when its parent appears in
+this feed and both request and response fall inside the frozen interval. The
+explicitly anchored current PR retains the independent single-scope current raw
+path and is never a historical sample.
 
 `anchors` binds the exact current PR and authenticated declaration PR. The
 detail seed is the union of newer pull rows, controlled-request PRs, and both

@@ -1227,6 +1227,39 @@ signed-commit, exact-range review, CI, and merge receipts remain parent-owned
 delivery evidence rather than mutable authority data in this journal, so
 recording those receipts cannot move the bytes they attest.
 
+## v10 Discovery-Classification Corrections
+
+The fresh named-single review of
+`b807cf90a2c8235ea79ef5013655bd7c52e4c886..db538424a1e5aa1731ddb3eddd70b541c2f84557`
+found two related cases where repository-wide discovery made a semantic verdict
+too early:
+
+1. The recent issue-comment feed kept strict `@codex review` records only when
+   they already looked like ordinary user comments with no App. That actor
+   filter could omit an otherwise old PR whose only discovery seed was an
+   untrusted, App-authored, or ambiguous strict request. The corrected rule is
+   actor-independent at discovery: every exact-body `@codex review` record
+   seeds its PR regardless of actor or App. Complete detail, raw-equal join,
+   actor classification, and request-scope sidecar validation then accept it or
+   select `unknown`; discovery never turns lack of trust into lack of scope.
+2. The fully paginated `since` feed is a live traversal, not an as-of snapshot.
+   A final reread may legitimately contain an ordinary human non-request comment
+   created wholly after the frozen `as_of_server_time`. The corrected parser
+   first validates schema, body, actor, canonical ordering, and timestamps. It
+   keeps such a confirmed-different non-request as a raw-only suffix, while a
+   future strict request, exact-provider or ambiguous record, or cross-cutoff
+   edit remains policy-bearing and fails closed.
+
+The decision reason is completeness before trust: a record's existence decides
+which PR must be inspected, while its fully validated identity and sidecars
+decide whether it can contribute authority. This preserves the established
+“result exists means pass” provider-result rule and the pinned
+`codex-review-gate` / `codex-review-gate-action` baseline. The Action alignment
+still says trustworthy provider results outrank request/run attribution;
+actor-independent historical discovery and the raw-only future suffix are
+playbook-only safeguards for the lower-information conditional `+1` fallback,
+not new Action behavior.
+
 ## Evidence
 
 - `skills/review-orchestration-playbook/references/github-codex-evidence-authority.md`
