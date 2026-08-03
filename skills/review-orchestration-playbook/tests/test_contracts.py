@@ -4523,6 +4523,42 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("ambiguous/provider-like", section)
                 self.assertIn("confirmed-different suffix", section)
 
+        artifact_publication_documents = {
+            "authority": authority,
+            "skill": anti_drift_documents["skill"],
+            "github-pr-probes": github_pr_probes,
+            "pr-readiness": anti_drift_documents["pr-readiness"],
+            "project-journal": journal,
+        }
+        for document_name, document in artifact_publication_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(artifact_publication_document=document_name):
+                self.assertIn("artifact-publication scope", normalized_document)
+                self.assertIn(
+                    "does not attest the provider's internal input merge base",
+                    normalized_document,
+                )
+                self.assertIn(
+                    "only a valid same-head/different-merge-base request sidecar "
+                    "proves base-changed-same-head",
+                    normalized_document,
+                )
+                self.assertIn(
+                    "a missing or malformed sidecar is not-proved, makes request "
+                    "policy unknown, and cannot veto an independently trustworthy "
+                    "terminal result",
+                    normalized_document,
+                )
+                self.assertIn(
+                    "restore the rejected request/run/artifact binding",
+                    normalized_document,
+                )
+                self.assertIn(
+                    "provider-authenticated input-base marker governed by a "
+                    "predeclared provider profile",
+                    normalized_document,
+                )
+
         authority_report_section = section_text(
             authority,
             "## Required Report Fields",
@@ -28507,6 +28543,32 @@ printf '%s\n' "$trusted_uv"
                 terminal_with_base_changed_request,
                 normal_lane_timing,
             )
+        )
+
+        terminal_with_unproved_base_change = clone(terminal_with_base_changed_request)
+        assert isinstance(terminal_with_unproved_base_change, dict)
+        terminal_with_unproved_base_change["request_scope_receipts"] = []
+        restamp(terminal_with_unproved_base_change)
+        unproved_base_change_history = history(
+            terminal_history,
+            current_raw=terminal_with_unproved_base_change,
+        )
+        unproved_base_change_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            unproved_base_change_history,
+            terminal_with_unproved_base_change,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(unproved_base_change_report)
+        assert isinstance(unproved_base_change_report, dict)
+        self.assertEqual(
+            unproved_base_change_report["provider_profile"],
+            "terminal-payload",
+        )
+        self.assertEqual(
+            unproved_base_change_report["request_policy"],
+            {"status": "unknown", "warnings": []},
         )
 
         terminal_with_old_epoch_request = clone(terminal_current)

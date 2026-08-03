@@ -177,6 +177,18 @@ neither request/run/artifact lineage nor an ABA-free interval. A missing
 request sidecar still closes only request/reaction authority; a missing or
 unstable artifact receipt blocks the wrapped terminal artifact.
 
+This v1 envelope uses **artifact-publication scope**. If its complete
+pre/GET/post receipt binds the current tuple, that tuple authorizes the artifact
+even when request history is unbound or a caller says the provider started work
+under an earlier merge base. The receipt does not attest the provider's
+internal input merge base. Only a valid same-head/different-merge-base request
+sidecar proves `base-changed-same-head`; a missing or malformed sidecar is
+`not-proved`, makes request policy unknown, and cannot veto an independently
+trustworthy terminal result. Requiring an unavailable launch-time tuple would
+restore the rejected request/run/artifact binding. A future
+provider-authenticated input-base marker governed by a predeclared provider
+profile may change this policy explicitly.
+
 The strict pre edge is intentional: GitHub supplies only whole-second time
 authority for these fields, so equality cannot distinguish an artifact created
 under the old base earlier in the second from a later same-head retarget and

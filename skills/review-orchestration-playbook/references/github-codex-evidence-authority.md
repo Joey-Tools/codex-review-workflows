@@ -430,6 +430,19 @@ precedence. Receipt capture and validation use a bounded, non-borrowing receipt
 ledger under the fixed evidence resource profile; no receipt may create an
 unbudgeted traversal or fresh deadline inside one decision pass.
 
+The v1 contract deliberately defines **artifact-publication scope**. A
+complete receipt authorizes the artifact for the whole-PR tuple observed around
+its publication even when request history is unbound or an external narrative
+says provider work began under an earlier merge base. It does not attest the
+provider's internal input merge base. Only a valid same-head/different-merge-base
+request sidecar proves `base-changed-same-head`; a missing or malformed sidecar
+is `not-proved`, makes request policy unknown, and cannot veto an independently
+trustworthy terminal result. Requiring unavailable launch-time scope would
+restore the rejected request/run/artifact binding. A future
+provider-authenticated input-base marker governed by a predeclared provider
+profile may change this policy explicitly; inference from request timing or
+caller narrative may not.
+
 Like the request-time sidecar, the receipt consists of point-in-time reads. It
 proves the recorded pre/artifact/post observations and detects an observed
 scope mismatch, but it does not prove that no intermediate `A -> B -> A`,

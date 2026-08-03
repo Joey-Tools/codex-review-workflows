@@ -83,6 +83,18 @@ superseded_by:
   missing or unstable artifact receipts block the wrapped terminal artifact.
   Neither receipt supplies request/run/artifact lineage, and their point reads
   do not exclude an intermediate ABA transition.
+- The v1 receipt is intentionally an **artifact-publication scope** contract.
+  A complete pre/artifact/post envelope authorizes the whole-PR tuple observed
+  around publication even if request history is unbound or a caller reports
+  that provider work began under an earlier merge base. It does not attest the
+  provider's internal input merge base. Only a valid
+  same-head/different-merge-base request sidecar proves
+  `base-changed-same-head`; a missing or malformed sidecar is `not-proved`,
+  makes request policy unknown, and cannot veto an independently trustworthy
+  terminal result. Requiring unavailable launch-time scope would restore the
+  rejected request/run/artifact binding. A future provider-authenticated
+  input-base marker governed by a predeclared provider profile may change this
+  policy explicitly; caller narrative and inferred timing may not.
 - Normalized current scope and artifact commit are now explicitly separate.
   `scope.head` always remains the exact current PR head. Clean must bind it;
   a finding keeps its own current-or-proved-ancestor commit and remains in the
@@ -847,6 +859,13 @@ R2 sidecar makes request policy unknown; it still cannot delete the already
 proved stable result. This is the direct implementation of the producer-policy
 versus consumer-verdict split below.
 
+The paired base-retarget regression fixes that evidence boundary rather than
+trusting a launch narrative. With the same current-scope artifact receipt, a
+valid same-head/different-base request sidecar blocks; removing that sidecar
+makes the retarget `not-proved`, leaves request policy unknown, and allows the
+artifact-publication scope result to decide. This preserves result-present
+authority and records why unavailable provider input scope is not inferred.
+
 The decision itself is unchanged and is recorded here explicitly to prevent
 future drift: **a trustworthy result being present is sufficient verdict
 evidence**. In concrete terms, a stable current-scope clean provider artifact
@@ -1029,6 +1048,18 @@ restore request/run binding or erase this rationale.
   dual-source discovery and its closed nested-comment rule. Heading-scoped
   documentation assertions plus executable regressions preserve both decisions;
   the corrected exact-head review remains parent-owned evidence.
+- The exact-head named-single review of
+  `0f77fb7b1dd59f5eed522fa9699497aa013695fc..0a019ad7db49c109ee5f18c5fa8c65976133a053`
+  raised one P1 about a provider run reportedly beginning before a same-head
+  base retarget when request scope was unproved. Two independent read-only
+  audits classified that scenario as the explicit v1 artifact-publication
+  scope boundary, not an implementation defect: the artifact receipt attests
+  publication scope, not the provider's hidden input merge base, and an
+  unbound narrative cannot recreate the request/run/artifact binding this
+  workstream deliberately removed. The cross-document anchors and paired
+  valid-sidecar-versus-missing-sidecar regression above record that disposition.
+  A fresh exact-head review after this documentation/test correction remains
+  parent-owned evidence and must not be claimed here in advance.
 - The later named-single review of
   `0f77fb7b1dd59f5eed522fa9699497aa013695fc..a1403a4f3b0bd63603591dc33c09583f8a8a69e0`
   found three P2 authority gaps: resolved target children could be
