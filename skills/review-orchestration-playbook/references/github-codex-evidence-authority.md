@@ -1320,32 +1320,41 @@ its initial/final copies must be type-preserving identical. It prevents a
 scope with no separate authority record from hiding base, head, merge-base, or
 lifecycle drift.
 
-Only after that raw seed/detail closure succeeds may the fixed projector omit a
-future-prefix-only pull seed from its semantic discovery projection, fixed
-union, `scope_classifications`, and `scope_authority_audit`. Omission requires
-all of the following: neither the since-cutoff request feed nor either anchor
-also seeds the PR; the complete detail traversal proves no semantic record in
-`(window_start_exclusive, as_of_server_time]`; it proves no controlled request,
-exact-provider, ambiguous/provider-like, exact-child, ambiguous-child, or other
-provider/policy-bearing semantic record at any time; and every observed
-post-as-of record is one of the already defined fully validated removable
-confirmed-different suffix forms. The raw pull row, every raw detail page, and
-all of their attempts/pages/records/bytes remain charged and retained. A
-request-feed or anchor seed always stays in the fixed union even when the same
-PR also appears in the future prefix. An incomplete page or join, cross-cutoff
-edit, unclassifiable record, or observed base/head/lifecycle drift fails closed
-instead of authorizing omission.
+Only after that raw seed/detail closure succeeds may one traversal classify a
+future-prefix-only pull seed as locally eligible for coordinated omission.
+Eligibility requires all of the following: neither the since-cutoff request
+feed nor either anchor also seeds the PR; the complete detail traversal proves
+no semantic record in `(window_start_exclusive, as_of_server_time]`; it proves
+no controlled request, exact-provider, ambiguous/provider-like, exact-child,
+ambiguous-child, or other provider/policy-bearing semantic record at any time;
+and every observed post-as-of record, if any, is one of the already defined
+fully validated removable confirmed-different suffix forms. An otherwise empty
+future-prefix scope can therefore be eligible. The per-traversal parser does
+not omit that scope: it remains in the local stable pull list, union,
+`retained_pull_scope_audit`, `scope_classifications`, and applicable authority
+projections until both traversals have been validated. The raw pull row, every
+raw detail page, and all attempts/pages/records/bytes remain charged and
+retained. A request-feed or anchor co-seed is never eligible. An incomplete
+page or join, cross-cutoff edit, unclassifiable record, or observed
+base/head/lifecycle drift fails closed instead of granting eligibility.
 
-Omission does not erase the seed's stable identity. Each traversal appends one
-closed `future_only_omitted_pull_audit` item for every omitted seed, containing
-exactly `pull_number`, pull-detail `base_oid` and `head_oid`, compare-derived
-`merge_base`, and the normalized closed `lifecycle`. Items are sorted by unique
-positive pull number. The stored projection must type-preservingly equal the
-raw-derived projection for that traversal. Across initial/final traversals,
-compare every other projection field exactly; a pull number may occur in only
-one omitted audit, but each pull number in their intersection must have an
-exactly equal audit item. Thus newly observed one-sided irrelevant activity can
-converge without letting a repeatedly observed omitted scope hide base, head,
+Each traversal records local eligibility in a closed
+`future_prefix_omission_eligibility_audit`. Every item contains exactly
+`pull_number`, pull-detail `base_oid` and `head_oid`, compare-derived
+`merge_base`, and normalized closed `lifecycle`, sorted by unique positive pull
+number. The stored projection must type-preservingly equal the raw-derived
+projection for that traversal. The eligibility audit is a closed subset of
+that traversal's retained audit identities. Only the initial/final joint coordinator may
+make omission effective: the PR must occur in exactly one complete local union
+and in that same traversal's eligibility audit. It then removes that one-sided
+scope only from the derived stable comparison view; it never rewrites or drops
+raw evidence. A PR observed in both traversals is always retained in the stable
+comparison even if either or both traversals mark it eligible, so unrelated
+post-as-of activity cannot turn an already retained record-free scope into an
+omission. Compare the remaining coordinated views exactly. Eligibility items
+for the same pull number in both traversals must also be type-preserving
+identical. Thus a newly observed one-sided irrelevant or empty scope can
+converge without letting a repeatedly observed scope hide base, head,
 merge-base, or lifecycle drift. Live `updated_at`, pull-row digest, and endpoint
 order remain deliberately outside this audit.
 
@@ -1430,10 +1439,11 @@ of that fixed semantic identity. The parser independently derives the complete
 set of candidate scope keys and scope-final bases from the retained semantic
 records. It also derives the closed `scope_classifications` list in positive
 pull-number order, with exactly one
-`{pull_number, scope_key, classification}` item for every PR retained in the
-fixed semantic union. A fully traversed future-prefix-only seed that satisfies
-the narrow omission rule above remains raw discovery evidence but has no fixed
-classification or audit item.
+`{pull_number, scope_key, classification}` item for every PR in that
+traversal's complete local semantic union. A fully traversed future-prefix-only
+seed that satisfies the narrow eligibility rule remains in this local
+projection; only the joint coordinator may remove a proved one-sided scope
+from the derived stable comparison view.
 The classification is exact `current`, `historical-candidate`, or
 `confirmed-non-candidate`; a pending controlled request, ambiguous identity,
 incomplete traversal, or unparseable record cannot be downgraded to
@@ -1600,7 +1610,8 @@ post-as-of human or unrelated-bot activity between traversals and still
 converge when its stable pull/base/head identity, lifecycle, cutoff-in evidence,
 provider/policy evidence, classification, and authority projection are
 unchanged. A new raw future-prefix-only seed may likewise appear in only one
-traversal and be omitted only under the narrow fully traversed rule above.
+traversal and be omitted from the coordinated stable view only under the
+narrow fully traversed eligibility rule above.
 Validate each traversal's page digests, REST links, GraphQL cursor chain, and
 seed-to-detail closure independently. The two raw transcript envelopes, page
 bodies, body digests, and opaque cursor tokens need not be byte-identical.
@@ -1610,11 +1621,13 @@ traversal; type-preserving equality of the fixed semantic projection core,
 count, together with the complete `scope_authority_audit`, establishes final
 equivalence. The core includes exact equality of
 `retained_pull_scope_audit`, even for request/anchor-only or record-free
-confirmed non-candidates. The two `future_only_omitted_pull_audit` arrays may have one-sided
-pull numbers, but exact audit equality is required for their pull-number
-intersection. Raw pull-row timestamps/digests/order and fully validated
-one-sided omitted future-only seeds are not fixed-semantic drift. Repeatedly
-observed omitted-scope base/head/merge-base/lifecycle drift,
+confirmed non-candidates. The joint coordinator derives one-sided effective
+omissions from the two complete local unions plus their
+`future_prefix_omission_eligibility_audit` arrays. A PR present in both unions
+is never omitted. Exact audit equality is required for every eligibility pull
+number present in both arrays. Raw pull-row timestamps/digests/order and fully
+validated one-sided eligible future-only seeds are not fixed-semantic drift.
+Repeatedly observed scope base/head/merge-base/lifecycle drift,
 controlled-request or provider/policy-bearing evidence, cross-cutoff edits,
 incomplete pages, or any other semantic or candidate-set drift still fails
 closed. For
@@ -2018,6 +2031,12 @@ Every GitHub Codex lane report includes the three independent keys below.
 Required keys may be `null` only in the states listed after the example; `null`
 is not another provider profile.
 
+For reaction-history evidence, each inventory reports its complete local union.
+The eligibility audit is a closed identity subset of the retained audit. The
+joint initial-final coordinator removes a scope from the stable comparison only
+when it is present in exactly one union and eligible there; a PR observed in
+both unions is retained and compared exactly.
+
 ```yaml
 request_policy:
   status: warning
@@ -2332,8 +2351,8 @@ evidence_basis:
             head_oid: <full lowercase pull-detail head OID>
             merge_base: <full lowercase compare-derived merge-base OID>
             lifecycle: <closed normalized PR lifecycle object>
-        future_only_omitted_pull_audit:
-          - pull_number: <unique positive omitted future-prefix-only PR number>
+        future_prefix_omission_eligibility_audit:
+          - pull_number: <unique positive locally eligible future-prefix-only PR number retained in this local union>
             base_oid: <full lowercase pull-detail base OID>
             head_oid: <full lowercase pull-detail head OID>
             merge_base: <full lowercase compare-derived merge-base OID>
@@ -2351,7 +2370,7 @@ evidence_basis:
             semantic: "+1" | eyes | clean | findings | malformed
             native_identity: [<parent reactions URL or channel>, <positive native ID>]
             source_record_sha256: <canonical policy-projection SHA-256>
-    final_inventory: <independently fetched complete inventory with identical fixed scope_discovery_projection core, exact overlap equality for future_only_omitted_pull_audit, identical semantic projection, and stable request_scope_receipts; raw future prefixes and one-sided omitted seeds may differ only under the validated omission rule>
+    final_inventory: <independently fetched complete inventory whose joint coordinated stable view equals the initial view, with exact overlap equality for future_prefix_omission_eligibility_audit, identical retained semantic projection, and stable request_scope_receipts; raw future prefixes and proved one-sided eligible seeds may differ only under the validated coordination rule>
     initial_candidates:
       - <complete candidate snapshot defined below>
     final_candidates:
@@ -2489,23 +2508,26 @@ records the cutoff, while the enclosing history window separately records the
 frozen as-of. It also records the stop reason, deterministic positive-number
 list of stable retained pull/base/head seed identities, ordered request
 IDs/PRs/digests, anchors, sorted fixed semantic union, and the closed
-`retained_pull_scope_audit`, whose item set exactly covers that union and whose
-initial/final copies are type-preserving identical. Every remaining projection
-field must also be type-preserving identical except for the closed
-`future_only_omitted_pull_audit`. Omitted-audit items are unique and ordered by
-positive pull number; one-sided items may differ, while every pull number in
-the initial/final intersection must bind identical
-pull/base/head/merge-base/lifecycle values. It deliberately excludes pull-list
+`retained_pull_scope_audit`, whose item set exactly covers that traversal's
+local union. Each traversal also records a closed
+`future_prefix_omission_eligibility_audit`; its items are unique and ordered by
+positive pull number and form a subset of the retained audit. The joint
+coordinator removes only a locally eligible PR present in exactly one complete
+local union, then requires every remaining projection field and retained audit
+item to be type-preserving identical. A PR present in both unions remains in
+the comparison. Every pull number in both eligibility audits must bind
+identical pull/base/head/merge-base/lifecycle values. The projection
+deliberately excludes pull-list
 `updated_at`, raw pull-row digests, and endpoint row order. The
 independently fetched raw transcript records need not be structurally or
 byte-identical when each traversal is complete and their fixed semantic
 projection cores are identical; opaque cursor and raw page-byte differences,
 unrelated activity on an already retained seed, and a fully traversed one-sided
-omitted future-prefix-only seed are raw observation differences, not candidate
+eligible future-prefix-only seed are raw observation differences, not candidate
 drift.
 Every such raw row and detail traversal still consumes the ordinary endpoint
 budget. A request-feed/anchor co-seed, controlled request, exact or ambiguous
-provider/policy evidence, cross-cutoff edit, repeated omitted-scope
+provider/policy evidence, cross-cutoff edit, repeatedly observed scope
 base/head/merge-base/lifecycle drift, or incomplete source/detail page remains
 fixed-semantic drift or incomplete
 authority and fails closed.

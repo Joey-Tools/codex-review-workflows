@@ -4294,8 +4294,9 @@ printf '%s\n' "$trusted_uv"
             anti_drift_documents["readme"].lower().replace("`", "").split()
         )
         self.assertIn(
-            "two independently complete initial/final discovery inventories whose "
-            "fixed semantic projection cores",
+            "independently complete initial/final inventories whose jointly "
+            "coordinated stable views and complete candidate arrays are "
+            "type-preserving identical",
             normalized_readme_text,
         )
         self.assertNotIn(
@@ -4454,9 +4455,9 @@ printf '%s\n' "$trusted_uv"
                 "schema-version-4 discovery_endpoint_transcript",
                 "updated-desc pull pages retained through the first page "
                 "containing updated_at <= window_start_exclusive",
-                "the 512 seeded-pr cap counts the pre-filter raw union/detail prs, "
-                "including future-only seeds, not boundary witnesses or cumulative "
-                "old prs",
+                "the 512 seeded-pr cap counts the pre-coordination raw union/detail "
+                "prs, including locally eligible future-prefix scopes, not boundary "
+                "witnesses or cumulative old prs",
                 "version 3 cannot prove the fallback",
             ),
             "github-pr-probes": (
@@ -4574,15 +4575,28 @@ printf '%s\n' "$trusted_uv"
             "anchors:",
             "union_pull_numbers:",
             "retained_pull_scope_audit:",
-            "future_only_omitted_pull_audit:",
+            "future_prefix_omission_eligibility_audit:",
             "scope_classifications:",
-            "identical fixed scope_discovery_projection core",
-            "exact overlap equality for future_only_omitted_pull_audit",
-            "one-sided omitted seeds may differ",
         )
         for marker in report_projection_markers:
             with self.subTest(report_projection_marker=marker):
                 self.assertIn(marker, authority_report_section)
+        normalized_report_projection_contract = re.sub(
+            r"[-\s]+",
+            " ",
+            authority_report_section.casefold(),
+        )
+        for report_projection_pattern in (
+            r"complete local union",
+            r"eligibility audit[^.]{0,160}subset[^.]{0,80}retained",
+            r"joint (?:initial final )?coordinator",
+            r"(?:exactly one|one sided)[^.]{0,160}(?:union|phase|traversal)",
+            r"(?:present|observed) in both[^.]{0,160}(?:retained|exact)",
+        ):
+            self.assertRegex(
+                normalized_report_projection_contract,
+                report_projection_pattern,
+            )
         self.assertLess(
             authority_report_section.index("request_scope_receipts:"),
             authority_report_section.index("scope_discovery_projection:"),
@@ -6858,9 +6872,9 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("raw", normalized_future_prefix_policy)
                 self.assertIn("budget", normalized_future_prefix_policy)
                 self.assertIn("detail", normalized_future_prefix_policy)
-                self.assertIn(
-                    "{pull_number, base_oid, head_oid}",
+                self.assertRegex(
                     normalized_future_prefix_policy,
+                    r"pull(?: number)?[^.]{0,100}base[^.]{0,80}head",
                 )
                 self.assertIn("updated_at", normalized_future_prefix_policy)
                 self.assertRegex(
@@ -6881,7 +6895,7 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("cross cutoff", normalized_future_prefix_policy)
                 self.assertIn("incomplete", normalized_future_prefix_policy)
                 self.assertIn(
-                    "future_only_omitted_pull_audit",
+                    "future_prefix_omission_eligibility_audit",
                     normalized_future_prefix_policy,
                 )
                 self.assertIn(
@@ -6890,9 +6904,27 @@ printf '%s\n' "$trusted_uv"
                 )
                 self.assertRegex(
                     normalized_future_prefix_policy,
-                    r"pull number[^.]{0,100}(?:both audits|intersection)",
+                    r"eligibility[^.]{0,200}(?:subset|retained)",
                 )
                 self.assertIn("one sided", normalized_future_prefix_policy)
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"complete local (?:union|projection)",
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"joint (?:initial final )?coordinator",
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"(?:exactly one|one sided)[^.]{0,160}"
+                    r"(?:union|phase|traversal)",
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"(?:present|observed) in both[^.]{0,160}"
+                    r"(?:retained|exact)",
+                )
                 self.assertIn("merge base", normalized_future_prefix_policy)
                 self.assertIn("lifecycle", normalized_future_prefix_policy)
                 self.assertRegex(
@@ -13587,7 +13619,7 @@ printf '%s\n' "$trusted_uv"
                     "anchors": clone(anchors),
                     "union_pull_numbers": union_pull_numbers,
                     "retained_pull_scope_audit": [],
-                    "future_only_omitted_pull_audit": [],
+                    "future_prefix_omission_eligibility_audit": [],
                 }
             else:
                 if (
@@ -13602,8 +13634,7 @@ printf '%s\n' "$trusted_uv"
 
             raw_semantic_scopes: list[dict[str, object]] = []
             retained_pull_scope_audit: list[dict[str, object]] = []
-            future_only_omitted_pull_numbers: set[int] = set()
-            future_only_omitted_pull_audit: list[dict[str, object]] = []
+            future_prefix_omission_eligibility_audit: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
@@ -13799,7 +13830,6 @@ printf '%s\n' "$trusted_uv"
                     if feed_pr == pr
                 }
                 matched_feed_request_ids: set[int] = set()
-                confirmed_different_post_cutoff_payload_count = 0
 
                 request_times: dict[int, int] = {}
                 request_records: dict[int, dict[str, object]] = {}
@@ -13889,7 +13919,6 @@ printf '%s\n' "$trusted_uv"
                             return None
                         if created_at > history_as_of_server_time:
                             if actor == "different":
-                                confirmed_different_post_cutoff_payload_count += 1
                                 continue
                             if not _allow_post_as_of_artifacts:
                                 return None
@@ -14025,7 +14054,6 @@ printf '%s\n' "$trusted_uv"
                             other_review_ids.add(review_id)
                             excluded_future_review_ids.add(review_id)
                             excluded_future_review_by_id[review_id] = projected_review
-                            confirmed_different_post_cutoff_payload_count += 1
                             continue
                         if not _allow_post_as_of_artifacts:
                             return None
@@ -14130,7 +14158,6 @@ printf '%s\n' "$trusted_uv"
                             parent_id,
                             projected_inline,
                         )
-                        confirmed_different_post_cutoff_payload_count += 1
                         continue
                     if parent_id in associated_inline_by_review:
                         associated_inline_by_review[parent_id].append(projected_inline)
@@ -14598,7 +14625,6 @@ printf '%s\n' "$trusted_uv"
                     seen_reaction_ids.add(reaction_id)
                     if created_at > history_as_of_server_time:
                         if actor == "different":
-                            confirmed_different_post_cutoff_payload_count += 1
                             continue
                         if not (
                             _allow_post_as_of_artifacts
@@ -14655,12 +14681,11 @@ printf '%s\n' "$trusted_uv"
                     ),
                     "nonterminal_records": list(nonterminal_records),
                 }
-                future_only_omittable = (
+                future_prefix_omission_eligible = (
                     _single_scope_pull_number is None
                     and pr in future_prefix_pull_numbers
                     and pr not in request_seed_pull_numbers
                     and pr not in anchor_pull_numbers
-                    and confirmed_different_post_cutoff_payload_count > 0
                     and not request_times
                     and not provider_reactions
                     and not semantic_reaction_records
@@ -14676,12 +14701,12 @@ printf '%s\n' "$trusted_uv"
                     "merge_base": merge_base,
                     "lifecycle": clone(normalized_lifecycle),
                 }
-                if future_only_omittable:
-                    future_only_omitted_pull_numbers.add(pr)
-                    future_only_omitted_pull_audit.append(scope_identity_audit_item)
-                else:
-                    retained_pull_scope_audit.append(scope_identity_audit_item)
-                    raw_semantic_scopes.append(raw_semantic_scope)
+                retained_pull_scope_audit.append(scope_identity_audit_item)
+                raw_semantic_scopes.append(raw_semantic_scope)
+                if future_prefix_omission_eligible:
+                    future_prefix_omission_eligibility_audit.append(
+                        clone(scope_identity_audit_item)
+                    )
             if (
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
@@ -14698,23 +14723,6 @@ printf '%s\n' "$trusted_uv"
                 return None
             if not resource_budget_charge(resource_tracker):
                 return None
-            if future_only_omitted_pull_numbers:
-                if not isinstance(scope_discovery_projection, dict):
-                    return None
-                retained_recent_pulls = [
-                    item
-                    for item in scope_discovery_projection["recent_pull_requests"]
-                    if item.get("pull_number") not in future_only_omitted_pull_numbers
-                ]
-                retained_union = [
-                    pull_number
-                    for pull_number in scope_discovery_projection["union_pull_numbers"]
-                    if pull_number not in future_only_omitted_pull_numbers
-                ]
-                scope_discovery_projection["recent_pull_requests"] = (
-                    retained_recent_pulls
-                )
-                scope_discovery_projection["union_pull_numbers"] = retained_union
             if isinstance(scope_discovery_projection, dict):
                 retained_pull_scope_audit.sort(
                     key=lambda item: int(item["pull_number"]),
@@ -14730,8 +14738,10 @@ printf '%s\n' "$trusted_uv"
                 scope_discovery_projection["retained_pull_scope_audit"] = clone(
                     retained_pull_scope_audit
                 )
-                scope_discovery_projection["future_only_omitted_pull_audit"] = sorted(
-                    future_only_omitted_pull_audit,
+                scope_discovery_projection[
+                    "future_prefix_omission_eligibility_audit"
+                ] = sorted(
+                    future_prefix_omission_eligibility_audit,
                     key=lambda item: int(item["pull_number"]),
                 )
             try:
@@ -16336,9 +16346,16 @@ printf '%s\n' "$trusted_uv"
                 mapping[candidate] = ancestry_return_code
             return mapping
 
-        def stable_scope_discovery_projection_and_omission_audit(
+        def stable_scope_discovery_projection_and_eligibility_audit(
             value: object,
-        ) -> tuple[dict[str, object], dict[int, dict[str, object]]] | None:
+        ) -> (
+            tuple[
+                dict[str, object],
+                dict[int, dict[str, object]],
+                dict[int, dict[str, object]],
+            ]
+            | None
+        ):
             if not isinstance(value, dict):
                 return None
             expected_audit_fields = {
@@ -16382,25 +16399,144 @@ printf '%s\n' "$trusted_uv"
             retained_audit_by_pull = parse_scope_identity_audit(
                 value.get("retained_pull_scope_audit")
             )
-            omitted_audit_by_pull = parse_scope_identity_audit(
-                value.get("future_only_omitted_pull_audit")
+            eligibility_audit_by_pull = parse_scope_identity_audit(
+                value.get("future_prefix_omission_eligibility_audit")
             )
             union_pull_numbers = value.get("union_pull_numbers")
             if (
                 retained_audit_by_pull is None
-                or omitted_audit_by_pull is None
+                or eligibility_audit_by_pull is None
                 or not isinstance(union_pull_numbers, list)
                 or not typed_json_equal(
                     list(retained_audit_by_pull),
                     union_pull_numbers,
                 )
-                or set(retained_audit_by_pull) & set(omitted_audit_by_pull)
+                or not set(eligibility_audit_by_pull).issubset(retained_audit_by_pull)
+                or any(
+                    not typed_json_equal(
+                        eligibility_audit,
+                        retained_audit_by_pull[pull_number],
+                    )
+                    for pull_number, eligibility_audit in (
+                        eligibility_audit_by_pull.items()
+                    )
+                )
             ):
                 return None
             stable_projection = clone(value)
             assert isinstance(stable_projection, dict)
-            stable_projection.pop("future_only_omitted_pull_audit")
-            return stable_projection, omitted_audit_by_pull
+            stable_projection.pop("future_prefix_omission_eligibility_audit")
+            return (
+                stable_projection,
+                retained_audit_by_pull,
+                eligibility_audit_by_pull,
+            )
+
+        def normalize_one_sided_future_scopes(
+            value: dict[str, object],
+            stable_scope_projection: dict[str, object],
+            omitted_pull_numbers: set[int],
+        ) -> dict[str, object] | None:
+            normalized_value = clone(value)
+            normalized_scope_projection = clone(stable_scope_projection)
+            assert isinstance(normalized_value, dict)
+            assert isinstance(normalized_scope_projection, dict)
+            normalized_scope_projection["recent_pull_requests"] = [
+                item
+                for item in normalized_scope_projection["recent_pull_requests"]
+                if item.get("pull_number") not in omitted_pull_numbers
+            ]
+            normalized_scope_projection["union_pull_numbers"] = [
+                pull_number
+                for pull_number in normalized_scope_projection["union_pull_numbers"]
+                if pull_number not in omitted_pull_numbers
+            ]
+            normalized_scope_projection["retained_pull_scope_audit"] = [
+                item
+                for item in normalized_scope_projection["retained_pull_scope_audit"]
+                if item.get("pull_number") not in omitted_pull_numbers
+            ]
+            normalized_value["scope_discovery_projection"] = normalized_scope_projection
+
+            scope_classifications = normalized_value.get("scope_classifications")
+            if isinstance(scope_classifications, list):
+                omitted_classifications = [
+                    item
+                    for item in scope_classifications
+                    if isinstance(item, dict)
+                    and item.get("pull_number") in omitted_pull_numbers
+                ]
+                if (
+                    len(omitted_classifications) != len(omitted_pull_numbers)
+                    or {item.get("pull_number") for item in omitted_classifications}
+                    != omitted_pull_numbers
+                    or any(
+                        item.get("classification") != "confirmed-non-candidate"
+                        for item in omitted_classifications
+                    )
+                ):
+                    return None
+                normalized_value["scope_classifications"] = [
+                    item
+                    for item in scope_classifications
+                    if not isinstance(item, dict)
+                    or item.get("pull_number") not in omitted_pull_numbers
+                ]
+            raw_scope_summaries = normalized_value.get("raw_scope_summaries")
+            if isinstance(raw_scope_summaries, list):
+                omitted_summaries = [
+                    item
+                    for item in raw_scope_summaries
+                    if isinstance(item, dict)
+                    and item.get("pull_number") in omitted_pull_numbers
+                ]
+                if (
+                    len(omitted_summaries) != len(omitted_pull_numbers)
+                    or {item.get("pull_number") for item in omitted_summaries}
+                    != omitted_pull_numbers
+                    or any(
+                        item.get("raw_scope_category") != "not-candidate"
+                        or item.get("raw_classification") != "confirmed-non-candidate"
+                        or item.get("source_ordering_key") is not None
+                        or item.get("source_evidence") is not None
+                        for item in omitted_summaries
+                    )
+                ):
+                    return None
+                normalized_value["raw_scope_summaries"] = [
+                    item
+                    for item in raw_scope_summaries
+                    if not isinstance(item, dict)
+                    or item.get("pull_number") not in omitted_pull_numbers
+                ]
+
+            def policy_record_pull_number(item: object) -> object:
+                if not isinstance(item, dict):
+                    return None
+                scope_value = item.get("scope_key")
+                if isinstance(scope_value, list) and len(scope_value) >= 2:
+                    return scope_value[1]
+                entry = item.get("entry")
+                entry_scope = (
+                    entry.get("scope_key") if isinstance(entry, dict) else None
+                )
+                if isinstance(entry_scope, list) and len(entry_scope) >= 2:
+                    return entry_scope[1]
+                return None
+
+            for field in (
+                "entries",
+                "scope_authority_audit",
+                "raw_authority_audit",
+                "candidate_projections",
+            ):
+                records = normalized_value.get(field)
+                if isinstance(records, list) and any(
+                    policy_record_pull_number(item) in omitted_pull_numbers
+                    for item in records
+                ):
+                    return None
+            return normalized_value
 
         def historical_phase_projections_converge(
             initial_value: object,
@@ -16410,33 +16546,45 @@ printf '%s\n' "$trusted_uv"
                 return False
             initial_projection = initial_value.get("scope_discovery_projection")
             final_projection = final_value.get("scope_discovery_projection")
-            initial_parts = stable_scope_discovery_projection_and_omission_audit(
+            initial_parts = stable_scope_discovery_projection_and_eligibility_audit(
                 initial_projection
             )
-            final_parts = stable_scope_discovery_projection_and_omission_audit(
+            final_parts = stable_scope_discovery_projection_and_eligibility_audit(
                 final_projection
             )
             if initial_parts is None or final_parts is None:
                 return False
-            initial_stable_scope_projection, initial_audit = initial_parts
-            final_stable_scope_projection, final_audit = final_parts
-            initial_stable_value = clone(initial_value)
-            final_stable_value = clone(final_value)
-            assert isinstance(initial_stable_value, dict)
-            assert isinstance(final_stable_value, dict)
-            initial_stable_value["scope_discovery_projection"] = (
-                initial_stable_scope_projection
+            (
+                initial_stable_scope_projection,
+                initial_retained_audit,
+                initial_eligibility_audit,
+            ) = initial_parts
+            (
+                final_stable_scope_projection,
+                final_retained_audit,
+                final_eligibility_audit,
+            ) = final_parts
+            initial_pull_numbers = set(initial_retained_audit)
+            final_pull_numbers = set(final_retained_audit)
+            initial_only_pull_numbers = initial_pull_numbers - final_pull_numbers
+            final_only_pull_numbers = final_pull_numbers - initial_pull_numbers
+            if not initial_only_pull_numbers.issubset(
+                initial_eligibility_audit
+            ) or not final_only_pull_numbers.issubset(final_eligibility_audit):
+                return False
+            initial_stable_value = normalize_one_sided_future_scopes(
+                initial_value,
+                initial_stable_scope_projection,
+                initial_only_pull_numbers,
             )
-            final_stable_value["scope_discovery_projection"] = (
-                final_stable_scope_projection
+            final_stable_value = normalize_one_sided_future_scopes(
+                final_value,
+                final_stable_scope_projection,
+                final_only_pull_numbers,
             )
-            return typed_json_equal(
-                initial_stable_value,
-                final_stable_value,
-            ) and all(
-                typed_json_equal(initial_audit[pull_number], final_audit[pull_number])
-                for pull_number in set(initial_audit) & set(final_audit)
-            )
+            if initial_stable_value is None or final_stable_value is None:
+                return False
+            return typed_json_equal(initial_stable_value, final_stable_value)
 
         def _validate_history_universe_complete(
             candidate_history: dict[str, object],
@@ -29873,6 +30021,190 @@ printf '%s\n' "$trusted_uv"
             [item["pull_number"] for item in record_free_initial_audit],
         )
 
+        record_free_human_progress = clone(record_free_history)
+        assert isinstance(record_free_human_progress, dict)
+        record_free_progress_final = record_free_human_progress["final_inventory"]
+        record_free_progress_transcript = record_free_progress_final[
+            "discovery_endpoint_transcript"
+        ]
+        record_free_progress_root_page = record_free_progress_transcript[
+            "scope_discovery"
+        ]["recent_pull_requests"]["pages"][0]
+        record_free_progress_root_records = strict_json_loads(
+            record_free_progress_root_page["body_utf8"]
+        )
+        assert isinstance(record_free_progress_root_records, list)
+        record_free_progress_root = next(
+            item
+            for item in record_free_progress_root_records
+            if isinstance(item, dict) and item.get("number") == 98
+        )
+        record_free_progress_root["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 6
+        )
+        record_free_progress_root_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            if isinstance(item, dict)
+            else -1,
+            reverse=True,
+        )
+        replace_raw_json_body(
+            record_free_progress_root_page,
+            canonical_raw_body(record_free_progress_root_records),
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                record_free_progress_transcript,
+                request_scope_receipts=record_free_progress_final[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        progress_human_issue = raw_request_record(
+            request(
+                93_098,
+                history_as_of_server_time + 1,
+                pr=98,
+            )
+        )
+        progress_human_issue["body"] = "Post-cutoff human progress."
+        progress_scope_transcript = next(
+            item
+            for item in record_free_progress_transcript["scopes"]
+            if item.get("pull_number") == 98
+        )
+        progress_issue_fetch_index = next(
+            index
+            for index, fetch in enumerate(progress_scope_transcript["fetches"])
+            if fetch.get("kind") == "issue_comments"
+        )
+        progress_issue_fetch = progress_scope_transcript["fetches"][
+            progress_issue_fetch_index
+        ]
+        progress_scope_transcript["fetches"][progress_issue_fetch_index] = rest_fetch(
+            "issue_comments",
+            progress_issue_fetch["pages"][0]["request_url"],
+            [progress_human_issue],
+        )
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                record_free_progress_transcript,
+                request_scope_receipts=record_free_progress_final[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+        progress_request_feed = record_free_progress_transcript["scope_discovery"][
+            "recent_request_comments"
+        ]
+        progress_feed_issue = clone(progress_human_issue)
+        assert isinstance(progress_feed_issue, dict)
+        progress_feed_issue["issue_url"] = (
+            f"https://api.github.com/repos/{current_repository}/issues/98"
+        )
+        existing_progress_feed_records: list[object] = []
+        for progress_feed_page in progress_request_feed["pages"]:
+            progress_feed_page_records = strict_json_loads(
+                progress_feed_page["body_utf8"]
+            )
+            assert isinstance(progress_feed_page_records, list)
+            existing_progress_feed_records.extend(progress_feed_page_records)
+        progress_feed_records = [
+            progress_feed_issue,
+            *existing_progress_feed_records,
+        ]
+        progress_feed_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            or -1,
+            reverse=True,
+        )
+        record_free_progress_transcript["scope_discovery"][
+            "recent_request_comments"
+        ] = rest_fetch(
+            "recent_request_comments",
+            progress_request_feed["pages"][0]["request_url"],
+            progress_feed_records,
+        )
+        self.assertIsNotNone(
+            parse_recent_request_discovery(
+                record_free_progress_transcript["scope_discovery"][
+                    "recent_request_comments"
+                ],
+                expected_url=progress_request_feed["pages"][0]["request_url"],
+                resource_tracker=new_resource_tracker(),
+            )
+        )
+        record_free_initial_projection = parse_discovery_endpoint_transcript(
+            record_free_human_progress["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=record_free_human_progress["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        record_free_final_projection = refresh_stored_scope_discovery_projection(
+            record_free_progress_final
+        )
+        self.assertIsNotNone(record_free_initial_projection)
+        assert isinstance(record_free_initial_projection, dict)
+        record_free_progress_final["scope_classifications"] = clone(
+            record_free_final_projection["scope_classifications"]
+        )
+        self.assertFalse(
+            typed_json_equal(
+                record_free_initial_projection,
+                record_free_final_projection,
+            )
+        )
+        self.assertTrue(
+            historical_phase_projections_converge(
+                record_free_initial_projection,
+                record_free_final_projection,
+            )
+        )
+        self.assertIn(
+            98,
+            {
+                item["pull_number"]
+                for item in record_free_final_projection["scope_discovery_projection"][
+                    "future_prefix_omission_eligibility_audit"
+                ]
+            },
+        )
+        self.assertIsNotNone(validate_history_universe(record_free_human_progress))
+
+        record_free_progress_sidecar_blind = clone(record_free_human_progress)
+        assert isinstance(record_free_progress_sidecar_blind, dict)
+        sidecar_victim_request_id = record_free_progress_sidecar_blind[
+            "initial_candidates"
+        ][0]["requests"][0]["id"]
+        for phase in ("initial", "final"):
+            sidecar_candidate = record_free_progress_sidecar_blind[
+                f"{phase}_candidates"
+            ][0]
+            sidecar_candidate["request_scope_receipts"][0]["authority_override"] = True
+            restamp(sidecar_candidate)
+            sidecar_inventory_receipt = next(
+                receipt
+                for receipt in record_free_progress_sidecar_blind[f"{phase}_inventory"][
+                    "request_scope_receipts"
+                ]
+                if receipt.get("request_id") == sidecar_victim_request_id
+            )
+            sidecar_inventory_receipt["authority_override"] = True
+        record_free_sidecar_result = validate_history_universe_result(
+            record_free_progress_sidecar_blind
+        )
+        self.assertIsNotNone(record_free_sidecar_result)
+        assert isinstance(record_free_sidecar_result, dict)
+        self.assertEqual(
+            record_free_sidecar_result["status"],
+            "unused-sidecar-unavailable",
+        )
+
         list_detail_state_mismatch = clone(record_free_history)
         assert isinstance(list_detail_state_mismatch, dict)
         mismatched_inventory = list_detail_state_mismatch["final_inventory"]
@@ -33811,6 +34143,20 @@ printf '%s\n' "$trusted_uv"
         self.assertTrue(
             typed_json_equal(initial_noise_projection, future_human_projection)
         )
+        for controlled_request_projection in (
+            initial_noise_projection,
+            future_human_projection,
+        ):
+            assert isinstance(controlled_request_projection, dict)
+            self.assertNotIn(
+                background_pr,
+                {
+                    item["pull_number"]
+                    for item in controlled_request_projection[
+                        "scope_discovery_projection"
+                    ]["future_prefix_omission_eligibility_audit"]
+                },
+            )
         assert isinstance(future_human_projection, dict)
         retained_background_seed = next(
             item
@@ -33935,11 +34281,11 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIsNotNone(future_only_projection)
         assert isinstance(future_only_projection, dict)
-        self.assertNotIn(
+        self.assertIn(
             future_only_pr,
             future_only_projection["scope_discovery_projection"]["union_pull_numbers"],
         )
-        self.assertNotIn(
+        self.assertIn(
             future_only_pr,
             {
                 item["pull_number"]
@@ -33948,7 +34294,7 @@ printf '%s\n' "$trusted_uv"
                 ]
             },
         )
-        self.assertNotIn(
+        self.assertIn(
             future_only_pr,
             {
                 item["pull_number"]
@@ -33962,11 +34308,11 @@ printf '%s\n' "$trusted_uv"
                 for item in future_only_projection["scope_authority_audit"]
             },
         )
-        future_only_omission_audit = future_only_projection[
+        future_only_eligibility_audit = future_only_projection[
             "scope_discovery_projection"
-        ]["future_only_omitted_pull_audit"]
+        ]["future_prefix_omission_eligibility_audit"]
         self.assertEqual(
-            future_only_omission_audit,
+            future_only_eligibility_audit,
             [
                 {
                     "pull_number": future_only_pr,
@@ -33979,27 +34325,150 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertEqual(
             future_only_history["initial_inventory"]["scope_discovery_projection"][
-                "future_only_omitted_pull_audit"
+                "future_prefix_omission_eligibility_audit"
             ],
             [],
         )
         future_only_final_inventory["scope_discovery_projection"] = clone(
             future_only_projection["scope_discovery_projection"]
         )
+        future_only_final_inventory["scope_classifications"] = clone(
+            future_only_projection["scope_classifications"]
+        )
+        future_only_initial_projection = parse_discovery_endpoint_transcript(
+            future_only_history["initial_inventory"]["discovery_endpoint_transcript"],
+            request_scope_receipts=future_only_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(future_only_initial_projection)
+        assert isinstance(future_only_initial_projection, dict)
+        self.assertTrue(
+            historical_phase_projections_converge(
+                future_only_initial_projection,
+                future_only_projection,
+            )
+        )
+        future_only_scope_key = [
+            current_repository,
+            future_only_pr,
+            future_only_scope["scope"]["pr_merge_base"],
+            future_only_scope["scope"]["head"],
+        ]
+        for policy_field, policy_record in (
+            ("entries", {"scope_key": clone(future_only_scope_key)}),
+            (
+                "scope_authority_audit",
+                {"scope_key": clone(future_only_scope_key)},
+            ),
+            (
+                "raw_authority_audit",
+                {"scope_key": clone(future_only_scope_key)},
+            ),
+            (
+                "candidate_projections",
+                {"entry": {"scope_key": clone(future_only_scope_key)}},
+            ),
+        ):
+            policy_bearing_one_sided = clone(future_only_projection)
+            assert isinstance(policy_bearing_one_sided, dict)
+            policy_bearing_one_sided.setdefault(policy_field, []).append(policy_record)
+            with self.subTest(one_sided_policy_bearing_field=policy_field):
+                self.assertFalse(
+                    historical_phase_projections_converge(
+                        future_only_initial_projection,
+                        policy_bearing_one_sided,
+                    )
+                )
+
+        empty_future_pr = 95
+        empty_future_scope = confirmed_nonprovider_scope(empty_future_pr)
+        empty_future_scope["raw_issue_records"] = []
+        empty_future_detail = build_discovery_endpoint_transcript(
+            [empty_future_scope],
+            _pull_updated_at_by_pr={
+                empty_future_pr: history_as_of_server_time + 5,
+            },
+        )
+        empty_future_history = history(samples)
+        empty_future_final_inventory = empty_future_history["final_inventory"]
+        empty_future_final_transcript = empty_future_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        empty_future_final_transcript["scopes"].append(
+            clone(empty_future_detail["scopes"][0])
+        )
+        empty_future_root_page = empty_future_final_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        empty_future_root_records = strict_json_loads(
+            empty_future_root_page["body_utf8"]
+        )
+        assert isinstance(empty_future_root_records, list)
+        empty_future_root_records.extend(
+            raw_rest_records(
+                empty_future_detail["scope_discovery"]["recent_pull_requests"]
+            )
+        )
+        empty_future_root_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            or -1,
+            reverse=True,
+        )
+        replace_raw_json_body(
+            empty_future_root_page,
+            canonical_raw_body(empty_future_root_records),
+        )
+        empty_future_projection = parse_discovery_endpoint_transcript(
+            empty_future_final_transcript,
+            request_scope_receipts=empty_future_final_inventory[
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(empty_future_projection)
+        assert isinstance(empty_future_projection, dict)
+        empty_future_discovery = empty_future_projection["scope_discovery_projection"]
+        self.assertIn(
+            empty_future_pr,
+            empty_future_discovery["union_pull_numbers"],
+        )
+        self.assertIn(
+            empty_future_pr,
+            {
+                item["pull_number"]
+                for item in empty_future_discovery[
+                    "future_prefix_omission_eligibility_audit"
+                ]
+            },
+        )
+        self.assertIn(
+            empty_future_pr,
+            {
+                item["pull_number"]
+                for item in empty_future_projection["scope_classifications"]
+            },
+        )
+        empty_future_final_inventory["scope_discovery_projection"] = clone(
+            empty_future_discovery
+        )
+        empty_future_final_inventory["scope_classifications"] = clone(
+            empty_future_projection["scope_classifications"]
+        )
         self.assertTrue(
             historical_phase_projections_converge(
                 {
-                    "scope_discovery_projection": future_only_history[
+                    "scope_discovery_projection": empty_future_history[
                         "initial_inventory"
                     ]["scope_discovery_projection"]
                 },
                 {
-                    "scope_discovery_projection": future_only_final_inventory[
-                        "scope_discovery_projection"
-                    ]
+                    "scope_discovery_projection": empty_future_discovery,
                 },
             )
         )
+        self.assertIsNotNone(validate_history_universe(empty_future_history))
 
         future_anchor_transcript = clone(future_only_final_transcript)
         assert isinstance(future_anchor_transcript, dict)
@@ -34060,7 +34529,7 @@ printf '%s\n' "$trusted_uv"
                     {
                         item["pull_number"]
                         for item in future_anchor_discovery[
-                            "future_only_omitted_pull_audit"
+                            "future_prefix_omission_eligibility_audit"
                         ]
                     },
                 )
@@ -34184,7 +34653,7 @@ printf '%s\n' "$trusted_uv"
             {
                 item["pull_number"]
                 for item in future_request_seed_discovery[
-                    "future_only_omitted_pull_audit"
+                    "future_prefix_omission_eligibility_audit"
                 ]
             },
         )
@@ -34282,6 +34751,9 @@ printf '%s\n' "$trusted_uv"
         )
         overlapping_initial_inventory["scope_discovery_projection"] = clone(
             overlapping_final_inventory["scope_discovery_projection"]
+        )
+        overlapping_initial_inventory["scope_classifications"] = clone(
+            overlapping_final_inventory["scope_classifications"]
         )
         self.assertIsNotNone(validate_history_universe(overlapping_future_only_history))
 
@@ -34402,24 +34874,24 @@ printf '%s\n' "$trusted_uv"
             drifted_final_inventory["scope_discovery_projection"] = clone(
                 drifted_final_projection["scope_discovery_projection"]
             )
-            initial_omission_audit = drifted_future_only_history["initial_inventory"][
+            initial_eligibility_audit = drifted_future_only_history[
+                "initial_inventory"
+            ]["scope_discovery_projection"]["future_prefix_omission_eligibility_audit"]
+            final_eligibility_audit = drifted_final_inventory[
                 "scope_discovery_projection"
-            ]["future_only_omitted_pull_audit"]
-            final_omission_audit = drifted_final_inventory[
-                "scope_discovery_projection"
-            ]["future_only_omitted_pull_audit"]
+            ]["future_prefix_omission_eligibility_audit"]
             self.assertEqual(
-                [item["pull_number"] for item in initial_omission_audit],
+                [item["pull_number"] for item in initial_eligibility_audit],
                 [future_only_pr],
             )
             self.assertEqual(
-                [item["pull_number"] for item in final_omission_audit],
+                [item["pull_number"] for item in final_eligibility_audit],
                 [future_only_pr],
             )
             self.assertFalse(
                 typed_json_equal(
-                    initial_omission_audit[0],
-                    final_omission_audit[0],
+                    initial_eligibility_audit[0],
+                    final_eligibility_audit[0],
                 )
             )
             with self.subTest(

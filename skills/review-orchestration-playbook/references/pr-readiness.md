@@ -212,21 +212,24 @@ parent-owned `request_scope_receipts` array and fixed
 `scope_discovery_projection` are stored beside the transcript; the latter binds
 the cutoff (with as-of separately frozen in the history envelope), stop reason,
 stable retained pull seeds, request IDs/PRs/digests, anchors, and the fixed
-semantic union. Its closed `retained_pull_scope_audit` covers every retained
-union seed with exact pull/base/head/merge-base/lifecycle identity, including
-request/anchor-only and record-free scopes, and must be identical across
-initial/final traversals. A typed recent pull-list `state` must also equal the
-pull-detail lifecycle state inside each traversal. It records a separate closed
-`future_only_omitted_pull_audit` with
-each omitted seed's pull/base/head/merge-base/lifecycle identity. An existing retained seed may converge
-across unrelated post-as-of human activity. A future-prefix-only seed may be
-omitted from that projection, semantic union, classification, and audit only
-after its complete detail proves no in-window or provider/policy-bearing
-semantic record and only existing-rule removable confirmed-different
-post-as-of activity. A request-feed or current/declaration anchor co-seed always
-remains. Compare every other projection field exactly across traversals; allow
-one-sided omitted audit items, but require type-preserving equality for every
-pull number in both audits. Raw discovery/detail bytes and their budget charges
+semantic union. Its closed `retained_pull_scope_audit` covers every complete
+local-union seed with exact pull/base/head/merge-base/lifecycle identity,
+including request/anchor-only and record-free scopes. A typed recent pull-list
+`state` must also equal the pull-detail lifecycle state inside each traversal.
+A future-prefix-only scope enters the closed
+`future_prefix_omission_eligibility_audit` only when complete detail proves no
+request-feed or anchor co-seed, no in-window or provider/policy-bearing
+semantic record, and only existing-rule removable confirmed-different
+post-as-of activity, if any. The eligibility audit is a closed subset of the
+`retained_pull_scope_audit` identities. The per-traversal projection still retains every
+eligible scope. The initial/final joint coordinator may remove a scope only
+from the derived stable comparison, only when it appears in exactly one
+complete local union and is eligible there. This one-sided omission is the only
+coordination exception. A PR present in both unions always
+remains and its retained identity/lifecycle and semantic projection must
+compare exactly, allowing unrelated post-as-of human activity without erasing
+an existing scope. Eligibility items present on both sides must also be
+type-preserving identical. Raw discovery/detail bytes and all budget charges
 are never omitted.
 
 Each historical inventory and each current raw endpoint inventory also stores
@@ -322,8 +325,8 @@ reconstructed. An exact or ambiguous child cannot be hidden with an otherwise
 confirmed-different future review. Schema version 4 has no independent
 inline-child timestamp, so it cannot infer that a human reply on an in-cutoff
 provider review is a removable later suffix; the child remains semantic drift.
-Observed base/head/lifecycle drift inside either traversal, repeated
-omitted-scope base/head/merge-base/lifecycle drift across traversals, or any
+Observed base/head/lifecycle drift inside either traversal, retained or
+shared-eligibility base/head/merge-base/lifecycle drift across traversals, or any
 incomplete source/detail page also fails closed; none can be normalized away as
 future-prefix churn.
 

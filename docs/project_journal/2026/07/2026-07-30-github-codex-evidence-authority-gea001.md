@@ -1349,19 +1349,22 @@ convergence:
   PR, its typed `state` must equal pull-detail lifecycle state. This closes the
   reviewer-found gap where a scope without a separate policy record could hide
   base or lifecycle drift.
-- A seed present only because of the future pull prefix can be omitted from the
-  fixed projection, semantic union, classification, and audit only after its
-  complete detail traversal proves no record in the frozen interval, no
-  controlled request or exact/ambiguous provider/policy-bearing semantic
-  record, and only the already authorized removable confirmed-different
-  post-as-of suffix forms. A request-feed or current/declaration anchor co-seed
-  always remains. No raw record, detail traversal, or budget charge is skipped.
-- Omission retains a closed `future_only_omitted_pull_audit` item with the
-  omitted PR's pull/base/head/merge-base/lifecycle identity. Initial/final
-  projection cores remain exactly equal. A one-sided omitted seed is allowed,
-  but the same pull number present in both audits must have a type-preserving
-  identical item; omission therefore cannot erase an observed identity or
-  lifecycle drift.
+- A seed present only because of the future pull prefix can enter the closed
+  `future_prefix_omission_eligibility_audit` only after its complete detail
+  traversal proves no record in the frozen interval, no request-feed or anchor
+  co-seed, no controlled request or exact/ambiguous provider/policy-bearing
+  semantic record, and only already authorized removable confirmed-different
+  post-as-of suffix forms, if any. An empty future-prefix scope can be eligible.
+  The eligibility audit is a closed subset of the
+  `retained_pull_scope_audit` identities. No raw record, normalized scope,
+  detail traversal, or budget charge is skipped by the per-traversal parser.
+- Effective omission is a joint initial/final decision, not a single-snapshot
+  classification. The joint coordinator removes a scope only from the derived stable
+  comparison and only when that PR appears in exactly one complete local union
+  and is eligible there. A PR observed in both traversals always remains in the
+  exact retained comparison, even when later unrelated human activity makes
+  one side locally eligible. Eligibility items shared by both traversals must
+  have type-preserving identical pull/base/head/merge-base/lifecycle identity.
 - Controlled requests, exact or ambiguous/provider-like evidence, exact or
   ambiguous children, cross-cutoff edits, base/head/lifecycle drift, incomplete
   pagination, broken joins, and overflow remain fail-closed. The exception is
@@ -1372,23 +1375,31 @@ The regression rationale is narrow: initial/final evidence should agree when
 only unrelated repository activity happened after the frozen semantic cutoff,
 while every raw discovery candidate still receives full detail validation.
 Coverage must distinguish an already retained seed with a future metadata bump,
-a new future-only seed that is fully traversed then semantically omitted, and
-the fail-closed request/provider-like/drift/incomplete variants. It must also
-prove that the raw 512-seed cap and every detail fetch apply before omission,
-that request/anchor co-seeds stay retained, and that repeated omitted scopes
-cannot change base, head, merge base, or lifecycle between traversals. Coverage
-must also bind every retained scope, including anchor-only and record-free
-scopes, and reject pull-list/detail lifecycle disagreement.
+an already retained record-free seed that later receives only removable human
+activity, a new empty or noisy one-sided future seed that is fully traversed
+then omitted only by joint coordination, and the fail-closed
+request/provider-like/drift/incomplete variants. It must also prove that the raw
+512-seed cap and every detail fetch apply before coordination, that
+request/anchor co-seeds stay retained, and that any scope observed in both
+traversals cannot change base, head, merge base, or lifecycle. Coverage must
+also bind every retained scope, including anchor-only and record-free scopes,
+and reject pull-list/detail lifecycle disagreement.
+
+The first formal named-single review of commit `4e760b6f25487b269fb3ba164e7e66eb1fd098de`
+found the prior single-traversal omission bug: it could not distinguish a newly
+observed empty future PR from an already retained record-free PR that later
+received removable human noise. The joint-coordination rule above is the
+accepted correction; it prevents future drift back to per-snapshot omission.
 
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
 trustworthy provider results remain authoritative without request/run
 attribution. Future-prefix discovery convergence is a conditional `+1`
 adaptation-plane playbook extension, not behaviour attributed to the Action.
-Any future change to the as-of meaning, stable seed identity, omission
-predicate, retained-scope audit, omitted-scope overlap audit, raw/detail budget
-closure, or Action
-attribution must update the versioned transcript/projector contract,
+Any future change to the as-of meaning, stable seed identity, eligibility or
+joint-omission predicate, retained-scope audit, eligibility-overlap audit,
+raw/detail budget closure, or Action attribution must update the versioned
+transcript/projector contract,
 agent/readiness/probe mirrors, regression coverage, and this journal together;
 changing the Action side also requires a new pinned
 source/release/tree/manifest baseline.

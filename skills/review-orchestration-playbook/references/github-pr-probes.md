@@ -308,21 +308,22 @@ positive-number `{pull_number, base_oid, head_oid}` identities. Do not include
 pull-list `updated_at`, raw pull-row digest, or endpoint order in that stable
 projection. Require typed pull-list `state` to match pull-detail lifecycle state
 whenever that list source contains the PR. The closed
-`retained_pull_scope_audit` covers every retained union PR with exact
+`retained_pull_scope_audit` covers every complete local-union PR with exact
 pull/base/head/merge-base/lifecycle identity, including request/anchor-only and
-record-free scopes, and must be identical across traversals. A retained seed
-may converge across unrelated post-as-of human activity without hiding scope or
-lifecycle drift. A future-prefix-only seed may be omitted from the fixed projection,
-semantic union, classification, and audit only when no request-feed or anchor
-also seeds it and full detail proves no in-window or provider/policy-bearing
+record-free scopes. A future-prefix-only scope enters the closed
+`future_prefix_omission_eligibility_audit` only when no request-feed or anchor
+co-seed exists and full detail proves no in-window or provider/policy-bearing
 semantic record plus only existing-rule removable confirmed-different
-post-as-of activity. Keep all raw rows/detail pages and budget charges. A
-closed `future_only_omitted_pull_audit` retains each omitted seed's
-pull/base/head/merge-base/lifecycle identity. Compare the rest of the fixed
-projection exactly across traversals; one-sided omitted audit items may differ,
-but every pull number present in both audits must be type-preserving identical.
+post-as-of activity, if any. The eligibility audit is a closed subset of the
+`retained_pull_scope_audit` identities. Keep the eligible scope in the traversal's local
+projection, and keep all raw rows/detail pages and budget charges. The
+initial/final joint coordinator may omit it only from the derived stable view,
+and only when the PR occurs in exactly one complete local union. A PR present
+in both traversals always remains and compares exactly, allowing unrelated
+post-as-of human activity without hiding scope or lifecycle drift. Shared
+eligibility items must also be type-preserving identical.
 A controlled request, exact or ambiguous provider/policy evidence, cross-cutoff
-edit, repeated omitted-scope identity/lifecycle drift, incomplete pagination,
+edit, retained or shared-eligibility identity/lifecycle drift, incomplete pagination,
 or failed join remains fail-closed.
 
 REST does not expose PR review-thread resolution. Preserve the fully paginated
@@ -578,9 +579,9 @@ scalar gate may endpoint objects retain unrelated forward-compatible GitHub
 fields; a digest paired with a permissive decoder is not sufficient authority.
 
 The parser independently proves raw-source-to-union and raw-union-to-detail
-one-to-one coverage, then classifies every retained-semantic PR as current,
-historical candidate, or confirmed non-candidate after applying only the narrow
-future-only omission rule above,
+one-to-one coverage, then classifies every local-union PR as current,
+historical candidate, or confirmed non-candidate before the joint coordinator
+applies only the narrow future-prefix eligibility rule above,
 and derives every candidate entry's scope/order plus carrier, channel,
 semantic, native identity, projected-source digest, and candidate count. The
 closed candidate evaluator separately validates complete candidate arrays and
@@ -608,13 +609,14 @@ Do not require the raw inventories or opaque cursor bytes to be identical:
 GitHub may issue different valid cursors on the final reread. Require instead
 type-preserving equality of the fixed semantic projection core, scope
 classifications, candidate entries and arrays, and candidate count. The closed
-`retained_pull_scope_audit` is part of that exact core and covers every fixed
-semantic-union pull number. The closed `future_only_omitted_pull_audit` is the
-sole projection exception: one-sided
-items are allowed, while every pull number in both traversals must have an
-exactly equal audit item. Any change to overlapping omitted-scope identity or
-lifecycle, nodes, classifications, candidate membership, or selected source
-evidence remains unstable and selects `unknown`.
+`retained_pull_scope_audit` covers every complete local-union pull number. Use
+the two closed `future_prefix_omission_eligibility_audit` arrays only to derive
+effective one-sided omissions at the joint coordinator: a PR must occur in
+exactly one union and be eligible on that side. A PR present in both unions is
+never omitted, and shared eligibility items must be exactly equal. Any change
+to a retained scope's identity, lifecycle, nodes, classification, candidate
+membership, or selected source evidence remains unstable and selects
+`unknown`.
 
 For each traversal, derive the audit-only `scope_authority_audit` projection
 for every scope with policy-relevant evidence. Its closed items retain scope,
@@ -759,10 +761,12 @@ traversal. Rederive and compare the fixed `scope_discovery_projection`,
 including its cutoff (with as-of separately frozen in the history envelope),
 stop reason, deterministic retained PR/base/head seeds, request IDs/PRs/digests,
 anchors, and fixed semantic union. Require exact equality of the closed
-`retained_pull_scope_audit` for every retained union PR. Compare the closed
-`future_only_omitted_pull_audit` by exact pull-number intersection while
-permitting a fully validated one-sided omitted seed; do not compare volatile
-pull `updated_at`, raw row digest, or endpoint order as semantic state. Then
+`retained_pull_scope_audit` for every complete local-union PR. Jointly derive
+effective omission from `future_prefix_omission_eligibility_audit`: only a PR
+present in exactly one union and eligible there may leave the stable comparison
+view; a PR present in both unions remains, and shared eligibility items compare
+exactly. Do not compare volatile pull `updated_at`, raw row digest, or endpoint
+order as semantic state. Then
 rederive the complete current/historical/non-candidate
 classification, exclude current only after parsing, rederive inventory
 scope/order/source-evidence entries and count, revalidate every request-time
