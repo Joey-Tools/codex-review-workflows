@@ -1601,8 +1601,10 @@ provider-evaluator regression. Repository-owned README and project-journal
 anti-drift assertions belong only to the canonical profile; the private
 profile keeps the shared skill/reference checks without requiring the pending
 private `AGENTS.md` authority-pointer migration or mirroring the complete
-canonical policy corpus. Private release transport materializes the reviewed
-private CI fixture as the live workflow. Installed-supervisor validation
+canonical policy corpus. Canonical-only repository policy files are not opened
+under the private profile; a missing-file regression preserves that boundary.
+Private release transport materializes the reviewed private CI fixture as the
+live workflow. Installed-supervisor validation
 requires exact Python 3.13 rather than treating later minor releases as
 compatible. The deep fallback cleanup success-path test now allows five
 seconds for runner-load variance, while the dedicated timeout tests retain

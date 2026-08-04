@@ -871,6 +871,26 @@ def _repository_agents_path(repo_root: pathlib.Path, profile: str) -> pathlib.Pa
     return _repository_policy_scope_root(repo_root, profile) / "AGENTS.md"
 
 
+def _github_provider_repository_policy_files(
+    repo_root: pathlib.Path,
+    profile: str,
+) -> dict[str, str]:
+    policy_paths: dict[str, pathlib.Path] = {}
+    if profile == "canonical":
+        policy_paths = {
+            "repository policy": _repository_agents_path(repo_root, profile),
+            "change delivery": (
+                _repository_policy_scope_root(repo_root, profile)
+                / "skills/change-delivery-workflow/SKILL.md"
+            ),
+        }
+    elif profile != "private":
+        raise AssertionError(f"unsupported repository policy profile: {profile}")
+    return {
+        name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
+    }
+
+
 def _claude_auth_repository_policy_files(
     repo_root: pathlib.Path,
     profile: str,
@@ -2258,6 +2278,10 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertFalse((policy_root / "docs/project_journal").exists())
             self.assertEqual(
                 _claude_auth_repository_policy_files(repo_root, "private"),
+                {},
+            )
+            self.assertEqual(
+                _github_provider_repository_policy_files(repo_root, "private"),
                 {},
             )
             self.assertEqual(
@@ -41169,14 +41193,13 @@ printf '%s\n' "$trusted_uv"
         egress = (SKILL_ROOT / "references/egress-consent.md").read_text(
             encoding="utf-8"
         )
-        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
-            encoding="utf-8"
-        )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
-        delivery = (
-            _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
-            / "skills/change-delivery-workflow/SKILL.md"
-        ).read_text(encoding="utf-8")
+        repository_policy_files = _github_provider_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        agents_policy = repository_policy_files.get("repository policy")
+        delivery = repository_policy_files.get("change delivery")
         authority = (
             SKILL_ROOT / "references/github-codex-evidence-authority.md"
         ).read_text(encoding="utf-8")
@@ -41184,6 +41207,10 @@ printf '%s\n' "$trusted_uv"
 
         review_scope_documents = [skill, readiness, probes, contracts, interface]
         if CI_PROFILE == "canonical":
+            self.assertIsInstance(agents_policy, str)
+            self.assertIsInstance(delivery, str)
+            assert isinstance(agents_policy, str)
+            assert isinstance(delivery, str)
             review_scope_documents.append(agents_policy)
         for content in review_scope_documents:
             self.assertIn("blocked-input", content)
