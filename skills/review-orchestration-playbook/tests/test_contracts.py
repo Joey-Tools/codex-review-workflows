@@ -4326,6 +4326,15 @@ printf '%s\n' "$trusted_uv"
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(complete_stop_reason_document=document_name):
                 self.assertIn(complete_stop_reason_contract, normalized_document)
+        ordinary_issue_nonseed_contract = (
+            "canonical ordinary-issue @codex review comments are validated, "
+            "retained, and budget-charged as raw-only non-seeds; mismatched or "
+            "ambiguous pr-like routing fails closed"
+        )
+        for document_name, document in complete_stop_reason_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(ordinary_issue_nonseed_document=document_name):
+                self.assertIn(ordinary_issue_nonseed_contract, normalized_document)
         normalized_stop_reason_probes = " ".join(
             anti_drift_documents["github-pr-probes"].lower().replace("`", "").split()
         )
@@ -13453,6 +13462,7 @@ printf '%s\n' "$trusted_uv"
                 return None
             by_id: dict[int, tuple[int, dict[str, object]]] = {}
             projection: list[dict[str, object]] = []
+            seen_controlled_comment_ids: set[int] = set()
             previous_updated_at: int | None = None
             for raw_record in raw_records:
                 projected = project_raw_issue_record(raw_record)
@@ -13470,17 +13480,17 @@ printf '%s\n' "$trusted_uv"
                     return None
                 previous_updated_at = updated_at
                 is_controlled_request = projected.get("body") == "@codex review"
-                if updated_at > history_as_of_server_time:
+                if not is_controlled_request:
                     created_at = projected.get("created_at")
                     if (
-                        not is_controlled_request
+                        updated_at > history_as_of_server_time
                         and type(created_at) is int
                         and created_at > history_as_of_server_time
                         and raw_issue_actor(projected) == "different"
                     ):
                         continue
-                    return None
-                if not is_controlled_request:
+                    if updated_at > history_as_of_server_time:
+                        return None
                     continue
                 request_id = projected.get("id")
                 issue_url = raw_record.get("issue_url")
@@ -13496,24 +13506,46 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(issue_url, str)
                     else None
                 )
-                pull_number = int(match.group(1)) if match is not None else None
+                issue_number_digits = match.group(1) if match is not None else None
+                issue_number = (
+                    int(issue_number_digits)
+                    if isinstance(issue_number_digits, str)
+                    and len(issue_number_digits) <= 39
+                    else None
+                )
                 if (
                     type(request_id) is not int
                     or request_id <= 0
-                    or request_id in by_id
-                    or type(pull_number) is not int
+                    or request_id.bit_length() > 128
+                    or request_id in seen_controlled_comment_ids
+                    or type(issue_number) is not int
+                    or issue_number.bit_length() > 128
                     or projected.get("url")
                     != (
                         "https://api.github.com/repos/"
                         f"{current_repository}/issues/comments/{request_id}"
                     )
-                    or projected.get("html_url")
-                    != (
-                        f"https://github.com/{current_repository}/pull/"
-                        f"{pull_number}#issuecomment-{request_id}"
-                    )
                 ):
                     return None
+                seen_controlled_comment_ids.add(request_id)
+                pull_html_url = (
+                    f"https://github.com/{current_repository}/pull/"
+                    f"{issue_number}#issuecomment-{request_id}"
+                )
+                issue_html_url = (
+                    f"https://github.com/{current_repository}/issues/"
+                    f"{issue_number}#issuecomment-{request_id}"
+                )
+                if projected.get("html_url") == issue_html_url:
+                    # The repository feed also returns ordinary issue comments.
+                    # Retain and charge their raw page, but never seed PR scope.
+                    continue
+                if (
+                    projected.get("html_url") != pull_html_url
+                    or updated_at > history_as_of_server_time
+                ):
+                    return None
+                pull_number = issue_number
                 raw_digest = hashlib.sha256(
                     canonical_raw_body(raw_record).encode("utf-8")
                 ).hexdigest()
@@ -22812,6 +22844,263 @@ printf '%s\n' "$trusted_uv"
             [item["request_id"] for item in discovered_request_projection],
             [920_101, 920_102, 920_103],
         )
+
+        ordinary_issue_number = 919
+        ordinary_issue_comment = raw_request_record(
+            request(
+                920_000,
+                history_as_of_server_time,
+                pr=ordinary_issue_number,
+            )
+        )
+        ordinary_issue_comment["html_url"] = (
+            f"https://github.com/{current_repository}/issues/"
+            f"{ordinary_issue_number}#issuecomment-920000"
+        )
+        ordinary_issue_tracker = new_resource_tracker()
+        self.assertIsNotNone(ordinary_issue_tracker)
+        assert isinstance(ordinary_issue_tracker, dict)
+        ordinary_issue_discovery = parse_recent_request_discovery(
+            rest_fetch(
+                "recent_request_comments",
+                request_discovery_url,
+                [ordinary_issue_comment, *actor_independent_request_records],
+            ),
+            expected_url=request_discovery_url,
+            resource_tracker=ordinary_issue_tracker,
+        )
+        self.assertIsNotNone(ordinary_issue_discovery)
+        assert ordinary_issue_discovery is not None
+        ordinary_issue_requests, ordinary_issue_projection = ordinary_issue_discovery
+        self.assertEqual(
+            set(ordinary_issue_requests),
+            {920_101, 920_102, 920_103},
+        )
+        self.assertEqual(
+            [item["request_id"] for item in ordinary_issue_projection],
+            [920_101, 920_102, 920_103],
+        )
+        self.assertEqual(ordinary_issue_tracker["records"], 4)
+
+        ordinary_issue_transcript = clone(request_seed_transcript)
+        assert isinstance(ordinary_issue_transcript, dict)
+        ordinary_issue_feed = ordinary_issue_transcript["scope_discovery"][
+            "recent_request_comments"
+        ]
+        ordinary_issue_feed_page = ordinary_issue_feed["pages"][0]
+        ordinary_issue_feed_records = strict_json_loads(
+            ordinary_issue_feed_page["body_utf8"]
+        )
+        assert isinstance(ordinary_issue_feed_records, list)
+        ordinary_issue_feed_records.insert(0, clone(ordinary_issue_comment))
+        replace_raw_json_body(
+            ordinary_issue_feed_page,
+            canonical_raw_body(ordinary_issue_feed_records),
+        )
+        ordinary_issue_transcript_projection = parse_discovery_endpoint_transcript(
+            ordinary_issue_transcript,
+            request_scope_receipts=request_seed_receipts,
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(ordinary_issue_transcript_projection)
+        assert isinstance(ordinary_issue_transcript_projection, dict)
+        self.assertTrue(
+            typed_json_equal(
+                ordinary_issue_transcript_projection["scope_discovery_projection"],
+                request_seed_projection["scope_discovery_projection"],
+            )
+        )
+        self.assertTrue(
+            historical_phase_projections_converge(
+                request_seed_projection,
+                ordinary_issue_transcript_projection,
+            )
+        )
+
+        provider_ordinary_issue_comment = clone(ordinary_issue_comment)
+        provider_ordinary_issue_comment["user"] = {
+            "login": exact_login,
+            "type": "Bot",
+            "node_id": "BOT_codex",
+        }
+        provider_ordinary_issue_comment["performed_via_github_app"] = {
+            "slug": "chatgpt-codex-connector",
+            "id": 1,
+        }
+        self.assertEqual(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [provider_ordinary_issue_comment],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            ),
+            ({}, []),
+        )
+
+        future_ordinary_issue_comment = clone(provider_ordinary_issue_comment)
+        future_ordinary_issue_comment["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        future_ordinary_issue_comment["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        self.assertEqual(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [future_ordinary_issue_comment],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            ),
+            ({}, []),
+        )
+        cross_cutoff_ordinary_issue_comment = clone(ordinary_issue_comment)
+        cross_cutoff_ordinary_issue_comment["created_at"] = (
+            _format_github_rfc3339_seconds(history_as_of_server_time - 1)
+        )
+        cross_cutoff_ordinary_issue_comment["updated_at"] = (
+            _format_github_rfc3339_seconds(history_as_of_server_time + 1)
+        )
+        self.assertEqual(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [cross_cutoff_ordinary_issue_comment],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            ),
+            ({}, []),
+        )
+        future_ambiguous_issue_route = clone(future_ordinary_issue_comment)
+        future_ambiguous_issue_route["html_url"] = (
+            f"https://github.com/{current_repository}/discussions/919"
+            "#issuecomment-920000"
+        )
+        self.assertIsNone(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [future_ambiguous_issue_route],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            )
+        )
+        duplicate_id_pr_comment = raw_request_record(
+            request(
+                920_000,
+                history_as_of_server_time - 1,
+                pr=920,
+            )
+        )
+        self.assertIsNone(
+            parse_recent_request_discovery(
+                rest_fetch(
+                    "recent_request_comments",
+                    request_discovery_url,
+                    [ordinary_issue_comment, duplicate_id_pr_comment],
+                ),
+                expected_url=request_discovery_url,
+                resource_tracker=new_resource_tracker(),
+            )
+        )
+
+        ordinary_issue_near_misses: dict[str, dict[str, object]] = {}
+        for near_miss_kind in (
+            "issue-number",
+            "comment-id",
+            "route",
+            "issue-url",
+            "host",
+            "repository",
+            "query",
+            "huge-issue-number",
+            "oversized-comment-id",
+        ):
+            near_miss = clone(ordinary_issue_comment)
+            assert isinstance(near_miss, dict)
+            if near_miss_kind == "issue-number":
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/issues/920"
+                    "#issuecomment-920000"
+                )
+            elif near_miss_kind == "comment-id":
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/issues/919"
+                    "#issuecomment-920001"
+                )
+            elif near_miss_kind == "route":
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/discussions/919"
+                    "#issuecomment-920000"
+                )
+            elif near_miss_kind == "issue-url":
+                near_miss["issue_url"] = (
+                    f"https://api.github.com/repos/{current_repository}/pulls/919"
+                )
+            elif near_miss_kind == "host":
+                near_miss["html_url"] = (
+                    f"https://example.com/{current_repository}/issues/919"
+                    "#issuecomment-920000"
+                )
+            elif near_miss_kind == "repository":
+                near_miss["html_url"] = (
+                    "https://github.com/OWNER/OTHER/issues/919#issuecomment-920000"
+                )
+            elif near_miss_kind == "query":
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/issues/919"
+                    "?view=1#issuecomment-920000"
+                )
+            elif near_miss_kind == "huge-issue-number":
+                huge_issue_number = "9" * 5_000
+                near_miss["issue_url"] = (
+                    f"https://api.github.com/repos/{current_repository}/issues/"
+                    f"{huge_issue_number}"
+                )
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/issues/"
+                    f"{huge_issue_number}#issuecomment-920000"
+                )
+            else:
+                oversized_comment_id = 1 << 128
+                near_miss["id"] = oversized_comment_id
+                near_miss["url"] = (
+                    f"https://api.github.com/repos/{current_repository}/"
+                    f"issues/comments/{oversized_comment_id}"
+                )
+                near_miss["html_url"] = (
+                    f"https://github.com/{current_repository}/issues/919"
+                    f"#issuecomment-{oversized_comment_id}"
+                )
+            ordinary_issue_near_misses[near_miss_kind] = near_miss
+        ordinary_issue_near_misses["duplicate-id"] = ordinary_issue_comment
+        for near_miss_kind, near_miss in ordinary_issue_near_misses.items():
+            records = (
+                [near_miss, clone(near_miss)]
+                if near_miss_kind == "duplicate-id"
+                else [near_miss]
+            )
+            with self.subTest(ordinary_issue_comment=near_miss_kind):
+                self.assertIsNone(
+                    parse_recent_request_discovery(
+                        rest_fetch(
+                            "recent_request_comments",
+                            request_discovery_url,
+                            records,
+                        ),
+                        expected_url=request_discovery_url,
+                        resource_tracker=new_resource_tracker(),
+                    )
+                )
 
         for variant_index, variant in enumerate(("bot", "app", "ambiguous")):
             invalid_actor_transcript = clone(request_seed_transcript)

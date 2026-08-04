@@ -274,9 +274,11 @@ witness, or through natural end; blindly paginating cumulative repository
 history is forbidden. The repository issue-comment source is fully paginated
 from the frozen cutoff. A `--jq` projection, `gh pr list`, open-only branch
 selector, slurped candidate array, or reuse of the initial bytes for the final
-inventory is not raw discovery authority. Newer pull rows, strict controlled
-request parents from the comment feed, and exact current/declaration anchors
-form the raw detail union. The frozen as-of bounds semantic history rather than
+inventory is not raw discovery authority. Newer pull rows, canonically
+PR-routed strict controlled-request parents from the comment feed, and exact
+current/declaration anchors form the raw detail union. Canonical ordinary-issue
+`@codex review` comments remain validated and budget-charged raw-only non-seeds.
+The frozen as-of bounds semantic history rather than
 raw observation time. Validate rows with `updated_at > as_of_server_time` as a
 contiguous descending future prefix, retain and charge them, and start exactly
 the same full detail traversal for them as for other raw seeds. Every canonical
@@ -460,10 +462,13 @@ embeds the raw `discovery_endpoint_transcript`. Its closed root contains the
 updated-desc pull traversal through its first cutoff-boundary page or natural
 end, the fully paginated since-cutoff repository issue-comment feed, exact
 current/declaration anchors, and one complete detail traversal for every union
-member. That repository feed retains every exact-body `@codex review` record
-regardless of actor or App; discovery seeds its PR before full actor, raw-equal
-detail, and sidecar validation either accepts the request or selects `unknown`.
-It never silently removes an untrusted or ambiguous strict request. Each detail
+member. That repository feed validates every exact-body `@codex review` record
+regardless of actor or App; discovery seeds a canonically routed PR before full
+actor, raw-equal detail, and sidecar validation either accepts the request or
+selects `unknown`. Canonical ordinary-issue `@codex review` comments are
+validated, retained, and budget-charged as raw-only non-seeds; mismatched or
+ambiguous PR-like routing fails closed. It never silently removes an untrusted
+or ambiguous strict PR request. Each detail
 traversal contains the policy-required pull detail, compare, issue-comment,
 review, inline-comment, raw GraphQL thread/comment, and controlled-request
 reaction fetches. The fixed parser excludes current only after every

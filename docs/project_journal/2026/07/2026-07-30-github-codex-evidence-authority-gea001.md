@@ -1420,6 +1420,24 @@ boundary witnesses, and one final-only eligible future PR to force the boundary
 from page one to page two while proving the coordinated semantic view remains
 stable.
 
+The fourth formal named-single review of commit
+`5e1be7e100beb375b10dff235ec21666a02aabd9` found that the repository-wide
+issue-comment endpoint also returns comments on ordinary issues. Treating every
+exact-body `@codex review` record as a PR request made one canonical ordinary
+issue comment invalidate the entire adaptive history and could consume the
+seeded-PR budget. Canonical ordinary-issue `@codex review` comments are
+validated, retained, and budget-charged as raw-only non-seeds; mismatched or
+ambiguous PR-like routing fails closed. The classifier jointly binds the
+canonical issue API URL, comment API URL, ordinary-issue or PR HTML route,
+shared issue number, and comment ID; controlled-comment IDs remain unique
+across both routes. A future ordinary-issue comment remains irrelevant to PR
+scope after the same raw validation, while a future canonically routed PR
+request continues to fail closed under the frozen as-of policy. Positive,
+future, duplicate-ID, route, issue-number, comment-ID, and issue-URL fixtures
+lock the distinction. Route and comment IDs stay inside the 128-bit native-ID
+envelope; a 5,000-digit route fixture proves rejection occurs before Python
+integer conversion can raise instead of returning a fail-closed result.
+
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
 trustworthy provider results remain authoritative without request/run

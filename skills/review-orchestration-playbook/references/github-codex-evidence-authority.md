@@ -1275,14 +1275,19 @@ can never be normalized into either complete form.
 
 The second source fully paginates
 `GET /repos/<owner>/<repo>/issues/comments?sort=updated&direction=desc&since=<RFC3339-cutoff>&per_page=100`.
-It retains every record whose body is the exact `@codex review` string,
+It validates every record whose body is the exact `@codex review` string,
 regardless of actor type or `performed_via_github_app`. Discovery is a scope
-completeness step, not an identity verdict: the full detail traversal and
-request-sidecar plane later accept a valid controlled request or select
-`unknown`, but an untrusted, App-authored, or ambiguous strict request may not
-make its PR disappear from the union. Each retained raw record binds its PR
-through both canonical `issue_url` and exact PR-comment `html_url`, and must
-occur one-to-one, type-preserving raw-equal in that PR's detail issue comments.
+completeness step, not an identity verdict: a comment whose canonical
+`issue_url` and `html_url` jointly route to a PR seeds that PR before the full
+detail traversal and request-sidecar plane later accept a valid controlled
+request or select `unknown`; an untrusted, App-authored, or ambiguous strict
+request may not make its PR disappear from the union. Canonical ordinary-issue
+`@codex review` comments are validated, retained, and budget-charged as raw-only
+non-seeds; mismatched or ambiguous PR-like routing fails closed. Each seeded raw
+record must occur one-to-one, type-preserving raw-equal in that PR's detail
+issue comments. Controlled-comment IDs remain unique across PR and ordinary
+issue routes. Route and comment IDs must fit the 128-bit native-ID envelope;
+reject an overlong decimal route before integer conversion.
 This source is necessary because a reaction does not imply that GitHub advances
 the PR's `updated_at`; a recent historical request can seed an otherwise
 old-updated PR. It proves neither request/run lineage nor request-time scope. A

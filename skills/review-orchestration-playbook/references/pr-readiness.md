@@ -185,10 +185,12 @@ Each initial/final historical inventory independently embeds the closed
 schema-version-4 raw discovery transcript. Its bounded updated-desc pull
 traversal stops after the first full page containing a row at or before the
 cutoff (or at natural end), while its fully paginated since-cutoff repository
-issue-comments feed retains every exact-body `@codex review` record regardless
-of actor or App, because discovery must seed the PR before complete actor,
-raw-equal detail, and sidecar validation accepts the request or selects
-`unknown`. Reactions may not update PR metadata. The frozen as-of bounds
+issue-comments feed validates every exact-body `@codex review` record regardless
+of actor or App, because discovery must seed a canonically routed PR before
+complete actor, raw-equal detail, and sidecar validation accepts the request or
+selects `unknown`. Canonical ordinary-issue `@codex review` comments are
+validated, retained, and budget-charged as raw-only non-seeds; mismatched or
+ambiguous PR-like routing fails closed. Reactions may not update PR metadata. The frozen as-of bounds
 semantic historical outcomes, not when the live pull endpoint was observed.
 Updated-desc rows later than as-of therefore form a contiguous validated future
 prefix; they stay raw and budget-charged and seed the complete
