@@ -32,6 +32,10 @@ from .recovery_cleanup import (
     quarantined_root_recovery_evidence,
     remove_published_manifest,
 )
+from .signal_relay import (
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
+)
 
 
 EXPECTED_CODEX_SHA256 = (
@@ -381,6 +385,39 @@ class CommandResult:
     stdout: bytes
     stderr: bytes
     process_closure: PreflightProcessClosureEvidence | None = None
+
+
+class BoundedCommandOutputLimitExceeded(ValueError):
+    def __init__(self, *, scope: str, limit: int) -> None:
+        self.scope = scope
+        self.limit = limit
+        super().__init__(f"command output exceeds {limit} bytes for {scope}")
+
+
+_BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE = "_codex_bounded_command_process_closure"
+
+
+def bounded_command_process_closure(
+    error: BaseException,
+) -> PreflightProcessClosureEvidence | None:
+    """Return authenticated settlement evidence carried by an aborted command."""
+
+    try:
+        evidence = getattr(error, _BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE, None)
+    except BaseException:
+        return None
+    return evidence if isinstance(evidence, PreflightProcessClosureEvidence) else None
+
+
+def _attach_bounded_command_process_closure(
+    error: BaseException,
+    evidence: PreflightProcessClosureEvidence,
+) -> None:
+    try:
+        setattr(error, _BOUNDED_COMMAND_PROCESS_CLOSURE_ATTRIBUTE, evidence)
+    except BaseException:
+        # A non-extensible control-flow exception remains fail closed for callers.
+        return
 
 
 class CommandRunner(Protocol):
@@ -3811,6 +3848,8 @@ def run_bounded_command(
     *,
     timeout_seconds: float,
     max_output_bytes: int,
+    max_stdout_bytes: int | None = None,
+    max_stderr_bytes: int | None = None,
     _prepared_no_child_profile: object | None = None,
 ) -> CommandResult:
     _require_python_313()
@@ -3822,7 +3861,12 @@ def run_bounded_command(
         raise ValueError(
             "bounded command requires an absolute executable and text argv"
         )
-    if timeout_seconds <= 0 or max_output_bytes <= 0:
+    if (
+        timeout_seconds <= 0
+        or max_output_bytes <= 0
+        or (max_stdout_bytes is not None and max_stdout_bytes <= 0)
+        or (max_stderr_bytes is not None and max_stderr_bytes <= 0)
+    ):
         raise ValueError("bounded command limits must be positive")
     prepared = (
         _prepare_root_protected_no_child_profile(pathlib.Path(argv[0]))
@@ -3842,6 +3886,7 @@ def run_bounded_command(
     selector: selectors.BaseSelector | None = None
     leader_reaped = False
     retain_runtime_resources = False
+    signal_scope = begin_bound_signal_deferral()
 
     def streams_are_drained() -> bool:
         if selector is None:
@@ -3859,36 +3904,67 @@ def run_bounded_command(
         )
         launch_ownership.transfer_receipt(launch_receipt)
         launched, stdout_fd, stderr_fd = launch_receipt
+        checkpoint_bound_signal_interrupt(force=True)
         streams = {
             stdout_fd: bytearray(),
             stderr_fd: bytearray(),
+        }
+        stream_limits = {
+            stdout_fd: max_stdout_bytes,
+            stderr_fd: max_stderr_bytes,
+        }
+        stream_labels = {
+            stdout_fd: "stdout",
+            stderr_fd: "stderr",
         }
         deadline = time.monotonic() + timeout_seconds
         selector = selectors.DefaultSelector()
         for descriptor in streams:
             selector.register(descriptor, selectors.EVENT_READ)
         while selector.get_map():
+            checkpoint_bound_signal_interrupt(force=True)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
-            events = selector.select(remaining)
+            events = selector.select(min(remaining, 0.25))
+            checkpoint_bound_signal_interrupt(force=True)
             if not events:
-                raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
+                continue
             for key, _ in events:
+                stream = streams[key.fd]
+                stream_limit = stream_limits[key.fd]
+                stream_remaining = (
+                    READ_CHUNK
+                    if stream_limit is None
+                    else stream_limit + 1 - len(stream)
+                )
                 chunk = os.read(
                     key.fd,
-                    min(READ_CHUNK, max_output_bytes + 1 - total),
+                    min(
+                        READ_CHUNK,
+                        max_output_bytes + 1 - total,
+                        stream_remaining,
+                    ),
                 )
                 if not chunk:
                     selector.unregister(key.fd)
                     continue
-                streams[key.fd].extend(chunk)
+                stream.extend(chunk)
                 total += len(chunk)
+                if stream_limit is not None and len(stream) > stream_limit:
+                    raise BoundedCommandOutputLimitExceeded(
+                        scope=stream_labels[key.fd],
+                        limit=stream_limit,
+                    )
                 if total > max_output_bytes:
-                    raise ValueError(f"command output exceeds {max_output_bytes} bytes")
+                    raise BoundedCommandOutputLimitExceeded(
+                        scope="aggregate",
+                        limit=max_output_bytes,
+                    )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
+        checkpoint_bound_signal_interrupt(force=True)
         wait_terminal(launched.pid, deadline=deadline)
         returncode = reap(launched.pid, deadline=deadline)
         leader_reaped = True
@@ -4013,9 +4089,13 @@ def run_bounded_command(
             )
             retain_runtime_resources = True
             raise retained from cleanup_error
+        if closure is not None:
+            _attach_bounded_command_process_closure(primary_error, closure)
         raise
     finally:
         close_errors: list[BaseException] = []
+        finalizer_error: CodexExecutableRetentionRequired | None = None
+        signal_error: BaseException | None = None
         if not retain_runtime_resources and selector is not None:
             try:
                 selector.close()
@@ -4070,9 +4150,22 @@ def run_bounded_command(
                 closure=retained_closure,
                 reason=(f"{type(close_errors[0]).__name__}: {close_errors[0]}"),
             )
-            raise retained from close_errors[0]
-        if not retain_runtime_resources and not launch_ownership.descriptors:
+            finalizer_error = retained
+        elif not retain_runtime_resources and not launch_ownership.descriptors:
             launch_ownership.mark_closed()
+        if signal_scope is not None:
+            try:
+                signal_scope.finish(
+                    deliver=finalizer_error is None and not retain_runtime_resources
+                )
+            except BaseException as error:
+                signal_error = error
+        if finalizer_error is not None:
+            raise finalizer_error from close_errors[0]
+        if signal_error is not None:
+            if closure is not None:
+                _attach_bounded_command_process_closure(signal_error, closure)
+            raise signal_error
     assert returncode is not None
     assert closure is not None
     return CommandResult(
@@ -5683,6 +5776,7 @@ def authenticate_codex_executable(
 
 __all__ = [
     "AGGREGATE_SCHEMA_NAME",
+    "BoundedCommandOutputLimitExceeded",
     "CODESIGN_PATH",
     "CommandResult",
     "CodexExecutableCustody",

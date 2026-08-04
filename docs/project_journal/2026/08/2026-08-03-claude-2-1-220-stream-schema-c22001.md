@@ -37,12 +37,18 @@ superseded_by:
 - `skills/review-orchestration-playbook/references/claude-stream-compatibility.json`
 - `skills/review-orchestration-playbook/scripts/validate_claude_stream.py`
 - `skills/review-orchestration-playbook/tests/test_validate_claude_stream.py`
-- Focused stream-validator suite: 108 tests passed in 6.550 seconds.
-- Complete review-orchestration suite after the range-wide compatibility update:
-  2,832 tests passed in 1,207.429 seconds outside the restricted sandbox, with
-  6 platform-gated skips.
+- Focused stream-validator suite after merging the latest `master`: 108 tests
+  passed in 7.666 seconds; the focused contract suite passed 107 tests in
+  11.359 seconds.
+- Complete review-orchestration suite after merging
+  `master@80d3fc9c7d9f4842d0fa247a7c0b974c00052124`: 2,834 tests passed in
+  1,132.890 seconds outside the restricted sandbox, with 6 platform-gated
+  skips.
 - The first PR CI run exposed the stale exact recovery-pointer assertion on
   both platforms; the focused repaired contract test passed while preserving
   the historical read-only supervisor evidence checks.
-- Ruff lint/format, JSON parsing, Actionlint, skill validation, project-journal
-  validation, and `git diff --check` passed.
+- Ruff lint/format, JSON parsing, core Actionlint with external ShellCheck and
+  Pyflakes integration disabled, skill validation, project-journal validation,
+  and `git diff --check` passed. Full Actionlint produced no diagnostics but did
+  not complete within the 180-second deadline either inside or outside the
+  restricted sandbox; no process remained after deadline cleanup.

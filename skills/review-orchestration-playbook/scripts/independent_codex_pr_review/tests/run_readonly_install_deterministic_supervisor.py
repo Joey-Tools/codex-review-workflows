@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import shutil
 import signal
 import stat
@@ -19,8 +20,27 @@ from dataclasses import asdict, dataclass, field
 from types import CodeType, FrameType, TracebackType
 from typing import Any
 
-from review_supervisor.gitraw import GitProcessClosureUnproven, run_bounded
+from review_supervisor.gitraw import (
+    CatFileBatch,
+    GitProcessClosureUnproven,
+    bound_git_environment,
+    enumerate_tree,
+    inspect_repository,
+    run_bounded,
+    selected_git_executable,
+)
 from review_supervisor.models import Identity
+from review_supervisor import no_child_profile
+from review_supervisor.codex_executable import (
+    BoundedCommandOutputLimitExceeded,
+    _macos_acl_entries,
+    bounded_command_process_closure,
+    run_bounded_command,
+)
+from review_supervisor.no_child_profile import (
+    attest_writable_root,
+    prepare_sandboxed_python_no_child_profile,
+)
 from review_supervisor.recovery_cleanup import (
     CustodiedDeletionResultOwner,
     CustodiedManifestResultOwner,
@@ -38,6 +58,8 @@ from review_supervisor.secureio import (
 from review_supervisor.signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
 
@@ -55,14 +77,109 @@ from .support import (
     _private_runtime_parent,
     _PrivateDirectoryCreationResultOwner,
     _PrivateDirectoryCreationRetentionRequired,
+    _runtime_parent_creation_allows_sticky_writable_ancestors,
     _settle_directory_parent_binding_result_preserving_trigger,
 )
+from .readonly_no_child_contract import SUCCESS_RECORD as NO_CHILD_SUCCESS_RECORD
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
+RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
+EXPECTED_HEAD_ENV = "CODEX_REVIEW_EXPECTED_HEAD_SHA"
+DEDICATED_ACCOUNT_CUSTODY_ENV = "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _create_bound_owned_private_runtime_directory(
+    prefix: str,
+    *,
+    result_owner: _PrivateDirectoryCreationResultOwner,
+) -> _DirectoryParentBinding:
+    """Preserve runner-local parent and creation injection seams."""
+
+    explicit_parent = os.environ.get(EXPLICIT_RUNTIME_PARENT_ENV)
+    parent = _private_runtime_parent()
+    allow_sticky_writable_ancestors = (
+        _runtime_parent_creation_allows_sticky_writable_ancestors(
+            explicit_parent,
+            parent,
+        )
+    )
+    if allow_sticky_writable_ancestors:
+        return _create_bound_owned_private_directory(
+            parent,
+            prefix,
+            result_owner=result_owner,
+            allow_sticky_writable_ancestors=True,
+        )
+    return _create_bound_owned_private_directory(
+        parent,
+        prefix,
+        result_owner=result_owner,
+    )
+
+
+NO_CHILD_SUITE_CODE = (
+    "import errno,os,pathlib,runpy,sys,tempfile\n"
+    "if not sys.flags.isolated or not sys.flags.no_site:\n"
+    " raise RuntimeError('read-only test child requires isolated no-site startup')\n"
+    "root=pathlib.Path(sys.argv[1])\n"
+    "runtime=pathlib.Path(sys.argv[2])\n"
+    f"os.environ[{EXPLICIT_RUNTIME_PARENT_ENV!r}]=sys.argv[2]\n"
+    "os.environ['TMPDIR']=sys.argv[2]\n"
+    "tempfile.tempdir=sys.argv[2]\n"
+    "def require_denied(action,label):\n"
+    " try:\n"
+    "  result=action()\n"
+    " except OSError as error:\n"
+    "  if error.errno in {errno.EACCES,errno.EPERM}:\n"
+    "   return\n"
+    "  raise\n"
+    " if isinstance(result,int):\n"
+    "  os.close(result)\n"
+    " raise RuntimeError(f'read-only install policy allowed {label}')\n"
+    "probe=root/'tests'/'__init__.py'\n"
+    "require_denied(lambda:os.chmod(root,0o700),'root chmod')\n"
+    "require_denied(lambda:os.chmod(probe,0o600),'file chmod')\n"
+    "require_denied(lambda:os.open(probe,os.O_WRONLY),'file write-open')\n"
+    "hardlink_probe=runtime/'release-hardlink-probe'\n"
+    "try:\n"
+    " require_denied(lambda:os.link(probe,hardlink_probe),"
+    "'release hard link into runtime')\n"
+    "finally:\n"
+    " try:\n"
+    "  os.unlink(hardlink_probe)\n"
+    " except FileNotFoundError:\n"
+    "  pass\n"
+    "parent_probe=root.parent/'seatbelt-parent-write-probe'\n"
+    "require_denied(lambda:os.open(parent_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,"
+    "0o600),'install-parent create')\n"
+    "runtime_probe=runtime/'seatbelt-write-probe'\n"
+    "try:\n"
+    " fd=os.open(runtime_probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
+    " try:\n"
+    "  os.write(fd,b'allowed runtime write\\n')\n"
+    " finally:\n"
+    "  os.close(fd)\n"
+    "finally:\n"
+    " try:\n"
+    "  os.unlink(runtime_probe)\n"
+    " except FileNotFoundError:\n"
+    "  pass\n"
+    "os.chdir(root)\n"
+    "sys.path.insert(0,str(root))\n"
+    "runpy.run_module('tests.run_readonly_no_child_supervisor',run_name='__main__')\n"
+)
+CREATION_ORIGIN_GUARANTEE = (
+    "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"
+)
+CLEANUP_GUARANTEE = (
+    "custodied-manifest-quarantine-descriptor-revalidation-"
+    "same-uid-final-rename-unlink-host-tcb"
+)
 ACL_LISTING_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -72,6 +189,13 @@ XATTR_NOFOLLOW = 0x0001
 XATTR_NAMES_LIMIT_BYTES = 64 * 1024
 XATTR_VALUE_LIMIT_BYTES = 16 * 1024 * 1024
 XATTR_AGGREGATE_LIMIT_BYTES = 64 * 1024 * 1024
+# This counts listing, capture, and revalidation observations, not unique paths.
+TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT = 32 * 1024
+TREE_SNAPSHOT_FILE_READ_LIMIT_BYTES = 512 * 1024 * 1024
+TREE_SNAPSHOT_ACCESS_POLICY_READ_LIMIT_BYTES = 128 * 1024 * 1024
+TREE_SNAPSHOT_PATH_READ_LIMIT_BYTES = 16 * 1024 * 1024
+TREE_SNAPSHOT_MAX_DEPTH = 64
+TREE_SNAPSHOT_TIMEOUT_SECONDS = 60.0
 DARWIN_PROC_UID_ONLY = 4
 DARWIN_PROC_RUID_ONLY = 5
 DARWIN_CTL_KERN = 1
@@ -81,6 +205,7 @@ DARWIN_KINFO_PROC_BYTES = 648
 DARWIN_PROCESS_CENSUS_CAP = 4096
 DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS = 5.0
 DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS = 0.25
+DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS = 0.1
 SANDBOX_FILTER_NONE = 0
 CHILD_ACCOUNT_PROBE_ENVIRONMENT = {
     "LANG": "C",
@@ -99,6 +224,7 @@ _CLEANUP_RECOVERY_EVIDENCE_ATTR = "_readonly_cleanup_recovery_evidence"
 @dataclass(frozen=True)
 class TreeEntrySnapshot:
     kind: str
+    size: int | None
     device: int
     inode: int
     generation: int
@@ -114,6 +240,7 @@ class TreeEntrySnapshot:
     def protected_key(self) -> tuple[object, ...]:
         return (
             self.kind,
+            self.size,
             self.device,
             self.inode,
             self.generation,
@@ -126,6 +253,86 @@ class TreeEntrySnapshot:
             self.xattrs,
             self.acl_entries,
         )
+
+
+@dataclass(frozen=True)
+class SourceTreeBinding:
+    source_manifest_sha256: str
+    source_root_gid: int
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...]
+
+
+@dataclass(frozen=True)
+class SourceCheckoutBinding:
+    repo_root: pathlib.Path
+    head_sha: str
+    source_relative_path: str
+    source_manifest_sha256: str
+    head_subtree_manifest_sha256: str
+    source_root_gid: int
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...]
+
+
+@dataclass
+class TreeSnapshotBudget:
+    entry_observations_remaining: int
+    file_read_bytes_remaining: int
+    access_policy_read_bytes_remaining: int
+    path_read_bytes_remaining: int
+    max_depth: int
+
+    @classmethod
+    def create(cls) -> TreeSnapshotBudget:
+        return cls(
+            entry_observations_remaining=TREE_SNAPSHOT_ENTRY_OBSERVATION_LIMIT,
+            file_read_bytes_remaining=TREE_SNAPSHOT_FILE_READ_LIMIT_BYTES,
+            access_policy_read_bytes_remaining=(
+                TREE_SNAPSHOT_ACCESS_POLICY_READ_LIMIT_BYTES
+            ),
+            path_read_bytes_remaining=TREE_SNAPSHOT_PATH_READ_LIMIT_BYTES,
+            max_depth=TREE_SNAPSHOT_MAX_DEPTH,
+        )
+
+    def start_scan(self) -> TreeSnapshotScan:
+        return TreeSnapshotScan(
+            budget=self,
+            deadline=time.monotonic() + TREE_SNAPSHOT_TIMEOUT_SECONDS,
+        )
+
+
+@dataclass
+class TreeSnapshotScan:
+    budget: TreeSnapshotBudget
+    deadline: float
+
+    def checkpoint(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise RuntimeError("tree snapshot exceeded its total deadline")
+
+    def observe_entry(self, *, depth: int, path_bytes: int) -> None:
+        self.checkpoint()
+        if depth > self.budget.max_depth:
+            raise RuntimeError("tree snapshot exceeds its depth bound")
+        if self.budget.entry_observations_remaining <= 0:
+            raise RuntimeError("tree snapshot exceeds its entry-observation bound")
+        if path_bytes < 0 or path_bytes > self.budget.path_read_bytes_remaining:
+            raise RuntimeError("tree snapshot exceeds its cumulative path byte bound")
+        self.budget.entry_observations_remaining -= 1
+        self.budget.path_read_bytes_remaining -= path_bytes
+
+    def consume_file_read(self, size: int) -> None:
+        self.checkpoint()
+        if size < 0 or size > self.budget.file_read_bytes_remaining:
+            raise RuntimeError("tree snapshot exceeds its cumulative file byte bound")
+        self.budget.file_read_bytes_remaining -= size
+
+    def consume_access_policy_read(self, size: int) -> None:
+        self.checkpoint()
+        if size < 0 or size > self.budget.access_policy_read_bytes_remaining:
+            raise RuntimeError(
+                "tree snapshot exceeds its cumulative access-policy byte bound"
+            )
+        self.budget.access_policy_read_bytes_remaining -= size
 
 
 @dataclass(frozen=True)
@@ -174,12 +381,34 @@ class ChildSignalTeardownError(RuntimeError):
         super().__init__(f"child signal teardown failed: {operations}")
 
 
+class TerminalPublicationError(RuntimeError):
+    def __init__(self, operation: str, error: BaseException) -> None:
+        self.operation = operation
+        self.error = error
+        super().__init__(
+            f"terminal publication {operation} failed: {type(error).__name__}: {error}"
+        )
+
+
 @dataclass(frozen=True)
 class ChildSignalGuard:
     signals: tuple[signal.Signals, ...]
     previous_handlers: tuple[Any, ...]
     previous_mask: set[signal.Signals]
     interrupt: DeferredSignalInterrupt
+
+
+@dataclass
+class LifecycleSignalFence:
+    signals: tuple[signal.Signals, ...]
+    previous_handlers: tuple[Any, ...]
+    previous_mask: set[signal.Signals]
+    received_signal: int | None = None
+    terminal_signal: int | None = None
+    terminal_selected_signal: int | None = None
+    terminal_exit_code: int | None = None
+    terminal_decision_frozen: bool = False
+    terminal_output_committed: bool = False
 
 
 @dataclass
@@ -190,6 +419,16 @@ class ChildProcessClosureProof:
     started: bool = False
     proven: bool = False
     destructive_cleanup_authorized: bool = True
+    runtime_profile: str | None = None
+
+
+class ChildOutputLimitExceeded(OverflowError):
+    def __init__(self, *, scope: str, limit: int) -> None:
+        self.scope = scope
+        self.limit = limit
+        super().__init__(
+            f"bounded no-child test {scope} output exceeded its {limit}-byte cap"
+        )
 
 
 @dataclass
@@ -216,6 +455,114 @@ def _child_process_closure_status(proof: ChildProcessClosureProof) -> str:
     return "unproven" if proof.started else "not-started"
 
 
+def _select_no_child_runtime_profile() -> tuple[str, no_child_profile.RuntimePin]:
+    if os.environ.get("GITHUB_ACTIONS") == "true" or any(
+        os.environ.get(name) is not None
+        for name in (RUNNER_ENVIRONMENT_ENV, RUNNER_ARCH_ENV)
+    ):
+        raise RuntimeError(
+            "read-only installed supervisor is forbidden under GitHub Actions "
+            "and hosted runner profiles"
+        )
+    return "production-current", no_child_profile.PINNED_RUNTIME
+
+
+def _authenticated_no_child_closure(
+    closure: object | None,
+    *,
+    require_stdio_closed: bool,
+) -> bool:
+    return bool(
+        closure is not None
+        and getattr(closure, "authenticated_no_child_profile", False) is True
+        and getattr(closure, "permitted_process_closure_proven", False) is True
+        and getattr(closure, "leader_reaped", False) is True
+        and (
+            not require_stdio_closed or getattr(closure, "stdio_closed", False) is True
+        )
+        and getattr(
+            closure,
+            "process_group_emptiness_used_as_descendant_proof",
+            True,
+        )
+        is False
+    )
+
+
+def _install_lifecycle_signal_fence() -> LifecycleSignalFence:
+    handled = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers: list[Any] = []
+    fence = LifecycleSignalFence(
+        signals=handled,
+        previous_handlers=(),
+        previous_mask=previous_mask,
+    )
+
+    def retain_lifecycle_signal(
+        signal_number: int,
+        _frame: FrameType | None,
+    ) -> None:
+        if fence.received_signal is None:
+            fence.received_signal = signal_number
+
+    try:
+        for signal_number in handled:
+            previous_handlers.append(
+                signal.signal(signal_number, retain_lifecycle_signal)
+            )
+        fence.previous_handlers = tuple(previous_handlers)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        for signal_number, previous in zip(
+            handled,
+            previous_handlers,
+            strict=False,
+        ):
+            signal.signal(signal_number, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
+    return fence
+
+
+def _restore_lifecycle_signal_fence(fence: LifecycleSignalFence) -> int | None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    pending = signal.sigpending()
+    selected = fence.received_signal
+    if selected is None:
+        selected = next(
+            (int(item) for item in fence.signals if item in pending),
+            None,
+        )
+    for signal_number, previous in zip(
+        fence.signals,
+        fence.previous_handlers,
+        strict=True,
+    ):
+        signal.signal(signal_number, previous)
+    signal.pthread_sigmask(signal.SIG_SETMASK, fence.previous_mask)
+    return selected
+
+
+def _freeze_lifecycle_terminal_signal(
+    fence: LifecycleSignalFence,
+) -> int | None:
+    if fence.terminal_decision_frozen:
+        return fence.terminal_signal
+    signal.pthread_sigmask(signal.SIG_BLOCK, fence.signals)
+    pending = signal.sigpending()
+    selected = fence.received_signal
+    if selected is None:
+        selected = next(
+            (int(item) for item in fence.signals if item in pending),
+            None,
+        )
+    fence.terminal_signal = selected
+    fence.terminal_decision_frozen = True
+    return selected
+
+
 @dataclass(frozen=True)
 class BoundPathEvidence:
     path: pathlib.Path
@@ -238,6 +585,18 @@ class DarwinProcessIdentity:
     # Process state is diagnostic/scope evidence, not object identity. A live
     # process can become terminal without occupying a new process-table slot.
     process_state: bytes = field(default=b"?", compare=False)
+
+
+@dataclass(frozen=True)
+class DedicatedUidScope:
+    # This capability is valid only while the ephemeral account remains the
+    # caller's real/effective UID and its prelaunch census contains this
+    # supervisor alone. Signals are still ordinary same-UID kill(2) calls;
+    # Darwin provides no pidfd-style atomic revalidate-and-signal primitive.
+    uid: int
+    account_name: str
+    receipt_sha256: str
+    baseline: tuple[DarwinProcessIdentity, ...]
 
 
 class ChildProcessTreeClosureUnproven(RuntimeError):
@@ -434,6 +793,130 @@ def _bound_child_signals(
             raise ChildSignalTeardownError(tuple(secondary_failures))
 
 
+def _run_no_child_test_suite(
+    *,
+    installed_root: pathlib.Path,
+    install_container_binding: _DirectoryParentBinding,
+    runtime_parent_binding: _DirectoryParentBinding,
+    timeout: float = CHILD_TIMEOUT_SECONDS,
+    stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
+    stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
+    secondary_failures: list[SecondaryFailure] | None = None,
+    closure_proof: ChildProcessClosureProof | None = None,
+    lifecycle_fence: LifecycleSignalFence | None = None,
+) -> subprocess.CompletedProcess[str]:
+    diagnostics = secondary_failures if secondary_failures is not None else []
+    proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
+    runtime_parent = runtime_parent_binding.path
+    if installed_root.parent != install_container_binding.path:
+        raise RuntimeError(
+            "read-only installed root is outside its bound install container"
+        )
+    install_container_binding.revalidate()
+    runtime_parent_binding.revalidate()
+    if directory_identities_match(
+        install_container_binding.identity,
+        runtime_parent_binding.identity,
+    ):
+        raise RuntimeError("runtime root aliases the read-only install container")
+    install_container = str(install_container_binding.path)
+    runtime_root = str(runtime_parent)
+    common = os.path.commonpath((install_container, runtime_root))
+    if common in {install_container, runtime_root}:
+        raise RuntimeError("runtime root overlaps the read-only install container")
+    writable_runtime = attest_writable_root(
+        runtime_parent,
+        directory_fd=runtime_parent_binding.fd,
+    )
+    with _bound_child_signals(diagnostics):
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        runtime_profile, runtime_pin = _select_no_child_runtime_profile()
+        proof.runtime_profile = runtime_profile
+        prepared = prepare_sandboxed_python_no_child_profile(
+            additional_seatbelt_rules="(deny file-write*)",
+            runtime_pin=runtime_pin,
+            writable_roots=(writable_runtime,),
+        )
+        if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
+        target = prepared.sandboxed_target
+        if target is None:
+            raise RuntimeError(
+                "read-only installed test profile lacks a bound Python target"
+            )
+        argv = (
+            target.path,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            NO_CHILD_SUITE_CODE,
+            str(installed_root),
+            str(runtime_parent),
+        )
+        install_container_binding.revalidate()
+        runtime_parent_binding.revalidate()
+        proof_scope = begin_bound_signal_deferral()
+        try:
+            checkpoint_bound_signal_interrupt(force=True)
+            proof.started = True
+            proof.destructive_cleanup_authorized = False
+            try:
+                result = run_bounded_command(
+                    argv,
+                    timeout_seconds=timeout,
+                    max_output_bytes=stdout_limit + stderr_limit,
+                    max_stdout_bytes=stdout_limit,
+                    max_stderr_bytes=stderr_limit,
+                    _prepared_no_child_profile=prepared,
+                )
+            except BaseException as error:
+                closure = bounded_command_process_closure(error)
+                if _authenticated_no_child_closure(
+                    closure,
+                    require_stdio_closed=False,
+                ):
+                    proof.proven = True
+                    proof.destructive_cleanup_authorized = True
+                if isinstance(error, BoundedCommandOutputLimitExceeded):
+                    raise ChildOutputLimitExceeded(
+                        scope=error.scope,
+                        limit=error.limit,
+                    ) from error
+                raise
+            closure = result.process_closure
+            if not _authenticated_no_child_closure(
+                closure,
+                require_stdio_closed=True,
+            ):
+                raise RuntimeError(
+                    "read-only installed test process closure lacks an authenticated "
+                    "no-child proof"
+                )
+            proof.proven = True
+            proof.destructive_cleanup_authorized = True
+            if len(result.stdout) > stdout_limit:
+                raise ChildOutputLimitExceeded(scope="stdout", limit=stdout_limit)
+            if len(result.stderr) > stderr_limit:
+                raise ChildOutputLimitExceeded(scope="stderr", limit=stderr_limit)
+            if result.returncode == 0 and result.stdout != (
+                NO_CHILD_SUCCESS_RECORD + "\n"
+            ).encode("ascii"):
+                raise RuntimeError(
+                    "read-only installed test child lacks its exact completion record"
+                )
+        finally:
+            if proof_scope is not None:
+                proof_scope.finish(deliver=proof.proven or not proof.started)
+    return subprocess.CompletedProcess(
+        args=argv,
+        returncode=result.returncode,
+        stdout=result.stdout.decode("utf-8", "replace"),
+        stderr=result.stderr.decode("utf-8", "replace"),
+    )
+
+
 def _process_census_deadline(deadline: float | None = None) -> float:
     return (
         time.monotonic() + DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS
@@ -619,11 +1102,19 @@ def _require_no_new_same_uid_processes(
     baseline: tuple[DarwinProcessIdentity, ...],
     *,
     deadline: float | None = None,
+    dedicated_scope: DedicatedUidScope | None = None,
 ) -> None:
     operation_deadline = _process_census_deadline(deadline)
     baseline_set = set(baseline)
     last_escaped: tuple[DarwinProcessIdentity, ...] = ()
     absent_since: float | None = None
+    terminate_sent_at: dict[DarwinProcessIdentity, float] = {}
+    kill_sent: set[DarwinProcessIdentity] = set()
+    if dedicated_scope is not None and dedicated_scope.baseline != baseline:
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            OSError(errno.EPERM, "dedicated UID scope does not match the baseline"),
+        )
     while True:
         if time.monotonic() >= operation_deadline:
             if last_escaped:
@@ -637,6 +1128,29 @@ def _require_no_new_same_uid_processes(
         if escaped:
             last_escaped = escaped
             absent_since = None
+            if dedicated_scope is not None:
+                _require_dedicated_uid_scope_current(dedicated_scope)
+                now = time.monotonic()
+                for process in escaped:
+                    first_signal = terminate_sent_at.get(process)
+                    if first_signal is None:
+                        if _signal_dedicated_uid_process(
+                            process,
+                            signal.SIGTERM,
+                            deadline=operation_deadline,
+                        ):
+                            terminate_sent_at[process] = now
+                    elif (
+                        process not in kill_sent
+                        and now - first_signal
+                        >= DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS
+                    ):
+                        if _signal_dedicated_uid_process(
+                            process,
+                            signal.SIGKILL,
+                            deadline=operation_deadline,
+                        ):
+                            kill_sent.add(process)
             _reap_terminal_same_uid_children(
                 escaped,
                 deadline=operation_deadline,
@@ -656,6 +1170,59 @@ def _require_no_new_same_uid_processes(
         if remaining <= 0:
             continue
         time.sleep(min(0.01, remaining))
+
+
+def _require_dedicated_uid_scope_current(scope: DedicatedUidScope) -> None:
+    if os.getuid() != scope.uid or os.geteuid() != scope.uid:
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            PermissionError(errno.EPERM, "dedicated UID custody changed"),
+        )
+    try:
+        account = pwd.getpwuid(scope.uid)
+    except KeyError as error:
+        raise ChildProcessTreeClosureUnproven((), error) from error
+    if (
+        account.pw_name != scope.account_name
+        or account.pw_uid != scope.uid
+        or account.pw_gid != scope.uid
+        or account.pw_dir != "/var/empty"
+        or account.pw_shell != "/usr/bin/false"
+    ):
+        raise ChildProcessTreeClosureUnproven(
+            (),
+            OSError(errno.ESTALE, "dedicated UID account identity or policy changed"),
+        )
+
+
+def _signal_dedicated_uid_process(
+    process: DarwinProcessIdentity,
+    signal_number: int,
+    *,
+    deadline: float,
+) -> bool:
+    _require_process_census_time(deadline)
+    rebound = tuple(
+        candidate
+        for candidate in _darwin_same_uid_processes(deadline=deadline)
+        if candidate.pid == process.pid
+    )
+    if not rebound:
+        return False
+    if len(rebound) != 1 or rebound[0] != process:
+        raise ChildProcessTreeClosureUnproven(
+            (process,),
+            OSError(
+                errno.ESTALE, "dedicated UID process identity changed before signal"
+            ),
+        )
+    try:
+        os.kill(process.pid, signal_number)
+    except ProcessLookupError:
+        return False
+    except OSError as error:
+        raise ChildProcessTreeClosureUnproven((process,), error) from error
+    return True
 
 
 def _reap_terminal_same_uid_children(
@@ -829,6 +1396,48 @@ def _require_isolated_child_account() -> tuple[DarwinProcessIdentity, ...]:
     return baseline
 
 
+def _dedicated_uid_scope(
+    baseline: tuple[DarwinProcessIdentity, ...],
+) -> DedicatedUidScope | None:
+    receipt = os.environ.get(DEDICATED_ACCOUNT_CUSTODY_ENV)
+    if receipt is None:
+        return None
+    if len(receipt) != 64 or any(
+        character not in "0123456789abcdef" for character in receipt
+    ):
+        raise PermissionError(errno.EPERM, "dedicated UID receipt is malformed")
+    uid = os.getuid()
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as error:
+        raise PermissionError(
+            errno.EPERM,
+            "dedicated UID account identity is unavailable",
+        ) from error
+    suffix = account.pw_name.removeprefix("codexreview")
+    if (
+        not 50000 <= uid <= 59999
+        or account.pw_uid != uid
+        or account.pw_gid != uid
+        or len(suffix) != 12
+        or any(character not in "0123456789abcdef" for character in suffix)
+        or account.pw_dir != "/var/empty"
+        or account.pw_shell != "/usr/bin/false"
+        or len(baseline) != 1
+        or baseline[0].pid != os.getpid()
+    ):
+        raise PermissionError(
+            errno.EPERM,
+            "dedicated UID account custody is not proven",
+        )
+    return DedicatedUidScope(
+        uid=uid,
+        account_name=account.pw_name,
+        receipt_sha256=receipt,
+        baseline=baseline,
+    )
+
+
 def _run_bounded_child(
     argv: tuple[str, ...],
     *,
@@ -850,6 +1459,9 @@ def _run_bounded_child(
             _require_isolated_child_account()
             if require_isolated_account
             else _stable_same_uid_processes()
+        )
+        dedicated_scope = (
+            _dedicated_uid_scope(baseline) if require_isolated_account else None
         )
         result: tuple[int, bytes, bytes] | None = None
         pending_error: BaseException | None = None
@@ -896,7 +1508,10 @@ def _run_bounded_child(
                 # same-UID closure check below.
                 pending_error = error
         try:
-            _require_no_new_same_uid_processes(baseline)
+            _require_no_new_same_uid_processes(
+                baseline,
+                dedicated_scope=dedicated_scope,
+            )
         except ChildProcessTreeClosureUnproven as error:
             raise error from pending_error
         except BaseException as error:
@@ -911,33 +1526,29 @@ def _run_bounded_child(
     return completed
 
 
-def _acl_entries(path: pathlib.Path) -> tuple[bytes, ...]:
-    completed = subprocess.run(
-        ("/bin/ls", "-lde", str(path)),
-        env=ACL_LISTING_ENVIRONMENT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=5,
+def _acl_entries(descriptor: int) -> tuple[bytes, ...]:
+    return tuple(
+        entry.encode("ascii", "strict") for entry in _macos_acl_entries(descriptor)
     )
-    if completed.returncode != 0:
-        raise RuntimeError("failed to snapshot extended ACL")
-    return tuple(completed.stdout.splitlines()[1:])
 
 
-def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
+def _xattr_snapshot(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan | None = None,
+) -> tuple[tuple[bytes, str], ...]:
     libc = ctypes.CDLL(None, use_errno=True)
-    listxattr = libc.listxattr
+    listxattr = libc.flistxattr
     listxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_void_p,
         ctypes.c_size_t,
         ctypes.c_int,
     )
     listxattr.restype = ctypes.c_ssize_t
-    getxattr = libc.getxattr
+    getxattr = libc.fgetxattr
     getxattr.argtypes = (
-        ctypes.c_char_p,
+        ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_void_p,
         ctypes.c_size_t,
@@ -945,11 +1556,10 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
         ctypes.c_int,
     )
     getxattr.restype = ctypes.c_ssize_t
-    raw_path = os.fsencode(path)
 
     def read_names() -> bytes:
         ctypes.set_errno(0)
-        size = listxattr(raw_path, None, 0, XATTR_NOFOLLOW)
+        size = listxattr(descriptor, None, 0, 0)
         if size < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -957,11 +1567,13 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
             )
         if size > XATTR_NAMES_LIMIT_BYTES:
             raise ValueError("extended attribute names exceed their byte bound")
+        if budget is not None:
+            budget.consume_access_policy_read(size)
         if size == 0:
             return b""
         buffer = ctypes.create_string_buffer(size)
         ctypes.set_errno(0)
-        actual = listxattr(raw_path, buffer, size, XATTR_NOFOLLOW)
+        actual = listxattr(descriptor, buffer, size, 0)
         if actual < 0:
             raise OSError(
                 ctypes.get_errno() or errno.EIO,
@@ -993,7 +1605,7 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
 
         def read_value() -> bytes:
             ctypes.set_errno(0)
-            size = getxattr(raw_path, name, None, 0, 0, XATTR_NOFOLLOW)
+            size = getxattr(descriptor, name, None, 0, 0, 0)
             if size < 0:
                 raise OSError(
                     ctypes.get_errno() or errno.EIO,
@@ -1001,18 +1613,13 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
                 )
             if size > XATTR_VALUE_LIMIT_BYTES:
                 raise ValueError("extended attribute value exceeds its byte bound")
+            if budget is not None:
+                budget.consume_access_policy_read(size)
             if size == 0:
                 return b""
             buffer = ctypes.create_string_buffer(size)
             ctypes.set_errno(0)
-            actual = getxattr(
-                raw_path,
-                name,
-                buffer,
-                size,
-                0,
-                XATTR_NOFOLLOW,
-            )
+            actual = getxattr(descriptor, name, buffer, size, 0, 0)
             if actual < 0:
                 raise OSError(
                     ctypes.get_errno() or errno.EIO,
@@ -1036,48 +1643,348 @@ def _xattr_snapshot(path: pathlib.Path) -> tuple[tuple[bytes, str], ...]:
     return tuple(snapshot)
 
 
-def _tree_snapshot(root: pathlib.Path) -> dict[str, TreeEntrySnapshot]:
-    snapshot: dict[str, TreeEntrySnapshot] = {}
-    paths = (root, *sorted(root.rglob("*")))
-    for path in paths:
-        metadata = path.lstat()
-        relative = "." if path == root else path.relative_to(root).as_posix()
-        mode = stat.S_IMODE(metadata.st_mode)
-        if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_nlink != 1:
-                raise RuntimeError(
-                    f"regular file has an external hardlink alias: {relative}"
-                )
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            kind = "file"
-            link_count = metadata.st_nlink
-        elif stat.S_ISDIR(metadata.st_mode):
-            digest = None
-            kind = "directory"
-            link_count = None
-        elif stat.S_ISLNK(metadata.st_mode):
-            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
-            kind = "symlink"
-            link_count = None
-        else:
-            digest = None
-            kind = "other"
-            link_count = None
-        snapshot[relative] = TreeEntrySnapshot(
-            kind=kind,
-            device=metadata.st_dev,
-            inode=metadata.st_ino,
-            generation=getattr(metadata, "st_gen", 0),
-            uid=metadata.st_uid,
-            gid=metadata.st_gid,
-            mode=mode,
-            flags=getattr(metadata, "st_flags", 0),
-            link_count=link_count,
-            digest=digest,
-            xattrs=_xattr_snapshot(path),
-            acl_entries=_acl_entries(path),
+def _snapshot_binding_key(metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        getattr(metadata, "st_gen", 0),
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+        metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None,
+    )
+
+
+def _open_snapshot_entry(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    if not name or name in {".", ".."} or "/" in name or "\0" in name:
+        raise ValueError("snapshot entry name is malformed")
+    initial = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if stat.S_ISREG(initial.st_mode):
+        flags = common_flags | os.O_NOFOLLOW
+    elif stat.S_ISDIR(initial.st_mode):
+        flags = common_flags | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISLNK(initial.st_mode):
+        raise OSError(
+            errno.EPERM,
+            "symlinks are unsupported in immutable install snapshots",
         )
-    return snapshot
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot entry changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_snapshot_root(root: pathlib.Path) -> tuple[int, os.stat_result]:
+    initial = root.lstat()
+    if not stat.S_ISDIR(initial.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "snapshot root is not a directory")
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _snapshot_binding_key(initial) != _snapshot_binding_key(opened):
+            raise OSError(errno.ESTALE, "snapshot root changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _descriptor_digest(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> str:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError(errno.EINVAL, "snapshot digest requires a regular file")
+    budget.consume_file_read(before.st_size + 1)
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < before.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, before.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+        budget.checkpoint()
+    extra = os.pread(descriptor, 1, offset)
+    after = os.fstat(descriptor)
+    if (
+        _snapshot_binding_key(before) != _snapshot_binding_key(after)
+        or before.st_size != after.st_size
+        or offset != after.st_size
+        or extra
+    ):
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest.hexdigest()
+
+
+def _access_policy_snapshot(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    xattrs = _xattr_snapshot(descriptor, budget=budget)
+    acl_entries = _acl_entries(descriptor)
+    budget.consume_access_policy_read(sum(len(entry) for entry in acl_entries))
+    return xattrs, acl_entries
+
+
+def _stable_access_policy_snapshot(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]]:
+    first = _access_policy_snapshot(descriptor, budget=budget)
+    second = _access_policy_snapshot(descriptor, budget=budget)
+    if first != second:
+        raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    return second
+
+
+def _regular_entry_sample(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    digest_before = _descriptor_digest(descriptor, budget=budget)
+    access_policy = _stable_access_policy_snapshot(descriptor, budget=budget)
+    digest_after = _descriptor_digest(descriptor, budget=budget)
+    if digest_before != digest_after:
+        raise OSError(errno.ESTALE, "regular file changed during snapshot")
+    return digest_after, access_policy
+
+
+def _stable_regular_entry_sample(
+    descriptor: int,
+    *,
+    budget: TreeSnapshotScan,
+) -> tuple[
+    str,
+    tuple[tuple[tuple[bytes, str], ...], tuple[bytes, ...]],
+]:
+    first = _regular_entry_sample(descriptor, budget=budget)
+    second = _regular_entry_sample(descriptor, budget=budget)
+    if first != second:
+        raise OSError(
+            errno.ESTALE,
+            "regular file content or access policy changed during snapshot",
+        )
+    return second
+
+
+def _snapshot_opened_entry(
+    descriptor: int,
+    initial: os.stat_result,
+    *,
+    relative: str,
+    snapshot: dict[str, TreeEntrySnapshot],
+    scan: TreeSnapshotScan,
+    depth: int,
+    expected_kinds: dict[bytes, str] | None,
+) -> TreeEntrySnapshot:
+    relative_bytes = os.fsencode(relative)
+    scan.observe_entry(depth=depth, path_bytes=len(relative_bytes))
+    if stat.S_ISREG(initial.st_mode):
+        kind = "file"
+    elif stat.S_ISDIR(initial.st_mode):
+        kind = "directory"
+    else:
+        raise OSError(errno.EPERM, "unsupported entry in read-only install tree")
+    if expected_kinds is not None and expected_kinds.get(relative_bytes) != kind:
+        raise RuntimeError("source checkout subtree does not match the exact HEAD tree")
+
+    if kind == "file":
+        if initial.st_nlink != 1:
+            raise RuntimeError(
+                f"regular file has an external hardlink alias: {relative}"
+            )
+        digest, access_policy = _stable_regular_entry_sample(
+            descriptor,
+            budget=scan,
+        )
+        link_count = initial.st_nlink
+    else:
+        digest = None
+        link_count = None
+        access_before = _stable_access_policy_snapshot(
+            descriptor,
+            budget=scan,
+        )
+        names = _bounded_snapshot_directory_names(
+            descriptor,
+            scan=scan,
+            child_depth=depth + 1,
+        )
+        for name in names:
+            child_relative = name if relative == "." else f"{relative}/{name}"
+            child_descriptor, child_initial = _open_snapshot_entry(descriptor, name)
+            try:
+                child_snapshot = _snapshot_opened_entry(
+                    child_descriptor,
+                    child_initial,
+                    relative=child_relative,
+                    snapshot=snapshot,
+                    scan=scan,
+                    depth=depth + 1,
+                    expected_kinds=expected_kinds,
+                )
+                final_child = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if _snapshot_binding_key(child_initial) != _snapshot_binding_key(
+                    final_child
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "snapshot path no longer names the bound object: "
+                        f"{child_relative}",
+                    )
+                snapshot[child_relative] = child_snapshot
+            finally:
+                os.close(child_descriptor)
+        if names != _bounded_snapshot_directory_names(
+            descriptor,
+            scan=scan,
+            child_depth=depth + 1,
+        ):
+            raise OSError(
+                errno.ESTALE,
+                f"directory changed during snapshot: {relative}",
+            )
+        access_policy = _stable_access_policy_snapshot(
+            descriptor,
+            budget=scan,
+        )
+        if access_before != access_policy:
+            raise OSError(errno.ESTALE, "access policy changed during snapshot")
+    final_descriptor = os.fstat(descriptor)
+    if _snapshot_binding_key(initial) != _snapshot_binding_key(final_descriptor):
+        raise OSError(
+            errno.ESTALE,
+            f"snapshot object changed during capture: {relative}",
+        )
+    if stat.S_ISREG(initial.st_mode) and initial.st_size != final_descriptor.st_size:
+        raise OSError(errno.ESTALE, f"regular file changed during snapshot: {relative}")
+    xattrs, acl_entries = access_policy
+    return TreeEntrySnapshot(
+        kind=kind,
+        size=final_descriptor.st_size if kind == "file" else None,
+        device=final_descriptor.st_dev,
+        inode=final_descriptor.st_ino,
+        generation=getattr(final_descriptor, "st_gen", 0),
+        uid=final_descriptor.st_uid,
+        gid=final_descriptor.st_gid,
+        mode=stat.S_IMODE(final_descriptor.st_mode),
+        flags=getattr(final_descriptor, "st_flags", 0),
+        link_count=link_count,
+        digest=digest,
+        xattrs=xattrs,
+        acl_entries=acl_entries,
+    )
+
+
+def _bounded_snapshot_directory_names(
+    descriptor: int,
+    *,
+    scan: TreeSnapshotScan,
+    child_depth: int,
+) -> tuple[str, ...]:
+    names = []
+    with os.scandir(descriptor) as iterator:
+        for entry in iterator:
+            encoded = os.fsencode(entry.name)
+            scan.observe_entry(depth=child_depth, path_bytes=len(encoded))
+            names.append(entry.name)
+    scan.checkpoint()
+    return tuple(sorted(names))
+
+
+def _tree_snapshot_once(
+    root: pathlib.Path,
+    *,
+    scan: TreeSnapshotScan,
+    expected_kinds: dict[bytes, str] | None = None,
+) -> dict[str, TreeEntrySnapshot]:
+    snapshot: dict[str, TreeEntrySnapshot] = {}
+    scan.checkpoint()
+    descriptor, initial = _open_snapshot_root(root)
+    try:
+        root_snapshot = _snapshot_opened_entry(
+            descriptor,
+            initial,
+            relative=".",
+            snapshot=snapshot,
+            scan=scan,
+            depth=0,
+            expected_kinds=expected_kinds,
+        )
+        final_descriptor = os.fstat(descriptor)
+        final_path = root.lstat()
+        if _snapshot_binding_key(final_descriptor) != _snapshot_binding_key(final_path):
+            raise OSError(
+                errno.ESTALE,
+                "snapshot root path no longer names the bound object",
+            )
+        snapshot["."] = root_snapshot
+        if (
+            expected_kinds is not None
+            and {os.fsencode(path): entry.kind for path, entry in snapshot.items()}
+            != expected_kinds
+        ):
+            raise RuntimeError(
+                "source checkout subtree does not match the exact HEAD tree"
+            )
+        return snapshot
+    finally:
+        os.close(descriptor)
+
+
+def _tree_snapshot(
+    root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+    expected_kinds: dict[bytes, str] | None = None,
+) -> dict[str, TreeEntrySnapshot]:
+    scan = (budget or TreeSnapshotBudget.create()).start_scan()
+    first = _tree_snapshot_once(
+        root,
+        scan=scan,
+        expected_kinds=expected_kinds,
+    )
+    second = _tree_snapshot_once(
+        root,
+        scan=scan,
+        expected_kinds=expected_kinds,
+    )
+    if not _tree_property_unchanged(first, second):
+        raise OSError(errno.ESTALE, "install tree changed during snapshot")
+    return second
 
 
 def _tree_property_unchanged(
@@ -1089,6 +1996,895 @@ def _tree_property_unchanged(
     return all(
         before[path].protected_key() == after[path].protected_key() for path in before
     )
+
+
+def _snapshot_manifest_sha256(
+    snapshot: dict[str, TreeEntrySnapshot],
+    *,
+    owner_uid_override: int | None,
+    group_gid_override: int | None,
+) -> str:
+    records = []
+    for path, entry in sorted(snapshot.items()):
+        records.append(
+            (
+                path,
+                entry.kind,
+                entry.size,
+                entry.uid if owner_uid_override is None else owner_uid_override,
+                entry.gid if group_gid_override is None else group_gid_override,
+                entry.mode,
+                entry.flags,
+                entry.digest,
+                tuple((name.hex(), digest) for name, digest in entry.xattrs),
+                tuple(value.hex() for value in entry.acl_entries),
+            )
+        )
+    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_snapshot_manifest_sha256(
+    snapshot: dict[str, TreeEntrySnapshot],
+) -> str:
+    return _snapshot_manifest_sha256(
+        snapshot,
+        owner_uid_override=None,
+        group_gid_override=None,
+    )
+
+
+def _destination_snapshot_manifest_sha256(
+    source_entries: tuple[tuple[str, TreeEntrySnapshot], ...],
+    *,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> str:
+    return _snapshot_manifest_sha256(
+        dict(source_entries),
+        owner_uid_override=destination_owner_uid,
+        group_gid_override=destination_group_gid,
+    )
+
+
+def _source_manifest_sha256(
+    root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+) -> str:
+    return _source_snapshot_manifest_sha256(_tree_snapshot(root, budget=budget))
+
+
+def _source_git_output(source_root: pathlib.Path, *arguments: str) -> bytes:
+    command = (
+        selected_git_executable(),
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "color.ui=false",
+        "-C",
+        str(source_root),
+        *arguments,
+    )
+    returncode, stdout, stderr = run_bounded(
+        command,
+        cwd=source_root,
+        environment=bound_git_environment(
+            {
+                "GIT_ASKPASS": "/usr/bin/false",
+                "GIT_PAGER": "cat",
+                "PAGER": "cat",
+            }
+        ),
+        timeout=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    if returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[:512]
+        raise RuntimeError(f"source checkout Git validation failed: {detail}")
+    return stdout
+
+
+def _validate_source_git_configuration(source_root: pathlib.Path) -> None:
+    payload = _source_git_output(
+        source_root,
+        "config",
+        "--no-includes",
+        "--null",
+        "--list",
+    )
+    if payload and not payload.endswith(b"\0"):
+        raise RuntimeError("source checkout Git config output is malformed")
+    for record in payload[:-1].split(b"\0") if payload else ():
+        key, separator, value = record.partition(b"\n")
+        if not key or not separator:
+            raise RuntimeError("source checkout Git config output is malformed")
+        lower_key = key.lower()
+        lower_value = value.strip().lower()
+        if lower_key == b"include.path" or (
+            lower_key.startswith(b"includeif.") and lower_key.endswith(b".path")
+        ):
+            raise RuntimeError("source checkout Git config contains an include")
+        if lower_key.startswith(b"alias."):
+            raise RuntimeError("source checkout Git config contains an alias")
+        if lower_key == b"core.filemode" and lower_value not in {
+            b"true",
+            b"yes",
+            b"on",
+            b"1",
+        }:
+            raise RuntimeError("source checkout Git config disables core.fileMode")
+        if lower_key == b"core.fsmonitor" and lower_value not in {
+            b"false",
+            b"no",
+            b"off",
+            b"0",
+        }:
+            raise RuntimeError("source checkout Git config enables core.fsmonitor")
+        filter_key = lower_key.startswith(b"filter.") and lower_key.rsplit(b".", 1)[
+            -1
+        ] in {b"clean", b"process", b"smudge"}
+        diff_key = lower_key == b"diff.external" or (
+            lower_key.startswith(b"diff.")
+            and lower_key.rsplit(b".", 1)[-1] in {b"command", b"textconv"}
+        )
+        if (filter_key or diff_key) and lower_value:
+            raise RuntimeError(
+                "source checkout Git config contains an executable filter or diff"
+            )
+
+
+def _validate_source_index_flags(
+    repo_root: pathlib.Path,
+    source_relative_path: str,
+) -> None:
+    payload = _source_git_output(
+        repo_root,
+        "ls-files",
+        "--cached",
+        "--full-name",
+        "-v",
+        "-z",
+        "--",
+        source_relative_path,
+    )
+    if payload and not payload.endswith(b"\0"):
+        raise RuntimeError("source checkout index flag output is malformed")
+    valid_tags = frozenset(b"HSMRCK?hsmrck")
+    for record in payload[:-1].split(b"\0") if payload else ():
+        if len(record) < 3 or record[1:2] != b" " or record[0] not in valid_tags:
+            raise RuntimeError("source checkout index flag output is malformed")
+        tag = record[0:1]
+        if tag == b"S" or tag.islower():
+            raise RuntimeError(
+                "source checkout contains assume-unchanged or skip-worktree flags"
+            )
+
+
+def _source_head_subtree(
+    *,
+    repo_root: pathlib.Path,
+    source_relative_path: str,
+    head_sha: str,
+    budget: TreeSnapshotBudget,
+) -> tuple[Any, tuple[tuple[bytes, Any], ...], dict[bytes, str]]:
+    repository = inspect_repository(
+        repo=repo_root,
+        base_sha=head_sha,
+        head_sha=head_sha,
+        git_executable=selected_git_executable(),
+    )
+    tree = enumerate_tree(repository, head_sha)
+    prefix = os.fsencode(source_relative_path)
+    prefix_with_separator = b"" if prefix == b"." else prefix + b"/"
+    selected = []
+    expansion_scan = budget.start_scan()
+    for entry in tree.entries:
+        expansion_scan.checkpoint()
+        if prefix_with_separator:
+            if not entry.path.startswith(prefix_with_separator):
+                continue
+            relative_path = entry.path[len(prefix_with_separator) :]
+        else:
+            relative_path = entry.path
+        if not relative_path or not entry.is_regular:
+            raise RuntimeError(
+                "source checkout exact-head subtree contains an unsupported entry"
+            )
+        selected.append((relative_path, entry))
+    if not selected:
+        raise RuntimeError("source checkout exact-head subtree is empty")
+    expected_kinds = {b".": "directory"}
+    expansion_scan.observe_entry(depth=0, path_bytes=1)
+    for relative_path, _entry in selected:
+        components = relative_path.split(b"/")
+        if any(not component or component in {b".", b".."} for component in components):
+            raise RuntimeError("source checkout exact-head path is malformed")
+        for index in range(1, len(components)):
+            directory = b"/".join(components[:index])
+            if directory not in expected_kinds:
+                expansion_scan.observe_entry(
+                    depth=index,
+                    path_bytes=len(directory),
+                )
+                expected_kinds[directory] = "directory"
+        expansion_scan.observe_entry(
+            depth=len(components),
+            path_bytes=len(relative_path),
+        )
+        expected_kinds[relative_path] = "file"
+    return repository, tuple(selected), expected_kinds
+
+
+def _bind_source_tree(
+    source_root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget,
+) -> SourceTreeBinding:
+    source_snapshot = _tree_snapshot(source_root, budget=budget)
+    return SourceTreeBinding(
+        source_manifest_sha256=_source_snapshot_manifest_sha256(source_snapshot),
+        source_root_gid=source_snapshot["."].gid,
+        source_entries=tuple(sorted(source_snapshot.items())),
+    )
+
+
+def _verify_source_snapshot_matches_head(
+    *,
+    source_snapshot: dict[str, TreeEntrySnapshot],
+    repository: Any,
+    selected: tuple[tuple[bytes, Any], ...],
+) -> str:
+    actual_files = {
+        os.fsencode(path): entry
+        for path, entry in source_snapshot.items()
+        if entry.kind == "file"
+    }
+    actual_directories = {
+        os.fsencode(path)
+        for path, entry in source_snapshot.items()
+        if entry.kind == "directory"
+    }
+    expected_directories = {b"."}
+    for relative_path, _entry in selected:
+        components = relative_path.split(b"/")
+        expected_directories.update(
+            b"/".join(components[:index]) for index in range(1, len(components))
+        )
+    expected_paths = {relative_path for relative_path, _entry in selected}
+    if (
+        actual_files.keys() != expected_paths
+        or actual_directories != expected_directories
+    ):
+        raise RuntimeError("source checkout subtree does not match the exact HEAD tree")
+
+    manifest_digest = hashlib.sha256()
+    with CatFileBatch(repository) as batch:
+        for relative_path, entry in selected:
+            local_entry = actual_files[relative_path]
+            if entry.mode != (stat.S_IFREG | local_entry.mode):
+                raise RuntimeError(
+                    "source checkout file mode does not match the exact HEAD tree"
+                )
+            blob_digest = hashlib.sha256()
+            batch.read_blob(entry, consumer=blob_digest.update)
+            observed_digest = blob_digest.hexdigest()
+            if local_entry.digest != observed_digest:
+                raise RuntimeError(
+                    "source checkout file content does not match the exact HEAD blob"
+                )
+            manifest_digest.update(f"{entry.mode:06o} ".encode("ascii"))
+            manifest_digest.update(observed_digest.encode("ascii"))
+            manifest_digest.update(b"\t")
+            manifest_digest.update(relative_path)
+            manifest_digest.update(b"\0")
+    return manifest_digest.hexdigest()
+
+
+def _bind_source_checkout(
+    source_root: pathlib.Path,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+) -> SourceCheckoutBinding:
+    active_budget = budget or TreeSnapshotBudget.create()
+    expected_head = os.environ.get(EXPECTED_HEAD_ENV, "")
+    if len(expected_head) != 40 or any(
+        character not in "0123456789abcdef" for character in expected_head
+    ):
+        raise RuntimeError(f"{EXPECTED_HEAD_ENV} must be one full lowercase SHA-1")
+    _validate_source_git_configuration(source_root)
+    repo_root = pathlib.Path(
+        os.fsdecode(
+            _source_git_output(source_root, "rev-parse", "--show-toplevel").strip()
+        )
+    ).resolve(strict=True)
+    resolved_source = source_root.resolve(strict=True)
+    try:
+        relative = resolved_source.relative_to(repo_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "runner source is outside its reported Git worktree"
+        ) from error
+    observed_head = os.fsdecode(
+        _source_git_output(source_root, "rev-parse", "HEAD").strip()
+    )
+    if observed_head != expected_head:
+        raise RuntimeError(
+            "source checkout HEAD does not match the expected exact head"
+        )
+    relative_path = relative.as_posix()
+    _validate_source_index_flags(repo_root, relative_path)
+    repository, selected, expected_kinds = _source_head_subtree(
+        repo_root=repo_root,
+        source_relative_path=relative_path,
+        head_sha=expected_head,
+        budget=active_budget,
+    )
+    source_snapshot = _tree_snapshot(
+        source_root,
+        budget=active_budget,
+        expected_kinds=expected_kinds,
+    )
+    head_subtree_manifest_sha256 = _verify_source_snapshot_matches_head(
+        source_snapshot=source_snapshot,
+        repository=repository,
+        selected=selected,
+    )
+    _validate_source_git_configuration(source_root)
+    _validate_source_index_flags(repo_root, relative_path)
+    return SourceCheckoutBinding(
+        repo_root=repo_root,
+        head_sha=observed_head,
+        source_relative_path=relative_path,
+        source_manifest_sha256=_source_snapshot_manifest_sha256(source_snapshot),
+        head_subtree_manifest_sha256=head_subtree_manifest_sha256,
+        source_root_gid=source_snapshot["."].gid,
+        source_entries=tuple(sorted(source_snapshot.items())),
+    )
+
+
+def _snapshot_entry_matches_metadata(
+    entry: TreeEntrySnapshot,
+    metadata: os.stat_result,
+) -> bool:
+    return (
+        entry.device == metadata.st_dev
+        and entry.inode == metadata.st_ino
+        and entry.generation == getattr(metadata, "st_gen", 0)
+        and entry.uid == metadata.st_uid
+        and entry.gid == metadata.st_gid
+        and entry.mode == stat.S_IMODE(metadata.st_mode)
+        and entry.flags == getattr(metadata, "st_flags", 0)
+        and entry.link_count
+        == (metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None)
+        and entry.size == (metadata.st_size if stat.S_ISREG(metadata.st_mode) else None)
+    )
+
+
+@contextmanager
+def _open_relative_source_entry(
+    root_descriptor: int,
+    relative: str,
+) -> Iterator[tuple[int, os.stat_result]]:
+    if relative == ".":
+        descriptor = os.dup(root_descriptor)
+        try:
+            yield descriptor, os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+    components = pathlib.PurePosixPath(relative).parts
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise RuntimeError("bound source path is malformed")
+    parent_descriptor = os.dup(root_descriptor)
+    try:
+        metadata: os.stat_result | None = None
+        for component in components:
+            child_descriptor, metadata = _open_snapshot_entry(
+                parent_descriptor,
+                component,
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+        assert metadata is not None
+        yield parent_descriptor, metadata
+    finally:
+        os.close(parent_descriptor)
+
+
+def _copy_bound_xattrs(
+    source_descriptor: int,
+    destination_descriptor: int,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    listxattr = libc.flistxattr
+    listxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    )
+    listxattr.restype = ctypes.c_ssize_t
+    getxattr = libc.fgetxattr
+    getxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    getxattr.restype = ctypes.c_ssize_t
+    setxattr = libc.fsetxattr
+    setxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    setxattr.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    names_size = listxattr(source_descriptor, None, 0, 0)
+    if names_size < 0:
+        raise OSError(
+            ctypes.get_errno() or errno.EIO,
+            "cannot size source extended attribute names during bounded copy",
+        )
+    if names_size > XATTR_NAMES_LIMIT_BYTES:
+        raise ValueError("source extended attribute names exceed their byte bound")
+    scan.consume_access_policy_read(names_size)
+    if names_size:
+        names_buffer = ctypes.create_string_buffer(names_size)
+        ctypes.set_errno(0)
+        actual_names_size = listxattr(
+            source_descriptor,
+            names_buffer,
+            names_size,
+            0,
+        )
+        if actual_names_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot read source extended attribute names during bounded copy",
+            )
+        if actual_names_size != names_size:
+            raise OSError(
+                errno.ESTALE,
+                "source extended attributes changed during bounded copy",
+            )
+        raw_names = bytes(names_buffer.raw[:names_size])
+        if not raw_names.endswith(b"\0"):
+            raise ValueError("source extended attribute name list is malformed")
+        observed_names = tuple(sorted(raw_names[:-1].split(b"\0")))
+    else:
+        observed_names = ()
+    if (
+        any(not name for name in observed_names)
+        or len(observed_names) > 128
+        or len(set(observed_names)) != len(observed_names)
+    ):
+        raise ValueError("source extended attribute name list is malformed")
+    expected_names = tuple(name for name, _digest in expected.xattrs)
+    if observed_names != expected_names:
+        raise OSError(errno.ESTALE, "source xattrs changed during bounded copy")
+    for name, expected_digest in expected.xattrs:
+        ctypes.set_errno(0)
+        value_size = getxattr(source_descriptor, name, None, 0, 0, 0)
+        if value_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot size source extended attribute during bounded copy",
+            )
+        if value_size > XATTR_VALUE_LIMIT_BYTES:
+            raise ValueError("source extended attribute exceeds its byte bound")
+        scan.consume_access_policy_read(value_size)
+        value_buffer = ctypes.create_string_buffer(max(1, value_size))
+        ctypes.set_errno(0)
+        actual_value_size = getxattr(
+            source_descriptor,
+            name,
+            value_buffer,
+            value_size,
+            0,
+            0,
+        )
+        if actual_value_size < 0:
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot read source extended attribute during bounded copy",
+            )
+        if actual_value_size != value_size:
+            raise OSError(
+                errno.ESTALE,
+                "source extended attribute changed during bounded copy",
+            )
+        value = bytes(value_buffer.raw[:value_size])
+        if hashlib.sha256(value).hexdigest() != expected_digest:
+            raise OSError(errno.ESTALE, "source xattr changed during bounded copy")
+        ctypes.set_errno(0)
+        if (
+            setxattr(
+                destination_descriptor,
+                name,
+                value_buffer,
+                value_size,
+                0,
+                0,
+            )
+            != 0
+        ):
+            raise OSError(
+                ctypes.get_errno() or errno.EIO,
+                "cannot copy source extended attribute to installed tree",
+            )
+
+
+def _require_copied_destination_owner(
+    destination_descriptor: int,
+    *,
+    destination_owner_uid: int,
+) -> os.stat_result:
+    destination_metadata = os.fstat(destination_descriptor)
+    if destination_metadata.st_uid != destination_owner_uid:
+        raise RuntimeError("bounded source copy changed the expected destination owner")
+    return destination_metadata
+
+
+def _require_copied_destination_identity(
+    destination_descriptor: int,
+    *,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> os.stat_result:
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
+    if destination_metadata.st_gid != destination_group_gid:
+        raise RuntimeError("bounded source copy changed the expected destination group")
+    return destination_metadata
+
+
+def _apply_copied_entry_policy(
+    source_descriptor: int,
+    destination_descriptor: int,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> None:
+    source_policy = _stable_access_policy_snapshot(
+        source_descriptor,
+        budget=scan,
+    )
+    if source_policy != (expected.xattrs, expected.acl_entries):
+        raise OSError(errno.ESTALE, "source access policy changed during bounded copy")
+    if expected.acl_entries:
+        raise RuntimeError("bounded source copy does not admit extended ACLs")
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
+    _copy_bound_xattrs(
+        source_descriptor,
+        destination_descriptor,
+        expected,
+        scan=scan,
+    )
+    destination_metadata = _require_copied_destination_owner(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+    )
+    if destination_metadata.st_gid != destination_group_gid:
+        os.fchown(destination_descriptor, -1, destination_group_gid)
+    os.fchmod(destination_descriptor, expected.mode)
+    if expected.flags:
+        if not hasattr(os, "fchflags"):
+            raise RuntimeError("bounded source copy cannot apply file flags")
+        os.fchflags(destination_descriptor, expected.flags)
+    _require_copied_destination_identity(
+        destination_descriptor,
+        destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
+    )
+
+
+def _copy_bound_regular_file(
+    source_descriptor: int,
+    destination: pathlib.Path,
+    expected: TreeEntrySnapshot,
+    *,
+    scan: TreeSnapshotScan,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> None:
+    if expected.kind != "file" or expected.size is None or expected.digest is None:
+        raise RuntimeError("bounded source file receipt is malformed")
+    initial = os.fstat(source_descriptor)
+    if not _snapshot_entry_matches_metadata(expected, initial):
+        raise OSError(errno.ESTALE, "bound source file identity changed before copy")
+    scan.consume_file_read(expected.size + 1)
+    destination_descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.size:
+            chunk = os.pread(
+                source_descriptor,
+                min(1024 * 1024, expected.size - offset),
+                offset,
+            )
+            if not chunk:
+                break
+            digest.update(chunk)
+            written = 0
+            while written < len(chunk):
+                count = os.write(destination_descriptor, chunk[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "bounded source copy made no progress")
+                written += count
+            offset += len(chunk)
+            scan.checkpoint()
+        extra = os.pread(source_descriptor, 1, offset)
+        final = os.fstat(source_descriptor)
+        if (
+            offset != expected.size
+            or extra
+            or not _snapshot_entry_matches_metadata(expected, final)
+            or digest.hexdigest() != expected.digest
+        ):
+            raise OSError(errno.ESTALE, "bound source file changed during copy")
+        _apply_copied_entry_policy(
+            source_descriptor,
+            destination_descriptor,
+            expected,
+            scan=scan,
+            destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
+        )
+    finally:
+        os.close(destination_descriptor)
+
+
+def _copy_bound_source_tree(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceCheckoutBinding | SourceTreeBinding,
+    *,
+    budget: TreeSnapshotBudget,
+    destination_owner_uid: int,
+    destination_group_gid: int,
+) -> None:
+    entries = dict(source_binding.source_entries)
+    root_entry = entries.get(".")
+    if root_entry is None or root_entry.kind != "directory":
+        raise RuntimeError("bound source root receipt is malformed")
+    scan = budget.start_scan()
+    source_descriptor, source_metadata = _open_snapshot_root(source_root)
+    try:
+        scan.observe_entry(depth=0, path_bytes=1)
+        if not _snapshot_entry_matches_metadata(root_entry, source_metadata):
+            raise OSError(
+                errno.ESTALE, "bound source root identity changed before copy"
+            )
+        installed_root.mkdir(mode=0o700)
+        installed_root_descriptor = os.open(
+            installed_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            _require_copied_destination_owner(
+                installed_root_descriptor,
+                destination_owner_uid=destination_owner_uid,
+            )
+        finally:
+            os.close(installed_root_descriptor)
+        directories = sorted(
+            (
+                (path, entry)
+                for path, entry in entries.items()
+                if path != "." and entry.kind == "directory"
+            ),
+            key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0]),
+        )
+        files = sorted(
+            (item for item in entries.items() if item[1].kind == "file"),
+            key=lambda item: item[0],
+        )
+        if len(directories) + len(files) + 1 != len(entries):
+            raise RuntimeError("bound source receipt contains an unsupported entry")
+        for relative, _entry in directories:
+            scan.observe_entry(
+                depth=len(pathlib.PurePosixPath(relative).parts),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            (installed_root / relative).mkdir(mode=0o700)
+        for relative, entry in files:
+            scan.observe_entry(
+                depth=len(pathlib.PurePosixPath(relative).parts),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            with _open_relative_source_entry(
+                source_descriptor,
+                relative,
+            ) as (entry_descriptor, metadata):
+                if not _snapshot_entry_matches_metadata(entry, metadata):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound source file identity changed before copy",
+                    )
+                _copy_bound_regular_file(
+                    entry_descriptor,
+                    installed_root / relative,
+                    entry,
+                    scan=scan,
+                    destination_owner_uid=destination_owner_uid,
+                    destination_group_gid=destination_group_gid,
+                )
+        for relative, entry in sorted(
+            ((".", root_entry), *directories),
+            key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0]),
+            reverse=True,
+        ):
+            scan.observe_entry(
+                depth=(
+                    0 if relative == "." else len(pathlib.PurePosixPath(relative).parts)
+                ),
+                path_bytes=len(os.fsencode(relative)),
+            )
+            with _open_relative_source_entry(
+                source_descriptor,
+                relative,
+            ) as (entry_descriptor, metadata):
+                if not _snapshot_entry_matches_metadata(entry, metadata):
+                    raise OSError(
+                        errno.ESTALE,
+                        "bound source directory identity changed during copy",
+                    )
+                destination_descriptor = os.open(
+                    installed_root if relative == "." else installed_root / relative,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_NONBLOCK
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW,
+                )
+                try:
+                    _apply_copied_entry_policy(
+                        entry_descriptor,
+                        destination_descriptor,
+                        entry,
+                        scan=scan,
+                        destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
+                    )
+                finally:
+                    os.close(destination_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
+def _copy_bound_tree(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceTreeBinding,
+    *,
+    budget: TreeSnapshotBudget,
+    destination_owner_uid: int | None = None,
+    destination_group_gid: int | None = None,
+) -> str:
+    destination_owner_uid = (
+        os.geteuid() if destination_owner_uid is None else destination_owner_uid
+    )
+    destination_group_gid = (
+        os.getegid() if destination_group_gid is None else destination_group_gid
+    )
+    _copy_bound_source_tree(
+        source_root,
+        installed_root,
+        source_binding,
+        budget=budget,
+        destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
+    )
+    installed_manifest = _source_manifest_sha256(
+        installed_root,
+        budget=budget,
+    )
+    source_binding_after = _bind_source_tree(
+        source_root,
+        budget=budget,
+    )
+    if (
+        source_binding_after != source_binding
+        or installed_manifest
+        != _destination_snapshot_manifest_sha256(
+            source_binding.source_entries,
+            destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
+        )
+    ):
+        raise RuntimeError(
+            "installed test input does not match the stable bounded source"
+        )
+    return source_binding.source_manifest_sha256
+
+
+def _copy_bound_source(
+    source_root: pathlib.Path,
+    installed_root: pathlib.Path,
+    source_binding: SourceCheckoutBinding,
+    source_manifest_before: str,
+    *,
+    budget: TreeSnapshotBudget | None = None,
+    destination_owner_uid: int | None = None,
+    destination_group_gid: int | None = None,
+) -> str:
+    active_budget = budget or TreeSnapshotBudget.create()
+    destination_owner_uid = (
+        os.geteuid() if destination_owner_uid is None else destination_owner_uid
+    )
+    destination_group_gid = (
+        os.getegid() if destination_group_gid is None else destination_group_gid
+    )
+    _copy_bound_source_tree(
+        source_root,
+        installed_root,
+        source_binding,
+        budget=active_budget,
+        destination_owner_uid=destination_owner_uid,
+        destination_group_gid=destination_group_gid,
+    )
+    installed_manifest = _source_manifest_sha256(
+        installed_root,
+        budget=active_budget,
+    )
+    source_binding_after = _bind_source_checkout(
+        source_root,
+        budget=active_budget,
+    )
+    source_manifest_after = source_binding_after.source_manifest_sha256
+    if (
+        source_binding_after != source_binding
+        or source_manifest_after != source_manifest_before
+        or installed_manifest
+        != _destination_snapshot_manifest_sha256(
+            source_binding.source_entries,
+            destination_owner_uid=destination_owner_uid,
+            destination_group_gid=destination_group_gid,
+        )
+    ):
+        raise RuntimeError(
+            "installed test input does not match the stable exact-head source"
+        )
+    return source_manifest_before
 
 
 def _set_tree_read_only(root: pathlib.Path) -> None:
@@ -1295,6 +3091,85 @@ def _bounded_failure_text(value: str, *, limit: int = 16_384) -> str:
     return value[-limit:]
 
 
+def _serialize_terminal_json(value: object, *, operation: str) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except BaseException as error:
+        raise TerminalPublicationError(operation, error) from error
+
+
+def _write_terminal_stdout(payload: bytes) -> None:
+    try:
+        descriptor = sys.stdout.fileno()
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "terminal stdout write made no progress")
+            remaining = remaining[written:]
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+    try:
+        written = os.write(descriptor, b"\n")
+        if written != 1:
+            raise OSError(
+                errno.EIO,
+                "terminal stdout newline write made no progress",
+            )
+    except BaseException as error:
+        _report_terminal_publication_failure(
+            TerminalPublicationError("stdout-newline", error)
+        )
+
+
+def _publish_terminal_output(
+    summary: dict[str, object],
+    diagnostics: str,
+    *,
+    terminal_process: bool,
+) -> None:
+    summary_text = _serialize_terminal_json(
+        summary,
+        operation="summary-serialization",
+    )
+    try:
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-flush", error) from error
+    try:
+        if diagnostics:
+            sys.stderr.write(diagnostics)
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-write", error) from error
+    try:
+        sys.stderr.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stderr-flush", error) from error
+
+    payload = summary_text.encode("utf-8")
+    if terminal_process:
+        _write_terminal_stdout(payload)
+        return
+    try:
+        sys.stdout.write(payload.decode("utf-8") + "\n")
+        sys.stdout.flush()
+    except BaseException as error:
+        raise TerminalPublicationError("stdout-write", error) from error
+
+
+def _report_terminal_publication_failure(error: TerminalPublicationError) -> None:
+    message = (
+        "read-only installed supervisor terminal publication failed: "
+        f"operation={error.operation}; "
+        f"error={type(error.error).__name__}: "
+        f"{_bounded_failure_text(str(error.error), limit=1_024)}\n"
+    )
+    try:
+        os.write(2, message.encode("utf-8", errors="backslashreplace"))
+    except BaseException:
+        pass
+
+
 def _primary_failure(stage: str, error: BaseException) -> PrimaryFailure:
     error_errno = getattr(error, "errno", None)
     return PrimaryFailure(
@@ -1352,7 +3227,7 @@ def _cleanup_tree(
 
 
 def _cleanup_failure_from_error(
-    path: pathlib.Path,
+    path: pathlib.Path | str,
     error: BaseException,
     *,
     retained: bool | None,
@@ -1469,6 +3344,57 @@ def _bound_cleanup_failure(
         original_path_status=evidence.original_path_status,
         access_policy_status=evidence.access_policy_status,
         recovery_evidence=recovery_evidence,
+    )
+
+
+def _bound_close_failure(
+    binding: _DirectoryParentBinding,
+    error: BaseException,
+    *,
+    evidence: BoundPathEvidence | None,
+    evidence_error: BaseException | None,
+) -> CleanupFailure:
+    """Report the held object, never a replacement at its lexical path."""
+
+    held_identity = binding.object_locator()
+    if evidence_error is not None:
+        try:
+            error.add_note(
+                "pre-close retention evidence failed: "
+                f"{type(evidence_error).__name__}: {evidence_error}"
+            )
+        except BaseException:
+            pass
+    if evidence is None or evidence.path_status == "bound-unresolved":
+        path: pathlib.Path | str = (
+            f"descriptor-object://{held_identity['device']}/{held_identity['inode']}"
+        )
+        retained = evidence.retained if evidence is not None else None
+        replacement_path = evidence.replacement_path if evidence is not None else None
+        original_path_status = (
+            evidence.original_path_status if evidence is not None else "unreadable"
+        )
+        access_policy_status = (
+            evidence.access_policy_status if evidence is not None else "unreadable"
+        )
+        path_status = "descriptor-object"
+    else:
+        path = evidence.path
+        retained = evidence.retained
+        replacement_path = evidence.replacement_path
+        original_path_status = evidence.original_path_status
+        access_policy_status = evidence.access_policy_status
+        path_status = evidence.path_status
+    return _cleanup_failure_from_error(
+        path,
+        error,
+        retained=retained,
+        original_path=binding.path,
+        path_status=path_status,
+        replacement_path=replacement_path,
+        held_identity=held_identity,
+        original_path_status=original_path_status,
+        access_policy_status=access_policy_status,
     )
 
 
@@ -3104,21 +5030,11 @@ def _retained_for_unproven_child_closure(
     )
 
 
-def main() -> int:
-    if sys.platform != "darwin":
-        print(
-            "read-only installed supervisor regression requires Darwin", file=sys.stderr
-        )
-        return 2
-    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(parent_metadata.st_mode)
-        or not parent_metadata.st_mode & stat.S_ISVTX
-        or not parent_metadata.st_mode & stat.S_IWOTH
-    ):
-        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
-        return 2
-
+def _run_main(
+    lifecycle_fence: LifecycleSignalFence,
+    *,
+    terminal_process: bool,
+) -> int:
     source_root = pathlib.Path(__file__).resolve().parents[1]
     install_container: pathlib.Path | None = None
     install_container_binding: _DirectoryParentBinding | None = None
@@ -3137,6 +5053,7 @@ def main() -> int:
     timeout_error: TimeoutError | None = None
     output_limit_error: OverflowError | None = None
     signal_error: ChildRunInterrupted | None = None
+    signal_is_primary = False
     closure_error: GitProcessClosureUnproven | None = None
     child_process_closure = "not-started"
     primary_failure: PrimaryFailure | None = None
@@ -3145,8 +5062,28 @@ def main() -> int:
     cleanup_failures: tuple[CleanupFailure, ...] = ()
     creation_cleanup_failures: list[CleanupFailure] = []
     deferred_control_flow_error: BaseException | None = None
-    stage = "install-container"
+    source_binding: SourceCheckoutBinding | None = None
+    source_tree_binding: SourceTreeBinding | SourceCheckoutBinding | None = None
+    source_head_bound = False
+    source_manifest_sha256: str | None = None
+    trusted_source_requested = bool(os.environ.get(EXPECTED_HEAD_ENV))
+    source_manifest_before: str | None = None
+    snapshot_budget = TreeSnapshotBudget.create()
+    stage = "source-head-binding" if trusted_source_requested else "install-container"
     try:
+        if trusted_source_requested:
+            source_binding = _bind_source_checkout(
+                source_root,
+                budget=snapshot_budget,
+            )
+            source_tree_binding = source_binding
+        else:
+            source_tree_binding = _bind_source_tree(
+                source_root,
+                budget=snapshot_budget,
+            )
+        source_manifest_before = source_tree_binding.source_manifest_sha256
+        stage = "install-container"
         install_container_binding = _create_bound_owned_private_directory(
             READONLY_INSTALL_PARENT,
             ".codex-review-readonly-install-",
@@ -3157,9 +5094,10 @@ def main() -> int:
             install_container_binding
         )
         install_container = install_container_binding.path
+        destination_owner_uid = install_container_binding.policy.uid
+        destination_group_gid = install_container_binding.policy.gid
         stage = "runtime-parent"
-        runtime_parent_binding = _create_bound_owned_private_directory(
-            _private_runtime_parent(),
+        runtime_parent_binding = _create_bound_owned_private_runtime_directory(
             ".codex-review-readonly-runtime-",
             result_owner=runtime_parent_owner,
         )
@@ -3168,49 +5106,83 @@ def main() -> int:
         stage = "permissions"
         installed_root = install_container / "independent_codex_pr_review"
         stage = "install-copy"
-        shutil.copytree(
-            source_root,
-            installed_root,
-            symlinks=True,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-        )
+        install_container_binding.revalidate()
+        if source_binding is not None:
+            source_manifest_sha256 = _copy_bound_source(
+                source_root,
+                installed_root,
+                source_binding,
+                source_manifest_before,
+                budget=snapshot_budget,
+                destination_owner_uid=destination_owner_uid,
+                destination_group_gid=destination_group_gid,
+            )
+        else:
+            assert isinstance(source_tree_binding, SourceTreeBinding)
+            source_manifest_sha256 = _copy_bound_tree(
+                source_root,
+                installed_root,
+                source_tree_binding,
+                budget=snapshot_budget,
+                destination_owner_uid=destination_owner_uid,
+                destination_group_gid=destination_group_gid,
+            )
+        install_container_binding.revalidate()
+        source_head_bound = source_binding is not None
         stage = "install-read-only"
         _set_tree_read_only(installed_root)
         stage = "snapshot-before"
-        before = _tree_snapshot(installed_root)
+        install_container_binding.revalidate()
+        before = _tree_snapshot(installed_root, budget=snapshot_budget)
         stage = "access-policy"
         if any(entry.acl_entries for entry in before.values()):
             raise RuntimeError("read-only installed tree has an extended ACL")
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment.pop("PYTHONPYCACHEPREFIX", None)
-        environment.update(
-            {
-                "PYTHONDONTWRITEBYTECODE": "1",
-                EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
-                "TMPDIR": str(runtime_parent),
-            }
-        )
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "child-run"
-        completed = _run_bounded_child(
-            (
-                sys.executable,
-                "-B",
-                "-m",
-                "tests.run_required_deterministic_supervisor",
-            ),
-            cwd=installed_root,
-            environment=environment,
-            secondary_failures=secondary_failures,
-            closure_proof=closure_proof,
-            outcome_receipt=child_outcome_receipt,
-            require_isolated_account=True,
-        )
+        if trusted_source_requested:
+            child_process_closure = "pending"
+            completed = _run_no_child_test_suite(
+                installed_root=installed_root,
+                install_container_binding=install_container_binding,
+                runtime_parent_binding=runtime_parent_binding,
+                secondary_failures=secondary_failures,
+                closure_proof=closure_proof,
+                lifecycle_fence=lifecycle_fence,
+            )
+        else:
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.update(
+                {
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
+                    "TMPDIR": str(runtime_parent),
+                }
+            )
+            completed = _run_bounded_child(
+                (
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "tests.run_required_deterministic_supervisor",
+                ),
+                cwd=installed_root,
+                environment=environment,
+                secondary_failures=secondary_failures,
+                closure_proof=closure_proof,
+                outcome_receipt=child_outcome_receipt,
+                require_isolated_account=True,
+            )
         child_process_closure = "proven"
+        if lifecycle_fence.received_signal is not None:
+            raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "install-container-revalidation"
         install_container_binding.revalidate()
         stage = "snapshot-after"
-        after = _tree_snapshot(installed_root)
+        after = _tree_snapshot(installed_root, budget=snapshot_budget)
+        install_container_binding.revalidate()
         stage = "runtime-residue"
         runtime_residue = _list_bound_directory(runtime_parent_binding)
         stage = "complete"
@@ -3238,6 +5210,7 @@ def main() -> int:
         primary_failure = _primary_failure(stage, error)
     except ChildRunInterrupted as error:
         signal_error = error
+        signal_is_primary = True
         child_process_closure = _child_process_closure_status(closure_proof)
         primary_failure = _primary_failure(stage, error)
     except Exception as error:
@@ -3369,10 +5342,11 @@ def main() -> int:
                     runtime_parent or install_container or READONLY_INSTALL_PARENT
                 )
                 try:
-                    cleanup_control_binding = _create_bound_owned_private_directory(
-                        _private_runtime_parent(),
-                        ".codex-review-readonly-cleanup-",
-                        result_owner=cleanup_control_owner,
+                    cleanup_control_binding = (
+                        _create_bound_owned_private_runtime_directory(
+                            ".codex-review-readonly-cleanup-",
+                            result_owner=cleanup_control_owner,
+                        )
                     )
                     cleanup_control_binding = cleanup_control_owner.transfer(
                         cleanup_control_binding
@@ -3634,13 +5608,23 @@ def main() -> int:
                     ):
                         deferred_control_flow_error = inspection_error
         finally:
-            for binding_role, binding, include_held_identity in (
-                ("install-container", install_container_binding, False),
-                ("runtime-parent", runtime_parent_binding, False),
-                ("cleanup-control", cleanup_control_binding, True),
+            for binding_role, binding in (
+                ("install-container", install_container_binding),
+                ("runtime-parent", runtime_parent_binding),
+                ("cleanup-control", cleanup_control_binding),
             ):
                 if binding is None:
                     continue
+                close_evidence: BoundPathEvidence | None = None
+                close_evidence_error: BaseException | None = None
+                try:
+                    close_evidence = _bound_path_evidence(binding)
+                except BaseException as evidence_error:
+                    close_evidence_error = evidence_error
+                    if deferred_control_flow_error is None and not isinstance(
+                        evidence_error, Exception
+                    ):
+                        deferred_control_flow_error = evidence_error
                 try:
                     binding.close()
                 except BaseException as close_error:
@@ -3661,22 +5645,11 @@ def main() -> int:
                         deferred_control_flow_error = close_error
                     try:
                         cleanup_results.append(
-                            _cleanup_failure_from_error(
-                                binding.path,
+                            _bound_close_failure(
+                                binding,
                                 close_error,
-                                retained=None,
-                                original_path=binding.path,
-                                path_status="close-unresolved",
-                                replacement_path=(
-                                    binding.path
-                                    if os.path.lexists(binding.path)
-                                    else None
-                                ),
-                                held_identity=(
-                                    binding.object_locator()
-                                    if include_held_identity
-                                    else None
-                                ),
+                                evidence=close_evidence,
+                                evidence_error=close_evidence_error,
                             )
                         )
                     except BaseException as evidence_error:
@@ -3742,102 +5715,202 @@ def main() -> int:
             pass
         raise propagated_control_flow
 
-    release_tree_immutable = (
-        before is not None
-        and after is not None
-        and _tree_property_unchanged(before, after)
+    terminal_signal = _freeze_lifecycle_terminal_signal(lifecycle_fence)
+    if terminal_signal is not None and signal_error is None:
+        signal_error = ChildRunInterrupted(terminal_signal)
+        if primary_failure is None:
+            signal_is_primary = True
+            primary_failure = _primary_failure(stage, signal_error)
+    lifecycle_fence.terminal_selected_signal = (
+        signal_error.signal_number if signal_error is not None else terminal_signal
     )
-    retained_paths = [
-        failure.path for failure in cleanup_failures if failure.retained is not False
-    ]
-    if primary_failure is not None:
-        if timeout_error is not None:
-            primary_status = "timed-out"
-        elif output_limit_error is not None:
-            primary_status = "output-limit"
-        elif signal_error is not None:
-            primary_status = "interrupted"
-        elif (
-            closure_error is not None
-            or not closure_proof.destructive_cleanup_authorized
-        ):
-            primary_status = "closure-unproven"
+    try:
+        release_tree_immutable = (
+            before is not None
+            and after is not None
+            and _tree_property_unchanged(before, after)
+        )
+        retained_paths = list(
+            dict.fromkeys(
+                failure.path
+                for failure in cleanup_failures
+                if failure.retained is not False
+            )
+        )
+        if primary_failure is not None:
+            if timeout_error is not None:
+                primary_status = "timed-out"
+            elif output_limit_error is not None:
+                primary_status = "output-limit"
+            elif signal_is_primary:
+                primary_status = "interrupted"
+            elif (
+                closure_error is not None
+                or not closure_proof.destructive_cleanup_authorized
+            ):
+                primary_status = "closure-unproven"
+            else:
+                primary_status = "failed"
+        elif completed is None:
+            primary_status = "not-completed"
+        elif completed.returncode != 0:
+            primary_status = "child-failed"
+        elif not release_tree_immutable:
+            primary_status = "property-mismatch"
+        elif runtime_residue:
+            primary_status = "runtime-residue"
         else:
-            primary_status = "failed"
-    elif completed is None:
-        primary_status = "not-completed"
-    elif completed.returncode != 0:
-        primary_status = "child-failed"
-    elif not release_tree_immutable:
-        primary_status = "property-mismatch"
-    elif runtime_residue:
-        primary_status = "runtime-residue"
-    else:
-        primary_status = "complete"
-    summary = {
-        "child_process_closure": child_process_closure,
-        "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
-        "cleanup_status": "incomplete" if cleanup_failures else "complete",
-        "install_parent_is_sticky_world_writable": True,
-        "primary_failure": (
-            asdict(primary_failure) if primary_failure is not None else None
-        ),
-        "primary_status": primary_status,
-        "release_tree_immutable": release_tree_immutable,
-        "release_tree_property": "object-identity-content-access-policy",
-        "retained_paths": retained_paths,
-        "returncode": completed.returncode if completed is not None else None,
-        "runtime_residue": list(runtime_residue),
-        "secondary_failures": [asdict(failure) for failure in secondary_failures],
-        "signal_number": (
-            signal_error.signal_number if signal_error is not None else None
-        ),
-        "timed_out": timeout_error is not None,
-    }
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+            primary_status = "complete"
+        summary: dict[str, object] = {
+            "child_process_closure": child_process_closure,
+            "cleanup_failures": [asdict(failure) for failure in cleanup_failures],
+            "cleanup_guarantee": CLEANUP_GUARANTEE,
+            "cleanup_status": "incomplete" if cleanup_failures else "complete",
+            "creation_origin_guarantee": CREATION_ORIGIN_GUARANTEE,
+            "creation_origin_proven": False,
+            "install_parent_is_sticky_world_writable": True,
+            "no_child_runtime_profile": closure_proof.runtime_profile,
+            "primary_failure": (
+                asdict(primary_failure) if primary_failure is not None else None
+            ),
+            "primary_status": primary_status,
+            "release_tree_immutable": release_tree_immutable,
+            "release_tree_property": "object-identity-content-access-policy",
+            "retained_paths": retained_paths,
+            "returncode": completed.returncode if completed is not None else None,
+            "runtime_residue": list(runtime_residue),
+            "secondary_failures": [asdict(failure) for failure in secondary_failures],
+            "signal_number": lifecycle_fence.terminal_selected_signal,
+            "source_head_bound": source_head_bound,
+            "source_head_sha": (
+                source_binding.head_sha if source_binding is not None else None
+            ),
+            "source_head_subtree_manifest_sha256": (
+                source_binding.head_subtree_manifest_sha256
+                if source_binding is not None
+                else None
+            ),
+            "source_manifest_sha256": source_manifest_sha256,
+            "timed_out": timeout_error is not None,
+        }
 
-    primary_failed = primary_status != "complete"
-    if primary_failure is not None:
+        primary_failed = primary_status != "complete"
+        diagnostic_lines: list[str] = []
+        if primary_failure is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor primary failure: "
+                + _serialize_terminal_json(
+                    asdict(primary_failure),
+                    operation="primary-diagnostic-serialization",
+                )
+            )
+        if secondary_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor secondary failures: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in secondary_failures],
+                    operation="secondary-diagnostic-serialization",
+                )
+            )
+        if completed is not None and primary_failed:
+            if completed.stdout:
+                diagnostic_lines.append(_bounded_failure_text(completed.stdout))
+            if completed.stderr:
+                diagnostic_lines.append(_bounded_failure_text(completed.stderr))
+        if timeout_error is not None:
+            diagnostic_lines.append(
+                "read-only installed supervisor regression timed out"
+            )
+        if cleanup_failures:
+            diagnostic_lines.append(
+                "read-only installed supervisor cleanup incomplete: "
+                + _serialize_terminal_json(
+                    [asdict(failure) for failure in cleanup_failures],
+                    operation="cleanup-diagnostic-serialization",
+                )
+            )
+        diagnostics = "".join(line + "\n" for line in diagnostic_lines)
+    except TerminalPublicationError:
+        raise
+    except BaseException as error:
+        raise TerminalPublicationError("summary-construction", error) from error
+
+    if lifecycle_fence.terminal_selected_signal is not None:
+        returncode = 128 + lifecycle_fence.terminal_selected_signal
+    else:
+        returncode = 1 if primary_failed or cleanup_failures else 0
+    lifecycle_fence.terminal_exit_code = returncode
+    _publish_terminal_output(
+        summary,
+        diagnostics,
+        terminal_process=terminal_process,
+    )
+    lifecycle_fence.terminal_output_committed = True
+    return returncode
+
+
+def main(*, _terminal_process: bool = False) -> int:
+    if sys.platform != "darwin":
         print(
-            "read-only installed supervisor primary failure: "
-            + json.dumps(
-                asdict(primary_failure),
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
+            "read-only installed supervisor regression requires Darwin", file=sys.stderr
         )
-    if secondary_failures:
-        print(
-            "read-only installed supervisor secondary failures: "
-            + json.dumps(
-                [asdict(failure) for failure in secondary_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
+        return 2
+    parent_metadata = READONLY_INSTALL_PARENT.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or not parent_metadata.st_mode & stat.S_ISVTX
+        or not parent_metadata.st_mode & stat.S_IWOTH
+    ):
+        print("/private/tmp is not the expected 01777-style parent", file=sys.stderr)
+        return 2
+    lifecycle_fence = _install_lifecycle_signal_fence()
+    try:
+        returncode = _run_main(
+            lifecycle_fence,
+            terminal_process=_terminal_process,
         )
-    if completed is not None and primary_failed:
-        if completed.stdout:
-            print(_bounded_failure_text(completed.stdout), file=sys.stderr)
-        if completed.stderr:
-            print(_bounded_failure_text(completed.stderr), file=sys.stderr)
-    if timeout_error is not None:
-        print("read-only installed supervisor regression timed out", file=sys.stderr)
-    if cleanup_failures:
-        print(
-            "read-only installed supervisor cleanup incomplete: "
-            + json.dumps(
-                [asdict(failure) for failure in cleanup_failures],
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-    if signal_error is not None:
-        return 128 + signal_error.signal_number
-    return 1 if primary_failed or cleanup_failures else 0
+    except TerminalPublicationError as publication_error:
+        _report_terminal_publication_failure(publication_error)
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            publication_error.add_note(
+                "lifecycle signal restoration failed after publication error: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+            _report_terminal_publication_failure(
+                TerminalPublicationError(
+                    "signal-fence-restoration",
+                    restore_error,
+                )
+            )
+            if lifecycle_fence.terminal_selected_signal is not None:
+                if lifecycle_fence.terminal_exit_code is not None:
+                    return lifecycle_fence.terminal_exit_code
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return 1
+        if lifecycle_fence.terminal_selected_signal is not None:
+            if lifecycle_fence.terminal_exit_code is None:
+                return 128 + lifecycle_fence.terminal_selected_signal
+            return lifecycle_fence.terminal_exit_code
+        return 1
+    except BaseException as primary_error:
+        try:
+            _restore_lifecycle_signal_fence(lifecycle_fence)
+        except BaseException as restore_error:
+            primary_error.add_note(
+                "lifecycle signal restoration failed: "
+                f"{type(restore_error).__name__}: {restore_error}"
+            )
+        raise
+    # The CLI exits with the sealed decision while lifecycle signals stay blocked.
+    if _terminal_process and lifecycle_fence.terminal_output_committed:
+        return returncode
+    received_signal = _restore_lifecycle_signal_fence(lifecycle_fence)
+    if not lifecycle_fence.terminal_output_committed and received_signal is not None:
+        return 128 + received_signal
+    return returncode
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(_terminal_process=True))

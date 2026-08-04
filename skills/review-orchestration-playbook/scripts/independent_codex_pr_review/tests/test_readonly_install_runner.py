@@ -3,17 +3,22 @@ from __future__ import annotations
 import contextlib
 import dis
 import errno
+import hashlib
+import importlib.util
 import io
 import json
 import os
 import pathlib
+import pwd
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
-from dataclasses import asdict
+from collections.abc import Iterator
+from dataclasses import asdict, replace
 from unittest import mock
 
 from review_supervisor import recovery_cleanup
@@ -24,7 +29,97 @@ from . import support
 from .support import owned_temporary_directory
 
 
+@contextlib.contextmanager
+def _mock_ambient_runtime_parent(parent: pathlib.Path) -> Iterator[None]:
+    """Patch the synthetic selector without inheriting an outer explicit path."""
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=False),
+        mock.patch.object(
+            runner,
+            "_private_runtime_parent",
+            return_value=parent,
+        ),
+    ):
+        os.environ.pop(runner.EXPLICIT_RUNTIME_PARENT_ENV, None)
+        yield
+
+
+def _captured_gate_source_for_nested_tests(path: pathlib.Path) -> str:
+    for finder in sys.meta_path:
+        sources = getattr(finder, "_sources", None)
+        if not isinstance(sources, dict):
+            continue
+        source = sources.get("tests.trusted_mac_gate")
+        payload = getattr(source, "payload", None)
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8")
+    return path.read_text(encoding="utf-8")
+
+
 class ReadOnlyInstallRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._source_binding = runner.SourceCheckoutBinding(
+            repo_root=pathlib.Path("/synthetic/repo"),
+            head_sha="a" * 40,
+            source_relative_path="source",
+            source_manifest_sha256="b" * 64,
+            head_subtree_manifest_sha256="c" * 64,
+            source_root_gid=os.getgid(),
+            source_entries=(),
+        )
+        self._source_tree_binding = runner.SourceTreeBinding(
+            source_manifest_sha256="b" * 64,
+            source_root_gid=os.getgid(),
+            source_entries=(),
+        )
+
+        def copy_bound_tree(
+            source: pathlib.Path,
+            destination: pathlib.Path,
+            _binding: runner.SourceTreeBinding,
+            *,
+            budget: runner.TreeSnapshotBudget,
+            destination_owner_uid: int,
+            destination_group_gid: int,
+        ) -> str:
+            self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+            self.assertEqual(destination_owner_uid, destination.parent.stat().st_uid)
+            self.assertEqual(destination_group_gid, destination.parent.stat().st_gid)
+            runner.shutil.copytree(
+                source,
+                destination,
+                symlinks=True,
+                ignore=runner.shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            return self._source_tree_binding.source_manifest_sha256
+
+        patchers = (
+            mock.patch.object(
+                runner,
+                "_bind_source_checkout",
+                return_value=self._source_binding,
+            ),
+            mock.patch.object(
+                runner,
+                "_bind_source_tree",
+                return_value=self._source_tree_binding,
+            ),
+            mock.patch.object(
+                runner,
+                "_copy_bound_tree",
+                side_effect=copy_bound_tree,
+            ),
+            mock.patch.object(
+                runner,
+                "_source_manifest_sha256",
+                return_value="b" * 64,
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def _make_private_directory(path: pathlib.Path) -> None:
         path.mkdir(mode=0o700)
@@ -68,7 +163,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             *,
             result_owner: support._PrivateDirectoryCreationResultOwner,
             require_owned_private_parent: bool = True,
+            allow_sticky_writable_ancestors: bool | None = None,
         ) -> support._DirectoryParentBinding:
+            if allow_sticky_writable_ancestors is not None:
+                raise AssertionError(
+                    "synthetic ambient runtime creation received explicit policy"
+                )
             parent_result_owner = support._DirectoryParentBindingResultOwner()
             binding = ReadOnlyInstallRunnerTests._open_parent_binding(
                 parent_result_owner,
@@ -653,6 +753,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 runner,
                 "_reap_terminal_same_uid_children",
             ),
+            mock.patch.object(runner.os, "kill") as kill,
             mock.patch.object(
                 runner.time,
                 "monotonic",
@@ -667,6 +768,156 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(closure.exception.processes, (escaped,))
+        kill.assert_not_called()
+
+    def test_dedicated_uid_scope_rejects_nonisolated_baseline(self) -> None:
+        supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
+        preexisting = runner.DarwinProcessIdentity(90_007, 2, 2)
+        account = mock.Mock(
+            pw_name="codexreview0123456789ab",
+            pw_uid=50_001,
+            pw_gid=50_001,
+            pw_dir="/var/empty",
+            pw_shell="/usr/bin/false",
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {runner.DEDICATED_ACCOUNT_CUSTODY_ENV: "a" * 64},
+            ),
+            mock.patch.object(runner.os, "getuid", return_value=50_001),
+            mock.patch.object(runner.pwd, "getpwuid", return_value=account),
+            self.assertRaisesRegex(PermissionError, "custody is not proven"),
+        ):
+            runner._dedicated_uid_scope((supervisor, preexisting))
+
+    def test_dedicated_uid_signal_rejects_pid_replacement(self) -> None:
+        selected = runner.DarwinProcessIdentity(90_008, 3, 3)
+        replacement = runner.DarwinProcessIdentity(selected.pid, 4, 4)
+        with (
+            mock.patch.object(
+                runner,
+                "_darwin_same_uid_processes",
+                return_value=(replacement,),
+            ),
+            mock.patch.object(runner.os, "kill") as kill,
+            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
+        ):
+            runner._signal_dedicated_uid_process(
+                selected,
+                signal.SIGTERM,
+                deadline=runner.time.monotonic() + 1.0,
+            )
+        self.assertIsInstance(closure.exception.cause, OSError)
+        self.assertIn("identity changed before signal", str(closure.exception.cause))
+        kill.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and hasattr(os, "fork"),
+        "requires Darwin process identity and fork",
+    )
+    def test_dedicated_uid_closure_kills_double_forked_session(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        leader = os.fork()
+        if leader == 0:
+            try:
+                os.close(read_descriptor)
+                os.setsid()
+                descendant = os.fork()
+                if descendant == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    os.write(write_descriptor, f"{os.getpid()}\n".encode("ascii"))
+                    while True:
+                        signal.pause()
+                os._exit(0)
+            except BaseException:
+                os._exit(97)
+
+        os.close(write_descriptor)
+        descendant_pid = -1
+        original_census = runner._darwin_same_uid_processes
+        real_kill = os.kill
+        selected_descendant: runner.DarwinProcessIdentity | None = None
+        try:
+            with os.fdopen(read_descriptor, "rb", closefd=True) as reader:
+                descendant_pid = int(reader.readline().decode("ascii"))
+            reaped_leader, leader_status = os.waitpid(leader, 0)
+            self.assertEqual(reaped_leader, leader)
+            self.assertEqual(leader_status, 0)
+
+            initial = original_census(deadline=time.monotonic() + 2.0)
+            supervisor = next(item for item in initial if item.pid == os.getpid())
+            selected_descendant = next(
+                item for item in initial if item.pid == descendant_pid
+            )
+            baseline = (supervisor,)
+            scope = runner.DedicatedUidScope(
+                uid=os.getuid(),
+                account_name=pwd.getpwuid(os.getuid()).pw_name,
+                receipt_sha256="a" * 64,
+                baseline=baseline,
+            )
+            signaled: list[tuple[int, int]] = []
+
+            def scoped_census(
+                *, deadline: float | None = None
+            ) -> tuple[runner.DarwinProcessIdentity, ...]:
+                return tuple(
+                    item
+                    for item in original_census(deadline=deadline)
+                    if item.pid in {os.getpid(), descendant_pid}
+                )
+
+            def record_kill(pid: int, signal_number: int) -> None:
+                signaled.append((pid, signal_number))
+                real_kill(pid, signal_number)
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "_darwin_same_uid_processes",
+                    side_effect=scoped_census,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_require_dedicated_uid_scope_current",
+                ),
+                mock.patch.object(
+                    runner,
+                    "_reap_terminal_same_uid_children",
+                ),
+                mock.patch.object(runner.os, "kill", side_effect=record_kill),
+                mock.patch.object(
+                    runner,
+                    "DARWIN_DEDICATED_PROCESS_TERMINATE_GRACE_SECONDS",
+                    0.02,
+                ),
+                mock.patch.object(
+                    runner,
+                    "DARWIN_PROCESS_ABSENCE_STABILITY_SECONDS",
+                    0.02,
+                ),
+            ):
+                runner._require_no_new_same_uid_processes(
+                    baseline,
+                    deadline=time.monotonic() + 5.0,
+                    dedicated_scope=scope,
+                )
+
+            self.assertIn((descendant_pid, signal.SIGTERM), signaled)
+            self.assertIn((descendant_pid, signal.SIGKILL), signaled)
+        finally:
+            if descendant_pid > 0:
+                try:
+                    current = original_census(deadline=time.monotonic() + 1.0)
+                    if selected_descendant in current:
+                        real_kill(descendant_pid, signal.SIGKILL)
+                except (OSError, StopIteration, TimeoutError):
+                    pass
+            try:
+                os.waitpid(leader, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
     def test_terminal_same_uid_child_reap_binds_exact_identity_under_deadline(
         self,
@@ -1087,19 +1338,80 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 self.assertEqual(len(rejection_errors), 1)
                 self.assertIsInstance(rejection_errors[0], OSError)
                 self.assertEqual(rejection_errors[0].errno, errno.EPERM)
-                with (
-                    mock.patch.dict(
-                        os.environ,
-                        {support._EXPLICIT_RUNTIME_PARENT_ENV: str(parent)},
+                self.assertEqual(
+                    support._validated_private_runtime_parent(
+                        str(parent),
+                        allow_sticky_writable_ancestors=True,
                     ),
-                    self.assertRaisesRegex(
-                        RuntimeError,
-                        r"errno=1: .*group- or world-writable",
-                    ),
+                    parent.resolve(strict=True),
+                )
+                ancestor.chmod(0o777)
+                self.assertIsNone(
+                    support._validated_private_runtime_parent(
+                        str(parent),
+                        allow_sticky_writable_ancestors=True,
+                    )
+                )
+                ancestor.chmod(0o1777)
+                with mock.patch.dict(
+                    os.environ,
+                    {support._EXPLICIT_RUNTIME_PARENT_ENV: str(parent)},
                 ):
-                    support._private_runtime_parent()
+                    self.assertEqual(support._private_runtime_parent(), parent)
             finally:
                 ancestor.chmod(0o700)
+
+        sticky_root = pathlib.Path(
+            "/private/tmp" if pathlib.Path("/private/tmp").is_dir() else "/tmp"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="codex-explicit-runtime-parent-",
+            dir=sticky_root,
+        ) as raw_runtime_parent:
+            runtime_parent = pathlib.Path(raw_runtime_parent)
+            runtime_parent.chmod(0o700)
+            strict_owner = support._PrivateDirectoryCreationResultOwner()
+            with self.assertRaisesRegex(
+                OSError,
+                "group- or world-writable",
+            ):
+                support._create_bound_owned_private_directory(
+                    runtime_parent,
+                    ".strict-runtime-",
+                    result_owner=strict_owner,
+                )
+            self.assertIsNone(strict_owner.binding)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {support._EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent)},
+                ),
+                mock.patch.object(support, "_RUNTIME_ROOT_STATE", None),
+            ):
+                with owned_temporary_directory("sticky-runtime-child-") as child:
+                    state = support._RUNTIME_ROOT_STATE
+                    self.assertIsNotNone(state)
+                    assert state is not None
+                    self.assertTrue(state.binding.allow_sticky_writable_ancestors)
+                    self.assertTrue(child.is_dir())
+                    mismatch_owner = support._PrivateDirectoryCreationResultOwner()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "held temporary-directory parent is inconsistent",
+                    ):
+                        support._create_bound_owned_private_directory(
+                            state.path,
+                            ".mismatched-policy-",
+                            result_owner=mismatch_owner,
+                            held_parent_binding=state.binding,
+                            allow_sticky_writable_ancestors=False,
+                        )
+                    self.assertIsNone(mismatch_owner.binding)
+                runtime_root = state.path
+                support._cleanup_process_runtime_root(state)
+                self.assertFalse(runtime_root.exists())
+                self.assertIsNone(support._RUNTIME_ROOT_STATE)
 
     def test_runtime_parent_revalidation_rejects_writable_ancestor(self) -> None:
         with owned_temporary_directory("runtime-parent-drift-") as root:
@@ -2100,11 +2412,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                             "READONLY_INSTALL_PARENT",
                             sticky_parent,
                         ),
-                        mock.patch.object(
-                            runner,
-                            "_private_runtime_parent",
-                            return_value=runtime_home,
-                        ),
+                        _mock_ambient_runtime_parent(runtime_home),
                         mock.patch.object(
                             runner,
                             "_create_bound_owned_private_directory",
@@ -2275,11 +2583,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -2371,11 +2675,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2474,11 +2774,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2660,11 +2956,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -2747,12 +3039,15 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 *,
                 require_owned_private_parent: bool,
                 result_owner: support._DirectoryParentBindingResultOwner,
+                allow_sticky_writable_ancestors: bool | None = None,
             ) -> support._DirectoryParentBinding:
                 nonlocal opened_binding
+                self.assertIs(allow_sticky_writable_ancestors, False)
                 opened_binding = real_open(
                     raw_path,
                     require_owned_private_parent=require_owned_private_parent,
                     result_owner=result_owner,
+                    allow_sticky_writable_ancestors=(allow_sticky_writable_ancestors),
                 )
                 raise open_failure
 
@@ -6458,26 +6753,26 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         with owned_temporary_directory("readonly-snapshot-policy-") as root:
             target = root / "target"
             target.write_text("content", encoding="utf-8")
-            acl_entries: dict[pathlib.Path, tuple[bytes, ...]] = {}
-            xattrs: dict[pathlib.Path, tuple[tuple[str, str], ...]] = {}
+            acl_entries: tuple[bytes, ...] = ()
+            xattrs: tuple[tuple[bytes, str], ...] = ()
 
             with (
                 mock.patch.object(
                     runner,
                     "_acl_entries",
-                    side_effect=lambda path: acl_entries.get(path, ()),
+                    side_effect=lambda _descriptor: acl_entries,
                 ),
                 mock.patch.object(
                     runner,
                     "_xattr_snapshot",
-                    side_effect=lambda path: xattrs.get(path, ()),
+                    side_effect=lambda _descriptor, **_kwargs: xattrs,
                 ),
             ):
                 baseline = runner._tree_snapshot(root)
-                acl_entries[target] = (b" 0: user:synthetic allow write",)
+                acl_entries = (b" 0: user:synthetic allow write",)
                 acl_changed = runner._tree_snapshot(root)
-                acl_entries.clear()
-                xattrs[target] = ((b"com.apple.synthetic", "digest"),)
+                acl_entries = ()
+                xattrs = ((b"com.apple.synthetic", "digest"),)
                 xattr_changed = runner._tree_snapshot(root)
 
             self.assertNotEqual(baseline[target.name], acl_changed[target.name])
@@ -6599,30 +6894,45 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         with owned_temporary_directory("readonly-child-descendant-") as root:
             group_file = root / "process-group"
-            result = runner._run_bounded_child(
-                (
-                    sys.executable,
-                    "-B",
-                    "-c",
-                    child_script,
-                    str(group_file),
+            # The ordinary developer account is not the hosted isolated account.
+            # Scope this fixture's census so unrelated same-UID process churn
+            # cannot replace its real process-group settlement assertion.
+            with (
+                mock.patch.object(
+                    runner,
+                    "_stable_same_uid_processes",
+                    return_value=(),
                 ),
-                cwd=root,
-                environment={
-                    "LANG": "C",
-                    "LC_ALL": "C",
-                    "PATH": "/usr/bin:/bin",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                timeout=5,
-                stdout_limit=1024,
-                stderr_limit=1024,
-            )
+                mock.patch.object(
+                    runner,
+                    "_require_no_new_same_uid_processes",
+                ) as require_closure,
+            ):
+                result = runner._run_bounded_child(
+                    (
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        child_script,
+                        str(group_file),
+                    ),
+                    cwd=root,
+                    environment={
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    timeout=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                )
 
             process_group = int(group_file.read_text(encoding="ascii"))
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, "")
+            require_closure.assert_called_once_with((), dedicated_scope=None)
             self._require_process_group_absent(process_group)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
@@ -6997,7 +7307,20 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         with owned_temporary_directory("readonly-child-overflow-") as root:
             group_file = root / "process-group"
-            with self.assertRaisesRegex(OverflowError, "byte cap"):
+            # Keep the real overflow/process-group behavior while excluding
+            # unrelated same-UID developer-account churn from this fixture.
+            with (
+                mock.patch.object(
+                    runner,
+                    "_stable_same_uid_processes",
+                    return_value=(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_require_no_new_same_uid_processes",
+                ) as require_closure,
+                self.assertRaisesRegex(OverflowError, "byte cap"),
+            ):
                 runner._run_bounded_child(
                     (
                         sys.executable,
@@ -7019,6 +7342,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 )
 
             process_group = int(group_file.read_text(encoding="ascii"))
+            require_closure.assert_called_once_with((), dedicated_scope=None)
             self._require_process_group_absent(process_group)
 
     def test_bounded_child_receipt_failure_does_not_skip_closure(self) -> None:
@@ -7091,7 +7415,10 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 str(caught.exception.__cause__),
                 "already published",
             )
-            require_closure.assert_called_once_with(baseline)
+            require_closure.assert_called_once_with(
+                baseline,
+                dedicated_scope=None,
+            )
             self.assertIs(outcome_receipt.completed, previous_outcome)
             self.assertTrue(closure_proof.started)
             self.assertFalse(closure_proof.proven)
@@ -7251,11 +7578,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -7344,10 +7667,14 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
         worker_script = (
             "import os,pathlib,sys\n"
+            "from unittest import mock\n"
             "from tests import run_readonly_install_deterministic_supervisor as runner\n"
             "root=pathlib.Path(sys.argv[1])\n"
             "try:\n"
-            " runner._run_bounded_child("
+            " with mock.patch.object(runner,'_stable_same_uid_processes',"
+            "return_value=()),mock.patch.object("
+            "runner,'_require_no_new_same_uid_processes'):\n"
+            "  runner._run_bounded_child("
             "(sys.executable,'-B','-c',sys.argv[2],sys.argv[3],sys.argv[4]),"
             "cwd=root,environment={'LANG':'C','LC_ALL':'C',"
             "'PATH':'/usr/bin:/bin','PYTHONDONTWRITEBYTECODE':'1'},"
@@ -7394,7 +7721,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                 worker.send_signal(signal.SIGTERM)
                 stdout, stderr = worker.communicate(timeout=10)
 
-                self.assertEqual(worker.returncode, 128 + signal.SIGTERM)
+                self.assertEqual(
+                    worker.returncode,
+                    128 + signal.SIGTERM,
+                    stderr.decode("utf-8", "replace"),
+                )
                 self.assertEqual(stdout, b"")
                 self.assertEqual(stderr, b"")
                 self._require_process_group_absent(process_group)
@@ -7459,11 +7790,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -7646,11 +7973,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                         "READONLY_INSTALL_PARENT",
                         sticky_parent,
                     ),
-                    mock.patch.object(
-                        runner,
-                        "_private_runtime_parent",
-                        return_value=runtime_home,
-                    ),
+                    _mock_ambient_runtime_parent(runtime_home),
                     mock.patch.object(
                         runner,
                         "_create_bound_owned_private_directory",
@@ -7762,11 +8085,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -7879,11 +8198,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -7980,11 +8295,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     "READONLY_INSTALL_PARENT",
                     sticky_parent,
                 ),
-                mock.patch.object(
-                    runner,
-                    "_private_runtime_parent",
-                    return_value=runtime_home,
-                ),
+                _mock_ambient_runtime_parent(runtime_home),
                 mock.patch.object(
                     runner,
                     "_create_bound_owned_private_directory",
@@ -8031,6 +8342,3367 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertTrue(original_runtime_parent.is_dir())
             self.assertTrue(runtime_parent.is_dir())
             self.assertIn("test runtime parent path changed", stderr.getvalue())
+
+    def test_terminal_signal_publication_is_linearized_in_a_real_process(
+        self,
+    ) -> None:
+        self.assertEqual(sys.version_info[:2], (3, 13))
+        test_names = unittest.defaultTestLoader.getTestCaseNames(
+            TerminalPublicationSignalIntegrationTests
+        )
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+            TerminalPublicationSignalIntegrationTests
+        )
+        transcript = io.StringIO()
+        result = unittest.TextTestRunner(
+            stream=transcript,
+            verbosity=2,
+        ).run(suite)
+
+        detail = transcript.getvalue()
+        self.assertEqual(result.testsRun, len(test_names), detail)
+        self.assertGreater(result.testsRun, 0, detail)
+        self.assertFalse(
+            any(
+                (
+                    result.failures,
+                    result.errors,
+                    result.skipped,
+                    result.expectedFailures,
+                    result.unexpectedSuccesses,
+                )
+            ),
+            detail,
+        )
+        self.assertTrue(result.wasSuccessful(), detail)
+
+    def test_no_child_suite_python_startup_ignores_site_injection(self) -> None:
+        self.assertEqual(sys.version_info[:2], (3, 13))
+        with owned_temporary_directory("readonly-python-site-injection-") as root:
+            pythonpath_root = root / "pythonpath"
+            pythonpath_root.mkdir(mode=0o700)
+            user_base = root / "user-base"
+            user_site = (
+                user_base
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+            user_site.mkdir(mode=0o700, parents=True)
+            child_cwd = root / "child-cwd"
+            child_cwd.mkdir(mode=0o700)
+            sitecustomize_marker = root / "sitecustomize-loaded"
+            pth_marker = root / "pth-loaded"
+            (pythonpath_root / "sitecustomize.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(sitecustomize_marker)!r}).write_text("
+                "'loaded\\n', encoding='ascii')\n"
+                "raise RuntimeError('sitecustomize injection executed')\n",
+                encoding="ascii",
+            )
+            (pythonpath_root / "injected_from_pythonpath.py").write_text(
+                "VALUE = 'injected'\n",
+                encoding="ascii",
+            )
+            (user_site / "injected.pth").write_text(
+                "import pathlib; "
+                f"pathlib.Path({str(pth_marker)!r}).write_text("
+                "'loaded\\n', encoding='ascii')\n"
+                f"{pythonpath_root}\n",
+                encoding="ascii",
+            )
+            child_code = (
+                "import json,pathlib,sys\n"
+                "user_site=str(pathlib.Path(sys.argv[1]).resolve())\n"
+                "pythonpath_root=str(pathlib.Path(sys.argv[2]).resolve())\n"
+                "try:\n"
+                " import injected_from_pythonpath\n"
+                "except ModuleNotFoundError:\n"
+                " injected=False\n"
+                "else:\n"
+                " injected=True\n"
+                "record={\n"
+                " 'dont_write_bytecode':sys.flags.dont_write_bytecode==1,\n"
+                " 'isolated':sys.flags.isolated==1,\n"
+                " 'no_site':sys.flags.no_site==1,\n"
+                " 'pythonpath_imported':injected,\n"
+                " 'pythonpath_on_sys_path':pythonpath_root in sys.path,\n"
+                " 'sitecustomize_loaded':'sitecustomize' in sys.modules,\n"
+                " 'user_site_on_sys_path':user_site in sys.path,\n"
+                "}\n"
+                "print(json.dumps(record,sort_keys=True,separators=(',',':')))\n"
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["PYTHONPATH"] = str(pythonpath_root)
+            environment["PYTHONUSERBASE"] = str(user_base)
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    child_code,
+                    str(user_site),
+                    str(pythonpath_root),
+                ),
+                cwd=child_cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", "replace"),
+            )
+            self.assertEqual(completed.stderr, b"")
+            self.assertEqual(
+                json.loads(completed.stdout.decode("ascii", "strict")),
+                {
+                    "dont_write_bytecode": True,
+                    "isolated": True,
+                    "no_site": True,
+                    "pythonpath_imported": False,
+                    "pythonpath_on_sys_path": False,
+                    "sitecustomize_loaded": False,
+                    "user_site_on_sys_path": False,
+                },
+            )
+            self.assertFalse(sitecustomize_marker.exists())
+            self.assertFalse(pth_marker.exists())
+            self.assertEqual(tuple(root.rglob("*.pyc")), ())
+            self.assertEqual(tuple(root.rglob("__pycache__")), ())
+
+    def test_bound_close_failure_never_retains_lexical_replacement(self) -> None:
+        with owned_temporary_directory("readonly-bound-close-moved-") as root:
+            lexical_path = root / "bound"
+            self._make_private_directory(lexical_path)
+            (lexical_path / "sentinel").write_text("held\n", encoding="ascii")
+            moved_path = root / "moved-bound"
+            parent_result_owner = support._DirectoryParentBindingResultOwner()
+            binding = self._open_parent_binding(
+                parent_result_owner,
+                lexical_path,
+                require_owned_private_parent=True,
+            )
+            held_identity = binding.object_locator()
+            try:
+                lexical_path.rename(moved_path)
+                self._make_private_directory(lexical_path)
+                (lexical_path / "sentinel").write_text(
+                    "replacement\n",
+                    encoding="ascii",
+                )
+                evidence = runner._bound_path_evidence(binding)
+                close_error = OSError(
+                    errno.EIO,
+                    "synthetic moved binding close failure",
+                )
+                with (
+                    mock.patch.object(
+                        support._DirectoryParentBinding,
+                        "close",
+                        autospec=True,
+                        side_effect=close_error,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    binding.close()
+
+                failure = runner._bound_close_failure(
+                    binding,
+                    caught.exception,
+                    evidence=evidence,
+                    evidence_error=None,
+                )
+                descriptor_uri = (
+                    "descriptor-object://"
+                    f"{held_identity['device']}/{held_identity['inode']}"
+                )
+                self.assertIn(failure.path, {str(moved_path), descriptor_uri})
+                self.assertNotEqual(failure.path, str(lexical_path))
+                self.assertIn(failure.path_status, {"bound-moved", "descriptor-object"})
+                self.assertEqual(failure.original_path, str(lexical_path))
+                self.assertEqual(failure.replacement_path, str(lexical_path))
+                self.assertEqual(failure.held_identity, held_identity)
+                self.assertEqual(failure.error_kind, "OSError")
+                self.assertEqual(failure.error_errno, errno.EIO)
+                self.assertEqual(
+                    (moved_path / "sentinel").read_text(encoding="ascii"),
+                    "held\n",
+                )
+                self.assertEqual(
+                    (lexical_path / "sentinel").read_text(encoding="ascii"),
+                    "replacement\n",
+                )
+            finally:
+                parent_result_owner.close()
+
+
+class _RunnerFilesystemTestCase(unittest.TestCase):
+    @staticmethod
+    def _make_private_directory(path: pathlib.Path) -> None:
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+
+    @staticmethod
+    def _open_parent_binding(
+        result_owner: support._DirectoryParentBindingResultOwner,
+        path: pathlib.Path,
+        *,
+        require_owned_private_parent: bool,
+    ) -> support._DirectoryParentBinding:
+        try:
+            binding = support._open_directory_parent(
+                path,
+                require_owned_private_parent=require_owned_private_parent,
+                result_owner=result_owner,
+            )
+            result_owner.transfer(binding)
+            return binding
+        except BaseException as error:
+            preserved = (
+                support._settle_directory_parent_binding_result_preserving_trigger(
+                    result_owner,
+                    error,
+                )
+            )
+            if preserved is error:
+                raise
+            raise preserved
+
+    @classmethod
+    def _bound_directory_factory(
+        cls,
+        *paths: pathlib.Path,
+    ) -> object:
+        remaining = iter(paths)
+
+        def create(
+            _parent: pathlib.Path,
+            _prefix: str,
+            *,
+            result_owner: support._PrivateDirectoryCreationResultOwner,
+            require_owned_private_parent: bool = True,
+            allow_sticky_writable_ancestors: bool | None = None,
+        ) -> support._DirectoryParentBinding:
+            if allow_sticky_writable_ancestors is not None:
+                raise AssertionError(
+                    "synthetic ambient runtime creation received explicit policy"
+                )
+            parent_result_owner = support._DirectoryParentBindingResultOwner()
+            binding = cls._open_parent_binding(
+                parent_result_owner,
+                next(remaining),
+                require_owned_private_parent=require_owned_private_parent,
+            )
+            result_owner.publish(binding)
+            return binding
+
+        return create
+
+
+class SourceCheckoutBindingIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _git(repo: pathlib.Path, *arguments: str) -> str:
+        environment = runner.bound_git_environment(
+            {
+                "HOME": str(repo),
+            }
+        )
+        returncode, stdout, stderr = runner.run_bounded(
+            (
+                runner.selected_git_executable(),
+                "--no-pager",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex-test@example.invalid",
+                "-C",
+                str(repo),
+                *arguments,
+            ),
+            cwd=repo,
+            environment=environment,
+            timeout=10,
+            stdout_limit=1024 * 1024,
+            stderr_limit=1024 * 1024,
+        )
+        if returncode != 0 or stderr:
+            detail = stderr.decode("utf-8", "replace")[-2_048:]
+            raise AssertionError(
+                f"synthetic Git command failed ({returncode}): {detail}"
+            )
+        return stdout.decode("ascii", "strict").strip()
+
+    def test_synthetic_git_uses_bound_toolchain_and_process_owner(self) -> None:
+        repo = pathlib.Path("/synthetic/repo")
+        environment = {"BOUND": "1"}
+        with (
+            mock.patch.object(
+                runner,
+                "selected_git_executable",
+                return_value="/trusted/Xcode/usr/bin/git",
+            ) as selected_git,
+            mock.patch.object(
+                runner,
+                "bound_git_environment",
+                return_value=environment,
+            ) as bound_environment,
+            mock.patch.object(
+                runner,
+                "run_bounded",
+                return_value=(0, b"synthetic-output\n", b""),
+            ) as run_bounded,
+        ):
+            self.assertEqual(
+                self._git(repo, "status", "--porcelain=v1"),
+                "synthetic-output",
+            )
+
+        selected_git.assert_called_once_with()
+        bound_environment.assert_called_once_with({"HOME": str(repo)})
+        argv = run_bounded.call_args.args[0]
+        self.assertEqual(argv[0], "/trusted/Xcode/usr/bin/git")
+        self.assertEqual(argv[-2:], ("status", "--porcelain=v1"))
+        self.assertEqual(run_bounded.call_args.kwargs["environment"], environment)
+        self.assertEqual(run_bounded.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run_bounded.call_args.kwargs["stdout_limit"], 1024 * 1024)
+        self.assertEqual(run_bounded.call_args.kwargs["stderr_limit"], 1024 * 1024)
+
+    @classmethod
+    @contextlib.contextmanager
+    def _synthetic_repository(
+        cls,
+    ) -> object:
+        with owned_temporary_directory("readonly-source-binding-") as root:
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            source = repo / "source"
+            source.mkdir(mode=0o700)
+            (source / "payload.txt").write_text("original\n", encoding="ascii")
+            (repo / ".gitignore").write_text(
+                "source/*.ignored\n",
+                encoding="ascii",
+            )
+            cls._git(repo, "init", "-q")
+            cls._git(repo, "add", "--all")
+            cls._git(repo, "commit", "-q", "-m", "Initial synthetic tree")
+            head_sha = cls._git(repo, "rev-parse", "HEAD")
+            yield root, repo, source, head_sha
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _expected_head(value: str | None) -> object:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            if value is None:
+                os.environ.pop(runner.EXPECTED_HEAD_ENV, None)
+            else:
+                os.environ[runner.EXPECTED_HEAD_ENV] = value
+            yield
+
+    @staticmethod
+    def _snapshot_budget(
+        *,
+        observations: int = 256,
+        file_bytes: int = 1024 * 1024,
+        access_policy_bytes: int = 1024 * 1024,
+        path_bytes: int = 1024 * 1024,
+        max_depth: int = 16,
+    ) -> runner.TreeSnapshotBudget:
+        return runner.TreeSnapshotBudget(
+            entry_observations_remaining=observations,
+            file_read_bytes_remaining=file_bytes,
+            access_policy_read_bytes_remaining=access_policy_bytes,
+            path_read_bytes_remaining=path_bytes,
+            max_depth=max_depth,
+        )
+
+    def test_clean_exact_head_binding_and_stable_copy(self) -> None:
+        with self._synthetic_repository() as (root, repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                installed = root / "installed"
+                copied_manifest = runner._copy_bound_source(
+                    source,
+                    installed,
+                    binding,
+                    source_manifest,
+                )
+
+            expected_blob_digest = hashlib.sha256(b"original\n").hexdigest()
+            expected_head_manifest = hashlib.sha256(
+                f"100644 {expected_blob_digest}\t".encode("ascii") + b"payload.txt\0"
+            ).hexdigest()
+            self.assertEqual(binding.repo_root, repo.resolve())
+            self.assertEqual(binding.head_sha, head_sha)
+            self.assertEqual(binding.source_relative_path, "source")
+            self.assertEqual(binding.source_manifest_sha256, source_manifest)
+            self.assertEqual(
+                binding.head_subtree_manifest_sha256,
+                expected_head_manifest,
+            )
+            self.assertEqual(copied_manifest, source_manifest)
+            self.assertEqual(
+                runner._source_manifest_sha256(installed),
+                source_manifest,
+            )
+            self.assertEqual(
+                (installed / "payload.txt").read_text(encoding="ascii"),
+                "original\n",
+            )
+
+    def test_hosted_root_source_copy_projects_nobody_destination_identity(self) -> None:
+        source_entry = runner.TreeEntrySnapshot(
+            kind="file",
+            size=0,
+            device=1,
+            inode=2,
+            generation=0,
+            uid=0,
+            gid=0,
+            mode=0o444,
+            flags=0,
+            link_count=1,
+            digest=hashlib.sha256(b"").hexdigest(),
+            xattrs=(),
+            acl_entries=(),
+        )
+        nobody_uid = 65_534
+        nobody_gid = 65_534
+        expected_destination_manifest = runner._destination_snapshot_manifest_sha256(
+            (("payload.py", source_entry),),
+            destination_owner_uid=nobody_uid,
+            destination_group_gid=nobody_gid,
+        )
+        self.assertEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {
+                    "payload.py": replace(
+                        source_entry,
+                        uid=nobody_uid,
+                        gid=nobody_gid,
+                    )
+                }
+            ),
+        )
+        self.assertNotEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {"payload.py": replace(source_entry, uid=501)}
+            ),
+        )
+        self.assertNotEqual(
+            expected_destination_manifest,
+            runner._source_snapshot_manifest_sha256(
+                {"payload.py": replace(source_entry, uid=nobody_uid, gid=0)}
+            ),
+        )
+
+        destination_state = {"gid": 0}
+
+        def destination_metadata(_descriptor: int) -> object:
+            return mock.Mock(st_uid=nobody_uid, st_gid=destination_state["gid"])
+
+        def project_group(_descriptor: int, _uid: int, gid: int) -> None:
+            destination_state["gid"] = gid
+
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(runner.os, "fstat", side_effect=destination_metadata),
+            mock.patch.object(runner.os, "fchown", side_effect=project_group) as chown,
+            mock.patch.object(runner.os, "fchmod") as chmod,
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
+            )
+        chown.assert_called_once_with(11, -1, nobody_gid)
+        chmod.assert_called_once_with(11, source_entry.mode)
+
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(
+                runner.os,
+                "fstat",
+                return_value=mock.Mock(st_uid=501, st_gid=0),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected destination owner"),
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
+            )
+
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_access_policy_snapshot",
+                return_value=((), ()),
+            ),
+            mock.patch.object(runner, "_copy_bound_xattrs"),
+            mock.patch.object(
+                runner.os,
+                "fstat",
+                return_value=mock.Mock(st_uid=nobody_uid, st_gid=0),
+            ),
+            mock.patch.object(runner.os, "fchown"),
+            mock.patch.object(runner.os, "fchmod"),
+            self.assertRaisesRegex(RuntimeError, "expected destination group"),
+        ):
+            runner._apply_copied_entry_policy(
+                10,
+                11,
+                source_entry,
+                scan=self._snapshot_budget(),
+                destination_owner_uid=nobody_uid,
+                destination_group_gid=nobody_gid,
+            )
+
+    def test_binding_rejects_missing_invalid_and_mismatched_expected_head(
+        self,
+    ) -> None:
+        with self._synthetic_repository() as (_root, _repo, source, head_sha):
+            invalid_values = (
+                ("missing", None),
+                ("short", "a" * 39),
+                ("uppercase", "A" * 40),
+                ("non-hex", "g" * 40),
+            )
+            for label, value in invalid_values:
+                with (
+                    self.subTest(case=label),
+                    self._expected_head(value),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "must be one full lowercase SHA-1",
+                    ),
+                ):
+                    runner._bind_source_checkout(source)
+
+            mismatch = "0" * 40
+            self.assertNotEqual(mismatch, head_sha)
+            with (
+                self._expected_head(mismatch),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "HEAD does not match the expected exact head",
+                ),
+            ):
+                runner._bind_source_checkout(source)
+
+    def test_binding_rejects_tracked_untracked_and_ignored_inputs(self) -> None:
+        cases = (
+            (
+                "tracked",
+                lambda source: (source / "payload.txt").write_text(
+                    "modified\n",
+                    encoding="ascii",
+                ),
+                "does not match the exact HEAD",
+            ),
+            (
+                "untracked",
+                lambda source: (source / "untracked.txt").write_text(
+                    "untracked\n",
+                    encoding="ascii",
+                ),
+                "does not match the exact HEAD",
+            ),
+            (
+                "ignored",
+                lambda source: (source / "payload.ignored").write_text(
+                    "ignored\n",
+                    encoding="ascii",
+                ),
+                "does not match the exact HEAD",
+            ),
+            (
+                "untracked-empty-directory",
+                lambda source: (source / "empty").mkdir(mode=0o700),
+                "does not match the exact HEAD",
+            ),
+            (
+                "tracked-mode",
+                lambda source: (source / "payload.txt").chmod(0o755),
+                "file mode does not match the exact HEAD",
+            ),
+        )
+        for label, mutate, expected_message in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    _root,
+                    _repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                mutate(source)
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, expected_message),
+                ):
+                    runner._bind_source_checkout(source)
+
+    def test_binding_rejects_hidden_index_flags(self) -> None:
+        cases = (
+            ("assume-unchanged", "--assume-unchanged"),
+            ("skip-worktree", "--skip-worktree"),
+        )
+        for label, option in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    _root,
+                    repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                self._git(repo, "update-index", option, "source/payload.txt")
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "assume-unchanged or skip-worktree",
+                    ),
+                ):
+                    runner._bind_source_checkout(source)
+
+    def test_binding_rejects_unsafe_local_git_configuration(self) -> None:
+        def configure_include(root: pathlib.Path, repo: pathlib.Path) -> None:
+            included = root / "included.config"
+            included.write_text("[core]\n\tfileMode = true\n", encoding="ascii")
+            self._git(repo, "config", "include.path", str(included))
+
+        cases = (
+            (
+                "filemode",
+                lambda _root, repo: self._git(repo, "config", "core.fileMode", "false"),
+                "disables core.fileMode",
+            ),
+            (
+                "filter",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "filter.synthetic.clean",
+                    "/usr/bin/false",
+                ),
+                "executable filter or diff",
+            ),
+            (
+                "diff",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "diff.synthetic.textconv",
+                    "/usr/bin/false",
+                ),
+                "executable filter or diff",
+            ),
+            (
+                "fsmonitor",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "core.fsmonitor",
+                    "true",
+                ),
+                "enables core.fsmonitor",
+            ),
+            (
+                "alias",
+                lambda _root, repo: self._git(
+                    repo,
+                    "config",
+                    "alias.synthetic",
+                    "!/usr/bin/true",
+                ),
+                "contains an alias",
+            ),
+            (
+                "include",
+                configure_include,
+                "contains an include",
+            ),
+        )
+        for label, configure, expected_message in cases:
+            with (
+                self.subTest(case=label),
+                self._synthetic_repository() as (
+                    root,
+                    repo,
+                    source,
+                    head_sha,
+                ),
+            ):
+                configure(root, repo)
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, expected_message),
+                ):
+                    runner._bind_source_checkout(source)
+
+    def test_snapshot_budget_is_shared_across_observations_bytes_and_passes(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-snapshot-budget-") as root:
+            first = root / "first"
+            first.write_bytes(b"1234")
+            runner._tree_snapshot(
+                root,
+                budget=self._snapshot_budget(
+                    observations=8,
+                    file_bytes=40,
+                    max_depth=1,
+                ),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "entry-observation bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=7,
+                        file_bytes=40,
+                        max_depth=1,
+                    ),
+                )
+
+            second = root / "second"
+            second.write_bytes(b"5678")
+            with self.assertRaisesRegex(RuntimeError, "cumulative file byte bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=64,
+                        file_bytes=40,
+                        max_depth=1,
+                    ),
+                )
+
+            first.unlink()
+            second.unlink()
+            sparse = root / "sparse"
+            with sparse.open("wb") as stream:
+                stream.truncate(1024 * 1024)
+            with (
+                mock.patch.object(
+                    runner.os,
+                    "pread",
+                    side_effect=AssertionError(
+                        "oversized sparse content must fail before pread"
+                    ),
+                ) as pread,
+                self.assertRaisesRegex(RuntimeError, "cumulative file byte bound"),
+            ):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(
+                        observations=128,
+                        file_bytes=16,
+                        max_depth=1,
+                    ),
+                )
+            pread.assert_not_called()
+
+    def test_snapshot_budget_enforces_depth_and_one_deadline_for_both_passes(
+        self,
+    ) -> None:
+        with owned_temporary_directory("readonly-snapshot-depth-") as root:
+            nested = root / "nested"
+            nested.mkdir(mode=0o700)
+            (nested / "payload").write_bytes(b"x")
+            runner._tree_snapshot(
+                root,
+                budget=self._snapshot_budget(max_depth=2),
+            )
+            with self.assertRaisesRegex(RuntimeError, "depth bound"):
+                runner._tree_snapshot(
+                    root,
+                    budget=self._snapshot_budget(max_depth=1),
+                )
+
+        def one_pass(
+            _root: pathlib.Path,
+            *,
+            scan: runner.TreeSnapshotScan,
+            expected_kinds: dict[bytes, str] | None = None,
+        ) -> dict[str, runner.TreeEntrySnapshot]:
+            del expected_kinds
+            scan.checkpoint()
+            return {}
+
+        with (
+            mock.patch.object(
+                runner.time, "monotonic", side_effect=(0.0, 59.999, 60.0)
+            ),
+            mock.patch.object(runner, "_tree_snapshot_once", side_effect=one_pass),
+            self.assertRaisesRegex(RuntimeError, "total deadline"),
+        ):
+            runner._tree_snapshot(pathlib.Path("/synthetic"))
+
+    def test_head_prefix_expansion_obeys_snapshot_depth_and_entry_budget(
+        self,
+    ) -> None:
+        for failure, budget in (
+            (
+                "depth bound",
+                self._snapshot_budget(observations=256, max_depth=2),
+            ),
+            (
+                "entry-observation bound",
+                self._snapshot_budget(observations=2, max_depth=16),
+            ),
+        ):
+            with (
+                self.subTest(failure=failure),
+                self._synthetic_repository() as (_root, repo, source, _head_sha),
+            ):
+                nested = source / "one" / "two"
+                nested.mkdir(mode=0o700, parents=True)
+                (nested / "payload.py").write_text("VALUE = 1\n", encoding="ascii")
+                self._git(repo, "add", "--all")
+                self._git(repo, "commit", "-q", "-m", "Add nested source")
+                head_sha = self._git(repo, "rev-parse", "HEAD")
+                with (
+                    self._expected_head(head_sha),
+                    self.assertRaisesRegex(RuntimeError, failure),
+                ):
+                    runner._bind_source_checkout(source, budget=budget)
+
+    def test_directory_copy_revalidation_consumes_observation_budget(self) -> None:
+        with owned_temporary_directory("readonly-directory-copy-budget-") as root:
+            source = root / "source"
+            nested = source / "nested"
+            nested.mkdir(mode=0o700, parents=True)
+            (nested / "payload.py").write_text("VALUE = 1\n", encoding="ascii")
+            binding = runner._bind_source_tree(
+                source,
+                budget=self._snapshot_budget(observations=128),
+            )
+            with self.assertRaisesRegex(RuntimeError, "entry-observation bound"):
+                runner._copy_bound_source_tree(
+                    source,
+                    root / "insufficient",
+                    binding,
+                    budget=self._snapshot_budget(observations=4),
+                    destination_owner_uid=os.geteuid(),
+                    destination_group_gid=os.getegid(),
+                )
+            runner._copy_bound_source_tree(
+                source,
+                root / "complete",
+                binding,
+                budget=self._snapshot_budget(observations=5),
+                destination_owner_uid=os.geteuid(),
+                destination_group_gid=os.getegid(),
+            )
+            self.assertEqual(
+                (root / "complete" / "nested" / "payload.py").read_text(
+                    encoding="ascii"
+                ),
+                "VALUE = 1\n",
+            )
+
+    def test_bounded_copy_ignores_concurrent_extra_until_bounded_revalidation(
+        self,
+    ) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                extra = source / "oversized.ignored"
+                with extra.open("wb") as stream:
+                    stream.truncate(1024 * 1024)
+                extra_identity = (extra.stat().st_dev, extra.stat().st_ino)
+                real_pread = runner.os.pread
+
+                def reject_extra_pread(
+                    descriptor: int,
+                    size: int,
+                    offset: int,
+                ) -> bytes:
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) == extra_identity:
+                        raise AssertionError(
+                            "bounded copy read a path absent from the exact receipt"
+                        )
+                    return real_pread(descriptor, size, offset)
+
+                installed = root / "installed"
+                with (
+                    mock.patch.object(
+                        runner.os, "pread", side_effect=reject_extra_pread
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "does not match the exact HEAD"
+                    ),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        installed,
+                        binding,
+                        source_manifest,
+                        budget=self._snapshot_budget(
+                            observations=128,
+                            file_bytes=1024,
+                        ),
+                    )
+
+            self.assertFalse((installed / extra.name).exists())
+            self.assertEqual(
+                (installed / "payload.txt").read_text(encoding="ascii"),
+                "original\n",
+            )
+
+    def test_post_copy_fanout_is_stopped_by_shared_observation_budget(self) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                real_copy = runner._copy_bound_source_tree
+
+                def copy_then_inject_fanout(
+                    source_path: pathlib.Path,
+                    destination: pathlib.Path,
+                    source_receipt: runner.SourceCheckoutBinding,
+                    *,
+                    budget: runner.TreeSnapshotBudget,
+                    destination_owner_uid: int,
+                    destination_group_gid: int,
+                ) -> None:
+                    real_copy(
+                        source_path,
+                        destination,
+                        source_receipt,
+                        budget=budget,
+                        destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
+                    )
+                    for index in range(64):
+                        (source_path / f"extra-{index:02d}.ignored").write_bytes(b"")
+
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_copy_bound_source_tree",
+                        side_effect=copy_then_inject_fanout,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "entry-observation bound"),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        root / "installed",
+                        binding,
+                        source_manifest,
+                        budget=self._snapshot_budget(observations=24),
+                    )
+
+    def test_copy_rejects_source_mutation_during_copy(self) -> None:
+        with self._synthetic_repository() as (root, _repo, source, head_sha):
+            with self._expected_head(head_sha):
+                binding = runner._bind_source_checkout(source)
+                source_manifest = binding.source_manifest_sha256
+                real_copy = runner._copy_bound_source_tree
+
+                def copy_then_mutate(
+                    source_path: pathlib.Path,
+                    destination: pathlib.Path,
+                    source_receipt: runner.SourceCheckoutBinding,
+                    *,
+                    budget: runner.TreeSnapshotBudget,
+                    destination_owner_uid: int,
+                    destination_group_gid: int,
+                ) -> None:
+                    real_copy(
+                        source_path,
+                        destination,
+                        source_receipt,
+                        budget=budget,
+                        destination_owner_uid=destination_owner_uid,
+                        destination_group_gid=destination_group_gid,
+                    )
+                    (pathlib.Path(source_path) / "payload.txt").write_text(
+                        "mutated during copy\n",
+                        encoding="ascii",
+                    )
+
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_copy_bound_source_tree",
+                        side_effect=copy_then_mutate,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "does not match the exact HEAD|stable exact-head source",
+                    ),
+                ):
+                    runner._copy_bound_source(
+                        source,
+                        root / "installed",
+                        binding,
+                        source_manifest,
+                    )
+
+
+class TrustedMacGateBootstrapTests(unittest.TestCase):
+    GATE_PATH = pathlib.Path(runner.__file__).with_name("trusted_mac_gate.py")
+    GATE_SOURCE = _captured_gate_source_for_nested_tests(GATE_PATH)
+    MANIFEST_PATH = GATE_PATH.parents[1] / "trusted_mac_gate_sources.index"
+
+    @classmethod
+    def _manifest_payload(cls, root: pathlib.Path) -> bytes:
+        records = []
+        for package in ("review_supervisor", "tests"):
+            for path in sorted(
+                (root / package).rglob("*"),
+                key=lambda item: os.fsencode(item.relative_to(root)),
+            ):
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise AssertionError(
+                        f"cannot manifest non-regular test source: {path}"
+                    )
+                payload = path.read_bytes()
+                mode = 0o100755 if metadata.st_mode & 0o111 else 0o100644
+                relative = path.relative_to(root).as_posix().encode("ascii")
+                records.append(
+                    f"{mode:o} {len(payload)} {hashlib.sha256(payload).hexdigest()}\t".encode(
+                        "ascii"
+                    )
+                    + relative
+                    + b"\n"
+                )
+        return b"trusted-mac-gate-source-manifest-v1\n" + b"".join(records)
+
+    @classmethod
+    def _write_manifest(cls, root: pathlib.Path) -> pathlib.Path:
+        manifest = root / "trusted_mac_gate_sources.index"
+        manifest.write_bytes(cls._manifest_payload(root))
+        return manifest
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _synthetic_tool_root() -> object:
+        with owned_temporary_directory("trusted-mac-gate-") as root:
+            review_supervisor = root / "review_supervisor"
+            tests = root / "tests"
+            review_supervisor.mkdir(mode=0o700)
+            tests.mkdir(mode=0o700)
+            (review_supervisor / "__init__.py").write_text("", encoding="ascii")
+            (review_supervisor / "captured.py").write_text(
+                "VALUE = 'captured'\n",
+                encoding="ascii",
+            )
+            (tests / "__init__.py").write_text("", encoding="ascii")
+            (tests / "trusted_mac_gate.py").write_text(
+                TrustedMacGateBootstrapTests.GATE_SOURCE,
+                encoding="utf-8",
+            )
+            marker = root / "ambient-marker"
+            payload = (
+                "import json, os, pathlib, sys\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "print(json.dumps({\n"
+                "    'environment': dict(sorted(os.environ.items())),\n"
+                "    'flags': {\n"
+                "        'isolated': sys.flags.isolated,\n"
+                "        'ignore_environment': sys.flags.ignore_environment,\n"
+                "        'no_site': sys.flags.no_site,\n"
+                "        'no_user_site': sys.flags.no_user_site,\n"
+                "        'safe_path': sys.flags.safe_path,\n"
+                "        'dont_write_bytecode': sys.dont_write_bytecode,\n"
+                "    },\n"
+                "    'marker_exists': marker.exists(),\n"
+                "    'sys_path': sys.path,\n"
+                "}, sort_keys=True))\n"
+            )
+            (tests / "run_required_no_child_profile.py").write_text(
+                payload,
+                encoding="ascii",
+            )
+            (tests / "run_readonly_install_deterministic_supervisor.py").write_text(
+                payload,
+                encoding="ascii",
+            )
+            TrustedMacGateBootstrapTests._write_manifest(root)
+            yield root, marker
+
+    @staticmethod
+    def _run_gate(
+        root: pathlib.Path,
+        *arguments: str,
+        isolated: bool = True,
+        extra_environment: dict[str, str] | None = None,
+        manifest_digest: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = ["/usr/bin/env", "-i", "LANG=C", "LC_ALL=C", "PATH=/usr/bin:/bin"]
+        if extra_environment:
+            command.extend(
+                f"{key}={value}" for key, value in sorted(extra_environment.items())
+            )
+        command.append(sys.executable)
+        command.extend(("-I", "-B", "-S") if isolated else ("-B", "-S"))
+        manifest = root / "trusted_mac_gate_sources.index"
+        digest = manifest_digest or hashlib.sha256(manifest.read_bytes()).hexdigest()
+        command.extend(("-", str(root), str(manifest), digest, *arguments))
+        return subprocess.run(
+            command,
+            cwd=root,
+            input=TrustedMacGateBootstrapTests.GATE_SOURCE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+    @classmethod
+    def _load_gate_module(cls) -> object:
+        spec = importlib.util.spec_from_file_location(
+            "_trusted_mac_gate_budget_test",
+            cls.GATE_PATH,
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load trusted gate test module")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+        return module
+
+    def test_source_only_bootstrap_ignores_ambient_python_startup(self) -> None:
+        with self._synthetic_tool_root() as (root, marker):
+            hostile = root / "hostile-python"
+            hostile.mkdir(mode=0o700)
+            marker_script = (
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('executed', encoding='ascii')\n"
+            )
+            (hostile / "sitecustomize.py").write_text(
+                marker_script,
+                encoding="ascii",
+            )
+            (hostile / "usercustomize.py").write_text(
+                marker_script,
+                encoding="ascii",
+            )
+            (hostile / "ambient.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('pth')\n",
+                encoding="ascii",
+            )
+            hostile_environment = {
+                "HOME": str(hostile),
+                "PYTHONHOME": str(hostile),
+                "PYTHONPATH": str(hostile),
+                "PYTHONUSERBASE": str(hostile),
+            }
+            cases = (("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),)
+            for label, arguments, expected_key in cases:
+                with self.subTest(mode=label):
+                    completed = self._run_gate(
+                        root,
+                        *arguments,
+                        extra_environment=hostile_environment,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stderr, "")
+                    result = json.loads(completed.stdout)
+                    self.assertEqual(
+                        result["flags"],
+                        {
+                            "dont_write_bytecode": True,
+                            "ignore_environment": 1,
+                            "isolated": 1,
+                            "no_site": 1,
+                            "no_user_site": 1,
+                            "safe_path": True,
+                        },
+                    )
+                    self.assertIn(expected_key, result["environment"])
+                    self.assertNotEqual(result["environment"]["HOME"], str(hostile))
+                    self.assertNotIn(str(hostile), result["sys_path"])
+                    self.assertNotIn(str(root), result["sys_path"])
+                    self.assertIs(result["marker_exists"], False)
+                    self.assertFalse(marker.exists())
+                    self.assertFalse(tuple(root.rglob("__pycache__")))
+
+    def test_hosted_git_receipt_is_closed_and_binds_runtime_environment(self) -> None:
+        gate = self._load_gate_module()
+        account = pwd.getpwuid(os.getuid())
+        paths = {
+            "runtime": "/private/runtime",
+            "home": "/private/home",
+            "developer": "/Applications/Trusted.app/Contents/Developer",
+            "executable": "/Applications/Trusted.app/Contents/Developer/usr/bin/git",
+            "exec_path": (
+                "/Applications/Trusted.app/Contents/Developer/usr/libexec/git-core"
+            ),
+        }
+        record = {
+            "developer_dir": paths["developer"],
+            "exec_path": paths["exec_path"],
+            "exec_path_sha256": "a" * 64,
+            "executable": paths["executable"],
+            "executable_sha256": "b" * 64,
+            "schema": "hosted-git-toolchain-receipt-v2",
+            "toolchain_sha256": "c" * 64,
+        }
+
+        def toolchain_payload(**overrides: str) -> bytes:
+            return (
+                json.dumps(
+                    {**record, **overrides},
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+
+        receipt_payload = toolchain_payload()
+        receipt = receipt_payload[:-1].decode("ascii")
+        arguments = [
+            paths["runtime"],
+            paths["home"],
+            paths["developer"],
+            paths["executable"],
+            "b" * 64,
+            paths["exec_path"],
+            receipt,
+            account.pw_name,
+            str(account.pw_uid),
+            str(account.pw_gid),
+            "e" * 64,
+        ]
+        with mock.patch.object(
+            gate,
+            "_hosted_git_receipt_payload",
+            return_value=receipt_payload,
+        ) as measure:
+            environment = gate._validate_hosted_git_toolchain(arguments)
+        self.assertEqual(
+            environment,
+            {
+                "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR": paths["developer"],
+                "CODEX_REVIEW_BOUND_GIT_EXECUTABLE": paths["executable"],
+                "CODEX_REVIEW_BOUND_GIT_EXEC_PATH": paths["exec_path"],
+                "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256": hashlib.sha256(
+                    receipt_payload
+                ).hexdigest(),
+                "CODEX_REVIEW_BOUND_GIT_TMPDIR": paths["runtime"],
+                "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256": "e" * 64,
+                "HOME": paths["home"],
+                "TMPDIR": paths["runtime"],
+            },
+        )
+        measure.assert_called_once_with(
+            [
+                paths["developer"],
+                paths["executable"],
+                "b" * 64,
+                paths["exec_path"],
+            ]
+        )
+
+        bound_environment = {
+            key: value
+            for key, value in environment.items()
+            if key.startswith("CODEX_REVIEW_BOUND_GIT_")
+        }
+        binding_arguments = [
+            paths["runtime"],
+            paths["developer"],
+            paths["executable"],
+            "b" * 64,
+            paths["exec_path"],
+            receipt,
+            "tmpdir-custody-receipt",
+        ]
+        tmpdir_custody_payload = b"canonical-tmpdir-custody-receipt\n"
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                return_value=receipt_payload,
+            ),
+            mock.patch.object(
+                gate,
+                "_validate_trusted_git_tmpdir",
+                return_value=tmpdir_custody_payload,
+            ) as validate_tmpdir,
+        ):
+            local_environment = gate._validate_bound_git_toolchain(
+                binding_arguments,
+                profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+            )
+        expected_tmpdir_validation = mock.call(
+            pathlib.Path(paths["runtime"]),
+            "tmpdir-custody-receipt",
+        )
+        self.assertEqual(
+            validate_tmpdir.call_args_list,
+            [expected_tmpdir_validation, expected_tmpdir_validation],
+        )
+        self.assertEqual(
+            local_environment["CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256"],
+            hashlib.sha256(
+                b"trusted-mac-bound-git-profile-v3\0"
+                + hashlib.sha256(receipt_payload).digest()
+                + hashlib.sha256(tmpdir_custody_payload).digest()
+            ).hexdigest(),
+        )
+        measurement_failure = RuntimeError("synthetic toolchain measurement failure")
+        custody_failure = RuntimeError("synthetic post-measurement custody drift")
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                side_effect=measurement_failure,
+            ),
+            mock.patch.object(
+                gate,
+                "_validate_trusted_git_tmpdir",
+                side_effect=(tmpdir_custody_payload, custody_failure),
+            ) as validate_drifting_tmpdir,
+            self.assertRaises(RuntimeError) as dual_failure,
+        ):
+            gate._validate_bound_git_toolchain(
+                binding_arguments,
+                profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+            )
+        self.assertIs(dual_failure.exception, measurement_failure)
+        self.assertEqual(
+            dual_failure.exception.codex_secondary_failures,
+            (custody_failure,),
+        )
+        self.assertEqual(
+            validate_drifting_tmpdir.call_args_list,
+            [expected_tmpdir_validation, expected_tmpdir_validation],
+        )
+        readonly_arguments = ["a" * 40, *binding_arguments]
+        cleared_environment: dict[str, str] = {}
+        with (
+            mock.patch.object(
+                gate,
+                "_validate_bound_git_toolchain",
+                return_value=bound_environment,
+            ) as validate,
+            mock.patch.object(gate.os, "environ", cleared_environment),
+        ):
+            module = gate._configure_environment("readonly", readonly_arguments)
+            selected_git = runner.selected_git_executable()
+            git_environment = runner.bound_git_environment()
+        self.assertEqual(
+            module,
+            "tests.run_readonly_install_deterministic_supervisor",
+        )
+        validate.assert_called_once_with(
+            binding_arguments,
+            profile=gate.TRUSTED_MAC_GIT_BINDING_PROFILE,
+        )
+        self.assertEqual(
+            {key: cleared_environment[key] for key in bound_environment},
+            bound_environment,
+        )
+        self.assertEqual(cleared_environment[runner.EXPECTED_HEAD_ENV], "a" * 40)
+        self.assertEqual(
+            cleared_environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"],
+            paths["runtime"],
+        )
+        self.assertEqual(selected_git, paths["executable"])
+        self.assertNotEqual(selected_git, "/usr/bin/git")
+        self.assertEqual(git_environment["DEVELOPER_DIR"], paths["developer"])
+        self.assertEqual(git_environment["GIT_EXEC_PATH"], paths["exec_path"])
+        self.assertEqual(git_environment["TMPDIR"], paths["runtime"])
+
+        with (
+            mock.patch.object(gate.os, "environ", {}),
+            self.assertRaisesRegex(RuntimeError, "trusted Git binding requires"),
+        ):
+            gate._configure_environment("readonly", ["a" * 40])
+        mismatched_arguments = list(binding_arguments)
+        mismatched_arguments[2] = paths["executable"] + "-replacement"
+        with self.assertRaisesRegex(RuntimeError, "does not bind"):
+            gate._validate_bound_git_toolchain(
+                mismatched_arguments[:6],
+                profile=gate.HOSTED_GIT_BINDING_PROFILE,
+            )
+        drifted_payload = toolchain_payload(exec_path_sha256="e" * 64)
+        with (
+            mock.patch.object(
+                gate,
+                "_hosted_git_receipt_payload",
+                return_value=drifted_payload,
+            ) as measure,
+            self.assertRaisesRegex(RuntimeError, "does not match its receipt"),
+        ):
+            gate._validate_bound_git_toolchain(
+                binding_arguments[:6],
+                profile=gate.HOSTED_GIT_BINDING_PROFILE,
+            )
+        measure.assert_called_once_with(
+            [
+                paths["developer"],
+                paths["executable"],
+                "b" * 64,
+                paths["exec_path"],
+            ]
+        )
+
+        with owned_temporary_directory("trusted-git-tmpdir-") as root:
+            trusted_tmp = root / "runtime"
+            other_tmp = root / "other"
+            replacement_tmp = root / "replacement"
+            trusted_tmp.mkdir(mode=0o700)
+            other_tmp.mkdir(mode=0o700)
+            replacement_tmp.mkdir(mode=0o700)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"CODEX_REVIEW_TEST_RUNTIME_PARENT": str(trusted_tmp)},
+                ),
+                mock.patch.object(
+                    support,
+                    "_repository_runtime_candidates",
+                    side_effect=AssertionError("ambient repository fallback ran"),
+                ),
+                mock.patch.object(
+                    support.shutil,
+                    "which",
+                    side_effect=AssertionError("unbound Git lookup ran"),
+                ),
+                mock.patch.object(
+                    support.subprocess,
+                    "run",
+                    side_effect=AssertionError("unbound Git subprocess ran"),
+                ),
+                mock.patch.object(
+                    support,
+                    "open_absolute_directory_chain",
+                    wraps=support.open_absolute_directory_chain,
+                ) as open_runtime_parent,
+            ):
+                self.assertEqual(support._private_runtime_parent(), trusted_tmp)
+            self.assertTrue(open_runtime_parent.call_args_list)
+            self.assertTrue(
+                all(
+                    call.kwargs["allow_sticky_writable_ancestors"]
+                    for call in open_runtime_parent.call_args_list
+                )
+            )
+
+            unsafe_runtime_ancestor = root / "unsafe-runtime-ancestor"
+            unsafe_runtime_parent = unsafe_runtime_ancestor / "private"
+            unsafe_runtime_ancestor.mkdir(mode=0o700)
+            unsafe_runtime_parent.mkdir(mode=0o700)
+            unsafe_runtime_ancestor.chmod(0o777)
+            try:
+                rejection_errors: list[BaseException] = []
+                self.assertIsNone(
+                    support._validated_private_runtime_parent(
+                        str(unsafe_runtime_parent),
+                        allow_sticky_writable_ancestors=True,
+                        rejection_errors=rejection_errors,
+                    )
+                )
+                self.assertTrue(rejection_errors)
+            finally:
+                unsafe_runtime_ancestor.chmod(0o700)
+
+            if sys.platform == "darwin" and pathlib.Path("/private/tmp").is_dir():
+                with tempfile.TemporaryDirectory(
+                    prefix="codex-safe-sticky-runtime-",
+                    dir="/private/tmp",
+                ) as raw_sticky_runtime:
+                    sticky_runtime = pathlib.Path(raw_sticky_runtime)
+                    sticky_runtime.chmod(0o700)
+                    self.assertEqual(
+                        support._validated_private_runtime_parent(
+                            str(sticky_runtime),
+                            allow_sticky_writable_ancestors=True,
+                        ),
+                        sticky_runtime,
+                    )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+            ):
+                tmpdir_payload = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(trusted_tmp)]
+                )
+                tmpdir_receipt = tmpdir_payload[:-1].decode("ascii")
+                parsed_tmpdir_receipt = json.loads(tmpdir_payload)
+                self.assertEqual(
+                    parsed_tmpdir_receipt["schema"],
+                    "trusted-git-tmpdir-custody-v1",
+                )
+                self.assertEqual(parsed_tmpdir_receipt["path"], str(trusted_tmp))
+                self.assertEqual(
+                    parsed_tmpdir_receipt["group_gid"], trusted_tmp.stat().st_gid
+                )
+                physical_chain = parsed_tmpdir_receipt["physical_chain"]
+                self.assertEqual(len(physical_chain), len(trusted_tmp.parts))
+                self.assertEqual(
+                    set(physical_chain[-1]),
+                    {
+                        "device",
+                        "file_type",
+                        "flags",
+                        "group_gid",
+                        "inode",
+                        "mode",
+                        "owner_uid",
+                    },
+                )
+                self.assertEqual(physical_chain[-1]["file_type"], stat.S_IFDIR)
+                self.assertEqual(physical_chain[-1]["mode"], 0o700)
+                self.assertEqual(physical_chain[-1]["inode"], trusted_tmp.stat().st_ino)
+                self.assertEqual(
+                    gate._validate_trusted_git_tmpdir(
+                        trusted_tmp,
+                        tmpdir_receipt,
+                    ),
+                    tmpdir_payload,
+                )
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(other_tmp, tmpdir_receipt)
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    gate._trusted_git_tmpdir_receipt_payload([str(root / "missing")])
+                with self.assertRaises(RuntimeError):
+                    gate._trusted_git_tmpdir_receipt_payload(["/tmp"])
+
+                child = trusted_tmp / "benign-child"
+                child.mkdir(mode=0o700)
+                self.assertEqual(
+                    gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)]),
+                    tmpdir_payload,
+                )
+                with mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    return_value=(b"com.apple.provenance",),
+                ):
+                    self.assertEqual(
+                        gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)]),
+                        tmpdir_payload,
+                    )
+
+                policy_parent = root / "policy-parent"
+                stable_leaf = policy_parent / "stable-leaf"
+                policy_parent.mkdir(mode=0o700)
+                stable_leaf.mkdir(mode=0o700)
+                stable_leaf_payload = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(stable_leaf)]
+                )
+                stable_leaf_receipt = stable_leaf_payload[:-1].decode("ascii")
+                policy_parent.chmod(0o755)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "does not match"):
+                        gate._validate_trusted_git_tmpdir(
+                            stable_leaf,
+                            stable_leaf_receipt,
+                        )
+                finally:
+                    policy_parent.chmod(0o700)
+
+                original_leaf_inode = stable_leaf.stat().st_ino
+                retained_parent = root / "retained-policy-parent"
+                policy_parent.rename(retained_parent)
+                policy_parent.mkdir(mode=0o700)
+                (retained_parent / stable_leaf.name).rename(stable_leaf)
+                self.assertEqual(stable_leaf.stat().st_ino, original_leaf_inode)
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(
+                        stable_leaf,
+                        stable_leaf_receipt,
+                    )
+
+                unsafe_ancestor = root / "unsafe-ancestor"
+                unsafe_target = unsafe_ancestor / "target"
+                unsafe_ancestor.mkdir(mode=0o700)
+                unsafe_target.mkdir(mode=0o700)
+                unsafe_ancestor.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "unsafe writable ancestor",
+                    ):
+                        gate._trusted_git_tmpdir_receipt_payload([str(unsafe_target)])
+                finally:
+                    unsafe_ancestor.chmod(0o700)
+
+                trusted_tmp.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "unsafe access policy"):
+                        gate._trusted_git_tmpdir_receipt_payload([str(trusted_tmp)])
+                finally:
+                    trusted_tmp.chmod(0o700)
+
+                replacement_receipt = gate._trusted_git_tmpdir_receipt_payload(
+                    [str(replacement_tmp)]
+                )[:-1].decode("ascii")
+                retained_tmp = root / "retained-original"
+                replacement_tmp.rename(retained_tmp)
+                replacement_tmp.mkdir(mode=0o700)
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    gate._validate_trusted_git_tmpdir(
+                        replacement_tmp,
+                        replacement_receipt,
+                    )
+
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=1),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_trusted_git_tmpdir(trusted_tmp, tmpdir_receipt)
+            if sys.platform == "darwin" and pathlib.Path("/private/tmp").is_dir():
+                with tempfile.TemporaryDirectory(
+                    prefix="codex-git-custody-physical-",
+                    dir="/private/tmp",
+                ) as raw_actual_tmp:
+                    actual_tmp = pathlib.Path(raw_actual_tmp)
+                    actual_tmp.chmod(0o700)
+                    actual_metadata_payload = gate._trusted_git_tmpdir_receipt_payload(
+                        [str(actual_tmp)]
+                    )
+                    self.assertIn(
+                        b'"schema":"trusted-git-tmpdir-custody-v1"',
+                        actual_metadata_payload,
+                    )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    return_value=(b"com.apple.quarantine",),
+                ),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_trusted_git_tmpdir(trusted_tmp, tmpdir_receipt)
+
+            root_owned_sticky = os.stat_result(
+                (stat.S_IFDIR | 0o1777, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+                {"st_flags": 0},
+            )
+            current_uid_target = os.stat_result(
+                (
+                    stat.S_IFDIR | 0o700,
+                    2,
+                    1,
+                    1,
+                    os.getuid(),
+                    os.getgid(),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                {"st_flags": 0},
+            )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    side_effect=lambda descriptor: (
+                        (b"com.apple.rootless",) if descriptor == 10 else ()
+                    ),
+                ),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (root_owned_sticky, current_uid_target),
+                )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(
+                    gate,
+                    "_macos_fd_xattr_names",
+                    side_effect=lambda descriptor: (
+                        (b"com.apple.rootless",) if descriptor == 11 else ()
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "unsafe ACL or xattr"),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (root_owned_sticky, current_uid_target),
+                )
+            untrusted_owner = os.stat_result(
+                (
+                    stat.S_IFDIR | 0o755,
+                    3,
+                    1,
+                    1,
+                    os.getuid() + 1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                {"st_flags": 0},
+            )
+            with (
+                mock.patch.object(gate, "_macos_acl_entry_count", return_value=0),
+                mock.patch.object(gate, "_macos_fd_xattr_names", return_value=()),
+                self.assertRaisesRegex(RuntimeError, "untrusted ancestor owner"),
+            ):
+                gate._validate_directory_chain_access_policy(
+                    [10, 11],
+                    (untrusted_owner, current_uid_target),
+                )
+
+            close_calls: list[int] = []
+
+            def close_all_descriptors(descriptor: int) -> None:
+                close_calls.append(descriptor)
+                if descriptor == 12:
+                    raise OSError(errno.EIO, "synthetic descriptor close failure")
+
+            synthetic_descriptors = [10, 11, 12]
+            with mock.patch.object(
+                gate.os,
+                "close",
+                side_effect=close_all_descriptors,
+            ):
+                close_failures = gate._close_directory_chain(synthetic_descriptors)
+            self.assertEqual(close_calls, [12, 11, 10])
+            self.assertEqual(synthetic_descriptors, [])
+            self.assertEqual(len(close_failures), 1)
+            inspection_failure = RuntimeError("synthetic inspection failure")
+            try:
+                raise inspection_failure
+            except RuntimeError:
+                with self.assertRaises(RuntimeError) as cleanup_group:
+                    gate._raise_directory_chain_cleanup_failures(close_failures)
+            self.assertIs(cleanup_group.exception, inspection_failure)
+            self.assertEqual(
+                cleanup_group.exception.codex_secondary_failures,
+                close_failures,
+            )
+
+        invalid_records = (
+            receipt + "\n",
+            receipt.replace('"schema":', '"unknown":"value","schema":'),
+            receipt.replace(
+                '"toolchain_sha256":"' + "c" * 64,
+                '"toolchain_sha256":"' + "C" * 64,
+            ),
+            receipt.replace("receipt-v2", "receipt-v1"),
+            json.dumps(record, ensure_ascii=True),
+        )
+        for invalid in invalid_records:
+            with self.subTest(receipt=invalid[:80]), self.assertRaises(RuntimeError):
+                gate._parse_hosted_git_receipt(invalid)
+
+    def test_hosted_git_receipt_payload_is_canonical_and_helper_bound(self) -> None:
+        gate = self._load_gate_module()
+        arguments = [
+            "/Applications/Trusted.app/Contents/Developer",
+            "/Applications/Trusted.app/Contents/Developer/usr/bin/git",
+            "b" * 64,
+            "/Applications/Trusted.app/Contents/Developer/usr/libexec/git-core",
+        ]
+        with mock.patch.object(
+            gate,
+            "_measure_hosted_git_toolchain",
+            return_value=("a" * 64, "c" * 64),
+        ) as measure:
+            payload = gate._hosted_git_receipt_payload(arguments)
+        self.assertLessEqual(len(payload), gate.GIT_TOOLCHAIN_RECEIPT_LIMIT_BYTES)
+        self.assertEqual(payload.count(b"\n"), 1)
+        self.assertTrue(payload.endswith(b"\n"))
+        parsed = gate._parse_hosted_git_receipt(payload[:-1].decode("ascii"))
+        self.assertEqual(
+            parsed,
+            {
+                "developer_dir": arguments[0],
+                "exec_path": arguments[3],
+                "exec_path_sha256": "a" * 64,
+                "executable": arguments[1],
+                "executable_sha256": "b" * 64,
+                "schema": "hosted-git-toolchain-receipt-v2",
+                "toolchain_sha256": "c" * 64,
+            },
+        )
+        measure.assert_called_once_with(arguments)
+
+        with owned_temporary_directory("hosted-git-helper-escape-") as root:
+            developer = root / "Developer"
+            exec_path = developer / "usr" / "libexec" / "git-core"
+            exec_path.mkdir(parents=True)
+            outside = root / "outside-helper"
+            outside.write_bytes(b"outside")
+            (exec_path / "git-helper").symlink_to(outside)
+
+            def readonly_access(_path: object, mode: int) -> bool:
+                return not bool(mode & os.W_OK)
+
+            with (
+                mock.patch.object(gate.os, "access", side_effect=readonly_access),
+                self.assertRaisesRegex(RuntimeError, "escapes the Developer directory"),
+            ):
+                gate._snapshot_git_exec_path(exec_path, developer_dir=developer)
+
+            (exec_path / "git-helper").unlink()
+            executable = developer / "usr" / "bin" / "git"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"first!")
+            (exec_path / "git-helper").symlink_to("../../bin/git")
+            with mock.patch.object(
+                gate.os,
+                "access",
+                side_effect=readonly_access,
+            ):
+                before = gate._snapshot_git_exec_path(
+                    exec_path,
+                    developer_dir=developer,
+                )
+                executable.write_bytes(b"second")
+                after = gate._snapshot_git_exec_path(
+                    exec_path,
+                    developer_dir=developer,
+                )
+            self.assertNotEqual(before, after)
+
+            temporary_directory = root / "runtime"
+            temporary_directory.mkdir(mode=0o700)
+            executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            receipt_arguments = [
+                str(developer),
+                str(executable),
+                executable_digest,
+                str(exec_path),
+            ]
+            with (
+                mock.patch.object(
+                    gate,
+                    "_require_candidate_readonly_physical_chain",
+                ),
+                mock.patch.object(gate.os, "access", side_effect=readonly_access),
+            ):
+                fresh_receipt = gate._hosted_git_receipt_payload(receipt_arguments)
+                parsed_receipt = gate._parse_hosted_git_receipt(
+                    fresh_receipt[:-1].decode("ascii")
+                )
+                self.assertEqual(
+                    parsed_receipt["schema"],
+                    "hosted-git-toolchain-receipt-v2",
+                )
+                self.assertNotIn("version_sha256", parsed_receipt)
+                (exec_path / "added-helper").write_bytes(b"additional helper")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "does not match its receipt",
+                ):
+                    gate._validate_bound_git_toolchain(
+                        [
+                            str(temporary_directory),
+                            *receipt_arguments,
+                            fresh_receipt[:-1].decode("ascii"),
+                        ],
+                        profile=gate.HOSTED_GIT_BINDING_PROFILE,
+                    )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires Developer, executable, digest, and exec-path",
+                ):
+                    gate._hosted_git_receipt_payload(
+                        [*receipt_arguments, str(temporary_directory)]
+                    )
+
+    def test_source_only_bootstrap_rejects_substitutes_and_nonisolated_start(
+        self,
+    ) -> None:
+        mutators = (
+            (
+                "symlink",
+                lambda root: (root / "review_supervisor" / "alias.py").symlink_to(
+                    "__init__.py"
+                ),
+                "contains a symlink",
+            ),
+            (
+                "native-substitute",
+                lambda root: (root / "review_supervisor" / "native.so").write_bytes(
+                    b"synthetic"
+                ),
+                "contains a substitute",
+            ),
+            (
+                "bytecode-cache",
+                lambda root: (root / "review_supervisor" / "__pycache__").mkdir(),
+                "contains __pycache__",
+            ),
+            (
+                "duplicate-module",
+                self._create_duplicate_module,
+                "maps duplicate module",
+            ),
+        )
+        for label, mutate, expected_message in mutators:
+            with (
+                self.subTest(case=label),
+                self._synthetic_tool_root() as (root, _marker),
+            ):
+                mutate(root)
+                completed = self._run_gate(root, "live")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_message, completed.stderr)
+
+        with self._synthetic_tool_root() as (root, _marker):
+            completed = self._run_gate(root, "live", isolated=False)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires -I -B -S", completed.stderr)
+
+            completed = self._run_gate(root, "readonly", "A" * 40)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires one full SHA-1", completed.stderr)
+
+            direct = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(root / "tests" / "trusted_mac_gate.py"),
+                    "live",
+                ),
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertIn("bounded trusted stdin", direct.stderr)
+
+    def test_external_bootstrap_rejects_gate_replacement_before_execution(self) -> None:
+        with self._synthetic_tool_root() as (root, marker):
+            gate_path = root / "tests" / "trusted_mac_gate.py"
+            gate_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed', encoding='ascii')\n",
+                encoding="ascii",
+            )
+            completed = self._run_gate(root, "live")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("does not match the exact manifest", completed.stderr)
+            self.assertFalse(marker.exists())
+
+            gate_path.unlink()
+            gate_path.symlink_to("run_required_no_child_profile.py")
+            completed = self._run_gate(root, "live")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("contains a symlink", completed.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_source_manifest_binds_content_mode_inventory_and_captured_bytes(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.MANIFEST_PATH.read_bytes(),
+            self._manifest_payload(self.GATE_PATH.parents[1]),
+        )
+
+        cases = (
+            (
+                "content",
+                lambda root: (root / "review_supervisor" / "captured.py").write_text(
+                    "VALUE = 'mutated'\n", encoding="ascii"
+                ),
+                "does not match the exact manifest",
+            ),
+            (
+                "mode",
+                lambda root: (root / "review_supervisor" / "captured.py").chmod(0o755),
+                "does not match the exact manifest",
+            ),
+            (
+                "extra",
+                lambda root: (root / "tests" / "extra.txt").write_text(
+                    "extra\n", encoding="ascii"
+                ),
+                "unexpected file",
+            ),
+            (
+                "missing",
+                lambda root: (root / "review_supervisor" / "captured.py").unlink(),
+                "missing exact manifest entries",
+            ),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label), self._synthetic_tool_root() as (root, _):
+                mutate(root)
+                completed = self._run_gate(root, "live")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
+
+        with self._synthetic_tool_root() as (root, _marker):
+            completed = self._run_gate(
+                root,
+                "live",
+                manifest_digest="0" * 64,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("manifest digest mismatch", completed.stderr)
+
+        gate = self._load_gate_module()
+        with self._synthetic_tool_root() as (root, _marker):
+            manifest_path = root / "trusted_mac_gate_sources.index"
+            manifest_payload = gate._read_source_manifest(
+                manifest_path,
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            )
+            sources = gate._snapshot_sources(
+                root,
+                gate._parse_source_manifest(manifest_payload),
+            )
+            (root / "review_supervisor" / "captured.py").write_text(
+                "VALUE = 'mutated-after-snapshot'\n",
+                encoding="ascii",
+            )
+            namespace: dict[str, object] = {}
+            exec(sources["review_supervisor.captured"].code, namespace)
+            self.assertEqual(namespace["VALUE"], "captured")
+
+    def test_gate_file_budget_uses_opened_size_and_link_count(self) -> None:
+        gate = self._load_gate_module()
+        with owned_temporary_directory("trusted-gate-open-budget-") as root:
+            payload = root / "payload.py"
+            payload.write_bytes(b"x")
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+            )
+            real_open = os.open
+            try:
+                for mutation in ("grow", "hardlink"):
+                    with self.subTest(mutation=mutation):
+                        payload.write_bytes(b"x")
+                        alias = root / "payload-link.py"
+                        if alias.exists():
+                            alias.unlink()
+
+                        def mutate_then_open(
+                            name: str,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            if mutation == "grow":
+                                mutation_descriptor = real_open(
+                                    payload,
+                                    os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC,
+                                )
+                                try:
+                                    os.write(
+                                        mutation_descriptor,
+                                        b"x" * (gate.SOURCE_FILE_LIMIT_BYTES + 1),
+                                    )
+                                finally:
+                                    os.close(mutation_descriptor)
+                            else:
+                                os.link(payload, alias)
+                            return real_open(name, flags, mode, dir_fd=dir_fd)
+
+                        with (
+                            mock.patch.object(
+                                gate.os,
+                                "open",
+                                side_effect=mutate_then_open,
+                            ),
+                            mock.patch.object(
+                                gate.os,
+                                "read",
+                                side_effect=AssertionError(
+                                    "mutated source must fail before read"
+                                ),
+                            ) as read,
+                            self.assertRaisesRegex(
+                                OSError,
+                                "changed while opening",
+                            ),
+                        ):
+                            gate._read_source_at(
+                                parent_descriptor,
+                                payload.name,
+                                payload,
+                                budget=gate._SnapshotBudget(),
+                            )
+                        read.assert_not_called()
+                        if alias.exists():
+                            alias.unlink()
+            finally:
+                os.close(parent_descriptor)
+
+    @staticmethod
+    def _create_duplicate_module(root: pathlib.Path) -> None:
+        package = root / "review_supervisor"
+        (package / "duplicate.py").write_text("", encoding="ascii")
+        duplicate = package / "duplicate"
+        duplicate.mkdir(mode=0o700)
+        (duplicate / "__init__.py").write_text("", encoding="ascii")
+        TrustedMacGateBootstrapTests._write_manifest(root)
+
+
+class RunnerPathSelectionTests(_RunnerFilesystemTestCase):
+    SOURCE_HEAD = "a" * 40
+    SOURCE_MANIFEST = "b" * 64
+    SOURCE_HEAD_MANIFEST = "c" * 64
+
+    def _run_selected_path(
+        self,
+        *,
+        expected_head: str | None,
+    ) -> tuple[
+        int,
+        dict[str, object],
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+        mock.Mock,
+    ]:
+        with owned_temporary_directory("readonly-runner-selection-") as root:
+            sticky_parent = root / "sticky"
+            sticky_parent.mkdir(mode=0o700)
+            sticky_parent.chmod(0o1777)
+            install_container = sticky_parent / "install"
+            self._make_private_directory(install_container)
+            runtime_home = root / "runtime-home"
+            self._make_private_directory(runtime_home)
+            runtime_parent = runtime_home / "runtime"
+            self._make_private_directory(runtime_parent)
+            cleanup_control = runtime_home / "cleanup-control"
+            self._make_private_directory(cleanup_control)
+            source_binding = runner.SourceCheckoutBinding(
+                repo_root=pathlib.Path("/synthetic/repo"),
+                head_sha=self.SOURCE_HEAD,
+                source_relative_path="source",
+                source_manifest_sha256=self.SOURCE_MANIFEST,
+                head_subtree_manifest_sha256=self.SOURCE_HEAD_MANIFEST,
+                source_root_gid=os.getgid(),
+                source_entries=(),
+            )
+            source_tree_binding = runner.SourceTreeBinding(
+                source_manifest_sha256=self.SOURCE_MANIFEST,
+                source_root_gid=os.getgid(),
+                source_entries=(),
+            )
+            completed = subprocess.CompletedProcess(
+                args=(sys.executable,),
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+            def fake_bound_copy(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                binding: runner.SourceCheckoutBinding,
+                source_manifest: str,
+                *,
+                budget: runner.TreeSnapshotBudget,
+                destination_owner_uid: int,
+                destination_group_gid: int,
+            ) -> str:
+                self.assertEqual(binding, source_binding)
+                self.assertEqual(source_manifest, self.SOURCE_MANIFEST)
+                self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+                self.assertEqual(destination_owner_uid, install_container.stat().st_uid)
+                self.assertEqual(destination_group_gid, install_container.stat().st_gid)
+                destination.mkdir(mode=0o700)
+                return source_manifest
+
+            def fake_bounded_tree_copy(
+                _source: pathlib.Path,
+                destination: pathlib.Path,
+                binding: runner.SourceTreeBinding,
+                *,
+                budget: runner.TreeSnapshotBudget,
+                destination_owner_uid: int,
+                destination_group_gid: int,
+            ) -> str:
+                self.assertEqual(binding, source_tree_binding)
+                self.assertIsInstance(budget, runner.TreeSnapshotBudget)
+                self.assertEqual(destination_owner_uid, install_container.stat().st_uid)
+                self.assertEqual(destination_group_gid, install_container.stat().st_gid)
+                destination.mkdir(mode=0o700)
+                return binding.source_manifest_sha256
+
+            def complete_no_child(**kwargs: object) -> subprocess.CompletedProcess[str]:
+                proof = kwargs["closure_proof"]
+                assert isinstance(proof, runner.ChildProcessClosureProof)
+                proof.started = True
+                proof.proven = True
+                proof.destructive_cleanup_authorized = True
+                proof.runtime_profile = "production-current"
+                return completed
+
+            def complete_hosted(
+                *_args: object,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                proof = kwargs["closure_proof"]
+                assert isinstance(proof, runner.ChildProcessClosureProof)
+                proof.started = True
+                proof.proven = True
+                proof.destructive_cleanup_authorized = True
+                return completed
+
+            bind_source = mock.Mock(return_value=source_binding)
+            bind_source_tree = mock.Mock(return_value=source_tree_binding)
+            copy_bound_source = mock.Mock(side_effect=fake_bound_copy)
+            copy_bound_tree = mock.Mock(side_effect=fake_bounded_tree_copy)
+            run_no_child = mock.Mock(side_effect=complete_no_child)
+            run_bounded_child = mock.Mock(side_effect=complete_hosted)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            lifecycle_fence = runner.LifecycleSignalFence(
+                signals=(),
+                previous_handlers=(),
+                previous_mask=set(),
+            )
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(
+                    runner,
+                    "READONLY_INSTALL_PARENT",
+                    sticky_parent,
+                ),
+                _mock_ambient_runtime_parent(runtime_home),
+                mock.patch.object(
+                    runner,
+                    "_create_bound_owned_private_directory",
+                    side_effect=self._bound_directory_factory(
+                        install_container,
+                        runtime_parent,
+                        cleanup_control,
+                    ),
+                ),
+                mock.patch.object(runner, "_bind_source_checkout", bind_source),
+                mock.patch.object(
+                    runner,
+                    "_bind_source_tree",
+                    bind_source_tree,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_copy_bound_source",
+                    copy_bound_source,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_copy_bound_tree",
+                    copy_bound_tree,
+                ),
+                mock.patch.object(runner, "_set_tree_read_only"),
+                mock.patch.object(runner, "_tree_snapshot", return_value={}),
+                mock.patch.object(
+                    runner,
+                    "_run_no_child_test_suite",
+                    run_no_child,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_bounded_child",
+                    run_bounded_child,
+                ),
+                mock.patch.object(runner, "_list_bound_directory", return_value=()),
+                mock.patch.object(
+                    runner,
+                    "_consume_cleanup_bound_tree_endpoint",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_consume_cleanup_empty_bound_control_endpoint",
+                    return_value=None,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                os.environ.pop("GITHUB_ACTIONS", None)
+                os.environ.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+                os.environ.pop(runner.RUNNER_ARCH_ENV, None)
+                if expected_head is None:
+                    os.environ.pop(runner.EXPECTED_HEAD_ENV, None)
+                else:
+                    os.environ[runner.EXPECTED_HEAD_ENV] = expected_head
+                returncode = runner._run_main(
+                    lifecycle_fence,
+                    terminal_process=False,
+                )
+
+            self.assertEqual(stderr.getvalue(), "")
+            summary = json.loads(stdout.getvalue())
+            return (
+                returncode,
+                summary,
+                bind_source,
+                bind_source_tree,
+                copy_bound_source,
+                copy_bound_tree,
+                run_no_child,
+                run_bounded_child,
+            )
+
+    def test_explicit_expected_head_selects_trusted_mac_no_child_path(self) -> None:
+        with (
+            self.subTest("runner-local explicit runtime parent policy"),
+            owned_temporary_directory("runner-explicit-runtime-parent-") as parent,
+        ):
+            selected_parent = parent.resolve(strict=True)
+            result_owner = support._PrivateDirectoryCreationResultOwner()
+            expected_binding = mock.sentinel.explicit_runtime_binding
+            select_parent = mock.Mock(return_value=selected_parent)
+            create_directory = mock.Mock(return_value=expected_binding)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        runner.EXPLICIT_RUNTIME_PARENT_ENV: str(selected_parent),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_private_runtime_parent",
+                    select_parent,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_create_bound_owned_private_directory",
+                    create_directory,
+                ),
+            ):
+                binding = runner._create_bound_owned_private_runtime_directory(
+                    ".explicit-runtime-",
+                    result_owner=result_owner,
+                )
+            self.assertIs(binding, expected_binding)
+            select_parent.assert_called_once_with()
+            create_directory.assert_called_once_with(
+                selected_parent,
+                ".explicit-runtime-",
+                result_owner=result_owner,
+                allow_sticky_writable_ancestors=True,
+            )
+
+        (
+            returncode,
+            summary,
+            bind_source,
+            bind_source_tree,
+            copy_bound_source,
+            copy_bound_tree,
+            run_no_child,
+            run_bounded_child,
+        ) = self._run_selected_path(expected_head=self.SOURCE_HEAD)
+
+        self.assertEqual(returncode, 0)
+        bind_source.assert_called_once()
+        bind_source_tree.assert_not_called()
+        copy_bound_source.assert_called_once()
+        copy_bound_tree.assert_not_called()
+        run_no_child.assert_called_once()
+        run_bounded_child.assert_not_called()
+        self.assertEqual(summary["primary_status"], "complete")
+        self.assertEqual(summary["no_child_runtime_profile"], "production-current")
+        self.assertIs(summary["source_head_bound"], True)
+        self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(
+            summary["source_head_subtree_manifest_sha256"],
+            self.SOURCE_HEAD_MANIFEST,
+        )
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
+        self.assertIs(summary["creation_origin_proven"], False)
+        self.assertEqual(
+            summary["creation_origin_guarantee"],
+            "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            summary["cleanup_guarantee"],
+            "custodied-manifest-quarantine-descriptor-revalidation-"
+            "same-uid-final-rename-unlink-host-tcb",
+        )
+
+    def test_missing_expected_head_keeps_hosted_isolated_account_path(self) -> None:
+        (
+            returncode,
+            summary,
+            bind_source,
+            bind_source_tree,
+            copy_bound_source,
+            copy_bound_tree,
+            run_no_child,
+            run_bounded_child,
+        ) = self._run_selected_path(expected_head=None)
+
+        self.assertEqual(returncode, 0)
+        bind_source.assert_not_called()
+        bind_source_tree.assert_called_once()
+        copy_bound_source.assert_not_called()
+        copy_bound_tree.assert_called_once()
+        run_no_child.assert_not_called()
+        run_bounded_child.assert_called_once()
+        call = run_bounded_child.call_args
+        self.assertEqual(
+            call.args[0],
+            (
+                sys.executable,
+                "-B",
+                "-m",
+                "tests.run_required_deterministic_supervisor",
+            ),
+        )
+        self.assertIs(call.kwargs["require_isolated_account"], True)
+        self.assertEqual(call.kwargs["environment"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(summary["primary_status"], "complete")
+        self.assertIs(summary["source_head_bound"], False)
+        self.assertIsNone(summary["source_head_sha"])
+        self.assertIsNone(summary["source_head_subtree_manifest_sha256"])
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
+
+
+class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
+    _UNSET = object()
+
+    @staticmethod
+    def _closure(
+        *,
+        authenticated: bool = True,
+        closure_proven: bool = True,
+        leader_reaped: bool = True,
+        stdio_closed: bool = True,
+        process_group_used: bool = False,
+    ) -> mock.Mock:
+        closure = mock.Mock()
+        closure.authenticated_no_child_profile = authenticated
+        closure.permitted_process_closure_proven = closure_proven
+        closure.leader_reaped = leader_reaped
+        closure.stdio_closed = stdio_closed
+        closure.process_group_emptiness_used_as_descendant_proof = process_group_used
+        return closure
+
+    @staticmethod
+    def _command_result(
+        *,
+        closure: object,
+        returncode: int = 0,
+        stdout: bytes | None = None,
+        stderr: bytes = b"",
+    ) -> mock.Mock:
+        result = mock.Mock()
+        result.process_closure = closure
+        result.returncode = returncode
+        result.stdout = (
+            (runner.NO_CHILD_SUCCESS_RECORD + "\n").encode("ascii")
+            if stdout is None
+            else stdout
+        )
+        result.stderr = stderr
+        return result
+
+    @contextlib.contextmanager
+    def _bound_roots(self) -> object:
+        with owned_temporary_directory("readonly-no-child-suite-") as root:
+            install_container = root / "install"
+            self._make_private_directory(install_container)
+            installed_root = install_container / "installed"
+            self._make_private_directory(installed_root)
+            runtime_parent = root / "runtime"
+            self._make_private_directory(runtime_parent)
+            install_owner = support._DirectoryParentBindingResultOwner()
+            runtime_owner = support._DirectoryParentBindingResultOwner()
+            install_binding = self._open_parent_binding(
+                install_owner,
+                install_container,
+                require_owned_private_parent=True,
+            )
+            runtime_binding = self._open_parent_binding(
+                runtime_owner,
+                runtime_parent,
+                require_owned_private_parent=True,
+            )
+            try:
+                yield (
+                    installed_root,
+                    install_binding,
+                    runtime_binding,
+                    runtime_parent,
+                )
+            finally:
+                runtime_owner.close()
+                install_owner.close()
+
+    def _invoke(
+        self,
+        outcome: object,
+        *,
+        proof: runner.ChildProcessClosureProof | None = None,
+        prepared: object | None = None,
+        error_closure: object = _UNSET,
+        timeout: float = 17,
+        stdout_limit: int = 1_024,
+        stderr_limit: int = 2_048,
+    ) -> tuple[
+        subprocess.CompletedProcess[str],
+        runner.ChildProcessClosureProof,
+        mock.Mock,
+        mock.Mock,
+        object,
+        tuple[str, ...],
+    ]:
+        closure_proof = proof or runner.ChildProcessClosureProof()
+        target = mock.Mock()
+        target.path = "/trusted/python3.13"
+        selected_prepared = prepared or mock.Mock(sandboxed_target=target)
+        writable_attestation = mock.sentinel.writable_runtime
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            runtime_parent,
+        ):
+            expected_argv = (
+                target.path,
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                runner.NO_CHILD_SUITE_CODE,
+                str(installed_root),
+                str(runtime_parent),
+            )
+            command_kwargs = (
+                {"side_effect": outcome}
+                if isinstance(outcome, BaseException)
+                else {"return_value": outcome}
+            )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {}, clear=False))
+                for name in (
+                    "GITHUB_ACTIONS",
+                    runner.RUNNER_ENVIRONMENT_ENV,
+                    runner.RUNNER_ARCH_ENV,
+                ):
+                    os.environ.pop(name, None)
+                stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "_bound_child_signals",
+                        return_value=contextlib.nullcontext(),
+                    )
+                )
+                attest = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "attest_writable_root",
+                        return_value=writable_attestation,
+                    )
+                )
+                prepare = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "prepare_sandboxed_python_no_child_profile",
+                        return_value=selected_prepared,
+                    )
+                )
+                run_command = stack.enter_context(
+                    mock.patch.object(
+                        runner,
+                        "run_bounded_command",
+                        **command_kwargs,
+                    )
+                )
+                if error_closure is not self._UNSET:
+                    stack.enter_context(
+                        mock.patch.object(
+                            runner,
+                            "bounded_command_process_closure",
+                            return_value=error_closure,
+                        )
+                    )
+                completed = runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    timeout=timeout,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                    closure_proof=closure_proof,
+                )
+
+            attest.assert_called_once_with(
+                runtime_parent,
+                directory_fd=runtime_binding.fd,
+            )
+            return (
+                completed,
+                closure_proof,
+                prepare,
+                run_command,
+                selected_prepared,
+                expected_argv,
+            )
+
+    def test_exact_production_profile_argv_success_record_and_closure(self) -> None:
+        closure = self._closure()
+        result = self._command_result(closure=closure)
+        (
+            completed,
+            proof,
+            prepare,
+            run_command,
+            prepared,
+            expected_argv,
+        ) = self._invoke(result)
+
+        self.assertEqual(completed.args, expected_argv)
+        self.assertEqual(
+            completed.stdout,
+            runner.NO_CHILD_SUCCESS_RECORD + "\n",
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(proof.started)
+        self.assertTrue(proof.proven)
+        self.assertTrue(proof.destructive_cleanup_authorized)
+        self.assertEqual(proof.runtime_profile, "production-current")
+        prepare.assert_called_once_with(
+            additional_seatbelt_rules="(deny file-write*)",
+            runtime_pin=runner.no_child_profile.PINNED_RUNTIME,
+            writable_roots=(mock.sentinel.writable_runtime,),
+        )
+        run_command.assert_called_once_with(
+            expected_argv,
+            timeout_seconds=17,
+            max_output_bytes=3_072,
+            max_stdout_bytes=1_024,
+            max_stderr_bytes=2_048,
+            _prepared_no_child_profile=prepared,
+        )
+
+    def test_zero_exit_rejects_missing_and_forged_completion_records(self) -> None:
+        outputs = (
+            ("missing", b""),
+            (
+                "forged",
+                (runner.NO_CHILD_SUCCESS_RECORD + "\nforged\n").encode("ascii"),
+            ),
+        )
+        for label, stdout in outputs:
+            proof = runner.ChildProcessClosureProof()
+            result = self._command_result(
+                closure=self._closure(),
+                stdout=stdout,
+            )
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks its exact completion record",
+                ),
+            ):
+                self._invoke(result, proof=proof)
+            self.assertTrue(proof.started)
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+    def test_result_rejects_unauthenticated_or_nonclosed_closure(self) -> None:
+        closures = (
+            ("unauthenticated", self._closure(authenticated=False)),
+            ("closure-unproven", self._closure(closure_proven=False)),
+            ("leader-unreaped", self._closure(leader_reaped=False)),
+            ("stdio-open", self._closure(stdio_closed=False)),
+            ("process-group-substitute", self._closure(process_group_used=True)),
+        )
+        for label, closure in closures:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "lacks an authenticated no-child proof",
+                ),
+            ):
+                self._invoke(
+                    self._command_result(closure=closure),
+                    proof=proof,
+                )
+            self.assertTrue(proof.started)
+            self.assertFalse(proof.proven)
+            self.assertFalse(proof.destructive_cleanup_authorized)
+
+    def test_output_limit_failures_preserve_exact_scope(self) -> None:
+        for scope, limit in (
+            ("stdout", 111),
+            ("stderr", 222),
+            ("aggregate", 333),
+        ):
+            proof = runner.ChildProcessClosureProof()
+            error = runner.BoundedCommandOutputLimitExceeded(
+                scope=scope,
+                limit=limit,
+            )
+            with (
+                self.subTest(scope=scope),
+                self.assertRaises(runner.ChildOutputLimitExceeded) as caught,
+            ):
+                self._invoke(
+                    error,
+                    proof=proof,
+                    error_closure=self._closure(stdio_closed=False),
+                )
+            self.assertEqual(caught.exception.scope, scope)
+            self.assertEqual(caught.exception.limit, limit)
+            self.assertIs(caught.exception.__cause__, error)
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+        returned_overflow = (
+            ("stdout", b"xx", b"", 1, 8),
+            ("stderr", b"", b"xx", 8, 1),
+        )
+        for scope, stdout, stderr, stdout_limit, stderr_limit in returned_overflow:
+            proof = runner.ChildProcessClosureProof()
+            with (
+                self.subTest(returned_scope=scope),
+                self.assertRaises(runner.ChildOutputLimitExceeded) as caught,
+            ):
+                self._invoke(
+                    self._command_result(
+                        closure=self._closure(),
+                        stdout=stdout,
+                        stderr=stderr,
+                    ),
+                    proof=proof,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                )
+            self.assertEqual(caught.exception.scope, scope)
+            self.assertEqual(
+                caught.exception.limit,
+                stdout_limit if scope == "stdout" else stderr_limit,
+            )
+            self.assertTrue(proof.proven)
+            self.assertTrue(proof.destructive_cleanup_authorized)
+
+    def test_timeout_propagates_and_requires_authenticated_error_closure(
+        self,
+    ) -> None:
+        for label, closure, expected_proven in (
+            (
+                "authenticated",
+                self._closure(stdio_closed=False),
+                True,
+            ),
+            ("missing", None, False),
+        ):
+            proof = runner.ChildProcessClosureProof()
+            timeout_error = TimeoutError(f"synthetic {label} timeout")
+            with (
+                self.subTest(case=label),
+                self.assertRaises(TimeoutError) as caught,
+            ):
+                self._invoke(
+                    timeout_error,
+                    proof=proof,
+                    error_closure=closure,
+                )
+            self.assertIs(caught.exception, timeout_error)
+            self.assertEqual(proof.proven, expected_proven)
+            self.assertEqual(proof.destructive_cleanup_authorized, expected_proven)
+
+    def test_signal_after_profile_preparation_precedes_target_read(self) -> None:
+        class PreparedTargetTrap:
+            accessed = False
+
+            @property
+            def sandboxed_target(self) -> object:
+                self.accessed = True
+                raise AssertionError("sandboxed target was read after pending signal")
+
+        lifecycle_fence = runner.LifecycleSignalFence(
+            signals=(),
+            previous_handlers=(),
+            previous_mask=set(),
+        )
+        proof = runner.ChildProcessClosureProof()
+        prepared = PreparedTargetTrap()
+
+        def prepare_profile(**_kwargs: object) -> PreparedTargetTrap:
+            lifecycle_fence.received_signal = signal.SIGTERM
+            return prepared
+
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            _runtime_parent,
+        ):
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(
+                    runner,
+                    "_bound_child_signals",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    side_effect=prepare_profile,
+                ) as prepare,
+                mock.patch.object(runner, "run_bounded_command") as run_command,
+                self.assertRaises(runner.ChildRunInterrupted) as caught,
+            ):
+                os.environ.pop("GITHUB_ACTIONS", None)
+                os.environ.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+                os.environ.pop(runner.RUNNER_ARCH_ENV, None)
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    closure_proof=proof,
+                    lifecycle_fence=lifecycle_fence,
+                )
+
+        self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+        self.assertFalse(prepared.accessed)
+        self.assertEqual(proof.runtime_profile, "production-current")
+        self.assertFalse(proof.started)
+        self.assertFalse(proof.proven)
+        prepare.assert_called_once()
+        run_command.assert_not_called()
+
+
+_TERMINAL_SIGNAL_WORKER = r"""
+import contextlib
+import errno
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import tempfile
+from unittest import mock
+
+from tests import run_readonly_install_deterministic_supervisor as runner
+from tests import support
+
+scenario = sys.argv[1]
+signal_number = int(sys.argv[2])
+sent = False
+
+
+def send_signal():
+    global sent
+    if signal_number and not sent:
+        sent = True
+        os.kill(os.getpid(), signal_number)
+
+
+class StreamProxy:
+    def __init__(self, stream, phase):
+        self._stream = stream
+        self._phase = phase
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def flush(self):
+        result = self._stream.flush()
+        if scenario == self._phase:
+            send_signal()
+        return result
+
+
+with tempfile.TemporaryDirectory(prefix="readonly-terminal-signal-") as raw_root:
+    root = pathlib.Path(raw_root)
+    sticky_parent = root / "sticky"
+    sticky_parent.mkdir(mode=0o700)
+    sticky_parent.chmod(0o1777)
+    install_container = sticky_parent / "install"
+    install_container.mkdir(mode=0o700)
+    runtime_home = root / "runtime-home"
+    runtime_home.mkdir(mode=0o700)
+    runtime_parent = runtime_home / "runtime"
+    runtime_parent.mkdir(mode=0o700)
+    cleanup_control = runtime_home / "cleanup-control"
+    cleanup_control.mkdir(mode=0o700)
+    remaining = iter(
+        (
+            (install_container, 101),
+            (runtime_parent, 102),
+            (cleanup_control, 103),
+        )
+    )
+
+    def make_binding(path, descriptor):
+        binding = mock.Mock(spec=support._DirectoryParentBinding)
+        binding.path = path
+        binding.fd = descriptor
+        binding.fd_close_outcome = "owned"
+        binding.fd_close_error = None
+        metadata = path.stat()
+        binding.policy = mock.Mock(uid=metadata.st_uid, gid=metadata.st_gid)
+
+        def close():
+            if binding.fd_close_outcome == "owned":
+                binding.fd_close_outcome = "closed"
+                binding.fd = -1
+
+        binding.close.side_effect = close
+        return binding
+
+    def create_binding(
+        _parent,
+        _prefix,
+        *,
+        result_owner,
+        require_owned_private_parent=True,
+    ):
+        del require_owned_private_parent
+        path, descriptor = next(remaining)
+        binding = make_binding(path, descriptor)
+        result_owner.publish(binding)
+        return binding
+
+    source_binding = runner.SourceCheckoutBinding(
+        repo_root=root,
+        head_sha="a" * 40,
+        source_relative_path="source",
+        source_manifest_sha256="b" * 64,
+        head_subtree_manifest_sha256="c" * 64,
+        source_root_gid=os.getgid(),
+        source_entries=(),
+    )
+    source_manifest = "b" * 64
+
+    def copy_bound_source(
+        _source,
+        destination,
+        _binding,
+        _source_manifest,
+        *,
+        budget,
+        destination_owner_uid,
+        destination_group_gid,
+    ):
+        assert isinstance(budget, runner.TreeSnapshotBudget)
+        assert destination_owner_uid == install_container.stat().st_uid
+        assert destination_group_gid == install_container.stat().st_gid
+        destination.mkdir(mode=0o700)
+        return source_manifest
+
+    snapshot_count = 0
+
+    def snapshot(_path, *, budget):
+        global snapshot_count
+        assert isinstance(budget, runner.TreeSnapshotBudget)
+        snapshot_count += 1
+        if scenario == "existing-primary-late-signal" and snapshot_count == 2:
+            raise RuntimeError("existing primary remains authoritative")
+        return {}
+
+    def complete_no_child(**kwargs):
+        proof = kwargs["closure_proof"]
+        proof.started = True
+        proof.proven = True
+        proof.destructive_cleanup_authorized = True
+        proof.runtime_profile = "production-current"
+        if scenario in {
+            "pre-seal",
+            "publication-failure",
+            "publication-restore-failure",
+        }:
+            send_signal()
+        return subprocess.CompletedProcess(
+            args=(sys.executable,),
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    real_serialize = runner._serialize_terminal_json
+
+    def serialize(value, *, operation):
+        if (
+            scenario in {"publication-failure", "publication-restore-failure"}
+            and operation == "summary-serialization"
+        ):
+            raise runner.TerminalPublicationError(
+                "summary-serialization",
+                RuntimeError("synthetic serialization failure"),
+            )
+        result = real_serialize(value, operation=operation)
+        if operation == "summary-serialization" and scenario in {
+            "post-serialization",
+            "existing-primary-late-signal",
+        }:
+            send_signal()
+        return result
+
+    real_write_terminal = runner._write_terminal_stdout
+
+    def write_terminal(payload):
+        real_write_terminal(payload)
+        if scenario == "post-stdout-write":
+            send_signal()
+
+    real_os_write = os.write
+
+    def write_with_newline_failure(descriptor, payload):
+        raw = bytes(payload)
+        if descriptor == 1 and raw == b"\n":
+            raise OSError(errno.EIO, "synthetic terminal newline failure")
+        written = real_os_write(descriptor, payload)
+        if descriptor == 1 and raw.startswith(b"{"):
+            send_signal()
+        return written
+
+    stdout_proxy = StreamProxy(sys.stdout, "post-stdout-flush")
+    stderr_proxy = StreamProxy(sys.stderr, "post-stderr-flush")
+    os.environ[runner.EXPECTED_HEAD_ENV] = "a" * 40
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(runner.sys, "platform", "darwin"))
+        stack.enter_context(
+            mock.patch.object(runner, "READONLY_INSTALL_PARENT", sticky_parent)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_private_runtime_parent",
+                return_value=runtime_home,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_create_bound_owned_private_directory",
+                side_effect=create_binding,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_bind_source_checkout",
+                return_value=source_binding,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_source_manifest_sha256",
+                return_value=source_manifest,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_copy_bound_source",
+                side_effect=copy_bound_source,
+            )
+        )
+        stack.enter_context(mock.patch.object(runner, "_set_tree_read_only"))
+        stack.enter_context(
+            mock.patch.object(runner, "_tree_snapshot", side_effect=snapshot)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_run_no_child_test_suite",
+                side_effect=complete_no_child,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_list_bound_directory", return_value=())
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_consume_cleanup_bound_tree_endpoint",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                runner,
+                "_consume_cleanup_empty_bound_control_endpoint",
+                return_value=None,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_serialize_terminal_json", side_effect=serialize)
+        )
+        stack.enter_context(
+            mock.patch.object(runner, "_write_terminal_stdout", side_effect=write_terminal)
+        )
+        if scenario == "post-stdout-flush":
+            stack.enter_context(mock.patch.object(runner.sys, "stdout", stdout_proxy))
+        if scenario == "post-stderr-flush":
+            stack.enter_context(mock.patch.object(runner.sys, "stderr", stderr_proxy))
+        if scenario == "newline-failure":
+            stack.enter_context(mock.patch.object(runner.os, "write", write_with_newline_failure))
+        if scenario == "publication-restore-failure":
+            stack.enter_context(
+                mock.patch.object(
+                    runner,
+                    "_restore_lifecycle_signal_fence",
+                    side_effect=OSError(errno.EIO, "synthetic restoration failure"),
+                )
+            )
+        returncode = runner.main(_terminal_process=True)
+
+raise SystemExit(returncode)
+"""
+
+
+class TerminalPublicationSignalIntegrationTests(unittest.TestCase):
+    SIGNALS = (
+        signal.SIGHUP,
+        signal.SIGINT,
+        signal.SIGQUIT,
+        signal.SIGTERM,
+    )
+    SOURCE_HEAD = "a" * 40
+    SOURCE_MANIFEST = "b" * 64
+    SOURCE_HEAD_MANIFEST = "c" * 64
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if sys.version_info[:2] != (3, 13):
+            raise unittest.SkipTest("terminal publication matrix requires Python 3.13")
+
+    @staticmethod
+    def _run_worker(
+        scenario: str,
+        signal_number: int = 0,
+    ) -> subprocess.CompletedProcess[bytes]:
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONPYCACHEPREFIX", None)
+        environment.pop("GITHUB_ACTIONS", None)
+        environment.pop(runner.RUNNER_ENVIRONMENT_ENV, None)
+        environment.pop(runner.RUNNER_ARCH_ENV, None)
+        environment.pop(runner.EXPLICIT_RUNTIME_PARENT_ENV, None)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        return subprocess.run(
+            (
+                sys.executable,
+                "-B",
+                "-c",
+                _TERMINAL_SIGNAL_WORKER,
+                scenario,
+                str(signal_number),
+            ),
+            cwd=pathlib.Path(__file__).resolve().parents[1],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=20,
+        )
+
+    def _single_summary(
+        self,
+        completed: subprocess.CompletedProcess[bytes],
+    ) -> dict[str, object]:
+        stdout = completed.stdout.decode("utf-8", "strict")
+        lines = stdout.splitlines()
+        self.assertEqual(lines, [stdout.rstrip("\n")])
+        self.assertEqual(len(lines), 1)
+        return json.loads(lines[0])
+
+    @staticmethod
+    def _sealed_exit_decision(summary: dict[str, object]) -> int:
+        signal_number = summary["signal_number"]
+        if isinstance(signal_number, int):
+            return 128 + signal_number
+        if (
+            summary["primary_status"] == "complete"
+            and summary["cleanup_status"] == "complete"
+        ):
+            return 0
+        return 1
+
+    def _assert_source_binding_summary(self, summary: dict[str, object]) -> None:
+        self.assertIs(summary["source_head_bound"], True)
+        self.assertEqual(summary["source_head_sha"], self.SOURCE_HEAD)
+        self.assertEqual(
+            summary["source_head_subtree_manifest_sha256"],
+            self.SOURCE_HEAD_MANIFEST,
+        )
+        self.assertEqual(summary["source_manifest_sha256"], self.SOURCE_MANIFEST)
+        self.assertIs(summary["creation_origin_proven"], False)
+        self.assertEqual(
+            summary["creation_origin_guarantee"],
+            "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            summary["cleanup_guarantee"],
+            "custodied-manifest-quarantine-descriptor-revalidation-"
+            "same-uid-final-rename-unlink-host-tcb",
+        )
+
+    def test_preseal_signal_publishes_one_interrupted_summary(self) -> None:
+        for signal_number in self.SIGNALS:
+            with self.subTest(signal=signal_number.name):
+                completed = self._run_worker("pre-seal", signal_number)
+                self.assertEqual(completed.returncode, 128 + signal_number)
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "interrupted")
+                self.assertEqual(summary["signal_number"], signal_number)
+                self.assertEqual(
+                    summary["primary_failure"]["error_kind"],
+                    "ChildRunInterrupted",
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
+                self._assert_source_binding_summary(summary)
+
+    def test_late_signal_after_each_publication_phase_keeps_sealed_json(
+        self,
+    ) -> None:
+        phases = (
+            "post-serialization",
+            "post-stdout-write",
+            "post-stdout-flush",
+            "post-stderr-flush",
+        )
+        for phase in phases:
+            for signal_number in self.SIGNALS:
+                with self.subTest(phase=phase, signal=signal_number.name):
+                    completed = self._run_worker(phase, signal_number)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = self._single_summary(completed)
+                    self.assertEqual(summary["primary_status"], "complete")
+                    self.assertIsNone(summary["signal_number"])
+                    self.assertEqual(
+                        completed.returncode,
+                        self._sealed_exit_decision(summary),
+                    )
+                    self._assert_source_binding_summary(summary)
+
+    def test_complete_json_is_committed_when_newline_write_fails(self) -> None:
+        for signal_number in (0, *self.SIGNALS):
+            label = "none" if signal_number == 0 else signal_number.name
+            with self.subTest(signal=label):
+                completed = self._run_worker("newline-failure", signal_number)
+                self.assertEqual(completed.returncode, 0)
+                self.assertFalse(completed.stdout.endswith(b"\n"))
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "complete")
+                self.assertIsNone(summary["signal_number"])
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
+                self.assertIn(b"operation=stdout-newline", completed.stderr)
+
+    def test_publication_and_restore_failures_prefer_sealed_signal(self) -> None:
+        for scenario in ("publication-failure", "publication-restore-failure"):
+            with self.subTest(scenario=scenario, signal="none"):
+                completed = self._run_worker(scenario)
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, b"")
+                self.assertIn(b"operation=summary-serialization", completed.stderr)
+            for signal_number in self.SIGNALS:
+                with self.subTest(scenario=scenario, signal=signal_number.name):
+                    completed = self._run_worker(scenario, signal_number)
+                    self.assertEqual(completed.returncode, 128 + signal_number)
+                    self.assertEqual(completed.stdout, b"")
+                    self.assertIn(
+                        b"operation=summary-serialization",
+                        completed.stderr,
+                    )
+                    if scenario == "publication-restore-failure":
+                        self.assertIn(
+                            b"operation=signal-fence-restoration",
+                            completed.stderr,
+                        )
+
+    def test_existing_primary_is_not_replaced_by_late_signal(self) -> None:
+        for signal_number in self.SIGNALS:
+            with self.subTest(signal=signal_number.name):
+                completed = self._run_worker(
+                    "existing-primary-late-signal",
+                    signal_number,
+                )
+                self.assertEqual(completed.returncode, 1)
+                summary = self._single_summary(completed)
+                self.assertEqual(summary["primary_status"], "failed")
+                self.assertIsNone(summary["signal_number"])
+                self.assertEqual(
+                    summary["primary_failure"]["stage"],
+                    "snapshot-after",
+                )
+                self.assertEqual(
+                    summary["primary_failure"]["message"],
+                    "existing primary remains authoritative",
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    self._sealed_exit_decision(summary),
+                )
 
 
 if __name__ == "__main__":

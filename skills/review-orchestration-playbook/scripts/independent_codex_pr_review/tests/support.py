@@ -111,6 +111,7 @@ class _DirectoryParentBinding:
     identity: Identity
     policy: DirectoryPolicyBinding
     require_owned_private_parent: bool
+    allow_sticky_writable_ancestors: bool
     fd_close_outcome: str = field(init=False, default="owned")
     fd_close_error: BaseException | None = field(init=False, default=None)
 
@@ -289,7 +290,7 @@ class _DirectoryParentBinding:
                 result = open_absolute_directory_chain(
                     self.path,
                     allow_sticky_writable_ancestors=(
-                        not self.require_owned_private_parent
+                        self.allow_sticky_writable_ancestors
                     ),
                 )
                 reopened_owner.publish(result)
@@ -447,6 +448,7 @@ def _open_directory_parent(
     *,
     require_owned_private_parent: bool,
     result_owner: _DirectoryParentBindingResultOwner,
+    allow_sticky_writable_ancestors: bool | None = None,
 ) -> _DirectoryParentBinding:
     if not isinstance(result_owner, _DirectoryParentBindingResultOwner):
         raise TypeError("directory parent binding result owner is required")
@@ -457,13 +459,15 @@ def _open_directory_parent(
     ):
         raise ValueError("directory parent binding result owner is already used")
     canonical = _canonical_ascii_directory(raw_path)
+    if allow_sticky_writable_ancestors is None:
+        allow_sticky_writable_ancestors = not require_owned_private_parent
     descriptor_owner = FdIdentityCustody()
     binding: _DirectoryParentBinding | None = None
     with supported_async_fd_publication(descriptor_owner):
         try:
             result = open_absolute_directory_chain(
                 canonical,
-                allow_sticky_writable_ancestors=(not require_owned_private_parent),
+                allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
             )
             descriptor_owner.publish(result)
             fd, identity = result
@@ -476,6 +480,7 @@ def _open_directory_parent(
                 identity=identity,
                 policy=policy,
                 require_owned_private_parent=require_owned_private_parent,
+                allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
             )
             binding.revalidate()
             result_owner.publish(binding)
@@ -524,6 +529,9 @@ def _duplicate_directory_parent(
                 identity=identity,
                 policy=policy,
                 require_owned_private_parent=source.require_owned_private_parent,
+                allow_sticky_writable_ancestors=(
+                    source.allow_sticky_writable_ancestors
+                ),
             )
             creation_result_owner.publish_creation_parent(binding)
             descriptor_owner.transfer(descriptor)
@@ -541,6 +549,7 @@ def _duplicate_directory_parent(
 def _validated_private_runtime_parent(
     raw_path: str,
     *,
+    allow_sticky_writable_ancestors: bool = False,
     rejection_errors: list[BaseException] | None = None,
 ) -> pathlib.Path | None:
     result_owner = _DirectoryParentBindingResultOwner()
@@ -549,6 +558,7 @@ def _validated_private_runtime_parent(
             raw_path,
             require_owned_private_parent=True,
             result_owner=result_owner,
+            allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
         )
         result_owner.transfer(binding)
     except (OSError, ValueError) as error:
@@ -1389,9 +1399,15 @@ def _create_bound_owned_private_directory(
     result_owner: _PrivateDirectoryCreationResultOwner,
     require_owned_private_parent: bool = True,
     held_parent_binding: _DirectoryParentBinding | None = None,
+    allow_sticky_writable_ancestors: bool | None = None,
 ) -> _DirectoryParentBinding:
     if not isinstance(result_owner, _PrivateDirectoryCreationResultOwner):
         raise TypeError("private-directory creation result owner is required")
+    if allow_sticky_writable_ancestors is not None and not isinstance(
+        allow_sticky_writable_ancestors,
+        bool,
+    ):
+        raise TypeError("sticky writable ancestor policy must be boolean")
     if (
         result_owner.creation_parent_binding is not None
         or result_owner.pending is not None
@@ -1415,12 +1431,15 @@ def _create_bound_owned_private_directory(
         raise ValueError("temporary-directory prefix is unsafe")
 
     if held_parent_binding is None:
+        if allow_sticky_writable_ancestors is None:
+            allow_sticky_writable_ancestors = not require_owned_private_parent
         parent_result_owner = _DirectoryParentBindingResultOwner()
         try:
             parent_binding = _open_directory_parent(
                 parent,
                 require_owned_private_parent=require_owned_private_parent,
                 result_owner=parent_result_owner,
+                allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
             )
             parent_result_owner.transfer(parent_binding)
             result_owner.publish_creation_parent(parent_binding)
@@ -1453,10 +1472,16 @@ def _create_bound_owned_private_directory(
                 raise
             raise preserved from trigger_error
     else:
+        if allow_sticky_writable_ancestors is None:
+            allow_sticky_writable_ancestors = (
+                held_parent_binding.allow_sticky_writable_ancestors
+            )
         if (
             parent != held_parent_binding.path
             or require_owned_private_parent
             != held_parent_binding.require_owned_private_parent
+            or allow_sticky_writable_ancestors
+            != held_parent_binding.allow_sticky_writable_ancestors
         ):
             raise ValueError("held temporary-directory parent is inconsistent")
         parent_binding = _duplicate_directory_parent(
@@ -1547,7 +1572,7 @@ def _create_bound_owned_private_directory(
                         child_path,
                         private_leaf=True,
                         allow_sticky_writable_ancestors=(
-                            not require_owned_private_parent
+                            allow_sticky_writable_ancestors
                         ),
                     )
                     path_owner.publish(path_result)
@@ -1576,6 +1601,7 @@ def _create_bound_owned_private_directory(
                 identity=child_identity,
                 policy=child_policy,
                 require_owned_private_parent=require_owned_private_parent,
+                allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
             )
             binding.revalidate()
             result_owner.publish(binding)
@@ -1647,6 +1673,7 @@ def _create_owned_private_directory(
     result_owner: _PrivateDirectoryCreationResultOwner,
     require_owned_private_parent: bool = True,
     held_parent_binding: _DirectoryParentBinding | None = None,
+    allow_sticky_writable_ancestors: bool | None = None,
 ) -> pathlib.Path:
     if not isinstance(result_owner, _PrivateDirectoryCreationResultOwner):
         raise TypeError("private-directory creation result owner is required")
@@ -1656,6 +1683,7 @@ def _create_owned_private_directory(
         result_owner=result_owner,
         require_owned_private_parent=require_owned_private_parent,
         held_parent_binding=held_parent_binding,
+        allow_sticky_writable_ancestors=allow_sticky_writable_ancestors,
     )
     result_owner.transfer(binding)
     return binding.path
@@ -1710,6 +1738,7 @@ def _private_runtime_parent() -> pathlib.Path:
         rejection_errors: list[BaseException] = []
         validated = _validated_private_runtime_parent(
             explicit_parent,
+            allow_sticky_writable_ancestors=True,
             rejection_errors=rejection_errors,
         )
         if validated is None:
@@ -1740,6 +1769,51 @@ def _private_runtime_parent() -> pathlib.Path:
         if raw_path and (parent := _validated_private_runtime_parent(raw_path)):
             return parent
     raise RuntimeError("no trusted private test runtime parent is available")
+
+
+def _create_bound_owned_private_runtime_directory(
+    prefix: str,
+    *,
+    result_owner: _PrivateDirectoryCreationResultOwner,
+) -> _DirectoryParentBinding:
+    """Create below the selected runtime parent with its exact ancestor policy."""
+
+    explicit_parent = os.environ.get(_EXPLICIT_RUNTIME_PARENT_ENV)
+    parent = _private_runtime_parent()
+    allow_sticky_writable_ancestors = (
+        _runtime_parent_creation_allows_sticky_writable_ancestors(
+            explicit_parent,
+            parent,
+        )
+    )
+    if allow_sticky_writable_ancestors:
+        return _create_bound_owned_private_directory(
+            parent,
+            prefix,
+            result_owner=result_owner,
+            allow_sticky_writable_ancestors=True,
+        )
+    return _create_bound_owned_private_directory(
+        parent,
+        prefix,
+        result_owner=result_owner,
+    )
+
+
+def _runtime_parent_creation_allows_sticky_writable_ancestors(
+    explicit_parent: str | None,
+    parent: pathlib.Path,
+) -> bool:
+    """Bind a selected runtime parent to its exact explicit-parent policy."""
+
+    if os.environ.get(_EXPLICIT_RUNTIME_PARENT_ENV) != explicit_parent:
+        raise RuntimeError("explicit test runtime parent changed during selection")
+    if explicit_parent is None:
+        return False
+    expected_parent = _canonical_ascii_directory(explicit_parent)
+    if parent != expected_parent:
+        raise RuntimeError("explicit test runtime parent selection is inconsistent")
+    return True
 
 
 def _repository_runtime_candidates() -> tuple[str, ...]:
@@ -2339,8 +2413,7 @@ def _initialize_process_runtime_root_core(
             cleanup.publish_runtime_state(reentrant_state)
             reentrant_state.binding.revalidate()
             return reentrant_state
-        binding = _create_bound_owned_private_directory(
-            _private_runtime_parent(),
+        binding = _create_bound_owned_private_runtime_directory(
             ".codex-review-tests-",
             result_owner=result_owner,
         )

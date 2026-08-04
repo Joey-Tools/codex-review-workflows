@@ -61,32 +61,553 @@ For issue-comment-only terminal or no-start evidence, apply the request-ledger a
 
 ## Trusted Mac Isolation Gate
 
-The pinned GitHub Hosted `macos-26` profile produces only a reviewed fail-closed
-signature, not production-equivalent no-child or snapshot-Seatbelt evidence.
-Its RLIMIT probes exit before post-exec leader binding, while its Seatbelt and
-combined probes bind the leader and then terminate with `SIGKILL` before probe
-evidence. When the frozen range changes the independent supervisor's Darwin
+The pinned GitHub Hosted `macos-26` production-profile probe produces only a
+reviewed fail-closed signature, not production-equivalent no-child evidence.
+The separate required hosted read-only job remains valuable: it runs the full
+deterministic suite from a root-owned isolated source as a randomly named,
+receipt-bound ephemeral non-admin account, with bound runtime custody and an
+exact terminal summary. The workflow selects an unused dedicated UID/GID,
+proves the account and group GUIDs, rejects admin membership or any process
+already using that UID, repeats the exact-UID process census immediately before
+launch and after the supervised run, and deletes only the same GUID-bound
+records after the UID is empty. Account ambiguity, replacement, a census
+failure, or a residual process fails closed and retains the records until the
+ephemeral runner is disposed. Even without Git metadata, the source is captured
+under the shared snapshot resource bounds and copied only from its descriptor
+receipt; there is no unbounded copy fallback. Its isolated-account closure is
+not the authenticated production no-child proof below. When the frozen range
+changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
 tests, the delivery operator must run this command on a trusted Mac that
 matches the production runtime pin after the final commit exists. First resolve
 and record a parent-validated absolute Python 3.13 interpreter whose entire
 resolved execution path satisfies the no-group-write/no-other-write access
 policy. A convenience symlink through a standard group-writable Homebrew
-`Cellar` does not satisfy that policy. Start from the repository root and enter
-the self-contained tool directory before invoking the package-local test
-runner:
+`Cellar` does not satisfy that policy. Separately resolve and record a physical,
+parent-validated Git 2.45 or newer executable, its Developer directory, and its
+exact exec-path; do not use the macOS `/usr/bin/git` toolchain dispatcher. The
+gate creates one canonical v2 toolchain receipt plus independent closed
+`CONTROL_PARENT` and TMPDIR full-chain custody receipts with the frozen gate
+source. The readonly v3 binding validates the TMPDIR receipt immediately before
+and after a fresh, non-executing measurement and exact-compares the complete
+canonical v2 toolchain receipt. The outer control binding freshly
+exact-compares both directory receipts before and after the full gate returns.
+Each ordered root-to-target chain record binds directory type and device/inode
+object identity; owner/group/mode/flags plus zero ACL entries and a closed,
+property-scoped permitted xattr set protect access policy. Target directories
+permit only benign `com.apple.provenance`; ancestors additionally permit the
+system-owned `com.apple.rootless` marker. Observed permitted names are not
+serialized, so appearance or disappearance of those policy-equivalent markers
+does not create false drift. Directory `nlink`, size, and timestamps are deliberately
+excluded because benign child-entry churn does not change either protected
+property. Every ancestor owner must be root or the current UID; group/world
+writable ancestors are rejected except for a root-owned sticky directory. The
+complete uid/gid ownership tuple is selected so reassignment is
+access-policy drift even while mode `0700` leaves group permissions dormant;
+target flags must remain zero because filesystem flags can change mutability,
+ancestor flags are byte-bound, ACLs must remain empty because they can grant
+access, and each measurement enforces the fixed permitted-xattr policy.
+The outer Developer-directory binding compares device/inode for object identity
+and owner/group/mode for access policy. The canonical toolchain receipt binds
+only the exact Git path and bytes plus the complete exec-path inventory; it does
+not contain TMPDIR custody or version/capability evidence. The readonly v3
+profile separately combines the canonical receipt with the independent TMPDIR
+full-chain custody receipt and binds `DEVELOPER_DIR`, `GIT_EXEC_PATH`, and
+`TMPDIR` into the child environment. Any parent preflight version record is
+provenance/capability evidence only and is not part of this security identity.
+This candidate gate and its receipts are implementation/self-test evidence only; formal named-review lanes remain controlled by an independently trusted prior bundle.
+Create a new owner-private control root beneath a current-UID, exact-`0700`,
+zero-flags `CONTROL_PARENT` outside the candidate repository, bind
+the source repository's physical common object directory, and reject the
+platform path-list separator in either path. The bootstrap initializes an empty
+bare control repository and
+exposes the source object directory only as a read-only alternate. Source local
+configuration, remotes, credential helpers, and promisor settings are therefore
+never loaded. Every Git invocation additionally disables lazy fetch, prompts,
+user-initiated protocols, optional writes, replacement objects, credential
+helpers, and all transport protocols before the first object query.
+
+Start from the repository root and enter the source-only gate by absolute path.
+The gate starts under an empty environment with isolated, site-disabled,
+bytecode-disabled Python. The gate itself is streamed from the frozen HEAD blob
+through bounded stdin, so no candidate worktree path executes before that
+binding. A second exact-HEAD blob binds a closed source manifest containing
+every regular file's relative path, Git mode, byte length, and SHA-256 under
+`review_supervisor/` and `tests/`.
+The gate snapshots the complete inventory, rejects missing or extra entries,
+symlinks, bytecode/native substitutes, and duplicate module mappings, and only
+then compiles the captured matching bytes:
 
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
-cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+TRUSTED_GIT_DEVELOPER_DIR=/absolute/path/to/parent-validated/Developer
+TRUSTED_GIT=/absolute/path/to/parent-validated/git
+TRUSTED_GIT_EXEC_PATH=/absolute/path/to/parent-validated/git-core
+CONTROL_ROOT=/absolute/path/to/parent-validated/absent-owner-private-control-root
+SOURCE_OBJECTS=/absolute/path/to/parent-validated-common-git-objects
+REPO_ROOT="$PWD"
+TOOL_REL=skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+TOOL_ROOT="$REPO_ROOT/$TOOL_REL"
+HEAD_SHA=<full-head-sha>
+GATE_SPEC="$HEAD_SHA:$TOOL_REL/tests/trusted_mac_gate.py"
+SOURCE_MANIFEST_PATH="$TOOL_ROOT/trusted_mac_gate_sources.index"
+SOURCE_MANIFEST_SPEC="$HEAD_SHA:$TOOL_REL/trusted_mac_gate_sources.index"
+CONTROL_GIT="$CONTROL_ROOT/repository.git"
+CONTROL_HOME="$CONTROL_ROOT/home"
+CONTROL_HOOKS="$CONTROL_ROOT/hooks"
+CONTROL_TEMPLATE="$CONTROL_ROOT/template"
+CONTROL_TMP="$CONTROL_ROOT/tmp"
+CONTROL_CONFIG="$CONTROL_GIT/config"
+CONTROL_PARENT="$(/usr/bin/dirname "$CONTROL_ROOT")"
+CONTROL_UID="$(/usr/bin/id -u)"
+probe_source_objects_acl() {
+  /usr/bin/find -s "$SOURCE_OBJECTS" -exec /bin/ls -lde {} \; \
+    | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+}
+probe_source_object_escape_metadata() {
+  local promisor_marker=""
+  if [[ -L "$SOURCE_OBJECTS/info" ]] \
+    || [[ -L "$SOURCE_OBJECTS/pack" ]] \
+    || [[ -e "$SOURCE_OBJECTS/info/alternates" ]] \
+    || [[ -L "$SOURCE_OBJECTS/info/alternates" ]] \
+    || [[ -e "$SOURCE_OBJECTS/info/http-alternates" ]] \
+    || [[ -L "$SOURCE_OBJECTS/info/http-alternates" ]]; then
+    printf '%s\n' alternate-metadata
+    return 0
+  fi
+  for promisor_marker in "$SOURCE_OBJECTS/pack/"*.promisor; do
+    if [[ -e "$promisor_marker" || -L "$promisor_marker" ]]; then
+      printf '%s\n' promisor-marker
+      return 0
+    fi
+  done
+}
+probe_control_acl() {
+  /usr/bin/find -s "$CONTROL_ROOT" -exec /bin/ls -lde {} \; \
+    | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+}
+CONTROL_PARENT_PHYSICAL="$(cd "$CONTROL_PARENT" && pwd -P)"
+CONTROL_PARENT_UID="$(/usr/bin/stat -f '%u' "$CONTROL_PARENT")"
+CONTROL_PARENT_MODE="$(/usr/bin/stat -f '%Lp' "$CONTROL_PARENT")"
+CONTROL_PARENT_FLAGS="$(/usr/bin/stat -f '%f' "$CONTROL_PARENT")"
+SOURCE_OBJECTS_PHYSICAL="$(cd "$SOURCE_OBJECTS" && pwd -P)"
+SOURCE_OBJECTS_MODE="$(/usr/bin/stat -f '%Lp' "$SOURCE_OBJECTS")"
+SOURCE_OBJECTS_ACL_VIOLATION="$(probe_source_objects_acl)" \
+  || SOURCE_OBJECTS_ACL_VIOLATION="<unreadable>"
+SOURCE_OBJECT_ESCAPE_METADATA="$(probe_source_object_escape_metadata)" \
+  || SOURCE_OBJECT_ESCAPE_METADATA="<unreadable>"
+TRUSTED_GIT_DEVELOPER_DIR_PHYSICAL="$(cd "$TRUSTED_GIT_DEVELOPER_DIR" && pwd -P)"
+TRUSTED_GIT_DEVELOPER_DIR_BINDING="$(
+  /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_DEVELOPER_DIR"
+)"
+TRUSTED_GIT_PHYSICAL="$(
+  cd "$(/usr/bin/dirname "$TRUSTED_GIT")" && pwd -P
+)/$(/usr/bin/basename "$TRUSTED_GIT")"
+TRUSTED_GIT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$TRUSTED_GIT")"
+TRUSTED_GIT_SHA256_RECORD="$(/usr/bin/shasum -a 256 "$TRUSTED_GIT")"
+TRUSTED_GIT_SHA256="${TRUSTED_GIT_SHA256_RECORD%% *}"
+TRUSTED_GIT_EXEC_PATH_PHYSICAL="$(cd "$TRUSTED_GIT_EXEC_PATH" && pwd -P)"
+TRUSTED_GIT_EXEC_PATH_BINDING="$(
+  /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_EXEC_PATH"
+)"
+if [[ "$CONTROL_ROOT" != /* || "$SOURCE_OBJECTS" != /* ]] \
+  || [[ "$CONTROL_ROOT" == *:* || "$SOURCE_OBJECTS" == *:* ]] \
+  || [[ "$CONTROL_ROOT" == *$'\n'* || "$SOURCE_OBJECTS" == *$'\n'* ]] \
+  || [[ "$CONTROL_PARENT_PHYSICAL" != "$CONTROL_PARENT" ]] \
+  || [[ "$SOURCE_OBJECTS_PHYSICAL" != "$SOURCE_OBJECTS" ]] \
+  || [[ ! "$CONTROL_UID" =~ ^[[:digit:]]+$ ]] \
+  || [[ "$CONTROL_PARENT_UID" != "$CONTROL_UID" ]] \
+  || [[ ! "$CONTROL_PARENT_MODE" =~ ^[0-7]{3,4}$ ]] \
+  || [[ "$CONTROL_PARENT_MODE" != "700" ]] \
+  || [[ "$CONTROL_PARENT_FLAGS" != "0" ]] \
+  || [[ ! "$SOURCE_OBJECTS_MODE" =~ ^[0-7]{3,4}$ ]] \
+  || (( (8#$SOURCE_OBJECTS_MODE & 0022) != 0 )) \
+  || [[ -n "$SOURCE_OBJECTS_ACL_VIOLATION" ]] \
+  || [[ -n "$SOURCE_OBJECT_ESCAPE_METADATA" ]] \
+  || [[ "$TRUSTED_GIT_DEVELOPER_DIR_PHYSICAL" != "$TRUSTED_GIT_DEVELOPER_DIR" ]] \
+  || [[ ! -d "$TRUSTED_GIT_DEVELOPER_DIR" || -L "$TRUSTED_GIT_DEVELOPER_DIR" ]] \
+  || [[ "$TRUSTED_GIT" != "$TRUSTED_GIT_DEVELOPER_DIR/"* ]] \
+  || [[ "$TRUSTED_GIT_EXEC_PATH" != "$TRUSTED_GIT_DEVELOPER_DIR/"* ]] \
+  || [[ "$TRUSTED_GIT_PHYSICAL" != "$TRUSTED_GIT" ]] \
+  || [[ ! -f "$TRUSTED_GIT" || -L "$TRUSTED_GIT" ]] \
+  || [[ ! "$TRUSTED_GIT_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || [[ "$TRUSTED_GIT_EXEC_PATH_PHYSICAL" != "$TRUSTED_GIT_EXEC_PATH" ]] \
+  || [[ ! -d "$TRUSTED_GIT_EXEC_PATH" || -L "$TRUSTED_GIT_EXEC_PATH" ]] \
+  || [[ -e "$CONTROL_ROOT" || -L "$CONTROL_ROOT" ]] \
+  || [[ ! -d "$SOURCE_OBJECTS" || -L "$SOURCE_OBJECTS" ]]; then
+  printf 'unsafe trusted Git bootstrap paths\n' >&2
+  exit 1
+fi
+/bin/mkdir -m 0700 "$CONTROL_ROOT"
+/bin/mkdir -m 0700 "$CONTROL_HOME" "$CONTROL_HOOKS" "$CONTROL_TEMPLATE" "$CONTROL_TMP"
+CONTROL_ROOT_PHYSICAL="$(cd "$CONTROL_ROOT" && pwd -P)"
+CONTROL_ROOT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_ROOT")"
+SOURCE_OBJECTS_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$SOURCE_OBJECTS")"
+if [[ "$CONTROL_ROOT_PHYSICAL" != "$CONTROL_ROOT" ]] \
+  || [[ "$(/usr/bin/stat -f '%u:%Lp' "$CONTROL_ROOT")" != "$CONTROL_UID:700" ]]; then
+  printf 'trusted Git control root failed custody validation\n' >&2
+  exit 1
+fi
+bootstrap_git() {
+  /usr/bin/env -i DEVELOPER_DIR="$TRUSTED_GIT_DEVELOPER_DIR" \
+    GIT_ASKPASS=/usr/bin/false GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_SYSTEM=/dev/null GIT_EXEC_PATH="$TRUSTED_GIT_EXEC_PATH" \
+    GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    GIT_PAGER=cat GIT_PROTOCOL_FROM_USER=0 GIT_TERMINAL_PROMPT=0 \
+    HOME="$CONTROL_HOME" LANG=C LC_ALL=C PAGER=cat PATH=/usr/bin:/bin \
+    TMPDIR="$CONTROL_TMP" \
+    "$TRUSTED_GIT" --no-pager --no-replace-objects "$@"
+}
+bootstrap_git init --bare -q --template="$CONTROL_TEMPLATE" "$CONTROL_GIT"
+/bin/chmod -RN "$CONTROL_ROOT"
+/bin/chmod -R go-rwx "$CONTROL_ROOT"
+/bin/chmod 0600 "$CONTROL_CONFIG"
+CONTROL_TMP_PHYSICAL="$(cd "$CONTROL_TMP" && pwd -P)"
+CONTROL_TMP_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%f' "$CONTROL_TMP")"
+CONTROL_GIT_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_GIT")"
+CONTROL_CONFIG_BINDING="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$CONTROL_CONFIG")"
+CONTROL_CONFIG_SHA256_RECORD="$(/usr/bin/shasum -a 256 "$CONTROL_CONFIG")"
+CONTROL_CONFIG_SHA256="${CONTROL_CONFIG_SHA256_RECORD%% *}"
+CONTROL_ACL_VIOLATION="$(probe_control_acl)" \
+  || CONTROL_ACL_VIOLATION="<unreadable>"
+trusted_git() {
+  /usr/bin/env -i DEVELOPER_DIR="$TRUSTED_GIT_DEVELOPER_DIR" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$SOURCE_OBJECTS" \
+    GIT_ASKPASS=/usr/bin/false GIT_ATTR_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_SYSTEM=/dev/null GIT_DIR="$CONTROL_GIT" \
+    GIT_EXEC_PATH="$TRUSTED_GIT_EXEC_PATH" GIT_NO_LAZY_FETCH=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_PAGER=cat \
+    GIT_PROTOCOL_FROM_USER=0 GIT_TERMINAL_PROMPT=0 HOME="$CONTROL_HOME" \
+    LANG=C LC_ALL=C PAGER=cat PATH=/usr/bin:/bin TMPDIR="$CONTROL_TMP" \
+    "$TRUSTED_GIT" --no-pager --no-replace-objects \
+      -c core.commitGraph=false -c core.multiPackIndex=false \
+      -c core.fsmonitor=false -c core.hooksPath="$CONTROL_HOOKS" \
+      -c core.attributesFile=/dev/null -c maintenance.auto=false \
+      -c credential.helper= -c protocol.ext.allow=never \
+      -c protocol.file.allow=never -c protocol.git.allow=never \
+      -c protocol.http.allow=never -c protocol.https.allow=never \
+      -c protocol.ssh.allow=never "$@"
+}
+CONTROL_SYMLINK="$(/usr/bin/find "$CONTROL_ROOT" -type l -print -quit)"
+if [[ -n "$CONTROL_SYMLINK" ]] \
+  || [[ -n "$CONTROL_ACL_VIOLATION" ]] \
+  || [[ "$CONTROL_TMP_PHYSICAL" != "$CONTROL_TMP" ]] \
+  || [[ ! "$CONTROL_CONFIG_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || trusted_git config --local --name-only \
+    --get-regexp '^(remote|credential|protocol)\.' >/dev/null 2>&1; then
+  printf 'unsafe trusted Git control repository\n' >&2
+  exit 1
+fi
+set -o pipefail
+if ! GATE_SIZE="$(trusted_git cat-file -s "$GATE_SPEC")"; then
+  printf 'unable to read trusted gate size\n' >&2
+  exit 1
+fi
+if ! GATE_SHA256_RECORD="$(
+  trusted_git cat-file blob "$GATE_SPEC" | /usr/bin/shasum -a 256
+)"; then
+  printf 'unable to hash trusted gate blob\n' >&2
+  exit 1
+fi
+GATE_SHA256="${GATE_SHA256_RECORD%% *}"
+if [[ ! "$GATE_SIZE" =~ ^[[:digit:]]+$ ]] \
+  || (( GATE_SIZE < 1 || GATE_SIZE > 131072 )); then
+  printf 'invalid trusted gate size: %s\n' "$GATE_SIZE" >&2
+  exit 1
+fi
+if [[ ! "$GATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  printf 'invalid trusted gate digest\n' >&2
+  exit 1
+fi
+if ! SOURCE_MANIFEST_SIZE="$(trusted_git cat-file -s "$SOURCE_MANIFEST_SPEC")"; then
+  printf 'unable to read trusted source manifest size\n' >&2
+  exit 1
+fi
+if ! SOURCE_MANIFEST_SHA256_RECORD="$(
+  trusted_git cat-file blob "$SOURCE_MANIFEST_SPEC" | /usr/bin/shasum -a 256
+)"; then
+  printf 'unable to hash trusted source manifest blob\n' >&2
+  exit 1
+fi
+SOURCE_MANIFEST_SHA256="${SOURCE_MANIFEST_SHA256_RECORD%% *}"
+if [[ ! "$SOURCE_MANIFEST_SIZE" =~ ^[[:digit:]]+$ ]] \
+  || (( SOURCE_MANIFEST_SIZE < 1 || SOURCE_MANIFEST_SIZE > 1048576 )) \
+  || [[ ! "$SOURCE_MANIFEST_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
+  || ! trusted_git cat-file blob "$SOURCE_MANIFEST_SPEC" \
+    | /usr/bin/cmp -s - "$SOURCE_MANIFEST_PATH"; then
+  printf 'trusted source manifest is not the exact HEAD blob\n' >&2
+  exit 1
+fi
+measure_trusted_git_directory_custody() {
+  local directory="$1"
+  trusted_git cat-file blob "$GATE_SPEC" \
+    | /usr/bin/env -i HOME=/var/empty LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+        TMPDIR="$CONTROL_TMP" "$TRUSTED_PYTHON" -I -B -S - \
+          --trusted-git-tmpdir-receipt "$directory"
+}
+verify_trusted_git_bootstrap_structure() {
+  local phase="$1"
+  local current_control_root_binding=""
+  local current_control_tmp_physical=""
+  local current_control_tmp_binding=""
+  local current_control_git_binding=""
+  local current_control_config_binding=""
+  local current_control_config_sha256_record=""
+  local current_control_config_sha256=""
+  local current_control_acl_violation=""
+  local current_source_objects_physical=""
+  local current_source_objects_binding=""
+  local current_source_objects_acl_violation=""
+  local current_source_object_escape_metadata=""
+  local current_trusted_git_developer_dir_physical=""
+  local current_trusted_git_developer_dir_binding=""
+  local current_trusted_git_physical=""
+  local current_trusted_git_binding=""
+  local current_trusted_git_sha256_record=""
+  local current_trusted_git_sha256=""
+  local current_trusted_git_exec_path_physical=""
+  local current_trusted_git_exec_path_binding=""
+  current_control_root_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_ROOT"
+  )" || current_control_root_binding="<unreadable>"
+  current_control_tmp_physical="$(cd "$CONTROL_TMP" && pwd -P)" \
+    || current_control_tmp_physical="<unreadable>"
+  current_control_tmp_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%f' "$CONTROL_TMP"
+  )" || current_control_tmp_binding="<unreadable>"
+  current_control_git_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$CONTROL_GIT"
+  )" || current_control_git_binding="<unreadable>"
+  current_control_config_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$CONTROL_CONFIG"
+  )" || current_control_config_binding="<unreadable>"
+  current_control_config_sha256_record="$(
+    /usr/bin/shasum -a 256 "$CONTROL_CONFIG"
+  )" || current_control_config_sha256_record="<unreadable>"
+  current_control_config_sha256="${current_control_config_sha256_record%% *}"
+  current_control_acl_violation="$(probe_control_acl)" \
+    || current_control_acl_violation="<unreadable>"
+  current_source_objects_physical="$(cd "$SOURCE_OBJECTS" && pwd -P)" \
+    || current_source_objects_physical="<unreadable>"
+  current_source_objects_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$SOURCE_OBJECTS"
+  )" || current_source_objects_binding="<unreadable>"
+  current_source_objects_acl_violation="$(probe_source_objects_acl)" \
+    || current_source_objects_acl_violation="<unreadable>"
+  current_source_object_escape_metadata="$(probe_source_object_escape_metadata)" \
+    || current_source_object_escape_metadata="<unreadable>"
+  current_trusted_git_developer_dir_physical="$(
+    cd "$TRUSTED_GIT_DEVELOPER_DIR" && pwd -P
+  )" || current_trusted_git_developer_dir_physical="<unreadable>"
+  current_trusted_git_developer_dir_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_DEVELOPER_DIR"
+  )" || current_trusted_git_developer_dir_binding="<unreadable>"
+  current_trusted_git_physical="$(
+    cd "$(/usr/bin/dirname "$TRUSTED_GIT")" && pwd -P
+  )/$(/usr/bin/basename "$TRUSTED_GIT")" \
+    || current_trusted_git_physical="<unreadable>"
+  current_trusted_git_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$TRUSTED_GIT"
+  )" || current_trusted_git_binding="<unreadable>"
+  current_trusted_git_sha256_record="$(
+    /usr/bin/shasum -a 256 "$TRUSTED_GIT"
+  )" || current_trusted_git_sha256_record="<unreadable>"
+  current_trusted_git_sha256="${current_trusted_git_sha256_record%% *}"
+  current_trusted_git_exec_path_physical="$(
+    cd "$TRUSTED_GIT_EXEC_PATH" && pwd -P
+  )" || current_trusted_git_exec_path_physical="<unreadable>"
+  current_trusted_git_exec_path_binding="$(
+    /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$TRUSTED_GIT_EXEC_PATH"
+  )" || current_trusted_git_exec_path_binding="<unreadable>"
+  if [[ "$current_control_root_binding" != "$CONTROL_ROOT_BINDING" ]] \
+    || [[ "$current_control_tmp_physical" != "$CONTROL_TMP" ]] \
+    || [[ "$current_control_tmp_binding" != "$CONTROL_TMP_BINDING" ]] \
+    || [[ "$current_control_git_binding" != "$CONTROL_GIT_BINDING" ]] \
+    || [[ "$current_control_config_binding" != "$CONTROL_CONFIG_BINDING" ]] \
+    || [[ "$current_control_config_sha256" != "$CONTROL_CONFIG_SHA256" ]] \
+    || [[ -n "$current_control_acl_violation" ]] \
+    || [[ "$current_source_objects_physical" != "$SOURCE_OBJECTS" ]] \
+    || [[ "$current_source_objects_binding" != "$SOURCE_OBJECTS_BINDING" ]] \
+    || [[ -n "$current_source_objects_acl_violation" ]] \
+    || [[ -n "$current_source_object_escape_metadata" ]] \
+    || [[ "$current_trusted_git_developer_dir_physical" != "$TRUSTED_GIT_DEVELOPER_DIR" ]] \
+    || [[ "$current_trusted_git_developer_dir_binding" != "$TRUSTED_GIT_DEVELOPER_DIR_BINDING" ]] \
+    || [[ "$current_trusted_git_physical" != "$TRUSTED_GIT" ]] \
+    || [[ "$current_trusted_git_binding" != "$TRUSTED_GIT_BINDING" ]] \
+    || [[ "$current_trusted_git_sha256" != "$TRUSTED_GIT_SHA256" ]] \
+    || [[ "$current_trusted_git_exec_path_physical" != "$TRUSTED_GIT_EXEC_PATH" ]] \
+    || [[ "$current_trusted_git_exec_path_binding" != "$TRUSTED_GIT_EXEC_PATH_BINDING" ]]; then
+    printf 'trusted Git bootstrap custody changed %s\n' "$phase" >&2
+    return 1
+  fi
+}
+if ! verify_trusted_git_bootstrap_structure \
+  'before directory receipt issuance'; then
+  exit 1
+fi
+if ! CONTROL_PARENT_CUSTODY_RECEIPT="$(
+  measure_trusted_git_directory_custody "$CONTROL_PARENT"
+)"; then
+  printf 'unable to measure CONTROL_PARENT custody\n' >&2
+  exit 1
+fi
+if ! TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(
+  measure_trusted_git_directory_custody "$CONTROL_TMP"
+)"; then
+  printf 'unable to measure trusted Git TMPDIR custody\n' >&2
+  exit 1
+fi
+for custody_receipt in \
+  "$CONTROL_PARENT_CUSTODY_RECEIPT" \
+  "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"; do
+  if [[ "$custody_receipt" == *$'\n'* ]] \
+    || [[ "$custody_receipt" != \
+      *'"schema":"trusted-git-tmpdir-custody-v1"'* ]]; then
+    printf 'trusted Git directory custody receipt is malformed\n' >&2
+    exit 1
+  fi
+done
+verify_trusted_git_directory_custody() {
+  local phase="$1"
+  local current_control_parent_custody_receipt=""
+  local current_control_tmp_custody_receipt=""
+  current_control_parent_custody_receipt="$(
+    measure_trusted_git_directory_custody "$CONTROL_PARENT"
+  )" || current_control_parent_custody_receipt="<unreadable>"
+  current_control_tmp_custody_receipt="$(
+    measure_trusted_git_directory_custody "$CONTROL_TMP"
+  )" || current_control_tmp_custody_receipt="<unreadable>"
+  if [[ "$current_control_parent_custody_receipt" != \
+    "$CONTROL_PARENT_CUSTODY_RECEIPT" ]] \
+    || [[ "$current_control_tmp_custody_receipt" != \
+      "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT" ]]; then
+    printf 'trusted Git directory chain custody changed %s\n' "$phase" >&2
+    return 1
+  fi
+}
+verify_trusted_git_bootstrap_custody() {
+  verify_trusted_git_bootstrap_structure "$1" \
+    && verify_trusted_git_directory_custody "$1"
+}
+if ! verify_trusted_git_bootstrap_custody 'before gate execution'; then
+  exit 1
+fi
+measure_trusted_git_toolchain() {
+  trusted_git cat-file blob "$GATE_SPEC" \
+    | /usr/bin/env -i HOME=/var/empty LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+        TMPDIR="$CONTROL_TMP" "$TRUSTED_PYTHON" -I -B -S - \
+          --hosted-git-receipt "$TRUSTED_GIT_DEVELOPER_DIR" \
+          "$TRUSTED_GIT" "$TRUSTED_GIT_SHA256" \
+          "$TRUSTED_GIT_EXEC_PATH"
+}
+if ! TRUSTED_GIT_TOOLCHAIN_RECEIPT="$(measure_trusted_git_toolchain)"; then
+  printf 'unable to measure trusted Git toolchain\n' >&2
+  exit 1
+fi
+if ! TRUSTED_GIT_TOOLCHAIN_RECEIPT_SHA256_RECORD="$(
+  /usr/bin/printf '%s\n' "$TRUSTED_GIT_TOOLCHAIN_RECEIPT" \
+    | /usr/bin/shasum -a 256
+)"; then
+  printf 'unable to hash trusted Git toolchain receipt\n' >&2
+  exit 1
+fi
+TRUSTED_GIT_TOOLCHAIN_RECEIPT_SHA256="${TRUSTED_GIT_TOOLCHAIN_RECEIPT_SHA256_RECORD%% *}"
+if [[ "$TRUSTED_GIT_TOOLCHAIN_RECEIPT" == *$'\n'* ]] \
+  || [[ "$TRUSTED_GIT_TOOLCHAIN_RECEIPT" != \
+    *'"schema":"hosted-git-toolchain-receipt-v2"'* ]] \
+  || [[ ! "$TRUSTED_GIT_TOOLCHAIN_RECEIPT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  printf 'trusted Git toolchain receipt is malformed\n' >&2
+  exit 1
+fi
+if ! trusted_git cat-file blob "$GATE_SPEC" \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+      "$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" live; then
+  printf 'trusted live gate failed\n' >&2
+  exit 1
+fi
+if ! trusted_git cat-file blob "$GATE_SPEC" \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+      "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+      "$SOURCE_MANIFEST_PATH" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA" \
+      "$CONTROL_TMP" "$TRUSTED_GIT_DEVELOPER_DIR" "$TRUSTED_GIT" \
+      "$TRUSTED_GIT_SHA256" "$TRUSTED_GIT_EXEC_PATH" \
+      "$TRUSTED_GIT_TOOLCHAIN_RECEIPT" \
+      "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"; then
+  printf 'trusted readonly gate failed\n' >&2
+  exit 1
+fi
+if ! verify_trusted_git_bootstrap_custody 'after gate execution'; then
+  exit 1
+fi
 ```
 
-Record the interpreter's absolute path and digest and exact `head_sha`; record
-nine tests run, zero skips, and the terminal result in the PR delivery evidence.
+The Python receipt and remeasurement logic never executes the measured Git
+toolchain. It reads and hashes the parent-selected physical Git executable and
+the bounded exec-path closure, then compares the canonical v2 record exactly.
+The surrounding operator may use that already bound executable to stream the
+gate blob. This keeps the protected property to object/content identity and
+access policy; dynamic version output is neither required nor folded into the
+receipt.
+
+Record the interpreter, Developer directory, Git executable/exec-path absolute
+paths and digests, the canonical Git toolchain receipt and its SHA-256,
+the independent canonical `CONTROL_PARENT` and TMPDIR full-chain custody receipts,
+the isolated control-repository identity, source-object-directory identity,
+exact `head_sha`, gate blob size and SHA-256, and source-manifest blob size and
+SHA-256; record
+the live runner's thirteen tests, zero skips, and terminal result, followed by the
+read-only install runner's complete structured summary. Accept that summary
+only when all of these predicates hold:
+
+- `primary_status == "complete"` and `primary_failure == null`
+- `child_process_closure == "proven"`
+- `cleanup_status == "complete"` and `cleanup_failures == []`
+- `release_tree_immutable == true`
+- `source_head_bound == true`, `source_head_sha == <full-head-sha>`, and
+  `source_head_subtree_manifest_sha256` is one full lowercase SHA-256
+- `source_manifest_sha256` is one full lowercase SHA-256
+- `no_child_runtime_profile == "production-current"`
+- `returncode == 0`
+- `retained_paths == []`, `runtime_residue == []`, and `secondary_failures == []`
+- `signal_number == null` and `timed_out == false`
+- `creation_origin_proven == false`
+- `creation_origin_guarantee == "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"`
+- `cleanup_guarantee == "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb"`
+
+The last three predicates are mandatory platform-boundary evidence, not a
+failed run. macOS provides neither an atomic create-directory-and-return-FD
+operation nor unlink-by-FD. The `mkdirat` to first no-follow open window and
+the final identity-check to `unlinkat`/`rmdir` window therefore rely on a
+128-bit unguessable leaf and cooperative same-UID host TCB. After the receipt
+exists, identity/access-policy drift fails closed; custodied manifests,
+quarantine, and descriptor revalidation are used for cleanup, and a replacement
+is never removed after mismatch or unproven identity has been observed.
+The two independent custody receipts persist every root-to-target physical
+chain record and are freshly exact-compared before and after gate execution.
+The TMPDIR receipt is also revalidated immediately before and after the Git
+toolchain static remeasurement inside readonly v3. These discrete snapshots do not claim to
+exclude a same-UID transient replace-and-restore inside the cooperative host
+TCB boundary.
+
+The exact-head source proof does not trust ordinary `git status`. It rejects
+repository-visible includes, executable filter/diff configuration,
+`core.fileMode=false`, fsmonitor, assume-unchanged, and skip-worktree state.
+An isolated Git object-control view reads the raw HEAD tree, blob bytes, and
+mode, which must exactly match a descriptor-based double snapshot of the source
+path set, directory set, complete file bytes, and executable bits. The
+`source_head_subtree_manifest_sha256` binds that raw HEAD proof; the separate
+`source_manifest_sha256` binds source path/type, content, mode/flags, and access
+policy. Descriptor snapshots separately protect object identity at capture and
+revalidation boundaries.
+
+Both commands must use the same recorded interpreter and exact head.
 Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,
 or nonmatching-host evidence blocks merge-readiness;
-Hosted CI's blocker-signature probe is not a substitute.
+neither Hosted CI's blocker-signature probe nor its isolated-account read-only
+job substitutes for the production no-child proof.
 
 This is an operator-enforced exact-head gate, not a GitHub check run, branch
 protection status, cryptographic attestation, or named review lane. Do not claim

@@ -35,12 +35,18 @@ from review_supervisor.constants import (
 )
 from review_supervisor.errors import SupervisorError
 from review_supervisor.gitraw import (
+    BOUND_GIT_DEVELOPER_DIR_ENV,
+    BOUND_GIT_EXECUTABLE_ENV,
+    BOUND_GIT_EXEC_PATH_ENV,
+    BOUND_GIT_RECEIPT_ENV,
+    BOUND_GIT_TMPDIR_ENV,
     CatFileBatch,
     GitProcessClosureUnproven,
     RepositoryInfo,
     _parse_tree_record,
     add_detached_worktree,
     authenticated_range_manifests,
+    bound_git_environment,
     check_attributes,
     create_sanitized_view,
     enumerate_tree,
@@ -53,6 +59,7 @@ from review_supervisor.gitraw import (
     revalidate_git_control,
     retry_git_process_closure,
     sanitized_git_environment,
+    selected_git_executable,
     verify_worktree_absent,
 )
 from review_supervisor.ledger import (
@@ -81,18 +88,35 @@ from tests.support import (
 )
 
 
-GIT = pathlib.Path("/usr/bin/git")
+GIT = pathlib.Path(selected_git_executable())
+FIXTURE_PROCESS_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+FIXTURE_PROCESS_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _run_fixture_process(
+    argv: tuple[str, ...],
+    *,
+    cwd: pathlib.Path,
+    timeout: float,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    returncode, stdout, stderr = gitraw.run_bounded(
+        argv,
+        cwd=cwd,
+        environment=environment,
+        timeout=timeout,
+        stdout_limit=FIXTURE_PROCESS_STDOUT_LIMIT_BYTES,
+        stderr_limit=FIXTURE_PROCESS_STDERR_LIMIT_BYTES,
+    )
+    return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
 
 
 def _git(repo: pathlib.Path, *arguments: str) -> bytes:
-    completed = subprocess.run(
+    completed = _run_fixture_process(
         (str(GIT), "-C", str(repo), *arguments),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        cwd=repo,
         timeout=10,
-        env=sanitized_git_environment(),
+        environment=bound_git_environment(),
     )
     if completed.returncode != 0:
         raise AssertionError(completed.stderr.decode("utf-8", "replace"))
@@ -100,20 +124,20 @@ def _git(repo: pathlib.Path, *arguments: str) -> bytes:
 
 
 def _init_repository(
-    repo: pathlib.Path, *, object_format: str
+    repo: pathlib.Path,
+    *,
+    object_format: str,
+    timeout: float = 10,
 ) -> subprocess.CompletedProcess[bytes]:
     arguments = [str(GIT), "init", "-q"]
     if object_format != "sha1":
         arguments.append(f"--object-format={object_format}")
     arguments.append(str(repo))
-    return subprocess.run(
-        arguments,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=10,
-        env=sanitized_git_environment(),
+    return _run_fixture_process(
+        tuple(arguments),
+        cwd=repo.parent,
+        timeout=timeout,
+        environment=bound_git_environment(),
     )
 
 
@@ -1635,6 +1659,70 @@ class RawGitProtocolTests(unittest.TestCase):
                 if descendant_pid is not None and descendant_identity is not None:
                     _kill_verified_process(descendant_pid, descendant_identity)
 
+    def test_fixture_git_timeout_reaps_same_group_descendants(self) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s %s\\n\' "$$" "$!" > "$0.pids"\n'
+            b"exec /bin/sleep 30\n"
+        )
+        with owned_temporary_directory("fixture-git-timeout-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(script)
+            executable.chmod(0o700)
+            pid_path = root / "fake-git.pids"
+            errors: list[BaseException] = []
+            results: list[subprocess.CompletedProcess[bytes]] = []
+            leader_pid: int | None = None
+            leader_identity: str | None = None
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            descendant_group: int | None = None
+
+            def invoke() -> None:
+                try:
+                    results.append(
+                        _init_repository(
+                            root / "repo",
+                            object_format="sha1",
+                            timeout=0.5,
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=invoke, daemon=True)
+            try:
+                with mock.patch(f"{__name__}.GIT", executable):
+                    worker.start()
+                    leader_pid, descendant_pid = _wait_for_pid_record(
+                        pid_path,
+                        field_count=2,
+                        timeout=2,
+                    )
+                    leader_identity = process_start_identity(leader_pid)
+                    descendant_identity = process_start_identity(descendant_pid)
+                    descendant_group = os.getpgid(descendant_pid)
+                    worker.join(timeout=5)
+
+                self.assertFalse(worker.is_alive(), "fixture Git timeout blocked")
+                self.assertEqual(results, [])
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], TimeoutError)
+                self.assertIn("bounded Git command timed out", str(errors[0]))
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "fixture Git timeout left its same-group descendant alive",
+                )
+                self.assertEqual(descendant_group, leader_pid)
+                self.assertFalse(_process_group_exists(leader_pid))
+            finally:
+                worker.join(timeout=5)
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
+                if leader_pid is not None and leader_identity is not None:
+                    _kill_verified_process(leader_pid, leader_identity)
+
     def test_bounded_git_overflow_terminates_same_group_child(self) -> None:
         script = (
             b"#!/bin/sh\n"
@@ -2067,7 +2155,7 @@ class RawGitProtocolTests(unittest.TestCase):
         self.assertIn("pack.useBitmaps=false", argv)
 
 
-@unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
+@unittest.skipUnless(GIT.is_file(), "the selected Git executable is required")
 class RawGitCheckoutTests(unittest.TestCase):
     def test_authenticated_range_rejects_commit_content_mismatch(self) -> None:
         with owned_temporary_directory("git-metadata-content-mismatch-") as root:
@@ -2410,7 +2498,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                 pathlib.Path(__file__).resolve().parent.parent
                 / "independent-codex-pr-review"
             )
-            completed = subprocess.run(
+            completed = _run_fixture_process(
                 (
                     sys.executable,
                     str(entrypoint),
@@ -2433,12 +2521,8 @@ class RawGitCheckoutTests(unittest.TestCase):
                     "/usr/bin/true",
                 ),
                 cwd=pathlib.Path(__file__).resolve().parent.parent,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
                 timeout=30,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
             self.assertEqual(
                 completed.returncode, 0, completed.stdout + completed.stderr
@@ -2476,7 +2560,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                 pathlib.Path(__file__).resolve().parent.parent
                 / "independent-codex-pr-review"
             )
-            completed = subprocess.run(
+            completed = _run_fixture_process(
                 (
                     sys.executable,
                     str(entrypoint),
@@ -2499,12 +2583,8 @@ class RawGitCheckoutTests(unittest.TestCase):
                     "/usr/bin/true",
                 ),
                 cwd=pathlib.Path(__file__).resolve().parent.parent,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
                 timeout=30,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
             self.assertEqual(completed.returncode, 2, completed.stderr)
             payload = json.loads(completed.stdout)
@@ -2538,7 +2618,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                 pathlib.Path(__file__).resolve().parent.parent
                 / "independent-codex-pr-review"
             )
-            completed = subprocess.run(
+            completed = _run_fixture_process(
                 (
                     sys.executable,
                     str(entrypoint),
@@ -2561,12 +2641,8 @@ class RawGitCheckoutTests(unittest.TestCase):
                     "/usr/bin/true",
                 ),
                 cwd=pathlib.Path(__file__).resolve().parent.parent,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
                 timeout=30,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
             self.assertEqual(completed.returncode, 2, completed.stderr)
             payload = json.loads(completed.stdout)
@@ -2743,6 +2819,41 @@ class RawGitCheckoutTests(unittest.TestCase):
         self.assertEqual(environment["HOME"], "/var/empty")
         self.assertNotIn("GIT_CONFIG", environment)
         self.assertNotIn("XDG_CONFIG_HOME", environment)
+
+    def test_bound_git_environment_is_closed_and_complete(self) -> None:
+        values = {
+            BOUND_GIT_EXECUTABLE_ENV: "/trusted/Xcode/usr/bin/git",
+            BOUND_GIT_EXEC_PATH_ENV: "/trusted/Xcode/usr/libexec/git-core",
+            BOUND_GIT_DEVELOPER_DIR_ENV: "/trusted/Xcode",
+            BOUND_GIT_TMPDIR_ENV: "/private/runtime",
+            BOUND_GIT_RECEIPT_ENV: "a" * 64,
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            self.assertEqual(
+                selected_git_executable(),
+                "/trusted/Xcode/usr/bin/git",
+            )
+            environment = bound_git_environment()
+        self.assertEqual(environment["DEVELOPER_DIR"], "/trusted/Xcode")
+        self.assertEqual(
+            environment["GIT_EXEC_PATH"],
+            "/trusted/Xcode/usr/libexec/git-core",
+        )
+        self.assertEqual(environment["TMPDIR"], "/private/runtime")
+
+        with mock.patch.dict(
+            os.environ,
+            {BOUND_GIT_EXECUTABLE_ENV: "/trusted/git"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "environment is incomplete"):
+                selected_git_executable()
+
+        invalid = dict(values)
+        invalid[BOUND_GIT_TMPDIR_ENV] = "relative/runtime"
+        with mock.patch.dict(os.environ, invalid, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "not an absolute normalized"):
+                bound_git_environment()
 
     def test_materializer_blocks_small_lfs_pointer_content(self) -> None:
         with owned_temporary_directory("git-lfs-block-") as root:
