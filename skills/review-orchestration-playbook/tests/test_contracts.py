@@ -91,13 +91,24 @@ REPOSITORY_POLICY_SCOPE_BY_PROFILE = {
     "canonical": pathlib.Path("."),
     "private": pathlib.Path("personal_codex"),
 }
+_MAX_CANONICAL_DECIMAL_BITS = 128
+_MAX_CANONICAL_DECIMAL_DIGITS = 39
 
 
 def _canonical_positive_decimal(value: object) -> str | None:
     if type(value) is int:
-        return str(value) if value > 0 else None
-    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) is not None:
-        return value
+        return (
+            str(value)
+            if value > 0 and value.bit_length() <= _MAX_CANONICAL_DECIMAL_BITS
+            else None
+        )
+    if (
+        isinstance(value, str)
+        and len(value) <= _MAX_CANONICAL_DECIMAL_DIGITS
+        and re.fullmatch(r"[1-9][0-9]*", value) is not None
+    ):
+        parsed = int(value)
+        return value if parsed.bit_length() <= _MAX_CANONICAL_DECIMAL_BITS else None
     return None
 
 
@@ -4335,6 +4346,15 @@ printf '%s\n' "$trusted_uv"
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(ordinary_issue_nonseed_document=document_name):
                 self.assertIn(ordinary_issue_nonseed_contract, normalized_document)
+        bounded_decimal_contract = (
+            "canonical decimal page and native-id tokens are limited to 39 digits "
+            "and 128 bits before integer conversion; overlong values fail closed "
+            "without raising"
+        )
+        for document_name, document in complete_stop_reason_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(bounded_decimal_document=document_name):
+                self.assertIn(bounded_decimal_contract, normalized_document)
         normalized_stop_reason_probes = " ".join(
             anti_drift_documents["github-pr-probes"].lower().replace("`", "").split()
         )
@@ -6918,6 +6938,21 @@ printf '%s\n' "$trusted_uv"
         history_window_seconds = 30 * 24 * 60 * 60
         history_as_of_server_time = 3_000_000
         history_start_exclusive = history_as_of_server_time - history_window_seconds
+        largest_native_decimal = (1 << _MAX_CANONICAL_DECIMAL_BITS) - 1
+        for representation in (
+            largest_native_decimal,
+            str(largest_native_decimal),
+        ):
+            self.assertEqual(
+                _canonical_positive_decimal(representation),
+                str(largest_native_decimal),
+            )
+        for representation in (
+            1 << _MAX_CANONICAL_DECIMAL_BITS,
+            str(1 << _MAX_CANONICAL_DECIMAL_BITS),
+            "9" * 5_000,
+        ):
+            self.assertIsNone(_canonical_positive_decimal(representation))
         future_prefix_policy_documents = {
             "readme": REPO_ROOT / "README.md",
             "authority": SKILL_ROOT / "references/github-codex-evidence-authority.md",
@@ -13360,9 +13395,15 @@ printf '%s\n' "$trusted_uv"
                             last_url,
                         )
                         if last_match is not None:
-                            candidate_last_page_number = int(last_match.group(1))
-                            if candidate_last_page_number >= 2:
-                                last_page_number = candidate_last_page_number
+                            candidate_last_page_decimal = _canonical_positive_decimal(
+                                last_match.group(1)
+                            )
+                            if candidate_last_page_decimal is not None:
+                                candidate_last_page_number = int(
+                                    candidate_last_page_decimal
+                                )
+                                if candidate_last_page_number >= 2:
+                                    last_page_number = candidate_last_page_number
                     if last_page_number is None or (
                         observed_last_url is not None and observed_last_url != last_url
                     ):
@@ -13506,20 +13547,23 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(issue_url, str)
                     else None
                 )
-                issue_number_digits = match.group(1) if match is not None else None
+                issue_number_digits = (
+                    _canonical_positive_decimal(match.group(1))
+                    if match is not None
+                    else None
+                )
                 issue_number = (
                     int(issue_number_digits)
                     if isinstance(issue_number_digits, str)
-                    and len(issue_number_digits) <= 39
                     else None
                 )
                 if (
                     type(request_id) is not int
                     or request_id <= 0
-                    or request_id.bit_length() > 128
+                    or request_id.bit_length() > _MAX_CANONICAL_DECIMAL_BITS
                     or request_id in seen_controlled_comment_ids
                     or type(issue_number) is not int
-                    or issue_number.bit_length() > 128
+                    or issue_number.bit_length() > _MAX_CANONICAL_DECIMAL_BITS
                     or projected.get("url")
                     != (
                         "https://api.github.com/repos/"
@@ -22660,6 +22704,22 @@ printf '%s\n' "$trusted_uv"
                     )
                 )
 
+        huge_last_page = clone(complete_scope_transcript)
+        assert isinstance(huge_last_page, dict)
+        huge_last_page_url = f"{recent_pull_url}&page={'9' * 5_000}"
+        huge_last_page["scope_discovery"]["recent_pull_requests"]["pages"][0][
+            "link_header"
+        ] = f'<{huge_last_page_url}>; rel="last"'
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                huge_last_page,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
         float_status_pull_discovery = clone(complete_scope_transcript)
         assert isinstance(float_status_pull_discovery, dict)
         float_status_pull_discovery["scope_discovery"]["recent_pull_requests"]["pages"][
@@ -30408,9 +30468,11 @@ printf '%s\n' "$trusted_uv"
             history_as_of_server_time + 6
         )
         record_free_progress_root_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            if isinstance(item, dict)
-            else -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at"))
+                if isinstance(item, dict)
+                else -1
+            ),
             reverse=True,
         )
         replace_raw_json_body(
@@ -30481,8 +30543,9 @@ printf '%s\n' "$trusted_uv"
             *existing_progress_feed_records,
         ]
         progress_feed_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            or -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at")) or -1
+            ),
             reverse=True,
         )
         record_free_progress_transcript["scope_discovery"][
@@ -34373,8 +34436,9 @@ printf '%s\n' "$trusted_uv"
             history_as_of_server_time + 4
         )
         future_recent_pull_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            or -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at")) or -1
+            ),
             reverse=True,
         )
         replace_raw_json_body(
@@ -34629,8 +34693,9 @@ printf '%s\n' "$trusted_uv"
         self.assertEqual(len(future_only_detail_root_records), 1)
         future_only_root_records.extend(future_only_detail_root_records)
         future_only_root_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            or -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at")) or -1
+            ),
             reverse=True,
         )
         replace_raw_json_body(
@@ -34872,8 +34937,9 @@ printf '%s\n' "$trusted_uv"
             )
         )
         empty_future_root_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            or -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at")) or -1
+            ),
             reverse=True,
         )
         replace_raw_json_body(
@@ -34952,9 +35018,11 @@ printf '%s\n' "$trusted_uv"
                     future_anchor_times[root_record["number"]]
                 )
         future_anchor_root_records.sort(
-            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
-            if isinstance(item, dict)
-            else -1,
+            key=lambda item: (
+                _parse_github_rfc3339_seconds(item.get("updated_at"))
+                if isinstance(item, dict)
+                else -1
+            ),
             reverse=True,
         )
         replace_raw_json_body(
@@ -35554,6 +35622,57 @@ printf '%s\n' "$trusted_uv"
             parse_discovery_endpoint_transcript(
                 future_parent_mismatch_transcript,
                 request_scope_receipts=future_parent_mismatch_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        future_huge_parent_inventory = clone(future_review_inventory)
+        assert isinstance(future_huge_parent_inventory, dict)
+        future_huge_parent_transcript = future_huge_parent_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_huge_parent_scope = next(
+            item
+            for item in future_huge_parent_transcript["scopes"]
+            if item.get("pull_number") == background_pr
+        )
+        future_huge_parent_fetches = future_huge_parent_scope["fetches"]
+        future_huge_parent_index = fetch_index(
+            future_huge_parent_fetches,
+            "review_threads",
+        )
+        future_huge_parent_fetch = future_huge_parent_fetches[future_huge_parent_index]
+        huge_parent_added = False
+        for page in future_huge_parent_fetch["pages"]:
+            body = json.loads(page["body_utf8"])
+            raw_nodes = body["data"]["repository"]["pullRequest"]["reviewThreads"][
+                "nodes"
+            ]
+            if raw_nodes and not huge_parent_added:
+                huge_parent_child_id = background_inline_id + 100
+                raw_nodes[0]["comments"]["nodes"].append(
+                    {
+                        "id": "PRRC_huge_parent",
+                        "fullDatabaseId": str(huge_parent_child_id),
+                        "url": (
+                            f"https://github.com/{current_repository}/pull/"
+                            f"{background_pr}#discussion_r{huge_parent_child_id}"
+                        ),
+                        "pullRequestReview": {
+                            "id": "PRR_huge_parent",
+                            "fullDatabaseId": "9" * 5_000,
+                        },
+                    }
+                )
+                huge_parent_added = True
+            replace_raw_json_body(page, canonical_raw_body(body))
+        self.assertTrue(huge_parent_added)
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_huge_parent_transcript,
+                request_scope_receipts=future_huge_parent_inventory[
                     "request_scope_receipts"
                 ],
                 provider_declaration=declaration,

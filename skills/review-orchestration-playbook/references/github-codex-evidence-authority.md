@@ -1286,8 +1286,9 @@ request may not make its PR disappear from the union. Canonical ordinary-issue
 non-seeds; mismatched or ambiguous PR-like routing fails closed. Each seeded raw
 record must occur one-to-one, type-preserving raw-equal in that PR's detail
 issue comments. Controlled-comment IDs remain unique across PR and ordinary
-issue routes. Route and comment IDs must fit the 128-bit native-ID envelope;
-reject an overlong decimal route before integer conversion.
+issue routes. Canonical decimal page and native-ID tokens are limited to 39
+digits and 128 bits before integer conversion; overlong values fail closed
+without raising.
 This source is necessary because a reaction does not imply that GitHub advances
 the PR's `updated_at`; a recent historical request can seed an otherwise
 old-updated PR. It proves neither request/run lineage nor request-time scope. A

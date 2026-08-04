@@ -1438,6 +1438,18 @@ lock the distinction. Route and comment IDs stay inside the 128-bit native-ID
 envelope; a 5,000-digit route fixture proves rejection occurs before Python
 integer conversion can raise instead of returning a fail-closed result.
 
+The fifth formal named-single review of commit
+`16af13eafceb0f6a84981bc887c0a6a556dd13d8` generalized that same exception
+boundary: an updated-desc `rel="last"` page number and GraphQL
+`fullDatabaseId` could still pass a decimal regex and then send a 5,000-digit
+value directly to Python `int()`. Canonical decimal page and native-ID tokens
+are limited to 39 digits and 128 bits before integer conversion; overlong
+values fail closed without raising. The shared canonical-decimal helper now
+establishes that property for every GraphQL child/parent ID consumer, while the
+pagination parser uses the same helper before interpreting `last`. Dedicated
+5,000-digit `last` and future-review parent-ID fixtures prove both paths return
+`None` rather than escaping the reference evaluator.
+
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
 trustworthy provider results remain authoritative without request/run

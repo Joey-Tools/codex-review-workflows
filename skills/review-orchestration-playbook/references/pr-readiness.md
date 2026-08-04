@@ -190,7 +190,9 @@ of actor or App, because discovery must seed a canonically routed PR before
 complete actor, raw-equal detail, and sidecar validation accepts the request or
 selects `unknown`. Canonical ordinary-issue `@codex review` comments are
 validated, retained, and budget-charged as raw-only non-seeds; mismatched or
-ambiguous PR-like routing fails closed. Reactions may not update PR metadata. The frozen as-of bounds
+ambiguous PR-like routing fails closed. Canonical decimal page and native-ID
+tokens are limited to 39 digits and 128 bits before integer conversion;
+overlong values fail closed without raising. Reactions may not update PR metadata. The frozen as-of bounds
 semantic historical outcomes, not when the live pull endpoint was observed.
 Updated-desc rows later than as-of therefore form a contiguous validated future
 prefix; they stay raw and budget-charged and seed the complete

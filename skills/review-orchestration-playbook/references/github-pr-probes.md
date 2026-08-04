@@ -278,6 +278,8 @@ inventory is not raw discovery authority. Newer pull rows, canonically
 PR-routed strict controlled-request parents from the comment feed, and exact
 current/declaration anchors form the raw detail union. Canonical ordinary-issue
 `@codex review` comments remain validated and budget-charged raw-only non-seeds.
+Canonical decimal page and native-ID tokens are limited to 39 digits and 128
+bits before integer conversion; overlong values fail closed without raising.
 The frozen as-of bounds semantic history rather than
 raw observation time. Validate rows with `updated_at > as_of_server_time` as a
 contiguous descending future prefix, retain and charge them, and start exactly
