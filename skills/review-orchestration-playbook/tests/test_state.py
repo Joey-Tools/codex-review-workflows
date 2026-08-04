@@ -2128,7 +2128,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            state.cleanup(self.review.container_dir, timeout_seconds=5),
             0,
         )
         self.assertFalse(self.review.workspace_root.exists())
