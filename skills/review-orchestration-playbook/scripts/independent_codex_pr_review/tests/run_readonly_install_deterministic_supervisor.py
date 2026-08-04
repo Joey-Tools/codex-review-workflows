@@ -59,6 +59,7 @@ from .support import (
 )
 
 EXPLICIT_RUNTIME_PARENT_ENV = "CODEX_REVIEW_TEST_RUNTIME_PARENT"
+_ISOLATED_ACCOUNT_CENSUS_ENV = "CODEX_REVIEW_TEST_ISOLATED_ACCOUNT_CENSUS"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
@@ -845,12 +846,19 @@ def _run_bounded_child(
     diagnostics = secondary_failures if secondary_failures is not None else []
     proof = closure_proof if closure_proof is not None else ChildProcessClosureProof()
     proof.destructive_cleanup_authorized = False
+    child_environment = dict(environment)
+    # The marker is derived only after this parent proves the dedicated
+    # account boundary. A caller-provided value cannot suppress fixture-local
+    # churn isolation or claim that account-wide census is authoritative.
+    child_environment.pop(_ISOLATED_ACCOUNT_CENSUS_ENV, None)
     with _bound_child_signals(diagnostics):
         baseline = (
             _require_isolated_child_account()
             if require_isolated_account
             else _stable_same_uid_processes()
         )
+        if require_isolated_account:
+            child_environment[_ISOLATED_ACCOUNT_CENSUS_ENV] = "1"
         result: tuple[int, bytes, bytes] | None = None
         pending_error: BaseException | None = None
         proof.started = True
@@ -858,7 +866,7 @@ def _run_bounded_child(
             result = run_bounded(
                 argv,
                 cwd=cwd,
-                environment=environment,
+                environment=child_environment,
                 timeout=timeout,
                 stdout_limit=stdout_limit,
                 stderr_limit=stderr_limit,

@@ -7196,6 +7196,72 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     self.assertFalse(closure_proof.destructive_cleanup_authorized)
                     run_bounded.assert_not_called()
 
+            process_baseline = (
+                runner.DarwinProcessIdentity(
+                    pid=os.getpid(),
+                    start_seconds=1_700_000_000,
+                    start_microseconds=123_456,
+                ),
+            )
+            forged_environment = {
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                runner._ISOLATED_ACCOUNT_CENSUS_ENV: "forged",
+            }
+            for require_isolated_account in (False, True):
+                with (
+                    self.subTest(
+                        parent_derived_marker=require_isolated_account,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_bound_child_signals",
+                        return_value=contextlib.nullcontext(),
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_stable_same_uid_processes",
+                        return_value=process_baseline,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_require_isolated_child_account",
+                        return_value=process_baseline,
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "_require_no_new_same_uid_processes",
+                    ),
+                    mock.patch.object(
+                        runner,
+                        "run_bounded",
+                        return_value=(0, b"", b""),
+                    ) as run_bounded,
+                ):
+                    completed = runner._run_bounded_child(
+                        (sys.executable, "-B", "-c", "raise SystemExit(0)"),
+                        cwd=root,
+                        environment=forged_environment,
+                        timeout=5,
+                        stdout_limit=1024,
+                        stderr_limit=1024,
+                        require_isolated_account=require_isolated_account,
+                    )
+
+                self.assertEqual(completed.returncode, 0)
+                child_environment = run_bounded.call_args.kwargs["environment"]
+                self.assertIsNot(child_environment, forged_environment)
+                self.assertEqual(
+                    child_environment.get(runner._ISOLATED_ACCOUNT_CENSUS_ENV),
+                    "1" if require_isolated_account else None,
+                )
+                self.assertEqual(
+                    forged_environment[runner._ISOLATED_ACCOUNT_CENSUS_ENV],
+                    "forged",
+                )
+
         foreign_process = runner.DarwinProcessIdentity(
             pid=os.getpid() + 10_000,
             start_seconds=1_700_000_000,
@@ -7335,11 +7401,11 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         inner_script = (
             "import os,pathlib,subprocess,sys,time\n"
             "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()), encoding='ascii')\n"
-            "pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii')\n"
             "subprocess.Popen((sys.executable,'-B','-c',"
             "'import time; time.sleep(300)'),"
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
             "stderr=subprocess.DEVNULL)\n"
+            "pathlib.Path(sys.argv[2]).write_text('ready', encoding='ascii')\n"
             "time.sleep(300)\n"
         )
         # This fixture targets real process-group settlement before deferred
@@ -7348,8 +7414,9 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         worker_script = (
             "import os,pathlib,sys\n"
             "from tests import run_readonly_install_deterministic_supervisor as runner\n"
-            "runner._stable_same_uid_processes=lambda: ()\n"
-            "runner._require_no_new_same_uid_processes=lambda _baseline: None\n"
+            "if os.environ.get(runner._ISOLATED_ACCOUNT_CENSUS_ENV)!='1':\n"
+            " runner._stable_same_uid_processes=lambda: ()\n"
+            " runner._require_no_new_same_uid_processes=lambda _baseline: None\n"
             "root=pathlib.Path(sys.argv[1])\n"
             "try:\n"
             " runner._run_bounded_child("
