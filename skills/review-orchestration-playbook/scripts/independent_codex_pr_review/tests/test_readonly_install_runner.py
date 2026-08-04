@@ -151,6 +151,25 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
         )
 
     @staticmethod
+    @contextlib.contextmanager
+    def _group_fixture_census_scope():
+        if os.environ.get(runner._ISOLATED_ACCOUNT_CENSUS_ENV) == "1":
+            yield
+            return
+        with (
+            mock.patch.object(
+                runner,
+                "_stable_same_uid_processes",
+                return_value=(),
+            ),
+            mock.patch.object(
+                runner,
+                "_require_no_new_same_uid_processes",
+            ),
+        ):
+            yield
+
+    @staticmethod
     def _synthetic_darwin_process_library(
         pid: int,
         inspect_pid: object,
@@ -6597,7 +6616,13 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
             "stderr=subprocess.DEVNULL)\n"
         )
-        with owned_temporary_directory("readonly-child-descendant-") as root:
+        # This fixture targets real process-group settlement after leader exit.
+        # Account-wide same-UID closure has dedicated Darwin coverage and can
+        # observe unrelated process churn on a shared hosted-runner account.
+        with (
+            owned_temporary_directory("readonly-child-descendant-") as root,
+            self._group_fixture_census_scope(),
+        ):
             group_file = root / "process-group"
             result = runner._run_bounded_child(
                 (
@@ -6624,6 +6649,37 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, "")
             self._require_process_group_absent(process_group)
+
+    def test_group_fixture_census_scope_requires_isolated_account_marker(
+        self,
+    ) -> None:
+        stable_census = runner._stable_same_uid_processes
+        closure_census = runner._require_no_new_same_uid_processes
+        for marker, expected_patched in (("forged", True), ("1", False)):
+            with (
+                self.subTest(marker=marker),
+                mock.patch.dict(
+                    os.environ,
+                    {runner._ISOLATED_ACCOUNT_CENSUS_ENV: marker},
+                ),
+                self._group_fixture_census_scope(),
+            ):
+                self.assertEqual(
+                    isinstance(runner._stable_same_uid_processes, mock.Mock),
+                    expected_patched,
+                )
+                self.assertEqual(
+                    isinstance(
+                        runner._require_no_new_same_uid_processes,
+                        mock.Mock,
+                    ),
+                    expected_patched,
+                )
+            self.assertIs(runner._stable_same_uid_processes, stable_census)
+            self.assertIs(
+                runner._require_no_new_same_uid_processes,
+                closure_census,
+            )
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin process census")
     def test_bounded_child_rejects_setsid_double_fork_escape(self) -> None:
@@ -6995,7 +7051,12 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             "os.write(1,b'x'*8192)\n"
             "time.sleep(300)\n"
         )
-        with owned_temporary_directory("readonly-child-overflow-") as root:
+        # Output overflow exercises the same real process-group settlement;
+        # account-wide census is orthogonal and noisy on shared runners.
+        with (
+            owned_temporary_directory("readonly-child-overflow-") as root,
+            self._group_fixture_census_scope(),
+        ):
             group_file = root / "process-group"
             with self.assertRaisesRegex(OverflowError, "byte cap"):
                 runner._run_bounded_child(

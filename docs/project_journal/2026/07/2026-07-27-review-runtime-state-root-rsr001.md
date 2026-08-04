@@ -322,3 +322,10 @@ superseded_by:
   publication fails, the unreaped direct-child relationship prevents PID reuse
   while the parent sends SIGKILL and then reaps that child; an independent
   custody receipt and exact-identity absence proof exercise that failure path.
+- The later hosted-runner fixture-scope correction passed 803/803 deterministic
+  tests in 207.831 seconds on CPython 3.13.0. The reviewed 803-test selected identity
+  has SHA-256
+  `4e1c3a2b8a4c08aaf734e060a77936f79d5e4305270351e7b3937b122ac5076d`.
+  Group-only settlement fixtures suppress unrelated account-wide process churn
+  only when the parent-derived isolated-account census marker is absent; the
+  production isolated-account lane still exercises exact same-UID closure.

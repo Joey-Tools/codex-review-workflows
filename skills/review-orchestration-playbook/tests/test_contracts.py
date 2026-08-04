@@ -131,13 +131,17 @@ def _github_rest_page_number(value: object, *, expected_url: str) -> int | None:
                 or re.search(r"%(?![0-9A-Fa-f]{2})", parts.query) is not None
             ):
                 return None
-            pairs = urllib.parse.parse_qsl(
-                parts.query,
-                keep_blank_values=True,
-                strict_parsing=True,
-                encoding="utf-8",
-                errors="strict",
-                max_num_fields=32,
+            pairs = (
+                []
+                if not parts.query
+                else urllib.parse.parse_qsl(
+                    parts.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                    encoding="utf-8",
+                    errors="strict",
+                    max_num_fields=32,
+                )
             )
         except (UnicodeError, ValueError):
             return None
@@ -2535,7 +2539,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 802", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 803", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -7101,6 +7105,19 @@ printf '%s\n' "$trusted_uv"
                 _github_rest_page_number(
                     page_url,
                     expected_url=semantic_rest_url,
+                ),
+                expected_page,
+            )
+        bare_rest_url = "https://api.github.com/repos/OWNER/REPO/pulls/2"
+        for page_url, expected_page in (
+            (bare_rest_url, 1),
+            (f"{bare_rest_url}?page=1", 1),
+            (f"{bare_rest_url}?page=2", 2),
+        ):
+            self.assertEqual(
+                _github_rest_page_number(
+                    page_url,
+                    expected_url=bare_rest_url,
                 ),
                 expected_page,
             )
