@@ -932,10 +932,11 @@ restore request/run binding or erase this rationale.
 - Keep REST/report IDs as exact positive JSON integers. Keep GraphQL BigInt
   canonical decimal text only at the join boundary.
 - Under schema version 4, accept a nested thread-comments connection only when
-  its first response is complete (`hasNextPage == false` and `endCursor ==
-  null`). A later page requires a separately bound child-cursor schema; until
-  then the profile is `unknown`, and normalized or fabricated child traversal
-  is forbidden.
+  its first response is complete (`hasNextPage == false`); terminal
+  `endCursor` may be null or a non-empty string and never triggers a later
+  fetch. Only `hasNextPage == true` requires a separately bound child-cursor
+  schema; until then the profile is `unknown`, and normalized or fabricated
+  child traversal is forbidden.
 - Classify issue-comment provider identity jointly: only the exact Bot actor
   plus exact `performed_via_github_app.slug == "chatgpt-codex-connector"` is
   exact. If either half claims the provider while the other is absent or
@@ -1259,9 +1260,11 @@ the first schema-v4 implementation did not yet enforce:
   result.
 - REST transport shape is part of evidence authority. Pull detail and compare
   are single-page, null-`Link`, direct-object responses. Collection pages have
-  array roots and canonical consecutive pagination URLs that preserve the fixed
-  path and query. An empty first page cannot redirect scope authority to an
-  arbitrary second URL.
+  array roots; Link relations preserve the fixed HTTPS host, path, and decoded
+  non-page query map, use one literal canonical `page=N` token, treat omitted
+  page and `page=1` as the same first page, and follow the exact raw `rel=next`
+  URL through consecutive page numbers. An empty first page cannot redirect
+  scope authority to an arbitrary second URL.
 - Updated-desc pull discovery accepts only exact integer status `200`. Its
   canonical `last` relation remains consistent across retained pages, equals the
   current page at a natural no-`next` end, and never precedes the next page.
@@ -1449,6 +1452,30 @@ establishes that property for every GraphQL child/parent ID consumer, while the
 pagination parser uses the same helper before interpreting `last`. Dedicated
 5,000-digit `last` and future-review parent-ID fixtures prove both paths return
 `None` rather than escaping the reference evaluator.
+
+The sixth formal named-single review of commit
+`ad391afe6a6b2ac1d3fcebaca0edb049e589b439` found two transport-compatibility
+errors after its exact full suite had passed 2,827 tests with six skips.
+GitHub's GraphQL contract uses typed `hasNextPage == false` as the terminal
+signal while `endCursor` may still identify the last returned edge, and
+GitHub's documented REST `Link` examples use an explicit `page=1` for `first`
+and `prev`. A terminal GraphQL page requires typed
+`hasNextPage == false`; `endCursor` may be null or a non-empty string, and a
+retained terminal cursor never triggers another fetch. The raw response and
+digest retain that opaque cursor, while the semantic projection canonicalizes
+a terminal cursor away so an otherwise identical initial/final reread remains
+stable. A nested v4 connection still fails closed when
+`hasNextPage == true` because this schema has no child-cursor fetch shape.
+
+REST Link page relations are validated semantically against the fixed HTTPS
+host, path, and non-page query map; omitted page and a literal canonical
+`page=1` are equivalent, while each raw `rel=next` URL is followed exactly.
+Only the page key/value must remain literal canonical text before the existing
+39-digit/128-bit conversion bound; non-page query order and valid percent
+encoding may vary without changing endpoint semantics. Duplicate, missing,
+extra, cross-host, cross-path, noncanonical-page, contradictory relation, and
+broken raw-next-chain evidence still fails closed. This division follows the
+provider's opaque traversal tokens without weakening scope binding.
 
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:

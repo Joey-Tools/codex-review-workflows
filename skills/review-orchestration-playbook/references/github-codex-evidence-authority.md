@@ -962,9 +962,11 @@ thread's stable `id`, typed `isResolved`, typed `isOutdated`, outer
 `pageInfo`, every nested thread-comment page and its `pageInfo`, and each
 comment's GraphQL `id`, `fullDatabaseId`, `url`, and
 `pullRequestReview { id fullDatabaseId }`. Both connections start at a null
-cursor, follow each opaque returned `endCursor` exactly, and terminate only at
-typed `hasNextPage == false`. The raw audit retains all fetched comments and
-threads; target selection happens only after complete pagination.
+cursor, follow an opaque non-empty `endCursor` exactly only when typed
+`hasNextPage == true`, and terminate at typed `hasNextPage == false` even when
+that terminal page retains a non-empty cursor. The raw audit retains all
+fetched comments and threads; target selection happens only after complete
+pagination.
 
 Normalize each non-null GraphQL `BigInt` to canonical positive decimal text.
 Normalize a REST JSON numeric ID only when it is a positive integer; booleans,
@@ -1231,8 +1233,10 @@ node and nested comment node is one record. Every accepted REST status is an
 exact integer `200`, never a boolean or float alias. Pull-detail and compare are
 direct-object endpoints: each has exactly one retained page, a null `Link`
 header, and a JSON object root. Every REST collection page has an array root;
-its unique canonical pagination relations preserve the fixed endpoint/query and
-advance only through the consecutive `page=N` parameter. For updated-desc pull
+its unique Link relations preserve the fixed HTTPS host, path, and decoded
+non-page query map, use one literal canonical `page=N` token, treat an omitted
+page and `page=1` as the same first page, and advance by following the exact raw
+`rel=next` URL through consecutive page numbers. For updated-desc pull
 discovery, `last` is stable across retained pages and cannot claim a page after
 a no-`next` natural end or before the current `next`. A later page or an array
 wrapper can never supply a direct-object scope response. Check the monotonic deadline at
@@ -1413,8 +1417,9 @@ A schema-version-4 `review_threads` response stores the real GraphQL
 `comments { nodes pageInfo }` connection inside each raw thread node; it never
 stores the report's normalized `comments.pagination_complete/pages` shape in
 the response body. Version 4 accepts that nested connection only when its
-first response is already complete (`hasNextPage == false` and
-`endCursor == null`). A nested `hasNextPage == true` requires a separately
+first response is already complete (`hasNextPage == false`). A terminal
+`endCursor` may be null or a non-empty string and never requests another page.
+A nested `hasNextPage == true` requires a separately
 bound child-cursor fetch shape that this schema does not define, so the profile
 is `unknown`; an implementation must introduce a new transcript schema version
 rather than folding multiple normalized pages into a fabricated raw response.
@@ -1439,11 +1444,16 @@ them to equal the transcript repository and positive pull number before it
 reads raw `pageInfo.hasNextPage` and `pageInfo.endCursor`. This response-side
 scope binding is mandatory even for an empty `reviewThreads.nodes` result, so
 a complete response from another owner, repository, or PR cannot substitute
-for the selected scope. REST traversal follows raw
-`Link rel=next` until none remains.
+for the selected scope. REST Link page relations are validated semantically
+against the fixed HTTPS host, path, and non-page query map; omitted page and a
+literal canonical `page=1` are equivalent, while each raw `rel=next` URL is
+followed exactly.
 GraphQL traversal starts at null, requires each next `request_after` to equal
 the prior raw `endCursor`, and terminates only at typed
-`hasNextPage == false`. A top-level GraphQL `errors` member, when present,
+`hasNextPage == false`. A terminal GraphQL page requires typed
+`hasNextPage == false`; `endCursor` may be null or a non-empty string, and a
+retained terminal cursor never triggers another fetch. A top-level GraphQL
+`errors` member, when present,
 must be an array. An empty array is admissible; `null`, a non-array value, or a
 nonempty array fails closed. A nonempty array is partial evidence even when the
 same response also contains apparently usable `data`; this rule applies

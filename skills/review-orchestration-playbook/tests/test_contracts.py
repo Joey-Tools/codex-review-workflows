@@ -112,6 +112,81 @@ def _canonical_positive_decimal(value: object) -> str | None:
     return None
 
 
+def _github_rest_page_number(value: object, *, expected_url: str) -> int | None:
+    if not isinstance(value, str) or not isinstance(expected_url, str):
+        return None
+
+    def parse_url(
+        candidate: str,
+    ) -> tuple[urllib.parse.SplitResult, dict[str, str]] | None:
+        if re.search(r"[\x00-\x20\x7f]", candidate) is not None or "#" in candidate:
+            return None
+        try:
+            parts = urllib.parse.urlsplit(candidate)
+            if (
+                parts.scheme != "https"
+                or not parts.netloc
+                or not parts.path
+                or parts.fragment
+                or re.search(r"%(?![0-9A-Fa-f]{2})", parts.query) is not None
+            ):
+                return None
+            pairs = urllib.parse.parse_qsl(
+                parts.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                encoding="utf-8",
+                errors="strict",
+                max_num_fields=32,
+            )
+        except (UnicodeError, ValueError):
+            return None
+        if any(not key for key, _ in pairs):
+            return None
+        parameters = dict(pairs)
+        if len(parameters) != len(pairs):
+            return None
+        if "page" in parameters:
+            raw_page_fields = [
+                field
+                for field in parts.query.split("&")
+                if field.split("=", 1)[0] == "page"
+            ]
+            if len(raw_page_fields) != 1 or "=" not in raw_page_fields[0]:
+                return None
+            raw_page_token = raw_page_fields[0].split("=", 1)[1]
+            if (
+                raw_page_token != parameters["page"]
+                or _canonical_positive_decimal(raw_page_token) is None
+            ):
+                return None
+        return parts, parameters
+
+    expected = parse_url(expected_url)
+    candidate = parse_url(value)
+    if expected is None or candidate is None:
+        return None
+    expected_parts, expected_parameters = expected
+    candidate_parts, candidate_parameters = candidate
+    if "page" in expected_parameters or (
+        candidate_parts.scheme,
+        candidate_parts.netloc,
+        candidate_parts.path,
+    ) != (
+        expected_parts.scheme,
+        expected_parts.netloc,
+        expected_parts.path,
+    ):
+        return None
+    page_token = candidate_parameters.pop("page", None)
+    if candidate_parameters != expected_parameters:
+        return None
+    if page_token is None:
+        return 1
+    canonical_page = _canonical_positive_decimal(page_token)
+    return int(canonical_page) if canonical_page is not None else None
+
+
 _GITHUB_CODEX_DISCLOSURE = "\n".join(
     (
         "<details> <summary>ℹ️ About Codex in GitHub</summary>",
@@ -640,7 +715,10 @@ def _review_thread_findings_from_raw(
                     return None
                 expected_after = end_cursor
             else:
-                if index != len(pages) - 1 or end_cursor is not None:
+                if index != len(pages) - 1 or (
+                    end_cursor is not None
+                    and (not isinstance(end_cursor, str) or not end_cursor)
+                ):
                     return None
                 expected_after = None
             for node in page["nodes"]:
@@ -4355,6 +4433,23 @@ printf '%s\n' "$trusted_uv"
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(bounded_decimal_document=document_name):
                 self.assertIn(bounded_decimal_contract, normalized_document)
+        rest_link_semantics_contract = (
+            "rest link page relations are validated semantically against the "
+            "fixed https host, path, and non-page query map; omitted page and a "
+            "literal canonical page=1 are equivalent, while each raw rel=next "
+            "url is followed exactly"
+        )
+        graphql_terminal_cursor_contract = (
+            "a terminal graphql page requires typed hasnextpage == false; "
+            "endcursor may be null or a non-empty string, and a retained terminal "
+            "cursor never triggers another fetch"
+        )
+        for document_name, document in complete_stop_reason_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(rest_link_semantics_document=document_name):
+                self.assertIn(rest_link_semantics_contract, normalized_document)
+            with self.subTest(graphql_terminal_cursor_document=document_name):
+                self.assertIn(graphql_terminal_cursor_contract, normalized_document)
         normalized_stop_reason_probes = " ".join(
             anti_drift_documents["github-pr-probes"].lower().replace("`", "").split()
         )
@@ -4579,13 +4674,14 @@ printf '%s\n' "$trusted_uv"
             "version-3 transcript cannot prove reaction fallback",
             "under schema version 4",
             "hasnextpage == false",
-            "endcursor == null",
+            "terminal endcursor may be null or a non-empty string",
             "separately bound child-cursor schema",
         ):
             self.assertIn(anchor, implementation_intent)
         for stale in (
             "schema-version-3 repository-wide raw discovery",
             "under schema version 3, fail closed",
+            "endcursor == null",
         ):
             self.assertNotIn(stale, implementation_intent)
 
@@ -4774,9 +4870,11 @@ printf '%s\n' "$trusted_uv"
             "boolean or float alias",
             "pull-detail and compare are direct-object endpoints: each has "
             "exactly one retained page, a null link header, and a json object root",
-            "every rest collection page has an array root; its unique canonical "
-            "pagination relations preserve the fixed endpoint/query and advance "
-            "only through the consecutive page=n parameter",
+            "every rest collection page has an array root; its unique link "
+            "relations preserve the fixed https host, path, and decoded non-page "
+            "query map, use one literal canonical page=n token, treat an omitted "
+            "page and page=1 as the same first page, and advance by following the "
+            "exact raw rel=next url through consecutive page numbers",
             "for updated-desc pull discovery, last is stable across retained "
             "pages and cannot claim a page after a no-next natural end or before "
             "the current next",
@@ -6647,6 +6745,30 @@ printf '%s\n' "$trusted_uv"
                     )
                 )
 
+        terminal_cursor_threads = _review_thread_pages(
+            [child],
+            parent_review_id=review_id,
+        )
+        terminal_cursor_threads["pages"][0]["pageInfo"]["endCursor"] = (
+            "THREAD_TERMINAL_CURSOR"
+        )
+        terminal_cursor_threads["pages"][0]["nodes"][0]["comments"]["pages"][0][
+            "pageInfo"
+        ]["endCursor"] = "COMMENT_TERMINAL_CURSOR"
+        terminal_cursor_join = _review_thread_findings_from_raw(
+            [child],
+            terminal_cursor_threads,
+            repository="OWNER/REPO",
+            pull_request=1,
+            parent_review_id=review_id,
+        )
+        self.assertIsNotNone(terminal_cursor_join)
+        assert terminal_cursor_join is not None
+        self.assertEqual(
+            [finding["child_id"] for finding in terminal_cursor_join],
+            [child["id"]],
+        )
+
         for audit_child in (
             human_audit_child,
             unrelated_bot_audit_child,
@@ -6953,6 +7075,58 @@ printf '%s\n' "$trusted_uv"
             "9" * 5_000,
         ):
             self.assertIsNone(_canonical_positive_decimal(representation))
+        semantic_rest_url = (
+            "https://api.github.com/repos/OWNER/REPO/issues/comments"
+            "?sort=updated&direction=desc&per_page=100"
+        )
+        for page_url, expected_page in (
+            (semantic_rest_url, 1),
+            (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments"
+                "?page=1&per_page=100&direction=desc&sort=updated",
+                1,
+            ),
+            (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments"
+                "?page=1&per_page=100&direction=desc&%73ort=%75pdated",
+                1,
+            ),
+            (
+                "https://api.github.com/repos/OWNER/REPO/issues/comments"
+                "?per_page=100&page=2&sort=updated&direction=desc",
+                2,
+            ),
+        ):
+            self.assertEqual(
+                _github_rest_page_number(
+                    page_url,
+                    expected_url=semantic_rest_url,
+                ),
+                expected_page,
+            )
+        for page_url in (
+            f"{semantic_rest_url}&page=1&page=2",
+            f"{semantic_rest_url}&page=0",
+            f"{semantic_rest_url}&page=01",
+            f"{semantic_rest_url}&page=%31",
+            f"{semantic_rest_url}&%70age=1",
+            f"{semantic_rest_url}&page={'9' * 5_000}",
+            f"{semantic_rest_url}&unexpected=1",
+            f"{semantic_rest_url}&sort=updated",
+            semantic_rest_url.replace("&direction=desc", ""),
+            f"{semantic_rest_url}&%73ort=updated",
+            semantic_rest_url.replace("api.github.com", "example.test"),
+            semantic_rest_url.replace("/issues/comments", "/pulls/comments"),
+            f" {semantic_rest_url}",
+            semantic_rest_url.replace("/issues/", "/issues\n/"),
+            f"{semantic_rest_url}#",
+        ):
+            self.assertIsNone(
+                _github_rest_page_number(
+                    page_url,
+                    expected_url=semantic_rest_url,
+                )
+            )
         future_prefix_policy_documents = {
             "readme": REPO_ROOT / "README.md",
             "authority": SKILL_ROOT / "references/github-codex-evidence-authority.md",
@@ -11475,7 +11649,16 @@ printf '%s\n' "$trusted_uv"
                 or not isinstance(pages[0].get("pageInfo"), dict)
                 or set(pages[0]["pageInfo"]) != {"hasNextPage", "endCursor"}
                 or pages[0]["pageInfo"].get("hasNextPage") is not False
-                or pages[0]["pageInfo"].get("endCursor") is not None
+                or (
+                    pages[0]["pageInfo"].get("endCursor") is not None
+                    and (
+                        not isinstance(
+                            pages[0]["pageInfo"].get("endCursor"),
+                            str,
+                        )
+                        or not pages[0]["pageInfo"].get("endCursor")
+                    )
+                )
             ):
                 return {"invalid_internal_thread": clone(node)}
             return {
@@ -12641,6 +12824,11 @@ printf '%s\n' "$trusted_uv"
                     }
                     or page.get("request_url") != page_url
                     or page_url in seen_page_urls
+                    or _github_rest_page_number(
+                        page_url,
+                        expected_url=expected_url,
+                    )
+                    != index + 1
                     or type(page.get("status")) is not int
                     or page.get("status") != 200
                     or page.get("request_after") is not None
@@ -12667,6 +12855,15 @@ printf '%s\n' "$trusted_uv"
                 links = link_relations(page.get("link_header"))
                 if links is None:
                     return None
+                link_page_numbers: dict[str, int] = {}
+                for relation, link_url in links.items():
+                    page_number = _github_rest_page_number(
+                        link_url,
+                        expected_url=expected_url,
+                    )
+                    if page_number is None:
+                        return None
+                    link_page_numbers[relation] = page_number
                 try:
                     body = strict_json_loads(page["body_utf8"])
                 except (TypeError, ValueError):
@@ -12676,30 +12873,20 @@ printf '%s\n' "$trusted_uv"
                         not isinstance(body, list)
                         or (
                             index < len(pages) - 1
-                            and links.get("next") != f"{expected_url}&page={index + 2}"
+                            and link_page_numbers.get("next") != index + 2
                         )
                         or (index == len(pages) - 1 and "next" in links)
-                        or ("first" in links and links["first"] != expected_url)
                         or (
-                            "prev" in links
-                            and (
-                                index == 0
-                                or links["prev"]
-                                != (
-                                    expected_url
-                                    if index == 1
-                                    else f"{expected_url}&page={index}"
-                                )
-                            )
+                            "first" in link_page_numbers
+                            and link_page_numbers["first"] != 1
                         )
                         or (
-                            "last" in links
-                            and links["last"]
-                            != (
-                                expected_url
-                                if len(pages) == 1
-                                else f"{expected_url}&page={len(pages)}"
-                            )
+                            "prev" in link_page_numbers
+                            and (index == 0 or link_page_numbers["prev"] != index)
+                        )
+                        or (
+                            "last" in link_page_numbers
+                            and link_page_numbers["last"] != len(pages)
                         )
                     ):
                         return None
@@ -12710,7 +12897,7 @@ printf '%s\n' "$trusted_uv"
                         return None
                     records.extend(body)
                     if index < len(pages) - 1:
-                        page_url = f"{expected_url}&page={index + 2}"
+                        page_url = links["next"]
                 elif isinstance(body, dict):
                     if (
                         retained_record_limit is not None
@@ -12756,6 +12943,48 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNone(
             parse_rest_pages(
                 direct_surrogate_rest,
+                expected_kind="strict_fixture",
+                expected_url=strict_rest_url,
+            )
+        )
+
+        semantic_first_url = (
+            "https://api.github.com/repos/OWNER/REPO/strict?page=1&per_page=100"
+        )
+        semantic_second_url = (
+            "https://api.github.com/repos/OWNER/REPO/strict?page=2&per_page=100"
+        )
+        semantic_link_fetch = rest_fetch(
+            "strict_fixture",
+            strict_rest_url,
+            [{"id": 1}, {"id": 2}],
+        )
+        semantic_link_fetch["pages"][0]["link_header"] = (
+            f'<{semantic_second_url}>; rel="next", '
+            f'<{semantic_second_url}>; rel="last", '
+            f'<{semantic_first_url}>; rel="first"'
+        )
+        semantic_link_fetch["pages"][1]["request_url"] = semantic_second_url
+        semantic_link_fetch["pages"][1]["link_header"] = (
+            f'<{semantic_first_url}>; rel="prev", '
+            f'<{semantic_second_url}>; rel="last", '
+            f'<{semantic_first_url}>; rel="first"'
+        )
+        self.assertEqual(
+            parse_rest_pages(
+                semantic_link_fetch,
+                expected_kind="strict_fixture",
+                expected_url=strict_rest_url,
+            ),
+            [{"id": 1}, {"id": 2}],
+        )
+        semantic_only_next_match = clone(semantic_link_fetch)
+        semantic_only_next_match["pages"][1]["request_url"] = (
+            f"{strict_rest_url}&page=2"
+        )
+        self.assertIsNone(
+            parse_rest_pages(
+                semantic_only_next_match,
                 expected_kind="strict_fixture",
                 expected_url=strict_rest_url,
             )
@@ -12864,7 +13093,10 @@ printf '%s\n' "$trusted_uv"
                     ):
                         return None
                     expected_after = end_cursor
-                elif index != len(pages) - 1 or end_cursor is not None:
+                elif index != len(pages) - 1 or (
+                    end_cursor is not None
+                    and (not isinstance(end_cursor, str) or not end_cursor)
+                ):
                     return None
                 else:
                     expected_after = None
@@ -12888,7 +13120,16 @@ printf '%s\n' "$trusted_uv"
                         or not {"hasNextPage", "endCursor"}
                         <= set(raw_comments["pageInfo"])
                         or raw_comments["pageInfo"].get("hasNextPage") is not False
-                        or raw_comments["pageInfo"].get("endCursor") is not None
+                        or (
+                            raw_comments["pageInfo"].get("endCursor") is not None
+                            and (
+                                not isinstance(
+                                    raw_comments["pageInfo"].get("endCursor"),
+                                    str,
+                                )
+                                or not raw_comments["pageInfo"].get("endCursor")
+                            )
+                        )
                     ):
                         return None
                     projected_comments: list[dict[str, object]] = []
@@ -12986,6 +13227,63 @@ printf '%s\n' "$trusted_uv"
         self.assertTrue(
             typed_json_equal(parsed_graphql_shape, [graphql_shape_internal])
         )
+        terminal_cursor_internal = clone(graphql_shape_internal)
+        terminal_cursor_internal["comments"]["pages"][0]["pageInfo"]["endCursor"] = (
+            "COMMENT_TERMINAL_CURSOR"
+        )
+        terminal_cursor_fetch = graphql_thread_fetch(
+            [terminal_cursor_internal],
+            repository=current_repository,
+            pull_number=current_pr,
+        )
+        terminal_cursor_page = terminal_cursor_fetch["pages"][0]
+        terminal_cursor_body = json.loads(terminal_cursor_page["body_utf8"])
+        terminal_cursor_body["data"]["repository"]["pullRequest"]["reviewThreads"][
+            "pageInfo"
+        ]["endCursor"] = "THREAD_TERMINAL_CURSOR"
+        replace_raw_json_body(
+            terminal_cursor_page,
+            canonical_raw_body(terminal_cursor_body),
+        )
+        parsed_terminal_cursor = parse_graphql_thread_pages(
+            terminal_cursor_fetch,
+            repository=current_repository,
+            pull_number=current_pr,
+        )
+        self.assertIsNotNone(parsed_terminal_cursor)
+        assert parsed_terminal_cursor is not None
+        self.assertTrue(
+            typed_json_equal(parsed_terminal_cursor, [graphql_shape_internal])
+        )
+        for cursor_scope in ("thread", "comment"):
+            for invalid_cursor in ("", 0, True, [], {}):
+                invalid_terminal_cursor = clone(terminal_cursor_fetch)
+                invalid_page = invalid_terminal_cursor["pages"][0]
+                invalid_body = json.loads(invalid_page["body_utf8"])
+                raw_connection = invalid_body["data"]["repository"]["pullRequest"][
+                    "reviewThreads"
+                ]
+                target_page_info = (
+                    raw_connection["pageInfo"]
+                    if cursor_scope == "thread"
+                    else raw_connection["nodes"][0]["comments"]["pageInfo"]
+                )
+                target_page_info["endCursor"] = invalid_cursor
+                replace_raw_json_body(
+                    invalid_page,
+                    canonical_raw_body(invalid_body),
+                )
+                with self.subTest(
+                    graphql_terminal_cursor=cursor_scope,
+                    invalid_value=repr(invalid_cursor),
+                ):
+                    self.assertIsNone(
+                        parse_graphql_thread_pages(
+                            invalid_terminal_cursor,
+                            repository=current_repository,
+                            pull_number=current_pr,
+                        )
+                    )
         empty_graphql_scope_fetch = graphql_thread_fetch(
             [],
             repository=current_repository,
@@ -13259,7 +13557,6 @@ printf '%s\n' "$trusted_uv"
             previous_updated_at: int | None = None
             boundary_seen = False
             expected_page_url = expected_url
-            observed_last_url: str | None = None
             observed_last_page_number: int | None = None
             for page_index, page in enumerate(pages):
                 if (
@@ -13276,6 +13573,11 @@ printf '%s\n' "$trusted_uv"
                         "body_sha256",
                     }
                     or page.get("request_url") != expected_page_url
+                    or _github_rest_page_number(
+                        expected_page_url,
+                        expected_url=expected_url,
+                    )
+                    != page_index + 1
                     or type(page.get("status")) is not int
                     or page.get("status") != 200
                     or page.get("request_after") is not None
@@ -13380,35 +13682,28 @@ printf '%s\n' "$trusted_uv"
                         ):
                             return None
                         links[match.group(2)] = match.group(1)
-                canonical_next_url = f"{expected_url}&page={page_index + 2}"
+                link_page_numbers: dict[str, int] = {}
+                for relation, link_url in links.items():
+                    page_number = _github_rest_page_number(
+                        link_url,
+                        expected_url=expected_url,
+                    )
+                    if page_number is None:
+                        return None
+                    link_page_numbers[relation] = page_number
                 next_url = links.get("next")
-                if next_url is not None and next_url != canonical_next_url:
+                if (
+                    next_url is not None
+                    and link_page_numbers.get("next") != page_index + 2
+                ):
                     return None
-                last_url = links.get("last")
-                last_page_number: int | None = None
-                if last_url is not None:
-                    if last_url == expected_url:
-                        last_page_number = 1
-                    else:
-                        last_match = re.fullmatch(
-                            re.escape(expected_url) + r"&page=([1-9][0-9]*)",
-                            last_url,
-                        )
-                        if last_match is not None:
-                            candidate_last_page_decimal = _canonical_positive_decimal(
-                                last_match.group(1)
-                            )
-                            if candidate_last_page_decimal is not None:
-                                candidate_last_page_number = int(
-                                    candidate_last_page_decimal
-                                )
-                                if candidate_last_page_number >= 2:
-                                    last_page_number = candidate_last_page_number
-                    if last_page_number is None or (
-                        observed_last_url is not None and observed_last_url != last_url
+                last_page_number = link_page_numbers.get("last")
+                if last_page_number is not None:
+                    if (
+                        observed_last_page_number is not None
+                        and observed_last_page_number != last_page_number
                     ):
                         return None
-                    observed_last_url = last_url
                     observed_last_page_number = last_page_number
                 if observed_last_page_number is not None and (
                     (next_url is None and observed_last_page_number != page_index + 1)
@@ -13418,21 +13713,17 @@ printf '%s\n' "$trusted_uv"
                     )
                 ):
                     return None
-                canonical_first_url = expected_url
-                canonical_previous_url = (
-                    expected_url
-                    if page_index == 1
-                    else f"{expected_url}&page={page_index}"
-                )
-                if ("first" in links and links["first"] != canonical_first_url) or (
-                    "prev" in links
-                    and (page_index == 0 or links["prev"] != canonical_previous_url)
+                if (
+                    "first" in link_page_numbers and link_page_numbers["first"] != 1
+                ) or (
+                    "prev" in link_page_numbers
+                    and (page_index == 0 or link_page_numbers["prev"] != page_index)
                 ):
                     return None
                 if page_index + 1 < len(pages):
-                    if page_boundary_seen or next_url != canonical_next_url:
+                    if page_boundary_seen or next_url is None:
                         return None
-                    expected_page_url = canonical_next_url
+                    expected_page_url = next_url
                 elif next_url is not None and not page_boundary_seen:
                     return None
             stop_reason = (
@@ -22610,6 +22901,66 @@ printf '%s\n' "$trusted_uv"
         )
         canonical_page_2 = f"{recent_pull_url}&page=2"
         canonical_page_3 = f"{recent_pull_url}&page=3"
+        semantic_recent_page_1 = (
+            f"https://api.github.com/repos/{current_repository}/pulls"
+            "?page=1&per_page=100&direction=desc&sort=updated&state=all"
+        )
+        semantic_recent_page_2 = (
+            f"https://api.github.com/repos/{current_repository}/pulls"
+            "?page=2&per_page=100&direction=desc&sort=updated&state=all"
+        )
+        semantic_recent_fetch = {
+            "kind": "recent_pull_requests",
+            "transport": "rest",
+            "parent_comment_id": None,
+            "pages": [
+                raw_page(
+                    request_url=recent_pull_url,
+                    body=[
+                        synthetic_pull_discovery_record(
+                            20_101,
+                            history_as_of_server_time - 1,
+                        )
+                    ],
+                    link_header=(
+                        f'<{semantic_recent_page_2}>; rel="next", '
+                        f'<{semantic_recent_page_2}>; rel="last", '
+                        f'<{semantic_recent_page_1}>; rel="first"'
+                    ),
+                ),
+                raw_page(
+                    request_url=semantic_recent_page_2,
+                    body=[
+                        synthetic_pull_discovery_record(
+                            20_102,
+                            history_start_exclusive,
+                        )
+                    ],
+                    link_header=(
+                        f'<{semantic_recent_page_1}>; rel="prev", '
+                        f'<{semantic_recent_page_2}>; rel="last", '
+                        f'<{semantic_recent_page_1}>; rel="first"'
+                    ),
+                ),
+            ],
+        }
+        semantic_recent_result = parse_recent_pull_discovery(
+            semantic_recent_fetch,
+            expected_url=recent_pull_url,
+            resource_tracker=new_resource_tracker(),
+        )
+        self.assertIsNotNone(semantic_recent_result)
+        assert semantic_recent_result is not None
+        self.assertEqual(set(semantic_recent_result[0]), {20_101})
+        semantic_only_recent_next_match = clone(semantic_recent_fetch)
+        semantic_only_recent_next_match["pages"][1]["request_url"] = canonical_page_2
+        self.assertIsNone(
+            parse_recent_pull_discovery(
+                semantic_only_recent_next_match,
+                expected_url=recent_pull_url,
+                resource_tracker=new_resource_tracker(),
+            )
+        )
         for (
             omitted_last_kind,
             first_page_last_url,
@@ -34175,6 +34526,70 @@ printf '%s\n' "$trusted_uv"
             compute_provider_profile(
                 declaration,
                 opaque_cursor_reread_history,
+                current,
+            ),
+            "thumbs-up-clean",
+        )
+
+        terminal_cursor_reread_history = clone(background_noise_history)
+        assert isinstance(terminal_cursor_reread_history, dict)
+        terminal_cursor_final_inventory = terminal_cursor_reread_history[
+            "final_inventory"
+        ]
+        terminal_cursor_final_transcript = terminal_cursor_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        terminal_cursor_final_fetches = terminal_cursor_final_transcript["scopes"][0][
+            "fetches"
+        ]
+        terminal_cursor_final_fetch = terminal_cursor_final_fetches[
+            fetch_index(terminal_cursor_final_fetches, "review_threads")
+        ]
+        terminal_cursor_final_page = terminal_cursor_final_fetch["pages"][0]
+        terminal_cursor_final_body = strict_json_loads(
+            terminal_cursor_final_page["body_utf8"]
+        )
+        terminal_cursor_final_connection = terminal_cursor_final_body["data"][
+            "repository"
+        ]["pullRequest"]["reviewThreads"]
+        self.assertTrue(terminal_cursor_final_connection["nodes"])
+        terminal_cursor_final_connection["pageInfo"]["endCursor"] = (
+            "THREAD_TERMINAL_REREAD_CURSOR"
+        )
+        terminal_cursor_final_connection["nodes"][0]["comments"]["pageInfo"][
+            "endCursor"
+        ] = "COMMENT_TERMINAL_REREAD_CURSOR"
+        replace_raw_json_body(
+            terminal_cursor_final_page,
+            canonical_raw_body(terminal_cursor_final_body),
+        )
+        terminal_initial_projection = parse_discovery_endpoint_transcript(
+            terminal_cursor_reread_history["initial_inventory"][
+                "discovery_endpoint_transcript"
+            ],
+            request_scope_receipts=terminal_cursor_reread_history["initial_inventory"][
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        terminal_final_projection = parse_discovery_endpoint_transcript(
+            terminal_cursor_final_transcript,
+            request_scope_receipts=terminal_cursor_final_inventory[
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(terminal_initial_projection)
+        self.assertTrue(
+            typed_json_equal(
+                terminal_initial_projection,
+                terminal_final_projection,
+            )
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                terminal_cursor_reread_history,
                 current,
             ),
             "thumbs-up-clean",

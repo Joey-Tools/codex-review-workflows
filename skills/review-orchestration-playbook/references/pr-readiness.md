@@ -194,6 +194,12 @@ ambiguous PR-like routing fails closed. Canonical decimal page and native-ID
 tokens are limited to 39 digits and 128 bits before integer conversion;
 overlong values fail closed without raising. Reactions may not update PR metadata. The frozen as-of bounds
 semantic historical outcomes, not when the live pull endpoint was observed.
+REST Link page relations are validated semantically against the fixed HTTPS
+host, path, and non-page query map; omitted page and a literal canonical
+`page=1` are equivalent, while each raw `rel=next` URL is followed exactly. A
+terminal GraphQL page requires typed `hasNextPage == false`; `endCursor` may be
+null or a non-empty string, and a retained terminal cursor never triggers
+another fetch.
 Updated-desc rows later than as-of therefore form a contiguous validated future
 prefix; they stay raw and budget-charged and seed the complete
 pull/compare/comments/reviews/inline/thread/reaction traversal. Newer pull

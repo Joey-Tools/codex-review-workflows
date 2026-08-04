@@ -265,8 +265,10 @@ exact request URL, exact integer status, raw `Link` header or null, raw UTF-8
 body, and recomputed body digest. Pull detail and compare are unpaginated
 direct-object responses: each has exactly one page, a null `Link`, and a JSON
 object root. Collection responses use an array root on every page; each
-canonical `next` preserves the fixed path and query and advances only through
-the consecutive `page=N` parameter. For updated-desc pulls, a stable canonical
+Link relation preserves the fixed HTTPS host, path, and decoded non-page query
+map, uses one literal canonical `page=N` token, and treats omitted page and
+`page=1` as the same first page. The fetch path follows the exact raw `next` URL
+through consecutive page numbers. For updated-desc pulls, a stable semantic
 `last` cannot point after a no-`next` natural end or before the current `next`.
 The fetch path follows updated-desc pull pages only through the
 first retained page containing an exact `updated_at <= window_start_exclusive`
@@ -349,9 +351,12 @@ record GraphQL `id`, REST-compatible `fullDatabaseId: BigInt`, `url`, and
 `pullRequestReview { id fullDatabaseId }`. Schema version 4 paginates only the
 outer `reviewThreads` connection: it starts with a null cursor, requires each
 next request cursor to equal the previous raw `endCursor`, and ends only at
-typed `hasNextPage == false`. Each nested `comments` connection must be
-complete in its first raw response with typed `hasNextPage == false` and
-`endCursor == null`. If any nested response reports another page, fail closed
+typed `hasNextPage == false`. A terminal GraphQL page requires typed
+`hasNextPage == false`; `endCursor` may be null or a non-empty string, and a
+retained terminal cursor never triggers another fetch. Each nested `comments`
+connection must be complete in its first raw response with typed
+`hasNextPage == false`; its terminal cursor follows the same rule. If any
+nested response reports another page, fail closed
 as profile `unknown`; schema version 4 cannot encode a child-cursor fetch. A
 future schema version must define and bind that fetch instead of flattening
 multiple normalized pages into one fabricated raw response.
@@ -569,16 +574,20 @@ status, raw Link header, bounded UTF-8 JSON body, and body SHA-256. Raw REST
 timestamps stay canonical whole-second RFC3339 `Z` text; the fixed projector
 strictly round-trips them to positive integer Unix seconds before ordering or
 hashing and rejects numeric, offset, fractional, invalid, or noncanonical
-substitutes. GraphQL pages retain the exact requested cursor and raw body from
+substitutes. REST Link page relations are validated semantically against the
+fixed HTTPS host, path, and non-page query map; omitted page and a literal
+canonical `page=1` are equivalent, while each raw `rel=next` URL is followed
+exactly. GraphQL pages retain the exact requested cursor and raw body from
 which the fixed parser validates `repository.nameWithOwner`,
 `pullRequest.number`, and `pageInfo` on every page. The first two values must
 match the exact transcript scope before an empty or nonempty connection can
 count as complete. A raw thread node contains the
 real GraphQL `comments { nodes pageInfo }` connection, never the normalized
 report `comments.pages` envelope. Version 4 accepts nested comments only when
-that first connection is complete (`hasNextPage == false`,
-`endCursor == null`); a child cursor requires a future schema version and
-therefore makes the current profile `unknown`. Endpoint JSON may gain
+that first connection is complete (`hasNextPage == false`); a terminal
+`endCursor` may still be null or a non-empty string. A child connection with
+`hasNextPage == true` requires a future schema version and therefore makes the
+current profile `unknown`. Endpoint JSON may gain
 unrelated GitHub fields; a fixed projector type-checks every policy field while
 the page digest binds all raw bytes.
 
