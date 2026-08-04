@@ -1404,6 +1404,22 @@ present in both traversals and permits complete-array difference solely for a
 fully validated one-sided eligibility-audit item. A contract assertion now
 forbids the obsolete unconditional-equality wording.
 
+The third formal named-single review of commit
+`8700073a41a1fa1930a1865a1d438e84b2b8071f` found a transport-level
+convergence gap: adding one fully eligible future-prefix PR can move the first
+old boundary witness from a page that still has `rel="next"` to the natural
+last page. Both traversals are independently complete, but their exact stored
+stop reasons then differ between `window-boundary-complete` and
+`natural-end-complete`. After both traversals independently prove complete,
+the joint stable comparison treats `window-boundary-complete` and
+`natural-end-complete` as equivalent complete termination forms. The exact
+reason remains in each raw-derived and stored projection; only that transport
+label is removed from the derived comparison, and incomplete or malformed
+pagination still fails closed. The regression uses 99 in-window rows, two old
+boundary witnesses, and one final-only eligible future PR to force the boundary
+from page one to page two while proving the coordinated semantic view remains
+stable.
+
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
 trustworthy provider results remain authoritative without request/run

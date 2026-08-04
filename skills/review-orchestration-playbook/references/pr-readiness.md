@@ -225,12 +225,19 @@ post-as-of activity, if any. The eligibility audit is a closed subset of the
 eligible scope. The initial/final joint coordinator may remove a scope only
 from the derived stable comparison, only when it appears in exactly one
 complete local union and is eligible there. This one-sided omission is the only
-coordination exception. A PR present in both unions always
+scope-removal coordination exception; the separately validated complete
+stop-reason forms use only the transport-label normalization described below.
+A PR present in both unions always
 remains and its retained identity/lifecycle and semantic projection must
 compare exactly, allowing unrelated post-as-of human activity without erasing
 an existing scope. Eligibility items present on both sides must also be
 type-preserving identical. Raw discovery/detail bytes and all budget charges
-are never omitted.
+are never omitted. After both traversals independently prove complete, the
+joint stable comparison treats `window-boundary-complete` and
+`natural-end-complete` as equivalent complete termination forms. The exact
+per-traversal stop reason remains in raw-derived and stored evidence; only that
+transport label is excluded from the derived comparison, and incomplete or
+malformed pagination remains fail-closed.
 
 Each historical inventory and each current raw endpoint inventory also stores
 a parent-owned `resource_budget` sibling beside, never inside, that unchanged

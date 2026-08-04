@@ -4309,6 +4309,54 @@ printf '%s\n' "$trusted_uv"
         normalized_readiness_text = " ".join(
             anti_drift_documents["pr-readiness"].lower().replace("`", "").split()
         )
+        complete_stop_reason_contract = (
+            "after both traversals independently prove complete, the joint stable "
+            "comparison treats window-boundary-complete and natural-end-complete "
+            "as equivalent complete termination forms"
+        )
+        complete_stop_reason_documents = {
+            "authority": authority,
+            "skill": anti_drift_documents["skill"],
+            "readme": anti_drift_documents["readme"],
+            "github-pr-probes": anti_drift_documents["github-pr-probes"],
+            "pr-readiness": anti_drift_documents["pr-readiness"],
+            "project-journal": anti_drift_documents["project-journal"],
+        }
+        for document_name, document in complete_stop_reason_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(complete_stop_reason_document=document_name):
+                self.assertIn(complete_stop_reason_contract, normalized_document)
+        normalized_stop_reason_probes = " ".join(
+            anti_drift_documents["github-pr-probes"].lower().replace("`", "").split()
+        )
+        self.assertIn(
+            "rederive and audit each fixed scope_discovery_projection independently",
+            normalized_stop_reason_probes,
+        )
+        self.assertNotIn(
+            "rederive and compare the fixed scope_discovery_projection",
+            normalized_stop_reason_probes,
+        )
+        normalized_stop_reason_authority = " ".join(
+            authority.lower().replace("`", "").split()
+        )
+        self.assertIn(
+            "coordinator first excludes the independently validated complete "
+            "stop-reason label from both derived views",
+            normalized_stop_reason_authority,
+        )
+        self.assertNotIn(
+            "then requires every remaining projection field",
+            normalized_stop_reason_authority,
+        )
+        self.assertNotIn(
+            "this one-sided omission is the only coordination exception",
+            normalized_readiness_text,
+        )
+        self.assertIn(
+            "this one-sided omission is the only scope-removal coordination exception",
+            normalized_readiness_text,
+        )
         self.assertIn(
             "request/reaction/sidecar-only drift is evaluated on its own plane",
             normalized_skill_text,
@@ -16451,7 +16499,7 @@ printf '%s\n' "$trusted_uv"
                 eligibility_audit_by_pull,
             )
 
-        def normalize_one_sided_future_scopes(
+        def normalize_coordinated_historical_view(
             value: dict[str, object],
             stable_scope_projection: dict[str, object],
             omitted_pull_numbers: set[int],
@@ -16460,6 +16508,15 @@ printf '%s\n' "$trusted_uv"
             normalized_scope_projection = clone(stable_scope_projection)
             assert isinstance(normalized_value, dict)
             assert isinstance(normalized_scope_projection, dict)
+            if normalized_scope_projection.get("stop_reason") not in {
+                "window-boundary-complete",
+                "natural-end-complete",
+            }:
+                return None
+            # Both forms independently prove complete traversal. Retain the
+            # exact raw/stored reason per phase, but exclude this transport
+            # termination detail from the jointly coordinated stable view.
+            normalized_scope_projection.pop("stop_reason")
             normalized_scope_projection["recent_pull_requests"] = [
                 item
                 for item in normalized_scope_projection["recent_pull_requests"]
@@ -16591,12 +16648,12 @@ printf '%s\n' "$trusted_uv"
                 initial_eligibility_audit
             ) or not final_only_pull_numbers.issubset(final_eligibility_audit):
                 return False
-            initial_stable_value = normalize_one_sided_future_scopes(
+            initial_stable_value = normalize_coordinated_historical_view(
                 initial_value,
                 initial_stable_scope_projection,
                 initial_only_pull_numbers,
             )
-            final_stable_value = normalize_one_sided_future_scopes(
+            final_stable_value = normalize_coordinated_historical_view(
                 final_value,
                 final_stable_scope_projection,
                 final_only_pull_numbers,
@@ -34367,6 +34424,101 @@ printf '%s\n' "$trusted_uv"
             historical_phase_projections_converge(
                 future_only_initial_projection,
                 future_only_projection,
+            )
+        )
+
+        boundary_shift_base_scopes = [clone(candidate) for candidate in samples] + [
+            clone(current),
+            provider_declaration_scope(),
+            *[confirmed_nonprovider_scope(20_000 + offset) for offset in range(94)],
+        ]
+        self.assertEqual(len(boundary_shift_base_scopes), 99)
+        boundary_shift_old_records = [
+            synthetic_pull_discovery_record(
+                30_000 + offset,
+                history_start_exclusive - offset,
+            )
+            for offset in (1, 2)
+        ]
+        boundary_shift_initial_transcript = build_discovery_endpoint_transcript(
+            boundary_shift_base_scopes,
+            _repository_historical_pull_records=boundary_shift_old_records,
+        )
+        boundary_shift_final_scopes = [
+            clone(future_only_scope),
+            *[clone(scope) for scope in boundary_shift_base_scopes],
+        ]
+        boundary_shift_final_transcript = build_discovery_endpoint_transcript(
+            boundary_shift_final_scopes,
+            _pull_updated_at_by_pr={
+                future_only_pr: history_as_of_server_time + 4,
+            },
+            _repository_historical_pull_records=boundary_shift_old_records,
+        )
+        boundary_shift_initial_projection = parse_discovery_endpoint_transcript(
+            boundary_shift_initial_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                boundary_shift_base_scopes
+            ),
+            provider_declaration=declaration,
+        )
+        boundary_shift_final_projection = parse_discovery_endpoint_transcript(
+            boundary_shift_final_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                boundary_shift_final_scopes
+            ),
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(boundary_shift_initial_projection)
+        self.assertIsNotNone(boundary_shift_final_projection)
+        assert isinstance(boundary_shift_initial_projection, dict)
+        assert isinstance(boundary_shift_final_projection, dict)
+        initial_boundary_pages = boundary_shift_initial_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"]
+        final_boundary_pages = boundary_shift_final_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"]
+        self.assertEqual(len(initial_boundary_pages), 1)
+        self.assertIn('rel="next"', initial_boundary_pages[0]["link_header"])
+        self.assertEqual(len(final_boundary_pages), 2)
+        self.assertIsNone(final_boundary_pages[-1]["link_header"])
+        self.assertEqual(
+            boundary_shift_initial_projection["scope_discovery_projection"][
+                "stop_reason"
+            ],
+            "window-boundary-complete",
+        )
+        self.assertEqual(
+            boundary_shift_final_projection["scope_discovery_projection"][
+                "stop_reason"
+            ],
+            "natural-end-complete",
+        )
+        self.assertIn(
+            future_only_pr,
+            {
+                item["pull_number"]
+                for item in boundary_shift_final_projection[
+                    "scope_discovery_projection"
+                ]["future_prefix_omission_eligibility_audit"]
+            },
+        )
+        self.assertTrue(
+            historical_phase_projections_converge(
+                boundary_shift_initial_projection,
+                boundary_shift_final_projection,
+            )
+        )
+        invalid_boundary_stop = clone(boundary_shift_final_projection)
+        assert isinstance(invalid_boundary_stop, dict)
+        invalid_boundary_stop["scope_discovery_projection"]["stop_reason"] = (
+            "incomplete"
+        )
+        self.assertFalse(
+            historical_phase_projections_converge(
+                boundary_shift_initial_projection,
+                invalid_boundary_stop,
             )
         )
         future_only_scope_key = [

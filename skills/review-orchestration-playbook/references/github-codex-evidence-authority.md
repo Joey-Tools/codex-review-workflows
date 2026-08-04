@@ -1265,6 +1265,14 @@ budget-charged raw pages and seed the same complete detail traversal as any
 other newer row. They are never accepted as historical semantic evidence from
 the pull row alone.
 
+Each raw-derived and stored per-traversal projection retains its exact complete
+stop reason. After both traversals independently prove complete, the joint
+stable comparison treats `window-boundary-complete` and
+`natural-end-complete` as equivalent complete termination forms. It removes
+only that transport-level stop label from the derived comparison view; raw and
+stored evidence keep it, and an incomplete, malformed, or unproved traversal
+can never be normalized into either complete form.
+
 The second source fully paginates
 `GET /repos/<owner>/<repo>/issues/comments?sort=updated&direction=desc&since=<RFC3339-cutoff>&per_page=100`.
 It retains every record whose body is the exact `@codex review` string,
@@ -1361,7 +1369,9 @@ for the same pull number in both traversals must also be type-preserving
 identical. Thus a newly observed one-sided irrelevant or empty scope can
 converge without letting a repeatedly observed scope hide base, head,
 merge-base, or lifecycle drift. Live `updated_at`, pull-row digest, and endpoint
-order remain deliberately outside this audit.
+order remain deliberately outside this audit. The two independently validated
+complete stop reasons are likewise transport observations rather than fixed
+semantic drift; their raw values remain audited under the rule above.
 
 The seed/detail closure includes the authenticated declaration PR. Its PR
 number must occur as an explicit anchor in the discovery union, drive the same
@@ -2517,11 +2527,13 @@ IDs/PRs/digests, anchors, sorted fixed semantic union, and the closed
 local union. Each traversal also records a closed
 `future_prefix_omission_eligibility_audit`; its items are unique and ordered by
 positive pull number and form a subset of the retained audit. The joint
-coordinator removes only a locally eligible PR present in exactly one complete
-local union, then requires every remaining projection field and retained audit
-item to be type-preserving identical. A PR present in both unions remains in
-the comparison. Every pull number in both eligibility audits must bind
-identical pull/base/head/merge-base/lifecycle values. The projection
+coordinator first excludes the independently validated complete stop-reason
+label from both derived views, removes only a locally eligible PR present in
+exactly one complete local union, then requires every projection field and
+retained audit item remaining after those two operations to be type-preserving
+identical. A PR present in both unions remains in the comparison. Every pull
+number in both eligibility audits must bind identical
+pull/base/head/merge-base/lifecycle values. The projection
 deliberately excludes pull-list
 `updated_at`, raw pull-row digests, and endpoint row order. The
 independently fetched raw transcript records need not be structurally or

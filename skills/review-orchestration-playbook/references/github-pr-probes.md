@@ -321,7 +321,12 @@ initial/final joint coordinator may omit it only from the derived stable view,
 and only when the PR occurs in exactly one complete local union. A PR present
 in both traversals always remains and compares exactly, allowing unrelated
 post-as-of human activity without hiding scope or lifecycle drift. Shared
-eligibility items must also be type-preserving identical.
+eligibility items must also be type-preserving identical. After both
+traversals independently prove complete, the joint stable comparison treats
+`window-boundary-complete` and `natural-end-complete` as equivalent complete
+termination forms. Preserve the exact stop reason in each raw-derived and
+stored projection; omit only that transport label from the derived comparison,
+and never normalize incomplete or malformed pagination.
 A controlled request, exact or ambiguous provider/policy evidence, cross-cutoff
 edit, retained or shared-eligibility identity/lifecycle drift, incomplete pagination,
 or failed join remains fail-closed.
@@ -757,10 +762,13 @@ provider declaration source/version/text without moving the initial-receipt
 as-of window, recompute its recorded normalization digest, and independently
 re-fetch each final schema-version-4 updated-desc pull boundary, since-cutoff
 request-comment feed, current/declaration anchors, and every raw-union-seeded PR
-traversal. Rederive and compare the fixed `scope_discovery_projection`,
-including its cutoff (with as-of separately frozen in the history envelope),
-stop reason, deterministic retained PR/base/head seeds, request IDs/PRs/digests,
-anchors, and fixed semantic union. Require exact equality of the closed
+traversal. Rederive and audit each fixed `scope_discovery_projection`
+independently, including its cutoff (with as-of separately frozen in the
+history envelope), exact complete stop reason, deterministic retained
+PR/base/head seeds, request IDs/PRs/digests, anchors, and fixed semantic union.
+Only after both traversals independently validate may the coordinated stable
+comparison exclude the transport-level stop-reason label. Require exact
+equality of the closed
 `retained_pull_scope_audit` for every complete local-union PR. Jointly derive
 effective omission from `future_prefix_omission_eligibility_audit`: only a PR
 present in exactly one union and eligible there may leave the stable comparison
