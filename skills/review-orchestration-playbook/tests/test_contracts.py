@@ -2235,6 +2235,36 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             _repository_policy_scope_root(repo_root, "unknown")
 
+    def test_private_profile_does_not_require_repository_readme_or_journal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+            policy_root = repo_root / "personal_codex"
+            private_skill_root = (
+                policy_root / "skills/review-orchestration-playbook"
+            )
+            private_skill_root.mkdir(parents=True)
+
+            self.assertEqual(
+                _ci_contract_context(private_skill_root),
+                (repo_root, "private"),
+            )
+            self.assertEqual(
+                _repository_agents_path(repo_root, "private"),
+                policy_root / "AGENTS.md",
+            )
+            self.assertFalse((policy_root / "README.md").exists())
+            self.assertFalse((policy_root / "docs/project_journal").exists())
+            self.assertEqual(
+                _claude_auth_repository_policy_files(repo_root, "private"),
+                {},
+            )
+            self.assertEqual(
+                _secret_admission_repository_policy_files(repo_root, "private"),
+                {},
+            )
+
     def test_ci_contract_carries_every_reviewed_profile_snapshot(self) -> None:
         self.assertEqual(
             set(CI_PROFILE_BY_SKILL_LAYOUT.values()),
@@ -5057,7 +5087,6 @@ printf '%s\n' "$trusted_uv"
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         guard = "if sys.version_info < (3, 10):"
         self.assertIn(guard, entrypoint)
@@ -5066,7 +5095,9 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIn('python-version: "3.10"', workflow)
         self.assertIn("tomli==2.2.1", workflow)
-        self.assertIn("requires Python 3.10 or later", readme)
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            self.assertIn("requires Python 3.10 or later", readme)
 
     def test_helper_entrypoint_does_not_write_import_bytecode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5815,9 +5846,28 @@ printf '%s\n' "$trusted_uv"
             baseline_manifest,
         )
 
+        if CI_PROFILE == "private":
+            skill_owned_policy_paths = {
+                "skill": SKILL_ROOT / "SKILL.md",
+                "interface": SKILL_ROOT / "agents/openai.yaml",
+                "GitHub probes": SKILL_ROOT / "references/github-pr-probes.md",
+                "PR readiness": SKILL_ROOT / "references/pr-readiness.md",
+                "lane contracts": (
+                    SKILL_ROOT / "references/review-lane-contracts.md"
+                ),
+                "prompt templates": (
+                    SKILL_ROOT / "references/review-prompt-templates.md"
+                ),
+            }
+            for document_name, document_path in skill_owned_policy_paths.items():
+                with self.subTest(private_authority_pointer=document_name):
+                    self.assertIn(
+                        "github-codex-evidence-authority.md",
+                        document_path.read_text(encoding="utf-8"),
+                    )
+
         anti_drift_documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
-            "readme": (SKILL_SCOPE_ROOT / "README.md").read_text(encoding="utf-8"),
             "interface": (SKILL_ROOT / "agents/openai.yaml").read_text(
                 encoding="utf-8"
             ),
@@ -5830,11 +5880,20 @@ printf '%s\n' "$trusted_uv"
             "review-lane-contracts": (
                 SKILL_ROOT / "references/review-lane-contracts.md"
             ).read_text(encoding="utf-8"),
-            "project-journal": (
-                SKILL_SCOPE_ROOT / "docs/project_journal/2026/07/"
-                "2026-07-30-github-codex-evidence-authority-gea001.md"
-            ).read_text(encoding="utf-8"),
         }
+        if CI_PROFILE == "canonical":
+            anti_drift_documents.update(
+                {
+                    "readme": (SKILL_SCOPE_ROOT / "README.md").read_text(
+                        encoding="utf-8"
+                    ),
+                    "project-journal": (
+                        SKILL_SCOPE_ROOT
+                        / "docs/project_journal/2026/07/"
+                        "2026-07-30-github-codex-evidence-authority-gea001.md"
+                    ).read_text(encoding="utf-8"),
+                }
+            )
         baseline_ids = (
             "16366aa81270ad2c875d2ceb8ce194f5b2308af6",
             "2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6",
@@ -5847,21 +5906,22 @@ printf '%s\n' "$trusted_uv"
                     baseline_id=baseline_id,
                 ):
                     self.assertIn(baseline_id, document)
-        journal = anti_drift_documents["project-journal"]
+        journal = anti_drift_documents.get("project-journal")
         github_pr_probes = anti_drift_documents["github-pr-probes"]
-        normalized_readme_text = " ".join(
-            anti_drift_documents["readme"].lower().replace("`", "").split()
-        )
-        self.assertIn(
-            "independently complete initial/final inventories whose jointly "
-            "coordinated stable views and complete candidate arrays are "
-            "type-preserving identical",
-            normalized_readme_text,
-        )
-        self.assertNotIn(
-            "embeds identical initial/final discovery inventories",
-            normalized_readme_text,
-        )
+        if readme := anti_drift_documents.get("readme"):
+            normalized_readme_text = " ".join(
+                readme.lower().replace("`", "").split()
+            )
+            self.assertIn(
+                "independently complete initial/final inventories whose jointly "
+                "coordinated stable views and complete candidate arrays are "
+                "type-preserving identical",
+                normalized_readme_text,
+            )
+            self.assertNotIn(
+                "embeds identical initial/final discovery inventories",
+                normalized_readme_text,
+            )
         normalized_skill_text = " ".join(
             anti_drift_documents["skill"].lower().replace("`", "").split()
         )
@@ -5876,11 +5936,12 @@ printf '%s\n' "$trusted_uv"
         complete_stop_reason_documents = {
             "authority": authority,
             "skill": anti_drift_documents["skill"],
-            "readme": anti_drift_documents["readme"],
             "github-pr-probes": anti_drift_documents["github-pr-probes"],
             "pr-readiness": anti_drift_documents["pr-readiness"],
-            "project-journal": anti_drift_documents["project-journal"],
         }
+        for optional_document in ("readme", "project-journal"):
+            if document := anti_drift_documents.get(optional_document):
+                complete_stop_reason_documents[optional_document] = document
         for document_name, document in complete_stop_reason_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(complete_stop_reason_document=document_name):
@@ -5967,7 +6028,6 @@ printf '%s\n' "$trusted_uv"
         )
         malformed_window_documents = {
             "skill": anti_drift_documents["skill"],
-            "README": (SKILL_SCOPE_ROOT / "README.md").read_text(encoding="utf-8"),
             "interface": (SKILL_ROOT / "agents/openai.yaml").read_text(
                 encoding="utf-8"
             ),
@@ -5980,6 +6040,8 @@ printf '%s\n' "$trusted_uv"
             ).read_text(encoding="utf-8"),
             "GitHub probes": github_pr_probes,
         }
+        if readme := anti_drift_documents.get("readme"):
+            malformed_window_documents["README"] = readme
         for document_name, document in malformed_window_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(malformed_window_document=document_name):
@@ -5988,20 +6050,20 @@ printf '%s\n' "$trusted_uv"
                     normalized_document,
                 )
                 self.assertIn("exclusive lower boundary", normalized_document)
-        for relative_path, blob_id in baseline_manifest.items():
-            with self.subTest(journal_action_baseline_path=relative_path):
-                self.assertIn(
-                    f"| `{relative_path}` | `{blob_id}` |",
-                    journal,
-                )
-        self.assertEqual(
-            parsed_baseline_manifest(journal),
-            baseline_manifest,
-        )
-        for document_name, document in (
-            ("authority", authority),
-            ("journal", journal),
-        ):
+        manifest_documents = {"authority": authority}
+        if journal is not None:
+            for relative_path, blob_id in baseline_manifest.items():
+                with self.subTest(journal_action_baseline_path=relative_path):
+                    self.assertIn(
+                        f"| `{relative_path}` | `{blob_id}` |",
+                        journal,
+                    )
+            self.assertEqual(
+                parsed_baseline_manifest(journal),
+                baseline_manifest,
+            )
+            manifest_documents["journal"] = journal
+        for document_name, document in manifest_documents.items():
             malformed_manifest_lines = document.splitlines()
             manifest_header_index = malformed_manifest_lines.index(
                 "| Relative path | Git blob ID |"
@@ -6029,10 +6091,11 @@ printf '%s\n' "$trusted_uv"
             "defects, but they do not contradict what the provider reported",
         ):
             self.assertIn(rationale, normalized)
-            self.assertIn(
-                rationale,
-                " ".join(journal.split()).lower(),
-            )
+            if journal is not None:
+                self.assertIn(
+                    rationale,
+                    " ".join(journal.split()).lower(),
+                )
 
         def normalized_markdown_section(
             document: str,
@@ -6077,11 +6140,12 @@ printf '%s\n' "$trusted_uv"
                 anti_drift_documents["pr-readiness"],
                 "## GitHub Codex Evidence",
             ),
-            "project-journal": section_text(
+        }
+        if journal is not None:
+            discovery_v4_sections["project-journal"] = section_text(
                 journal,
                 "## Bounded Dual-Source Discovery Superseding Decision",
-            ),
-        }
+            )
         discovery_v4_contracts = {
             "authority": (
                 "{schema_version: 4, repository, scope_discovery, scopes}",
@@ -6117,14 +6181,15 @@ printf '%s\n' "$trusted_uv"
                 "boundary witnesses do not consume the 512 raw-union-seeded-pr cap",
                 "a version-3 transcript cannot prove reaction fallback",
             ),
-            "project-journal": (
+        }
+        if journal is not None:
+            discovery_v4_contracts["project-journal"] = (
                 "schema-version-4 bounded dual-source discovery",
                 "an updated-desc pull-list traversal retains complete pages "
                 "through the first updated_at <= window_start_exclusive boundary",
                 "the 512 cap now counts only this union and its detail traversals",
                 "version 3 cannot prove reaction fallback",
-            ),
-        }
+            )
         for document_name, anchors in discovery_v4_contracts.items():
             for anchor in anchors:
                 with self.subTest(
@@ -6133,35 +6198,38 @@ printf '%s\n' "$trusted_uv"
                 ):
                     self.assertIn(anchor, discovery_v4_sections[document_name])
 
-        implementation_intent = section_text(journal, "## Implementation Intent")
-        for anchor in (
-            "schema-version-4 bounded dual-source discovery",
-            "updated_at <= window_start_exclusive boundary",
-            "fully traverse and parse every union-seeded pr before excluding "
-            "the exact current scope",
-            "512 seeded-pr cap only against that deduplicated union and its "
-            "detail traversals",
-            "version-3 transcript cannot prove reaction fallback",
-            "under schema version 4",
-            "hasnextpage == false",
-            "terminal endcursor may be null or a non-empty string",
-            "separately bound child-cursor schema",
-        ):
-            self.assertIn(anchor, implementation_intent)
-        for stale in (
-            "schema-version-3 repository-wide raw discovery",
-            "under schema version 3, fail closed",
-            "endcursor == null",
-        ):
-            self.assertNotIn(stale, implementation_intent)
-
         provider_identity_sections = {
             "authority": discovery_v4_sections["authority"],
             "skill": discovery_v4_sections["skill"],
             "github-pr-probes": discovery_v4_sections["github-pr-probes"],
             "pr-readiness": discovery_v4_sections["pr-readiness"],
-            "project-journal": implementation_intent,
         }
+        if journal is not None:
+            implementation_intent = section_text(
+                journal,
+                "## Implementation Intent",
+            )
+            for anchor in (
+                "schema-version-4 bounded dual-source discovery",
+                "updated_at <= window_start_exclusive boundary",
+                "fully traverse and parse every union-seeded pr before excluding "
+                "the exact current scope",
+                "512 seeded-pr cap only against that deduplicated union and its "
+                "detail traversals",
+                "version-3 transcript cannot prove reaction fallback",
+                "under schema version 4",
+                "hasnextpage == false",
+                "terminal endcursor may be null or a non-empty string",
+                "separately bound child-cursor schema",
+            ):
+                self.assertIn(anchor, implementation_intent)
+            for stale in (
+                "schema-version-3 repository-wide raw discovery",
+                "under schema version 3, fail closed",
+                "endcursor == null",
+            ):
+                self.assertNotIn(stale, implementation_intent)
+            provider_identity_sections["project-journal"] = implementation_intent
         for document_name, section in provider_identity_sections.items():
             with self.subTest(provider_identity_document=document_name):
                 self.assertIn("only the exact bot actor", section)
@@ -6173,8 +6241,9 @@ printf '%s\n' "$trusted_uv"
             "skill": anti_drift_documents["skill"],
             "github-pr-probes": github_pr_probes,
             "pr-readiness": anti_drift_documents["pr-readiness"],
-            "project-journal": journal,
         }
+        if journal is not None:
+            artifact_publication_documents["project-journal"] = journal
         for document_name, document in artifact_publication_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(artifact_publication_document=document_name):
@@ -6282,21 +6351,22 @@ printf '%s\n' "$trusted_uv"
             authority_report_section.index("scope_discovery_projection:"),
             authority_report_section.index("scope_classifications:"),
         )
-        current_state_section = section_text(journal, "## Current State")
-        for marker in (
-            "schema-version-4 discovery transcripts",
-            "updated-desc pull boundary",
-            "since-cutoff controlled request-comment feed",
-            "version 3 cannot prove reaction fallback",
-            "boundary witnesses and cumulative old prs consume endpoint budgets "
-            "but do not consume the 512 union/detail cap",
-        ):
-            with self.subTest(project_journal_current_state_marker=marker):
-                self.assertIn(marker, current_state_section)
-        self.assertNotIn(
-            "state=all&sort=created&direction=asc&per_page=100",
-            current_state_section,
-        )
+        if journal is not None:
+            current_state_section = section_text(journal, "## Current State")
+            for marker in (
+                "schema-version-4 discovery transcripts",
+                "updated-desc pull boundary",
+                "since-cutoff controlled request-comment feed",
+                "version 3 cannot prove reaction fallback",
+                "boundary witnesses and cumulative old prs consume endpoint budgets "
+                "but do not consume the 512 union/detail cap",
+            ):
+                with self.subTest(project_journal_current_state_marker=marker):
+                    self.assertIn(marker, current_state_section)
+            self.assertNotIn(
+                "state=all&sort=created&direction=asc&per_page=100",
+                current_state_section,
+            )
         self.assertIn(
             "schema version 4 records no independent inline-child timestamp",
             github_pr_probes.lower(),
@@ -6365,10 +6435,11 @@ printf '%s\n' "$trusted_uv"
             "its initial/final copies must be type-preserving identical",
             normalized_authority_text,
         )
-        self.assertNotIn(
-            "is exactly equal across traversals",
-            " ".join(journal.lower().replace("`", "").split()),
-        )
+        if journal is not None:
+            self.assertNotIn(
+                "is exactly equal across traversals",
+                " ".join(journal.lower().replace("`", "").split()),
+            )
         for raw_rest_shape_marker in (
             "every accepted rest status is an exact integer 200, never a "
             "boolean or float alias",
@@ -6567,11 +6638,12 @@ printf '%s\n' "$trusted_uv"
             "pr-readiness": " ".join(
                 anti_drift_documents["pr-readiness"].lower().replace("`", "").split()
             ),
-            "project-journal": section_text(
+        }
+        if journal is not None:
+            discovery_actor_documents["project-journal"] = section_text(
                 journal,
                 "## v10 Discovery-Classification Corrections",
-            ),
-        }
+            )
         for document_name, document in discovery_actor_documents.items():
             with self.subTest(discovery_actor_document=document_name):
                 self.assertIn("discovery", document)
@@ -6579,29 +6651,27 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("regardless of actor", document)
                 self.assertIn("sidecar", document)
                 self.assertIn("unknown", document)
-        journal_discovery_correction = discovery_actor_documents["project-journal"]
-        self.assertIn(
-            "the fully paginated since feed is a live traversal, not an as-of snapshot",
-            journal_discovery_correction,
-        )
-        self.assertIn(
-            "this preserves the established “result exists means pass” "
-            "provider-result rule",
-            journal_discovery_correction,
-        )
-        self.assertIn(
-            "codex-review-gate / codex-review-gate-action baseline",
-            journal_discovery_correction,
-        )
+        if journal is not None:
+            journal_discovery_correction = discovery_actor_documents[
+                "project-journal"
+            ]
+            self.assertIn(
+                "the fully paginated since feed is a live traversal, not an as-of snapshot",
+                journal_discovery_correction,
+            )
+            self.assertIn(
+                "this preserves the established “result exists means pass” "
+                "provider-result rule",
+                journal_discovery_correction,
+            )
+            self.assertIn(
+                "codex-review-gate / codex-review-gate-action baseline",
+                journal_discovery_correction,
+            )
 
         exact_resource_profile_documents = {
             "authority": authority,
-            "README": malformed_window_documents["README"],
-            "interface": malformed_window_documents["interface"],
-            "PR readiness": malformed_window_documents["PR readiness"],
-            "lane contracts": malformed_window_documents["lane contracts"],
-            "prompt templates": malformed_window_documents["prompt templates"],
-            "GitHub probes": malformed_window_documents["GitHub probes"],
+            **malformed_window_documents,
         }
         resource_profile_anchors = (
             "profile: github-codex-evidence-resource-budget-v1",
@@ -6635,10 +6705,12 @@ printf '%s\n' "$trusted_uv"
                 self.assertTrue(
                     "64 mib" in normalized_document or "64-mib" in normalized_document
                 )
-        for document_name, document in (
-            ("skill", anti_drift_documents["skill"]),
-            ("project-journal", journal),
-        ):
+        resource_budget_summary_documents = {
+            "skill": anti_drift_documents["skill"],
+        }
+        if journal is not None:
+            resource_budget_summary_documents["project-journal"] = journal
+        for document_name, document in resource_budget_summary_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(resource_budget_summary=document_name):
                 self.assertIn(
@@ -6657,8 +6729,9 @@ printf '%s\n' "$trusted_uv"
             "skill": anti_drift_documents["skill"],
             "PR readiness": malformed_window_documents["PR readiness"],
             "GitHub probes": malformed_window_documents["GitHub probes"],
-            "project-journal": journal,
         }
+        if journal is not None:
+            memo_guard_documents["project-journal"] = journal
         for document_name, document in memo_guard_documents.items():
             normalized_document = " ".join(
                 document.lower().replace("`", "").replace(",", "").split()
@@ -6716,14 +6789,16 @@ printf '%s\n' "$trusted_uv"
         )
         resource_plane_documents = {
             "authority": authority,
-            "README": malformed_window_documents["README"],
-            "skill": anti_drift_documents["skill"],
+            "skill": malformed_window_documents["skill"],
             "PR readiness": malformed_window_documents["PR readiness"],
             "lane contracts": malformed_window_documents["lane contracts"],
             "prompt templates": malformed_window_documents["prompt templates"],
             "GitHub probes": malformed_window_documents["GitHub probes"],
-            "project-journal": journal,
         }
+        if readme := malformed_window_documents.get("README"):
+            resource_plane_documents["README"] = readme
+        if journal is not None:
+            resource_plane_documents["project-journal"] = journal
         for document_name, document in resource_plane_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(resource_plane_contract=document_name):
@@ -6789,10 +6864,6 @@ printf '%s\n' "$trusted_uv"
             "skill": discovery_v4_sections["skill"],
             "github-pr-probes": discovery_v4_sections["github-pr-probes"],
             "pr-readiness": discovery_v4_sections["pr-readiness"],
-            "project-journal": section_text(
-                journal,
-                "## Decision Rationale",
-            ),
         }
         result_present_contracts = {
             "authority": (
@@ -6829,15 +6900,20 @@ printf '%s\n' "$trusted_uv"
                 "an unresolved target-thread finding or malformed target join blocks "
                 "even when a later clean payload exists",
             ),
-            "project-journal": (
+        }
+        if journal is not None:
+            result_present_sections["project-journal"] = section_text(
+                journal,
+                "## Decision Rationale",
+            )
+            result_present_contracts["project-journal"] = (
                 "provider evidence is therefore the verdict authority, while "
                 "requests remain producer controls and audit records",
                 "duplicate or mistimed requests are still actionable orchestration "
                 "defects, but they do not contradict what the provider reported",
                 "silently weaken identity, scope, pagination, finding, or "
                 "final-stability gates",
-            ),
-        }
+            )
         for document_name, anchors in result_present_contracts.items():
             for anchor in anchors:
                 with self.subTest(
@@ -6845,21 +6921,22 @@ printf '%s\n' "$trusted_uv"
                     result_present_contract=anchor,
                 ):
                     self.assertIn(anchor, result_present_sections[document_name])
-        v7_correction_section = section_text(
-            journal,
-            "## v7 Named-Single Superseding Corrections",
-        )
-        for anchor in (
-            "a trustworthy result being present is sufficient verdict evidence",
-            "a request records producer intent and orchestration compliance; it is "
-            "not the consumer verdict",
-            "must not silently restore request/run binding or erase this rationale",
-            "the 20,000-item, 8-mib-response, and 64-mib-run magnitudes align",
-            "the 512 seeded-pr, 512 controlled-request, 8,192 fetch-attempt, "
-            "4,096 retained-page, and 900-second limits are playbook-specific "
-            "extensions",
-        ):
-            self.assertIn(anchor, v7_correction_section)
+        if journal is not None:
+            v7_correction_section = section_text(
+                journal,
+                "## v7 Named-Single Superseding Corrections",
+            )
+            for anchor in (
+                "a trustworthy result being present is sufficient verdict evidence",
+                "a request records producer intent and orchestration compliance; it is "
+                "not the consumer verdict",
+                "must not silently restore request/run binding or erase this rationale",
+                "the 20,000-item, 8-mib-response, and 64-mib-run magnitudes align",
+                "the 512 seeded-pr, 512 controlled-request, 8,192 fetch-attempt, "
+                "4,096 retained-page, and 900-second limits are playbook-specific "
+                "extensions",
+            ):
+                self.assertIn(anchor, v7_correction_section)
 
         action_boundary_sections = {
             "authority": section_text(
@@ -6869,7 +6946,6 @@ printf '%s\n' "$trusted_uv"
             "skill": discovery_v4_sections["skill"],
             "github-pr-probes": discovery_v4_sections["github-pr-probes"],
             "pr-readiness": discovery_v4_sections["pr-readiness"],
-            "project-journal": result_present_sections["project-journal"],
         }
         action_boundary_contracts = {
             "authority": (
@@ -6896,13 +6972,17 @@ printf '%s\n' "$trusted_uv"
                 "receipts, ancestor-finding projection, declaration discovery, "
                 "and +1 fallback are playbook extensions",
             ),
-            "project-journal": (
+        }
+        if journal is not None:
+            action_boundary_sections["project-journal"] = result_present_sections[
+                "project-journal"
+            ]
+            action_boundary_contracts["project-journal"] = (
                 "the action alignment is intentionally asymmetric. provider-result "
                 "authority, duplicate-result consumption, and early-result "
                 "consumption are inherited",
                 "are deliberate playbook extensions",
-            ),
-        }
+            )
         for document_name, anchors in action_boundary_contracts.items():
             for anchor in anchors:
                 with self.subTest(
@@ -6937,17 +7017,18 @@ printf '%s\n' "$trusted_uv"
             "early-result consumption aligns with the action",
         ):
             self.assertIn(anchor, normalized)
-        journal_normalized = " ".join(journal.split()).lower()
-        for anchor in (
-            "provider-result authority",
-            "duplicate/early-result consumption",
-            "warning/report fields",
-            "local-lane sequencing",
-            "stricter whole-pr lifecycle and scope",
-            "explicit terminal-payload grammar",
-            "conditional `+1` fallback",
-        ):
-            self.assertIn(anchor, journal_normalized)
+        if journal is not None:
+            journal_normalized = " ".join(journal.split()).lower()
+            for anchor in (
+                "provider-result authority",
+                "duplicate/early-result consumption",
+                "warning/report fields",
+                "local-lane sequencing",
+                "stricter whole-pr lifecycle and scope",
+                "explicit terminal-payload grammar",
+                "conditional `+1` fallback",
+            ):
+                self.assertIn(anchor, journal_normalized)
 
         for anchor in (
             "fixed authority baseline intentionally defines no accepted no-start body grammar",
@@ -8645,14 +8726,22 @@ printf '%s\n' "$trusted_uv"
                 )
             )
         future_prefix_policy_documents = {
-            "readme": REPO_ROOT / "README.md",
             "authority": SKILL_ROOT / "references/github-codex-evidence-authority.md",
             "skill": SKILL_ROOT / "SKILL.md",
             "github-pr-probes": SKILL_ROOT / "references/github-pr-probes.md",
             "pr-readiness": SKILL_ROOT / "references/pr-readiness.md",
-            "project-journal": REPO_ROOT / "docs/project_journal/2026/07/"
-            "2026-07-30-github-codex-evidence-authority-gea001.md",
         }
+        if CI_PROFILE == "canonical":
+            future_prefix_policy_documents.update(
+                {
+                    "readme": REPO_ROOT / "README.md",
+                    "project-journal": (
+                        REPO_ROOT
+                        / "docs/project_journal/2026/07/"
+                        "2026-07-30-github-codex-evidence-authority-gea001.md"
+                    ),
+                }
+            )
         for document_name, document_path in future_prefix_policy_documents.items():
             normalized_future_prefix_policy = re.sub(
                 r"[-\s]+",
@@ -25889,15 +25978,16 @@ printf '%s\n' "$trusted_uv"
                     )
                 )
 
-        readme_contract = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "fully paginated exact-provider selected-review target-child set",
-            readme_contract,
-        )
-        self.assertNotIn(
-            "fully paginated associated inline set is present and empty",
-            readme_contract,
-        )
+        if CI_PROFILE == "canonical":
+            readme_contract = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            self.assertIn(
+                "fully paginated exact-provider selected-review target-child set",
+                readme_contract,
+            )
+            self.assertNotIn(
+                "fully paginated associated inline set is present and empty",
+                readme_contract,
+            )
         declaration_scope_transcript = next(
             item
             for item in complete_scope_transcript["scopes"]
@@ -41092,7 +41182,10 @@ printf '%s\n' "$trusted_uv"
         ).read_text(encoding="utf-8")
         normalized_authority = " ".join(authority.split()).lower()
 
-        for content in (skill, readiness, probes, contracts, agents_policy, interface):
+        review_scope_documents = [skill, readiness, probes, contracts, interface]
+        if CI_PROFILE == "canonical":
+            review_scope_documents.append(agents_policy)
+        for content in review_scope_documents:
             self.assertIn("blocked-input", content)
             self.assertIn("explicit", content)
             self.assertIn("target", content)
@@ -41141,18 +41234,18 @@ printf '%s\n' "$trusted_uv"
             probes,
         )
 
-        identity_documents = (
+        identity_documents = [
             skill,
             readiness,
             probes,
             contracts,
             templates,
             egress,
-            agents_policy,
             interface,
-            delivery,
             authority,
-        )
+        ]
+        if CI_PROFILE == "canonical":
+            identity_documents.extend((agents_policy, delivery))
         for content in identity_documents:
             self.assertIn("github.com", content)
             self.assertIn("chatgpt-codex-connector[bot]", content)
@@ -41176,16 +41269,17 @@ printf '%s\n' "$trusted_uv"
             "terminal issue comments or pull-request reviews",
         ):
             self.assertIn(anchor, normalized_authority)
-        for content in (
+        payload_failure_documents = [
             skill,
             readiness,
             contracts,
             templates,
             egress,
-            agents_policy,
             interface,
-            delivery,
-        ):
+        ]
+        if CI_PROFILE == "canonical":
+            payload_failure_documents.extend((agents_policy, delivery))
+        for content in payload_failure_documents:
             with self.subTest(payload_failure_contract=content[:40]):
                 lowered = content.lower()
                 self.assertIn("missing", lowered)
@@ -41291,7 +41385,6 @@ printf '%s\n' "$trusted_uv"
             "GitHub probes": probes,
             "lane contracts": contracts,
             "prompt templates": templates,
-            "repository policy": agents_policy,
             "skill interface": interface,
         }
         authority_consumer_documents = {
@@ -41306,7 +41399,6 @@ printf '%s\n' "$trusted_uv"
             "lane contracts": contracts,
             "prompt templates": templates,
             "egress consent": egress,
-            "repository policy": agents_policy,
             "skill interface": interface,
         }
         if CI_PROFILE == "canonical":
@@ -41318,10 +41410,12 @@ printf '%s\n' "$trusted_uv"
             ).read_text(encoding="utf-8")
             producer_policy_documents.update(
                 {
+                    "repository policy": agents_policy,
                     "README": readme,
                     "migration journal": migration_journal,
                 }
             )
+            reaction_profile_entry_documents["repository policy"] = agents_policy
             reaction_profile_entry_documents["README"] = readme
         for name, content in reaction_profile_entry_documents.items():
             normalized = " ".join(content.split()).lower().replace("`", "")
@@ -41433,14 +41527,16 @@ printf '%s\n' "$trusted_uv"
             "integration/service state is unknown rather than unavailable",
         ):
             self.assertIn(anchor, normalized_authority)
-        for content in (
+        capability_policy_documents = [
             readiness,
             probes,
             contracts,
-            delivery,
             interface,
             templates,
-        ):
+        ]
+        if CI_PROFILE == "canonical":
+            capability_policy_documents.append(delivery)
+        for content in capability_policy_documents:
             normalized = " ".join(content.split()).lower()
             self.assertTrue(
                 "empty accepted structured capability/installation schema set"
@@ -41468,24 +41564,28 @@ printf '%s\n' "$trusted_uv"
             "`pr_merge_base` and head are unchanged",
             probes,
         )
-        for content in (probes, contracts, interface, templates, delivery):
+        terminal_wait_documents = [probes, contracts, interface, templates]
+        if CI_PROFILE == "canonical":
+            terminal_wait_documents.append(delivery)
+        for content in terminal_wait_documents:
             normalized = content.lower().replace("`", "")
             self.assertIn("nonterminal/check-only", normalized)
             self.assertIn("pending while bounded waiting is meaningful", normalized)
             self.assertIn("malformed", normalized)
             self.assertIn("ambiguous", normalized)
             self.assertTrue("immediate" in normalized or "立即" in normalized)
-        for content in (
+        terminal_grammar_documents = [
             skill,
             readiness,
             probes,
             contracts,
             templates,
             interface,
-            delivery,
             egress,
-            agents_policy,
-        ):
+        ]
+        if CI_PROFILE == "canonical":
+            terminal_grammar_documents.extend((delivery, agents_policy))
+        for content in terminal_grammar_documents:
             normalized = " ".join(content.split()).lower()
             self.assertTrue(
                 "fixed terminal-payload grammar" in normalized
@@ -41494,16 +41594,17 @@ printf '%s\n' "$trusted_uv"
             )
             self.assertIn("terminal-looking", normalized)
             self.assertIn("malformed", normalized)
-        for content in (
+        reaction_binding_documents = [
             skill,
             readiness,
             probes,
             contracts,
             templates,
             interface,
-            delivery,
-            agents_policy,
-        ):
+        ]
+        if CI_PROFILE == "canonical":
+            reaction_binding_documents.extend((delivery, agents_policy))
+        for content in reaction_binding_documents:
             normalized = " ".join(content.split()).lower().replace("`", "")
             self.assertIn("historical", normalized)
             self.assertTrue(
@@ -41664,12 +41765,14 @@ printf '%s\n' "$trusted_uv"
             "transcript schema version "
             f"{request_scope_sidecar['raw_transcript_schema_version']}"
         )
-        for path in (
-            SKILL_SCOPE_ROOT / "README.md",
+        transcript_schema_documents = [
             SKILL_ROOT / "references/github-codex-evidence-authority.md",
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
-        ):
+        ]
+        if CI_PROFILE == "canonical":
+            transcript_schema_documents.append(SKILL_SCOPE_ROOT / "README.md")
+        for path in transcript_schema_documents:
             with self.subTest(transcript_schema_document=str(path)):
                 normalized = " ".join(path.read_text(encoding="utf-8").split()).lower()
                 self.assertIn(transcript_schema_marker, normalized)
@@ -44858,7 +44961,10 @@ printf '%s\n' "$trusted_uv"
                     requires_python_313 = (
                         entrypoint.name == "independent-codex-pr-review"
                     )
-                    if requires_python_313 and sys.version_info < (3, 13):
+                    if (
+                        requires_python_313
+                        and sys.version_info[:2] != (3, 13)
+                    ):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertIn(
                             "Python 3.13 is required; running",
@@ -44904,8 +45010,8 @@ printf '%s\n' "$trusted_uv"
             )
             self.assertEqual(bytecode, [])
 
-    @unittest.skipIf(
-        sys.version_info < (3, 13),
+    @unittest.skipUnless(
+        sys.version_info[:2] == (3, 13),
         "the independent supervisor requires Python 3.13",
     )
     def test_installed_supervisor_preflight_keeps_release_tree_immutable(
