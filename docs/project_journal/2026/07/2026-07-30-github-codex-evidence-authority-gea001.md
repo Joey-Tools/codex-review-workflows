@@ -3,7 +3,7 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-08-03
+updated: 2026-08-04
 branch: wip/github-codex-evidence-authority
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
@@ -95,6 +95,25 @@ superseded_by:
   rejected request/run/artifact binding. A future provider-authenticated
   input-base marker governed by a predeclared provider profile may change this
   policy explicitly; caller narrative and inferred timing may not.
+- Reports describe this assurance as `artifact-publication-only`. They may say
+  that a terminal result is independently trustworthy for the selected
+  publication-time evidence scope, but they must not claim that GitHub Codex
+  reviewed the current whole-PR range or that its internal input merge base was
+  attested. `Result present` does not make an unreceipted historical artifact
+  current-scope evidence.
+- Legacy receipt migration never adopts an old artifact retroactively and
+  never lets the agent POST a replacement same-scope request. Recovery is
+  limited to an ordinary substantive change that creates a new head, or one
+  explicitly caller-owned manual exact `@codex review` trigger on the unchanged
+  head after the parent persisted the standard pre-artifact pull/compare scope
+  pair. The agent neither performs nor repeats that POST and creates no request
+  sidecar for it; request policy remains `unknown`, and reaction-only evidence
+  is unavailable. Only a later terminal artifact that strictly follows the pre
+  boundary and completes the normal version-1 artifact receipt/final-stability
+  contract can decide without request/run attribution. Otherwise the lane
+  remains `triple-inconclusive`. A proved `base-changed-same-head` event cannot
+  use the manual path and requires a real new head; empty or anchor commits are
+  not recovery mechanisms.
 - Normalized current scope and artifact commit are now explicitly separate.
   `scope.head` always remains the exact current PR head. Clean must bind it;
   a finding keeps its own current-or-proved-ancestor commit and remains in the
@@ -428,6 +447,36 @@ superseded_by:
   pinned documentation reference and the executable closed-schema tests
   together; adding a caller-supplied or derived self URL is not a compatible
   extension.
+
+## Latest Formal-Review Disposition
+
+- The artifact-publication/internal-input-base finding is an accepted trust
+  boundary, not a state-machine defect. The policy intentionally authorizes a
+  receipted terminal result for its publication-time evidence scope without
+  claiming the provider's internal input merge base or inventing
+  request/run/artifact lineage. Report wording now names this assurance
+  `artifact-publication-only` and forbids the stronger claim that GitHub Codex
+  reviewed the current whole-PR range. Changing that boundary requires a new
+  predeclared provider-authenticated input-base profile, not inferred timing.
+- The legacy-receipt finding exposed an operability/documentation gap. It is
+  closed by the two explicit recovery paths above while preserving the rule
+  that the agent never POSTs a replacement request and that old artifacts are
+  never scoped retroactively. No evaluator or base-retarget state-machine
+  behaviour changed.
+- The large reference matrix remains exhaustive, but its report-only negative
+  variants no longer recompute the full evidence oracle. A pure matcher reuses
+  an already independently generated and positively round-tripped expected
+  report for 34 near misses and for unchanged-input null-status variants,
+  removing 90 redundant `expected_report_from_inputs` evaluations without
+  deleting fixtures. The focused Python 3.13 run improved from 93.805 seconds
+  to 72.056 seconds (about 23%).
+- An attempted single-pass cache-hit optimization was rejected because it
+  weakened the protected property: content stability across validation, not
+  merely object identity or container shape. Deterministic inventory and
+  artifact regressions now mutate equal-length content between the no-hash
+  preflight and digest observations and require fail-closed rejection. The
+  race-safe two-observation contract remains normative even though it costs
+  more than a single traversal.
 
 ## Final Named-Single Review Corrections
 
@@ -989,7 +1038,7 @@ restore request/run binding or erase this rationale.
   contains the corresponding policy and contract corrections. Its final full
   validation gate and successor exact-head named-single review remain pending;
   this journal does not claim either result in advance.
-- The final candidate gate reruns the focused 107-test contract module, the
+- The final candidate gate reruns the focused 109-test contract module, the
   complete review-orchestration suite, Ruff format/lint, the skill validator,
   the project-journal validator, JSON parsing when changed JSON exists, and
   `git diff --check` after the candidate bytes stop changing. The focused

@@ -392,6 +392,21 @@ These REST lifecycle reads are point-in-time snapshots. They do not prove that n
 
 Before posting, inspect authenticated complete issue-comment history and the bounded audit record. Producer policy permits the parent to post one exact `@codex review` only after both local lanes are terminal and only when no request already exists for the unchanged current scope. Never post a second or third request. Record `early-request-observed` when a request preceded the local terminals. Record `duplicate-observed` when more than one same-scope request exists, including an overlapping or pending extra request. These are outcome-neutral warnings. A lone compliant pending request is not a warning; it remains pending unless a trustworthy terminal artifact already exists. Request markers, counts, ordering, and inferred request/run lineage are not provider verdict evidence.
 
+Legacy receipt migration never adopts an old artifact retroactively. The agent
+never POSTs a replacement same-scope request. Recover only after a separately
+authorized ordinary substantive change creates a new head, or after the caller
+explicitly performs one caller-owned manual exact `@codex review` trigger on
+the unchanged head after the parent has persisted the standard pre-artifact
+pull/compare scope pair. The agent neither performs nor repeats that POST and
+does not synthesize its request sidecar. Request policy therefore remains
+`unknown`, and reaction-only evidence is unavailable. Only a later terminal
+artifact that strictly follows that pre boundary and passes the complete
+version-1 artifact receipt/final-stability contract may decide without
+request/run attribution.
+A proved `base-changed-same-head` event cannot use the manual path and requires
+a real new head. Otherwise remain `triple-inconclusive`; never manufacture an
+empty or anchor commit to create a new epoch.
+
 ### Provider-evidence reconciliation
 
 Use [github-codex-evidence-authority.md](github-codex-evidence-authority.md) as

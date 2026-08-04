@@ -443,6 +443,41 @@ provider-authenticated input-base marker governed by a predeclared provider
 profile may change this policy explicitly; inference from request timing or
 caller narrative may not.
 
+### Legacy Receipt Migration
+
+Legacy receipt migration never adopts an old artifact retroactively. A
+same-head request or terminal result observed before the parent captured the
+version-1 artifact pre-scope boundary remains in the complete raw audit, but it
+cannot acquire `parent-recorded-terminal-artifact-scope-v1` authority from a
+later current-scope read. Old findings and unresolved threads retain their
+normal blocking authority; an old clean remains inconclusive when no
+previously persisted valid artifact receipt already brackets it.
+
+The agent never POSTs another same-scope request to repair this legacy gap.
+There are only two recovery paths:
+
+1. A separately authorized, ordinary substantive change creates a new head;
+   the new scope epoch then follows the normal one-request producer policy.
+   Never manufacture an empty or anchor commit for this purpose.
+2. The caller may explicitly perform one caller-owned manual exact
+   `@codex review` trigger on the unchanged head, but only after the parent has
+   persisted the standard pre-artifact pull/compare scope pair. The agent
+   neither performs nor repeats that POST, does not synthesize a request
+   sidecar for it. Request policy therefore remains `unknown`, and reaction-only
+   evidence is unavailable. Only a later terminal artifact that strictly
+   follows the recorded pre boundary, satisfies the complete version-1 artifact
+   receipt and final-stability contract, and wins normal terminal precedence may
+   decide. It need not be attributed to the manual request.
+
+A proved `base-changed-same-head` event is not a legacy-receipt gap and cannot
+use the manual path; only a real new head can recover that lane.
+
+If neither path produces a newly receipted terminal artifact, or the new
+artifact is equal to the pre boundary at whole-second authority, the lane
+remains `triple-inconclusive`. This migration rule preserves result-present
+authority without weakening whole-PR publication scope or creating a hidden
+request/run/artifact join.
+
 Like the request-time sidecar, the receipt consists of point-in-time reads. It
 proves the recorded pre/artifact/post observations and detects an observed
 scope mismatch, but it does not prove that no intermediate `A -> B -> A`,
@@ -2067,6 +2102,14 @@ The eligibility audit is a closed identity subset of the retained audit. The
 joint initial-final coordinator removes a scope from the stable comparison only
 when it is present in exactly one union and eligible there; a PR observed in
 both unions is retained and compared exactly.
+
+For every terminal basis, report the v1 scope assurance as
+`artifact-publication-only`: the artifact is independently trustworthy for the
+selected publication-time evidence scope, but the report must not claim that
+GitHub Codex reviewed the current whole-PR range or that its internal input
+merge base was attested. `Result present` never turns an unreceipted historical
+artifact into current-scope evidence. This wording requirement records the
+accepted trust boundary without adding request/run/artifact lineage.
 
 ```yaml
 request_policy:

@@ -6207,6 +6207,40 @@ printf '%s\n' "$trusted_uv"
                     normalized_document,
                 )
 
+        for document_name, document in artifact_publication_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(legacy_receipt_migration_document=document_name):
+                for migration_anchor in (
+                    "legacy receipt migration never adopts an old artifact "
+                    "retroactively",
+                    "caller-owned manual",
+                    "manual exact @codex review trigger",
+                    "pre-artifact",
+                    "neither performs nor repeats",
+                    "reaction-only evidence is unavailable",
+                    "only a later terminal artifact",
+                    "proved base-changed-same-head",
+                    "empty or anchor commit",
+                ):
+                    self.assertIn(migration_anchor, normalized_document)
+
+        normalized_authority_report_contract = " ".join(
+            section_text(authority, "## Required Report Fields")
+            .lower()
+            .replace("`", "")
+            .split()
+        )
+        for publication_only_report_anchor in (
+            "artifact-publication-only",
+            "must not claim that github codex reviewed the current whole-pr range",
+            "result present never turns an unreceipted historical artifact into "
+            "current-scope evidence",
+        ):
+            self.assertIn(
+                publication_only_report_anchor,
+                normalized_authority_report_contract,
+            )
+
         authority_report_section = section_text(
             authority,
             "## Required Report Fields",
@@ -22146,6 +22180,18 @@ printf '%s\n' "$trusted_uv"
                 "evidence_basis": evidence_basis,
             }
 
+        def complete_report_matches_expected(
+            report: object,
+            expected: object,
+        ) -> bool:
+            return (
+                expected is not None
+                and isinstance(report, dict)
+                and set(report)
+                == {"request_policy", "provider_profile", "evidence_basis"}
+                and typed_json_equal(report, expected)
+            )
+
         def validate_complete_report(
             report: object,
             *,
@@ -22162,13 +22208,7 @@ printf '%s\n' "$trusted_uv"
                 current_record,
                 local_lane_timing,
             )
-            return (
-                expected is not None
-                and isinstance(report, dict)
-                and set(report)
-                == {"request_policy", "provider_profile", "evidence_basis"}
-                and typed_json_equal(report, expected)
-            )
+            return complete_report_matches_expected(report, expected)
 
         samples = [sample(pr) for pr in (2, 3, 4)]
         current_request = request(10, 10, pr=current_pr)
@@ -29083,6 +29123,62 @@ printf '%s\n' "$trusted_uv"
             )
         )
         self.assertEqual(plane_cache_producer_calls, 2)
+
+        exit_clock_mutation_inventory = {"state": "stable"}
+        exit_clock_mutation_calls = 0
+        exit_clock_mutation_at: int | None = None
+
+        def exit_clock_mutation_clock() -> float:
+            nonlocal exit_clock_mutation_calls
+            exit_clock_mutation_calls += 1
+            if exit_clock_mutation_calls == exit_clock_mutation_at:
+                # Protect content stability, not merely object identity or shape:
+                # the exit-time clock hook swaps an equal-length scalar after the
+                # preflight traversal, so the digest traversal must observe it.
+                exit_clock_mutation_inventory["state"] = "change"
+            return float(exit_clock_mutation_calls)
+
+        exit_clock_mutation_context = new_inventory_validation_context(
+            monotonic_clock=exit_clock_mutation_clock
+        )
+        assert exit_clock_mutation_context is not None
+        exit_clock_mutation_parts = inventory_validation_context_parts(
+            exit_clock_mutation_context
+        )
+        assert exit_clock_mutation_parts is not None
+        exit_clock_mutation_producer_calls = 0
+
+        def exit_clock_mutation_producer() -> dict[str, bool]:
+            nonlocal exit_clock_mutation_producer_calls
+            exit_clock_mutation_producer_calls += 1
+            return {"accepted": True}
+
+        self.assertTrue(
+            typed_json_equal(
+                inventory_validation_memoized(
+                    exit_clock_mutation_context,
+                    namespace="exit-clock-content-stability-v1",
+                    inventory=exit_clock_mutation_inventory,
+                    producer=exit_clock_mutation_producer,
+                    budget_tracker=exit_clock_mutation_parts[1],
+                ),
+                {"accepted": True},
+            )
+        )
+        exit_clock_mutation_at = exit_clock_mutation_calls + 2
+        self.assertIsNone(
+            inventory_validation_memoized(
+                exit_clock_mutation_context,
+                namespace="exit-clock-content-stability-v1",
+                inventory=exit_clock_mutation_inventory,
+                producer=exit_clock_mutation_producer,
+                budget_tracker=exit_clock_mutation_parts[1],
+            )
+        )
+        self.assertEqual(exit_clock_mutation_inventory, {"state": "change"})
+        self.assertEqual(exit_clock_mutation_producer_calls, 1)
+        self.assertIs(exit_clock_mutation_parts[1]["failed"], False)
+
         root_tracker_producer_calls = 0
 
         def root_tracker_producer() -> dict[str, bool]:
@@ -29966,6 +30062,75 @@ printf '%s\n' "$trusted_uv"
             hashlib.sha256 = original_sha256
         self.assertIsNone(equal_summary_result)
         self.assertGreater(equal_summary_hash_calls, 0)
+
+        artifact_pass_boundary_mutation = clone(
+            terminal_current["evidence_state"]["terminal_payloads"][0]
+        )
+        assert isinstance(artifact_pass_boundary_mutation, dict)
+        artifact_pass_boundary_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 70.0
+        )
+        assert artifact_pass_boundary_context is not None
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                artifact_pass_boundary_mutation,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=artifact_pass_boundary_context,
+            )
+        )
+        artifact_pass_boundary_modes: list[bool] = []
+        artifact_pass_boundary_mutated = False
+        original_bounded_json_fingerprint_pass = bounded_json_fingerprint_pass
+
+        def mutate_artifact_after_prehash_pass(
+            value: object,
+            *,
+            resource_tracker: dict[str, object],
+            calculate_digest: bool,
+        ) -> tuple[tuple[object, ...], str | None] | None:
+            nonlocal artifact_pass_boundary_mutated
+            fingerprint = original_bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=calculate_digest,
+            )
+            if value is artifact_pass_boundary_mutation:
+                artifact_pass_boundary_modes.append(calculate_digest)
+                if (
+                    not calculate_digest
+                    and fingerprint is not None
+                    and not artifact_pass_boundary_mutated
+                ):
+                    # Protect content stability across the two observations: an
+                    # equal-length body change preserves identity and shape, so
+                    # only the following digest pass can reject the stale cache.
+                    snapshot = artifact_pass_boundary_mutation["final_snapshot"]
+                    assert isinstance(snapshot, dict)
+                    body = snapshot["body"]
+                    assert isinstance(body, str) and body
+                    snapshot["body"] = "X" + body[1:]
+                    artifact_pass_boundary_mutated = True
+            return fingerprint
+
+        bounded_json_fingerprint_pass = mutate_artifact_after_prehash_pass
+        try:
+            artifact_pass_boundary_result = validate_candidate_artifact(
+                artifact_pass_boundary_mutation,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=artifact_pass_boundary_context,
+            )
+        finally:
+            bounded_json_fingerprint_pass = original_bounded_json_fingerprint_pass
+        self.assertIsNone(artifact_pass_boundary_result)
+        self.assertIs(artifact_pass_boundary_mutated, True)
+        self.assertEqual(artifact_pass_boundary_modes, [False, True])
+        artifact_pass_boundary_parts = artifact_validation_context_parts(
+            artifact_pass_boundary_context
+        )
+        assert artifact_pass_boundary_parts is not None
+        self.assertIs(artifact_pass_boundary_parts[0]["failed"], False)
 
         decision_clock_calls = 0
 
@@ -34477,13 +34642,9 @@ printf '%s\n' "$trusted_uv"
         for name, report_near_miss in report_near_misses.items():
             with self.subTest(complete_report_near_miss=name):
                 self.assertFalse(
-                    validate_complete_report(
+                    complete_report_matches_expected(
                         report_near_miss,
-                        lane_state="accepted-reaction-clean",
-                        provider_declaration=declaration,
-                        candidate_history=duplicate_history,
-                        current_record=duplicate_current,
-                        local_lane_timing=normal_lane_timing,
+                        complete_report,
                     )
                 )
 
@@ -34720,14 +34881,19 @@ printf '%s\n' "$trusted_uv"
                     if case_name == "pre-provider-ineligible"
                     else normal_lane_timing
                 )
+                matrix_expected = expected_report_from_inputs(
+                    lane_state,
+                    declaration,
+                    matrix_history,
+                    matrix_current,
+                    matrix_lane_timing,
+                )
+                self.assertIsNotNone(matrix_expected)
+                assert isinstance(matrix_expected, dict)
                 self.assertTrue(
-                    validate_complete_report(
+                    complete_report_matches_expected(
                         null_report,
-                        lane_state=lane_state,
-                        provider_declaration=declaration,
-                        candidate_history=matrix_history,
-                        current_record=matrix_current,
-                        local_lane_timing=matrix_lane_timing,
+                        matrix_expected,
                     )
                 )
                 for request_policy_field in ("status", "warnings"):
@@ -34737,39 +34903,27 @@ printf '%s\n' "$trusted_uv"
                         request_policy_field
                     ]
                     self.assertFalse(
-                        validate_complete_report(
+                        complete_report_matches_expected(
                             missing_matrix_policy_field,
-                            lane_state=lane_state,
-                            provider_declaration=declaration,
-                            candidate_history=matrix_history,
-                            current_record=matrix_current,
-                            local_lane_timing=matrix_lane_timing,
+                            matrix_expected,
                         )
                     )
                 boolean_matrix_profile = clone(null_report)
                 assert isinstance(boolean_matrix_profile, dict)
                 boolean_matrix_profile["provider_profile"] = False
                 self.assertFalse(
-                    validate_complete_report(
+                    complete_report_matches_expected(
                         boolean_matrix_profile,
-                        lane_state=lane_state,
-                        provider_declaration=declaration,
-                        candidate_history=matrix_history,
-                        current_record=matrix_current,
-                        local_lane_timing=matrix_lane_timing,
+                        matrix_expected,
                     )
                 )
                 boolean_matrix_basis = clone(null_report)
                 assert isinstance(boolean_matrix_basis, dict)
                 boolean_matrix_basis["evidence_basis"] = False
                 self.assertFalse(
-                    validate_complete_report(
+                    complete_report_matches_expected(
                         boolean_matrix_basis,
-                        lane_state=lane_state,
-                        provider_declaration=declaration,
-                        candidate_history=matrix_history,
-                        current_record=matrix_current,
-                        local_lane_timing=matrix_lane_timing,
+                        matrix_expected,
                     )
                 )
 
