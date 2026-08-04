@@ -10920,24 +10920,37 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 return cached if isinstance(cached, tuple) else None
+            baseline_fingerprint = bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=True,
+            )
+            if (
+                baseline_fingerprint is None
+                or baseline_fingerprint[0] != wrapper_summary
+                or not isinstance(baseline_fingerprint[1], str)
+            ):
+                return None
+            baseline_digest = baseline_fingerprint[1]
             validated = _validate_candidate_artifact_uncached(
                 value,
                 expected_kind=expected_kind,
                 expected_scope=expected_scope,
                 artifact_receipt_resource_tracker=resource_tracker,
             )
-            if validated is None:
-                if resource_tracker.get("failed") is not False:
-                    return None
-            wrapper_fingerprint = bounded_json_fingerprint_pass(
+            if resource_tracker.get("failed") is not False:
+                return None
+            confirmation_fingerprint = bounded_json_fingerprint_pass(
                 value,
                 resource_tracker=resource_tracker,
                 calculate_digest=True,
             )
             if (
-                wrapper_fingerprint is None
-                or wrapper_fingerprint[0] != wrapper_summary
-                or not isinstance(wrapper_fingerprint[1], str)
+                confirmation_fingerprint is None
+                or confirmation_fingerprint[0] != wrapper_summary
+                or confirmation_fingerprint[0] != baseline_fingerprint[0]
+                or not isinstance(confirmation_fingerprint[1], str)
+                or confirmation_fingerprint[1] != baseline_digest
             ):
                 return None
             validated_artifacts[cache_key] = {
@@ -10945,7 +10958,7 @@ printf '%s\n' "$trusted_uv"
                 "wrapper": value,
                 "header": wrapper_header,
                 "summary": wrapper_summary,
-                "digest": wrapper_fingerprint[1],
+                "digest": confirmation_fingerprint[1],
                 "validated": validated,
             }
             return validated
@@ -10956,6 +10969,33 @@ printf '%s\n' "$trusted_uv"
             "active_top_level_findings": "active-top-level-finding",
             "unresolved_thread_findings": "unresolved-thread-finding",
         }
+
+        def artifact_authority_role(
+            artifact_kind: object,
+            outcome: object,
+        ) -> str | None:
+            if (
+                artifact_kind == "terminal-payload"
+                and outcome == "clean"
+            ):
+                return "clean"
+            if artifact_kind in {
+                "terminal-payload",
+                "active-top-level-finding",
+            } and outcome == "findings":
+                return "finding"
+            if (
+                artifact_kind == "unresolved-thread-finding"
+                and outcome == "findings"
+            ):
+                return "unresolved-thread-finding"
+            if (
+                artifact_kind == "malformed-terminal-artifact"
+                and outcome == "malformed"
+            ):
+                return "malformed"
+            return None
+
         unordered_invalid_review_state_marker = object()
 
         def precharged_artifact_wrapper_arrays(
@@ -12146,17 +12186,21 @@ printf '%s\n' "$trusted_uv"
                     (
                         server_time,
                         artifact_id,
-                        _,
+                        validated_kind,
                         semantic,
                         channel,
                         artifact_commit,
                     ) = validated
+                    role = artifact_authority_role(validated_kind, semantic)
+                    if role is None:
+                        return None
                     source_bundle = artifact_source_bundle(artifact["final_snapshot"])
                     audit_entry = {
                         "server_time": server_time,
                         "id": artifact_id,
                         "channel": channel,
                         "semantic": semantic,
+                        "role": role,
                         "artifact_commit": (
                             None
                             if channel == "issue-comment" and semantic == "malformed"
@@ -12554,18 +12598,32 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 return cached_result
-            result = producer()
-            if budget_tracker.get("failed") is not False:
-                return None
-            fingerprint = bounded_json_fingerprint_pass(
+            baseline_fingerprint = bounded_json_fingerprint_pass(
                 inventory,
                 resource_tracker=budget_tracker,
                 calculate_digest=True,
             )
             if (
-                fingerprint is None
-                or fingerprint[0] != summary
-                or not isinstance(fingerprint[1], str)
+                baseline_fingerprint is None
+                or baseline_fingerprint[0] != summary
+                or not isinstance(baseline_fingerprint[1], str)
+            ):
+                return None
+            baseline_digest = baseline_fingerprint[1]
+            result = producer()
+            if budget_tracker.get("failed") is not False:
+                return None
+            confirmation_fingerprint = bounded_json_fingerprint_pass(
+                inventory,
+                resource_tracker=budget_tracker,
+                calculate_digest=True,
+            )
+            if (
+                confirmation_fingerprint is None
+                or confirmation_fingerprint[0] != summary
+                or confirmation_fingerprint[0] != baseline_fingerprint[0]
+                or not isinstance(confirmation_fingerprint[1], str)
+                or confirmation_fingerprint[1] != baseline_digest
             ):
                 return None
             memo[cache_key] = {
@@ -12573,7 +12631,7 @@ printf '%s\n' "$trusted_uv"
                 "inventory": inventory,
                 "header": header,
                 "summary": summary,
-                "digest": fingerprint[1],
+                "digest": confirmation_fingerprint[1],
                 "result": result,
             }
             return result
@@ -16350,12 +16408,14 @@ printf '%s\n' "$trusted_uv"
                         )
                     )
 
-                artifact_bases: list[tuple[int, int, str, str, str, str | None]] = []
+                artifact_bases: list[
+                    tuple[int, int, str, str, str, str | None, str]
+                ] = []
                 unresolved_artifact_bases: list[
-                    tuple[int, int, str, str, str, str | None]
+                    tuple[int, int, str, str, str, str | None, str]
                 ] = []
                 invalid_review_state_blockers: list[
-                    tuple[int, int, str, str, str, str | None]
+                    tuple[int, int, str, str, str, str | None, str]
                 ] = []
                 for review_id, raw_review in review_by_id.items():
                     user = raw_review.get("user")
@@ -16461,6 +16521,30 @@ printf '%s\n' "$trusted_uv"
                         if parsed_scope == current_scope_key and semantic == "clean":
                             continue
                         return None
+                    invalid_review_state = (
+                        _github_codex_invalid_review_state_terminal_signal(
+                            body,
+                            state=state,
+                            has_associated_children=bool(
+                                associated_inline_by_review[review_id]
+                            ),
+                        )
+                    )
+                    has_unresolved_finding = semantic == "findings" and any(
+                        finding.get("is_resolved") is False for finding in joined
+                    )
+                    raw_artifact_kind = (
+                        "malformed-terminal-artifact"
+                        if invalid_review_state or semantic == "malformed"
+                        else (
+                            "unresolved-thread-finding"
+                            if has_unresolved_finding
+                            else "terminal-payload"
+                        )
+                    )
+                    role = artifact_authority_role(raw_artifact_kind, semantic)
+                    if role is None:
+                        return None
                     artifact_basis = (
                         submitted_at,
                         review_id,
@@ -16470,19 +16554,12 @@ printf '%s\n' "$trusted_uv"
                             canonical_raw_body(source_bundle).encode("utf-8")
                         ).hexdigest(),
                         review_commit,
+                        role,
                     )
                     artifact_bases.append(artifact_basis)
-                    if _github_codex_invalid_review_state_terminal_signal(
-                        body,
-                        state=state,
-                        has_associated_children=bool(
-                            associated_inline_by_review[review_id]
-                        ),
-                    ):
+                    if invalid_review_state:
                         invalid_review_state_blockers.append(artifact_basis)
-                    if semantic == "findings" and any(
-                        finding.get("is_resolved") is False for finding in joined
-                    ):
+                    if has_unresolved_finding:
                         unresolved_artifact_bases.append(artifact_basis)
 
                 for raw_issue in issue_artifacts:
@@ -16542,6 +16619,18 @@ printf '%s\n' "$trusted_uv"
                             continue
                     elif semantic == "findings" and parsed_commit != head:
                         return None
+                    raw_artifact_kind = (
+                        "active-top-level-finding"
+                        if semantic == "findings"
+                        else (
+                            "malformed-terminal-artifact"
+                            if semantic == "malformed"
+                            else "terminal-payload"
+                        )
+                    )
+                    role = artifact_authority_role(raw_artifact_kind, semantic)
+                    if role is None:
+                        return None
                     artifact_bases.append(
                         (
                             server_time,
@@ -16552,6 +16641,7 @@ printf '%s\n' "$trusted_uv"
                                 canonical_raw_body(raw_issue).encode("utf-8")
                             ).hexdigest(),
                             parsed_commit,
+                            role,
                         )
                     )
 
@@ -16949,6 +17039,7 @@ printf '%s\n' "$trusted_uv"
                     "id": artifact_id,
                     "channel": channel,
                     "semantic": semantic,
+                    "role": role,
                     "source_record_sha256": source_digest,
                     "artifact_commit": artifact_commit,
                 }
@@ -16959,6 +17050,7 @@ printf '%s\n' "$trusted_uv"
                     semantic,
                     source_digest,
                     artifact_commit,
+                    role,
                 ) in sorted(artifact_bases)
             ]
             scope_audit_nonterminal = [
@@ -17560,6 +17652,7 @@ printf '%s\n' "$trusted_uv"
                                 "id": artifact_id,
                                 "channel": channel,
                                 "semantic": semantic,
+                                "role": role,
                                 "source_record_sha256": source_digest,
                                 "artifact_commit": artifact_commit,
                             }
@@ -17570,6 +17663,7 @@ printf '%s\n' "$trusted_uv"
                                 semantic,
                                 source_digest,
                                 artifact_commit,
+                                role,
                             ) in sorted(artifact_bases)
                         ],
                         "provider_reactions": [
@@ -19071,11 +19165,14 @@ printf '%s\n' "$trusted_uv"
                     (
                         server_time,
                         artifact_id,
-                        _,
+                        validated_kind,
                         semantic,
                         channel,
                         artifact_commit,
                     ) = validated
+                    role = artifact_authority_role(validated_kind, semantic)
+                    if role is None:
+                        return None
                     native_identity = (channel, artifact_id)
                     if native_identity in artifact_audit_by_identity:
                         return None
@@ -19085,6 +19182,7 @@ printf '%s\n' "$trusted_uv"
                         "id": artifact_id,
                         "channel": channel,
                         "semantic": semantic,
+                        "role": role,
                         "artifact_commit": (
                             None
                             if channel == "issue-comment" and semantic == "malformed"
@@ -19918,6 +20016,233 @@ printf '%s\n' "$trusted_uv"
                 del authority["provider_reactions"]
             return projected
 
+        def legacy_unreceipted_artifact_partition(
+            record: dict[str, object],
+            raw_authority: object,
+            normalized_audit: dict[str, object],
+            *,
+            selected_ordering_key: tuple[int, int] | object,
+            selected_kind_override: str | None,
+            artifact_validation_context: dict[str, object],
+        ) -> list[dict[str, object]] | None:
+            raw_artifacts = (
+                raw_authority.get("applicable_artifacts")
+                if isinstance(raw_authority, dict)
+                else None
+            )
+            normalized_artifacts = normalized_audit.get("applicable_artifacts")
+            candidate_basis = record.get("candidate_basis")
+            if (
+                not isinstance(raw_artifacts, list)
+                or not isinstance(normalized_artifacts, list)
+            ):
+                return None
+
+            artifact_audit_fields = {
+                "server_time",
+                "id",
+                "channel",
+                "semantic",
+                "role",
+                "artifact_commit",
+                "source_record_sha256",
+            }
+
+            def artifacts_by_identity(
+                artifacts: list[object],
+            ) -> dict[tuple[str, int], dict[str, object]] | None:
+                by_identity: dict[tuple[str, int], dict[str, object]] = {}
+                for artifact in artifacts:
+                    if (
+                        not isinstance(artifact, dict)
+                        or set(artifact) != artifact_audit_fields
+                        or not isinstance(artifact.get("channel"), str)
+                        or type(artifact.get("id")) is not int
+                        or type(artifact.get("server_time")) is not int
+                        or artifact["server_time"] <= 0
+                        or artifact.get("role")
+                        not in {
+                            "clean",
+                            "finding",
+                            "unresolved-thread-finding",
+                            "malformed",
+                        }
+                        or not isinstance(artifact.get("source_record_sha256"), str)
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}", artifact["source_record_sha256"]
+                        )
+                        is None
+                    ):
+                        return None
+                    identity = (artifact["channel"], artifact["id"])
+                    if identity in by_identity:
+                        return None
+                    by_identity[identity] = artifact
+                return by_identity
+
+            raw_by_identity = artifacts_by_identity(raw_artifacts)
+            normalized_by_identity = artifacts_by_identity(normalized_artifacts)
+            if raw_by_identity is None or normalized_by_identity is None:
+                return None
+
+            if (
+                isinstance(candidate_basis, dict)
+                and candidate_basis.get("kind") == "reaction"
+            ):
+                return (
+                    []
+                    if not raw_by_identity and not normalized_by_identity
+                    else None
+                )
+            if (
+                not isinstance(selected_ordering_key, tuple)
+                or len(selected_ordering_key) != 2
+                or type(selected_ordering_key[0]) is not int
+                or type(selected_ordering_key[1]) is not int
+            ):
+                return (
+                    []
+                    if set(raw_by_identity) == set(normalized_by_identity)
+                    and all(
+                        typed_json_equal(
+                            raw_by_identity[identity],
+                            normalized_artifact,
+                        )
+                        for identity, normalized_artifact in (
+                            normalized_by_identity.items()
+                        )
+                    )
+                    else None
+                )
+
+            selected_kind = (
+                selected_kind_override
+                if selected_kind_override is not None
+                else (
+                    candidate_basis.get("kind")
+                    if isinstance(candidate_basis, dict)
+                    else None
+                )
+            )
+            artifact_field_by_kind = {
+                "terminal-payload": "terminal_payloads",
+                "malformed-terminal-artifact": "malformed_terminal_artifacts",
+                "active-top-level-finding": "active_top_level_findings",
+                "unresolved-thread-finding": "unresolved_thread_findings",
+            }
+            selected_field = artifact_field_by_kind.get(selected_kind)
+            evidence_state = record.get("evidence_state")
+            record_scope = scope_key(record)
+            selected_wrappers = (
+                evidence_state.get(selected_field)
+                if isinstance(evidence_state, dict)
+                and isinstance(selected_field, str)
+                else None
+            )
+            if (
+                not isinstance(selected_kind, str)
+                or not isinstance(selected_wrappers, list)
+                or record_scope is None
+            ):
+                return None
+
+            selected_validations: list[
+                tuple[dict[str, object], tuple[int, int, str, str, str, str]]
+            ] = []
+            for wrapper in selected_wrappers:
+                validated = validate_candidate_artifact(
+                    wrapper,
+                    expected_kind=selected_kind,
+                    expected_scope=record_scope,
+                    artifact_validation_context=artifact_validation_context,
+                )
+                if (
+                    validated is not None
+                    and (validated[0], validated[1]) == selected_ordering_key
+                    and isinstance(wrapper, dict)
+                ):
+                    selected_validations.append((wrapper, validated))
+            if len(selected_validations) != 1:
+                return None
+            selected_wrapper, selected_before = selected_validations[0]
+            selected_identity = (selected_before[4], selected_before[1])
+
+            artifact_receipt = selected_wrapper.get("artifact_scope_receipt")
+            pre_scope_receipts = (
+                artifact_receipt.get("pre_artifact_scope_receipts")
+                if isinstance(artifact_receipt, dict)
+                else None
+            )
+            pull_receipt = (
+                pre_scope_receipts.get("pull")
+                if isinstance(pre_scope_receipts, dict)
+                else None
+            )
+            compare_receipt = (
+                pre_scope_receipts.get("compare")
+                if isinstance(pre_scope_receipts, dict)
+                else None
+            )
+            pre_scope_times = (
+                parse_http_date(pull_receipt.get("date_header"))
+                if isinstance(pull_receipt, dict)
+                else None,
+                parse_http_date(compare_receipt.get("date_header"))
+                if isinstance(compare_receipt, dict)
+                else None,
+            )
+            selected_after = validate_candidate_artifact(
+                selected_wrapper,
+                expected_kind=selected_kind,
+                expected_scope=record_scope,
+                artifact_validation_context=artifact_validation_context,
+            )
+            if (
+                any(type(server_time) is not int for server_time in pre_scope_times)
+                or selected_after is None
+                or selected_after != selected_before
+            ):
+                return None
+
+            if (
+                selected_identity not in normalized_by_identity
+                or not set(normalized_by_identity).issubset(raw_by_identity)
+                or any(
+                    not typed_json_equal(
+                        raw_by_identity[identity],
+                        normalized_artifact,
+                    )
+                    for identity, normalized_artifact in normalized_by_identity.items()
+                )
+            ):
+                return None
+
+            legacy_artifacts: list[dict[str, object]] = []
+            for identity in sorted(
+                set(raw_by_identity) - set(normalized_by_identity),
+                key=lambda item: (str(item[0]), int(item[1])),
+            ):
+                artifact = raw_by_identity[identity]
+                if artifact["role"] not in {"clean", "finding"} or not all(
+                    artifact["server_time"] < boundary
+                    for boundary in pre_scope_times
+                ):
+                    return None
+                legacy_artifacts.append(
+                    {
+                        "scope_authority": "unreceipted-audit-only-v1",
+                        "role": artifact["role"],
+                        "channel": artifact["channel"],
+                        "id": artifact["id"],
+                        "server_time": artifact["server_time"],
+                        "artifact_commit": artifact["artifact_commit"],
+                        "source_record_sha256": artifact[
+                            "source_record_sha256"
+                        ],
+                    }
+                )
+            return legacy_artifacts
+
         def normalized_current_decision_entry(
             record: dict[str, object],
             raw_entry: dict[str, object],
@@ -20054,10 +20379,24 @@ printf '%s\n' "$trusted_uv"
                 or not isinstance(lifecycle, dict)
             ):
                 return None
+            legacy_unreceipted_artifacts = legacy_unreceipted_artifact_partition(
+                authority_record,
+                raw_authority,
+                normalized_audit,
+                selected_ordering_key=ordering_key,
+                selected_kind_override=selected_kind_override,
+                artifact_validation_context=artifact_context,
+            )
+            raw_applicable_artifacts = raw_authority.get("applicable_artifacts")
+            if (
+                legacy_unreceipted_artifacts is None
+                or not isinstance(raw_applicable_artifacts, list)
+            ):
+                return None
             expected_authority: dict[str, object] = {
                 "scope": clone(raw_scope),
                 "lifecycle": clone(lifecycle),
-                "applicable_artifacts": clone(normalized_audit["applicable_artifacts"]),
+                "applicable_artifacts": clone(raw_applicable_artifacts),
             }
             if retain_request_reaction_records:
                 raw_requests = record.get("requests")
@@ -20171,6 +20510,7 @@ printf '%s\n' "$trusted_uv"
                 ),
                 "source_evidence": source_evidence,
                 "current_authority_projection": expected_authority,
+                "legacy_unreceipted_artifacts": legacy_unreceipted_artifacts,
             }
 
         def current_raw_authority_matches(
@@ -20324,10 +20664,31 @@ printf '%s\n' "$trusted_uv"
                 finding_ancestry=ancestry,
                 inventory_validation_context=final_context,
             )
+            initial_legacy_artifacts = (
+                expected_initial_decision_entry.pop(
+                    "legacy_unreceipted_artifacts",
+                    None,
+                )
+                if isinstance(expected_initial_decision_entry, dict)
+                else None
+            )
+            final_legacy_artifacts = (
+                expected_final_decision_entry.pop(
+                    "legacy_unreceipted_artifacts",
+                    None,
+                )
+                if isinstance(expected_final_decision_entry, dict)
+                else None
+            )
             return (
                 initial_decision_entry is not None
                 and expected_initial_decision_entry is not None
                 and expected_final_decision_entry is not None
+                and isinstance(initial_legacy_artifacts, list)
+                and typed_json_equal(
+                    initial_legacy_artifacts,
+                    final_legacy_artifacts,
+                )
                 and typed_json_equal(
                     initial_decision_entry,
                     expected_initial_decision_entry,
@@ -20377,6 +20738,12 @@ printf '%s\n' "$trusted_uv"
                 inventory_validation_context=final_context,
             )
             if final_entry is None or expected_final_decision_entry is None:
+                return False
+            final_legacy_artifacts = expected_final_decision_entry.pop(
+                "legacy_unreceipted_artifacts",
+                None,
+            )
+            if not isinstance(final_legacy_artifacts, list):
                 return False
             final_authority = final_entry.get("current_authority_projection")
             final_requests = (
@@ -21352,6 +21719,70 @@ printf '%s\n' "$trusted_uv"
                 },
             }
 
+        def stable_legacy_unreceipted_artifacts(
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+            *,
+            prefer_unresolved_thread_blocker: bool = False,
+            inventory_validation_contexts: dict[str, object] | None = None,
+        ) -> list[dict[str, object]] | None:
+            ancestry = current_ancestry_mapping(candidate_history)
+            if ancestry is None:
+                return None
+            phase_legacy_artifacts: dict[str, list[dict[str, object]]] = {}
+            for phase in ("initial", "final"):
+                inventory = candidate_history.get(f"{phase}_current_raw_inventory")
+                inventory_context = (
+                    report_inventory_validation_context_for(
+                        inventory_validation_contexts,
+                        f"{phase}_current_raw_inventory",
+                    )
+                    if inventory_validation_contexts is not None
+                    else new_inventory_validation_context()
+                )
+                if not isinstance(inventory, dict) or inventory_context is None:
+                    return None
+                raw_entry = parse_current_endpoint_inventory(
+                    inventory,
+                    current_ancestry=ancestry,
+                    prefer_unresolved_thread_blocker=(
+                        prefer_unresolved_thread_blocker
+                    ),
+                    _inventory_validation_context=inventory_context,
+                )
+                if raw_entry is None:
+                    return None
+                expected_entry = normalized_current_decision_entry(
+                    current_record,
+                    raw_entry,
+                    prefer_unresolved_thread_blocker=(
+                        prefer_unresolved_thread_blocker
+                    ),
+                    retain_request_reaction_records=False,
+                    finding_ancestry=ancestry,
+                    inventory_validation_context=inventory_context,
+                )
+                legacy_artifacts = (
+                    expected_entry.pop("legacy_unreceipted_artifacts", None)
+                    if isinstance(expected_entry, dict)
+                    else None
+                )
+                if (
+                    not isinstance(legacy_artifacts, list)
+                    or not typed_json_equal(
+                        current_decision_authority_entry(raw_entry),
+                        expected_entry,
+                    )
+                ):
+                    return None
+                phase_legacy_artifacts[phase] = legacy_artifacts
+            if not typed_json_equal(
+                phase_legacy_artifacts.get("initial"),
+                phase_legacy_artifacts.get("final"),
+            ):
+                return None
+            return clone(phase_legacy_artifacts["final"])
+
         def reaction_evidence_basis_from_inputs(
             provider_declaration: dict[str, object] | None,
             candidate_history: dict[str, object],
@@ -21767,9 +22198,15 @@ printf '%s\n' "$trusted_uv"
                 require_request_reaction_stability=False,
                 inventory_validation_contexts=inventory_validation_contexts,
             )
+            legacy_unreceipted_artifacts = stable_legacy_unreceipted_artifacts(
+                candidate_history,
+                current_record,
+                inventory_validation_contexts=inventory_validation_contexts,
+            )
             if (
                 not isinstance(selected_final, dict)
                 or current_raw_authority is None
+                or legacy_unreceipted_artifacts is None
                 or not current_raw_authority_matches(
                     candidate_history,
                     current_record,
@@ -21780,6 +22217,8 @@ printf '%s\n' "$trusted_uv"
                 return None
             return {
                 "kind": selected_final["channel"],
+                "scope_assurance": "artifact-publication-only",
+                "legacy_unreceipted_artifacts": legacy_unreceipted_artifacts,
                 "selection_snapshots": {
                     "initial": clone(initial_snapshot),
                     "final": clone(final_snapshot),
@@ -21908,9 +22347,18 @@ printf '%s\n' "$trusted_uv"
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 inventory_validation_contexts=inventory_validation_contexts,
             )
+            legacy_unreceipted_artifacts = stable_legacy_unreceipted_artifacts(
+                candidate_history,
+                current_record,
+                prefer_unresolved_thread_blocker=(
+                    prefer_unresolved_thread_blocker
+                ),
+                inventory_validation_contexts=inventory_validation_contexts,
+            )
             if (
                 not isinstance(selected_final, dict)
                 or current_raw_authority is None
+                or legacy_unreceipted_artifacts is None
                 or not current_raw_authority_matches(
                     candidate_history,
                     current_record,
@@ -21922,6 +22370,8 @@ printf '%s\n' "$trusted_uv"
                 return None
             return {
                 "kind": selected_final["channel"],
+                "scope_assurance": "artifact-publication-only",
+                "legacy_unreceipted_artifacts": legacy_unreceipted_artifacts,
                 "selection_snapshots": {
                     "initial": clone(initial_snapshot),
                     "final": clone(final_snapshot),
@@ -29121,6 +29571,62 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertEqual(plane_cache_producer_calls, 2)
 
+        cold_mutation_inventory = {"state": "before"}
+        cold_mutation_context = new_inventory_validation_context(
+            monotonic_clock=lambda: 0.0
+        )
+        assert cold_mutation_context is not None
+        cold_mutation_parts = inventory_validation_context_parts(
+            cold_mutation_context
+        )
+        assert cold_mutation_parts is not None
+        cold_mutation_events: list[str] = []
+        original_bounded_json_fingerprint_pass = bounded_json_fingerprint_pass
+
+        def observe_cold_mutation_inventory_fingerprint(
+            value: object,
+            *,
+            resource_tracker: dict[str, object],
+            calculate_digest: bool,
+        ) -> tuple[tuple[object, ...], str | None] | None:
+            if value is cold_mutation_inventory:
+                cold_mutation_events.append(
+                    "digest" if calculate_digest else "no-hash"
+                )
+            return original_bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=calculate_digest,
+            )
+
+        def cold_mutation_inventory_producer() -> dict[str, bool]:
+            cold_mutation_events.append("producer")
+            # Protect content stability across cold validation. This preserves
+            # identity, type, shape, and scalar byte length while changing the
+            # exact memo subject after the bounded baseline digest.
+            cold_mutation_inventory["state"] = "after!"
+            return {"accepted": True}
+
+        bounded_json_fingerprint_pass = observe_cold_mutation_inventory_fingerprint
+        try:
+            cold_mutation_result = inventory_validation_memoized(
+                cold_mutation_context,
+                namespace="cold-content-stability-v1",
+                inventory=cold_mutation_inventory,
+                producer=cold_mutation_inventory_producer,
+                budget_tracker=cold_mutation_parts[1],
+            )
+        finally:
+            bounded_json_fingerprint_pass = original_bounded_json_fingerprint_pass
+        self.assertIsNone(cold_mutation_result)
+        self.assertEqual(
+            cold_mutation_events,
+            ["no-hash", "digest", "producer", "digest"],
+        )
+        self.assertEqual(cold_mutation_inventory, {"state": "after!"})
+        self.assertEqual(cold_mutation_parts[4], {})
+        self.assertIs(cold_mutation_parts[1]["failed"], False)
+
         exit_clock_mutation_inventory = {"state": "stable"}
         exit_clock_mutation_calls = 0
         exit_clock_mutation_at: int | None = None
@@ -30128,6 +30634,74 @@ printf '%s\n' "$trusted_uv"
         )
         assert artifact_pass_boundary_parts is not None
         self.assertIs(artifact_pass_boundary_parts[0]["failed"], False)
+
+        cold_mutation_artifact = clone(
+            terminal_current["evidence_state"]["terminal_payloads"][0]
+        )
+        assert isinstance(cold_mutation_artifact, dict)
+        cold_mutation_artifact_context = new_artifact_validation_context(
+            monotonic_clock=lambda: 80.0
+        )
+        assert cold_mutation_artifact_context is not None
+        cold_mutation_artifact_events: list[str] = []
+        original_bounded_json_fingerprint_pass = bounded_json_fingerprint_pass
+        original_artifact_producer = _validate_candidate_artifact_uncached
+
+        def observe_cold_mutation_artifact_fingerprint(
+            value: object,
+            *,
+            resource_tracker: dict[str, object],
+            calculate_digest: bool,
+        ) -> tuple[tuple[object, ...], str | None] | None:
+            if value is cold_mutation_artifact:
+                cold_mutation_artifact_events.append(
+                    "digest" if calculate_digest else "no-hash"
+                )
+            return original_bounded_json_fingerprint_pass(
+                value,
+                resource_tracker=resource_tracker,
+                calculate_digest=calculate_digest,
+            )
+
+        def mutate_cold_artifact_during_validation(
+            value: object, **kwargs: object
+        ) -> object:
+            if value is not cold_mutation_artifact:
+                return original_artifact_producer(value, **kwargs)
+            cold_mutation_artifact_events.append("validator")
+            validated = original_artifact_producer(value, **kwargs)
+            assert validated is not None
+            final_snapshot = cold_mutation_artifact["final_snapshot"]
+            assert isinstance(final_snapshot, dict)
+            body = final_snapshot["body"]
+            assert isinstance(body, str) and body
+            replacement = "X" if body[0] != "X" else "Y"
+            final_snapshot["body"] = replacement + body[1:]
+            return validated
+
+        bounded_json_fingerprint_pass = observe_cold_mutation_artifact_fingerprint
+        _validate_candidate_artifact_uncached = mutate_cold_artifact_during_validation
+        try:
+            cold_mutation_artifact_result = validate_candidate_artifact(
+                cold_mutation_artifact,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=cold_mutation_artifact_context,
+            )
+        finally:
+            bounded_json_fingerprint_pass = original_bounded_json_fingerprint_pass
+            _validate_candidate_artifact_uncached = original_artifact_producer
+        self.assertIsNone(cold_mutation_artifact_result)
+        self.assertEqual(
+            cold_mutation_artifact_events,
+            ["no-hash", "digest", "validator", "digest"],
+        )
+        cold_mutation_artifact_parts = artifact_validation_context_parts(
+            cold_mutation_artifact_context
+        )
+        assert cold_mutation_artifact_parts is not None
+        self.assertEqual(cold_mutation_artifact_parts[1], {})
+        self.assertIs(cold_mutation_artifact_parts[0]["failed"], False)
 
         decision_clock_calls = 0
 
@@ -33270,10 +33844,20 @@ printf '%s\n' "$trusted_uv"
                     set(terminal_report_basis),
                     {
                         "kind",
+                        "scope_assurance",
+                        "legacy_unreceipted_artifacts",
                         "selection_snapshots",
                         "artifact",
                         "current_raw_authority",
                     },
+                )
+                self.assertEqual(
+                    terminal_report_basis["scope_assurance"],
+                    "artifact-publication-only",
+                )
+                self.assertEqual(
+                    terminal_report_basis["legacy_unreceipted_artifacts"],
+                    [],
                 )
                 self.assertEqual(
                     terminal_report_basis["kind"],
@@ -33295,6 +33879,14 @@ printf '%s\n' "$trusted_uv"
                     report_example = authority.split("## Required Report Fields", 1)[
                         1
                     ].split("| Lane state", 1)[0]
+                    documented_scope_assurance = report_example.split(
+                        "  scope_assurance: ",
+                        1,
+                    )[1].splitlines()[0]
+                    self.assertEqual(
+                        documented_scope_assurance,
+                        "artifact-publication-only",
+                    )
                     actual_artifact = terminal_report_basis["artifact"]
                     documented_artifact_json = report_example.split("  artifact: ", 1)[
                         1
@@ -33353,6 +33945,9 @@ printf '%s\n' "$trusted_uv"
                     )
                     documented_round_trip = clone(terminal_report)
                     assert isinstance(documented_round_trip, dict)
+                    documented_round_trip["evidence_basis"][
+                        "scope_assurance"
+                    ] = documented_scope_assurance
                     documented_round_trip["evidence_basis"]["artifact"] = clone(
                         documented_artifact
                     )
@@ -33418,6 +34013,34 @@ printf '%s\n' "$trusted_uv"
                         local_lane_timing=normal_lane_timing,
                     )
                 )
+                for mutation_name, mutation_value in (
+                    ("missing", "__DELETE__"),
+                    ("wrong", "whole-pr-reviewed"),
+                    ("null", None),
+                ):
+                    with self.subTest(
+                        accepted_terminal_scope_assurance=mutation_name,
+                    ):
+                        mutated_scope_assurance = clone(terminal_report)
+                        assert isinstance(mutated_scope_assurance, dict)
+                        if mutation_value == "__DELETE__":
+                            del mutated_scope_assurance["evidence_basis"][
+                                "scope_assurance"
+                            ]
+                        else:
+                            mutated_scope_assurance["evidence_basis"][
+                                "scope_assurance"
+                            ] = mutation_value
+                        self.assertFalse(
+                            validate_complete_report(
+                                mutated_scope_assurance,
+                                lane_state="accepted-terminal-clean",
+                                provider_declaration=declaration,
+                                candidate_history=terminal_report_history,
+                                current_record=terminal_report_current,
+                                local_lane_timing=normal_lane_timing,
+                            )
+                        )
 
         terminal_findings_current = clone(current)
         assert isinstance(terminal_findings_current, dict)
@@ -33735,6 +34358,22 @@ printf '%s\n' "$trusted_uv"
         unresolved_basis = unresolved_report["evidence_basis"]
         self.assertIsInstance(unresolved_basis, dict)
         assert isinstance(unresolved_basis, dict)
+        self.assertEqual(
+            set(unresolved_basis),
+            {
+                "kind",
+                "scope_assurance",
+                "legacy_unreceipted_artifacts",
+                "selection_snapshots",
+                "artifact",
+                "current_raw_authority",
+            },
+        )
+        self.assertEqual(
+            unresolved_basis["scope_assurance"],
+            "artifact-publication-only",
+        )
+        self.assertEqual(unresolved_basis["legacy_unreceipted_artifacts"], [])
         self.assertEqual(unresolved_basis["kind"], "pull-request-review")
         self.assertEqual(
             unresolved_basis["artifact"]["final_snapshot"]["artifact_kind"],
@@ -33754,6 +34393,34 @@ printf '%s\n' "$trusted_uv"
                 local_lane_timing=normal_lane_timing,
             )
         )
+        for mutation_name, mutation_value in (
+            ("missing", "__DELETE__"),
+            ("wrong", "whole-pr-reviewed"),
+            ("null", None),
+        ):
+            with self.subTest(
+                stable_blocker_scope_assurance=mutation_name,
+            ):
+                mutated_scope_assurance = clone(unresolved_report)
+                assert isinstance(mutated_scope_assurance, dict)
+                if mutation_value == "__DELETE__":
+                    del mutated_scope_assurance["evidence_basis"][
+                        "scope_assurance"
+                    ]
+                else:
+                    mutated_scope_assurance["evidence_basis"][
+                        "scope_assurance"
+                    ] = mutation_value
+                self.assertFalse(
+                    validate_complete_report(
+                        mutated_scope_assurance,
+                        lane_state="inconclusive",
+                        provider_declaration=declaration,
+                        candidate_history=unresolved_history,
+                        current_record=terminal_current_with_unresolved,
+                        local_lane_timing=normal_lane_timing,
+                    )
+                )
 
         malformed_current = clone(terminal_current)
         assert isinstance(malformed_current, dict)
@@ -33787,6 +34454,11 @@ printf '%s\n' "$trusted_uv"
         malformed_basis = malformed_report["evidence_basis"]
         self.assertIsInstance(malformed_basis, dict)
         assert isinstance(malformed_basis, dict)
+        self.assertEqual(
+            malformed_basis["scope_assurance"],
+            "artifact-publication-only",
+        )
+        self.assertEqual(malformed_basis["legacy_unreceipted_artifacts"], [])
         self.assertEqual(
             malformed_basis["artifact"]["final_snapshot"]["artifact_kind"],
             "malformed-terminal-artifact",
@@ -33989,6 +34661,269 @@ printf '%s\n' "$trusted_uv"
             80_312,
         )
 
+        def expected_legacy_unreceipted_audit(
+            artifact: dict[str, object],
+            *,
+            role: str,
+        ) -> dict[str, object]:
+            final_snapshot = artifact.get("final_snapshot")
+            assert isinstance(final_snapshot, dict)
+            source_bundle = artifact_source_bundle(final_snapshot)
+            channel = final_snapshot.get("channel")
+            artifact_commit = (
+                final_snapshot.get("commit_id")
+                if channel == "pull-request-review"
+                else final_snapshot.get("parsed_commit")
+            )
+            return {
+                "scope_authority": "unreceipted-audit-only-v1",
+                "role": role,
+                "channel": channel,
+                "id": final_snapshot.get("id"),
+                "server_time": final_snapshot.get("server_time"),
+                "artifact_commit": artifact_commit,
+                "source_record_sha256": hashlib.sha256(
+                    canonical_raw_body(source_bundle).encode("utf-8")
+                ).hexdigest(),
+            }
+
+        blocker_legacy_clean_artifact = complete_review_artifact(
+            malformed_current,
+            80_289,
+            malformed_time - 2,
+        )
+        raw_blocker_with_legacy_clean = clone(malformed_current)
+        assert isinstance(raw_blocker_with_legacy_clean, dict)
+        raw_blocker_with_legacy_clean["evidence_state"][
+            "terminal_payloads"
+        ].append(clone(blocker_legacy_clean_artifact))
+        restamp(raw_blocker_with_legacy_clean)
+        blocker_legacy_clean_history = history(
+            samples,
+            current_raw=raw_blocker_with_legacy_clean,
+        )
+        blocker_legacy_clean_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            blocker_legacy_clean_history,
+            malformed_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(blocker_legacy_clean_report)
+        assert isinstance(blocker_legacy_clean_report, dict)
+        blocker_legacy_clean_basis = blocker_legacy_clean_report["evidence_basis"]
+        self.assertIsInstance(blocker_legacy_clean_basis, dict)
+        assert isinstance(blocker_legacy_clean_basis, dict)
+        self.assertEqual(
+            blocker_legacy_clean_basis["artifact"]["final_snapshot"]["id"],
+            malformed_id,
+        )
+        self.assertEqual(
+            blocker_legacy_clean_basis["legacy_unreceipted_artifacts"],
+            [
+                expected_legacy_unreceipted_audit(
+                    blocker_legacy_clean_artifact,
+                    role="clean",
+                )
+            ],
+        )
+        self.assertTrue(
+            validate_complete_report(
+                blocker_legacy_clean_report,
+                lane_state="inconclusive",
+                provider_declaration=declaration,
+                candidate_history=blocker_legacy_clean_history,
+                current_record=malformed_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        legacy_clean_artifact = complete_review_artifact(
+            terminal_current,
+            80_290,
+            terminal_time - 2,
+        )
+        raw_with_legacy_clean = clone(terminal_current)
+        assert isinstance(raw_with_legacy_clean, dict)
+        raw_with_legacy_clean["evidence_state"]["terminal_payloads"].append(
+            clone(legacy_clean_artifact)
+        )
+        restamp(raw_with_legacy_clean)
+        legacy_clean_history = history(
+            samples,
+            current_raw=raw_with_legacy_clean,
+        )
+        legacy_clean_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            legacy_clean_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(legacy_clean_report)
+        assert isinstance(legacy_clean_report, dict)
+        self.assertEqual(
+            set(legacy_clean_report),
+            {"request_policy", "provider_profile", "evidence_basis"},
+        )
+        self.assertEqual(
+            legacy_clean_report["evidence_basis"][
+                "legacy_unreceipted_artifacts"
+            ],
+            [
+                expected_legacy_unreceipted_audit(
+                    legacy_clean_artifact,
+                    role="clean",
+                )
+            ],
+        )
+        self.assertTrue(
+            validate_complete_report(
+                legacy_clean_report,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=legacy_clean_history,
+                current_record=terminal_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        legacy_finding_artifact = complete_issue_comment_artifact(
+            terminal_current,
+            80_291,
+            terminal_time - 2,
+            artifact_kind="active-top-level-finding",
+            outcome="findings",
+        )
+        raw_with_legacy_finding = clone(terminal_current)
+        assert isinstance(raw_with_legacy_finding, dict)
+        raw_with_legacy_finding["evidence_state"][
+            "active_top_level_findings"
+        ].append(clone(legacy_finding_artifact))
+        restamp(raw_with_legacy_finding)
+        legacy_finding_history = history(
+            samples,
+            current_raw=raw_with_legacy_finding,
+            current_ancestry={current_head: 0},
+        )
+        legacy_finding_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            legacy_finding_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(legacy_finding_report)
+        assert isinstance(legacy_finding_report, dict)
+        self.assertEqual(
+            legacy_finding_report["evidence_basis"][
+                "legacy_unreceipted_artifacts"
+            ],
+            [
+                expected_legacy_unreceipted_audit(
+                    legacy_finding_artifact,
+                    role="finding",
+                )
+            ],
+        )
+        self.assertTrue(
+            validate_complete_report(
+                legacy_finding_report,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=legacy_finding_history,
+                current_record=terminal_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        equal_boundary_clean_artifact = complete_review_artifact(
+            terminal_current,
+            80_292,
+            terminal_time - 1,
+        )
+        raw_with_equal_boundary_clean = clone(terminal_current)
+        assert isinstance(raw_with_equal_boundary_clean, dict)
+        raw_with_equal_boundary_clean["evidence_state"][
+            "terminal_payloads"
+        ].append(equal_boundary_clean_artifact)
+        restamp(raw_with_equal_boundary_clean)
+        equal_boundary_history = history(
+            samples,
+            current_raw=raw_with_equal_boundary_clean,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                equal_boundary_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        raw_only_malformed_current = clone(terminal_current)
+        assert isinstance(raw_only_malformed_current, dict)
+        raw_only_malformed_current["evidence_state"][
+            "malformed_terminal_artifacts"
+        ].append(
+            complete_review_artifact(
+                raw_only_malformed_current,
+                80_294,
+                terminal_time - 2,
+                artifact_kind="malformed-terminal-artifact",
+                outcome="malformed",
+            )
+        )
+        restamp(raw_only_malformed_current)
+        raw_only_malformed_history = history(
+            samples,
+            current_raw=raw_only_malformed_current,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                raw_only_malformed_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+
+        raw_with_only_unreceipted_clean = clone(current)
+        assert isinstance(raw_with_only_unreceipted_clean, dict)
+        only_unreceipted_clean_artifact = complete_review_artifact(
+            raw_with_only_unreceipted_clean,
+            80_293,
+            terminal_time - 2,
+        )
+        raw_with_only_unreceipted_clean["evidence_state"][
+            "terminal_payloads"
+        ].append(only_unreceipted_clean_artifact)
+        restamp(raw_with_only_unreceipted_clean)
+        only_unreceipted_clean_history = history(
+            samples,
+            current_raw=raw_with_only_unreceipted_clean,
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                only_unreceipted_clean_history,
+                current,
+            ),
+            "unknown",
+        )
+        only_unreceipted_clean_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            only_unreceipted_clean_history,
+            current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(only_unreceipted_clean_report)
+        assert isinstance(only_unreceipted_clean_report, dict)
+        self.assertIsNone(only_unreceipted_clean_report["evidence_basis"])
+
         raw_only_unresolved_current = clone(terminal_current)
         assert isinstance(raw_only_unresolved_current, dict)
         raw_only_terminal_basis = raw_only_unresolved_current["candidate_basis"]
@@ -33999,7 +34934,7 @@ printf '%s\n' "$trusted_uv"
             complete_review_artifact(
                 raw_only_unresolved_current,
                 80_301,
-                raw_only_terminal_time - 1,
+                raw_only_terminal_time - 2,
                 artifact_kind="unresolved-thread-finding",
                 outcome="findings",
             )
@@ -34027,6 +34962,16 @@ printf '%s\n' "$trusted_uv"
                 normal_lane_timing,
             )
         )
+        raw_only_unresolved_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            raw_only_unresolved_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(raw_only_unresolved_report)
+        assert isinstance(raw_only_unresolved_report, dict)
+        self.assertIsNone(raw_only_unresolved_report["evidence_basis"])
         self.assertFalse(
             validate_complete_report(
                 clean_report_before_unresolved,
@@ -34347,6 +35292,7 @@ printf '%s\n' "$trusted_uv"
                 "samples",
             },
         )
+        self.assertNotIn("scope_assurance", complete_basis)
         report_current = complete_basis["current"]
         report_samples = complete_basis["samples"]
         report_declaration = complete_basis["provider_declaration"]
@@ -34522,6 +35468,14 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(supplied_profile, dict)
         supplied_profile["provider_profile"] = "terminal-payload"
         report_near_misses["caller-supplied-provider-profile"] = supplied_profile
+        reaction_with_scope_assurance = clone(complete_report)
+        assert isinstance(reaction_with_scope_assurance, dict)
+        reaction_with_scope_assurance["evidence_basis"]["scope_assurance"] = (
+            "artifact-publication-only"
+        )
+        report_near_misses["reaction-injected-scope-assurance"] = (
+            reaction_with_scope_assurance
+        )
         for field in (
             "kind",
             "provider_declaration",

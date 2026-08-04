@@ -393,16 +393,61 @@ These REST lifecycle reads are point-in-time snapshots. They do not prove that n
 Before posting, inspect authenticated complete issue-comment history and the bounded audit record. Producer policy permits the parent to post one exact `@codex review` only after both local lanes are terminal and only when no request already exists for the unchanged current scope. Never post a second or third request. Record `early-request-observed` when a request preceded the local terminals. Record `duplicate-observed` when more than one same-scope request exists, including an overlapping or pending extra request. These are outcome-neutral warnings. A lone compliant pending request is not a warning; it remains pending unless a trustworthy terminal artifact already exists. Request markers, counts, ordering, and inferred request/run lineage are not provider verdict evidence.
 
 Legacy receipt migration never adopts an old artifact retroactively. The agent
-never POSTs a replacement same-scope request. Recover only after a separately
-authorized ordinary substantive change creates a new head, or after the caller
-explicitly performs one caller-owned manual exact `@codex review` trigger on
-the unchanged head after the parent has persisted the standard pre-artifact
-pull/compare scope pair. The agent neither performs nor repeats that POST and
-does not synthesize its request sidecar. Request policy therefore remains
-`unknown`, and reaction-only evidence is unavailable. Only a later terminal
-artifact that strictly follows that pre boundary and passes the complete
-version-1 artifact receipt/final-stability contract may decide without
-request/run attribution.
+never POSTs a replacement same-scope request. Preserve complete initial and
+final current endpoint inventories and, after the ordinary raw actor, carrier,
+grammar, commit-applicability, inline-join, and thread validation, derive their
+raw applicable artifact identities. Retain exact-provider terminal-looking
+identities whose grammar, role, or required thread state is malformed or
+unknown so the partition, rather than pre-filtering, fails closed. In each
+pass, prove one-to-one by exact `(channel, positive native id)` that
+`raw_applicable_artifacts = receipt_bound_normalized_artifacts ⊎ legacy_unreceipted_audit`.
+Reject a duplicate, overlap, omission, or raw artifact that cannot enter
+exactly one closed member.
+
+Read the selected newly receipted artifact's two raw pre-scope HTTP `Date`
+values directly from its pull-detail and compare receipts. Every legacy item's
+trusted semantic server time must be strictly earlier than both values in both
+passes. Whole-second equality, a later time, an unknown or malformed time or
+`Date`, a missing boundary, an invalid receipt, or an unprojectable/malformed
+legacy artifact is fail-closed evidence. The selected completion artifact must
+come from the receipt-bound normalized member; the legacy member never supplies
+clean or findings completion. Within that legacy member, old clean is
+audit-only, an old top-level or all-resolved thread finding follows ordinary
+precedence and may be superseded by a later receipt-bound current-head clean,
+and any old unresolved applicable target thread remains blocking. Unresolved,
+malformed, or unknown legacy evidence cannot enter the tolerated list; it makes
+the partition fail closed instead.
+
+Require type-preserving equality across the two passes for the provider
+decision-authority projection: terminal artifacts, applicable findings, joined
+thread state, canonical provider nonterminal audit records, both partition
+members, and the partition itself. Preserve the full raw inventories, but keep
+request/reaction-only differences on their existing separate plane so they do
+not veto an otherwise stable result-present decision. Serialize the closed
+`evidence_basis.legacy_unreceipted_artifacts` list under the authority's exact
+seven-field item schema; every ordinary non-null terminal-shaped basis uses
+`[]`. Derive the list independently from both raw inventories, require the two
+projections to be type-preserving identical, then emit only their common
+canonical `(channel, id)`-sorted value. When rejected legacy evidence leaves no
+independently valid stable receipt-bound blocker basis, keep literal
+`evidence_basis: null` rather than promoting an unreceipted artifact merely for
+reporting. Equal projection/digest pairs prove neither an intermediate provider
+state ABA nor stability after the final digest; report those limits and treat a
+later observation as invalidating the prior decision.
+
+Recover only after a separately authorized ordinary substantive change creates
+a new head, or after the caller explicitly performs one caller-owned manual
+exact `@codex review` trigger on the unchanged head after the parent has
+persisted the standard pre-artifact pull/compare scope pair. The agent neither
+performs nor repeats that POST and does not synthesize its request sidecar.
+Request policy therefore remains `unknown`, and reaction-only evidence is
+unavailable. Only a later terminal artifact, itself receipt-bound, that
+strictly follows both pre boundaries, closes the partition, passes the complete
+version-1 artifact receipt/final-stability contract, and wins ordinary
+precedence may decide without request/run attribution. This keeps the fixed Action's
+result-present authority: a provider result, not request lineage, completes the
+lane; ordinary older top-level/resolved findings can be superseded; and the
+existing unresolved-thread rule remains the safety blocker.
 A proved `base-changed-same-head` event cannot use the manual path and requires
 a real new head. Otherwise remain `triple-inconclusive`; never manufacture an
 empty or anchor commit to create a new epoch.
@@ -782,6 +827,12 @@ an applicable finding may preserve a proved-ancestor artifact commit.
 REST request, reaction, parent, selected, and artifact IDs remain exact
 positive JSON integers; quoted decimal strings are invalid. An
 ID/time/commit summary alone is not acceptance evidence.
+
+Serialize exact nested `scope_assurance: artifact-publication-only` in every
+accepted terminal or stable terminal-blocker `evidence_basis`. This field
+attests only the receipt-bound publication-time scope; it does not attest the
+provider's internal input merge base or whole-PR review coverage. Omit it from
+reaction bases, and keep an absent basis as literal `null`.
 
 Immediately before success, repeat the lifecycle, base/head, unique merge-base,
 complete evidence, pagination, every applicable artifact-time scope receipt, and

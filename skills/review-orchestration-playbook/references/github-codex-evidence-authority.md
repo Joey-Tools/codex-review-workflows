@@ -447,11 +447,98 @@ caller narrative may not.
 
 Legacy receipt migration never adopts an old artifact retroactively. A
 same-head request or terminal result observed before the parent captured the
-version-1 artifact pre-scope boundary remains in the complete raw audit, but it
-cannot acquire `parent-recorded-terminal-artifact-scope-v1` authority from a
-later current-scope read. Old findings and unresolved threads retain their
-normal blocking authority; an old clean remains inconclusive when no
-previously persisted valid artifact receipt already brackets it.
+version-1 artifact pre-scope boundary cannot acquire
+`parent-recorded-terminal-artifact-scope-v1` authority from a later
+current-scope read. Before any migration decision can complete, derive the raw
+applicable artifact set from each complete current endpoint inventory, after
+the ordinary actor, carrier, grammar, commit-applicability, inline-join, and
+thread checks. An exact-provider terminal-looking identity remains in this raw
+set when its grammar, role, or required thread state is malformed or unknown;
+those defects cannot be filtered away before partitioning. Then prove this
+exact disjoint union:
+
+```text
+raw_applicable_artifacts
+  = receipt_bound_normalized_artifacts ⊎ legacy_unreceipted_audit
+```
+
+Here, receipt-bound normalized artifacts (normalized decision records backed
+by their own valid version-1 artifact receipt) are the only positive terminal
+authority. The legacy unreceipted audit (the closed negative/audit projection
+for otherwise-applicable artifacts that lack that receipt) is not another
+completion source. Match the three sets one-to-one by exact
+`(channel, positive native id)`. Every raw applicable artifact appears exactly
+once on the right, no identity appears in both members, and neither duplicate,
+overlap, nor omission is allowed. A raw item that cannot be projected into one
+of the two closed members makes the partition unproved rather than ignorable.
+
+The selected newly receipted artifact supplies two pre-scope boundaries: the
+raw HTTP `Date` from its pre-artifact pull-detail receipt and the raw HTTP
+`Date` from its pre-artifact compare receipt. Every item admitted to
+`legacy_unreceipted_audit` must have a trustworthy semantic server time
+strictly earlier than both boundaries. Recompute this comparison from the raw
+records and the selected artifact receipt in both the initial and final
+selection passes. Equality at whole-second authority, a later legacy time, an
+unknown or malformed semantic time or `Date`, an absent boundary, an invalid
+receipt, or an unprojectable/malformed legacy artifact fails closed. A final
+current-scope read never supplies the missing earlier boundary.
+
+The legacy list is audit-only for positive authority, but it is not
+verdict-neutral:
+
+- An old clean is audit-only and can never establish clean or become the
+  selected completion basis.
+- An old top-level finding or an old finding whose joined target threads are
+  all resolved follows ordinary terminal precedence. A later receipt-bound
+  current-head clean may supersede it.
+- An old finding with any still-unresolved applicable target thread remains a
+  blocker even when the newly receipted artifact is clean. It cannot enter the
+  tolerated legacy list, so the partition does not close.
+
+An unreceipted malformed terminal artifact, unknown role, incomplete target
+join, or unknown/malformed required item field likewise cannot enter the
+tolerated legacy list. Each makes the partition unproved and fails closed; do
+not hide it under an audit role.
+
+Every completed terminal clean or findings result must therefore select an
+artifact from `receipt_bound_normalized_artifacts` and embed that artifact's
+valid receipt. No `legacy_unreceipted_audit` item may become a completion
+basis. A legacy unresolved-thread blocker instead leaves the lane
+`triple-inconclusive` and is never promoted into a receipt-bound basis. If no
+independently validated stable receipt-bound blocker basis exists, report
+literal `evidence_basis: null`; do not manufacture a basis merely to display
+the rejected legacy artifact.
+
+Preserve both complete initial and final raw endpoint inventories. For
+migration completion, their provider decision-authority projections—terminal
+artifacts, applicable findings, joined thread state, canonical provider
+nonterminal audit records, the receipt-bound normalized member, and the closed
+legacy member—must be type-preserving identical, and the disjoint partition
+must close independently in both passes. Raw request, reaction, and
+request-sidecar bytes remain on their separate plane: preserve and reevaluate
+them, but request/reaction-only drift does not overturn an otherwise identical
+receipt-bound terminal decision. This is the same result-present boundary used
+outside migration.
+
+Every non-null terminal-shaped `evidence_basis` exposes the single stable
+closed list `legacy_unreceipted_artifacts`; an ordinary non-migration terminal
+basis uses `[]`. The evaluator independently derives the list from the initial
+and final raw inventories, requires the two type-preserving projections to be
+identical, and emits only that one sorted list. Each item has exactly
+`{scope_authority, role, channel, id, server_time, artifact_commit,
+source_record_sha256}`. `scope_authority` is the exact literal
+`unreceipted-audit-only-v1`; `role` is exactly `clean` or `finding`, where
+`finding` covers every non-unresolved finding, whether top-level or
+thread-backed with no unresolved applicable target thread. The report does not
+claim a finer top-level-versus-resolved distinction. `channel` plus positive
+native `id` is the canonical identity; `server_time` is the trusted semantic time;
+`artifact_commit` is the preserved lowercase full SHA; and
+`source_record_sha256` binds the canonical raw artifact/thread projection.
+Sort only for serialization by `(channel, id)`. Unknown fields, an invalid
+role, noncanonical identity/commit/digest, or a raw projection mismatch fails
+closed. An unresolved thread, malformed terminal artifact, or unknown legacy
+record is rejected before list emission rather than represented by another
+role.
 
 The agent never POSTs another same-scope request to repair this legacy gap.
 There are only two recovery paths:
@@ -466,8 +553,9 @@ There are only two recovery paths:
    sidecar for it. Request policy therefore remains `unknown`, and reaction-only
    evidence is unavailable. Only a later terminal artifact that strictly
    follows the recorded pre boundary, satisfies the complete version-1 artifact
-   receipt and final-stability contract, and wins normal terminal precedence may
-   decide. It need not be attributed to the manual request.
+   receipt and final-stability contract, closes the raw/normalized legacy
+   partition above, and wins normal terminal precedence may decide. It need not
+   be attributed to the manual request.
 
 A proved `base-changed-same-head` event is not a legacy-receipt gap and cannot
 use the manual path; only a real new head can recover that lane.
@@ -476,13 +564,23 @@ If neither path produces a newly receipted terminal artifact, or the new
 artifact is equal to the pre boundary at whole-second authority, the lane
 remains `triple-inconclusive`. This migration rule preserves result-present
 authority without weakening whole-PR publication scope or creating a hidden
-request/run/artifact join.
+request/run/artifact join. It also preserves alignment with the fixed Action
+rationale: completion still comes from a trustworthy provider result without
+request/run attribution; request markers and audit history remain separate;
+and an ordinary older top-level or resolved-thread finding may be superseded by
+a later current-head clean. Treating an unresolved provider thread as a blocker
+is the existing playbook thread-safety extension, not a request-history veto.
 
 Like the request-time sidecar, the receipt consists of point-in-time reads. It
 proves the recorded pre/artifact/post observations and detects an observed
 scope mismatch, but it does not prove that no intermediate `A -> B -> A`,
-close/reopen, or other ABA transition occurred. Preserve that limitation in
-reports rather than describing the envelope as continuous scope attestation.
+close/reopen, or other ABA transition occurred. Equality of the initial/final
+raw decision-authority projections and their digests likewise cannot prove
+that no intermediate provider-state ABA occurred, and no final digest proves
+that GitHub state stayed unchanged after that digest was computed. Preserve
+both limitations in reports rather than describing the envelope as continuous
+scope or post-read stability attestation; a later observation invalidates the
+prior completion decision.
 
 ## Terminal Artifact Precedence
 
@@ -1213,20 +1311,32 @@ The order is normative. First perform the iterative, no-hash structural
 preflight. Apply it to the bounded policy-binding envelope too, including the
 provider declaration and local ancestry map, before deriving that envelope's
 streaming namespace digest; never derive a namespace with canonical JSON. On a
-cache miss, run the owning plane's uncached evidence validator so its record,
-page, and retained-byte charges succeed before hashing the memo subject. A
-truthy partial result cannot override a failed ledger. Only then compute a
-sorted-key, type-tagged, length-framed SHA-256 incrementally; never call
-`json.dumps` or build a complete canonical body for the memo key. Healthy
-positive and negative results both retain that digest. Every cache hit repeats
-the bounded preflight and rehashes unchanged summaries, so an equal-size nested
-content edit cannot reuse either result. Because snapshots are immutable, a
-mutation after a cached negative remains fail-closed rather than being upgraded
-in place; a fresh reread uses a fresh context. Transient fingerprint bytes are
-not retained evidence and are not charged again; zero-charge deadline
+cache miss, immediately compute a bounded, sorted-key, type-tagged,
+length-framed SHA-256 baseline after admission; never call `json.dumps` or build
+a complete canonical body for the memo key. This first digest is a
+non-authoritative content-stability observation, not authority evidence or
+cache admission. Then run the owning plane's uncached evidence validator so
+its record, page, and retained-byte charges succeed. A failed ledger discards
+the baseline, and a truthy partial result cannot override that failure. After a
+healthy validator return, compute a second bounded confirmation fingerprint.
+The no-hash, baseline, and confirmation summaries must match, and the baseline
+and confirmation digests must match, before either a result is returned or a
+cache entry is written. A mismatch does neither. Healthy positive and negative
+results retain only the confirmed digest. A cache hit remains the bounded
+no-hash preflight followed by one content digest: summary drift rejects before
+hashing, and an unchanged summary is rehashed against the cached digest. Thus
+an equal-size nested content edit cannot reuse either result. The protected
+property is exact memo-subject content stability across cold validation, not
+merely object identity or container shape. These point observations cannot
+exclude an `A -> B -> A` change between the two cold digests or a mutation
+after the final confirmation hash, so immutable snapshots and a fresh
+reread/context remain required. A mutation after a cached negative remains
+fail-closed rather than being upgraded in place. Transient fingerprint bytes
+are not retained evidence and are not charged again; zero-charge deadline
 observations still advance. This sequencing preserves immutable-result
-memoization without letting memo work precede the evidence budget or letting a
-sidecar failure consume the independent terminal-artifact ledger.
+memoization without letting the bounded baseline become authority, survive a
+failed evidence ledger, or let a sidecar failure consume the independent
+terminal-artifact ledger.
 
 Memo subjects and cache identity are plane-specific. Endpoint memoization sees
 only the retained transcript or the exact single-scope `fetches` list;
@@ -2103,13 +2213,16 @@ joint initial-final coordinator removes a scope from the stable comparison only
 when it is present in exactly one union and eligible there; a PR observed in
 both unions is retained and compared exactly.
 
-For every terminal basis, report the v1 scope assurance as
-`artifact-publication-only`: the artifact is independently trustworthy for the
-selected publication-time evidence scope, but the report must not claim that
-GitHub Codex reviewed the current whole-PR range or that its internal input
-merge base was attested. `Result present` never turns an unreceipted historical
-artifact into current-scope evidence. This wording requirement records the
-accepted trust boundary without adding request/run/artifact lineage.
+For every accepted terminal basis and stable terminal blocking basis, include
+the exact nested field
+`evidence_basis.scope_assurance: artifact-publication-only`. The artifact is
+independently trustworthy for the selected publication-time evidence scope,
+but the report must not claim that GitHub Codex reviewed the current whole-PR
+range or that its internal input merge base was attested. `Result present`
+never turns an unreceipted historical artifact into current-scope evidence.
+This closed field records the accepted trust boundary without adding
+request/run/artifact lineage. Reaction bases omit `scope_assurance`, and a
+`null` basis remains literal `null` rather than an object carrying assurance.
 
 ```yaml
 request_policy:
@@ -2119,6 +2232,8 @@ request_policy:
 provider_profile: mixed
 evidence_basis:
   kind: pull-request-review
+  scope_assurance: artifact-publication-only
+  legacy_unreceipted_artifacts: []
   selection_snapshots:
     initial: <complete lifecycle/scope/pagination/candidate/thread snapshot>
     final: <repeat the complete identical selection snapshot>
@@ -2212,16 +2327,22 @@ artifact, and round-trips the complete report through the closed validator.
 | Inconclusive evidence | Computed profile or `unknown` | Stable blocking artifact when one exists; otherwise `null` |
 
 An inconclusive blocking basis reuses the terminal basis shape above: `kind`
-is the carrier channel and the complete selected artifact, identical selection
-snapshots, and current raw authority remain embedded. An unresolved exact-
-provider target-thread finding has blocking-basis priority regardless of an
-otherwise newer clean or malformed artifact; choose the greatest
+is the carrier channel, `scope_assurance` is exactly
+`artifact-publication-only`, and the complete selected artifact, identical
+selection snapshots, and current raw authority remain embedded. An unresolved
+exact-provider target-thread finding has blocking-basis priority regardless of
+an otherwise newer clean or malformed artifact; choose the greatest
 `(server_time, stable_artifact_id)` only among fully validated unresolved
 target-thread artifacts. When no such thread blocker exists, a malformed
 artifact supplies a basis only when it is the selected terminal blocker under
 the ordinary channel/time/precedence rules. Input list order never selects a
 blocker, and an unstable, incomplete, or ambiguous blocker has no stable basis
 and therefore reports `null` rather than a guessed summary.
+An unreceipted legacy unresolved thread or malformed/unknown terminal artifact
+is not a fully validated blocker basis under this paragraph. It fails the
+legacy partition and blocks completion, but `evidence_basis` remains `null`
+unless a separate receipt-bound blocker independently satisfies the complete
+basis contract.
 Selecting an unresolved blocker uses a blocker-specific projection of the same
 fully validated raw endpoint inventories: it chooses the greatest validated
 unresolved target-thread `(server_time, stable_artifact_id)` before ordinary
@@ -2250,6 +2371,24 @@ Git ancestry receipts. The raw projection must type-preservingly equal the
 normalized current selection input; a selected-artifact summary or normalized
 snapshot without that authority is not auditable evidence.
 
+Every non-null terminal-shaped basis includes
+`legacy_unreceipted_artifacts`. An ordinary terminal basis uses the empty list.
+For a legacy-receipt migration decision, independently derive the closed list
+from each raw inventory, require the two projections to be type-preserving
+identical, and emit only their common canonical `(channel, id)`-sorted value.
+Prove that the raw applicable artifact set is exactly the disjoint union of the
+receipt-bound normalized decision projection and this list. The selected
+completion artifact must be in the receipt-bound member. Revalidate that every
+legacy semantic time is strictly earlier than both of the selected artifact
+receipt's pre-scope `Date` values; equality, later/unknown time, malformed
+projection, overlap, omission, or drift selects `triple-inconclusive`. Legacy
+clean remains audit-only, ordinary old top-level/all-resolved findings remain
+visible to normal precedence, and an old any-unresolved target thread fails
+the partition and still blocks. Request/reaction-only raw drift remains
+excluded from this decision-authority comparison under the independent-plane
+rule. A rejected legacy blocker is never promoted merely so the report can
+carry a non-null basis.
+
 Each terminal-looking artifact wrapper in those snapshots also embeds its
 unique closed `artifact_scope_receipt`. The object contains exactly `kind`,
 `pre_artifact_scope_receipts`, `artifact_get_receipt`, and
@@ -2267,12 +2406,14 @@ artifact is not trustworthy current-scope terminal authority.
 
 For terminal authority, initial/final equality covers scope, lifecycle,
 provider artifacts, thread/finding state, and canonical nonterminal provider
-audit records. Raw request records, provider reactions, and request-scope
-sidecar metadata belong to the separate request/reaction plane. Preserve the
-exact initial and final raw inventories in the report even when those records
-differ, a sidecar is absent, or the sidecar-only projection drifts. Their
-complete pages must remain parseable, but their differences do not veto an
-identical terminal selection and artifact snapshot. Recompute
+audit records. In legacy migration it also covers the closed
+raw-applicable/receipt-bound/legacy partition and the complete legacy item
+projection. Raw request records, provider reactions, and request-scope sidecar
+metadata belong to the separate request/reaction plane. Preserve the exact
+initial and final raw inventories in the report even when those records differ,
+a sidecar is absent, or the sidecar-only projection drifts. Their complete pages
+must remain parseable, but their differences do not veto an identical terminal
+selection and artifact snapshot. Recompute
 `request_policy.status` and reaction authority from the available final
 evidence; use `unknown` whenever their own stability or binding cannot be
 proved.

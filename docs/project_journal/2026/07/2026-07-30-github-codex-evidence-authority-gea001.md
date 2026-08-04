@@ -458,11 +458,20 @@ superseded_by:
   `artifact-publication-only` and forbids the stronger claim that GitHub Codex
   reviewed the current whole-PR range. Changing that boundary requires a new
   predeclared provider-authenticated input-base profile, not inferred timing.
-- The legacy-receipt finding exposed an operability/documentation gap. It is
-  closed by the two explicit recovery paths above while preserving the rule
-  that the agent never POSTs a replacement request and that old artifacts are
-  never scoped retroactively. No evaluator or base-retarget state-machine
-  behaviour changed.
+- The legacy-receipt finding first exposed an operability/documentation gap,
+  then a later evaluator audit proved that the documented manual recovery path
+  was not executable: a pre-receipt artifact could neither enter the normalized
+  record nor be omitted from the raw projection. The evaluator now proves the
+  closed partition `raw = receipt-bound ⊎ legacy-unreceipted-audit` by native
+  identity. Only old clean and non-unresolved finding roles that are strictly
+  earlier than both selected-artifact pre-scope boundaries enter the audit-only
+  member; unresolved, malformed, unknown, equal-boundary, later, overlapping,
+  or omitted evidence fails closed. A selected completion remains independently
+  receipt-bound, and reports expose the stable audit list without adding a
+  fourth top-level key. This makes the two recovery paths executable while
+  preserving the rule that the agent never POSTs a replacement request, old
+  artifacts are never scoped retroactively, and the base-retarget state machine
+  is unchanged.
 - The large reference matrix remains exhaustive, but its report-only negative
   variants no longer recompute the full evidence oracle. A pure matcher reuses
   an already independently generated and positively round-tripped expected
@@ -477,6 +486,29 @@ superseded_by:
   preflight and digest observations and require fail-closed rejection. The
   race-safe two-observation contract remains normative even though it costs
   more than a single traversal.
+- A later cold-cache audit found that the two-observation guarantee had only
+  been enforced on hits: a miss took its sole digest after the uncached
+  validator or producer, so an equal-length mutation during that work could be
+  cached. Cold admission now takes a bounded, non-authoritative baseline digest
+  after the no-hash guard, runs the owning ledger, then requires an equal
+  confirmation summary and digest before returning or caching. Ledger failure
+  discards the baseline. Deterministic inventory and artifact regressions make
+  equal-length changes during the producer/validator and require no stale cache
+  with a healthy tracker. This protects exact content stability between the two
+  digest observations; it does not detect an `A -> B -> A` transition between
+  them or mutation after the final confirmation hash, so snapshot immutability
+  and fresh rereads remain part of the boundary.
+- A report-contract audit found that the documented publication-scope boundary
+  was prose-only. Every accepted terminal or stable receipt-bound terminal
+  blocker basis now carries the exact nested field
+  `scope_assurance: artifact-publication-only`; reaction and `null` bases do
+  not. Missing, wrong, null, or reaction-injected values fail exact report
+  validation. This records why result-present evidence is sufficient without
+  overstating what it proves: the provider artifact attests its trustworthy
+  publication-time scope, but not the provider's internal input merge base or
+  whole-PR review coverage. Any future stronger interpretation requires a
+  predeclared provider-authenticated input-base profile rather than inferred
+  request/run timing.
 
 ## Final Named-Single Review Corrections
 
