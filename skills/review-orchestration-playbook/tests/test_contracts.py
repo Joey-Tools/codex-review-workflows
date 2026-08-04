@@ -4673,6 +4673,25 @@ printf '%s\n' "$trusted_uv"
             normalized_github_pr_probes_text,
         )
         normalized_authority_text = " ".join(authority.lower().replace("`", "").split())
+        self.assertIn(
+            "for a pr present in both local unions, the corresponding "
+            "initial/final audit items must be type-preserving identical",
+            normalized_authority_text,
+        )
+        self.assertIn(
+            "the complete arrays may differ only by a fully validated item "
+            "that appears in exactly one local union and also appears "
+            "identically in that side's future_prefix_omission_eligibility_audit",
+            normalized_authority_text,
+        )
+        self.assertNotIn(
+            "its initial/final copies must be type-preserving identical",
+            normalized_authority_text,
+        )
+        self.assertNotIn(
+            "is exactly equal across traversals",
+            " ".join(journal.lower().replace("`", "").split()),
+        )
         for raw_rest_shape_marker in (
             "every accepted rest status is an exact integer 200, never a "
             "boolean or float alias",

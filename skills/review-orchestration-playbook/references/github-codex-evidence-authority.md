@@ -1316,9 +1316,14 @@ semantic union. Each item contains exactly `pull_number`, pull-detail
 `base_oid` and `head_oid`, compare-derived `merge_base`, and normalized closed
 `lifecycle`, sorted by unique positive pull number. This audit covers
 request-feed and anchor-only seeds plus record-free confirmed non-candidates;
-its initial/final copies must be type-preserving identical. It prevents a
-scope with no separate authority record from hiding base, head, merge-base, or
-lifecycle drift.
+for a PR present in both local unions, the corresponding initial/final audit
+items must be type-preserving identical. The complete arrays may differ only by
+a fully validated item that appears in exactly one local union and also appears
+identically in that side's `future_prefix_omission_eligibility_audit`; the joint
+coordinator handles that difference below. This prevents a shared scope with no
+separate authority record from hiding base, head, merge-base, or lifecycle
+drift without rejecting an eligible one-sided future-prefix scope before joint
+coordination.
 
 Only after that raw seed/detail closure succeeds may one traversal classify a
 future-prefix-only pull seed as locally eligible for coordinated omission.

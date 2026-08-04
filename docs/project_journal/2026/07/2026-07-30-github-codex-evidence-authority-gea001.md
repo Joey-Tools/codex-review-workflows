@@ -1345,10 +1345,13 @@ convergence:
 - The closed `retained_pull_scope_audit` additionally records
   pull/base/head/merge-base/lifecycle for every retained semantic-union PR,
   including request/anchor-only and record-free confirmed non-candidates, and
-  is exactly equal across traversals. When the recent pull list also contains a
-  PR, its typed `state` must equal pull-detail lifecycle state. This closes the
-  reviewer-found gap where a scope without a separate policy record could hide
-  base or lifecycle drift.
+  requires identical audit identity for every PR present in both traversals.
+  Complete initial/final arrays may differ only by an identically audited,
+  eligible PR present in exactly one local union; the joint coordinator handles
+  that difference. When the recent pull list also contains a PR, its typed
+  `state` must equal pull-detail lifecycle state. This closes the reviewer-found
+  gap where a shared scope without a separate policy record could hide base or
+  lifecycle drift without rejecting a valid one-sided future-prefix scope.
 - A seed present only because of the future pull prefix can enter the closed
   `future_prefix_omission_eligibility_audit` only after its complete detail
   traversal proves no record in the frozen interval, no request-feed or anchor
@@ -1390,6 +1393,16 @@ found the prior single-traversal omission bug: it could not distinguish a newly
 observed empty future PR from an already retained record-free PR that later
 received removable human noise. The joint-coordination rule above is the
 accepted correction; it prevents future drift back to per-snapshot omission.
+
+The second formal named-single review of commit
+`65e1c329f2514818503d0f29e175909a45ce620f` found one residual prose
+contradiction: the authority still required the complete
+`retained_pull_scope_audit` arrays to be identical before coordination. That
+would reject the exact one-sided eligible scope that the joint coordinator is
+defined to normalize. The corrected rule requires exact identity only for PRs
+present in both traversals and permits complete-array difference solely for a
+fully validated one-sided eligibility-audit item. A contract assertion now
+forbids the obsolete unconditional-equality wording.
 
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
