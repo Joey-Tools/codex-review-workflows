@@ -36,7 +36,41 @@ VERSION_ADAPTATIONS = {
             }
         },
         "terminal_result": {"optional_field_contracts": {}},
-    }
+    },
+    "2.1.220": {
+        "scope": "exact-selected-version",
+        "init_event": {
+            "profile_field_contracts": {
+                "capabilities": {
+                    "rule": "exact_ordered_array",
+                    "values": [
+                        "interrupt_receipt_v1",
+                        "interrupt_cancel_queued_v1",
+                        "msg_lifecycle_v1",
+                    ],
+                    "failure": "inconclusive",
+                }
+            },
+            "optional_field_contracts": {
+                "fast_mode_disabled_reason": {
+                    "rule": "constant",
+                    "value": "sdk_opt_in_required",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "inconclusive",
+                }
+            },
+        },
+        "terminal_result": {
+            "optional_field_contracts": {
+                "fast_mode_disabled_reason": {
+                    "rule": "constant",
+                    "value": "sdk_opt_in_required",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "inconclusive",
+                }
+            }
+        },
+    },
 }
 REFERENCE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "references"
 COMPATIBILITY_PATH = REFERENCE_ROOT / "claude-stream-compatibility.json"

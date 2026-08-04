@@ -26,6 +26,7 @@ import review_supervisor.recovery_cleanup as recovery_cleanup
 
 from review_supervisor.codex_executable import (
     AGGREGATE_SCHEMA_NAME,
+    BoundedCommandOutputLimitExceeded,
     CODESIGN_PATH,
     CommandResult,
     CodexExecutableCustody,
@@ -50,6 +51,7 @@ from review_supervisor.codex_executable import (
     _macos_fd_xattr_names,
     _validate_node,
     authenticate_codex_executable,
+    bounded_command_process_closure,
     build_snapshot_seatbelt_policy,
     copy_executable_from_fd,
     run_bounded_command,
@@ -58,6 +60,11 @@ from review_supervisor.codex_executable import (
 from review_supervisor.recovery_cleanup import (
     CustodiedManifest,
     QuarantinedRootRecoveryEvidence,
+)
+from review_supervisor.signal_relay import (
+    DeferredSignalInterrupt,
+    activate_deferred_signal_interrupt,
+    deactivate_deferred_signal_interrupt,
 )
 from tests.support import (
     _remove_exact_test_entry,
@@ -611,6 +618,371 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                     os.fstat(descriptor)
                 self.assertEqual(raised.exception.errno, errno.EBADF)
 
+    def test_bounded_timeout_carries_settled_no_child_closure(self) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+
+        class TimeoutSelector:
+            def __init__(self) -> None:
+                self.descriptors: set[int] = set()
+                self.closed = False
+
+            def register(self, descriptor: int, _events: int) -> None:
+                self.descriptors.add(descriptor)
+
+            def get_map(self) -> dict[int, object]:
+                return {descriptor: object() for descriptor in self.descriptors}
+
+            def select(self, _timeout: float) -> list[object]:
+                return []
+
+            def close(self) -> None:
+                self.closed = True
+
+        selector = TimeoutSelector()
+        try:
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=_published_launch(
+                        launched,
+                        stdout_read,
+                        stderr_read,
+                    ),
+                ),
+                mock.patch.object(
+                    codex_executable.selectors,
+                    "DefaultSelector",
+                    return_value=selector,
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_terminate_and_reap_preflight",
+                    return_value=-signal.SIGKILL,
+                ) as terminate,
+                self.assertRaises(TimeoutError) as caught,
+            ):
+                run_bounded_command(
+                    ("/usr/bin/true",),
+                    timeout_seconds=0.01,
+                    max_output_bytes=1024,
+                )
+        finally:
+            os.close(stdout_write)
+            os.close(stderr_write)
+
+        terminate.assert_called_once_with(launched, deadline=mock.ANY)
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.authenticated_no_child_profile)
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertTrue(evidence.leader_reaped)
+        self.assertFalse(evidence.stdio_closed)
+        self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+        self.assertFalse(evidence.runtime_descriptors_retained)
+        self.assertTrue(selector.closed)
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_bounded_output_limit_carries_settled_no_child_closure(self) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.write(stdout_write, b"12345")
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+
+        class OutputSelector:
+            def __init__(self) -> None:
+                self.descriptors: set[int] = set()
+                self.closed = False
+
+            def register(self, descriptor: int, _events: int) -> None:
+                self.descriptors.add(descriptor)
+
+            def get_map(self) -> dict[int, object]:
+                return {descriptor: object() for descriptor in self.descriptors}
+
+            def select(self, _timeout: float) -> list[tuple[object, None]]:
+                return [(SimpleNamespace(fd=stdout_read), None)]
+
+            def close(self) -> None:
+                self.closed = True
+
+        selector = OutputSelector()
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable.selectors,
+                "DefaultSelector",
+                return_value=selector,
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                return_value=-signal.SIGKILL,
+            ) as terminate,
+            self.assertRaisesRegex(
+                BoundedCommandOutputLimitExceeded,
+                "command output exceeds",
+            ) as caught,
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=4,
+            )
+
+        terminate.assert_called_once_with(launched, deadline=mock.ANY)
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertEqual(caught.exception.scope, "aggregate")
+        self.assertEqual(caught.exception.limit, 4)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.authenticated_no_child_profile)
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertTrue(evidence.leader_reaped)
+        self.assertFalse(evidence.stdio_closed)
+        self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+        self.assertFalse(evidence.runtime_descriptors_retained)
+        self.assertTrue(selector.closed)
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def _assert_per_stream_output_limit_preempts_open_peer_stream(
+        self,
+        selected_stream: str,
+    ) -> None:
+        stream_limit = 4
+        aggregate_limit = 1024
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(stdout_read)
+                os.close(stderr_read)
+                os.close(ready_read)
+                os.setsid()
+                os.write(ready_write, b"1")
+                os.close(ready_write)
+                selected_write = (
+                    stdout_write if selected_stream == "stdout" else stderr_write
+                )
+                os.write(selected_write, b"x" * (stream_limit + 1))
+                while True:
+                    signal.pause()
+            except BaseException:
+                os._exit(127)
+        os.close(ready_write)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        child_reaped_by_runner = False
+        try:
+            self.assertEqual(os.read(ready_read, 1), b"1")
+            os.close(ready_read)
+            launched = SimpleNamespace(
+                pid=pid,
+                pgid=pid,
+                session_id=pid,
+                start_identity=codex_executable.process_start_identity(pid),
+                profile_sha256="a" * 64,
+            )
+            real_terminate_and_reap = codex_executable._terminate_and_reap_preflight
+            started = time.monotonic()
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=_published_launch(
+                        launched,
+                        stdout_read,
+                        stderr_read,
+                    ),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_terminate_and_reap_preflight",
+                    wraps=real_terminate_and_reap,
+                ) as terminate,
+                self.assertRaisesRegex(
+                    BoundedCommandOutputLimitExceeded,
+                    (
+                        f"command output exceeds {stream_limit} bytes "
+                        f"for {selected_stream}"
+                    ),
+                ) as caught,
+            ):
+                run_bounded_command(
+                    ("/usr/bin/true",),
+                    timeout_seconds=30.0,
+                    max_output_bytes=aggregate_limit,
+                    max_stdout_bytes=stream_limit,
+                    max_stderr_bytes=stream_limit,
+                )
+            self.assertLess(time.monotonic() - started, 5.0)
+            terminate.assert_called_once_with(launched, deadline=mock.ANY)
+
+            error = caught.exception
+            self.assertIsInstance(error, BoundedCommandOutputLimitExceeded)
+            self.assertEqual(error.scope, selected_stream)
+            self.assertEqual(error.limit, stream_limit)
+            evidence = bounded_command_process_closure(error)
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertTrue(evidence.authenticated_no_child_profile)
+            self.assertTrue(evidence.permitted_process_closure_proven)
+            self.assertTrue(evidence.leader_reaped)
+            self.assertFalse(evidence.stdio_closed)
+            self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+            self.assertFalse(evidence.runtime_descriptors_retained)
+            for descriptor in (stdout_read, stderr_read):
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                child_reaped_by_runner = True
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(ready_read)
+            for descriptor in (stdout_read, stderr_read):
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            if not child_reaped_by_runner:
+                try:
+                    waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+                else:
+                    if waited_pid == 0:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+                        with contextlib.suppress(ChildProcessError):
+                            os.waitpid(pid, 0)
+
+        self.assertTrue(child_reaped_by_runner)
+
+    def test_stdout_output_limit_preempts_open_stderr_stream(self) -> None:
+        self._assert_per_stream_output_limit_preempts_open_peer_stream("stdout")
+
+    def test_stderr_output_limit_preempts_open_stdout_stream(self) -> None:
+        self._assert_per_stream_output_limit_preempts_open_peer_stream("stderr")
+
+    def test_post_reap_signal_waits_for_closure_publication_and_cleanup(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        interruption = KeyboardInterrupt("synthetic post-reap signal")
+        interrupt = DeferredSignalInterrupt(lambda _signal_number: interruption)
+
+        def reap_after_signal(_pid: int, *, deadline: float) -> int:
+            self.assertGreater(deadline, 0)
+            interrupt.request(signal.SIGTERM)
+            return 0
+
+        binding = activate_deferred_signal_interrupt(interrupt)
+        try:
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=_published_launch(
+                        launched,
+                        stdout_read,
+                        stderr_read,
+                    ),
+                ),
+                mock.patch.object(codex_executable, "wait_terminal"),
+                mock.patch.object(
+                    codex_executable,
+                    "reap",
+                    side_effect=reap_after_signal,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                run_bounded_command(
+                    ("/usr/bin/true",),
+                    timeout_seconds=1.0,
+                    max_output_bytes=1024,
+                )
+        finally:
+            deactivate_deferred_signal_interrupt(binding)
+
+        self.assertIs(caught.exception, interruption)
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.authenticated_no_child_profile)
+        self.assertTrue(evidence.leader_reaped)
+        self.assertTrue(evidence.stdio_closed)
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+        self.assertFalse(evidence.runtime_descriptors_retained)
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
     def test_launch_receipt_setup_interrupt_terminates_and_reaps(self) -> None:
         stdout_read, stdout_write = os.pipe()
         stderr_read, stderr_write = os.pipe()
@@ -654,7 +1026,7 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
             self.assertRaisesRegex(
                 KeyboardInterrupt,
                 "synthetic receipt setup interrupt",
-            ),
+            ) as caught,
         ):
             run_bounded_command(
                 ("/usr/bin/true",),
@@ -664,6 +1036,14 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
 
         terminate.assert_called_once()
         self.assertIs(terminate.call_args.args[0], launched)
+        evidence = bounded_command_process_closure(caught.exception)
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.authenticated_no_child_profile)
+        self.assertTrue(evidence.permitted_process_closure_proven)
+        self.assertTrue(evidence.leader_reaped)
+        self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+        self.assertFalse(evidence.runtime_descriptors_retained)
         for descriptor in (stdout_read, stderr_read):
             with self.assertRaises(OSError) as raised:
                 os.fstat(descriptor)

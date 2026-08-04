@@ -3,7 +3,7 @@ id: 20260730-rss001
 title: Read-Only Supervisor Scratch
 status: completed
 created: 2026-07-30
-updated: 2026-07-31
+updated: 2026-08-01
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -103,12 +103,20 @@ superseded_by:
   regression in separate macOS Python 3.13 jobs. The read-only job copies the
   tracked source from the checkout into a root-owned, read-only
   `/private/codex-review-readonly.*` isolation tree and executes the runner as
-  `nobody` with an empty environment inside an inherited Seatbelt profile.
-  Before starting the child, the runner proves real/effective UID equality,
-  non-root and non-admin membership, kernel-visible `job-creation` denial,
-  generic set-ID exec filtering through a direct `sudo` EPERM probe, and a
-  same-UID baseline containing only the supervisor. The job has a 20-minute
-  emergency outer budget around the
+  a randomly named, receipt-bound ephemeral account with an empty environment
+  inside an inherited Seatbelt profile. The workflow binds a dedicated unused
+  UID/GID to user/group GUIDs, rejects admin membership and any pre-existing
+  process for that UID, and revalidates identity plus the exact-UID process
+  census before launch, after the run, and before deletion. The hidden-user
+  assertion uses the exact native Directory Services record
+  `dsAttrTypeNative:IsHidden: 1`; all directory, cache, runtime identity, primary
+  group, and non-admin checks have distinct fail-closed reason codes and report
+  shell-escaped expected/observed values before retention. Before starting the
+  child, the runner additionally proves real/effective UID equality, non-root
+  and non-admin membership, kernel-visible `job-creation` denial, generic
+  set-ID exec filtering through a direct `sudo` EPERM probe, and a same-UID
+  baseline containing only the supervisor. The job has a 20-minute emergency
+  outer budget around the
   runner's 10-minute child timeout. CI success requires the terminal structured
   closure and cleanup proof; a host cancellation or missing terminal summary
   cannot count as a clean gate. The root-owned outer isolation container is
@@ -118,6 +126,16 @@ superseded_by:
   revalidated before and after launch. The outer summary parser runs with
   isolated, site-disabled Python imports and accepts only the exact terminal
   schema; its identity-bound path is reported whenever failure retains it.
+- Before the hosted gate's first candidate object query, the workflow binds the
+  detached exact-SHA checkout's Git directory, object directory, and `HEAD`,
+  creates an owner-private empty bare control repository, and points a fixed
+  direct Git executable at the source objects only through an alternate. The
+  query environment cannot load source-local remotes, promisor state,
+  credentials, protocols, or lazy fetch behavior. It also disables replacement
+  objects and optional writes, then revalidates the fixed toolchain,
+  control/source identities, exact `HEAD`, and control-config digest around the
+  bounded gate and manifest reads. The operator Trusted Mac gate documents the
+  same isolated-control contract.
 - Linux sandbox-command unit tests use a synthetic trusted runtime mount instead
   of assuming `/usr` ownership on a hosted image. A separate policy test still
   accepts a system path only when every resolved component is root-owned and
@@ -334,3 +352,277 @@ superseded_by:
   ordered normal/failure-injection double-fork rounds passed 20/20 in 67.488
   seconds. The repository contracts passed 105/105 under the same uv-managed
   CPython 3.13.13 runtime.
+- The exact follow-up working tree passed 825/825 deterministic tests in
+  397.034 seconds on host-level Homebrew CPython 3.13.12. The reviewed
+  825-test selected identity has SHA-256
+  `44716a7919f53dc79897cb7426ccca293c8f4a0a3d879003cc3b346cf17eb3cd`.
+  The read-only no-child subset independently passed 275/275 in 28.783 seconds
+  with selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`.
+  The fixed `/usr/bin/git` checkout module passed 43/43 at host level. Inside
+  the Codex outer sandbox, Apple Git 2.53 emitted a `confstr()` diagnostic while
+  resolving `DARWIN_USER_TEMP_DIR`; the unchanged stderr-empty contract rejected
+  all four affected reachability paths. Setting `TMPDIR` inside the private Git
+  control was rejected because `xcrun` created an unmanifested `xcrun_db`; no
+  such workaround or stderr relaxation entered the source.
+- The positive thirteen-test production no-child gate remains blocked in this
+  Codex Desktop context because the process inherits an outer Seatbelt. The
+  required-mode run failed closed with one failure and two errors rather than
+  skipping. A no-outer-Seatbelt Trusted Mac must rerun all 13 tests and the
+  exact-head read-only installed runner after the final signed commit; neither
+  the hosted blocker-signature probe nor the deterministic result
+  substitutes for that evidence.
+- Fresh prior-bundle Codex review of the signed source-binding merge found that
+  `file-link` remained independently available inside writable-root Seatbelt
+  profiles and that index-aware status could hide exact-head source divergence.
+  Writable profiles now globally deny `file-link`, with a real hard-link alias
+  attack in the child suite. Source custody rejects repository-visible include,
+  filter/diff, fsmonitor, `core.fileMode=false`, assume-unchanged, and
+  skip-worktree state, then compares a descriptor-based double snapshot with
+  raw HEAD tree/blob/mode evidence from an isolated object-control view.
+- The corrected host-level deterministic gate passed 827/827 in 236.142 seconds
+  on Homebrew CPython 3.13.12. The reviewed 827-test selected identity has
+  SHA-256
+  `759eaa93eb1903347f2160532617154b5c54d910ce964cc4c77794767dfc0ba0`.
+  The read-only no-child subset remained 275/275 in 26.676 seconds with
+  selected-identity SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`;
+  the complete affected modules passed 198/198 in 48.776 seconds with three
+  platform skips, and the fixed `/usr/bin/git` checkout module passed 43/43 at
+  host level. The sandboxed deterministic attempt retained the known four raw
+  Git non-passing outcomes and is not successful evidence.
+- BL's prior-bundle Claude 2.1.220 attempt passed credential-free preflight and
+  clean child supervision, but strict validation remained inconclusive with
+  `init.capabilities.mismatch`, `init.unknown-field`, and
+  `terminal.unknown-field`. No findings were accepted or classified. The
+  result records the prior-policy bootstrap need for this exact closed schema;
+  it does not complete a Claude lane or authorize candidate control execution.
+- The final host-level Python 3.13.12 full discovery passed 2,833/2,833 tests in
+  1080.124 seconds with six platform skips. Actionlint passed for the canonical
+  workflow and both generated CI fixtures; full Ruff lint, changed-file Ruff
+  formatting, source-only compilation, skill validation, project-journal
+  validation, `git diff --check`, and the zero-bytecode inventory also passed.
+- The Trusted Mac outer gate now executes only source bytes streamed from the
+  exact frozen HEAD blob or from one manifest-bound, no-follow descriptor read.
+  The installed-release producer validates a closed 131072-byte cap, a singly
+  linked regular file, stable object identity and selected access policy, and
+  the exact manifest SHA-256 before writing the same in-memory bytes to the
+  isolated Python consumer. Size and digest predicates exit explicitly on
+  failure. Regressions execute the documented producer and prove that digest
+  mismatch, oversize content, a symlink, a hard link, and a FIFO produce no gate
+  bytes. Git size and digest producer failures are checked independently before
+  any frozen gate blob is consumed.
+- Exact source custody now shares bounded entry, path, source-byte, depth, and
+  per-snapshot deadline accounting across raw HEAD expansion, descriptor
+  snapshots, and copy revalidation. The hosted no-HEAD path uses the same
+  bounded descriptor manifest and copy owner; neither production path calls
+  `shutil.copytree`. Opened gate files are charged from descriptor size plus a
+  growth probe before reading, while immutable content is the compared
+  property and timestamp-only churn remains benign.
+- The replacement host-level deterministic gate passed 837/837 in 253.934
+  seconds on Homebrew CPython 3.13.12. The reviewed selected-identity SHA-256 is
+  `100e6bfa5e93c72f61c20d45cfe69a1d945ae55908b3fc4e6943564886fed434`.
+  The complete read-only runner module passed 143/143 in 55.021 seconds, the
+  source-binding/bootstrap focus passed 18/18 in 20.851 seconds, the read-only
+  no-child subset passed 275/275 in 19.809 seconds with selected-identity
+  SHA-256
+  `c860d5d56346ea3069a57da7310a5a96611b93d05f557b28d3772c741b4aab6b`,
+  and the fixed `/usr/bin/git` checkout module passed 43/43 in 29.644 seconds.
+- A direct real read-only wrapper attempt in the current Desktop host failed
+  closed before child launch because the configured read-only child account is
+  a member of the admin group. Process closure remained `not-started`, and the
+  runner retained two descriptor-bound roots with explicit incomplete-cleanup
+  evidence. This host-configuration result is not counted as the 275-test
+  deterministic gate or as Trusted Mac exact-head evidence; no retained path
+  was silently deleted or reported as clean.
+- The frozen final host-level Python 3.13.12 full discovery passed
+  2,833/2,833 in 941.136 seconds with six existing platform skips. Final
+  contracts passed 105/105, both bounded precommit audits returned
+  `No findings.`, and canonical/fixture Actionlint plus canonical fixture byte
+  equality passed. Changed Python files passed Ruff 0.13.2 lint and formatting,
+  source-only compilation, skill validation, project-journal validation,
+  `git diff --check`, and the zero-bytecode inventory.
+- A diagnostic repository-wide `uvx ruff check .` used a newer unpinned Ruff
+  ruleset and surfaced 3,033 pre-existing all-rule baseline findings. It made no
+  source change and is not counted as this diff's lint gate; the repository's
+  installed Ruff 0.13.2 changed-file gate is the applicable passing evidence.
+- Canonical PR #86 hosted job `91434745317` then failed closed at
+  `install-copy`: the root-owned staged source receipt was incorrectly reused as
+  the expected owner of the nobody-owned installed tree. Cleanup completed, no
+  child started, and no path was retained. The replacement binds source
+  identity/access policy and destination execution ownership independently,
+  projects only the source UID when deriving the expected installed manifest,
+  and rejects any destination owner other than the frozen execution UID. The
+  affected read-only runner module passed 144/144, and the host-level
+  deterministic gate passed 838/838 in 243.890 seconds with selected-identity
+  SHA-256
+  `76dedc279ab17a3033d3f87dcdbb1b6534bae68bde8837568e5bb913507e66f3`.
+- The matching hosted summary contract now treats that manifest as a required
+  exact lowercase SHA-256 rather than a null field. The runner summary is never
+  printed before validation; successful validation emits a canonical JSON
+  object, while malformed input reports only bounded metadata and never echoes
+  injected content. Canonical and fixture workflows remain byte-identical. The
+  final read-only audit returned `No findings.`, contracts passed 105/105, the
+  affected runner passed 144/144 in 61.905 seconds, and the final host-level
+  Python 3.13.12 full discovery passed 2,833/2,833 in 1008.735 seconds with six
+  platform skips.
+- Fresh prior-bundle Codex review of signed head
+  `7fd02b0ec52f0e60f5fd221cbf12ae40f44e70d0` returned two P1 findings. First,
+  the outer Trusted Mac gate performed stable local reads but did not prove that
+  every compiled module and fixture matched exact committed content, Git mode,
+  and inventory. Second, the bounded installed copy projected the destination
+  UID while retaining the source GID, so hosted success depended on incidental
+  BSD group inheritance. The old head and its head-bound review and CI evidence
+  are stale and must not be reused.
+- The source gate now validates an externally digest-bound checked manifest for
+  every regular file under `review_supervisor/` and `tests/`, rejects missing,
+  extra, linked, substituted, content-mutated, or executable-mode-mutated
+  entries, captures the complete validated byte set, and only then compiles the
+  required modules. Frozen-repository callers derive both gate and manifest
+  digests from exact HEAD; installed-release callers must supply independent
+  publication evidence for the manifest digest. Nested tests consume the
+  already captured gate bytes rather than reopening a mutable candidate path.
+- Destination object identity is now projected separately from source custody:
+  the held install-container policy supplies the exact execution UID and GID,
+  every copied entry is changed and revalidated against both values, and the
+  installed manifest uses the same projection. The source receipt continues to
+  bind the original owner, object identity, and access policy. The complete
+  affected runner passed 145/145 in 54.773 seconds. The host-level deterministic
+  gate passed 839/839 in 241.339 seconds with selected-identity SHA-256
+  `7eae7f29771b98d6ddef11365c2896b25f8a216b80d168464ffe5dec8e0b73fd`.
+- The complete P1-corrected host-level Python 3.13.12 discovery passed
+  2,833/2,833 tests in 941.501 seconds with six existing platform skips;
+  repository contracts passed 105/105 in 8.167 seconds after the deterministic
+  identity was recorded.
+- Exact-head PR #86 run `30730882541` attempt 1 proved that the hosted workflow's
+  shared system `nobody` account violated the runner's whole-UID isolation
+  premise. The 839-test child suite passed, but a later same-UID process identity
+  `8608:1785641827.600459/state=2` made process-tree closure unprovable; the
+  install and runtime roots were retained with explicit incomplete-cleanup
+  evidence. Attempt 2 job `91453660059` completed with proven closure and clean
+  cleanup, but that single retry does not erase the demonstrated shared-account
+  race.
+- The hosted job now creates a randomly named, GUID-bound ephemeral non-admin
+  user and group with a dedicated unused UID/GID. It proves exact identity,
+  primary group, disabled login, non-admin membership, and an empty whole-UID
+  process census before use and launch, then repeats identity and census checks
+  after the supervised run. Cleanup deletes only the same GUID-bound records
+  after the UID is empty; mismatch, census failure, or residual processes retain
+  the records until ephemeral runner disposal. The executable contract also
+  proves that a synthetic shared-account process is excluded from the dedicated
+  UID census.
+- Exact-head PR #86 run `30734590280`, job `91460962452`, stopped before the
+  supervisor after creating account `codexreviewb4aed91925e3` with UID/GID
+  `56254`. The account verifier compared the native hidden-user record against
+  `IsHidden: 1`, while macOS returns `dsAttrTypeNative:IsHidden: 1`; that exact
+  mismatch made the otherwise intentional fail-closed retention path fire.
+  The corrected workflow binds the full native attribute name and decomposes
+  the previous short-circuit chain into independently reported property checks.
+  An executable scalar-parser fixture accepts only the native-prefix form and
+  rejects the short name, `YES`, empty, and multi-record values. On any failure,
+  the specific reason is emitted before cleanup revalidation and neither the
+  user nor its group is deleted while identity or policy remains unproved.
+  Dynamic expected/observed diagnostics are printed as one ordinary
+  `printf '%s\n'` line after a fixed GitHub error annotation; the executable
+  parser contract enables Bash 3.2 `xpg_echo` and proves a newline plus
+  `::warning::...` payload remains data on that same diagnostic line.
+- Exact-head run `30736565697`, job `91466273221`, then proved the dedicated
+  account and outer census were working as designed: one raw test-fixture
+  `/usr/bin/git init` timed out after 10 seconds, the suite ended with one error,
+  and the supervisor found six same-UID `state=2` processes before retaining the
+  install/runtime roots and ephemeral account. The defect was the fixture's
+  leader-only `subprocess.run` timeout ownership, not the account verifier or
+  the supervisor's fail-closed retention. The fixture's Git and CLI subprocess
+  consumers now use the existing `gitraw.run_bounded` fresh session and process
+  group, fixed output caps, descendant termination, leader reap, and explicit
+  unproven-closure exception without increasing or retrying a deadline. A
+  timeout regression starts a real fake-Git leader and same-group descendant,
+  observes their live group binding, and requires leader, descendant, and group
+  absence after the typed timeout. The deterministic suite now selects 840
+  tests with identity digest
+  `6d40334cf49865b44402c49233a9f820b722eb9cb5f35de646f42194b6345fa0`.
+  After synchronizing the exact Trusted Mac source manifest, the final
+  host-level Python 3.13.12 deterministic gate passed 840/840 in 269.450
+  seconds. The earlier manifest-mismatch run is non-counting.
+- PR #86 run `30737798906`, job `91469661843`, proved that process-group-only
+  fixture cleanup was still insufficient for the hosted gate. Two direct
+  `/usr/bin/git init` calls timed out, and the outer dedicated-account census
+  retained six additional same-UID `state=2` processes. The log does not bind
+  those six objects to exact argv or parentage, so the evidence is limited to
+  post-baseline whole-UID presence. The replacement gate keeps the ephemeral
+  account under whole-UID custody: it requires an empty baseline, revalidates
+  the exact account receipt, applies bounded TERM/KILL settlement to every
+  post-baseline process while the account remains exclusively owned, requires
+  stable absence, and retains the account and roots on any census, identity, or
+  cleanup uncertainty. Shared-account paths never signal by UID.
+- Process diagnostics now go only to a root-owned mode-`0600`, one-MiB-bounded
+  file; GitHub annotations remain fixed literals. Every `ps` census and detail
+  query has an independently checked exit status and bounded result, so the
+  hosted Bash default no longer lets a successful `awk` or `cut` hide a failed
+  `ps`. The focused dedicated-UID regressions include baseline rejection, PID
+  replacement, and a real `setsid` plus double-fork TERM-ignoring process that
+  requires KILL and stable absence. The final deterministic suite passed
+  846/846 in 292.588 seconds with selected-identity SHA-256
+  `cf927546fed88325300574c2c802f42b63a2038ac0a22322e0fa773a48e317b8`.
+  One bounded 90-second actionlint run timed out with empty output and is
+  tool-inconclusive; both extracted workflow shell blocks passed `bash -n` and
+  ShellCheck under an explicit Bash profile.
+- Exact-head PR #86 run `30741504176`, job `91479663871`, exposed one remaining
+  dispatcher path in `SourceCheckoutBindingIntegrationTests`: the
+  `assume-unchanged` case called raw `/usr/bin/git init`, timed out after the
+  unchanged ten-second deadline, and left the 846-test hosted suite with one
+  error after 254.968 seconds. The helper now selects the receipt-bound direct
+  Git executable, carries the exact exec path and owner-private `TMPDIR` through
+  the closed Git environment, and uses the existing bounded process owner. It
+  still rejects any stderr and does not extend or retry the deadline. A static
+  contract forbids raw `/usr/bin/git` and `subprocess.run` in that integration
+  class.
+- The exact failing case plus the new launch-contract regression passed 2/2,
+  the complete source-binding integration class passed 14/14, and the affected
+  read-only runner module passed 151/151. After regenerating the checked Trusted
+  Mac source manifest, the final host-level Python 3.13.12 deterministic gate
+  passed 847/847 in 356.893 seconds. The reviewed selected-identity SHA-256 is
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`.
+- The `acb1182dbcab61ab6076e661c35088719dac2f35` formal single is explicitly
+  zero-start and non-counting. A prior-bundle independent workspace was
+  materialized and validated, but no reviewer agent or model was launched and
+  no reviewer output or findings existed. The task root was then cleaned; none
+  of that head's admission, CI, or review-control evidence carries forward.
+- A Desktop-sandbox full discovery was diagnostic only: local Unix and loopback
+  socket binds returned `EPERM`, producing 7 failures and 11 errors among 2,834
+  tests after 1203.084 seconds. The same frozen tree and Python 3.13.12 runtime
+  then passed the host-level full discovery 2,834/2,834 in 1036.788 seconds with
+  six existing platform skips. No socket-bind failure reproduced outside the
+  Desktop sandbox.
+- The prior-b4ca fresh Codex retry on
+  `e8a0080de284711893c416f7ca546182e748c9fa` found that the Trusted Mac
+  bootstrap's first `cat-file` still loaded candidate-local Git configuration.
+  A missing promisor blob could therefore start lazy fetch, credentials, remote
+  helpers, object-store writes, or external commands before isolated Python.
+  The reviewer workspace was safely cleaned and the trusted control manifest
+  stayed at
+  `b383222c430ab57779a750d137d509db885b235ca5bdb5ace2845ccdb7d3c71b`;
+  every e8a admission, CI, Claude, and review result is stale for the fix head.
+- A real malicious-promisor contract now deletes a required blob and configures
+  an `ext::` helper. The unsafe source-local query proves the fixture by
+  starting that helper; the isolated empty-control query fails without stdout,
+  helper start, or object materialization. Bounded precommit audits found two
+  evidence gaps and three shell-custody gaps: the safe test needed a positive
+  alternate read and complete source/control object-store inventories; source
+  and control ACLs needed recursive rejection; local/HTTP alternates and
+  promisor pack markers needed explicit rejection; and the operator gate
+  needed Git executable/digest/exec-path revalidation after both streamed
+  executions. All five findings were fixed. Final repository contracts passed
+  107/107 in 8.982 seconds. Extracted workflow and operator shell passed
+  `bash -n` and ShellCheck 0.11.0, and Ruby Psych parsed the YAML. One exact
+  120-second actionlint run timed out with empty output and remains
+  tooling-inconclusive.
+- The Desktop-sandbox deterministic attempt was non-counting because Git's
+  `DARWIN_USER_TEMP_DIR` fallback warning violated the fixture's empty-stderr
+  contract, producing 22 failures and 2 errors. Host-level Python 3.13.12 then
+  passed the affected source-binding class 14/14 in 20.942 seconds. After the
+  five precommit findings were fixed, the final deterministic selection passed
+  847/847 in 283.459 seconds with unchanged identity
+  `93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`,
+  and complete discovery passed 2,835/2,835 in 1058.164 seconds with six existing
+  platform skips.

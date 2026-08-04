@@ -25,6 +25,7 @@ from .errors import (
 )
 from .final_transport import run_fifo_reader
 from .legacy_retention import installed_legacy_retention_fence
+from .gitraw import selected_git_executable
 from .runtime import (
     attempt_supervisor_main,
     authorization_helper_main,
@@ -65,7 +66,9 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
         "--checkout-parent",
         type=_absolute,
     )
-    parser.add_argument("--git", dest="git_executable", default="/usr/bin/git")
+    parser.add_argument(
+        "--git", dest="git_executable", default=selected_git_executable()
+    )
     parser.add_argument("--codex", dest="codex_executable")
 
 

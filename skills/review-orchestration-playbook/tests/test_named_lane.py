@@ -407,7 +407,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(fake_python_marker.exists())
         self.assertFalse(sitecustomize_marker.exists())
 
-    def test_entrypoint_skips_global_sitecustomize_with_no_site(self) -> None:
+    def test_entrypoint_skips_global_site_hooks_with_no_site(self) -> None:
         _, guard = self.copy_guard_bundle()
         environment_root = self.root / "sitecustomize-environment"
         venv.EnvBuilder(with_pip=False).create(environment_root)
@@ -432,9 +432,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(purelib_probe.returncode, 0, purelib_probe.stderr)
         site_packages = pathlib.Path(purelib_probe.stdout.strip())
         self.assertTrue(site_packages.is_dir())
-        marker = self.root / "global-sitecustomize.marker"
-        (site_packages / "sitecustomize.py").write_text(
-            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('loaded')\n",
+        marker = self.root / "global-site-hook.marker"
+        # Executable .pth lines remain a venv site hook across Python 3.13 patches.
+        (site_packages / "codex-review-site-hook.pth").write_text(
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('loaded')\n",
             encoding="utf-8",
         )
 
@@ -814,9 +815,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "BASELINE": str(
                 scripts.parent / "references/claude-2.1.212-stream-schema.json"
             ),
-            "PROFILE": str(
-                scripts.parent / "references/claude-stream-schema.json"
-            ),
+            "PROFILE": str(scripts.parent / "references/claude-stream-schema.json"),
             "CAPABILITY": str(runtime / "claude_capabilities.py"),
         }
         body = (
@@ -2911,9 +2910,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         second_source = self.root / "linked-back-pointer-other-source"
         git(self.repo, "worktree", "add", "--detach", str(first_source), head)
         git(self.repo, "worktree", "add", "--detach", str(second_source), head)
-        first_admin = pathlib.Path(
-            git(first_source, "rev-parse", "--absolute-git-dir")
-        )
+        first_admin = pathlib.Path(git(first_source, "rev-parse", "--absolute-git-dir"))
         back_pointer = first_admin / "gitdir"
         original_payload = back_pointer.read_bytes()
         original_inode = back_pointer.lstat().st_ino

@@ -10,6 +10,7 @@ from .test_no_child_profile import (
     REQUIRE_LIVE_NO_CHILD_PROFILE_ENV,
 )
 from .test_direct_gate import SnapshotMutationProbeTests
+from .test_readonly_install_runner import ReadOnlyInstallRunnerTests
 
 REQUIRED_NO_CHILD_TEST_METHODS = (
     "test_every_probe_preserves_the_ordered_launch_binding",
@@ -32,8 +33,24 @@ REQUIRED_TEST_CASES = tuple(
         "test_bounded_preflight_cannot_leave_child_after_closing_stdio",
     ),
     (
+        CodexExecutableAuthenticationTests,
+        "test_stdout_output_limit_preempts_open_stderr_stream",
+    ),
+    (
+        CodexExecutableAuthenticationTests,
+        "test_stderr_output_limit_preempts_open_stdout_stream",
+    ),
+    (
         SnapshotMutationProbeTests,
         "test_live_probe_denies_every_snapshot_mutation",
+    ),
+    (
+        ReadOnlyInstallRunnerTests,
+        "test_terminal_signal_publication_is_linearized_in_a_real_process",
+    ),
+    (
+        ReadOnlyInstallRunnerTests,
+        "test_no_child_suite_python_startup_ignores_site_injection",
     ),
 )
 REQUIRED_TEST_KEYS = frozenset(
@@ -54,7 +71,7 @@ def main() -> int:
     )
     expected_count = len(REQUIRED_TEST_CASES)
     if (
-        expected_count != 9
+        expected_count != 13
         or len(REQUIRED_TEST_KEYS) != expected_count
         or suite.countTestCases() != expected_count
     ):

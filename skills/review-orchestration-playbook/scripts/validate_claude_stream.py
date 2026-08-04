@@ -1813,6 +1813,16 @@ def _version_optional_contracts(
     return adaptation[surface]["optional_field_contracts"]
 
 
+def _version_profile_field_contracts(
+    version: str,
+    surface: str,
+) -> Mapping[str, Mapping[str, Any]]:
+    adaptation = claude_stream_contract.version_adaptation(version)
+    if adaptation is None:
+        return {}
+    return adaptation[surface].get("profile_field_contracts", {})
+
+
 def _record_adaptation_failure(
     evidence: _Evidence,
     classification: str,
@@ -1906,11 +1916,28 @@ def _validate_profile_exact_array(
         evidence.inconclusive.add(f"init.{field_name}.mismatch")
 
 
-def _validate_extended_init(event: Mapping[str, Any], evidence: _Evidence) -> None:
+def _validate_extended_init(
+    event: Mapping[str, Any],
+    *,
+    claude_code_version: str,
+    evidence: _Evidence,
+) -> None:
     _validate_profile_exact_string(event, "output_style", "default", evidence)
     _validate_profile_exact_array(event, "agents", EXPECTED_AGENTS, evidence)
+    capabilities_contract = _version_profile_field_contracts(
+        claude_code_version,
+        "init_event",
+    ).get("capabilities")
+    expected_capabilities = (
+        EXPECTED_CAPABILITIES
+        if capabilities_contract is None
+        else tuple(capabilities_contract["values"])
+    )
     _validate_profile_exact_array(
-        event, "capabilities", EXPECTED_CAPABILITIES, evidence
+        event,
+        "capabilities",
+        expected_capabilities,
+        evidence,
     )
 
     if "analytics_disabled" in event:
@@ -2014,7 +2041,11 @@ def _validate_init(
     )
 
     if profile_name == "extended-2x":
-        _validate_extended_init(event, evidence)
+        _validate_extended_init(
+            event,
+            claude_code_version=claude_code_version,
+            evidence=evidence,
+        )
 
 
 def _validate_closed_object(

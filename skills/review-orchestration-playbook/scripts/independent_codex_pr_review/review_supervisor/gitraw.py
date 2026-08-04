@@ -69,6 +69,11 @@ LOCAL_CONFIG_BYTES_LIMIT = 1024 * 1024
 GITDIR_POINTER_BYTES_LIMIT = 64 * 1024
 _CONFIG_SECTION_PATTERN = re.compile(rb"^\[\s*([A-Za-z0-9][A-Za-z0-9-]*)")
 _CONFIG_KEY_PATTERN = re.compile(rb"^([A-Za-z][A-Za-z0-9-]*)")
+BOUND_GIT_EXECUTABLE_ENV = "CODEX_REVIEW_BOUND_GIT_EXECUTABLE"
+BOUND_GIT_EXEC_PATH_ENV = "CODEX_REVIEW_BOUND_GIT_EXEC_PATH"
+BOUND_GIT_DEVELOPER_DIR_ENV = "CODEX_REVIEW_BOUND_GIT_DEVELOPER_DIR"
+BOUND_GIT_TMPDIR_ENV = "CODEX_REVIEW_BOUND_GIT_TMPDIR"
+BOUND_GIT_RECEIPT_ENV = "CODEX_REVIEW_BOUND_GIT_RECEIPT_SHA256"
 
 
 class GitProcessClosureUnproven(RuntimeError):
@@ -251,6 +256,63 @@ def sanitized_git_environment(extra: dict[str, str] | None = None) -> dict[str, 
     if extra:
         environment.update(extra)
     return environment
+
+
+def _bound_git_configuration() -> tuple[str, str, str, str, str] | None:
+    names = (
+        BOUND_GIT_EXECUTABLE_ENV,
+        BOUND_GIT_EXEC_PATH_ENV,
+        BOUND_GIT_DEVELOPER_DIR_ENV,
+        BOUND_GIT_TMPDIR_ENV,
+        BOUND_GIT_RECEIPT_ENV,
+    )
+    values = tuple(os.environ.get(name) for name in names)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise RuntimeError("bound Git toolchain environment is incomplete")
+    executable, exec_path, developer_dir, temporary_directory, receipt = values
+    assert executable is not None
+    assert exec_path is not None
+    assert developer_dir is not None
+    assert temporary_directory is not None
+    assert receipt is not None
+    for label, value in (
+        ("executable", executable),
+        ("exec-path", exec_path),
+        ("developer directory", developer_dir),
+        ("temporary directory", temporary_directory),
+    ):
+        path = pathlib.Path(value)
+        if not path.is_absolute() or path != pathlib.Path(os.path.abspath(path)):
+            raise RuntimeError(f"bound Git {label} is not an absolute normalized path")
+    if len(receipt) != 64 or any(
+        character not in "0123456789abcdef" for character in receipt
+    ):
+        raise RuntimeError("bound Git toolchain receipt is malformed")
+    return executable, exec_path, developer_dir, temporary_directory, receipt
+
+
+def selected_git_executable(*, default: str = "/usr/bin/git") -> str:
+    configuration = _bound_git_configuration()
+    return default if configuration is None else configuration[0]
+
+
+def bound_git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    configuration = _bound_git_configuration()
+    values: dict[str, str] = {}
+    if configuration is not None:
+        _, exec_path, developer_dir, temporary_directory, _ = configuration
+        values.update(
+            {
+                "DEVELOPER_DIR": developer_dir,
+                "GIT_EXEC_PATH": exec_path,
+                "TMPDIR": temporary_directory,
+            }
+        )
+    if extra:
+        values.update(extra)
+    return sanitized_git_environment(values)
 
 
 def _terminate_process(
@@ -1082,7 +1144,7 @@ def _git_control_environment(
     }
     if extra:
         values.update(extra)
-    return sanitized_git_environment(values)
+    return bound_git_environment(values)
 
 
 @contextmanager

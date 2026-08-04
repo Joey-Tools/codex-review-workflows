@@ -1079,6 +1079,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 self.assertEqual(prepared.writable_roots, (writable,))
                 lines = prepared.seatbelt_profile.splitlines()
                 self.assertIn("(deny file-write*)", lines)
+                self.assertIn("(deny file-link)", lines)
                 self.assertIn(
                     f'(allow file-write* (subpath "{writable_path}"))',
                     lines,
@@ -1095,6 +1096,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 )
                 self.assertLess(
                     lines.index("(deny file-write*)"),
+                    lines.index(f'(allow file-write* (subpath "{writable_path}"))'),
+                )
+                self.assertLess(
+                    lines.index("(deny file-link)"),
                     lines.index(f'(allow file-write* (subpath "{writable_path}"))'),
                 )
                 with (
@@ -1144,10 +1149,17 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 _close_owner_snapshot_attestation(attestation)
                 self.skipTest(f"macOS Data firmlink alias is unavailable: {error}")
             try:
-                writable = profile.attest_writable_root(
-                    data_alias,
-                    directory_fd=alias_fd,
-                )
+                try:
+                    writable = profile.attest_writable_root(
+                        data_alias,
+                        directory_fd=alias_fd,
+                    )
+                except profile.ExecutableAuthenticationError as error:
+                    self.assertRegex(
+                        str(error),
+                        "ancestor access policy|untrusted writer|untrusted owner",
+                    )
+                    return
                 with (
                     mock.patch.object(
                         profile,
@@ -2611,6 +2623,41 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 {"DYLD_INSERT_LIBRARIES": "/synthetic/injected.dylib"}
             )
 
+    def test_custom_runtime_pin_cannot_prepare_or_launch(self) -> None:
+        custom_pin = replace(
+            profile.PINNED_RUNTIME,
+            macos_product_version="synthetic-probe-only-runtime",
+        )
+        with (
+            mock.patch.object(profile, "probe_compatibility") as probe,
+            mock.patch.object(profile, "authenticate_executable") as authenticate,
+            self.assertRaisesRegex(profile.NoChildProfileError, "probe-only"),
+        ):
+            profile.prepare_sandboxed_python_no_child_profile(
+                runtime_pin=custom_pin,
+            )
+        probe.assert_not_called()
+        authenticate.assert_not_called()
+
+        prepared = replace(
+            _synthetic_prepared_launch(),
+            evidence=mock.Mock(production_capable=False),
+        )
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_fork_with_launch_error_pipe") as fork,
+            self.assertRaisesRegex(
+                profile.NoChildProfileError,
+                "exact production runtime pin",
+            ),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [prepared.executable.path],
+                cwd="/",
+            )
+        fork.assert_not_called()
+
     def test_sandboxed_python_preparation_binds_path_execution_attestation(
         self,
     ) -> None:
@@ -2639,12 +2686,13 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
         evidence = mock.Mock()
         evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
+        runtime_pin = profile.PINNED_RUNTIME
         with (
             mock.patch.object(
                 profile,
                 "probe_compatibility",
                 return_value=evidence,
-            ),
+            ) as probe_compatibility,
             mock.patch.object(profile, "require_compatible"),
             mock.patch.object(
                 profile,
@@ -2664,12 +2712,14 @@ class NoChildProfileUnitTests(unittest.TestCase):
         ):
             prepared = profile.prepare_sandboxed_python_no_child_profile(
                 additional_seatbelt_rules="(deny file-write*)",
+                runtime_pin=runtime_pin,
             )
 
         authenticate_loader.assert_called_once_with(
             profile.SANDBOX_EXEC,
             expected_sha256=sandbox_exec.sha256,
         )
+        probe_compatibility.assert_called_once_with(pin=runtime_pin)
         authenticate_target.assert_called_once_with(pathlib.Path(target.path))
         self.assertEqual(prepared.sandboxed_target, target)
         self.assertIs(
@@ -2690,6 +2740,195 @@ class NoChildProfileUnitTests(unittest.TestCase):
             profile._revalidate_prepared_profile(
                 replace(prepared, sandboxed_target_attestation=None)
             )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and sys.version_info[:2] == (3, 13),
+        "Darwin with Python 3.13 is required",
+    )
+    def test_sandboxed_python_write_authority_is_fd_bound_and_default_deny(
+        self,
+    ) -> None:
+        sandbox_exec = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        target = replace(
+            sandbox_exec,
+            path=str(pathlib.Path("/usr/bin/true").resolve(strict=True)),
+            inode=3,
+            uid=os.geteuid(),
+            sha256="b" * 64,
+        )
+        target_attestation = profile.PathExecutedExecutableAttestation(
+            executable=target,
+            components=(),
+        )
+        evidence = mock.Mock()
+        evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
+        runtime_pin = profile.PINNED_RUNTIME
+        with owned_temporary_directory("sandboxed-python-writable-root-") as root:
+            writable_path = root / "runtime"
+            writable_path.mkdir(mode=0o700)
+            writable_fd = os.open(
+                writable_path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                writable = profile.attest_writable_root(
+                    writable_path,
+                    directory_fd=writable_fd,
+                )
+                writable_key = (
+                    writable.identity.device,
+                    writable.identity.inode,
+                )
+                with self.assertRaisesRegex(
+                    profile.ExecutableAuthenticationError,
+                    "overlaps the sandboxed target through a path alias",
+                ):
+                    profile._validated_sandboxed_writable_roots(
+                        (writable,),
+                        protected_component_keys=frozenset({writable_key}),
+                    )
+                with (
+                    mock.patch.object(
+                        profile,
+                        "probe_compatibility",
+                        return_value=evidence,
+                    ),
+                    mock.patch.object(profile, "require_compatible"),
+                    mock.patch.object(
+                        profile,
+                        "authenticate_executable",
+                        return_value=sandbox_exec,
+                    ),
+                    mock.patch.object(
+                        profile,
+                        "python_runtime_executable",
+                        return_value=pathlib.Path(target.path),
+                    ),
+                    mock.patch.object(
+                        profile,
+                        "_authenticate_path_executed_executable",
+                        return_value=target_attestation,
+                    ),
+                    self.assertRaisesRegex(
+                        profile.NoChildProfileError,
+                        "default-deny filesystem writes",
+                    ),
+                ):
+                    profile.prepare_sandboxed_python_no_child_profile(
+                        runtime_pin=runtime_pin,
+                        writable_roots=(writable,),
+                    )
+
+                with (
+                    mock.patch.object(
+                        profile,
+                        "probe_compatibility",
+                        return_value=evidence,
+                    ),
+                    mock.patch.object(profile, "require_compatible"),
+                    mock.patch.object(
+                        profile,
+                        "authenticate_executable",
+                        return_value=sandbox_exec,
+                    ),
+                    mock.patch.object(
+                        profile,
+                        "python_runtime_executable",
+                        return_value=pathlib.Path(target.path),
+                    ),
+                    mock.patch.object(
+                        profile,
+                        "_authenticate_path_executed_executable",
+                        return_value=target_attestation,
+                    ),
+                ):
+                    prepared = profile.prepare_sandboxed_python_no_child_profile(
+                        additional_seatbelt_rules="(deny file-write*)",
+                        runtime_pin=runtime_pin,
+                        writable_roots=(writable,),
+                    )
+
+                lines = prepared.seatbelt_profile.splitlines()
+                allow_rule = f'(allow file-write* (subpath "{writable_path}"))'
+                self.assertEqual(prepared.writable_roots, (writable,))
+                self.assertEqual(
+                    prepared.writable_roots[0].path_components[-1].path,
+                    str(writable_path),
+                )
+                self.assertIn("(deny file-write*)", lines)
+                self.assertIn("(deny file-link)", lines)
+                self.assertIn(allow_rule, lines)
+                self.assertLess(
+                    lines.index("(deny file-write*)"),
+                    lines.index(allow_rule),
+                )
+                self.assertLess(
+                    lines.index("(deny file-link)"), lines.index(allow_rule)
+                )
+                with (
+                    mock.patch.object(profile, "require_compatible"),
+                    mock.patch.object(profile, "_require_live_runtime"),
+                    mock.patch.object(profile.os, "fork") as fork,
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "writable-root descriptors cannot be inherited",
+                    ),
+                ):
+                    profile.launch_prepared_no_child_process(
+                        prepared,
+                        [target.path],
+                        cwd=root,
+                        pass_fds=(writable_fd,),
+                    )
+                fork.assert_not_called()
+
+                root.chmod(0o777)
+                try:
+                    with self.assertRaisesRegex(
+                        profile.ExecutableAuthenticationError,
+                        "ancestor permits an untrusted writer|access policy",
+                    ):
+                        profile._validated_sandboxed_writable_roots(
+                            (writable,),
+                            protected_component_keys=frozenset({(999, 999)}),
+                        )
+                finally:
+                    root.chmod(0o700)
+            finally:
+                os.close(writable_fd)
+
+            unsafe_ancestor = root / "unsafe-ancestor"
+            unsafe_ancestor.mkdir(mode=0o700)
+            unsafe_runtime = unsafe_ancestor / "runtime"
+            unsafe_runtime.mkdir(mode=0o700)
+            unsafe_fd = os.open(
+                unsafe_runtime,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            unsafe_ancestor.chmod(0o777)
+            try:
+                with self.assertRaisesRegex(
+                    profile.ExecutableAuthenticationError,
+                    "ancestor permits an untrusted writer",
+                ):
+                    profile.attest_writable_root(
+                        unsafe_runtime,
+                        directory_fd=unsafe_fd,
+                    )
+            finally:
+                unsafe_ancestor.chmod(0o700)
+                os.close(unsafe_fd)
 
     def test_path_executed_target_rejects_untrusted_owner_or_writer(
         self,
@@ -3635,7 +3874,10 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
         baseline = self.evidence.observation("seatbelt", "baseline")
         self.assertIsNotNone(baseline)
         assert baseline is not None
-        if baseline.outcome == "ambiguous" and "sandbox_apply" in baseline.detail:
+        if (
+            baseline.outcome == "ambiguous"
+            and baseline.detail == profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED
+        ):
             self.assertFalse(self.evidence.compatible)
             self._skip_or_fail(
                 "outer sandbox blocks nested Seatbelt; fail-closed verified"

@@ -341,25 +341,254 @@ final artifact 才能进入独立 authorization/readback 流程。
 
 ## Self-Tests
 
+This candidate gate and its receipts are implementation/self-test evidence only; formal named-review lanes remain controlled by an independently trusted prior bundle.
+
 以下命令需在已安装的 self-contained tool directory 中运行，只使用本目录中的
 fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、不访问网络、
 不读取认证配置：
 
 ```bash
 TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
-PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
-PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
+TRUSTED_GIT_DEVELOPER_DIR=/absolute/path/to/parent-validated/Developer
+TRUSTED_GIT=/absolute/path/to/parent-validated/git
+TRUSTED_GIT_SHA256=<parent-validated-sha256>
+TRUSTED_GIT_EXEC_PATH=/absolute/path/to/parent-validated/git-core
+TRUSTED_GIT_CONTROL_PARENT=/absolute/path/to/owner-private-control-parent
+TRUSTED_GIT_TMPDIR=/absolute/path/to/owner-private-runtime
+if ! PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B \
+  -m tests.run_required_deterministic_supervisor; then
+  exit 1
+fi
+TOOL_ROOT="$PWD"
+HEAD_SHA=<full-head-sha>
+GATE_SOURCE="$TOOL_ROOT/tests/trusted_mac_gate.py"
+GATE_SOURCE_SHA256=<manifest-bound-sha256>
+SOURCE_MANIFEST="$TOOL_ROOT/trusted_mac_gate_sources.index"
+SOURCE_MANIFEST_SHA256=<manifest-bound-sha256>
+set -o pipefail
+stream_manifest_gate() {
+  /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+    "$TRUSTED_PYTHON" -I -B -S -c '
+import hashlib
+import os
+import stat
+import sys
+
+limit = 131072
+path, expected_digest = sys.argv[1:]
+if len(expected_digest) != 64 or any(
+    character not in "0123456789abcdef" for character in expected_digest
+):
+    raise SystemExit("invalid manifest-bound gate digest")
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise SystemExit("trusted gate is not a singly linked regular file")
+    if opened.st_size < 1 or opened.st_size > limit:
+        raise SystemExit("trusted gate size is outside the closed bound")
+    chunks = []
+    total = 0
+    while total <= limit:
+        chunk = os.read(descriptor, min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    data = b"".join(chunks)
+    closed = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+identity = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    stat.S_IFMT(value.st_mode),
+    value.st_uid,
+    value.st_gid,
+    stat.S_IMODE(value.st_mode),
+    value.st_nlink,
+    value.st_size,
+)
+if identity(opened) != identity(closed):
+    raise SystemExit("trusted gate identity or access policy changed")
+if len(data) != opened.st_size or not 1 <= len(data) <= limit:
+    raise SystemExit("trusted gate content exceeded or disagreed with its bound")
+if hashlib.sha256(data).hexdigest() != expected_digest:
+    raise SystemExit("trusted gate digest disagrees with the installed manifest")
+view = memoryview(data)
+while view:
+    written = os.write(1, view)
+    if written <= 0:
+        raise SystemExit("trusted gate stream made no progress")
+    view = view[written:]
+' "$GATE_SOURCE" "$GATE_SOURCE_SHA256"
+}
+measure_trusted_git_directory_custody() {
+  local directory="$1"
+  stream_manifest_gate \
+    | /usr/bin/env -i HOME=/var/empty LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+        TMPDIR="$TRUSTED_GIT_TMPDIR" "$TRUSTED_PYTHON" -I -B -S - \
+          --trusted-git-tmpdir-receipt "$directory"
+}
+if ! TRUSTED_GIT_CONTROL_PARENT_CUSTODY_RECEIPT="$(
+  measure_trusted_git_directory_custody "$TRUSTED_GIT_CONTROL_PARENT"
+)"; then
+  exit 1
+fi
+if ! TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT="$(
+  measure_trusted_git_directory_custody "$TRUSTED_GIT_TMPDIR"
+)"; then
+  exit 1
+fi
+for custody_receipt in \
+  "$TRUSTED_GIT_CONTROL_PARENT_CUSTODY_RECEIPT" \
+  "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"; do
+  if [[ "$custody_receipt" == *$'\n'* ]] \
+    || [[ "$custody_receipt" != \
+      *'"schema":"trusted-git-tmpdir-custody-v1"'* ]]; then
+    exit 1
+  fi
+done
+verify_trusted_git_directory_custody() {
+  local current_control_parent_receipt=""
+  local current_tmpdir_receipt=""
+  current_control_parent_receipt="$(
+    measure_trusted_git_directory_custody "$TRUSTED_GIT_CONTROL_PARENT"
+  )" || return 1
+  current_tmpdir_receipt="$(
+    measure_trusted_git_directory_custody "$TRUSTED_GIT_TMPDIR"
+  )" || return 1
+  [[ "$current_control_parent_receipt" == \
+    "$TRUSTED_GIT_CONTROL_PARENT_CUSTODY_RECEIPT" ]] \
+    && [[ "$current_tmpdir_receipt" == \
+      "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT" ]]
+}
+if ! TRUSTED_GIT_TOOLCHAIN_RECEIPT="$(
+  stream_manifest_gate \
+    | /usr/bin/env -i HOME=/var/empty LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+        TMPDIR="$TRUSTED_GIT_TMPDIR" "$TRUSTED_PYTHON" -I -B -S - \
+          --hosted-git-receipt "$TRUSTED_GIT_DEVELOPER_DIR" \
+          "$TRUSTED_GIT" "$TRUSTED_GIT_SHA256" \
+          "$TRUSTED_GIT_EXEC_PATH"
+)"; then
+  exit 1
+fi
+if ! verify_trusted_git_directory_custody; then
+  exit 1
+fi
+if ! stream_manifest_gate \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+  "$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" live; then
+  exit 1
+fi
+if ! stream_manifest_gate \
+  | /usr/bin/env -i LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+  "$TRUSTED_PYTHON" -I -B -S - "$TOOL_ROOT" \
+  "$SOURCE_MANIFEST" "$SOURCE_MANIFEST_SHA256" readonly "$HEAD_SHA" \
+  "$TRUSTED_GIT_TMPDIR" "$TRUSTED_GIT_DEVELOPER_DIR" "$TRUSTED_GIT" \
+  "$TRUSTED_GIT_SHA256" "$TRUSTED_GIT_EXEC_PATH" \
+  "$TRUSTED_GIT_TOOLCHAIN_RECEIPT" \
+  "$TRUSTED_GIT_TMPDIR_CUSTODY_RECEIPT"; then
+  exit 1
+fi
+if ! verify_trusted_git_directory_custody; then
+  exit 1
+fi
+if ! PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B \
+  independent-codex-pr-review --help; then
+  exit 1
+fi
 ```
 
-第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二条命令只允许在匹配生产 pin、
-且没有外层 Seatbelt 的受信任 Mac 上运行，九项测试必须全部执行并通过。GitHub Hosted
-`macos-26` 自身位于外层 Seatbelt 中，不能产生生产等价的 live isolation evidence；CI
-因此只验证该环境以已审阅的 blocker signature 失败关闭，并把真实九项 live suite 保留为
-涉及隔离边界变更时的本机交付门。若 Hosted 环境不再呈现该 signature，CI 会失败并要求
-重新审阅架构，不能把环境指纹相同解释为生产能力证明。
+第一条命令是确定性零跳过测试。Hosted CI 的 required read-only job 另以 root-owned
+isolated source、随机命名且 receipt-bound 的 ephemeral non-admin child account、受监管
+Python runtime 和完整 deterministic suite 验证安装树。Workflow 为该 account 选择未占用的
+专用 UID/GID，绑定 user/group GUID，拒绝 admin membership 或该 UID 已存在的进程，并在启动前、
+supervised run 后和删除前重验同一身份与 exact-UID process census；身份不明、replacement、
+census 失败或残留进程都会 fail closed，并保留 account records 到 ephemeral runner disposal。
+它保留 `source_head_bound == false` 与 `no_child_runtime_profile == null`，因为 exact Git binding
+和 production no-child proof 不属于这个 isolated copy 的证明边界。
 
-这个 live gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub check、
-branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR delivery
-evidence 必须记录对应 `head_sha`、9 tests、0 skips 和 terminal result；任何后续 push 都会
-使证据失效。缺少该证据时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。
+后续 receipt、live 与 readonly gate commands 只允许在匹配 production pin、且没有外层
+Seatbelt 的受信任 Mac 上连续运行。
+它们不通过 ambient `PYTHONPATH` 或 `-m` 解析 candidate source。source-only bootstrap
+要求 `-I -B -S`，且只从已绑定 exact HEAD blob 或 installed-release manifest 的最多
+131072-byte stdin 执行。Installed-release 模式由 parent-validated Python 以 no-follow
+descriptor 只读取一次，验证同一内存 byte sequence 的 manifest digest 后再流入 gate；
+路径替换、增长、链接、FIFO 或 access-policy 变化均失败关闭。直接执行 candidate gate path
+会失败。外部发布证据还必须分别绑定 `trusted_mac_gate_sources.index` 的 SHA-256；
+安装树内的自声明摘要不能作为信任根。`TRUSTED_GIT_CONTROL_PARENT` 与
+`TRUSTED_GIT_TMPDIR` 必须是 physical、current-UID、0700、zero-flags 的
+owner-private directories。各自的 canonical receipt 持久化完整 root-to-target chain
+的 type/device/inode/uid/gid/mode/flags；祖先 owner 只能是 root 或 current UID，普通
+group/world-writable ancestor 失败关闭，root-owned sticky ancestor 允许。每级 ACL 必须
+为空；target xattr 仅允许 provenance，ancestor 另允许系统 rootless marker，允许项的
+出现/消失不序列化为漂移。Readonly v3 entry 先校验独立 closed TMPDIR custody
+receipt，再以非执行方式重新读取 physical Git bytes 与完整 exec-path inventory，并
+exact-compare canonical v2 toolchain receipt，随后再次校验 TMPDIR。Canonical receipt
+本身只保护 exact Git path/SHA 与 exec-path closure；TMPDIR path/full-chain custody 是
+并列的外部 receipt，由 readonly v3 composite profile 与 `DEVELOPER_DIR`、`GIT_EXEC_PATH`、
+`TMPDIR` 环境绑定合并。发行或 operator 若另记 Git version/capability，只能作为 provenance
+evidence，不能折入该 security identity；receipt issuance 与 child validation 均不执行 Git。
+随后恢复完整的 `CODEX_REVIEW_BOUND_GIT_*` 绑定，并将同一
+receipt-bound TMPDIR 设置为显式 `CODEX_REVIEW_TEST_RUNTIME_PARENT`，避免任何 ambient
+repository candidate 或未绑定 Git dispatcher 探测。该 explicit parent 保持 private
+target policy，同时只对 root-owned sticky writable ancestor 使用安全例外。清空环境后，gate 先将
+`review_supervisor/` 与 `tests/` 的完整 regular-file inventory 和 checked manifest 中的
+相对路径、Git mode、长度及 SHA-256 逐项比较，再从 descriptor-bound、双重读取且有
+entry/path/source-byte 上限的捕获 bytes 映射加载模块；missing/extra entry、symlink、
+`__pycache__`、`.pyc`/`.pyo`、native substitute 和重复 module mapping 均失败关闭。
+十三项 live 测试必须全部执行并通过，随后 exact-head read-only install runner 必须返回完整
+成功的 structured summary。该 Trusted Mac summary 只有在
+`primary_status == "complete"`、`primary_failure == null`、
+`child_process_closure == "proven"`、`cleanup_status == "complete"`、
+`cleanup_failures == []`、`release_tree_immutable == true`、
+`source_head_bound == true`、`source_head_sha == <full-head-sha>`、
+`source_head_subtree_manifest_sha256` 是完整小写 SHA-256、
+`source_manifest_sha256` 是完整小写 SHA-256、
+`no_child_runtime_profile == "production-current"`、`returncode == 0`、
+`retained_paths == []`、`runtime_residue == []`、`secondary_failures == []`、
+`signal_number == null`、`timed_out == false`、`creation_origin_proven == false`、
+`creation_origin_guarantee == "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb"`
+且
+`cleanup_guarantee == "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb"`
+时才算成功。后三项固定字段声明平台边界，不是失败：macOS 没有创建目录并原子返回
+descriptor 的 API，也没有按 descriptor 删除目录的 API。因此 receipt 建立前的
+`mkdirat`→首次 no-follow open 和最终 identity check→`unlinkat`/`rmdir` 窗口依赖
+128-bit 不可预测 leaf 与 cooperative same-UID host TCB。receipt 建立后，工具绑定
+identity/access policy，使用 custodied manifest、quarantine 和 descriptor revalidation；
+一旦观察到 identity-unproven 或 mismatch，就保留对象且绝不删除当前 replacement。
+CONTROL_PARENT 与 TMPDIR 的独立 receipts 都绑定完整 physical chain；每个 ordered
+record 保护 type/device/inode 对象身份与 uid/gid/mode/flags access policy，每次
+issuance/revalidation 另强制上述 owner、writable ancestor、ACL 与 property-scoped xattr
+policy。不比较会因正常 child-entry churn 变化的 `nlink`、size、mtime 或 ctime。路径生成
+到最终复验之间仍依赖文中既有的 cooperative same-UID host TCB，离散 receipt snapshot
+不声称排除同 UID 的瞬时替换后恢复。
+Exact-head source proof 不信任普通 `git status`。它拒绝 repository-visible include、
+executable filter/diff、`core.fileMode=false`、fsmonitor、assume-unchanged 和
+skip-worktree 状态，并通过隔离 Git object-control 视图读取 HEAD 的 raw tree/blob/mode。
+Descriptor-based 双重 source snapshot 必须在路径集合、目录集合、完整文件字节和 executable
+bit 上与该 raw subtree 精确一致；`source_head_subtree_manifest_sha256` 绑定这份 HEAD 证明，
+而 `source_manifest_sha256` 继续绑定实际 source 的 path/type、content、mode/flags 和
+access policy；descriptor snapshot 在 capture/revalidation 边界单独保护 object identity。
+所有 source/installed snapshot 与 exact-receipt copy 共用累计 file/access-policy/path byte
+和 entry-observation 预算；entry observation 统计 listing、open/capture 与 revalidation
+观察，并非 unique path 数。每个双 pass snapshot 另有一个两遍共享的 monotonic deadline，
+child 前后 snapshot 各自取得新 deadline。Copy 只遍历 initial exact snapshot 中已绑定的
+expected path set；并发新增的 untracked/ignored/fanout path 不会先被复制或读取，随后仍由
+同一累计预算下的 exact-head rebind 显式拒绝。Raw HEAD path 的隐式目录展开同样消费
+depth/path/entry/deadline 预算。Hosted root-owned source 没有 Git metadata，因此不声明
+`source_head_bound`；它仍先建立同一有界 descriptor receipt，再按 receipt 复制并复验，
+不再使用无界 `copytree`。
+GitHub Hosted `macos-26` 的独立 production-profile probe仍必须以已审阅 blocker signature
+失败关闭；hosted read-only job 的 root/ephemeral-account 隔离成功不能替代 Trusted Mac
+no-child proof。
+
+这个 Trusted Mac gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub
+check、branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR
+delivery evidence 必须记录对应 `head_sha`、Python absolute path/digest、13 tests、0 skips、
+live terminal result 和紧随其后的 read-only structured summary；该 read-only child还必须
+给出固定的 no-child test count/identity completion record。任何后续 push 都会使证据失效。
+缺少任一项时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。
