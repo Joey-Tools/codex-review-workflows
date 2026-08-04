@@ -142,8 +142,8 @@ and its reactions from reaction-profile authority. Continue to evaluate an
 independently complete terminal payload normally, but only through its own
 artifact-time scope receipt below.
 
-For each terminal-looking exact-provider artifact admitted to current-scope
-precedence, retain one singular closed artifact-wrapper field
+For each terminal-looking exact-provider artifact admitted to the receipt-bound
+normalized decision member, retain one singular closed artifact-wrapper field
 `artifact_scope_receipt`. Its object contains exactly `kind`,
 `pre_artifact_scope_receipts`, `artifact_get_receipt`, and
 `post_artifact_scope_receipts`, with kind
@@ -176,6 +176,12 @@ current PR metadata. The receipt is independent of request sidecars and proves
 neither request/run/artifact lineage nor an ABA-free interval. A missing
 request sidecar still closes only request/reaction authority; a missing or
 unstable artifact receipt blocks the wrapped terminal artifact.
+A truly absent pre-v1 receipt is the narrow audit-only exception: keep the
+strictly older, otherwise well-formed artifact raw, exclude it from normalized
+receipt-bound wrappers, and admit it only through the closed
+`legacy_unreceipted_audit` partition below. It never supplies positive
+authority or a basis, but it does not by itself veto a later receipt-bound
+result when every migration gate closes.
 
 This v1 envelope uses **artifact-publication scope**. If its complete
 pre/GET/post receipt binds the current tuple, that tuple authorizes the artifact

@@ -472,6 +472,13 @@ superseded_by:
   preserving the rule that the agent never POSTs a replacement request, old
   artifacts are never scoped retroactively, and the base-retarget state machine
   is unchanged.
+  A follow-up regression now constructs the raw legacy member with its
+  `artifact_scope_receipt` truly absent, proves that copying that wrapper into
+  the normalized receipt-bound member remains `unknown`, and covers later v1
+  clean/findings recovery plus only-legacy, newer-finding, and unresolved-thread
+  fail-closed cases. Operational summaries now state the same partition
+  exception explicitly so the ordinary raw/normalized equality rule cannot be
+  misread as a permanent lane-wide veto.
 - The large reference matrix remains exhaustive, but its report-only negative
   variants no longer recompute the full evidence oracle. A pure matcher reuses
   an already independently generated and positively round-tripped expected

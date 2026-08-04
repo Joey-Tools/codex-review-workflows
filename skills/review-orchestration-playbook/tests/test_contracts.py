@@ -6314,6 +6314,30 @@ printf '%s\n' "$trusted_uv"
                 ):
                     self.assertIn(migration_anchor, normalized_document)
 
+        legacy_partition_documents = {
+            "authority": authority,
+            "skill": anti_drift_documents["skill"],
+            "github-pr-probes": github_pr_probes,
+            "pr-readiness": anti_drift_documents["pr-readiness"],
+            "review-lane-contracts": anti_drift_documents[
+                "review-lane-contracts"
+            ],
+            "review-prompt-templates": (
+                SKILL_ROOT / "references/review-prompt-templates.md"
+            ).read_text(encoding="utf-8"),
+        }
+        if readme := anti_drift_documents.get("readme"):
+            legacy_partition_documents["readme"] = readme
+        for document_name, document in legacy_partition_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(legacy_partition_document=document_name):
+                for partition_anchor in (
+                    "truly absent pre-v1 receipt",
+                    "legacy_unreceipted_audit",
+                    "does not by itself veto a later receipt-bound result",
+                ):
+                    self.assertIn(partition_anchor, normalized_document)
+
         normalized_authority_report_contract = " ".join(
             section_text(authority, "## Required Report Fields")
             .lower()
@@ -34801,10 +34825,21 @@ printf '%s\n' "$trusted_uv"
                 ).hexdigest(),
             }
 
-        blocker_legacy_clean_artifact = complete_review_artifact(
-            malformed_current,
-            80_289,
-            malformed_time - 2,
+        def as_unreceipted_legacy_artifact(
+            artifact: dict[str, object],
+        ) -> dict[str, object]:
+            legacy_artifact = clone(artifact)
+            assert isinstance(legacy_artifact, dict)
+            removed_receipt = legacy_artifact.pop("artifact_scope_receipt", None)
+            assert isinstance(removed_receipt, dict)
+            return legacy_artifact
+
+        blocker_legacy_clean_artifact = as_unreceipted_legacy_artifact(
+            complete_review_artifact(
+                malformed_current,
+                80_289,
+                malformed_time - 2,
+            )
         )
         raw_blocker_with_legacy_clean = clone(malformed_current)
         assert isinstance(raw_blocker_with_legacy_clean, dict)
@@ -34852,10 +34887,12 @@ printf '%s\n' "$trusted_uv"
             )
         )
 
-        legacy_clean_artifact = complete_review_artifact(
-            terminal_current,
-            80_290,
-            terminal_time - 2,
+        legacy_clean_artifact = as_unreceipted_legacy_artifact(
+            complete_review_artifact(
+                terminal_current,
+                80_290,
+                terminal_time - 2,
+            )
         )
         raw_with_legacy_clean = clone(terminal_current)
         assert isinstance(raw_with_legacy_clean, dict)
@@ -34901,13 +34938,29 @@ printf '%s\n' "$trusted_uv"
                 local_lane_timing=normal_lane_timing,
             )
         )
+        invalid_normalized_legacy_clean = clone(terminal_current)
+        assert isinstance(invalid_normalized_legacy_clean, dict)
+        invalid_normalized_legacy_clean["evidence_state"][
+            "terminal_payloads"
+        ].append(clone(legacy_clean_artifact))
+        restamp(invalid_normalized_legacy_clean)
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                legacy_clean_history,
+                invalid_normalized_legacy_clean,
+            ),
+            "unknown",
+        )
 
-        legacy_finding_artifact = complete_issue_comment_artifact(
-            terminal_current,
-            80_291,
-            terminal_time - 2,
-            artifact_kind="active-top-level-finding",
-            outcome="findings",
+        legacy_finding_artifact = as_unreceipted_legacy_artifact(
+            complete_issue_comment_artifact(
+                terminal_current,
+                80_291,
+                terminal_time - 2,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+            )
         )
         raw_with_legacy_finding = clone(terminal_current)
         assert isinstance(raw_with_legacy_finding, dict)
@@ -34951,10 +35004,67 @@ printf '%s\n' "$trusted_uv"
             )
         )
 
-        equal_boundary_clean_artifact = complete_review_artifact(
-            terminal_current,
-            80_292,
-            terminal_time - 1,
+        legacy_clean_before_finding_artifact = as_unreceipted_legacy_artifact(
+            complete_review_artifact(
+                terminal_findings_current,
+                80_302,
+                terminal_time - 2,
+            )
+        )
+        raw_with_legacy_clean_before_finding = clone(terminal_findings_current)
+        assert isinstance(raw_with_legacy_clean_before_finding, dict)
+        raw_with_legacy_clean_before_finding["evidence_state"][
+            "terminal_payloads"
+        ].append(clone(legacy_clean_before_finding_artifact))
+        restamp(raw_with_legacy_clean_before_finding)
+        legacy_clean_before_finding_history = history(
+            samples,
+            current_raw=raw_with_legacy_clean_before_finding,
+            current_ancestry={current_head: 0},
+        )
+        legacy_clean_before_finding_report = expected_report_from_inputs(
+            "accepted-terminal-findings",
+            declaration,
+            legacy_clean_before_finding_history,
+            terminal_findings_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(legacy_clean_before_finding_report)
+        assert isinstance(legacy_clean_before_finding_report, dict)
+        self.assertEqual(
+            legacy_clean_before_finding_report["evidence_basis"]["artifact"][
+                "final_snapshot"
+            ]["id"],
+            80_200,
+        )
+        self.assertEqual(
+            legacy_clean_before_finding_report["evidence_basis"][
+                "legacy_unreceipted_artifacts"
+            ],
+            [
+                expected_legacy_unreceipted_audit(
+                    legacy_clean_before_finding_artifact,
+                    role="clean",
+                )
+            ],
+        )
+        self.assertTrue(
+            validate_complete_report(
+                legacy_clean_before_finding_report,
+                lane_state="accepted-terminal-findings",
+                provider_declaration=declaration,
+                candidate_history=legacy_clean_before_finding_history,
+                current_record=terminal_findings_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
+
+        equal_boundary_clean_artifact = as_unreceipted_legacy_artifact(
+            complete_review_artifact(
+                terminal_current,
+                80_292,
+                terminal_time - 1,
+            )
         )
         raw_with_equal_boundary_clean = clone(terminal_current)
         assert isinstance(raw_with_equal_boundary_clean, dict)
@@ -34976,17 +35086,67 @@ printf '%s\n' "$trusted_uv"
             )
         )
 
+        newer_unreceipted_finding_artifact = as_unreceipted_legacy_artifact(
+            complete_issue_comment_artifact(
+                terminal_current,
+                80_303,
+                terminal_time + 1,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+            )
+        )
+        raw_with_newer_unreceipted_finding = clone(terminal_current)
+        assert isinstance(raw_with_newer_unreceipted_finding, dict)
+        raw_with_newer_unreceipted_finding["evidence_state"][
+            "active_top_level_findings"
+        ].append(newer_unreceipted_finding_artifact)
+        restamp(raw_with_newer_unreceipted_finding)
+        newer_unreceipted_finding_history = history(
+            samples,
+            current_raw=raw_with_newer_unreceipted_finding,
+            current_ancestry={current_head: 0},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                newer_unreceipted_finding_history,
+                terminal_current,
+            ),
+            "unknown",
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                newer_unreceipted_finding_history,
+                terminal_current,
+                normal_lane_timing,
+            )
+        )
+        newer_unreceipted_finding_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            newer_unreceipted_finding_history,
+            terminal_current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(newer_unreceipted_finding_report)
+        assert isinstance(newer_unreceipted_finding_report, dict)
+        self.assertIsNone(newer_unreceipted_finding_report["evidence_basis"])
+
         raw_only_malformed_current = clone(terminal_current)
         assert isinstance(raw_only_malformed_current, dict)
         raw_only_malformed_current["evidence_state"][
             "malformed_terminal_artifacts"
         ].append(
-            complete_review_artifact(
-                raw_only_malformed_current,
-                80_294,
-                terminal_time - 2,
-                artifact_kind="malformed-terminal-artifact",
-                outcome="malformed",
+            as_unreceipted_legacy_artifact(
+                complete_review_artifact(
+                    raw_only_malformed_current,
+                    80_294,
+                    terminal_time - 2,
+                    artifact_kind="malformed-terminal-artifact",
+                    outcome="malformed",
+                )
             )
         )
         restamp(raw_only_malformed_current)
@@ -35006,10 +35166,12 @@ printf '%s\n' "$trusted_uv"
 
         raw_with_only_unreceipted_clean = clone(current)
         assert isinstance(raw_with_only_unreceipted_clean, dict)
-        only_unreceipted_clean_artifact = complete_review_artifact(
-            raw_with_only_unreceipted_clean,
-            80_293,
-            terminal_time - 2,
+        only_unreceipted_clean_artifact = as_unreceipted_legacy_artifact(
+            complete_review_artifact(
+                raw_with_only_unreceipted_clean,
+                80_293,
+                terminal_time - 2,
+            )
         )
         raw_with_only_unreceipted_clean["evidence_state"][
             "terminal_payloads"
@@ -35038,6 +35200,45 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(only_unreceipted_clean_report, dict)
         self.assertIsNone(only_unreceipted_clean_report["evidence_basis"])
 
+        raw_with_only_unreceipted_finding = clone(current)
+        assert isinstance(raw_with_only_unreceipted_finding, dict)
+        only_unreceipted_finding_artifact = as_unreceipted_legacy_artifact(
+            complete_issue_comment_artifact(
+                raw_with_only_unreceipted_finding,
+                80_300,
+                terminal_time - 2,
+                artifact_kind="active-top-level-finding",
+                outcome="findings",
+            )
+        )
+        raw_with_only_unreceipted_finding["evidence_state"][
+            "active_top_level_findings"
+        ].append(only_unreceipted_finding_artifact)
+        restamp(raw_with_only_unreceipted_finding)
+        only_unreceipted_finding_history = history(
+            samples,
+            current_raw=raw_with_only_unreceipted_finding,
+            current_ancestry={current_head: 0},
+        )
+        self.assertEqual(
+            compute_provider_profile(
+                declaration,
+                only_unreceipted_finding_history,
+                current,
+            ),
+            "unknown",
+        )
+        only_unreceipted_finding_report = expected_report_from_inputs(
+            "inconclusive",
+            declaration,
+            only_unreceipted_finding_history,
+            current,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(only_unreceipted_finding_report)
+        assert isinstance(only_unreceipted_finding_report, dict)
+        self.assertIsNone(only_unreceipted_finding_report["evidence_basis"])
+
         raw_only_unresolved_current = clone(terminal_current)
         assert isinstance(raw_only_unresolved_current, dict)
         raw_only_terminal_basis = raw_only_unresolved_current["candidate_basis"]
@@ -35045,12 +35246,14 @@ printf '%s\n' "$trusted_uv"
         raw_only_terminal_time = raw_only_terminal_basis["server_time"]
         assert isinstance(raw_only_terminal_time, int)
         raw_only_unresolved_current["evidence_state"]["unresolved_thread_findings"] = [
-            complete_review_artifact(
-                raw_only_unresolved_current,
-                80_301,
-                raw_only_terminal_time - 2,
-                artifact_kind="unresolved-thread-finding",
-                outcome="findings",
+            as_unreceipted_legacy_artifact(
+                complete_review_artifact(
+                    raw_only_unresolved_current,
+                    80_301,
+                    raw_only_terminal_time - 2,
+                    artifact_kind="unresolved-thread-finding",
+                    outcome="findings",
+                )
             )
         ]
         restamp(raw_only_unresolved_current)

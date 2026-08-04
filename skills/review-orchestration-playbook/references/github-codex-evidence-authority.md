@@ -113,8 +113,8 @@ playbook changes.
 
 Result-present acceptance is not optimistic acceptance. A newer finding or
 malformed terminal artifact, unresolved thread, incomplete page, conflicting
-same-time channel evidence, missing artifact-time scope receipt, stale scope,
-or unstable final provider
+same-time channel evidence, a missing artifact-time scope receipt on an
+artifact claimed as receipt-bound authority, stale scope, or unstable final provider
 artifact/thread/selection re-read still blocks. Request-sidecar-only instability
 instead closes request/reaction authority without erasing a stable terminal
 result. Likewise, request edits, request/reaction relative ordering, selected
@@ -122,6 +122,12 @@ reaction IDs, and legal reaction contents remain audited but cannot invalidate
 a complete terminal carrier; those constraints become result authority only
 for the reaction-only fallback.
 An unresolved thread finding is not superseded by a later clean artifact.
+A truly absent pre-v1 receipt is the narrow legacy exception: a strictly older,
+otherwise well-formed artifact may remain only in the closed
+`legacy_unreceipted_audit` partition. It is never positive terminal authority
+or a non-null basis, but it does not by itself veto a later receipt-bound result
+when every legacy-migration partition, time, stability, ordinary-precedence,
+and thread gate closes.
 
 ## Decision
 
@@ -325,12 +331,17 @@ continuous lifecycle attestation, or run identifier.
 Result-present acceptance removes request/run lineage as a consumer gate; it
 does not permit the current PR metadata to retroactively assign whole-PR scope
 to an older provider artifact. Every terminal-looking exact-provider artifact
-that participates in current-scope precedence, including the selected clean or
-findings artifact and any malformed blocker, therefore requires exactly one
-independent parent-owned `parent-recorded-terminal-artifact-scope-v1` receipt.
+that enters the receipt-bound normalized decision member, including the
+selected clean or findings artifact and any receipt-bound malformed blocker,
+therefore requires exactly one independent parent-owned
+`parent-recorded-terminal-artifact-scope-v1` receipt.
 Store the unique receipt as that artifact wrapper's singular
 `artifact_scope_receipt` beside, never inside, the raw endpoint inventory.
 Do not insert it into transcript schema version 4.
+An otherwise applicable pre-v1 artifact with a truly absent receipt never
+enters that normalized member. Preserve it only through the raw endpoint
+inventory and the closed Legacy Receipt Migration partition below; that
+audit-only exception cannot select a result or basis.
 
 Each receipt rejects unknown fields and contains exactly:
 
@@ -600,12 +611,16 @@ Evaluate provider artifacts independently of request count:
    records with their IDs, actors, content, and server times.
 3. Require the unique matching
    `parent-recorded-terminal-artifact-scope-v1` receipt for every
-   terminal-looking exact-provider artifact admitted to current-scope
-   precedence. Validate its pre/artifact/post time envelope, exact artifact-time
-   scope, and artifact body/digest/identity binding before using it in the
-   current projection. Clean and malformed evidence require the exact current
-   scope; a finding may use the proved-ancestor head rule above. A missing
-   earlier boundary cannot be manufactured by a later fetch.
+   terminal-looking exact-provider artifact admitted to the receipt-bound
+   normalized decision member. Validate its pre/artifact/post time envelope,
+   exact artifact-time scope, and artifact body/digest/identity binding before
+   using it as positive authority. Clean and malformed evidence require the
+   exact current scope; a finding may use the proved-ancestor head rule above.
+   A missing earlier boundary cannot be manufactured by a later fetch. A
+   strictly older, otherwise well-formed pre-v1 artifact whose receipt is truly
+   absent remains raw and may enter only the Legacy Receipt Migration
+   audit-only member; it does not by itself veto a later receipt-bound result
+   when that partition and all ordinary gates close.
 4. Admit only exact provider identity. Terminal comment/review evidence
    requires REST `user.login == "chatgpt-codex-connector[bot]"` and
    `user.type == "Bot"`. A lookalike, missing field, or differently cased
@@ -2050,9 +2065,15 @@ inventory. Request-scope sidecars remain a separate plane: their absence,
 malformation, or reread drift cannot veto a stable terminal payload, but it
 makes request policy and reaction authority `unknown`.
 
-For terminal completion, the complete raw projection must equal the normalized
-current record before terminal precedence is applied. A raw-only artifact or
-thread that the normalized record omits makes the profile `unknown`. An
+For ordinary terminal completion, the complete raw projection must equal the
+normalized current record before terminal precedence is applied. Legacy
+receipt migration instead proves the explicit raw-to-receipt-qualified join
+`raw_applicable_artifacts = receipt_bound_normalized_artifacts ⊎
+legacy_unreceipted_audit`; the normalized current record contains only the
+receipt-bound wrappers, while the closed audit-only member remains derived
+from both raw inventories. A raw-only artifact or thread that is neither in
+the receipt-bound normalized member nor admissible under that exact legacy
+partition makes the profile `unknown`. An
 unresolved applicable target-thread finding still blocks terminal clean; an
 older top-level finding may be superseded only under the documented strong
 terminal-precedence rule and must remain present in the compared projection.
@@ -2367,9 +2388,11 @@ malformed blockers, and relevant thread state. It also embeds identical
 `artifact.initial_snapshot` and `.final_snapshot` records plus
 `current_raw_authority` with independent initial/final raw endpoint
 inventories, raw-derived finding-commit sets, and matching parent-owned local
-Git ancestry receipts. The raw projection must type-preservingly equal the
-normalized current selection input; a selected-artifact summary or normalized
-snapshot without that authority is not auditable evidence.
+Git ancestry receipts. Outside migration, the raw projection must
+type-preservingly equal the normalized current selection input. During legacy
+migration, equality is replaced only by the closed raw-to-receipt-qualified
+partition above; a selected-artifact summary or normalized snapshot without
+that authority is not auditable evidence.
 
 Every non-null terminal-shaped basis includes
 `legacy_unreceipted_artifacts`. An ordinary terminal basis uses the empty list.
@@ -2389,8 +2412,8 @@ excluded from this decision-authority comparison under the independent-plane
 rule. A rejected legacy blocker is never promoted merely so the report can
 carry a non-null basis.
 
-Each terminal-looking artifact wrapper in those snapshots also embeds its
-unique closed `artifact_scope_receipt`. The object contains exactly `kind`,
+Each receipt-bound terminal-looking artifact wrapper in those snapshots also
+embeds its unique closed `artifact_scope_receipt`. The object contains exactly `kind`,
 `pre_artifact_scope_receipts`, `artifact_get_receipt`, and
 `post_artifact_scope_receipts`; its kind is
 `parent-recorded-terminal-artifact-scope-v1`. Initial/final equality includes
@@ -2403,6 +2426,10 @@ older artifact-time head while the enclosing normalized `scope.head` remains
 current and local ancestry proves applicability. A missing earlier pre-scope
 boundary cannot be supplied by final current metadata, so an unreceipted old
 artifact is not trustworthy current-scope terminal authority.
+Do not copy a truly unreceipted legacy wrapper into those normalized snapshots:
+it remains visible only in the complete raw inventories and the derived closed
+`legacy_unreceipted_artifacts` list. That audit-only omission from normalized
+receipt-bound wrappers is the migration join, not a raw/normalized mismatch.
 
 For terminal authority, initial/final equality covers scope, lifecycle,
 provider artifacts, thread/finding state, and canonical nonterminal provider
