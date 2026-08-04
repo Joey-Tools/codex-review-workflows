@@ -1737,7 +1737,7 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(evidence, journal)
 
-    def test_readonly_supervisor_journal_is_recovery_pointer(self) -> None:
+    def test_latest_workstream_pointer_and_readonly_supervisor_journal(self) -> None:
         if CI_PROFILE != "canonical":
             self.skipTest("canonical project journal is not mirrored")
         project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
@@ -1750,8 +1750,8 @@ class RepositoryContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(
             "Latest workstream: "
-            "`docs/project_journal/2026/07/"
-            "2026-07-30-readonly-supervisor-scratch-rss001.md`",
+            "`docs/project_journal/2026/08/"
+            "2026-08-03-claude-2-1-220-stream-schema-c22001.md`",
             project_state,
         )
         for evidence in (
@@ -1883,8 +1883,7 @@ class RepositoryContractTest(unittest.TestCase):
             matches = [
                 statement
                 for statement in tree.body
-                if isinstance(statement, ast.FunctionDef)
-                and statement.name == name
+                if isinstance(statement, ast.FunctionDef) and statement.name == name
             ]
             self.assertEqual(len(matches), 1)
             return matches[0]
@@ -1909,9 +1908,7 @@ class RepositoryContractTest(unittest.TestCase):
                 private_creation.args.kw_defaults,
             )
         }
-        sticky_default = private_creation_defaults[
-            "allow_sticky_writable_ancestors"
-        ]
+        sticky_default = private_creation_defaults["allow_sticky_writable_ancestors"]
         self.assertIsInstance(sticky_default, ast.Constant)
         self.assertIsNone(sticky_default.value)
         for propagation_target in (
@@ -5900,7 +5897,7 @@ printf '%s\n' "$trusted_uv"
                 "outside the model-visible worktree", " ".join(content.split())
             )
         for content in (contracts,):
-            self.assertIn("optional nonempty `session_id`", content)
+            self.assertIn("Common reviewed optional init metadata", content)
             self.assertIn("unknown init field", content)
             self.assertIn("missing, invalid, or nonzero child return code", content)
             self.assertIn("structured `blocked` or `blocked-authentication`", content)
@@ -5982,10 +5979,44 @@ printf '%s\n' "$trusted_uv"
             },
         )
         self.assertFalse(init_contract["additional_fields"])
-        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_fields"],
+            ["session_id", "capabilities", "fast_mode_disabled_reason"],
+        )
         self.assertEqual(
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["capabilities"],
+            {
+                "rule": "one_of_exact_ordered_arrays",
+                "values": [
+                    ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    [
+                        "interrupt_receipt_v1",
+                        "interrupt_cancel_queued_v1",
+                        "msg_lifecycle_v1",
+                    ],
+                ],
+                "failure": "inconclusive",
+            },
+        )
+        expected_fast_mode_disabled_reason = {
+            "rule": "constant",
+            "value": "sdk_opt_in_required",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        }
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["fast_mode_disabled_reason"],
+            expected_fast_mode_disabled_reason,
+        )
+        self.assertEqual(
+            stream_schema["terminal_result"]["optional_field_contracts"][
+                "fast_mode_disabled_reason"
+            ],
+            expected_fast_mode_disabled_reason,
         )
         self.assertEqual(
             compatibility_profile,
@@ -6151,7 +6182,10 @@ printf '%s\n' "$trusted_uv"
         )
         init_contract = schema["init_event"]
         self.assertFalse(init_contract["additional_fields"])
-        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_fields"],
+            ["session_id", "capabilities", "fast_mode_disabled_reason"],
+        )
         self.assertEqual(
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
@@ -6211,8 +6245,15 @@ printf '%s\n' "$trusted_uv"
                     "failure": "inconclusive",
                 },
                 "capabilities": {
-                    "rule": "exact_ordered_array",
-                    "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    "rule": "one_of_exact_ordered_arrays",
+                    "values": [
+                        ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                        [
+                            "interrupt_receipt_v1",
+                            "interrupt_cancel_queued_v1",
+                            "msg_lifecycle_v1",
+                        ],
+                    ],
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {

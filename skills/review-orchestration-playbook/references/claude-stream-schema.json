@@ -96,7 +96,9 @@
     ],
     "additional_fields": false,
     "optional_fields": [
-      "session_id"
+      "session_id",
+      "capabilities",
+      "fast_mode_disabled_reason"
     ],
     "field_contracts": {
       "type": {
@@ -176,6 +178,27 @@
       "session_id": {
         "rule": "nonempty_string",
         "failure": "inconclusive"
+      },
+      "capabilities": {
+        "rule": "one_of_exact_ordered_arrays",
+        "values": [
+          [
+            "interrupt_receipt_v1",
+            "msg_lifecycle_v1"
+          ],
+          [
+            "interrupt_receipt_v1",
+            "interrupt_cancel_queued_v1",
+            "msg_lifecycle_v1"
+          ]
+        ],
+        "failure": "inconclusive"
+      },
+      "fast_mode_disabled_reason": {
+        "rule": "constant",
+        "value": "sdk_opt_in_required",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "inconclusive"
       }
     },
     "profiles": {
@@ -220,10 +243,17 @@
               "failure": "inconclusive"
             },
             "capabilities": {
-              "rule": "exact_ordered_array",
+              "rule": "one_of_exact_ordered_arrays",
               "values": [
-                "interrupt_receipt_v1",
-                "msg_lifecycle_v1"
+                [
+                  "interrupt_receipt_v1",
+                  "msg_lifecycle_v1"
+                ],
+                [
+                  "interrupt_receipt_v1",
+                  "interrupt_cancel_queued_v1",
+                  "msg_lifecycle_v1"
+                ]
               ],
               "failure": "inconclusive"
             },
@@ -615,7 +645,8 @@
       "error",
       "errors",
       "api_error_status",
-      "permission_denials"
+      "permission_denials",
+      "fast_mode_disabled_reason"
     ],
     "optional_field_contracts": {
       "result": {
@@ -681,6 +712,12 @@
       "permission_denials": {
         "rule": "empty_array",
         "failure": "blocked"
+      },
+      "fast_mode_disabled_reason": {
+        "rule": "constant",
+        "value": "sdk_opt_in_required",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "inconclusive"
       }
     },
     "variants": {
