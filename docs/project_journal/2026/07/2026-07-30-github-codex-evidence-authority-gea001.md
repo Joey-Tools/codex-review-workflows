@@ -1491,11 +1491,14 @@ The hosted macOS job also created unrelated same-UID processes while a fixture
 was verifying real process-group settlement after leader exit. Account-wide
 same-UID census protects exact process identity and remains mandatory in the
 production isolated-account lane; it is not a property of those group-only
-fixtures. The fixtures suppress ambient census only when the parent-derived
-isolated-account marker is absent, retain the real process-group absence proof,
-and preserve the complete census when the marker is present. The deterministic
-supervisor inventory therefore intentionally grows to 803 tests with identity
-digest `4e1c3a2b8a4c08aaf734e060a77936f79d5e4305270351e7b3937b122ac5076d`.
+fixtures. After integrating the newer trusted-source-custody baseline, those
+fixtures explicitly replace only their account-wide census calls, assert the
+non-dedicated closure invocation, and retain the real process-group absence
+proof. The trusted macOS gate separately exercises the unfiltered production
+census under its dedicated-UID custody receipt, so a caller-controlled marker
+is neither needed nor accepted as isolation evidence. The combined baseline
+keeps the reviewed 847-test deterministic identity with digest
+`93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897`.
 
 This disposition preserves the earlier “result exists means pass” decision and
 the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
