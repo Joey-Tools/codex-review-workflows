@@ -157,6 +157,7 @@ TERMINAL_OPTIONAL_FIELDS = frozenset(
         "errors",
         "api_error_status",
         "permission_denials",
+        "fast_mode_disabled_reason",
     )
 )
 EXTENDED_TERMINAL_FIELDS = frozenset(
@@ -188,7 +189,9 @@ INIT_REQUIRED_FIELDS = frozenset(
         "apiKeySource",
     )
 )
-INIT_OPTIONAL_FIELDS = frozenset(("session_id",))
+INIT_OPTIONAL_FIELDS = frozenset(
+    ("session_id", "capabilities", "fast_mode_disabled_reason")
+)
 EXTENDED_INIT_REQUIRED_FIELDS = frozenset(
     (
         "output_style",
@@ -202,6 +205,33 @@ EXTENDED_INIT_REQUIRED_FIELDS = frozenset(
 )
 EXPECTED_AGENTS = ("claude", "Explore", "general-purpose", "Plan")
 EXPECTED_CAPABILITIES = ("interrupt_receipt_v1", "msg_lifecycle_v1")
+EXPECTED_CAPABILITY_SEQUENCES = (
+    EXPECTED_CAPABILITIES,
+    (
+        "interrupt_receipt_v1",
+        "interrupt_cancel_queued_v1",
+        "msg_lifecycle_v1",
+    ),
+)
+EXPECTED_FAST_MODE_DISABLED_REASON = "sdk_opt_in_required"
+COMPATIBLE_INIT_OPTIONAL_CONTRACTS = {
+    "capabilities": {
+        "rule": "one_of_exact_ordered_arrays",
+        "values": [list(values) for values in EXPECTED_CAPABILITY_SEQUENCES],
+        "failure": "inconclusive",
+    },
+    "fast_mode_disabled_reason": {
+        "rule": "constant",
+        "value": EXPECTED_FAST_MODE_DISABLED_REASON,
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "inconclusive",
+    },
+}
+COMPATIBLE_TERMINAL_OPTIONAL_CONTRACTS = {
+    "fast_mode_disabled_reason": COMPATIBLE_INIT_OPTIONAL_CONTRACTS[
+        "fast_mode_disabled_reason"
+    ]
+}
 INIT_PROFILE_CONTRACT = {
     "selector": "claude_code_version",
     "variants": {
@@ -231,8 +261,10 @@ INIT_PROFILE_CONTRACT = {
                     "failure": "inconclusive",
                 },
                 "capabilities": {
-                    "rule": "exact_ordered_array",
-                    "values": list(EXPECTED_CAPABILITIES),
+                    "rule": "one_of_exact_ordered_arrays",
+                    "values": [
+                        list(values) for values in EXPECTED_CAPABILITY_SEQUENCES
+                    ],
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {
@@ -1086,7 +1118,8 @@ def _load_contract_with_binding() -> tuple[
         "session_id": {
             "rule": "nonempty_string",
             "failure": "inconclusive",
-        }
+        },
+        **COMPATIBLE_INIT_OPTIONAL_CONTRACTS,
     }
     if (
         init_contract.get("optional_field_contracts")
@@ -1151,6 +1184,7 @@ def _load_contract_with_binding() -> tuple[
             "failure": "classify",
         },
         "permission_denials": {"rule": "empty_array", "failure": "blocked"},
+        **COMPATIBLE_TERMINAL_OPTIONAL_CONTRACTS,
     }
     if optional_contracts != expected_terminal_optional_contracts:
         raise _ContractError("terminal optional contracts do not match the validator")
@@ -1813,17 +1847,7 @@ def _version_optional_contracts(
     return adaptation[surface]["optional_field_contracts"]
 
 
-def _version_profile_field_contracts(
-    version: str,
-    surface: str,
-) -> Mapping[str, Mapping[str, Any]]:
-    adaptation = claude_stream_contract.version_adaptation(version)
-    if adaptation is None:
-        return {}
-    return adaptation[surface].get("profile_field_contracts", {})
-
-
-def _record_adaptation_failure(
+def _record_optional_contract_failure(
     evidence: _Evidence,
     classification: str,
     reason: str,
@@ -1834,7 +1858,7 @@ def _record_adaptation_failure(
         evidence.inconclusive.add(reason)
 
 
-def _validate_adapted_fields(
+def _validate_optional_contract_fields(
     event: Mapping[str, Any],
     *,
     prefix: str,
@@ -1856,6 +1880,15 @@ def _validate_adapted_fields(
             )
             if not malformed:
                 mismatch = frozenset(value) != frozenset(field_contract["values"])
+        elif rule == "one_of_exact_ordered_arrays":
+            malformed = type(value) is not list or any(
+                type(item) is not str for item in value
+            )
+            if not malformed:
+                accepted = tuple(
+                    tuple(sequence) for sequence in field_contract["values"]
+                )
+                mismatch = tuple(value) not in accepted
         elif rule == "boolean":
             malformed = type(value) is not bool
         elif rule == "null":
@@ -1868,20 +1901,20 @@ def _validate_adapted_fields(
             malformed = type(value) is not str or not value.strip()
         elif rule == "nonnegative_finite_number":
             malformed = not _is_nonnegative_finite_number(value)
-        else:  # The bound compatibility profile should make this unreachable.
-            evidence.inconclusive.add("validator.version-adaptation-invalid")
+        else:  # The bound stream profile should make this unreachable.
+            evidence.inconclusive.add("validator.optional-field-contract-invalid")
             continue
 
         if malformed:
-            _record_adaptation_failure(
+            _record_optional_contract_failure(
                 evidence,
                 field_contract.get("malformed_failure", field_contract.get("failure")),
                 f"{prefix}.{field_name}.malformed",
             )
         elif mismatch:
-            _record_adaptation_failure(
+            _record_optional_contract_failure(
                 evidence,
-                field_contract["mismatch_failure"],
+                field_contract.get("mismatch_failure", field_contract.get("failure")),
                 f"{prefix}.{field_name}.mismatch",
             )
 
@@ -1919,26 +1952,10 @@ def _validate_profile_exact_array(
 def _validate_extended_init(
     event: Mapping[str, Any],
     *,
-    claude_code_version: str,
     evidence: _Evidence,
 ) -> None:
     _validate_profile_exact_string(event, "output_style", "default", evidence)
     _validate_profile_exact_array(event, "agents", EXPECTED_AGENTS, evidence)
-    capabilities_contract = _version_profile_field_contracts(
-        claude_code_version,
-        "init_event",
-    ).get("capabilities")
-    expected_capabilities = (
-        EXPECTED_CAPABILITIES
-        if capabilities_contract is None
-        else tuple(capabilities_contract["values"])
-    )
-    _validate_profile_exact_array(
-        event,
-        "capabilities",
-        expected_capabilities,
-        evidence,
-    )
 
     if "analytics_disabled" in event:
         value = event["analytics_disabled"]
@@ -2033,7 +2050,13 @@ def _validate_init(
         value = event["session_id"]
         if type(value) is not str or not value.strip():
             evidence.inconclusive.add("init.session_id.malformed")
-    _validate_adapted_fields(
+    _validate_optional_contract_fields(
+        event,
+        prefix="init",
+        contracts=COMPATIBLE_INIT_OPTIONAL_CONTRACTS,
+        evidence=evidence,
+    )
+    _validate_optional_contract_fields(
         event,
         prefix="init",
         contracts=adaptation_contracts,
@@ -2043,7 +2066,6 @@ def _validate_init(
     if profile_name == "extended-2x":
         _validate_extended_init(
             event,
-            claude_code_version=claude_code_version,
             evidence=evidence,
         )
 
@@ -3327,7 +3349,13 @@ def _validate_terminal(
             evidence.inconclusive.add("terminal.result.malformed")
 
     _validate_optional_terminal_fields(event, evidence)
-    _validate_adapted_fields(
+    _validate_optional_contract_fields(
+        event,
+        prefix="terminal",
+        contracts=COMPATIBLE_TERMINAL_OPTIONAL_CONTRACTS,
+        evidence=evidence,
+    )
+    _validate_optional_contract_fields(
         event,
         prefix="terminal",
         contracts=adaptation_contracts,

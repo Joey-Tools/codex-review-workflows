@@ -4431,7 +4431,7 @@ printf '%s\n' "$trusted_uv"
                 "outside the model-visible worktree", " ".join(content.split())
             )
         for content in (contracts,):
-            self.assertIn("optional nonempty `session_id`", content)
+            self.assertIn("Common reviewed optional init metadata", content)
             self.assertIn("unknown init field", content)
             self.assertIn("missing, invalid, or nonzero child return code", content)
             self.assertIn("structured `blocked` or `blocked-authentication`", content)
@@ -4513,10 +4513,44 @@ printf '%s\n' "$trusted_uv"
             },
         )
         self.assertFalse(init_contract["additional_fields"])
-        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_fields"],
+            ["session_id", "capabilities", "fast_mode_disabled_reason"],
+        )
         self.assertEqual(
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["capabilities"],
+            {
+                "rule": "one_of_exact_ordered_arrays",
+                "values": [
+                    ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    [
+                        "interrupt_receipt_v1",
+                        "interrupt_cancel_queued_v1",
+                        "msg_lifecycle_v1",
+                    ],
+                ],
+                "failure": "inconclusive",
+            },
+        )
+        expected_fast_mode_disabled_reason = {
+            "rule": "constant",
+            "value": "sdk_opt_in_required",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        }
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["fast_mode_disabled_reason"],
+            expected_fast_mode_disabled_reason,
+        )
+        self.assertEqual(
+            stream_schema["terminal_result"]["optional_field_contracts"][
+                "fast_mode_disabled_reason"
+            ],
+            expected_fast_mode_disabled_reason,
         )
         self.assertEqual(
             compatibility_profile,
@@ -4682,7 +4716,10 @@ printf '%s\n' "$trusted_uv"
         )
         init_contract = schema["init_event"]
         self.assertFalse(init_contract["additional_fields"])
-        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_fields"],
+            ["session_id", "capabilities", "fast_mode_disabled_reason"],
+        )
         self.assertEqual(
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
@@ -4742,8 +4779,15 @@ printf '%s\n' "$trusted_uv"
                     "failure": "inconclusive",
                 },
                 "capabilities": {
-                    "rule": "exact_ordered_array",
-                    "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    "rule": "one_of_exact_ordered_arrays",
+                    "values": [
+                        ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                        [
+                            "interrupt_receipt_v1",
+                            "interrupt_cancel_queued_v1",
+                            "msg_lifecycle_v1",
+                        ],
+                    ],
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {
