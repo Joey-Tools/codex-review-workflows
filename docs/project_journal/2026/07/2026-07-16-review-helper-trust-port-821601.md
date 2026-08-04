@@ -698,6 +698,12 @@ metadata behavior.
   launcher C syntax, project-journal validation, and `git diff --check` pass.
   Ruff 0.13.2 still identifies the same three unchanged baseline files outside
   this change range that it would reformat; they remain untouched.
+> Historical policy note: the next bullet records the rule active on
+> 2026-07-16. Its request/run binding and early-request poisoning decision are
+> superseded by the provider-evidence authority recorded in
+> `2026-07-30-github-codex-evidence-authority-gea001.md`; they are not current
+> review policy.
+
 - A final orchestration audit found that the documented lane sequence required
   both local reviewers to finish before `@codex review`, but did not classify an
   accidentally early same-head request or prevent its later terminal payload
