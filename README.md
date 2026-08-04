@@ -72,9 +72,12 @@ interval.
 A truly absent pre-v1 receipt is the narrow audit-only exception: keep the
 strictly older, otherwise well-formed artifact raw, exclude it from normalized
 receipt-bound wrappers, and admit it only through the closed
-`legacy_unreceipted_audit` partition. It never supplies positive authority or a
-basis, but it does not by itself veto a later receipt-bound result when the
-partition, time, stability, precedence, and thread gates all close.
+`legacy_unreceipted_audit` partition. It never supplies positive authority or
+becomes the selected completion basis. A later accepted receipt-bound result
+may still have a non-null `evidence_basis` that carries the item in
+`legacy_unreceipted_artifacts`; the legacy item does not by itself veto that
+result when the partition, time, stability, precedence, and thread gates all
+close.
 The frozen reaction-history `as_of_server_time` bounds historical artifact
 semantic time, not receipt collection time. Exact artifact GET and post-scope
 response `Date` values may be later when gathered during the bounded

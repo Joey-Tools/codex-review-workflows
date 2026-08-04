@@ -125,9 +125,11 @@ An unresolved thread finding is not superseded by a later clean artifact.
 A truly absent pre-v1 receipt is the narrow legacy exception: a strictly older,
 otherwise well-formed artifact may remain only in the closed
 `legacy_unreceipted_audit` partition. It is never positive terminal authority
-or a non-null basis, but it does not by itself veto a later receipt-bound result
-when every legacy-migration partition, time, stability, ordinary-precedence,
-and thread gate closes.
+or the selected completion basis. A later accepted receipt-bound result may
+still have a non-null `evidence_basis` that carries the item in
+`legacy_unreceipted_artifacts`; the legacy item does not by itself veto that
+result when every legacy-migration partition, time, stability,
+ordinary-precedence, and thread gate closes.
 
 ## Decision
 

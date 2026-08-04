@@ -6334,7 +6334,10 @@ printf '%s\n' "$trusted_uv"
                 for partition_anchor in (
                     "truly absent pre-v1 receipt",
                     "legacy_unreceipted_audit",
-                    "does not by itself veto a later receipt-bound result",
+                    "selected completion basis",
+                    "non-null evidence_basis",
+                    "legacy_unreceipted_artifacts",
+                    "does not by itself veto that result",
                 ):
                     self.assertIn(partition_anchor, normalized_document)
 
