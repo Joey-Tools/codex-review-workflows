@@ -1101,6 +1101,12 @@ window_end_inclusive = as_of_server_time]`. Record the source URL, all four
 values, and the initial receipt. Self-reported `authenticated` or
 `tls_attested` booleans are not receipt fields and add no authority.
 
+This frozen as-of bounds semantic historical outcomes; it is not a claim that
+the later raw discovery traversals observed an immutable repository snapshot at
+that instant. Raw updated-desc pull rows may therefore carry an `updated_at`
+later than `as_of_server_time`. Those rows are discovery observations, not
+eligible historical outcomes merely because the live endpoint returned them.
+
 The raw `discovery_endpoint_transcript`, not the candidate array, inventory
 entries, or count, is the historical-universe authority. Store it in both the
 initial and final inventory, with each inventory produced by its own
@@ -1251,7 +1257,13 @@ with a canonical unique `Link rel="next"` is complete only after that boundary
 `natural-end-complete`. A next link without a boundary is incomplete. Other
 unique canonical GitHub pagination relations may coexist with `next`;
 duplicate, unknown, malformed, or inconsistent relations fail closed. Only
-rows newer than the cutoff seed scopes; boundary and older rows are witnesses.
+rows newer than the cutoff seed raw detail scopes; boundary and older rows are
+witnesses. Because ordering is descending, every row with
+`updated_at > as_of_server_time` must form one contiguous validated future
+prefix before every row at or before as-of. Future-prefix rows remain in the
+budget-charged raw pages and seed the same complete detail traversal as any
+other newer row. They are never accepted as historical semantic evidence from
+the pull row alone.
 
 The second source fully paginates
 `GET /repos/<owner>/<repo>/issues/comments?sort=updated&direction=desc&since=<RFC3339-cutoff>&per_page=100`.
@@ -1271,12 +1283,13 @@ this feed and both request and response fall inside the frozen interval. The
 explicitly anchored current PR retains the independent single-scope current raw
 path and is never a historical sample.
 
-`anchors` binds the exact current PR and authenticated declaration PR. The
+`anchors` binds the exact current PR and authenticated declaration PR. The raw
 detail seed is the union of newer pull rows, controlled-request PRs, and both
-anchors. `max_seeded_pull_requests: 512` counts only that union and its detail
-traversals, never boundary witnesses or cumulative repository PR count. A
-513th union member, an incomplete source, or a budget overflow selects
-`unknown`; no prefix or truncation is allowed. Each scope is exactly
+anchors. `max_seeded_pull_requests: 512` counts that pre-filter union and all of
+its detail traversals, including future-prefix-only pull seeds, never boundary
+witnesses or cumulative repository PR count. A 513th raw union member, an
+incomplete source, or a budget overflow selects `unknown`; no prefix or
+truncation is allowed. Each scope is exactly
 `{pull_number, fetches}`, where `pull_number` is a canonical positive integer
 from that union.
 A version-3 transcript lacks this bounded dual-source completeness proof and
@@ -1293,7 +1306,48 @@ fetch is the canonical detail GET for that exact number. The fixed parser takes
 `base.sha` and `head.sha` from that raw detail record, binds those exact values
 into the canonical compare request, and takes `pr_merge_base` only from
 `compare.merge_base_commit.sha`; neither `base.sha` nor
-`merge_commit_sha` substitutes for the merge base.
+`merge_commit_sha` substitutes for the merge base. When updated-desc discovery
+also supplied the PR, its typed list-row `state` must equal the pull-detail
+lifecycle state.
+
+After every raw scope is completely parsed, the fixed projection records one
+closed `retained_pull_scope_audit` item for every PR that remains in the
+semantic union. Each item contains exactly `pull_number`, pull-detail
+`base_oid` and `head_oid`, compare-derived `merge_base`, and normalized closed
+`lifecycle`, sorted by unique positive pull number. This audit covers
+request-feed and anchor-only seeds plus record-free confirmed non-candidates;
+its initial/final copies must be type-preserving identical. It prevents a
+scope with no separate authority record from hiding base, head, merge-base, or
+lifecycle drift.
+
+Only after that raw seed/detail closure succeeds may the fixed projector omit a
+future-prefix-only pull seed from its semantic discovery projection, fixed
+union, `scope_classifications`, and `scope_authority_audit`. Omission requires
+all of the following: neither the since-cutoff request feed nor either anchor
+also seeds the PR; the complete detail traversal proves no semantic record in
+`(window_start_exclusive, as_of_server_time]`; it proves no controlled request,
+exact-provider, ambiguous/provider-like, exact-child, ambiguous-child, or other
+provider/policy-bearing semantic record at any time; and every observed
+post-as-of record is one of the already defined fully validated removable
+confirmed-different suffix forms. The raw pull row, every raw detail page, and
+all of their attempts/pages/records/bytes remain charged and retained. A
+request-feed or anchor seed always stays in the fixed union even when the same
+PR also appears in the future prefix. An incomplete page or join, cross-cutoff
+edit, unclassifiable record, or observed base/head/lifecycle drift fails closed
+instead of authorizing omission.
+
+Omission does not erase the seed's stable identity. Each traversal appends one
+closed `future_only_omitted_pull_audit` item for every omitted seed, containing
+exactly `pull_number`, pull-detail `base_oid` and `head_oid`, compare-derived
+`merge_base`, and the normalized closed `lifecycle`. Items are sorted by unique
+positive pull number. The stored projection must type-preservingly equal the
+raw-derived projection for that traversal. Across initial/final traversals,
+compare every other projection field exactly; a pull number may occur in only
+one omitted audit, but each pull number in their intersection must have an
+exactly equal audit item. Thus newly observed one-sided irrelevant activity can
+converge without letting a repeatedly observed omitted scope hide base, head,
+merge-base, or lifecycle drift. Live `updated_at`, pull-row digest, and endpoint
+order remain deliberately outside this audit.
 
 The seed/detail closure includes the authenticated declaration PR. Its PR
 number must occur as an explicit anchor in the discovery union, drive the same
@@ -1369,10 +1423,17 @@ The transcript envelope is closed, but endpoint JSON objects are forward
 compatible: the versioned fixed projector reads and type-checks every field
 used by policy while ignoring unrelated GitHub response additions. The raw page
 digest still binds all response bytes. A versioned fixed parser independently
-derives the complete set of candidate scope keys and scope-final bases from the
-projected records. It also derives the closed `scope_classifications` list in
-positive pull-number order, with exactly one
-`{pull_number, scope_key, classification}` item for every union-seeded PR.
+derives the fixed semantic seed list from stable closed
+`{pull_number, base_oid, head_oid}` identities in positive pull-number order;
+pull-list `updated_at`, raw pull-row digest, and endpoint row order are not part
+of that fixed semantic identity. The parser independently derives the complete
+set of candidate scope keys and scope-final bases from the retained semantic
+records. It also derives the closed `scope_classifications` list in positive
+pull-number order, with exactly one
+`{pull_number, scope_key, classification}` item for every PR retained in the
+fixed semantic union. A fully traversed future-prefix-only seed that satisfies
+the narrow omission rule above remains raw discovery evidence but has no fixed
+classification or audit item.
 The classification is exact `current`, `historical-candidate`, or
 `confirmed-non-candidate`; a pending controlled request, ambiguous identity,
 incomplete traversal, or unparseable record cannot be downgraded to
@@ -1424,7 +1485,7 @@ fully validated confirmed-different suffix records defined below are raw-only
 and excludable from the fixed semantic projection.
 
 The fixed semantic projection also derives `scope_authority_audit`, sorted by
-positive pull number, for every seeded scope that contains policy-relevant
+positive pull number, for every retained semantic scope that contains policy-relevant
 request, reaction, provider artifact, or provider nonterminal evidence. Each
 item is exactly
 `{scope_key, lifecycle, requests, reactions, applicable_artifacts,
@@ -1533,15 +1594,30 @@ when no controlled request was observed. Reaction-only evidence still requires
 the exact controlled parent and its matching request-time scope sidecar.
 Complete pagination and scope inventory must prove that universe and its
 recorded count by derivation from the raw transcript. The initial and final
-enumerations must be semantically identical for the same frozen interval.
+enumerations must be semantically identical for the same frozen interval. A PR
+already retained in that fixed semantic inventory may acquire unrelated
+post-as-of human or unrelated-bot activity between traversals and still
+converge when its stable pull/base/head identity, lifecycle, cutoff-in evidence,
+provider/policy evidence, classification, and authority projection are
+unchanged. A new raw future-prefix-only seed may likewise appear in only one
+traversal and be omitted only under the narrow fully traversed rule above.
 Validate each traversal's page digests, REST links, GraphQL cursor chain, and
 seed-to-detail closure independently. The two raw transcript envelopes, page
 bodies, body digests, and opaque cursor tokens need not be byte-identical.
 Opaque GraphQL cursor bytes need only form a valid chain within their own
-traversal; type-preserving equality of the fixed semantic projection,
+traversal; type-preserving equality of the fixed semantic projection core,
 `scope_classifications`, candidate `entries`, candidate arrays, and recorded
 count, together with the complete `scope_authority_audit`, establishes final
-equivalence. Any semantic or candidate-set drift still fails closed. For
+equivalence. The core includes exact equality of
+`retained_pull_scope_audit`, even for request/anchor-only or record-free
+confirmed non-candidates. The two `future_only_omitted_pull_audit` arrays may have one-sided
+pull numbers, but exact audit equality is required for their pull-number
+intersection. Raw pull-row timestamps/digests/order and fully validated
+one-sided omitted future-only seeds are not fixed-semantic drift. Repeatedly
+observed omitted-scope base/head/merge-base/lifecycle drift,
+controlled-request or provider/policy-bearing evidence, cross-cutoff edits,
+incomplete pages, or any other semantic or candidate-set drift still fails
+closed. For
 `thumbs-up-clean`, the separately evaluated current reaction-only outcome's
 selected basis must not be later than the same `as_of_server_time`; its
 reaction-fallback raw evidence snapshot is subject to that bound as well. This
@@ -1818,7 +1894,7 @@ second deadline, or mutate retained bytes after budget validation.
    labels, copied prose, and self-hashed paraphrases do not satisfy it.
 3. The complete bounded 30-day same-repository historical candidate universe,
    derived from a schema-version-4 bounded dual-source discovery union,
-   excludes the exact current scope only after every union-seeded PR was fully
+   excludes the exact current scope only after every raw-union-seeded PR was fully
    traversed and parsed, and has type-preserving stable initial/final discovery
    projections. It selects 3 to 10 outcomes
    and every selected candidate is eligible under the profile rule above. No
@@ -1874,7 +1950,7 @@ second deadline, or mutate retained bytes after budget validation.
     show that work started or restarted, but it never proves clean.
 13. The final re-read is unchanged, including the canonical declaration REST
     artifact and recomputed digest, trusted history-window anchor/count, the
-    complete dual-source discovery projection and every union-seeded PR classification, every
+    complete dual-source discovery projection and every retained-semantic PR classification, every
     candidate before sorting, every ordered historical request/reaction sample,
     every request-time scope sidecar, the exact current request and reaction,
     the independently fetched raw
@@ -2238,9 +2314,9 @@ evidence_basis:
         cutoff_rfc3339: <canonical window_start_exclusive>
         stop_reason: window-boundary-complete | natural-end-complete
         recent_pull_requests:
-          - pull_number: <positive recently updated PR number>
-            updated_at: <canonical in-window server time>
-            source_record_sha256: <canonical raw pull-record SHA-256>
+          - pull_number: <positive PR number retained after complete detail validation>
+            base_oid: <full lowercase pull-detail base OID>
+            head_oid: <full lowercase pull-detail head OID>
         recent_request_comments:
           - request_id: <positive controlled-request comment ID>
             pull_number: <positive joined PR number>
@@ -2249,9 +2325,21 @@ evidence_basis:
         anchors:
           current_pull_number: <positive current PR number>
           declaration_pull_number: <positive declaration PR number>
-        union_pull_numbers: [<every sorted union-seeded PR number>]
+        union_pull_numbers: [<every sorted fixed-semantic-union PR number>]
+        retained_pull_scope_audit:
+          - pull_number: <every unique positive fixed-semantic-union PR number>
+            base_oid: <full lowercase pull-detail base OID>
+            head_oid: <full lowercase pull-detail head OID>
+            merge_base: <full lowercase compare-derived merge-base OID>
+            lifecycle: <closed normalized PR lifecycle object>
+        future_only_omitted_pull_audit:
+          - pull_number: <unique positive omitted future-prefix-only PR number>
+            base_oid: <full lowercase pull-detail base OID>
+            head_oid: <full lowercase pull-detail head OID>
+            merge_base: <full lowercase compare-derived merge-base OID>
+            lifecycle: <closed normalized PR lifecycle object>
       scope_classifications:
-        - pull_number: <every union-seeded PR, including current, declaration, and confirmed non-candidates>
+        - pull_number: <every fixed-semantic-union PR, including current, declaration, and confirmed non-candidates>
           scope_key: [OWNER/REPO, <pr>, <pr_merge_base>, <head>]
           classification: current | historical-candidate | confirmed-non-candidate
       entries:
@@ -2263,7 +2351,7 @@ evidence_basis:
             semantic: "+1" | eyes | clean | findings | malformed
             native_identity: [<parent reactions URL or channel>, <positive native ID>]
             source_record_sha256: <canonical policy-projection SHA-256>
-    final_inventory: <independently fetched complete inventory with identical scope_discovery_projection, semantic projection, and stable request_scope_receipts>
+    final_inventory: <independently fetched complete inventory with identical fixed scope_discovery_projection core, exact overlap equality for future_only_omitted_pull_audit, identical semantic projection, and stable request_scope_receipts; raw future prefixes and one-sided omitted seeds may differ only under the validated omission rule>
     initial_candidates:
       - <complete candidate snapshot defined below>
     final_candidates:
@@ -2378,7 +2466,7 @@ REST/report JSON type.
 
 The report embeds both independently fetched schema-version-4 raw historical
 discovery endpoint transcripts, including each bounded pull/request source,
-both anchors, every union-seeded PR traversal, and every
+both anchors, every raw-union-seeded PR traversal, and every retained-semantic
 current/candidate/non-candidate classification. The union/detail closure includes the authenticated declaration
 PR and retains its exact declaration record in its declaration role. That role
 does not suppress terminal classification; only an independently nonterminal
@@ -2397,12 +2485,30 @@ request/reaction IDs when present, `same_scope_request_audit`, and
 `candidate_basis`. The initial and final candidate arrays, parent-owned
 `request_scope_receipts`, derived `scope_classifications`, and derived `entries`
 must be type-preserving identical. The fixed `scope_discovery_projection`
-records the cutoff, stop reason, ordered recent pull records, ordered request
-IDs/PRs/digests, anchors, and sorted union; its initial/final copies must also
-be type-preserving identical. The independently fetched raw transcript
-records need not be structurally or byte-identical when each traversal is
-complete and their fixed semantic projections are identical; opaque cursor and
-raw page-byte differences are transport evidence, not candidate drift.
+records the cutoff, while the enclosing history window separately records the
+frozen as-of. It also records the stop reason, deterministic positive-number
+list of stable retained pull/base/head seed identities, ordered request
+IDs/PRs/digests, anchors, sorted fixed semantic union, and the closed
+`retained_pull_scope_audit`, whose item set exactly covers that union and whose
+initial/final copies are type-preserving identical. Every remaining projection
+field must also be type-preserving identical except for the closed
+`future_only_omitted_pull_audit`. Omitted-audit items are unique and ordered by
+positive pull number; one-sided items may differ, while every pull number in
+the initial/final intersection must bind identical
+pull/base/head/merge-base/lifecycle values. It deliberately excludes pull-list
+`updated_at`, raw pull-row digests, and endpoint row order. The
+independently fetched raw transcript records need not be structurally or
+byte-identical when each traversal is complete and their fixed semantic
+projection cores are identical; opaque cursor and raw page-byte differences,
+unrelated activity on an already retained seed, and a fully traversed one-sided
+omitted future-prefix-only seed are raw observation differences, not candidate
+drift.
+Every such raw row and detail traversal still consumes the ordinary endpoint
+budget. A request-feed/anchor co-seed, controlled request, exact or ambiguous
+provider/policy evidence, cross-cutoff edit, repeated omitted-scope
+base/head/merge-base/lifecycle drift, or incomplete source/detail page remains
+fixed-semantic drift or incomplete
+authority and fails closed.
 
 `current.raw_endpoint_inventories.initial` and `.final` are independent,
 complete endpoint traversals and each is the authority for its corresponding
@@ -2485,7 +2591,7 @@ References to an external ledger do not replace these fields.
 Immediately before success, re-fetch and revalidate the authenticated
 declaration artifact without moving the frozen window, re-read every raw
 discovery endpoint transcript, independently rederive the bounded dual-source
-union coverage, every union-seeded PR classification, the historical inventory/count,
+raw-union coverage, every retained-semantic PR classification, the historical inventory/count,
 and every universe candidate before sorting, and revalidate every ordered
 `samples[]`. Independently re-fetch the final raw current endpoint inventory,
 rederive its complete finding-commit set, repeat every parent-owned local Git
@@ -2556,11 +2662,15 @@ implementation mechanically:
 9. **Bounded dual-source discovery schema version 4 is a playbook extension.**
    This playbook combines an updated-desc boundary traversal, a since-cutoff
    repository issue-comment feed, and current/declaration anchors; it traverses
-   every union-seeded PR and excludes current only after full parsing. Version 3
+   every raw-union-seeded PR and excludes current only after full parsing. Its
+   fixed semantic projection compares stable PR/base/head seed identities rather
+   than live pull-row timestamps, digests, or endpoint order, and may omit a
+   fully traversed future-prefix-only seed only under the narrow
+   confirmed-different rule above. Version 3
    cannot prove the fallback, and evidence-budget overflow selects `unknown`.
    The versioned playbook budget deliberately reuses the fixed Action
    baseline's 20000-item, 8 MiB per-response, and 64 MiB per-work bounds. Its
-   512 union-seeded PRs, 512 controlled requests, 8192 attempts, 4096 retained pages,
+   512 raw-union-seeded PRs, 512 controlled requests, 8192 attempts, 4096 retained pages,
    and 900-second per-traversal deadline are playbook extensions needed for
    the two fresh historical traversals; they are not attributed to the Action.
 10. **Request-time scope sidecars are a playbook extension.** The fixed Action

@@ -1318,6 +1318,81 @@ actor-independent historical discovery and the raw-only future suffix are
 playbook-only safeguards for the lower-information conditional `+1` fallback,
 not new Action behavior.
 
+## Final Reviewer P2: Future-Prefix Semantic Convergence
+
+The final formal reviewer reported P2 against the schema-v4 stability rule.
+Disposition: accepted and corrected. The raw updated-desc pull traversal is a
+live observation made after the provider-declaration receipt froze
+`as_of_server_time`; treating a pull row's live `updated_at`, raw row digest, or
+endpoint position as fixed semantic state caused an unrelated human comment to
+make otherwise identical initial/final histories disagree and select a false
+`unknown`.
+
+The corrected contract separates raw discovery closure from fixed semantic
+convergence:
+
+- The frozen as-of bounds historical outcome semantics, not raw endpoint
+  observation time. Rows later than as-of form a validated contiguous future
+  prefix. They remain in retained raw pages, consume the ordinary attempt,
+  page, record, byte, deadline, and 512-seed budgets, and seed the complete
+  pull/compare/comments/reviews/inline/thread/reaction traversal.
+- The fixed `scope_discovery_projection` uses deterministic positive-number
+  `{pull_number, base_oid, head_oid}` retained-seed identities. It does not bind
+  volatile pull-list `updated_at`, raw row digests, or endpoint row order. An
+  existing retained seed can therefore converge across unrelated post-as-of
+  confirmed-different activity when its scope, lifecycle, semantic evidence,
+  classification, and authority audit remain unchanged.
+- The closed `retained_pull_scope_audit` additionally records
+  pull/base/head/merge-base/lifecycle for every retained semantic-union PR,
+  including request/anchor-only and record-free confirmed non-candidates, and
+  is exactly equal across traversals. When the recent pull list also contains a
+  PR, its typed `state` must equal pull-detail lifecycle state. This closes the
+  reviewer-found gap where a scope without a separate policy record could hide
+  base or lifecycle drift.
+- A seed present only because of the future pull prefix can be omitted from the
+  fixed projection, semantic union, classification, and audit only after its
+  complete detail traversal proves no record in the frozen interval, no
+  controlled request or exact/ambiguous provider/policy-bearing semantic
+  record, and only the already authorized removable confirmed-different
+  post-as-of suffix forms. A request-feed or current/declaration anchor co-seed
+  always remains. No raw record, detail traversal, or budget charge is skipped.
+- Omission retains a closed `future_only_omitted_pull_audit` item with the
+  omitted PR's pull/base/head/merge-base/lifecycle identity. Initial/final
+  projection cores remain exactly equal. A one-sided omitted seed is allowed,
+  but the same pull number present in both audits must have a type-preserving
+  identical item; omission therefore cannot erase an observed identity or
+  lifecycle drift.
+- Controlled requests, exact or ambiguous/provider-like evidence, exact or
+  ambiguous children, cross-cutoff edits, base/head/lifecycle drift, incomplete
+  pagination, broken joins, and overflow remain fail-closed. The exception is
+  therefore convergence of irrelevant live repository activity, not prefix
+  acceptance or a weaker completeness rule.
+
+The regression rationale is narrow: initial/final evidence should agree when
+only unrelated repository activity happened after the frozen semantic cutoff,
+while every raw discovery candidate still receives full detail validation.
+Coverage must distinguish an already retained seed with a future metadata bump,
+a new future-only seed that is fully traversed then semantically omitted, and
+the fail-closed request/provider-like/drift/incomplete variants. It must also
+prove that the raw 512-seed cap and every detail fetch apply before omission,
+that request/anchor co-seeds stay retained, and that repeated omitted scopes
+cannot change base, head, merge base, or lifecycle between traversals. Coverage
+must also bind every retained scope, including anchor-only and record-free
+scopes, and reject pull-list/detail lifecycle disagreement.
+
+This disposition preserves the earlier “result exists means pass” decision and
+the pinned `codex-review-gate` / released `codex-review-gate-action` alignment:
+trustworthy provider results remain authoritative without request/run
+attribution. Future-prefix discovery convergence is a conditional `+1`
+adaptation-plane playbook extension, not behaviour attributed to the Action.
+Any future change to the as-of meaning, stable seed identity, omission
+predicate, retained-scope audit, omitted-scope overlap audit, raw/detail budget
+closure, or Action
+attribution must update the versioned transcript/projector contract,
+agent/readiness/probe mirrors, regression coverage, and this journal together;
+changing the Action side also requires a new pinned
+source/release/tree/manifest baseline.
+
 ## Evidence
 
 - `skills/review-orchestration-playbook/references/github-codex-evidence-authority.md`

@@ -4295,7 +4295,7 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIn(
             "two independently complete initial/final discovery inventories whose "
-            "fixed semantic projections",
+            "fixed semantic projection cores",
             normalized_readme_text,
         )
         self.assertNotIn(
@@ -4444,9 +4444,9 @@ printf '%s\n' "$trusted_uv"
                 "{schema_version: 4, repository, scope_discovery, scopes}",
                 "scope_discovery is exactly "
                 "{recent_pull_requests, recent_request_comments, anchors}",
-                "max_seeded_pull_requests: 512 counts only that union and its "
-                "detail traversals, never boundary witnesses or cumulative "
-                "repository pr count",
+                "max_seeded_pull_requests: 512 counts that pre-filter union and "
+                "all of its detail traversals, including future-prefix-only pull "
+                "seeds, never boundary witnesses or cumulative repository pr count",
                 "a version-3 transcript lacks this bounded dual-source "
                 "completeness proof and cannot prove reaction fallback",
             ),
@@ -4454,8 +4454,9 @@ printf '%s\n' "$trusted_uv"
                 "schema-version-4 discovery_endpoint_transcript",
                 "updated-desc pull pages retained through the first page "
                 "containing updated_at <= window_start_exclusive",
-                "the 512 seeded-pr cap counts only union/detail prs, not boundary "
-                "witnesses or cumulative old prs",
+                "the 512 seeded-pr cap counts the pre-filter raw union/detail prs, "
+                "including future-only seeds, not boundary witnesses or cumulative "
+                "old prs",
                 "version 3 cannot prove the fallback",
             ),
             "github-pr-probes": (
@@ -4470,7 +4471,7 @@ printf '%s\n' "$trusted_uv"
                 "schema-version-4 raw discovery transcript",
                 "bounded updated-desc pull traversal stops after the first full "
                 "page containing a row at or before the cutoff",
-                "boundary witnesses do not consume the 512 union-seeded-pr cap",
+                "boundary witnesses do not consume the 512 raw-union-seeded-pr cap",
                 "a version-3 transcript cannot prove reaction fallback",
             ),
             "project-journal": (
@@ -4572,8 +4573,12 @@ printf '%s\n' "$trusted_uv"
             "recent_request_comments:",
             "anchors:",
             "union_pull_numbers:",
+            "retained_pull_scope_audit:",
+            "future_only_omitted_pull_audit:",
             "scope_classifications:",
-            "identical scope_discovery_projection",
+            "identical fixed scope_discovery_projection core",
+            "exact overlap equality for future_only_omitted_pull_audit",
+            "one-sided omitted seeds may differ",
         )
         for marker in report_projection_markers:
             with self.subTest(report_projection_marker=marker):
@@ -6823,6 +6828,79 @@ printf '%s\n' "$trusted_uv"
         history_window_seconds = 30 * 24 * 60 * 60
         history_as_of_server_time = 3_000_000
         history_start_exclusive = history_as_of_server_time - history_window_seconds
+        future_prefix_policy_documents = {
+            "readme": REPO_ROOT / "README.md",
+            "authority": SKILL_ROOT / "references/github-codex-evidence-authority.md",
+            "skill": SKILL_ROOT / "SKILL.md",
+            "github-pr-probes": SKILL_ROOT / "references/github-pr-probes.md",
+            "pr-readiness": SKILL_ROOT / "references/pr-readiness.md",
+            "project-journal": REPO_ROOT / "docs/project_journal/2026/07/"
+            "2026-07-30-github-codex-evidence-authority-gea001.md",
+        }
+        for document_name, document_path in future_prefix_policy_documents.items():
+            normalized_future_prefix_policy = re.sub(
+                r"[-\s]+",
+                " ",
+                document_path.read_text(encoding="utf-8").casefold(),
+            )
+            with self.subTest(future_prefix_policy_document=document_name):
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"as of[^.]{0,240}bounds[^.]{0,160}semantic",
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"raw[^.]{0,200}(?:observation(?: time| snapshot)|"
+                    r"observed an immutable repository snapshot)|"
+                    r"not when the live pull endpoint was observed",
+                )
+                self.assertIn("future prefix", normalized_future_prefix_policy)
+                self.assertIn("raw", normalized_future_prefix_policy)
+                self.assertIn("budget", normalized_future_prefix_policy)
+                self.assertIn("detail", normalized_future_prefix_policy)
+                self.assertIn(
+                    "{pull_number, base_oid, head_oid}",
+                    normalized_future_prefix_policy,
+                )
+                self.assertIn("updated_at", normalized_future_prefix_policy)
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"raw (?:pull )?row digest",
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"endpoint(?: row)? order",
+                )
+                self.assertIn("request", normalized_future_prefix_policy)
+                self.assertIn("anchor", normalized_future_prefix_policy)
+                self.assertIn(
+                    "confirmed different",
+                    normalized_future_prefix_policy,
+                )
+                self.assertIn("ambiguous", normalized_future_prefix_policy)
+                self.assertIn("cross cutoff", normalized_future_prefix_policy)
+                self.assertIn("incomplete", normalized_future_prefix_policy)
+                self.assertIn(
+                    "future_only_omitted_pull_audit",
+                    normalized_future_prefix_policy,
+                )
+                self.assertIn(
+                    "retained_pull_scope_audit",
+                    normalized_future_prefix_policy,
+                )
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"pull number[^.]{0,100}(?:both audits|intersection)",
+                )
+                self.assertIn("one sided", normalized_future_prefix_policy)
+                self.assertIn("merge base", normalized_future_prefix_policy)
+                self.assertIn("lifecycle", normalized_future_prefix_policy)
+                self.assertRegex(
+                    normalized_future_prefix_policy,
+                    r"drift[^.]{0,240}fail(?:s|ed)? closed",
+                )
+                self.assertIn("playbook extension", normalized_future_prefix_policy)
+                self.assertIn("action", normalized_future_prefix_policy)
         declaration_pr = 99
         declaration_artifact_id = 9_001
         declaration_text = (
@@ -13015,7 +13093,7 @@ printf '%s\n' "$trusted_uv"
             resource_tracker: dict[str, object],
         ) -> (
             tuple[
-                dict[int, tuple[str, str]],
+                dict[int, tuple[str, str, int, str]],
                 list[dict[str, object]],
                 str,
             ]
@@ -13032,7 +13110,7 @@ printf '%s\n' "$trusted_uv"
             ):
                 return None
             pages = fetch["pages"]
-            recent_pulls: dict[int, tuple[str, str]] = {}
+            recent_pulls: dict[int, tuple[str, str, int, str]] = {}
             projection: list[dict[str, object]] = []
             seen_all_pull_numbers: set[int] = set()
             previous_updated_at: int | None = None
@@ -13095,6 +13173,7 @@ printf '%s\n' "$trusted_uv"
                     head = raw_pull.get("head")
                     base_oid = base.get("sha") if isinstance(base, dict) else None
                     head_oid = head.get("sha") if isinstance(head, dict) else None
+                    state = raw_pull.get("state")
                     updated_at = _parse_github_rfc3339_seconds(
                         raw_pull.get("updated_at")
                     )
@@ -13111,8 +13190,9 @@ printf '%s\n' "$trusted_uv"
                         or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
                         or not isinstance(head_oid, str)
                         or re.fullmatch(r"[0-9a-f]{40}", head_oid) is None
+                        or type(state) is not str
+                        or state not in {"open", "closed"}
                         or updated_at is None
-                        or updated_at > history_as_of_server_time
                         or (
                             previous_updated_at is not None
                             and updated_at > previous_updated_at
@@ -13127,14 +13207,17 @@ printf '%s\n' "$trusted_uv"
                         continue
                     if page_boundary_seen:
                         return None
-                    recent_pulls[pull_number] = (base_oid, head_oid)
+                    recent_pulls[pull_number] = (
+                        base_oid,
+                        head_oid,
+                        updated_at,
+                        state,
+                    )
                     projection.append(
                         {
                             "pull_number": pull_number,
-                            "updated_at": updated_at,
-                            "source_record_sha256": hashlib.sha256(
-                                canonical_raw_body(raw_pull).encode("utf-8")
-                            ).hexdigest(),
+                            "base_oid": base_oid,
+                            "head_oid": head_oid,
                         }
                     )
                 raw_link_header = page.get("link_header")
@@ -13208,6 +13291,7 @@ printf '%s\n' "$trusted_uv"
                 if next_url is not None
                 else "natural-end-complete"
             )
+            projection.sort(key=lambda item: int(item["pull_number"]))
             return recent_pulls, projection, stop_reason
 
         def raw_actor(value: object) -> str:
@@ -13425,9 +13509,12 @@ printf '%s\n' "$trusted_uv"
                 "&per_page=100"
             )
             scope_discovery = value.get("scope_discovery")
-            discovered_pulls: dict[int, tuple[str, str] | None] = {}
+            discovered_pulls: dict[int, tuple[str, str, int, str] | None] = {}
             recent_request_by_id: dict[int, tuple[int, dict[str, object]]] = {}
             scope_discovery_projection: dict[str, object] | None = None
+            future_prefix_pull_numbers: set[int] = set()
+            request_seed_pull_numbers: set[int] = set()
+            anchor_pull_numbers: set[int] = set()
             if _single_scope_pull_number is None:
                 if (
                     not isinstance(scope_discovery, dict)
@@ -13452,6 +13539,14 @@ printf '%s\n' "$trusted_uv"
                     return None
                 recent_pulls, recent_pull_projection, stop_reason = recent_pull_result
                 recent_request_by_id, recent_request_projection = recent_request_result
+                future_prefix_pull_numbers = {
+                    pull_number
+                    for pull_number, (_, _, updated_at, _) in recent_pulls.items()
+                    if updated_at > history_as_of_server_time
+                }
+                request_seed_pull_numbers = {
+                    pull_number for pull_number, _ in recent_request_by_id.values()
+                }
                 anchors = scope_discovery["anchors"]
                 anchor_values: list[int] = []
                 for anchor_name in (
@@ -13463,6 +13558,7 @@ printf '%s\n' "$trusted_uv"
                         return None
                     if type(anchor) is int:
                         anchor_values.append(anchor)
+                anchor_pull_numbers = set(anchor_values)
                 if anchors.get("current_pull_number") != current_pr:
                     return None
                 if (
@@ -13471,9 +13567,7 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 union_pull_numbers = sorted(
-                    set(recent_pulls)
-                    | {pull_number for pull_number, _ in recent_request_by_id.values()}
-                    | set(anchor_values)
+                    set(recent_pulls) | request_seed_pull_numbers | set(anchor_values)
                 )
                 if len(union_pull_numbers) > effective_limits[
                     "max_seeded_pull_requests"
@@ -13492,6 +13586,8 @@ printf '%s\n' "$trusted_uv"
                     "recent_request_comments": recent_request_projection,
                     "anchors": clone(anchors),
                     "union_pull_numbers": union_pull_numbers,
+                    "retained_pull_scope_audit": [],
+                    "future_only_omitted_pull_audit": [],
                 }
             else:
                 if (
@@ -13505,6 +13601,9 @@ printf '%s\n' "$trusted_uv"
                 discovered_pulls[_single_scope_pull_number] = None
 
             raw_semantic_scopes: list[dict[str, object]] = []
+            retained_pull_scope_audit: list[dict[str, object]] = []
+            future_only_omitted_pull_numbers: set[int] = set()
+            future_only_omitted_pull_audit: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
             observed_current_finding_heads: set[str] = set()
@@ -13605,6 +13704,10 @@ printf '%s\n' "$trusted_uv"
                     or not isinstance(head, str)
                     or re.fullmatch(r"[0-9a-f]{40}", head) is None
                     or (discovered_scope is not None and head != discovered_scope[1])
+                    or (
+                        discovered_scope is not None
+                        and normalized_lifecycle["state"] != discovered_scope[3]
+                    )
                     or "merged_at" not in pull_record
                     or (raw_merged_at is not None and merged_at is None)
                     or not lifecycle_is_typed(
@@ -13696,6 +13799,7 @@ printf '%s\n' "$trusted_uv"
                     if feed_pr == pr
                 }
                 matched_feed_request_ids: set[int] = set()
+                confirmed_different_post_cutoff_payload_count = 0
 
                 request_times: dict[int, int] = {}
                 request_records: dict[int, dict[str, object]] = {}
@@ -13785,6 +13889,7 @@ printf '%s\n' "$trusted_uv"
                             return None
                         if created_at > history_as_of_server_time:
                             if actor == "different":
+                                confirmed_different_post_cutoff_payload_count += 1
                                 continue
                             if not _allow_post_as_of_artifacts:
                                 return None
@@ -13920,6 +14025,7 @@ printf '%s\n' "$trusted_uv"
                             other_review_ids.add(review_id)
                             excluded_future_review_ids.add(review_id)
                             excluded_future_review_by_id[review_id] = projected_review
+                            confirmed_different_post_cutoff_payload_count += 1
                             continue
                         if not _allow_post_as_of_artifacts:
                             return None
@@ -14024,6 +14130,7 @@ printf '%s\n' "$trusted_uv"
                             parent_id,
                             projected_inline,
                         )
+                        confirmed_different_post_cutoff_payload_count += 1
                         continue
                     if parent_id in associated_inline_by_review:
                         associated_inline_by_review[parent_id].append(projected_inline)
@@ -14491,6 +14598,7 @@ printf '%s\n' "$trusted_uv"
                     seen_reaction_ids.add(reaction_id)
                     if created_at > history_as_of_server_time:
                         if actor == "different":
+                            confirmed_different_post_cutoff_payload_count += 1
                             continue
                         if not (
                             _allow_post_as_of_artifacts
@@ -14515,40 +14623,65 @@ printf '%s\n' "$trusted_uv"
                         )
                     )
 
-                raw_semantic_scopes.append(
-                    {
-                        "pull_number": pr,
-                        "scope_key": parsed_scope,
-                        "repository": repository,
-                        "base_oid": base_oid,
-                        "merge_base": merge_base,
-                        "head": head,
-                        "lifecycle": clone(normalized_lifecycle),
-                        "request_times": dict(request_times),
-                        "request_records": {
-                            request_id: clone(request_record)
-                            for request_id, request_record in request_records.items()
-                        },
-                        "request_actor_eligibility": dict(request_actor_eligibility),
-                        "feed_request_ids": (
-                            None
-                            if _single_scope_pull_number is not None
-                            or parsed_scope == current_scope_key
-                            else sorted(feed_request_records)
-                        ),
-                        "provider_reactions": list(provider_reactions),
-                        "reaction_records": [
-                            clone(reaction_record)
-                            for reaction_record in semantic_reaction_records
-                        ],
-                        "artifact_bases": list(artifact_bases),
-                        "unresolved_artifact_bases": list(unresolved_artifact_bases),
-                        "invalid_review_state_blockers": list(
-                            invalid_review_state_blockers
-                        ),
-                        "nonterminal_records": list(nonterminal_records),
-                    }
+                raw_semantic_scope = {
+                    "pull_number": pr,
+                    "scope_key": parsed_scope,
+                    "repository": repository,
+                    "base_oid": base_oid,
+                    "merge_base": merge_base,
+                    "head": head,
+                    "lifecycle": clone(normalized_lifecycle),
+                    "request_times": dict(request_times),
+                    "request_records": {
+                        request_id: clone(request_record)
+                        for request_id, request_record in request_records.items()
+                    },
+                    "request_actor_eligibility": dict(request_actor_eligibility),
+                    "feed_request_ids": (
+                        None
+                        if _single_scope_pull_number is not None
+                        or parsed_scope == current_scope_key
+                        else sorted(feed_request_records)
+                    ),
+                    "provider_reactions": list(provider_reactions),
+                    "reaction_records": [
+                        clone(reaction_record)
+                        for reaction_record in semantic_reaction_records
+                    ],
+                    "artifact_bases": list(artifact_bases),
+                    "unresolved_artifact_bases": list(unresolved_artifact_bases),
+                    "invalid_review_state_blockers": list(
+                        invalid_review_state_blockers
+                    ),
+                    "nonterminal_records": list(nonterminal_records),
+                }
+                future_only_omittable = (
+                    _single_scope_pull_number is None
+                    and pr in future_prefix_pull_numbers
+                    and pr not in request_seed_pull_numbers
+                    and pr not in anchor_pull_numbers
+                    and confirmed_different_post_cutoff_payload_count > 0
+                    and not request_times
+                    and not provider_reactions
+                    and not semantic_reaction_records
+                    and not artifact_bases
+                    and not unresolved_artifact_bases
+                    and not invalid_review_state_blockers
+                    and not nonterminal_records
                 )
+                scope_identity_audit_item = {
+                    "pull_number": pr,
+                    "base_oid": base_oid,
+                    "head_oid": head,
+                    "merge_base": merge_base,
+                    "lifecycle": clone(normalized_lifecycle),
+                }
+                if future_only_omittable:
+                    future_only_omitted_pull_numbers.add(pr)
+                    future_only_omitted_pull_audit.append(scope_identity_audit_item)
+                else:
+                    retained_pull_scope_audit.append(scope_identity_audit_item)
+                    raw_semantic_scopes.append(raw_semantic_scope)
             if (
                 seen_detail_pulls != set(discovered_pulls)
                 or current_scope_key not in seen_scopes
@@ -14565,6 +14698,42 @@ printf '%s\n' "$trusted_uv"
                 return None
             if not resource_budget_charge(resource_tracker):
                 return None
+            if future_only_omitted_pull_numbers:
+                if not isinstance(scope_discovery_projection, dict):
+                    return None
+                retained_recent_pulls = [
+                    item
+                    for item in scope_discovery_projection["recent_pull_requests"]
+                    if item.get("pull_number") not in future_only_omitted_pull_numbers
+                ]
+                retained_union = [
+                    pull_number
+                    for pull_number in scope_discovery_projection["union_pull_numbers"]
+                    if pull_number not in future_only_omitted_pull_numbers
+                ]
+                scope_discovery_projection["recent_pull_requests"] = (
+                    retained_recent_pulls
+                )
+                scope_discovery_projection["union_pull_numbers"] = retained_union
+            if isinstance(scope_discovery_projection, dict):
+                retained_pull_scope_audit.sort(
+                    key=lambda item: int(item["pull_number"]),
+                )
+                expected_retained_pull_numbers = scope_discovery_projection.get(
+                    "union_pull_numbers"
+                )
+                if not typed_json_equal(
+                    [item["pull_number"] for item in retained_pull_scope_audit],
+                    expected_retained_pull_numbers,
+                ):
+                    return None
+                scope_discovery_projection["retained_pull_scope_audit"] = clone(
+                    retained_pull_scope_audit
+                )
+                scope_discovery_projection["future_only_omitted_pull_audit"] = sorted(
+                    future_only_omitted_pull_audit,
+                    key=lambda item: int(item["pull_number"]),
+                )
             try:
                 transcript_digest = hashlib.sha256(
                     canonical_raw_body(value).encode("utf-8")
@@ -16167,6 +16336,108 @@ printf '%s\n' "$trusted_uv"
                 mapping[candidate] = ancestry_return_code
             return mapping
 
+        def stable_scope_discovery_projection_and_omission_audit(
+            value: object,
+        ) -> tuple[dict[str, object], dict[int, dict[str, object]]] | None:
+            if not isinstance(value, dict):
+                return None
+            expected_audit_fields = {
+                "pull_number",
+                "base_oid",
+                "head_oid",
+                "merge_base",
+                "lifecycle",
+            }
+
+            def parse_scope_identity_audit(
+                audit: object,
+            ) -> dict[int, dict[str, object]] | None:
+                if not isinstance(audit, list):
+                    return None
+                audit_by_pull: dict[int, dict[str, object]] = {}
+                previous_pull_number = 0
+                for item in audit:
+                    if not isinstance(item, dict) or set(item) != expected_audit_fields:
+                        return None
+                    pull_number = item.get("pull_number")
+                    base_oid = item.get("base_oid")
+                    head_oid = item.get("head_oid")
+                    merge_base = item.get("merge_base")
+                    if (
+                        type(pull_number) is not int
+                        or pull_number <= previous_pull_number
+                        or not isinstance(base_oid, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", base_oid) is None
+                        or not isinstance(head_oid, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", head_oid) is None
+                        or not isinstance(merge_base, str)
+                        or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
+                        or not lifecycle_is_typed(item, require_open=False)
+                    ):
+                        return None
+                    previous_pull_number = pull_number
+                    audit_by_pull[pull_number] = item
+                return audit_by_pull
+
+            retained_audit_by_pull = parse_scope_identity_audit(
+                value.get("retained_pull_scope_audit")
+            )
+            omitted_audit_by_pull = parse_scope_identity_audit(
+                value.get("future_only_omitted_pull_audit")
+            )
+            union_pull_numbers = value.get("union_pull_numbers")
+            if (
+                retained_audit_by_pull is None
+                or omitted_audit_by_pull is None
+                or not isinstance(union_pull_numbers, list)
+                or not typed_json_equal(
+                    list(retained_audit_by_pull),
+                    union_pull_numbers,
+                )
+                or set(retained_audit_by_pull) & set(omitted_audit_by_pull)
+            ):
+                return None
+            stable_projection = clone(value)
+            assert isinstance(stable_projection, dict)
+            stable_projection.pop("future_only_omitted_pull_audit")
+            return stable_projection, omitted_audit_by_pull
+
+        def historical_phase_projections_converge(
+            initial_value: object,
+            final_value: object,
+        ) -> bool:
+            if not isinstance(initial_value, dict) or not isinstance(final_value, dict):
+                return False
+            initial_projection = initial_value.get("scope_discovery_projection")
+            final_projection = final_value.get("scope_discovery_projection")
+            initial_parts = stable_scope_discovery_projection_and_omission_audit(
+                initial_projection
+            )
+            final_parts = stable_scope_discovery_projection_and_omission_audit(
+                final_projection
+            )
+            if initial_parts is None or final_parts is None:
+                return False
+            initial_stable_scope_projection, initial_audit = initial_parts
+            final_stable_scope_projection, final_audit = final_parts
+            initial_stable_value = clone(initial_value)
+            final_stable_value = clone(final_value)
+            assert isinstance(initial_stable_value, dict)
+            assert isinstance(final_stable_value, dict)
+            initial_stable_value["scope_discovery_projection"] = (
+                initial_stable_scope_projection
+            )
+            final_stable_value["scope_discovery_projection"] = (
+                final_stable_scope_projection
+            )
+            return typed_json_equal(
+                initial_stable_value,
+                final_stable_value,
+            ) and all(
+                typed_json_equal(initial_audit[pull_number], final_audit[pull_number])
+                for pull_number in set(initial_audit) & set(final_audit)
+            )
+
         def _validate_history_universe_complete(
             candidate_history: dict[str, object],
             *,
@@ -16541,7 +16812,10 @@ printf '%s\n' "$trusted_uv"
                 not isinstance(initial_candidate_entries, list)
                 or not isinstance(final_candidate_entries, list)
                 or not typed_json_equal(initial_candidates, final_candidates)
-                or not typed_json_equal(initial_projection, final_projection)
+                or not historical_phase_projections_converge(
+                    initial_projection,
+                    final_projection,
+                )
                 or not typed_json_equal(
                     initial_historical_entries,
                     final_historical_entries,
@@ -17419,9 +17693,9 @@ printf '%s\n' "$trusted_uv"
                 return None
             initial_stable_summary = clone(initial_phase["audit_summary"])
             final_stable_summary = clone(final_phase["audit_summary"])
-            if (
-                not typed_json_equal(initial_stable_summary, final_stable_summary)
-                or initial_phase["audit_sha256"] != final_phase["audit_sha256"]
+            if not historical_phase_projections_converge(
+                initial_stable_summary,
+                final_stable_summary,
             ):
                 return None
             sidecar_unavailable = (
@@ -21957,6 +22231,7 @@ printf '%s\n' "$trusted_uv"
                 ),
                 "base": {"sha": f"{pull_number + 100_000:040x}"},
                 "head": {"sha": f"{pull_number + 200_000:040x}"},
+                "state": "closed",
                 "updated_at": _format_github_rfc3339_seconds(updated_at),
             }
 
@@ -29373,9 +29648,317 @@ printf '%s\n' "$trusted_uv"
             final_scope_page,
             canonical_raw_body(final_scope_body),
         )
-        self.assertIsNone(
-            validate_history_universe_result(scope_source_digest_drift_history)
+        volatile_discovery_result = validate_history_universe_result(
+            scope_source_digest_drift_history
         )
+        self.assertIsNotNone(volatile_discovery_result)
+        assert isinstance(volatile_discovery_result, dict)
+        self.assertEqual(
+            volatile_discovery_result["status"],
+            "unused-sidecar-unavailable",
+        )
+
+        stable_seed_identity_drift_history = clone(scope_source_digest_drift_history)
+        assert isinstance(stable_seed_identity_drift_history, dict)
+        stable_final_inventory = stable_seed_identity_drift_history["final_inventory"]
+        stable_final_transcript = stable_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        stable_final_page = stable_final_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        stable_final_records = strict_json_loads(stable_final_page["body_utf8"])
+        assert isinstance(stable_final_records, list)
+        drifted_seed_record = stable_final_records[0]
+        assert isinstance(drifted_seed_record, dict)
+        drifted_pull_number = drifted_seed_record["number"]
+        drifted_head_oid = drifted_seed_record["head"]["sha"]
+        original_base_oid = drifted_seed_record["base"]["sha"]
+        replacement_base_oid = "e" * 40
+        self.assertNotEqual(original_base_oid, replacement_base_oid)
+        drifted_seed_record["base"]["sha"] = replacement_base_oid
+        replace_raw_json_body(
+            stable_final_page,
+            canonical_raw_body(stable_final_records),
+        )
+        drifted_scope = next(
+            item
+            for item in stable_final_transcript["scopes"]
+            if item.get("pull_number") == drifted_pull_number
+        )
+        drifted_fetches = drifted_scope["fetches"]
+        drifted_pull_fetch = next(
+            fetch for fetch in drifted_fetches if fetch.get("kind") == "pull_requests"
+        )
+        drifted_pull_body = strict_json_loads(
+            drifted_pull_fetch["pages"][0]["body_utf8"]
+        )
+        assert isinstance(drifted_pull_body, dict)
+        drifted_pull_body["base"]["sha"] = replacement_base_oid
+        replace_raw_json_body(
+            drifted_pull_fetch["pages"][0],
+            canonical_raw_body(drifted_pull_body),
+        )
+        drifted_compare_fetch = next(
+            fetch for fetch in drifted_fetches if fetch.get("kind") == "compare"
+        )
+        drifted_compare_page = drifted_compare_fetch["pages"][0]
+        drifted_compare_page["request_url"] = (
+            f"https://api.github.com/repos/{current_repository}/compare/"
+            f"{replacement_base_oid}...{drifted_head_oid}"
+        )
+        drifted_compare_body = strict_json_loads(drifted_compare_page["body_utf8"])
+        assert isinstance(drifted_compare_body, dict)
+        drifted_compare_body["base_commit"]["sha"] = replacement_base_oid
+        replace_raw_json_body(
+            drifted_compare_page,
+            canonical_raw_body(drifted_compare_body),
+        )
+        stable_final_projection_context = new_inventory_validation_context()
+        self.assertIsNotNone(stable_final_projection_context)
+        assert isinstance(stable_final_projection_context, dict)
+        stable_final_projection = parse_discovery_endpoint_transcript(
+            stable_final_transcript,
+            request_scope_receipts=None,
+            provider_declaration=declaration,
+            _endpoint_plane_only=True,
+            _sidecar_blind_audit=True,
+            _inventory_validation_context=stable_final_projection_context,
+        )
+        self.assertIsNotNone(stable_final_projection)
+        assert isinstance(stable_final_projection, dict)
+        stable_final_inventory["scope_discovery_projection"] = clone(
+            stable_final_projection["scope_discovery_projection"]
+        )
+        drifted_retained_seed = next(
+            item
+            for item in stable_final_inventory["scope_discovery_projection"][
+                "retained_pull_scope_audit"
+            ]
+            if item.get("pull_number") == drifted_pull_number
+        )
+        self.assertEqual(drifted_retained_seed["base_oid"], replacement_base_oid)
+        self.assertIsNone(
+            validate_history_universe_result(stable_seed_identity_drift_history)
+        )
+
+        def mutate_recent_pull_record(
+            transcript: dict[str, object],
+            pull_number: int,
+            mutate: object,
+        ) -> None:
+            if not callable(mutate):
+                raise AssertionError("recent-pull mutator must be callable")
+            pages = transcript["scope_discovery"]["recent_pull_requests"]["pages"]
+            for page in pages:
+                records = strict_json_loads(page["body_utf8"])
+                if not isinstance(records, list):
+                    raise AssertionError("recent-pull page must contain a list")
+                record = next(
+                    (
+                        item
+                        for item in records
+                        if isinstance(item, dict) and item.get("number") == pull_number
+                    ),
+                    None,
+                )
+                if record is None:
+                    continue
+                mutate(record)
+                replace_raw_json_body(page, canonical_raw_body(records))
+                return
+            raise AssertionError(f"recent-pull record is missing: {pull_number}")
+
+        def remove_recent_pull_record(
+            transcript: dict[str, object],
+            pull_number: int,
+        ) -> None:
+            pages = transcript["scope_discovery"]["recent_pull_requests"]["pages"]
+            for page in pages:
+                records = strict_json_loads(page["body_utf8"])
+                if not isinstance(records, list):
+                    raise AssertionError("recent-pull page must contain a list")
+                retained_records = [
+                    item
+                    for item in records
+                    if not (
+                        isinstance(item, dict) and item.get("number") == pull_number
+                    )
+                ]
+                if len(retained_records) == len(records):
+                    continue
+                replace_raw_json_body(
+                    page,
+                    canonical_raw_body(retained_records),
+                )
+                return
+            raise AssertionError(f"recent-pull record is missing: {pull_number}")
+
+        def mutate_pull_detail_identity(
+            transcript: dict[str, object],
+            pull_number: int,
+            *,
+            base_oid: str | None = None,
+            state: str | None = None,
+        ) -> None:
+            scope_transcript = next(
+                item
+                for item in transcript["scopes"]
+                if item.get("pull_number") == pull_number
+            )
+            pull_fetch = next(
+                fetch
+                for fetch in scope_transcript["fetches"]
+                if fetch.get("kind") == "pull_requests"
+            )
+            pull_page = pull_fetch["pages"][0]
+            pull_record = strict_json_loads(pull_page["body_utf8"])
+            if not isinstance(pull_record, dict):
+                raise AssertionError("pull detail must contain an object")
+            compare_fetch = next(
+                fetch
+                for fetch in scope_transcript["fetches"]
+                if fetch.get("kind") == "compare"
+            )
+            compare_page = compare_fetch["pages"][0]
+            compare_record = strict_json_loads(compare_page["body_utf8"])
+            if not isinstance(compare_record, dict):
+                raise AssertionError("compare detail must contain an object")
+            if base_oid is not None:
+                pull_record["base"]["sha"] = base_oid
+                compare_record["base_commit"]["sha"] = base_oid
+                compare_page["request_url"] = (
+                    f"https://api.github.com/repos/{current_repository}/compare/"
+                    f"{base_oid}...{pull_record['head']['sha']}"
+                )
+            if state is not None:
+                pull_record["state"] = state
+                pull_record["merged"] = False
+                pull_record["merged_at"] = None
+            replace_raw_json_body(
+                pull_page,
+                canonical_raw_body(pull_record),
+            )
+            replace_raw_json_body(
+                compare_page,
+                canonical_raw_body(compare_record),
+            )
+
+        def refresh_stored_scope_discovery_projection(
+            inventory: dict[str, object],
+        ) -> dict[str, object]:
+            projection = parse_discovery_endpoint_transcript(
+                inventory["discovery_endpoint_transcript"],
+                request_scope_receipts=inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
+            if not isinstance(projection, dict):
+                raise AssertionError("scope discovery projection must parse")
+            inventory["scope_discovery_projection"] = clone(
+                projection["scope_discovery_projection"]
+            )
+            return projection
+
+        record_free_scope = confirmed_nonprovider_scope(98)
+        record_free_scope["raw_issue_records"] = []
+        record_free_history = history(
+            samples,
+            confirmed_noncandidate_scopes=[record_free_scope],
+        )
+        record_free_initial_audit = record_free_history["initial_inventory"][
+            "scope_discovery_projection"
+        ]["retained_pull_scope_audit"]
+        self.assertIn(
+            98,
+            [item["pull_number"] for item in record_free_initial_audit],
+        )
+
+        list_detail_state_mismatch = clone(record_free_history)
+        assert isinstance(list_detail_state_mismatch, dict)
+        mismatched_inventory = list_detail_state_mismatch["final_inventory"]
+        mutate_recent_pull_record(
+            mismatched_inventory["discovery_endpoint_transcript"],
+            98,
+            lambda record: record.__setitem__("state", "closed"),
+        )
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                mismatched_inventory["discovery_endpoint_transcript"],
+                request_scope_receipts=mismatched_inventory["request_scope_receipts"],
+                provider_declaration=declaration,
+            )
+        )
+
+        retained_lifecycle_drift = clone(record_free_history)
+        assert isinstance(retained_lifecycle_drift, dict)
+        retained_lifecycle_final = retained_lifecycle_drift["final_inventory"]
+        retained_lifecycle_transcript = retained_lifecycle_final[
+            "discovery_endpoint_transcript"
+        ]
+        mutate_recent_pull_record(
+            retained_lifecycle_transcript,
+            98,
+            lambda record: record.__setitem__("state", "closed"),
+        )
+        mutate_pull_detail_identity(
+            retained_lifecycle_transcript,
+            98,
+            state="closed",
+        )
+        refresh_stored_scope_discovery_projection(retained_lifecycle_final)
+        initial_record_free_audit = next(
+            item for item in record_free_initial_audit if item.get("pull_number") == 98
+        )
+        final_record_free_audit = next(
+            item
+            for item in retained_lifecycle_final["scope_discovery_projection"][
+                "retained_pull_scope_audit"
+            ]
+            if item.get("pull_number") == 98
+        )
+        self.assertFalse(
+            typed_json_equal(initial_record_free_audit, final_record_free_audit)
+        )
+        self.assertIsNone(validate_history_universe_result(retained_lifecycle_drift))
+
+        anchor_only_base_drift = history(samples)
+        for phase in ("initial", "final"):
+            anchor_inventory = anchor_only_base_drift[f"{phase}_inventory"]
+            remove_recent_pull_record(
+                anchor_inventory["discovery_endpoint_transcript"],
+                declaration_pr,
+            )
+            refresh_stored_scope_discovery_projection(anchor_inventory)
+            anchor_projection = anchor_inventory["scope_discovery_projection"]
+            self.assertNotIn(
+                declaration_pr,
+                [
+                    item["pull_number"]
+                    for item in anchor_projection["recent_pull_requests"]
+                ],
+            )
+            self.assertIn(
+                declaration_pr,
+                anchor_projection["union_pull_numbers"],
+            )
+        self.assertIsNotNone(validate_history_universe(anchor_only_base_drift))
+        anchor_final_inventory = anchor_only_base_drift["final_inventory"]
+        anchor_replacement_base = "d" * 40
+        mutate_pull_detail_identity(
+            anchor_final_inventory["discovery_endpoint_transcript"],
+            declaration_pr,
+            base_oid=anchor_replacement_base,
+        )
+        refresh_stored_scope_discovery_projection(anchor_final_inventory)
+        anchor_final_audit = next(
+            item
+            for item in anchor_final_inventory["scope_discovery_projection"][
+                "retained_pull_scope_audit"
+            ]
+            if item.get("pull_number") == declaration_pr
+        )
+        self.assertEqual(anchor_final_audit["base_oid"], anchor_replacement_base)
+        self.assertIsNone(validate_history_universe(anchor_only_base_drift))
 
         def append_scope_rest_record(
             candidate_history: dict[str, object],
@@ -33077,6 +33660,30 @@ printf '%s\n' "$trusted_uv"
         future_review_transcript = future_review_inventory[
             "discovery_endpoint_transcript"
         ]
+        future_recent_pull_page = future_review_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        future_recent_pull_records = strict_json_loads(
+            future_recent_pull_page["body_utf8"]
+        )
+        assert isinstance(future_recent_pull_records, list)
+        future_background_pull = next(
+            item
+            for item in future_recent_pull_records
+            if item.get("number") == background_pr
+        )
+        future_background_pull["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 4
+        )
+        future_recent_pull_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            or -1,
+            reverse=True,
+        )
+        replace_raw_json_body(
+            future_recent_pull_page,
+            canonical_raw_body(future_recent_pull_records),
+        )
         future_review_scope = next(
             item
             for item in future_review_transcript["scopes"]
@@ -33204,6 +33811,22 @@ printf '%s\n' "$trusted_uv"
         self.assertTrue(
             typed_json_equal(initial_noise_projection, future_human_projection)
         )
+        assert isinstance(future_human_projection, dict)
+        retained_background_seed = next(
+            item
+            for item in future_human_projection["scope_discovery_projection"][
+                "recent_pull_requests"
+            ]
+            if item.get("pull_number") == background_pr
+        )
+        self.assertEqual(
+            set(retained_background_seed),
+            {"pull_number", "base_oid", "head_oid"},
+        )
+        self.assertIn(
+            background_pr,
+            future_human_projection["scope_discovery_projection"]["union_pull_numbers"],
+        )
         self.assertFalse(
             typed_json_equal(
                 future_human_review_history["initial_inventory"][
@@ -33236,7 +33859,6 @@ printf '%s\n' "$trusted_uv"
                     ],
                 )
             )
-        assert isinstance(future_human_projection, dict)
         future_audits = {
             tuple(audit["scope_key"]): audit
             for audit in future_human_projection["scope_authority_audit"]
@@ -33260,6 +33882,552 @@ printf '%s\n' "$trusted_uv"
             ),
             "thumbs-up-clean",
         )
+
+        future_only_pr = 96
+        future_only_scope = confirmed_nonprovider_scope(future_only_pr)
+        future_only_issue = future_only_scope["raw_issue_records"][0]
+        assert isinstance(future_only_issue, dict)
+        future_only_issue["created_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        future_only_issue["updated_at"] = _format_github_rfc3339_seconds(
+            history_as_of_server_time + 1
+        )
+        future_only_detail = build_discovery_endpoint_transcript(
+            [future_only_scope],
+            _pull_updated_at_by_pr={
+                future_only_pr: history_as_of_server_time + 4,
+            },
+        )
+        future_only_history = history(samples)
+        future_only_final_inventory = future_only_history["final_inventory"]
+        future_only_final_transcript = future_only_final_inventory[
+            "discovery_endpoint_transcript"
+        ]
+        future_only_final_transcript["scopes"].append(
+            clone(future_only_detail["scopes"][0])
+        )
+        future_only_root_page = future_only_final_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        future_only_root_records = strict_json_loads(future_only_root_page["body_utf8"])
+        assert isinstance(future_only_root_records, list)
+        future_only_detail_root_records = raw_rest_records(
+            future_only_detail["scope_discovery"]["recent_pull_requests"]
+        )
+        self.assertEqual(len(future_only_detail_root_records), 1)
+        future_only_root_records.extend(future_only_detail_root_records)
+        future_only_root_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            or -1,
+            reverse=True,
+        )
+        replace_raw_json_body(
+            future_only_root_page,
+            canonical_raw_body(future_only_root_records),
+        )
+        future_only_projection = parse_discovery_endpoint_transcript(
+            future_only_final_transcript,
+            request_scope_receipts=future_only_final_inventory[
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(future_only_projection)
+        assert isinstance(future_only_projection, dict)
+        self.assertNotIn(
+            future_only_pr,
+            future_only_projection["scope_discovery_projection"]["union_pull_numbers"],
+        )
+        self.assertNotIn(
+            future_only_pr,
+            {
+                item["pull_number"]
+                for item in future_only_projection["scope_discovery_projection"][
+                    "recent_pull_requests"
+                ]
+            },
+        )
+        self.assertNotIn(
+            future_only_pr,
+            {
+                item["pull_number"]
+                for item in future_only_projection["scope_classifications"]
+            },
+        )
+        self.assertNotIn(
+            future_only_pr,
+            {
+                item["scope_key"][1]
+                for item in future_only_projection["scope_authority_audit"]
+            },
+        )
+        future_only_omission_audit = future_only_projection[
+            "scope_discovery_projection"
+        ]["future_only_omitted_pull_audit"]
+        self.assertEqual(
+            future_only_omission_audit,
+            [
+                {
+                    "pull_number": future_only_pr,
+                    "base_oid": f"{future_only_pr + 100_000:040x}",
+                    "head_oid": future_only_scope["scope"]["head"],
+                    "merge_base": future_only_scope["scope"]["pr_merge_base"],
+                    "lifecycle": future_only_scope["lifecycle"],
+                }
+            ],
+        )
+        self.assertEqual(
+            future_only_history["initial_inventory"]["scope_discovery_projection"][
+                "future_only_omitted_pull_audit"
+            ],
+            [],
+        )
+        future_only_final_inventory["scope_discovery_projection"] = clone(
+            future_only_projection["scope_discovery_projection"]
+        )
+        self.assertTrue(
+            historical_phase_projections_converge(
+                {
+                    "scope_discovery_projection": future_only_history[
+                        "initial_inventory"
+                    ]["scope_discovery_projection"]
+                },
+                {
+                    "scope_discovery_projection": future_only_final_inventory[
+                        "scope_discovery_projection"
+                    ]
+                },
+            )
+        )
+
+        future_anchor_transcript = clone(future_only_final_transcript)
+        assert isinstance(future_anchor_transcript, dict)
+        future_anchor_root_page = future_anchor_transcript["scope_discovery"][
+            "recent_pull_requests"
+        ]["pages"][0]
+        future_anchor_root_records = strict_json_loads(
+            future_anchor_root_page["body_utf8"]
+        )
+        assert isinstance(future_anchor_root_records, list)
+        future_anchor_times = {
+            current_pr: history_as_of_server_time + 3,
+            declaration_pr: history_as_of_server_time + 2,
+        }
+        for root_record in future_anchor_root_records:
+            if (
+                isinstance(root_record, dict)
+                and root_record.get("number") in future_anchor_times
+            ):
+                root_record["updated_at"] = _format_github_rfc3339_seconds(
+                    future_anchor_times[root_record["number"]]
+                )
+        future_anchor_root_records.sort(
+            key=lambda item: _parse_github_rfc3339_seconds(item.get("updated_at"))
+            if isinstance(item, dict)
+            else -1,
+            reverse=True,
+        )
+        replace_raw_json_body(
+            future_anchor_root_page,
+            canonical_raw_body(future_anchor_root_records),
+        )
+        future_anchor_projection = parse_discovery_endpoint_transcript(
+            future_anchor_transcript,
+            request_scope_receipts=future_only_final_inventory[
+                "request_scope_receipts"
+            ],
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(future_anchor_projection)
+        assert isinstance(future_anchor_projection, dict)
+        future_anchor_discovery = future_anchor_projection["scope_discovery_projection"]
+        for anchor_pull_number in (current_pr, declaration_pr):
+            with self.subTest(future_prefix_anchor=anchor_pull_number):
+                self.assertIn(
+                    anchor_pull_number,
+                    future_anchor_discovery["union_pull_numbers"],
+                )
+                self.assertIn(
+                    anchor_pull_number,
+                    {
+                        item["pull_number"]
+                        for item in future_anchor_discovery["recent_pull_requests"]
+                    },
+                )
+                self.assertNotIn(
+                    anchor_pull_number,
+                    {
+                        item["pull_number"]
+                        for item in future_anchor_discovery[
+                            "future_only_omitted_pull_audit"
+                        ]
+                    },
+                )
+        self.assertIsNotNone(validate_history_universe(future_only_history))
+        self.assertEqual(
+            compute_provider_profile(declaration, future_only_history, current),
+            "thumbs-up-clean",
+        )
+
+        future_only_raw_scope_count = len(future_only_final_transcript["scopes"])
+        self.assertGreater(future_only_raw_scope_count, 1)
+        self.assertIsNone(
+            parse_discovery_endpoint_transcript(
+                future_only_final_transcript,
+                request_scope_receipts=future_only_final_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+                _tightened_resource_limits=tightened_resource_limits(
+                    max_seeded_pull_requests=future_only_raw_scope_count - 1,
+                ),
+            )
+        )
+
+        future_only_detail_fetch_kinds = {
+            fetch["kind"]
+            for fetch in next(
+                item
+                for item in future_only_final_transcript["scopes"]
+                if item.get("pull_number") == future_only_pr
+            )["fetches"]
+        }
+        self.assertEqual(
+            future_only_detail_fetch_kinds,
+            set(required_universe_pagination)
+            - {
+                "recent_pull_requests",
+                "recent_request_comments",
+                "request_reactions",
+            },
+        )
+        for detail_kind in sorted(future_only_detail_fetch_kinds):
+            unreadable_future_detail = clone(future_only_final_transcript)
+            assert isinstance(unreadable_future_detail, dict)
+            unreadable_scope = next(
+                item
+                for item in unreadable_future_detail["scopes"]
+                if item.get("pull_number") == future_only_pr
+            )
+            unreadable_fetch = unreadable_scope["fetches"][
+                fetch_index(unreadable_scope["fetches"], detail_kind)
+            ]
+            unreadable_fetch["pages"][0]["status"] = 500
+            with self.subTest(future_only_detail_fetch=detail_kind):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        unreadable_future_detail,
+                        request_scope_receipts=future_only_final_inventory[
+                            "request_scope_receipts"
+                        ],
+                        provider_declaration=declaration,
+                    )
+                )
+
+        future_request_seed_pr = 97
+        future_request_seed_scope = sample(future_request_seed_pr)
+        future_request_seed_human_issue = raw_request_record(
+            request(
+                40_000 + future_request_seed_pr,
+                history_as_of_server_time + 1,
+                pr=future_request_seed_pr,
+            )
+        )
+        future_request_seed_human_issue["body"] = "Post-cutoff human discussion."
+        future_request_seed_scope["raw_issue_records"] = [
+            future_request_seed_human_issue
+        ]
+        future_request_seed_scopes = [
+            future_request_seed_scope,
+            clone(current),
+            provider_declaration_scope(),
+        ]
+        future_request_seed_transcript = build_discovery_endpoint_transcript(
+            future_request_seed_scopes,
+            _pull_updated_at_by_pr={
+                future_request_seed_pr: history_as_of_server_time + 4,
+            },
+        )
+        future_request_seed_projection = parse_discovery_endpoint_transcript(
+            future_request_seed_transcript,
+            request_scope_receipts=request_scope_receipts_for_scopes(
+                future_request_seed_scopes
+            ),
+            provider_declaration=declaration,
+        )
+        self.assertIsNotNone(future_request_seed_projection)
+        assert isinstance(future_request_seed_projection, dict)
+        future_request_seed_discovery = future_request_seed_projection[
+            "scope_discovery_projection"
+        ]
+        self.assertIn(
+            future_request_seed_pr,
+            future_request_seed_discovery["union_pull_numbers"],
+        )
+        self.assertIn(
+            future_request_seed_pr,
+            {
+                item["pull_number"]
+                for item in future_request_seed_discovery["recent_pull_requests"]
+            },
+        )
+        self.assertIn(
+            future_request_seed_pr,
+            {
+                item["pull_number"]
+                for item in future_request_seed_discovery["recent_request_comments"]
+            },
+        )
+        self.assertNotIn(
+            future_request_seed_pr,
+            {
+                item["pull_number"]
+                for item in future_request_seed_discovery[
+                    "future_only_omitted_pull_audit"
+                ]
+            },
+        )
+
+        for future_only_negative in (
+            "exact-provider",
+            "ambiguous-provider-like",
+            "controlled-request-feed",
+            "cross-cutoff-human",
+            "incomplete-detail-page",
+        ):
+            rejected_future_only_history = clone(future_only_history)
+            assert isinstance(rejected_future_only_history, dict)
+            rejected_inventory = rejected_future_only_history["final_inventory"]
+            rejected_transcript = rejected_inventory["discovery_endpoint_transcript"]
+            rejected_scope = next(
+                item
+                for item in rejected_transcript["scopes"]
+                if item.get("pull_number") == future_only_pr
+            )
+            rejected_fetches = rejected_scope["fetches"]
+            rejected_issue_index = fetch_index(rejected_fetches, "issue_comments")
+            rejected_issue_fetch = rejected_fetches[rejected_issue_index]
+            rejected_issue_records = raw_rest_records(rejected_issue_fetch)
+            rejected_issue = rejected_issue_records[0]
+            assert isinstance(rejected_issue, dict)
+            if future_only_negative == "exact-provider":
+                rejected_issue["user"] = {"login": exact_login, "type": "Bot"}
+                rejected_issue["performed_via_github_app"] = {
+                    "slug": "chatgpt-codex-connector",
+                    "id": 1,
+                }
+            elif future_only_negative == "ambiguous-provider-like":
+                rejected_issue["user"] = {
+                    "login": "other-codex[bot]",
+                    "type": "Bot",
+                }
+            elif future_only_negative == "controlled-request-feed":
+                rejected_issue["body"] = "@codex review"
+                feed_record = clone(rejected_issue)
+                assert isinstance(feed_record, dict)
+                feed_record["issue_url"] = (
+                    f"https://api.github.com/repos/{current_repository}/issues/"
+                    f"{future_only_pr}"
+                )
+                request_feed = rejected_transcript["scope_discovery"][
+                    "recent_request_comments"
+                ]
+                request_feed_records = raw_rest_records(request_feed)
+                request_feed_records.insert(0, feed_record)
+                rejected_transcript["scope_discovery"]["recent_request_comments"] = (
+                    rest_fetch(
+                        "recent_request_comments",
+                        request_feed["pages"][0]["request_url"],
+                        request_feed_records,
+                    )
+                )
+            elif future_only_negative == "cross-cutoff-human":
+                rejected_issue["created_at"] = _format_github_rfc3339_seconds(
+                    history_as_of_server_time - 1
+                )
+            else:
+                rejected_issue_fetch["pages"][0]["link_header"] = (
+                    f"<{rejected_issue_fetch['pages'][0]['request_url']}&page=2>; "
+                    'rel="next"'
+                )
+            if future_only_negative != "incomplete-detail-page":
+                rejected_fetches[rejected_issue_index] = rest_fetch(
+                    "issue_comments",
+                    rejected_issue_fetch["pages"][0]["request_url"],
+                    rejected_issue_records,
+                )
+            with self.subTest(final_only_future_prefix=future_only_negative):
+                self.assertIsNone(
+                    parse_discovery_endpoint_transcript(
+                        rejected_transcript,
+                        request_scope_receipts=rejected_inventory[
+                            "request_scope_receipts"
+                        ],
+                        provider_declaration=declaration,
+                    )
+                )
+                self.assertIsNone(
+                    validate_history_universe(rejected_future_only_history)
+                )
+
+        overlapping_future_only_history = clone(future_only_history)
+        assert isinstance(overlapping_future_only_history, dict)
+        overlapping_initial_inventory = overlapping_future_only_history[
+            "initial_inventory"
+        ]
+        overlapping_final_inventory = overlapping_future_only_history["final_inventory"]
+        overlapping_initial_inventory["discovery_endpoint_transcript"] = clone(
+            overlapping_final_inventory["discovery_endpoint_transcript"]
+        )
+        overlapping_initial_inventory["scope_discovery_projection"] = clone(
+            overlapping_final_inventory["scope_discovery_projection"]
+        )
+        self.assertIsNotNone(validate_history_universe(overlapping_future_only_history))
+
+        def mutate_future_only_scope_identity(
+            transcript: dict[str, object],
+            *,
+            drift_kind: str,
+        ) -> None:
+            replacement_base_oid = "a" * 40
+            replacement_head_oid = "b" * 40
+            replacement_merge_base = "c" * 40
+            root_fetch = transcript["scope_discovery"]["recent_pull_requests"]
+            root_record: dict[str, object] | None = None
+            root_page: dict[str, object] | None = None
+            root_records: list[object] | None = None
+            for candidate_page in root_fetch["pages"]:
+                candidate_records = strict_json_loads(candidate_page["body_utf8"])
+                if not isinstance(candidate_records, list):
+                    raise AssertionError("recent-pull page must contain a list")
+                candidate_record = next(
+                    (
+                        item
+                        for item in candidate_records
+                        if isinstance(item, dict)
+                        and item.get("number") == future_only_pr
+                    ),
+                    None,
+                )
+                if candidate_record is not None:
+                    root_record = candidate_record
+                    root_page = candidate_page
+                    root_records = candidate_records
+                    break
+            if root_record is None or root_page is None or root_records is None:
+                raise AssertionError("future-only pull root is missing")
+            scope_transcript = next(
+                item
+                for item in transcript["scopes"]
+                if item.get("pull_number") == future_only_pr
+            )
+            pull_fetch = scope_transcript["fetches"][
+                fetch_index(scope_transcript["fetches"], "pull_requests")
+            ]
+            pull_page = pull_fetch["pages"][0]
+            pull_record = strict_json_loads(pull_page["body_utf8"])
+            if not isinstance(pull_record, dict):
+                raise AssertionError("pull detail must contain an object")
+            compare_fetch = scope_transcript["fetches"][
+                fetch_index(scope_transcript["fetches"], "compare")
+            ]
+            compare_page = compare_fetch["pages"][0]
+            compare_record = strict_json_loads(compare_page["body_utf8"])
+            if not isinstance(compare_record, dict):
+                raise AssertionError("compare detail must contain an object")
+
+            if drift_kind == "base_oid":
+                root_record["base"]["sha"] = replacement_base_oid
+                pull_record["base"]["sha"] = replacement_base_oid
+                compare_record["base_commit"]["sha"] = replacement_base_oid
+            elif drift_kind == "head_oid":
+                root_record["head"]["sha"] = replacement_head_oid
+                pull_record["head"]["sha"] = replacement_head_oid
+                compare_record["head_commit"]["sha"] = replacement_head_oid
+            elif drift_kind == "merge_base":
+                compare_record["merge_base_commit"]["sha"] = replacement_merge_base
+            elif drift_kind == "lifecycle":
+                root_record["state"] = "closed"
+                pull_record["state"] = "closed"
+                pull_record["merged"] = False
+                pull_record["merged_at"] = None
+            else:
+                raise AssertionError(f"unknown future-only drift: {drift_kind}")
+
+            base_oid = pull_record["base"]["sha"]
+            head_oid = pull_record["head"]["sha"]
+            compare_page["request_url"] = (
+                f"https://api.github.com/repos/{current_repository}/compare/"
+                f"{base_oid}...{head_oid}"
+            )
+            replace_raw_json_body(
+                root_page,
+                canonical_raw_body(root_records),
+            )
+            replace_raw_json_body(
+                pull_page,
+                canonical_raw_body(pull_record),
+            )
+            replace_raw_json_body(
+                compare_page,
+                canonical_raw_body(compare_record),
+            )
+
+        for future_only_identity_drift in (
+            "base_oid",
+            "head_oid",
+            "merge_base",
+            "lifecycle",
+        ):
+            drifted_future_only_history = clone(overlapping_future_only_history)
+            assert isinstance(drifted_future_only_history, dict)
+            drifted_final_inventory = drifted_future_only_history["final_inventory"]
+            drifted_final_transcript = drifted_final_inventory[
+                "discovery_endpoint_transcript"
+            ]
+            mutate_future_only_scope_identity(
+                drifted_final_transcript,
+                drift_kind=future_only_identity_drift,
+            )
+            drifted_final_projection = parse_discovery_endpoint_transcript(
+                drifted_final_transcript,
+                request_scope_receipts=drifted_final_inventory[
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+            self.assertIsNotNone(drifted_final_projection)
+            assert isinstance(drifted_final_projection, dict)
+            drifted_final_inventory["scope_discovery_projection"] = clone(
+                drifted_final_projection["scope_discovery_projection"]
+            )
+            initial_omission_audit = drifted_future_only_history["initial_inventory"][
+                "scope_discovery_projection"
+            ]["future_only_omitted_pull_audit"]
+            final_omission_audit = drifted_final_inventory[
+                "scope_discovery_projection"
+            ]["future_only_omitted_pull_audit"]
+            self.assertEqual(
+                [item["pull_number"] for item in initial_omission_audit],
+                [future_only_pr],
+            )
+            self.assertEqual(
+                [item["pull_number"] for item in final_omission_audit],
+                [future_only_pr],
+            )
+            self.assertFalse(
+                typed_json_equal(
+                    initial_omission_audit[0],
+                    final_omission_audit[0],
+                )
+            )
+            with self.subTest(
+                future_only_cross_traversal_drift=future_only_identity_drift
+            ):
+                self.assertIsNone(
+                    validate_history_universe(drifted_future_only_history)
+                )
 
         future_conflicting_app_history = clone(future_human_review_history)
         assert isinstance(future_conflicting_app_history, dict)

@@ -188,22 +188,46 @@ cutoff (or at natural end), while its fully paginated since-cutoff repository
 issue-comments feed retains every exact-body `@codex review` record regardless
 of actor or App, because discovery must seed the PR before complete actor,
 raw-equal detail, and sidecar validation accepts the request or selects
-`unknown`. Reactions may not update PR metadata. Newer pull rows, request-bound
-PRs, and exact current/declaration anchors form the detail union. Historical
+`unknown`. Reactions may not update PR metadata. The frozen as-of bounds
+semantic historical outcomes, not when the live pull endpoint was observed.
+Updated-desc rows later than as-of therefore form a contiguous validated future
+prefix; they stay raw and budget-charged and seed the complete
+pull/compare/comments/reviews/inline/thread/reaction traversal. Newer pull
+rows, request-bound PRs, and exact current/declaration anchors form the raw
+detail union. Historical
 reaction-only eligibility requires the parent in that feed and both request and
 response in the frozen interval. The fixed parser classifies every union-seeded
-PR and
+PR retained in the semantic union only after fully parsing every raw seed, and
 excludes current only after full parsing. Boundary witnesses do not consume the
-512 union-seeded-PR cap; union member 513, incomplete source/detail closure, or any
+512 raw-union-seeded-PR cap; raw union member 513, incomplete source/detail closure, or any
 budget overflow selects `unknown` without truncation. A version-3 transcript
 cannot prove reaction fallback. Only
 `compare.merge_base_commit.sha` supplies `pr_merge_base`. The fixed projector
-derives scope/order/source-evidence entries and count, while the closed
+uses deterministic stable `{pull_number, base_oid, head_oid}` retained-seed
+identity rather than pull-list `updated_at`, raw row digest, or endpoint order,
+then derives scope/order/source-evidence entries and count while the closed
 candidate evaluator independently validates every complete candidate.
 Self-consistent summaries or selected samples do not prove completeness. The
 parent-owned `request_scope_receipts` array and fixed
 `scope_discovery_projection` are stored beside the transcript; the latter binds
-cutoff, stop reason, recent PRs, request IDs/PRs/digests, anchors, and union.
+the cutoff (with as-of separately frozen in the history envelope), stop reason,
+stable retained pull seeds, request IDs/PRs/digests, anchors, and the fixed
+semantic union. Its closed `retained_pull_scope_audit` covers every retained
+union seed with exact pull/base/head/merge-base/lifecycle identity, including
+request/anchor-only and record-free scopes, and must be identical across
+initial/final traversals. A typed recent pull-list `state` must also equal the
+pull-detail lifecycle state inside each traversal. It records a separate closed
+`future_only_omitted_pull_audit` with
+each omitted seed's pull/base/head/merge-base/lifecycle identity. An existing retained seed may converge
+across unrelated post-as-of human activity. A future-prefix-only seed may be
+omitted from that projection, semantic union, classification, and audit only
+after its complete detail proves no in-window or provider/policy-bearing
+semantic record and only existing-rule removable confirmed-different
+post-as-of activity. A request-feed or current/declaration anchor co-seed always
+remains. Compare every other projection field exactly across traversals; allow
+one-sided omitted audit items, but require type-preserving equality for every
+pull number in both audits. Raw discovery/detail bytes and their budget charges
+are never omitted.
 
 Each historical inventory and each current raw endpoint inventory also stores
 a parent-owned `resource_budget` sibling beside, never inside, that unchanged
@@ -271,9 +295,12 @@ mutation. The initial and final inventories must be independent fresh fetches
 with independent 900-second starts. The `20000`-record, `8388608`-byte
 per-response, and `67108864`-byte aggregate caps intentionally align with the
 pinned `codex-review-gate-action` baseline above (20,000 items, 8 MiB per
-response, and 64 MiB per work unit). The 512 union-seeded PRs, 512 controlled
+response, and 64 MiB per work unit). The 512 raw-union-seeded PRs, 512 controlled
 requests, 8192 attempts, 4096 retained pages, and 900-second deadline are
-playbook extensions and are not attributed to that Action.
+playbook extensions and are not attributed to that Action. The stable
+future-prefix semantic projection is likewise a playbook extension; it
+preserves the Action-aligned provider-result authority rule rather than
+changing what a trustworthy result means.
 
 Classify actor identity and validate each carrier's complete schema, native
 IDs, canonical URLs, and joins before applying the frozen as-of cutoff. A
@@ -295,8 +322,12 @@ reconstructed. An exact or ambiguous child cannot be hidden with an otherwise
 confirmed-different future review. Schema version 4 has no independent
 inline-child timestamp, so it cannot infer that a human reply on an in-cutoff
 provider review is a removable later suffix; the child remains semantic drift.
+Observed base/head/lifecycle drift inside either traversal, repeated
+omitted-scope base/head/merge-base/lifecycle drift across traversals, or any
+incomplete source/detail page also fails closed; none can be normalized away as
+future-prefix churn.
 
-Validate every union-seeded PR before sorting, including candidates outside the
+Validate every raw-union-seeded PR before sorting, including candidates outside the
 newest 10 and scopes that become confirmed non-candidates. Validate current
 separately and never count it toward the three-outcome history minimum. Every
 historical sample and current reaction record binds the exact
