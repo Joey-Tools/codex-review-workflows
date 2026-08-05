@@ -2604,6 +2604,10 @@ class RepositoryContractTest(unittest.TestCase):
 """,
             private,
         )
+        self.assertNotIn(
+            "personal_codex/skills/waited-delivery/tests",
+            private,
+        )
 
     def test_completed_trust_port_journal_uses_current_claude_range(self) -> None:
         if CI_PROFILE != "canonical":
