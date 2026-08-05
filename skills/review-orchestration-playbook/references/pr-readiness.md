@@ -700,7 +700,7 @@ A qualifying third-lane result must prove all of the following:
 - The frozen reaction-history `as_of_server_time` bounds eligible historical artifact semantic times, not receipt collection time. An exact artifact GET or post-scope receipt may have a later `Date` when collected during the bounded decision/final reread; do not reject it solely for being observed after that cutoff.
 - A strong current `terminal-payload` or `mixed` result may also have semantic time after declaration discovery when it arrives during the bounded provider wait. The frozen as-of bounds historical samples and the separate current reaction-only basis for `thumbs-up-clean`, not strong current terminal evidence.
 - The evidence snapshot completely enumerated issue comments, reviews, every relevant review's raw REST associated inline comments, raw GraphQL review-thread and nested-comment pages, and relevant request-comment reactions. It canonically joins every exact-provider selected-review REST target child exactly once to GraphQL evidence. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. Incomplete pagination, a broken cursor/link chain, missing target review association, duplicate/orphaned target, or missing typed target `isResolved` fails closed.
-- Every counted provider artifact has exact REST `login: chatgpt-codex-connector[bot]` and exact REST `type: Bot`. The enclosing normalized `scope.head` is always the exact current `headRefOid`. A strong clean artifact's parsed/native commit equals that head and contains an explicit provider-authored no-findings outcome. A finding keeps its own artifact commit and may remain applicable on a proved ancestor through its parent-owned local Git ancestry receipt; it is never rewritten to current head or omitted merely to make projections agree. A terminal issue comment also satisfies the authority's closed canonical API/HTML, exact App, raw/normalized body, grammar, parsed-commit, immutable-current-scope, and edit-aware time schema. An empty `APPROVED` review is not clean evidence.
+- Every counted provider artifact has exact REST `login: chatgpt-codex-connector[bot]` and exact REST `type: Bot`. The enclosing normalized `scope.head` is always the exact current `headRefOid`. A strong clean artifact's parsed/native commit equals that head and contains an explicit provider-authored no-findings outcome. Action parity for clean issue comments is limited to the 10/40 carrier lengths and the short carrier's fail-closed exact-repository REST resolution outcome; it is not full-grammar parity. The playbook accepts only a lowercase exact 10- or 40-hex marker: 40 binds directly to current head and forbids a companion; raw 10 remains `clean-pending-resolution` and non-authoritative until the independent closed `parent-recorded-reviewed-commit-resolution-v1` companion joins the exact artifact ID, scope, ref, and full head. Its initial/final exact-repository `/commits/<prefix>` raw `200` receipts must resolve one prefix-matching full-40 SHA equal to `parsed_commit` and current head, and their retained dates must prove `artifact GET <= initial resolution <= every post-scope snapshot <= final resolution`, allowing same-second equality. Missing, `404`/`409`/`422`/`429`/`5xx`, malformed, ambiguous, drifting, misordered, or non-current resolution fails closed. Apply the same companion join in current, complete-history, and sidecar-blind historical paths; sidecar-blind may ignore request sidecars but never the resolution companion. Retain the raw marker/ref and resolution basis while `parsed_commit` remains full. Lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank boundary, and the closed lead/tagline/disclosure/native grammar are stricter playbook rules. Only the official disclosure suffix trims lines and drops blanks before exact closed nine-line matching; the result body and two-LF boundary remain strict. A finding keeps its own artifact commit and may remain applicable on a proved ancestor through its parent-owned local Git ancestry receipt; it is never rewritten to current head or omitted merely to make projections agree. Finding URLs, reviews, and inline commits remain full-40. A terminal issue comment also satisfies the authority's closed canonical API/HTML, exact App, raw/normalized body, grammar, parsed-commit, immutable-current-scope, and edit-aware time schema. An empty `APPROVED` review is not clean evidence.
 - A proved non-ancestor is raw audit-only and must not appear in normalized `active_top_level_findings` or `unresolved_thread_findings`. Treat any such normalized injection as a raw/normalized projection mismatch and select `unknown`; it cannot become a terminal finding or blocker candidate.
 - Review state admissibility is separate from terminal-looking detection. A submitted review artifact uses exact state `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`. `PENDING` is nonterminal. `DISMISSED` is always terminal-looking; a missing or unknown state is likewise terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each is a whole-snapshot inconclusive blocker: original `submitted_at` is not a trusted state-transition time, so no later-looking clean may supersede it. See the authority's closed review-state rule.
 - One uniquely observed invalid-state blocker may supply a stable inconclusive basis. Two or more cannot be ordered by list position, review ID, channel, or original `submitted_at`: keep all of them in the current-scope audit, set the selected source and `evidence_basis` to `null`, reject both terminal and reaction clean, and retain an independently validated unresolved target-thread basis only under its higher-priority blocker rule.
@@ -833,8 +833,11 @@ deadline_seconds: 900
 Enforce the profile independently for each complete inventory. Use three
 non-borrowing endpoint, request-scope-sidecar, and
 terminal-artifact-scope-receipt ledgers with the same inventory start/deadline;
-pre-count each sidecar or artifact-wrapper array and each wrapper's five raw
-responses. Create the artifact ledger once per inventory decision pass,
+pre-count each sidecar or artifact-wrapper array. An ordinary artifact wrapper
+has five raw scope/artifact responses and costs six records including the
+wrapper. A lowercase 10-hex clean wrapper adds two independent
+commit-resolution responses, for seven raw responses and eight records. Create
+the artifact ledger once per inventory decision pass,
 validate each immutable wrapper once, and thread its memoized result through
 candidate ordering, audit, profile, outcome, and report projection. Never
 reset it per candidate/scope/recomputation or recharge the same wrapper. A
@@ -865,8 +868,10 @@ the exact tracker and exact artifact scope types; a narrow current `fetches`
 subject requires its closed transcript scaffold. Mutated immutable negatives
 remain fail-closed until a fresh reread/context. Complete, sidecar-blind,
 ancestry-filtering, and candidate-ordering consumers share the same
-exact-list/dict wrapper-array precharge before iteration, so each wrapper plus
-five responses consumes six artifact-ledger records exactly once. A filtered
+exact-list/dict wrapper-array precharge before iteration, so an ordinary wrapper
+plus five raw scope/artifact responses consumes six artifact-ledger records
+exactly once; the lowercase 10-hex companion adds two independent resolution
+responses, yielding seven raw responses and eight records. A filtered
 view must be an identity-preserving subsequence of the charged source arrays.
 Before rebuilding a narrow current transcript, require an exact built-in raw
 object/fetch list and an exact positive integer PR number; boolean/floating
@@ -965,7 +970,8 @@ remain audit context and cannot supply resolution; malformed target joins fail
 closed. No synthesized REST resolution field counts.
 An issue-comment basis records its full closed canonical API/HTML, exact
 actor/App, raw/normalized body, grammar, `created_at`, `updated_at`,
-edit-aware server time/field, parsed artifact commit, and immutable current
+edit-aware server time/field, parsed full artifact commit, raw clean marker/ref,
+resolution basis and companion when required, and immutable current
 scope. Clean requires that commit to equal `scope.head`; an applicable finding
 may preserve a proved-ancestor artifact commit while `scope.head` remains
 current. A sparse ID/time/commit summary cannot prove the grammar,

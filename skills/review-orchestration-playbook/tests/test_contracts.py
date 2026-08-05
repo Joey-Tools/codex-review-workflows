@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import collections
 import datetime
 import email.utils
 import hashlib
@@ -237,6 +238,56 @@ _GITHUB_CODEX_CLEAN_TAGLINES = {
 }
 
 
+def _official_codex_disclosure_has_closed_grammar(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return [line.strip() for line in value.split("\n") if line.strip()] == (
+        _GITHUB_CODEX_DISCLOSURE.split("\n")
+    )
+
+
+def _strip_official_codex_disclosure(value: str) -> tuple[str, bool]:
+    expected_lines = _GITHUB_CODEX_DISCLOSURE.split("\n")
+    nonblank_tail: collections.deque[tuple[int, str]] = collections.deque(
+        maxlen=len(expected_lines)
+    )
+    line_start = 0
+    for physical_line in value.split("\n"):
+        stripped_line = physical_line.strip()
+        if stripped_line:
+            nonblank_tail.append((line_start, stripped_line))
+        line_start += len(physical_line) + 1
+    if [line for _, line in nonblank_tail] != expected_lines:
+        return (value, False)
+    suffix_start = nonblank_tail[0][0]
+    boundary = suffix_start - 2
+    if (
+        boundary < 0
+        or value[boundary:suffix_start] != "\n\n"
+        or (boundary > 0 and value[boundary - 1] == "\n")
+    ):
+        return (value, False)
+    suffix = value[suffix_start:]
+    if not _official_codex_disclosure_has_closed_grammar(suffix):
+        return (value, False)
+    return (value[:boundary], True)
+
+
+def _github_codex_clean_issue_marker(
+    normalized_body: str,
+) -> tuple[str, str] | None:
+    core, _ = _strip_official_codex_disclosure(normalized_body)
+    clean_lead = "Codex Review: Didn't find any major issues."
+    for tagline in _GITHUB_CODEX_CLEAN_TAGLINES:
+        marker_prefix = f"{clean_lead}{tagline}\n\n**Reviewed commit:** `"
+        if not core.startswith(marker_prefix) or not core.endswith("`"):
+            continue
+        commit_ref = core[len(marker_prefix) : -1]
+        if re.fullmatch(r"[0-9a-f]{10}|[0-9a-f]{40}", commit_ref) is not None:
+            return (f"**Reviewed commit:** `{commit_ref}`", commit_ref)
+    return None
+
+
 def _normalize_github_codex_body(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -278,6 +329,7 @@ def _github_codex_issue_body_semantic(
     repository: str,
     head: str,
     allow_foreign_finding_sha: bool = False,
+    resolved_clean_commit: str | None = None,
 ) -> tuple[str, str | None]:
     body = _normalize_github_codex_body(raw_body)
     if body is None or not _github_codex_issue_terminal_looking(body):
@@ -313,15 +365,17 @@ def _github_codex_issue_body_semantic(
     if progress_only and not any(line for line in later_lines):
         return ("nonterminal", None)
 
-    clean_lead = "Codex Review: Didn't find any major issues."
-    commit_marker = f"**Reviewed commit:** `{head}`"
-    for tagline in _GITHUB_CODEX_CLEAN_TAGLINES:
-        clean_core = f"{clean_lead}{tagline}\n\n{commit_marker}"
-        if body in {
-            clean_core,
-            f"{clean_core}\n\n{_GITHUB_CODEX_DISCLOSURE}",
-        }:
-            return ("clean", head)
+    clean_marker = _github_codex_clean_issue_marker(body)
+    if clean_marker is not None:
+        _, commit_ref = clean_marker
+        resolved_commit = commit_ref if len(commit_ref) == 40 else resolved_clean_commit
+        if (
+            isinstance(resolved_commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}", resolved_commit) is not None
+            and resolved_commit.startswith(commit_ref)
+            and resolved_commit == head
+        ):
+            return ("clean", resolved_commit)
 
     finding_body = body
     disclosure_suffix = f"\n\n{_GITHUB_CODEX_DISCLOSURE}"
@@ -2209,6 +2263,23 @@ class RepositoryContractTest(unittest.TestCase):
             expected,
             f"CI workflow differs from reviewed {CI_PROFILE} snapshot",
         )
+        private_fixture = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        project_journal_step_start = private_fixture.index(
+            "      - name: Verify canonical project journal workflow\n"
+        )
+        project_journal_step_end = private_fixture.index(
+            "      - name: Verify private overlay sync on macOS\n",
+            project_journal_step_start,
+        )
+        self.assertEqual(
+            private_fixture[project_journal_step_start:project_journal_step_end],
+            """      - name: Verify canonical project journal workflow
+        run: |
+          python3 -m unittest discover \\
+            -s personal_codex/skills/project-journal/tests \\
+            -p 'test_*.py'
+""",
+        )
 
     def test_ci_contract_context_accepts_only_supported_layouts(self) -> None:
         cases = (
@@ -2261,9 +2332,7 @@ class RepositoryContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)
             policy_root = repo_root / "personal_codex"
-            private_skill_root = (
-                policy_root / "skills/review-orchestration-playbook"
-            )
+            private_skill_root = policy_root / "skills/review-orchestration-playbook"
             private_skill_root.mkdir(parents=True)
 
             self.assertEqual(
@@ -5526,7 +5595,10 @@ printf '%s\n' "$trusted_uv"
             "fully paginated individual reaction records",
             "fixed grammar below and an exact commit binding",
             "the body either ends after the final finding line or appends exactly",
-            "two lf characters plus the exact disclosure block above",
+            (
+                "two lf characters plus the byte-for-byte line form of the "
+                "disclosure block"
+            ),
             "state admissibility and terminal-looking detection are separate",
             "`dismissed` is terminal-looking but inadmissible",
             (
@@ -5731,7 +5803,7 @@ printf '%s\n' "$trusted_uv"
             "fixed terminal-payload grammar",
             'performed_via_github_app.slug == "chatgpt-codex-connector"',
             "codex review: didn't find any major issues.[ optional_tagline]",
-            "**reviewed commit:** `<full_40_hex_sha>`",
+            "**reviewed commit:** `<lowercase_10_or_40_hex_sha>`",
             'rest `state == "approved"`',
             "normalized body exactly equal to `no findings.`",
             "ascii rfc 3986 absolute uri",
@@ -5744,7 +5816,8 @@ printf '%s\n' "$trusted_uv"
             "`original_commit_id == p`",
             "all other terminal-looking exact-provider comments or reviews "
             "are malformed",
-            "a 10-character sha",
+            "a short reference without its complete stable resolution companion",
+            "a marker with any length other than 10 or 40",
             "`no findings!`",
             "an empty `approved` review",
             "`looks good.`",
@@ -5876,9 +5949,7 @@ printf '%s\n' "$trusted_uv"
                 "interface": SKILL_ROOT / "agents/openai.yaml",
                 "GitHub probes": SKILL_ROOT / "references/github-pr-probes.md",
                 "PR readiness": SKILL_ROOT / "references/pr-readiness.md",
-                "lane contracts": (
-                    SKILL_ROOT / "references/review-lane-contracts.md"
-                ),
+                "lane contracts": (SKILL_ROOT / "references/review-lane-contracts.md"),
                 "prompt templates": (
                     SKILL_ROOT / "references/review-prompt-templates.md"
                 ),
@@ -5912,8 +5983,7 @@ printf '%s\n' "$trusted_uv"
                         encoding="utf-8"
                     ),
                     "project-journal": (
-                        SKILL_SCOPE_ROOT
-                        / "docs/project_journal/2026/07/"
+                        SKILL_SCOPE_ROOT / "docs/project_journal/2026/07/"
                         "2026-07-30-github-codex-evidence-authority-gea001.md"
                     ).read_text(encoding="utf-8"),
                 }
@@ -5933,9 +6003,7 @@ printf '%s\n' "$trusted_uv"
         journal = anti_drift_documents.get("project-journal")
         github_pr_probes = anti_drift_documents["github-pr-probes"]
         if readme := anti_drift_documents.get("readme"):
-            normalized_readme_text = " ".join(
-                readme.lower().replace("`", "").split()
-            )
+            normalized_readme_text = " ".join(readme.lower().replace("`", "").split())
             self.assertIn(
                 "independently complete initial/final inventories whose jointly "
                 "coordinated stable views and complete candidate arrays are "
@@ -6319,9 +6387,7 @@ printf '%s\n' "$trusted_uv"
             "skill": anti_drift_documents["skill"],
             "github-pr-probes": github_pr_probes,
             "pr-readiness": anti_drift_documents["pr-readiness"],
-            "review-lane-contracts": anti_drift_documents[
-                "review-lane-contracts"
-            ],
+            "review-lane-contracts": anti_drift_documents["review-lane-contracts"],
             "review-prompt-templates": (
                 SKILL_ROOT / "references/review-prompt-templates.md"
             ).read_text(encoding="utf-8"),
@@ -6703,9 +6769,7 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("sidecar", document)
                 self.assertIn("unknown", document)
         if journal is not None:
-            journal_discovery_correction = discovery_actor_documents[
-                "project-journal"
-            ]
+            journal_discovery_correction = discovery_actor_documents["project-journal"]
             self.assertIn(
                 "the fully paginated since feed is a live traversal, not an as-of snapshot",
                 journal_discovery_correction,
@@ -6775,6 +6839,38 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("900", normalized_document)
                 self.assertIn("action", normalized_document)
                 self.assertIn("extension", normalized_document)
+        prompt_lane_short_resolution_documents = {
+            "lane contracts": malformed_window_documents["lane contracts"],
+            "prompt templates": malformed_window_documents["prompt templates"],
+        }
+        for (
+            document_name,
+            document,
+        ) in prompt_lane_short_resolution_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(short_resolution_prompt_lane=document_name):
+                self.assertIn(
+                    "ordinary artifact wrapper plus five raw scope/artifact "
+                    "responses costs six records",
+                    normalized_document,
+                )
+                self.assertIn(
+                    "for seven raw responses and eight records",
+                    normalized_document,
+                )
+                self.assertIn("clean-pending-resolution", normalized_document)
+                self.assertIn(
+                    "current, complete-history, and sidecar-blind historical paths",
+                    normalized_document,
+                )
+                self.assertTrue(
+                    "sidecar-blind may ignore request-scope sidecars but never "
+                    "the resolution companion"
+                    in normalized_document
+                    or "sidecar-blind may ignore request-scope sidecars but never "
+                    "this companion"
+                    in normalized_document
+                )
         memo_guard_documents = {
             "authority": authority,
             "skill": anti_drift_documents["skill"],
@@ -6826,8 +6922,12 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("root", normalized_document)
                 self.assertIn("tracker", normalized_document)
                 self.assertIn("sidecar-blind", normalized_document)
-                self.assertIn("five responses", normalized_document)
+                self.assertIn("ordinary", normalized_document)
+                self.assertIn("five", normalized_document)
                 self.assertIn("six", normalized_document)
+                self.assertIn("seven", normalized_document)
+                self.assertIn("eight", normalized_document)
+                self.assertIn("resolution", normalized_document)
                 self.assertTrue(
                     "ancestry-filtering" in normalized_document
                     or "ancestry filtering" in normalized_document
@@ -7029,10 +7129,10 @@ printf '%s\n' "$trusted_uv"
                 "project-journal"
             ]
             action_boundary_contracts["project-journal"] = (
-                "the action alignment is intentionally asymmetric. provider-result "
-                "authority, duplicate-result consumption, and early-result "
-                "consumption are inherited",
-                "are deliberate playbook extensions",
+                "the action alignment is intentionally asymmetric and remains pinned",
+                "provider-result authority, duplicate-result consumption, and "
+                "early-result consumption are inherited",
+                "are further playbook extensions",
             )
         for document_name, anchors in action_boundary_contracts.items():
             for anchor in anchors:
@@ -7096,6 +7196,49 @@ printf '%s\n' "$trusted_uv"
             "future accepted authenticated no-start rejection",
         ):
             self.assertIn(anchor, normalized)
+
+    def test_official_codex_disclosure_parser_checks_one_tail_candidate(self) -> None:
+        global _official_codex_disclosure_has_closed_grammar
+
+        original_validator = _official_codex_disclosure_has_closed_grammar
+        validation_calls = 0
+
+        def counted_validator(value: object) -> bool:
+            nonlocal validation_calls
+            validation_calls += 1
+            return original_validator(value)
+
+        near_miss_disclosure = _GITHUB_CODEX_DISCLOSURE.replace(
+            "Reviews are triggered",
+            "Reviews might be triggered",
+        )
+        many_boundary_near_miss = (
+            "Result"
+            + "".join(f"\n\nnot-disclosure-{index}" for index in range(4096))
+            + f"\n\n{near_miss_disclosure}"
+        )
+        _official_codex_disclosure_has_closed_grammar = counted_validator
+        try:
+            self.assertEqual(
+                _strip_official_codex_disclosure(many_boundary_near_miss),
+                (many_boundary_near_miss, False),
+            )
+        finally:
+            _official_codex_disclosure_has_closed_grammar = original_validator
+        self.assertLessEqual(validation_calls, 1)
+
+        for extra_lf_count in (1, 3, 4):
+            value = "Result" + ("\n" * extra_lf_count) + _GITHUB_CODEX_DISCLOSURE
+            with self.subTest(disclosure_boundary_lf_count=extra_lf_count):
+                self.assertEqual(
+                    _strip_official_codex_disclosure(value),
+                    (value, False),
+                )
+        exact_value = f"Result\n\n{_GITHUB_CODEX_DISCLOSURE}"
+        self.assertEqual(
+            _strip_official_codex_disclosure(exact_value),
+            ("Result", True),
+        )
 
     def test_github_codex_terminal_grammar_fixture_matrix(self) -> None:
         authority = (
@@ -7221,10 +7364,17 @@ printf '%s\n' "$trusted_uv"
             if channel == "issue-comment":
                 if record.get("app_slug") != "chatgpt-codex-connector":
                     return "malformed"
+                clean_marker = _github_codex_clean_issue_marker(body)
+                resolved_clean_commit = (
+                    current_sha
+                    if clean_marker is not None and clean_marker[1] == current_sha[:10]
+                    else None
+                )
                 semantic, _ = _github_codex_issue_body_semantic(
                     body,
                     repository="OWNER/REPO",
                     head=current_sha,
+                    resolved_clean_commit=resolved_clean_commit,
                 )
                 return semantic
             if channel != "review":
@@ -7508,9 +7658,104 @@ printf '%s\n' "$trusted_uv"
         add(
             "clean-issue-short-sha",
             "clean issue comment",
-            "10-character marker",
-            "malformed",
+            "10-character marker resolved by stable exact-repository receipts",
+            "clean",
             short_sha,
+        )
+        live_disclosure = "\n".join(
+            (
+                "  <details> <summary>ℹ️ About Codex in GitHub</summary>  ",
+                "",
+                " <br/> ",
+                "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+                " - Open a pull request for review ",
+                "- Mark a draft as ready",
+                ' - Comment "@codex review". ',
+                "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+                'When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".',
+                "",
+                "    </details>",
+            )
+        )
+        finding_with_whitespace_disclosure = clone(finding)
+        finding_with_whitespace_disclosure["body"] = (
+            f"{finding['body']}\n\n{live_disclosure}"
+        )
+        add(
+            "finding-with-whitespace-disclosure",
+            "top-level finding",
+            "whitespace-varied disclosure suffix",
+            "malformed",
+            finding_with_whitespace_disclosure,
+        )
+        live_disclosure_clean = clone(short_sha)
+        live_disclosure_clean["body"] = (
+            "Codex Review: Didn't find any major issues. "
+            "Another round soon, please!\n\n"
+            f"**Reviewed commit:** `{current_sha[:10]}`\n\n"
+            f"{live_disclosure}"
+        )
+        add(
+            "clean-issue-live-disclosure-whitespace-positive",
+            "clean issue comment",
+            "10-character marker plus trimmed closed disclosure lines",
+            "clean",
+            live_disclosure_clean,
+        )
+        disclosure_third_lf = clone(live_disclosure_clean)
+        disclosure_third_lf["body"] = str(disclosure_third_lf["body"]).replace(
+            "\n\n  <details>", "\n\n\n  <details>"
+        )
+        add(
+            "clean-issue-disclosure-third-lf",
+            "clean issue comment",
+            "three-LF marker-to-disclosure boundary",
+            "malformed",
+            disclosure_third_lf,
+        )
+        disclosure_space_line = clone(live_disclosure_clean)
+        disclosure_space_line["body"] = str(disclosure_space_line["body"]).replace(
+            "\n\n  <details>", "\n\n \n  <details>"
+        )
+        add(
+            "clean-issue-disclosure-space-line",
+            "clean issue comment",
+            "whitespace-only marker-to-disclosure line",
+            "malformed",
+            disclosure_space_line,
+        )
+        mutated_disclosure = clone(live_disclosure_clean)
+        mutated_disclosure["body"] = str(mutated_disclosure["body"]).replace(
+            "Reviews are triggered", "Reviews may be triggered"
+        )
+        add(
+            "clean-issue-mutated-disclosure",
+            "clean issue comment",
+            "mutated disclosure line",
+            "malformed",
+            mutated_disclosure,
+        )
+        disclosure_extra_nonempty = clone(live_disclosure_clean)
+        disclosure_extra_nonempty["body"] = str(
+            disclosure_extra_nonempty["body"]
+        ).replace("    </details>", "Unexpected\n    </details>")
+        add(
+            "clean-issue-disclosure-extra-nonempty",
+            "clean issue comment",
+            "extra nonempty disclosure line",
+            "malformed",
+            disclosure_extra_nonempty,
+        )
+        disclosure_changed_link = clone(live_disclosure_clean)
+        disclosure_changed_link["body"] = str(disclosure_changed_link["body"]).replace(
+            "https://openai.com/codex", "https://openai.com/codex/"
+        )
+        add(
+            "clean-issue-disclosure-changed-link",
+            "clean issue comment",
+            "changed disclosure link",
+            "malformed",
+            disclosure_changed_link,
         )
         missing_marker = clone(clean_issue)
         missing_marker["body"] = "Codex Review: Didn't find any major issues."
@@ -8787,8 +9032,7 @@ printf '%s\n' "$trusted_uv"
                 {
                     "readme": REPO_ROOT / "README.md",
                     "project-journal": (
-                        REPO_ROOT
-                        / "docs/project_journal/2026/07/"
+                        REPO_ROOT / "docs/project_journal/2026/07/"
                         "2026-07-30-github-codex-evidence-authority-gea001.md"
                     ),
                 }
@@ -9586,6 +9830,57 @@ printf '%s\n' "$trusted_uv"
                 "post_artifact_scope_receipts": scope_receipts(artifact_time + 2),
             }
 
+        def reviewed_commit_resolution_receipt(
+            snapshot: dict[str, object],
+        ) -> dict[str, object]:
+            scope = snapshot.get("scope")
+            artifact_id = snapshot.get("id")
+            commit_ref = snapshot.get("commit_ref")
+            resolved_commit = snapshot.get("parsed_commit")
+            if (
+                not isinstance(scope, dict)
+                or type(artifact_id) is not int
+                or not isinstance(commit_ref, str)
+                or re.fullmatch(r"[0-9a-f]{10}", commit_ref) is None
+                or not isinstance(resolved_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", resolved_commit) is None
+            ):
+                raise AssertionError("reviewed-commit resolution fixture is malformed")
+            repository = scope.get("repository")
+            if not isinstance(repository, str):
+                raise AssertionError("reviewed-commit repository fixture is malformed")
+            request_url = (
+                f"https://api.github.com/repos/{repository}/commits/{commit_ref}"
+            )
+
+            def response_receipt(server_time: int) -> dict[str, object]:
+                body_utf8 = canonical_raw_body({"sha": resolved_commit})
+                return {
+                    "method": "GET",
+                    "request_url": request_url,
+                    "status": 200,
+                    "date_header": email.utils.format_datetime(
+                        datetime.datetime.fromtimestamp(
+                            server_time, datetime.timezone.utc
+                        ),
+                        usegmt=True,
+                    ),
+                    "body_utf8": body_utf8,
+                    "body_sha256": hashlib.sha256(
+                        body_utf8.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+            return {
+                "kind": "parent-recorded-reviewed-commit-resolution-v1",
+                "artifact_id": artifact_id,
+                "scope": clone(scope),
+                "commit_ref": commit_ref,
+                "resolved_commit": resolved_commit,
+                "initial_receipt": response_receipt(int(snapshot["server_time"]) + 1),
+                "final_receipt": response_receipt(int(snapshot["server_time"]) + 3),
+            }
+
         def set_response_date(
             response: dict[str, object],
             server_time: int,
@@ -10292,6 +10587,7 @@ printf '%s\n' "$trusted_uv"
             artifact_kind: str = "terminal-payload",
             outcome: str = "clean",
             artifact_commit: str | None = None,
+            commit_ref: str | None = None,
             edited: bool = False,
             user_login: str = exact_login,
             user_type: str = "Bot",
@@ -10305,9 +10601,12 @@ printf '%s\n' "$trusted_uv"
                 head if artifact_commit is None else artifact_commit
             )
             if outcome == "clean":
+                reviewed_commit_ref = (
+                    resolved_artifact_commit if commit_ref is None else commit_ref
+                )
                 body = (
                     "Codex Review: Didn't find any major issues.\n\n"
-                    f"**Reviewed commit:** `{resolved_artifact_commit}`"
+                    f"**Reviewed commit:** `{reviewed_commit_ref}`"
                 )
                 grammar_status = "accepted"
             elif outcome == "findings":
@@ -10357,11 +10656,29 @@ printf '%s\n' "$trusted_uv"
                 "parsed_commit": resolved_artifact_commit,
                 "scope": scope,
             }
+            if outcome == "clean":
+                snapshot.update(
+                    {
+                        "raw_reviewed_commit_marker": (
+                            f"**Reviewed commit:** `{reviewed_commit_ref}`"
+                        ),
+                        "commit_ref": reviewed_commit_ref,
+                        "commit_resolution_basis": (
+                            "direct-full-sha-v1"
+                            if len(reviewed_commit_ref) == 40
+                            else "parent-recorded-reviewed-commit-resolution-v1"
+                        ),
+                    }
+                )
             wrapper = {
                 "initial_snapshot": clone(snapshot),
                 "final_snapshot": clone(snapshot),
                 "artifact_scope_receipt": artifact_scope_receipt(snapshot),
             }
+            if outcome == "clean" and len(reviewed_commit_ref) == 10:
+                wrapper["reviewed_commit_resolution_receipt"] = (
+                    reviewed_commit_resolution_receipt(snapshot)
+                )
             return wrapper
 
         def artifact_scope_receipt_matches(
@@ -10574,6 +10891,139 @@ printf '%s\n' "$trusted_uv"
                 and resource_budget_charge(tracker)
             )
 
+        def reviewed_commit_resolution_receipt_matches(
+            value: object,
+            snapshot: dict[str, object],
+            *,
+            expected_scope: tuple[object, ...],
+            resource_tracker: dict[str, object],
+            artifact_scope_receipt: object,
+        ) -> bool:
+            repository, pr, merge_base, head = expected_scope
+            artifact_id = snapshot.get("id")
+            commit_ref = snapshot.get("commit_ref")
+            resolved_commit = snapshot.get("parsed_commit")
+            expected_scope_record = {
+                "repository": repository,
+                "pr": pr,
+                "pr_merge_base": merge_base,
+                "head": head,
+            }
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {
+                    "kind",
+                    "artifact_id",
+                    "scope",
+                    "commit_ref",
+                    "resolved_commit",
+                    "initial_receipt",
+                    "final_receipt",
+                }
+                or value.get("kind") != "parent-recorded-reviewed-commit-resolution-v1"
+                or type(artifact_id) is not int
+                or value.get("artifact_id") != artifact_id
+                or not typed_json_equal(value.get("scope"), expected_scope_record)
+                or not isinstance(commit_ref, str)
+                or re.fullmatch(r"[0-9a-f]{10}", commit_ref) is None
+                or value.get("commit_ref") != commit_ref
+                or not isinstance(resolved_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", resolved_commit) is None
+                or value.get("resolved_commit") != resolved_commit
+                or resolved_commit != head
+                or not resolved_commit.startswith(commit_ref)
+            ):
+                return False
+            request_url = (
+                f"https://api.github.com/repos/{repository}/commits/{commit_ref}"
+            )
+
+            def parse_receipt(response: object) -> tuple[str, int, str] | None:
+                if (
+                    not isinstance(response, dict)
+                    or set(response) != request_scope_response_fields
+                    or response.get("method") != "GET"
+                    or response.get("request_url") != request_url
+                    or type(response.get("status")) is not int
+                    or response.get("status") != 200
+                    or not isinstance(response.get("body_utf8"), str)
+                    or not charge_request_scope_response_resource(
+                        response, resource_tracker
+                    )
+                ):
+                    return None
+                body_utf8 = response["body_utf8"]
+                try:
+                    body_bytes = body_utf8.encode("utf-8", errors="strict")
+                    body = strict_json_loads(body_utf8)
+                except (TypeError, UnicodeEncodeError, ValueError):
+                    return None
+                receipt_time = parse_http_date(response.get("date_header"))
+                response_sha = body.get("sha") if isinstance(body, dict) else None
+                if (
+                    response.get("body_sha256")
+                    != hashlib.sha256(body_bytes).hexdigest()
+                    or receipt_time is None
+                    or not isinstance(response_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", response_sha) is None
+                    or not response_sha.startswith(commit_ref)
+                ):
+                    return None
+                return (response_sha, receipt_time, body_utf8)
+
+            initial = parse_receipt(value.get("initial_receipt"))
+            final = parse_receipt(value.get("final_receipt"))
+            artifact_get_receipt = (
+                artifact_scope_receipt.get("artifact_get_receipt")
+                if isinstance(artifact_scope_receipt, dict)
+                else None
+            )
+            post_scope_receipts = (
+                artifact_scope_receipt.get("post_artifact_scope_receipts")
+                if isinstance(artifact_scope_receipt, dict)
+                else None
+            )
+            post_pull_receipt = (
+                post_scope_receipts.get("pull")
+                if isinstance(post_scope_receipts, dict)
+                else None
+            )
+            post_compare_receipt = (
+                post_scope_receipts.get("compare")
+                if isinstance(post_scope_receipts, dict)
+                else None
+            )
+            artifact_get_time = (
+                parse_http_date(artifact_get_receipt.get("date_header"))
+                if isinstance(artifact_get_receipt, dict)
+                else None
+            )
+            post_scope_times = (
+                (
+                    parse_http_date(post_pull_receipt.get("date_header"))
+                    if isinstance(post_pull_receipt, dict)
+                    else None
+                ),
+                (
+                    parse_http_date(post_compare_receipt.get("date_header"))
+                    if isinstance(post_compare_receipt, dict)
+                    else None
+                ),
+            )
+            return (
+                initial is not None
+                and final is not None
+                and type(artifact_get_time) is int
+                and all(type(server_time) is int for server_time in post_scope_times)
+                and initial[0] == resolved_commit
+                and final[0] == resolved_commit
+                and artifact_get_time <= initial[1]
+                and initial[1] <= min(post_scope_times)
+                and max(post_scope_times) <= final[1]
+                and initial[2] == final[2]
+            )
+
         def _validate_candidate_artifact_uncached(
             value: object,
             *,
@@ -10585,13 +11035,22 @@ printf '%s\n' "$trusted_uv"
                 return None
             initial = value.get("initial_snapshot")
             final = value.get("final_snapshot")
+            resolution_expected = (
+                isinstance(final, dict)
+                and final.get("channel") == "issue-comment"
+                and final.get("outcome") == "clean"
+                and isinstance(final.get("commit_ref"), str)
+                and len(final["commit_ref"]) == 10
+            )
+            expected_wrapper_fields = {
+                "initial_snapshot",
+                "final_snapshot",
+                "artifact_scope_receipt",
+            }
+            if resolution_expected:
+                expected_wrapper_fields.add("reviewed_commit_resolution_receipt")
             if (
-                set(value)
-                != {
-                    "initial_snapshot",
-                    "final_snapshot",
-                    "artifact_scope_receipt",
-                }
+                set(value) != expected_wrapper_fields
                 or not isinstance(initial, dict)
                 or not isinstance(final, dict)
                 or not typed_json_equal(initial, final)
@@ -10600,6 +11059,19 @@ printf '%s\n' "$trusted_uv"
                     final,
                     expected_scope=expected_scope,
                     resource_tracker=artifact_receipt_resource_tracker,
+                )
+                or (
+                    resolution_expected
+                    and (
+                        artifact_receipt_resource_tracker is None
+                        or not reviewed_commit_resolution_receipt_matches(
+                            value.get("reviewed_commit_resolution_receipt"),
+                            final,
+                            expected_scope=expected_scope,
+                            resource_tracker=artifact_receipt_resource_tracker,
+                            artifact_scope_receipt=value.get("artifact_scope_receipt"),
+                        )
+                    )
                 )
             ):
                 return None
@@ -10641,6 +11113,11 @@ printf '%s\n' "$trusted_uv"
                 "created_at",
                 "updated_at",
                 "parsed_commit",
+            }
+            clean_issue_comment_snapshot_keys = issue_comment_snapshot_keys | {
+                "raw_reviewed_commit_marker",
+                "commit_ref",
+                "commit_resolution_basis",
             }
             if (
                 final.get("complete") is not True
@@ -10692,8 +11169,14 @@ printf '%s\n' "$trusted_uv"
                 expected_time_field = (
                     "created_at" if updated_at == created_at else "updated_at"
                 )
+                clean_marker = _github_codex_clean_issue_marker(normalized_body)
+                expected_issue_keys = (
+                    clean_issue_comment_snapshot_keys
+                    if outcome == "clean"
+                    else issue_comment_snapshot_keys
+                )
                 if (
-                    set(final) != issue_comment_snapshot_keys
+                    set(final) != expected_issue_keys
                     or final.get("api_url")
                     != (
                         f"https://api.github.com/repos/{repository}/"
@@ -10714,6 +11197,22 @@ printf '%s\n' "$trusted_uv"
                     or not isinstance(artifact_commit, str)
                     or re.fullmatch(r"[0-9a-f]{40}", artifact_commit) is None
                     or not _github_codex_issue_terminal_looking(normalized_body)
+                ):
+                    return None
+                if outcome == "clean" and (
+                    clean_marker is None
+                    or final.get("raw_reviewed_commit_marker") != clean_marker[0]
+                    or final.get("commit_ref") != clean_marker[1]
+                    or final.get("commit_resolution_basis")
+                    != (
+                        "direct-full-sha-v1"
+                        if len(clean_marker[1]) == 40
+                        else "parent-recorded-reviewed-commit-resolution-v1"
+                    )
+                    or (
+                        len(clean_marker[1]) == 40
+                        and clean_marker[1] != artifact_commit
+                    )
                 ):
                     return None
             else:
@@ -10759,6 +11258,14 @@ printf '%s\n' "$trusted_uv"
                     repository=str(repository),
                     head=str(head),
                     allow_foreign_finding_sha=True,
+                    resolved_clean_commit=(
+                        artifact_commit
+                        if channel == "issue-comment"
+                        and outcome == "clean"
+                        and isinstance(final.get("commit_ref"), str)
+                        and len(final["commit_ref"]) == 10
+                        else None
+                    ),
                 )
                 if channel == "issue-comment"
                 else ("nonterminal", None)
@@ -11114,20 +11621,18 @@ printf '%s\n' "$trusted_uv"
             artifact_kind: object,
             outcome: object,
         ) -> str | None:
-            if (
-                artifact_kind == "terminal-payload"
-                and outcome == "clean"
-            ):
+            if artifact_kind == "terminal-payload" and outcome == "clean":
                 return "clean"
-            if artifact_kind in {
-                "terminal-payload",
-                "active-top-level-finding",
-            } and outcome == "findings":
-                return "finding"
             if (
-                artifact_kind == "unresolved-thread-finding"
+                artifact_kind
+                in {
+                    "terminal-payload",
+                    "active-top-level-finding",
+                }
                 and outcome == "findings"
             ):
+                return "finding"
+            if artifact_kind == "unresolved-thread-finding" and outcome == "findings":
                 return "unresolved-thread-finding"
             if (
                 artifact_kind == "malformed-terminal-artifact"
@@ -11135,6 +11640,351 @@ printf '%s\n' "$trusted_uv"
             ):
                 return "malformed"
             return None
+
+        pending_short_clean_semantic = "clean-pending-resolution"
+        pending_short_clean_role = "clean-pending-resolution"
+
+        def pending_short_clean_raw_artifact_matches_normalized(
+            raw_artifact: object,
+            normalized_artifact: object,
+            wrapper: object,
+            *,
+            expected_scope: tuple[object, ...],
+            artifact_validation_context: dict[str, object],
+        ) -> bool:
+            if (
+                not isinstance(raw_artifact, dict)
+                or not isinstance(normalized_artifact, dict)
+                or not isinstance(wrapper, dict)
+            ):
+                return False
+            validated = validate_candidate_artifact(
+                wrapper,
+                expected_kind="terminal-payload",
+                expected_scope=expected_scope,
+                artifact_validation_context=artifact_validation_context,
+            )
+            final_snapshot = wrapper.get("final_snapshot")
+            raw_commit_ref = raw_artifact.get("artifact_commit")
+            normalized_commit = normalized_artifact.get("artifact_commit")
+            stable_fields = {
+                "server_time",
+                "id",
+                "channel",
+                "source_record_sha256",
+            }
+            return (
+                validated is not None
+                and isinstance(final_snapshot, dict)
+                and raw_artifact.get("semantic") == pending_short_clean_semantic
+                and raw_artifact.get("role") == pending_short_clean_role
+                and raw_artifact.get("channel") == "issue-comment"
+                and isinstance(raw_commit_ref, str)
+                and re.fullmatch(r"[0-9a-f]{10}", raw_commit_ref) is not None
+                and normalized_artifact.get("semantic") == "clean"
+                and normalized_artifact.get("role") == "clean"
+                and isinstance(normalized_commit, str)
+                and re.fullmatch(r"[0-9a-f]{40}", normalized_commit) is not None
+                and normalized_commit.startswith(raw_commit_ref)
+                and normalized_commit == expected_scope[3]
+                and final_snapshot.get("commit_ref") == raw_commit_ref
+                and final_snapshot.get("parsed_commit") == normalized_commit
+                and final_snapshot.get("commit_resolution_basis")
+                == "parent-recorded-reviewed-commit-resolution-v1"
+                and validated
+                == (
+                    normalized_artifact.get("server_time"),
+                    normalized_artifact.get("id"),
+                    "terminal-payload",
+                    "clean",
+                    "issue-comment",
+                    normalized_commit,
+                )
+                and all(
+                    typed_json_equal(
+                        raw_artifact.get(field),
+                        normalized_artifact.get(field),
+                    )
+                    for field in stable_fields
+                )
+            )
+
+        def candidate_artifact_wrappers_by_identity(
+            candidate: object,
+        ) -> dict[tuple[str, int], dict[str, object]] | None:
+            evidence_state = (
+                candidate.get("evidence_state") if isinstance(candidate, dict) else None
+            )
+            if not isinstance(evidence_state, dict) or set(evidence_state) != set(
+                artifact_kind_by_field
+            ):
+                return None
+            wrappers_by_identity: dict[tuple[str, int], dict[str, object]] = {}
+            for field in artifact_kind_by_field:
+                wrappers = evidence_state.get(field)
+                if not isinstance(wrappers, list):
+                    return None
+                for wrapper in wrappers:
+                    final_snapshot = (
+                        wrapper.get("final_snapshot")
+                        if isinstance(wrapper, dict)
+                        else None
+                    )
+                    channel = (
+                        final_snapshot.get("channel")
+                        if isinstance(final_snapshot, dict)
+                        else None
+                    )
+                    artifact_id = (
+                        final_snapshot.get("id")
+                        if isinstance(final_snapshot, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(wrapper, dict)
+                        or not isinstance(channel, str)
+                        or type(artifact_id) is not int
+                    ):
+                        return None
+                    identity = (channel, artifact_id)
+                    if identity in wrappers_by_identity:
+                        return None
+                    wrappers_by_identity[identity] = wrapper
+            return wrappers_by_identity
+
+        def pending_short_clean_source_evidence_matches_normalized(
+            raw_source_evidence: object,
+            normalized_source_evidence: object,
+            source_ordering_key: object,
+            candidate: object,
+            *,
+            expected_scope: tuple[object, ...],
+            artifact_validation_context: dict[str, object],
+        ) -> bool:
+            source_evidence_fields = {
+                "carrier",
+                "channel",
+                "semantic",
+                "native_identity",
+                "source_record_sha256",
+            }
+            if (
+                not isinstance(raw_source_evidence, dict)
+                or not isinstance(normalized_source_evidence, dict)
+                or set(raw_source_evidence) != source_evidence_fields
+                or set(normalized_source_evidence) != source_evidence_fields
+                or not isinstance(source_ordering_key, list)
+                or len(source_ordering_key) != 2
+                or any(type(item) is not int for item in source_ordering_key)
+                or not isinstance(candidate, dict)
+                or scope_key(candidate) != expected_scope
+            ):
+                return False
+            basis = candidate.get("candidate_basis")
+            native_identity = normalized_source_evidence.get("native_identity")
+            if (
+                not isinstance(basis, dict)
+                or basis.get("kind") != "terminal-payload"
+                or basis.get("server_time") != source_ordering_key[0]
+                or basis.get("stable_artifact_id") != source_ordering_key[1]
+                or raw_source_evidence.get("semantic") != pending_short_clean_semantic
+                or normalized_source_evidence.get("semantic") != "clean"
+                or raw_source_evidence.get("carrier") != "terminal-artifact"
+                or normalized_source_evidence.get("carrier") != "terminal-artifact"
+                or raw_source_evidence.get("channel") != "issue-comment"
+                or normalized_source_evidence.get("channel") != "issue-comment"
+                or not isinstance(native_identity, list)
+                or native_identity != ["issue-comment", source_ordering_key[1]]
+                or any(
+                    not typed_json_equal(
+                        raw_source_evidence.get(field),
+                        normalized_source_evidence.get(field),
+                    )
+                    for field in source_evidence_fields - {"semantic"}
+                )
+            ):
+                return False
+            wrappers_by_identity = candidate_artifact_wrappers_by_identity(candidate)
+            wrapper = (
+                wrappers_by_identity.get(("issue-comment", source_ordering_key[1]))
+                if isinstance(wrappers_by_identity, dict)
+                else None
+            )
+            validated = (
+                validate_candidate_artifact(
+                    wrapper,
+                    expected_kind="terminal-payload",
+                    expected_scope=expected_scope,
+                    artifact_validation_context=artifact_validation_context,
+                )
+                if isinstance(wrapper, dict)
+                else None
+            )
+            final_snapshot = (
+                wrapper.get("final_snapshot") if isinstance(wrapper, dict) else None
+            )
+            if (
+                validated
+                != (
+                    source_ordering_key[0],
+                    source_ordering_key[1],
+                    "terminal-payload",
+                    "clean",
+                    "issue-comment",
+                    expected_scope[3],
+                )
+                or not isinstance(final_snapshot, dict)
+                or not isinstance(final_snapshot.get("commit_ref"), str)
+            ):
+                return False
+            try:
+                expected_digest = hashlib.sha256(
+                    canonical_raw_body(artifact_source_bundle(final_snapshot)).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()
+            except (TypeError, UnicodeEncodeError, ValueError):
+                return False
+            raw_artifact = {
+                "server_time": source_ordering_key[0],
+                "id": source_ordering_key[1],
+                "channel": "issue-comment",
+                "semantic": pending_short_clean_semantic,
+                "role": pending_short_clean_role,
+                "artifact_commit": final_snapshot["commit_ref"],
+                "source_record_sha256": raw_source_evidence["source_record_sha256"],
+            }
+            normalized_artifact = {
+                "server_time": source_ordering_key[0],
+                "id": source_ordering_key[1],
+                "channel": "issue-comment",
+                "semantic": "clean",
+                "role": "clean",
+                "artifact_commit": expected_scope[3],
+                "source_record_sha256": normalized_source_evidence[
+                    "source_record_sha256"
+                ],
+            }
+            return expected_digest == normalized_source_evidence.get(
+                "source_record_sha256"
+            ) and pending_short_clean_raw_artifact_matches_normalized(
+                raw_artifact,
+                normalized_artifact,
+                wrapper,
+                expected_scope=expected_scope,
+                artifact_validation_context=artifact_validation_context,
+            )
+
+        def artifact_audit_arrays_match_with_pending_short_clean(
+            raw_artifacts: object,
+            normalized_artifacts: object,
+            candidate: object,
+            *,
+            expected_scope: tuple[object, ...],
+            artifact_validation_context: dict[str, object],
+        ) -> bool:
+            if (
+                not isinstance(raw_artifacts, list)
+                or not isinstance(normalized_artifacts, list)
+                or len(raw_artifacts) != len(normalized_artifacts)
+            ):
+                return False
+            wrappers_by_identity = candidate_artifact_wrappers_by_identity(candidate)
+            if wrappers_by_identity is None:
+                return False
+            for raw_artifact, normalized_artifact in zip(
+                raw_artifacts,
+                normalized_artifacts,
+                strict=True,
+            ):
+                if typed_json_equal(raw_artifact, normalized_artifact):
+                    continue
+                identity = (
+                    (
+                        normalized_artifact.get("channel"),
+                        normalized_artifact.get("id"),
+                    )
+                    if isinstance(normalized_artifact, dict)
+                    else None
+                )
+                wrapper = (
+                    wrappers_by_identity.get(identity)
+                    if isinstance(identity, tuple)
+                    else None
+                )
+                if not pending_short_clean_raw_artifact_matches_normalized(
+                    raw_artifact,
+                    normalized_artifact,
+                    wrapper,
+                    expected_scope=expected_scope,
+                    artifact_validation_context=artifact_validation_context,
+                ):
+                    return False
+            return True
+
+        def historical_entries_match_with_pending_short_clean(
+            raw_entries: object,
+            normalized_entries: object,
+            candidates: object,
+            *,
+            artifact_validation_context: dict[str, object],
+        ) -> bool:
+            if (
+                not isinstance(raw_entries, list)
+                or not isinstance(normalized_entries, list)
+                or not isinstance(candidates, list)
+                or len(raw_entries) != len(normalized_entries)
+                or len(raw_entries) != len(candidates)
+            ):
+                return False
+            candidates_by_scope: dict[tuple[object, ...], dict[str, object]] = {}
+            for candidate in candidates:
+                candidate_scope = (
+                    scope_key(candidate) if isinstance(candidate, dict) else None
+                )
+                if (
+                    candidate_scope is None
+                    or candidate_scope in candidates_by_scope
+                    or not isinstance(candidate, dict)
+                ):
+                    return False
+                candidates_by_scope[candidate_scope] = candidate
+            for raw_entry, normalized_entry in zip(
+                raw_entries,
+                normalized_entries,
+                strict=True,
+            ):
+                if typed_json_equal(raw_entry, normalized_entry):
+                    continue
+                if (
+                    not isinstance(raw_entry, dict)
+                    or not isinstance(normalized_entry, dict)
+                    or set(raw_entry)
+                    != {"scope_key", "source_ordering_key", "source_evidence"}
+                    or set(normalized_entry) != set(raw_entry)
+                    or not typed_json_equal(
+                        raw_entry.get("scope_key"),
+                        normalized_entry.get("scope_key"),
+                    )
+                    or not typed_json_equal(
+                        raw_entry.get("source_ordering_key"),
+                        normalized_entry.get("source_ordering_key"),
+                    )
+                    or not isinstance(raw_entry.get("scope_key"), list)
+                ):
+                    return False
+                entry_scope = tuple(raw_entry["scope_key"])
+                candidate = candidates_by_scope.get(entry_scope)
+                if not pending_short_clean_source_evidence_matches_normalized(
+                    raw_entry.get("source_evidence"),
+                    normalized_entry.get("source_evidence"),
+                    raw_entry.get("source_ordering_key"),
+                    candidate,
+                    expected_scope=entry_scope,
+                    artifact_validation_context=artifact_validation_context,
+                ):
+                    return False
+            return True
 
         unordered_invalid_review_state_marker = object()
 
@@ -13687,6 +14537,276 @@ printf '%s\n' "$trusted_uv"
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
+
+        short_resolution_source = {
+            "scope": {
+                "repository": current_repository,
+                "pr": current_pr,
+                "pr_merge_base": current_merge_base,
+                "head": current_head,
+            }
+        }
+        short_resolution_artifact = complete_issue_comment_artifact(
+            short_resolution_source,
+            91_001,
+            1_000,
+            commit_ref=current_head[:10],
+        )
+        short_resolution_result = validate_candidate_artifact(
+            short_resolution_artifact,
+            expected_kind="terminal-payload",
+            expected_scope=current_scope_key,
+        )
+        self.assertIsNotNone(short_resolution_result)
+        self.assertEqual(short_resolution_result[-1], current_head)
+        short_snapshot = short_resolution_artifact["final_snapshot"]
+        self.assertEqual(short_snapshot["parsed_commit"], current_head)
+        self.assertEqual(short_snapshot["commit_ref"], current_head[:10])
+        self.assertEqual(
+            short_snapshot["raw_reviewed_commit_marker"],
+            f"**Reviewed commit:** `{current_head[:10]}`",
+        )
+        self.assertEqual(
+            short_snapshot["commit_resolution_basis"],
+            "parent-recorded-reviewed-commit-resolution-v1",
+        )
+
+        def resolution_record_limit_result(max_records: int) -> object:
+            limits = {
+                key: int(evidence_resource_budget_v1[key])
+                for key in evidence_resource_limit_fields
+            }
+            limits["max_records"] = max_records
+            tracker = new_resource_tracker(tightened_limits=limits)
+            assert tracker is not None
+            self.assertTrue(resource_budget_charge(tracker, records=1))
+            context = new_artifact_validation_context(
+                tightened_limits=limits,
+                resource_tracker=tracker,
+            )
+            assert context is not None
+            return validate_candidate_artifact(
+                clone(short_resolution_artifact),
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+                artifact_validation_context=context,
+            )
+
+        self.assertIsNotNone(resolution_record_limit_result(8))
+        self.assertIsNone(resolution_record_limit_result(7))
+
+        def assert_resolution_rejected(artifact: dict[str, object]) -> None:
+            self.assertIsNone(
+                validate_candidate_artifact(
+                    artifact,
+                    expected_kind="terminal-payload",
+                    expected_scope=current_scope_key,
+                )
+            )
+
+        missing_resolution = clone(short_resolution_artifact)
+        missing_resolution.pop("reviewed_commit_resolution_receipt")
+        assert_resolution_rejected(missing_resolution)
+
+        full_artifact = complete_issue_comment_artifact(
+            short_resolution_source, 91_002, 1_010
+        )
+        full_artifact["reviewed_commit_resolution_receipt"] = clone(
+            short_resolution_artifact["reviewed_commit_resolution_receipt"]
+        )
+        assert_resolution_rejected(full_artifact)
+
+        def replace_resolution_body(
+            artifact: dict[str, object], receipt_name: str, body: object
+        ) -> None:
+            resolution = artifact["reviewed_commit_resolution_receipt"]
+            assert isinstance(resolution, dict)
+            receipt = resolution[receipt_name]
+            assert isinstance(receipt, dict)
+            body_utf8 = canonical_raw_body(body)
+            receipt["body_utf8"] = body_utf8
+            receipt["body_sha256"] = hashlib.sha256(
+                body_utf8.encode("utf-8")
+            ).hexdigest()
+
+        for rejected_status in (404, 409, 422, 429, 500, 503):
+            rejected = clone(short_resolution_artifact)
+            resolution = rejected["reviewed_commit_resolution_receipt"]
+            assert isinstance(resolution, dict)
+            initial = resolution["initial_receipt"]
+            assert isinstance(initial, dict)
+            initial["status"] = rejected_status
+            with self.subTest(reviewed_commit_resolution_status=rejected_status):
+                assert_resolution_rejected(rejected)
+
+        for case, body in {
+            "non-full": {"sha": current_head[:10]},
+            "uppercase": {"sha": current_head.upper()},
+            "non-object": [{"sha": current_head}],
+            "missing": {"commit": current_head},
+            "non-prefix": {"sha": "f" * 40},
+        }.items():
+            rejected = clone(short_resolution_artifact)
+            replace_resolution_body(rejected, "initial_receipt", body)
+            with self.subTest(reviewed_commit_resolution_body=case):
+                assert_resolution_rejected(rejected)
+
+        wrong_repo = clone(short_resolution_artifact)
+        wrong_repo_resolution = wrong_repo["reviewed_commit_resolution_receipt"]
+        assert isinstance(wrong_repo_resolution, dict)
+        wrong_repo_initial = wrong_repo_resolution["initial_receipt"]
+        assert isinstance(wrong_repo_initial, dict)
+        wrong_repo_initial["request_url"] = wrong_repo_initial["request_url"].replace(
+            current_repository, "OTHER/REPO"
+        )
+        assert_resolution_rejected(wrong_repo)
+
+        resolved_sha_drift = clone(short_resolution_artifact)
+        replace_resolution_body(
+            resolved_sha_drift,
+            "final_receipt",
+            {"sha": current_head[:10] + ("f" * 30)},
+        )
+        assert_resolution_rejected(resolved_sha_drift)
+
+        raw_resolution_drift = clone(short_resolution_artifact)
+        replace_resolution_body(
+            raw_resolution_drift,
+            "final_receipt",
+            {"sha": current_head, "extra": "drift"},
+        )
+        assert_resolution_rejected(raw_resolution_drift)
+
+        initial_before_artifact_get = clone(short_resolution_artifact)
+        initial_before_artifact_scope_receipt = initial_before_artifact_get[
+            "artifact_scope_receipt"
+        ]
+        assert isinstance(initial_before_artifact_scope_receipt, dict)
+        artifact_get_receipt = initial_before_artifact_scope_receipt[
+            "artifact_get_receipt"
+        ]
+        assert isinstance(artifact_get_receipt, dict)
+        artifact_get_time = parse_http_date(artifact_get_receipt["date_header"])
+        self.assertIsNotNone(artifact_get_time)
+        assert artifact_get_time is not None
+        initial_before_artifact_resolution = initial_before_artifact_get[
+            "reviewed_commit_resolution_receipt"
+        ]
+        assert isinstance(initial_before_artifact_resolution, dict)
+        initial_before_artifact_receipt = initial_before_artifact_resolution[
+            "initial_receipt"
+        ]
+        assert isinstance(initial_before_artifact_receipt, dict)
+        set_response_date(
+            initial_before_artifact_receipt,
+            artifact_get_time - 1,
+        )
+        assert_resolution_rejected(initial_before_artifact_get)
+
+        final_before_post_scope = clone(short_resolution_artifact)
+        final_before_post_artifact_scope_receipt = final_before_post_scope[
+            "artifact_scope_receipt"
+        ]
+        assert isinstance(final_before_post_artifact_scope_receipt, dict)
+        post_scope_receipts = final_before_post_artifact_scope_receipt[
+            "post_artifact_scope_receipts"
+        ]
+        assert isinstance(post_scope_receipts, dict)
+        post_scope_times = [
+            parse_http_date(receipt["date_header"])
+            for receipt in post_scope_receipts.values()
+            if isinstance(receipt, dict)
+        ]
+        self.assertEqual(len(post_scope_times), 2)
+        self.assertTrue(
+            all(server_time is not None for server_time in post_scope_times)
+        )
+        final_before_post_resolution = final_before_post_scope[
+            "reviewed_commit_resolution_receipt"
+        ]
+        assert isinstance(final_before_post_resolution, dict)
+        final_before_post_receipt = final_before_post_resolution["final_receipt"]
+        assert isinstance(final_before_post_receipt, dict)
+        set_response_date(
+            final_before_post_receipt,
+            max(
+                server_time
+                for server_time in post_scope_times
+                if server_time is not None
+            )
+            - 1,
+        )
+        assert_resolution_rejected(final_before_post_scope)
+
+        initial_after_post_scope = clone(short_resolution_artifact)
+        initial_after_post_artifact_scope_receipt = initial_after_post_scope[
+            "artifact_scope_receipt"
+        ]
+        assert isinstance(initial_after_post_artifact_scope_receipt, dict)
+        initial_after_post_receipts = initial_after_post_artifact_scope_receipt[
+            "post_artifact_scope_receipts"
+        ]
+        assert isinstance(initial_after_post_receipts, dict)
+        initial_after_post_times = [
+            parse_http_date(receipt["date_header"])
+            for receipt in initial_after_post_receipts.values()
+            if isinstance(receipt, dict)
+        ]
+        self.assertEqual(len(initial_after_post_times), 2)
+        self.assertTrue(
+            all(server_time is not None for server_time in initial_after_post_times)
+        )
+        initial_after_post_resolution = initial_after_post_scope[
+            "reviewed_commit_resolution_receipt"
+        ]
+        assert isinstance(initial_after_post_resolution, dict)
+        initial_after_post_receipt = initial_after_post_resolution["initial_receipt"]
+        assert isinstance(initial_after_post_receipt, dict)
+        set_response_date(
+            initial_after_post_receipt,
+            min(
+                server_time
+                for server_time in initial_after_post_times
+                if server_time is not None
+            )
+            + 1,
+        )
+        assert_resolution_rejected(initial_after_post_scope)
+
+        same_second_resolution_envelope = clone(short_resolution_artifact)
+        same_second_artifact_scope_receipt = same_second_resolution_envelope[
+            "artifact_scope_receipt"
+        ]
+        assert isinstance(same_second_artifact_scope_receipt, dict)
+        same_second_artifact_get = same_second_artifact_scope_receipt[
+            "artifact_get_receipt"
+        ]
+        same_second_post_scope = same_second_artifact_scope_receipt[
+            "post_artifact_scope_receipts"
+        ]
+        assert isinstance(same_second_artifact_get, dict)
+        assert isinstance(same_second_post_scope, dict)
+        same_second_time = parse_http_date(same_second_artifact_get["date_header"])
+        self.assertIsNotNone(same_second_time)
+        assert same_second_time is not None
+        for post_receipt in same_second_post_scope.values():
+            assert isinstance(post_receipt, dict)
+            set_response_date(post_receipt, same_second_time)
+        same_second_resolution = same_second_resolution_envelope[
+            "reviewed_commit_resolution_receipt"
+        ]
+        assert isinstance(same_second_resolution, dict)
+        for receipt_name in ("initial_receipt", "final_receipt"):
+            same_second_receipt = same_second_resolution[receipt_name]
+            assert isinstance(same_second_receipt, dict)
+            set_response_date(same_second_receipt, same_second_time)
+        self.assertIsNotNone(
+            validate_candidate_artifact(
+                same_second_resolution_envelope,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+            )
+        )
 
         def raw_reaction_record(value: object) -> dict[str, object]:
             if not isinstance(value, dict):
@@ -16730,6 +17850,20 @@ printf '%s\n' "$trusted_uv"
                         head=head,
                         allow_foreign_finding_sha=(parsed_scope == current_scope_key),
                     )
+                    normalized_issue_body = _normalize_github_codex_body(body)
+                    pending_clean_marker = (
+                        _github_codex_clean_issue_marker(normalized_issue_body)
+                        if isinstance(normalized_issue_body, str)
+                        else None
+                    )
+                    if (
+                        semantic == "malformed"
+                        and pending_clean_marker is not None
+                        and len(pending_clean_marker[1]) == 10
+                        and head.startswith(pending_clean_marker[1])
+                    ):
+                        semantic = pending_short_clean_semantic
+                        parsed_commit = pending_clean_marker[1]
                     if semantic == "nonterminal":
                         nonterminal_records.append(
                             (
@@ -16768,7 +17902,11 @@ printf '%s\n' "$trusted_uv"
                             else "terminal-payload"
                         )
                     )
-                    role = artifact_authority_role(raw_artifact_kind, semantic)
+                    role = (
+                        pending_short_clean_role
+                        if semantic == pending_short_clean_semantic
+                        else artifact_authority_role(raw_artifact_kind, semantic)
+                    )
                     if role is None:
                         return None
                     artifact_bases.append(
@@ -16979,7 +18117,12 @@ printf '%s\n' "$trusted_uv"
             latest = [item for item in artifact_bases if item[0] == latest_time]
             if len({item[2] for item in latest}) != 1:
                 return (False, None, False)
-            priority = {"clean": 1, "findings": 2, "malformed": 3}
+            priority = {
+                "clean": 1,
+                pending_short_clean_semantic: 1,
+                "findings": 2,
+                "malformed": 3,
+            }
             if any(item[3] not in priority for item in latest):
                 return (False, None, False)
             highest = max(priority[item[3]] for item in latest)
@@ -18823,7 +19966,9 @@ printf '%s\n' "$trusted_uv"
             def validate_inventory_projection_uncached(
                 value: object,
                 inventory_context: dict[str, object],
+                candidates: list[object],
             ) -> tuple[dict[str, object], list[dict[str, object]]] | None:
+                context_parts = inventory_validation_context_parts(inventory_context)
                 if (
                     not isinstance(value, dict)
                     or set(value) != expected_inventory_fields
@@ -18837,6 +19982,7 @@ printf '%s\n' "$trusted_uv"
                         value.get("pagination"),
                         required_universe_pagination,
                     )
+                    or context_parts is None
                 ):
                     return None
                 projection = parse_discovery_endpoint_transcript(
@@ -18896,9 +20042,11 @@ printf '%s\n' "$trusted_uv"
                         value.get("scope_classifications"),
                         raw_scope_classifications,
                     )
-                    or not typed_json_equal(
-                        value.get("entries"),
+                    or not historical_entries_match_with_pending_short_clean(
                         historical_transcript_entries,
+                        value.get("entries"),
+                        candidates,
+                        artifact_validation_context=context_parts[3],
                     )
                     or not typed_json_equal(
                         historical_classification_scope_keys,
@@ -18986,6 +20134,7 @@ printf '%s\n' "$trusted_uv"
                 validated_projection = validate_inventory_projection_uncached(
                     value,
                     inventory_context,
+                    candidates,
                 )
                 transcript = value.get("discovery_endpoint_transcript")
                 if not isinstance(transcript, dict):
@@ -19146,7 +20295,25 @@ printf '%s\n' "$trusted_uv"
                         comparable_raw_audit.pop("reactions", None)
                         candidate_audit.pop("requests", None)
                         candidate_audit.pop("reactions", None)
-                    if not typed_json_equal(candidate_audit, comparable_raw_audit):
+                    raw_artifacts = comparable_raw_audit.pop(
+                        "applicable_artifacts",
+                        None,
+                    )
+                    normalized_artifacts = candidate_audit.pop(
+                        "applicable_artifacts",
+                        None,
+                    )
+                    if (
+                        not typed_json_equal(candidate_audit, comparable_raw_audit)
+                        or candidate_scope_key is None
+                        or not artifact_audit_arrays_match_with_pending_short_clean(
+                            raw_artifacts,
+                            normalized_artifacts,
+                            candidate,
+                            expected_scope=candidate_scope_key,
+                            artifact_validation_context=artifact_context,
+                        )
+                    ):
                         return False
                 return True
 
@@ -19162,13 +20329,17 @@ printf '%s\n' "$trusted_uv"
                     initial_historical_entries,
                     final_historical_entries,
                 )
-                or not typed_json_equal(
+                or not historical_entries_match_with_pending_short_clean(
                     initial_historical_entries,
                     initial_candidate_entries,
+                    initial_candidates,
+                    artifact_validation_context=initial_artifact_context,
                 )
-                or not typed_json_equal(
+                or not historical_entries_match_with_pending_short_clean(
                     final_historical_entries,
                     final_candidate_entries,
+                    final_candidates,
+                    artifact_validation_context=final_artifact_context,
                 )
                 or not authority_audits_match(
                     initial_candidates,
@@ -19502,9 +20673,19 @@ printf '%s\n' "$trusted_uv"
                     artifact_validation_context=artifact_validation_context,
                     basis_kind_override=str(basis["kind"]),
                 )
-                if expected_source_evidence is None or not typed_json_equal(
-                    source_evidence,
-                    expected_source_evidence,
+                if expected_source_evidence is None or not (
+                    typed_json_equal(
+                        source_evidence,
+                        expected_source_evidence,
+                    )
+                    or pending_short_clean_source_evidence_matches_normalized(
+                        source_evidence,
+                        expected_source_evidence,
+                        list(ordering_key),
+                        candidate,
+                        expected_scope=candidate_scope_key,
+                        artifact_validation_context=artifact_validation_context,
+                    )
                 ):
                     return None
 
@@ -19851,9 +21032,19 @@ printf '%s\n' "$trusted_uv"
                     if not isinstance(basis, dict):
                         return None
                     if category == "required-terminal":
-                        if basis.get("kind") == "reaction" or not typed_json_equal(
-                            normalized_source_evidence,
-                            raw_source_evidence,
+                        if basis.get("kind") == "reaction" or not (
+                            typed_json_equal(
+                                normalized_source_evidence,
+                                raw_source_evidence,
+                            )
+                            or pending_short_clean_source_evidence_matches_normalized(
+                                raw_source_evidence,
+                                normalized_source_evidence,
+                                raw_scope_summary.get("source_ordering_key"),
+                                candidate,
+                                expected_scope=required_scope,
+                                artifact_validation_context=artifact_context,
+                            )
                         ):
                             return None
                     else:
@@ -19952,16 +21143,38 @@ printf '%s\n' "$trusted_uv"
                     comparable.pop("nonterminal_records")
                     return comparable
 
+                def sidecar_blind_authority_audit_matches(
+                    required_scope: tuple[object, ...],
+                ) -> bool:
+                    raw_audit = candidate_comparable_raw_audit(
+                        required_raw_audits[required_scope]
+                    )
+                    normalized_audit = clone(normalized_audits_by_scope[required_scope])
+                    candidate = candidate_by_scope.get(required_scope)
+                    if not isinstance(normalized_audit, dict) or not isinstance(
+                        candidate, dict
+                    ):
+                        return False
+                    raw_artifacts = raw_audit.pop("applicable_artifacts", None)
+                    normalized_artifacts = normalized_audit.pop(
+                        "applicable_artifacts",
+                        None,
+                    )
+                    return typed_json_equal(
+                        raw_audit, normalized_audit
+                    ) and artifact_audit_arrays_match_with_pending_short_clean(
+                        raw_artifacts,
+                        normalized_artifacts,
+                        candidate,
+                        expected_scope=required_scope,
+                        artifact_validation_context=artifact_context,
+                    )
+
                 if (
                     set(required_raw_audits) != required_scopes
                     or set(normalized_audits_by_scope) != required_scopes
                     or any(
-                        not typed_json_equal(
-                            candidate_comparable_raw_audit(
-                                required_raw_audits[required_scope]
-                            ),
-                            normalized_audits_by_scope[required_scope],
-                        )
+                        not sidecar_blind_authority_audit_matches(required_scope)
                         for required_scope in required_scopes
                     )
                 ):
@@ -20164,7 +21377,7 @@ printf '%s\n' "$trusted_uv"
             selected_ordering_key: tuple[int, int] | object,
             selected_kind_override: str | None,
             artifact_validation_context: dict[str, object],
-        ) -> list[dict[str, object]] | None:
+        ) -> tuple[list[dict[str, object]], str | None] | None:
             raw_artifacts = (
                 raw_authority.get("applicable_artifacts")
                 if isinstance(raw_authority, dict)
@@ -20172,9 +21385,8 @@ printf '%s\n' "$trusted_uv"
             )
             normalized_artifacts = normalized_audit.get("applicable_artifacts")
             candidate_basis = record.get("candidate_basis")
-            if (
-                not isinstance(raw_artifacts, list)
-                or not isinstance(normalized_artifacts, list)
+            if not isinstance(raw_artifacts, list) or not isinstance(
+                normalized_artifacts, list
             ):
                 return None
 
@@ -20190,6 +21402,8 @@ printf '%s\n' "$trusted_uv"
 
             def artifacts_by_identity(
                 artifacts: list[object],
+                *,
+                allow_pending_short_clean: bool,
             ) -> dict[tuple[str, int], dict[str, object]] | None:
                 by_identity: dict[tuple[str, int], dict[str, object]] = {}
                 for artifact in artifacts:
@@ -20206,6 +21420,11 @@ printf '%s\n' "$trusted_uv"
                             "finding",
                             "unresolved-thread-finding",
                             "malformed",
+                            *(
+                                {pending_short_clean_role}
+                                if allow_pending_short_clean
+                                else set()
+                            ),
                         }
                         or not isinstance(artifact.get("source_record_sha256"), str)
                         or re.fullmatch(
@@ -20220,8 +21439,14 @@ printf '%s\n' "$trusted_uv"
                     by_identity[identity] = artifact
                 return by_identity
 
-            raw_by_identity = artifacts_by_identity(raw_artifacts)
-            normalized_by_identity = artifacts_by_identity(normalized_artifacts)
+            raw_by_identity = artifacts_by_identity(
+                raw_artifacts,
+                allow_pending_short_clean=True,
+            )
+            normalized_by_identity = artifacts_by_identity(
+                normalized_artifacts,
+                allow_pending_short_clean=False,
+            )
             if raw_by_identity is None or normalized_by_identity is None:
                 return None
 
@@ -20230,7 +21455,7 @@ printf '%s\n' "$trusted_uv"
                 and candidate_basis.get("kind") == "reaction"
             ):
                 return (
-                    []
+                    ([], None)
                     if not raw_by_identity and not normalized_by_identity
                     else None
                 )
@@ -20241,7 +21466,7 @@ printf '%s\n' "$trusted_uv"
                 or type(selected_ordering_key[1]) is not int
             ):
                 return (
-                    []
+                    ([], None)
                     if set(raw_by_identity) == set(normalized_by_identity)
                     and all(
                         typed_json_equal(
@@ -20275,8 +21500,7 @@ printf '%s\n' "$trusted_uv"
             record_scope = scope_key(record)
             selected_wrappers = (
                 evidence_state.get(selected_field)
-                if isinstance(evidence_state, dict)
-                and isinstance(selected_field, str)
+                if isinstance(evidence_state, dict) and isinstance(selected_field, str)
                 else None
             )
             if (
@@ -20306,6 +21530,10 @@ printf '%s\n' "$trusted_uv"
                 return None
             selected_wrapper, selected_before = selected_validations[0]
             selected_identity = (selected_before[4], selected_before[1])
+
+            wrapper_by_identity = candidate_artifact_wrappers_by_identity(record)
+            if wrapper_by_identity is None:
+                return None
 
             artifact_receipt = selected_wrapper.get("artifact_scope_receipt")
             pre_scope_receipts = (
@@ -20344,18 +21572,25 @@ printf '%s\n' "$trusted_uv"
             ):
                 return None
 
-            if (
-                selected_identity not in normalized_by_identity
-                or not set(normalized_by_identity).issubset(raw_by_identity)
-                or any(
-                    not typed_json_equal(
-                        raw_by_identity[identity],
-                        normalized_artifact,
-                    )
-                    for identity, normalized_artifact in normalized_by_identity.items()
-                )
-            ):
+            if selected_identity not in normalized_by_identity or not set(
+                normalized_by_identity
+            ).issubset(raw_by_identity):
                 return None
+            pending_join_identities: set[tuple[str, int]] = set()
+            for identity, normalized_artifact in normalized_by_identity.items():
+                raw_artifact = raw_by_identity[identity]
+                if typed_json_equal(raw_artifact, normalized_artifact):
+                    continue
+                wrapper = wrapper_by_identity.get(identity)
+                if not pending_short_clean_raw_artifact_matches_normalized(
+                    raw_artifact,
+                    normalized_artifact,
+                    wrapper,
+                    expected_scope=record_scope,
+                    artifact_validation_context=artifact_validation_context,
+                ):
+                    return None
+                pending_join_identities.add(identity)
 
             legacy_artifacts: list[dict[str, object]] = []
             for identity in sorted(
@@ -20364,8 +21599,7 @@ printf '%s\n' "$trusted_uv"
             ):
                 artifact = raw_by_identity[identity]
                 if artifact["role"] not in {"clean", "finding"} or not all(
-                    artifact["server_time"] < boundary
-                    for boundary in pre_scope_times
+                    artifact["server_time"] < boundary for boundary in pre_scope_times
                 ):
                     return None
                 legacy_artifacts.append(
@@ -20376,12 +21610,17 @@ printf '%s\n' "$trusted_uv"
                         "id": artifact["id"],
                         "server_time": artifact["server_time"],
                         "artifact_commit": artifact["artifact_commit"],
-                        "source_record_sha256": artifact[
-                            "source_record_sha256"
-                        ],
+                        "source_record_sha256": artifact["source_record_sha256"],
                     }
                 )
-            return legacy_artifacts
+            return (
+                legacy_artifacts,
+                (
+                    pending_short_clean_semantic
+                    if selected_identity in pending_join_identities
+                    else None
+                ),
+            )
 
         def normalized_current_decision_entry(
             record: dict[str, object],
@@ -20519,7 +21758,7 @@ printf '%s\n' "$trusted_uv"
                 or not isinstance(lifecycle, dict)
             ):
                 return None
-            legacy_unreceipted_artifacts = legacy_unreceipted_artifact_partition(
+            artifact_partition = legacy_unreceipted_artifact_partition(
                 authority_record,
                 raw_authority,
                 normalized_audit,
@@ -20528,11 +21767,20 @@ printf '%s\n' "$trusted_uv"
                 artifact_validation_context=artifact_context,
             )
             raw_applicable_artifacts = raw_authority.get("applicable_artifacts")
-            if (
-                legacy_unreceipted_artifacts is None
-                or not isinstance(raw_applicable_artifacts, list)
+            if artifact_partition is None or not isinstance(
+                raw_applicable_artifacts, list
             ):
                 return None
+            legacy_unreceipted_artifacts, selected_raw_semantic = artifact_partition
+            if selected_raw_semantic is not None:
+                if (
+                    not isinstance(source_evidence, dict)
+                    or source_evidence.get("semantic") != "clean"
+                ):
+                    return None
+                source_evidence = clone(source_evidence)
+                assert isinstance(source_evidence, dict)
+                source_evidence["semantic"] = selected_raw_semantic
             expected_authority: dict[str, object] = {
                 "scope": clone(raw_scope),
                 "lifecycle": clone(lifecycle),
@@ -21885,9 +23133,7 @@ printf '%s\n' "$trusted_uv"
                 raw_entry = parse_current_endpoint_inventory(
                     inventory,
                     current_ancestry=ancestry,
-                    prefer_unresolved_thread_blocker=(
-                        prefer_unresolved_thread_blocker
-                    ),
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     _inventory_validation_context=inventory_context,
                 )
                 if raw_entry is None:
@@ -21895,9 +23141,7 @@ printf '%s\n' "$trusted_uv"
                 expected_entry = normalized_current_decision_entry(
                     current_record,
                     raw_entry,
-                    prefer_unresolved_thread_blocker=(
-                        prefer_unresolved_thread_blocker
-                    ),
+                    prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     retain_request_reaction_records=False,
                     finding_ancestry=ancestry,
                     inventory_validation_context=inventory_context,
@@ -21907,12 +23151,9 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(expected_entry, dict)
                     else None
                 )
-                if (
-                    not isinstance(legacy_artifacts, list)
-                    or not typed_json_equal(
-                        current_decision_authority_entry(raw_entry),
-                        expected_entry,
-                    )
+                if not isinstance(legacy_artifacts, list) or not typed_json_equal(
+                    current_decision_authority_entry(raw_entry),
+                    expected_entry,
                 ):
                     return None
                 phase_legacy_artifacts[phase] = legacy_artifacts
@@ -22490,9 +23731,7 @@ printf '%s\n' "$trusted_uv"
             legacy_unreceipted_artifacts = stable_legacy_unreceipted_artifacts(
                 candidate_history,
                 current_record,
-                prefer_unresolved_thread_blocker=(
-                    prefer_unresolved_thread_blocker
-                ),
+                prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 inventory_validation_contexts=inventory_validation_contexts,
             )
             if (
@@ -26984,6 +28223,209 @@ printf '%s\n' "$trusted_uv"
             channel="issue-comment",
             edited=True,
         )
+        short_issue_terminal_current = clone(current)
+        assert isinstance(short_issue_terminal_current, dict)
+        short_issue_terminal_time = (
+            max(
+                int(item["created_at"])
+                for item in short_issue_terminal_current["reactions"]
+            )
+            + 1
+        )
+        short_issue_terminal_id = 81_101
+        short_issue_terminal_artifact = complete_issue_comment_artifact(
+            short_issue_terminal_current,
+            short_issue_terminal_id,
+            short_issue_terminal_time,
+            commit_ref=current_head[:10],
+            edited=True,
+        )
+        short_issue_terminal_current["evidence_state"]["terminal_payloads"] = [
+            short_issue_terminal_artifact
+        ]
+        short_issue_terminal_current["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": short_issue_terminal_time,
+            "stable_artifact_id": short_issue_terminal_id,
+        }
+        restamp(short_issue_terminal_current)
+
+        short_issue_terminal_history = clone(issue_terminal_history)
+        assert isinstance(short_issue_terminal_history, list)
+        short_historical_candidate = short_issue_terminal_history[0]
+        assert isinstance(short_historical_candidate, dict)
+        short_historical_scope = scope_key(short_historical_candidate)
+        self.assertIsNotNone(short_historical_scope)
+        assert short_historical_scope is not None
+        short_historical_basis = short_historical_candidate["candidate_basis"]
+        assert isinstance(short_historical_basis, dict)
+        short_historical_id = short_historical_basis["stable_artifact_id"]
+        short_historical_time = short_historical_basis["server_time"]
+        self.assertIsInstance(short_historical_id, int)
+        self.assertIsInstance(short_historical_time, int)
+        assert isinstance(short_historical_id, int)
+        assert isinstance(short_historical_time, int)
+        short_historical_candidate["evidence_state"]["terminal_payloads"] = [
+            complete_issue_comment_artifact(
+                short_historical_candidate,
+                short_historical_id,
+                short_historical_time,
+                commit_ref=str(short_historical_scope[3])[:10],
+                edited=True,
+            )
+        ]
+        restamp(short_historical_candidate)
+        complete_short_history = history(short_issue_terminal_history)
+        complete_short_history_validation = validate_history_universe_result(
+            complete_short_history
+        )
+        self.assertIsNotNone(complete_short_history_validation)
+        assert isinstance(complete_short_history_validation, dict)
+        self.assertEqual(complete_short_history_validation["status"], "complete")
+        complete_short_candidates = complete_short_history_validation["candidates"]
+        assert isinstance(complete_short_candidates, list)
+        validated_short_candidate = next(
+            candidate
+            for candidate in complete_short_candidates
+            if scope_key(candidate) == short_historical_scope
+        )
+        validated_short_ordering = candidate_order_basis(validated_short_candidate)
+        self.assertEqual(
+            validated_short_ordering,
+            (short_historical_time, short_historical_id),
+        )
+        validated_short_source = candidate_source_evidence(
+            validated_short_candidate,
+            validated_short_ordering,
+        )
+        self.assertIsNotNone(validated_short_source)
+        assert isinstance(validated_short_source, dict)
+        self.assertEqual(validated_short_source["semantic"], "clean")
+        self.assertNotEqual(
+            validated_short_source["semantic"],
+            pending_short_clean_semantic,
+        )
+
+        sidecar_blind_short_history = clone(complete_short_history)
+        assert isinstance(sidecar_blind_short_history, dict)
+        short_historical_request_id = short_historical_candidate["requests"][0]["id"]
+        self.assertIsInstance(short_historical_request_id, int)
+        for phase in ("initial", "final"):
+            phase_candidate = next(
+                candidate
+                for candidate in sidecar_blind_short_history[f"{phase}_candidates"]
+                if scope_key(candidate) == short_historical_scope
+            )
+            phase_receipt = next(
+                receipt
+                for receipt in phase_candidate["request_scope_receipts"]
+                if receipt.get("request_id") == short_historical_request_id
+            )
+            phase_receipt["authority_override"] = True
+            restamp(phase_candidate)
+            inventory_receipt = next(
+                receipt
+                for receipt in sidecar_blind_short_history[f"{phase}_inventory"][
+                    "request_scope_receipts"
+                ]
+                if receipt.get("request_id") == short_historical_request_id
+            )
+            inventory_receipt["authority_override"] = True
+        sidecar_blind_short_validation = validate_history_universe_result(
+            sidecar_blind_short_history
+        )
+        self.assertIsNotNone(sidecar_blind_short_validation)
+        assert isinstance(sidecar_blind_short_validation, dict)
+        self.assertEqual(
+            sidecar_blind_short_validation["status"],
+            "unused-sidecar-unavailable",
+        )
+
+        def historical_short_resolution_attack(
+            source_history: dict[str, object],
+            attack: str,
+        ) -> dict[str, object]:
+            attacked = clone(source_history)
+            assert isinstance(attacked, dict)
+            if attack in {"missing-companion", "drifting-companion"}:
+                for phase in ("initial", "final"):
+                    candidate = next(
+                        item
+                        for item in attacked[f"{phase}_candidates"]
+                        if scope_key(item) == short_historical_scope
+                    )
+                    wrapper = candidate["evidence_state"]["terminal_payloads"][0]
+                    if attack == "missing-companion":
+                        wrapper.pop("reviewed_commit_resolution_receipt")
+                    else:
+                        replace_resolution_body(
+                            wrapper,
+                            "final_receipt",
+                            {"sha": short_historical_scope[3], "extra": "drift"},
+                        )
+                    restamp(candidate)
+                return attacked
+            if attack != "cross-plane-source-digest":
+                raise AssertionError("unknown historical short-resolution attack")
+            for phase in ("initial", "final"):
+                transcript = attacked[f"{phase}_inventory"][
+                    "discovery_endpoint_transcript"
+                ]
+                raw_scope = next(
+                    item
+                    for item in transcript["scopes"]
+                    if item.get("pull_number") == short_historical_scope[1]
+                )
+                issue_fetch = next(
+                    fetch
+                    for fetch in raw_scope["fetches"]
+                    if fetch.get("kind") == "issue_comments"
+                )
+                mutation_count = 0
+                for page in issue_fetch["pages"]:
+                    records = strict_json_loads(page["body_utf8"])
+                    assert isinstance(records, list)
+                    for raw_record in records:
+                        if (
+                            isinstance(raw_record, dict)
+                            and raw_record.get("id") == short_historical_id
+                        ):
+                            raw_record["body"] = str(raw_record["body"]).replace(
+                                "Didn't find any major issues.",
+                                "Didn't find any major issues. Nice work!",
+                                1,
+                            )
+                            mutation_count += 1
+                    if mutation_count:
+                        replace_raw_json_body(
+                            page,
+                            canonical_raw_body(records),
+                        )
+                self.assertEqual(mutation_count, 1)
+            return attacked
+
+        for validation_path, source_history in {
+            "complete-history": complete_short_history,
+            "sidecar-blind-history": sidecar_blind_short_history,
+        }.items():
+            for attack in (
+                "missing-companion",
+                "drifting-companion",
+                "cross-plane-source-digest",
+            ):
+                with self.subTest(
+                    short_resolution_validation_path=validation_path,
+                    short_resolution_attack=attack,
+                ):
+                    self.assertIsNone(
+                        validate_history_universe_result(
+                            historical_short_resolution_attack(
+                                source_history,
+                                attack,
+                            )
+                        )
+                    )
+
         terminal_basis = terminal_current["candidate_basis"]
         assert isinstance(terminal_basis, dict)
         terminal_server_time = terminal_basis["server_time"]
@@ -28765,6 +30207,39 @@ printf '%s\n' "$trusted_uv"
 
         normal_lane_timing = lane_timing(1, 2)
 
+        for resolution_near_miss_name in ("missing", "drifting-final-read"):
+            resolution_near_miss = clone(short_issue_terminal_current)
+            assert isinstance(resolution_near_miss, dict)
+            resolution_wrapper = resolution_near_miss["evidence_state"][
+                "terminal_payloads"
+            ][0]
+            if resolution_near_miss_name == "missing":
+                resolution_wrapper.pop("reviewed_commit_resolution_receipt")
+            else:
+                final_resolution = resolution_wrapper[
+                    "reviewed_commit_resolution_receipt"
+                ]["final_receipt"]
+                replace_raw_json_body(
+                    final_resolution,
+                    canonical_raw_body({"sha": "f" * 40}),
+                )
+            restamp(resolution_near_miss)
+            with self.subTest(
+                short_issue_terminal_resolution=resolution_near_miss_name,
+            ):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        history(
+                            issue_terminal_history,
+                            current_raw=resolution_near_miss,
+                        ),
+                        resolution_near_miss,
+                        normal_lane_timing,
+                    )
+                )
+
         strong_terminal_history = history(
             samples,
             current_raw=terminal_current,
@@ -29717,9 +31192,7 @@ printf '%s\n' "$trusted_uv"
             monotonic_clock=lambda: 0.0
         )
         assert cold_mutation_context is not None
-        cold_mutation_parts = inventory_validation_context_parts(
-            cold_mutation_context
-        )
+        cold_mutation_parts = inventory_validation_context_parts(cold_mutation_context)
         assert cold_mutation_parts is not None
         cold_mutation_events: list[str] = []
         original_bounded_json_fingerprint_pass = bounded_json_fingerprint_pass
@@ -29731,9 +31204,7 @@ printf '%s\n' "$trusted_uv"
             calculate_digest: bool,
         ) -> tuple[tuple[object, ...], str | None] | None:
             if value is cold_mutation_inventory:
-                cold_mutation_events.append(
-                    "digest" if calculate_digest else "no-hash"
-                )
+                cold_mutation_events.append("digest" if calculate_digest else "no-hash")
             return original_bounded_json_fingerprint_pass(
                 value,
                 resource_tracker=resource_tracker,
@@ -33906,6 +35377,15 @@ printf '%s\n' "$trusted_uv"
                 "terminal-payload",
                 "issue-comment",
             ),
+            "terminal-issue-comment-short-sha": (
+                history(
+                    issue_terminal_history,
+                    current_raw=short_issue_terminal_current,
+                ),
+                short_issue_terminal_current,
+                "terminal-payload",
+                "issue-comment",
+            ),
             "mixed-later-eyes": (
                 history(
                     samples,
@@ -34086,9 +35566,9 @@ printf '%s\n' "$trusted_uv"
                     )
                     documented_round_trip = clone(terminal_report)
                     assert isinstance(documented_round_trip, dict)
-                    documented_round_trip["evidence_basis"][
-                        "scope_assurance"
-                    ] = documented_scope_assurance
+                    documented_round_trip["evidence_basis"]["scope_assurance"] = (
+                        documented_scope_assurance
+                    )
                     documented_round_trip["evidence_basis"]["artifact"] = clone(
                         documented_artifact
                     )
@@ -34545,13 +36025,11 @@ printf '%s\n' "$trusted_uv"
                 mutated_scope_assurance = clone(unresolved_report)
                 assert isinstance(mutated_scope_assurance, dict)
                 if mutation_value == "__DELETE__":
-                    del mutated_scope_assurance["evidence_basis"][
-                        "scope_assurance"
-                    ]
+                    del mutated_scope_assurance["evidence_basis"]["scope_assurance"]
                 else:
-                    mutated_scope_assurance["evidence_basis"][
-                        "scope_assurance"
-                    ] = mutation_value
+                    mutated_scope_assurance["evidence_basis"]["scope_assurance"] = (
+                        mutation_value
+                    )
                 self.assertFalse(
                     validate_complete_report(
                         mutated_scope_assurance,
@@ -34846,9 +36324,9 @@ printf '%s\n' "$trusted_uv"
         )
         raw_blocker_with_legacy_clean = clone(malformed_current)
         assert isinstance(raw_blocker_with_legacy_clean, dict)
-        raw_blocker_with_legacy_clean["evidence_state"][
-            "terminal_payloads"
-        ].append(clone(blocker_legacy_clean_artifact))
+        raw_blocker_with_legacy_clean["evidence_state"]["terminal_payloads"].append(
+            clone(blocker_legacy_clean_artifact)
+        )
         restamp(raw_blocker_with_legacy_clean)
         blocker_legacy_clean_history = history(
             samples,
@@ -34921,9 +36399,7 @@ printf '%s\n' "$trusted_uv"
             {"request_policy", "provider_profile", "evidence_basis"},
         )
         self.assertEqual(
-            legacy_clean_report["evidence_basis"][
-                "legacy_unreceipted_artifacts"
-            ],
+            legacy_clean_report["evidence_basis"]["legacy_unreceipted_artifacts"],
             [
                 expected_legacy_unreceipted_audit(
                     legacy_clean_artifact,
@@ -34943,9 +36419,9 @@ printf '%s\n' "$trusted_uv"
         )
         invalid_normalized_legacy_clean = clone(terminal_current)
         assert isinstance(invalid_normalized_legacy_clean, dict)
-        invalid_normalized_legacy_clean["evidence_state"][
-            "terminal_payloads"
-        ].append(clone(legacy_clean_artifact))
+        invalid_normalized_legacy_clean["evidence_state"]["terminal_payloads"].append(
+            clone(legacy_clean_artifact)
+        )
         restamp(invalid_normalized_legacy_clean)
         self.assertEqual(
             compute_provider_profile(
@@ -34967,9 +36443,9 @@ printf '%s\n' "$trusted_uv"
         )
         raw_with_legacy_finding = clone(terminal_current)
         assert isinstance(raw_with_legacy_finding, dict)
-        raw_with_legacy_finding["evidence_state"][
-            "active_top_level_findings"
-        ].append(clone(legacy_finding_artifact))
+        raw_with_legacy_finding["evidence_state"]["active_top_level_findings"].append(
+            clone(legacy_finding_artifact)
+        )
         restamp(raw_with_legacy_finding)
         legacy_finding_history = history(
             samples,
@@ -34986,9 +36462,7 @@ printf '%s\n' "$trusted_uv"
         self.assertIsNotNone(legacy_finding_report)
         assert isinstance(legacy_finding_report, dict)
         self.assertEqual(
-            legacy_finding_report["evidence_basis"][
-                "legacy_unreceipted_artifacts"
-            ],
+            legacy_finding_report["evidence_basis"]["legacy_unreceipted_artifacts"],
             [
                 expected_legacy_unreceipted_audit(
                     legacy_finding_artifact,
@@ -35071,9 +36545,9 @@ printf '%s\n' "$trusted_uv"
         )
         raw_with_equal_boundary_clean = clone(terminal_current)
         assert isinstance(raw_with_equal_boundary_clean, dict)
-        raw_with_equal_boundary_clean["evidence_state"][
-            "terminal_payloads"
-        ].append(equal_boundary_clean_artifact)
+        raw_with_equal_boundary_clean["evidence_state"]["terminal_payloads"].append(
+            equal_boundary_clean_artifact
+        )
         restamp(raw_with_equal_boundary_clean)
         equal_boundary_history = history(
             samples,
@@ -35176,9 +36650,9 @@ printf '%s\n' "$trusted_uv"
                 terminal_time - 2,
             )
         )
-        raw_with_only_unreceipted_clean["evidence_state"][
-            "terminal_payloads"
-        ].append(only_unreceipted_clean_artifact)
+        raw_with_only_unreceipted_clean["evidence_state"]["terminal_payloads"].append(
+            only_unreceipted_clean_artifact
+        )
         restamp(raw_with_only_unreceipted_clean)
         only_unreceipted_clean_history = history(
             samples,
@@ -45210,10 +46684,7 @@ printf '%s\n' "$trusted_uv"
                     requires_python_313 = (
                         entrypoint.name == "independent-codex-pr-review"
                     )
-                    if (
-                        requires_python_313
-                        and sys.version_info[:2] != (3, 13)
-                    ):
+                    if requires_python_313 and sys.version_info[:2] != (3, 13):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertIn(
                             "Python 3.13 is required; running",

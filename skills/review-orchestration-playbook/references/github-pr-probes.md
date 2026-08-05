@@ -95,6 +95,11 @@ gh api --hostname <host> --method GET --paginate --slurp \
 gh api --hostname <host> --method GET --include \
   repos/<owner>/<repo>/issues/comments/<artifact_comment_id>
 
+# Only for a lowercase 10-hex clean marker: retain this authenticated
+# exact-repository response as the initial commit-resolution receipt.
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/commits/<exact_10_hex_commit_ref>
+
 # For a review candidate, use this exact GET instead of the issue-comment GET.
 gh api --hostname <host> --method GET --include \
   repos/<owner>/<repo>/pulls/<number>/reviews/<artifact_review_id>
@@ -104,6 +109,10 @@ gh api --hostname <host> --method GET --include \
 
 gh api --hostname <host> --method GET --include \
   'repos/<owner>/<repo>/compare/<artifact_post_base_oid>...<artifact_post_head_oid>'
+
+# Re-read the same endpoint for the final short-marker resolution receipt.
+gh api --hostname <host> --method GET --include \
+  repos/<owner>/<repo>/commits/<exact_10_hex_commit_ref>
 
 gh api --hostname <host> --method GET --paginate --slurp \
   'repos/<owner>/<repo>/issues/comments/<request_comment_id>/reactions?per_page=100' \
@@ -500,7 +509,7 @@ Build one complete current-scope snapshot from:
   and post pull/compare raw responses; and
 - the lifecycle, base/head, merge-base, and check/run observations needed to validate scope and distinguish liveness from terminal evidence.
 
-Normalize stable API IDs, source channel, exact provider identity, artifact commit, enclosing current `scope.head`, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full artifact commit, and immutable current scope; review-only fields are rejected. Clean must bind the exact current `scope.head`. A finding keeps its parsed/native commit and may remain applicable when local ancestry receipts prove it is current or an ancestor; never rewrite it to current head or omit it from the complete projection. Apply only the authority's fixed terminal-payload grammar: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase full-SHA `Reviewed commit` marker; clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
+Normalize stable API IDs, source channel, exact provider identity, artifact commit, enclosing current `scope.head`, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full artifact commit, raw clean marker/ref and resolution basis, and immutable current scope; review-only fields are rejected. Clean must bind the exact current `scope.head`. A finding keeps its parsed/native commit and may remain applicable when local ancestry receipts prove it is current or an ancestor; never rewrite it to current head or omit it from the complete projection. Apply only the authority's fixed terminal-payload grammar: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase 10- or 40-hex `Reviewed commit` marker. Forty hex binds directly to current head. Ten hex requires a separate closed `parent-recorded-reviewed-commit-resolution-v1` companion whose authenticated initial/final exact-repository `/commits/<prefix>` raw receipts both return exact `200`, pass UTF-8/digest/strict-JSON validation, stably expose one lowercase full-40 top-level `sha` starting with the prefix, and resolve to `parsed_commit == scope.head`. Require their retained server times to prove `artifact GET Date <= initial resolution Date <= every post-scope Date <= final resolution Date`; same-second equality is allowed at each of these non-strict edges. Missing, `404`/`409`/`422`/`429`/`5xx`, invalid, ambiguous, drifting, misordered, or non-current evidence fails closed, and the companion is forbidden for full-40. Only the official disclosure suffix trims each line and drops blanks before exact closed nine-line comparison; the lead, tagline, marker, two-LF boundary, extra nonempty text, and links remain strict. Clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Finding URLs, review commit IDs, and inline parent/child commit IDs remain lowercase full-40. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
 
 Apply the evidence in this order:
 
@@ -575,7 +584,9 @@ deadline_seconds: 900
 Apply those maxima to three non-borrowing endpoint,
 request-scope-sidecar, and terminal-artifact-scope-receipt ledgers that share
 one inventory start/deadline. Pre-count each sidecar or artifact-wrapper array
-and each wrapper's five raw responses. Create the artifact ledger once per
+and each wrapper's five raw scope/artifact responses. A 10-character clean
+issue marker adds exactly two authenticated exact-repository commit-resolution
+GETs to that same artifact ledger. Create the artifact ledger once per
 inventory decision pass, validate each immutable wrapper once, and thread its
 memoized result through candidate ordering, audit, profile, outcome, and report
 projection; a consumer must never create a per-candidate, per-scope, or
@@ -602,8 +613,9 @@ cache identity binds the exact plane tracker, exact artifact scope types, and
 the closed scaffold around a narrowed current `fetches` subject. Mutation of an
 immutable cached negative stays fail-closed until a fresh reread/context.
 Complete, sidecar-blind, ancestry-filtering, and candidate-ordering consumers share one
-exact-list/dict wrapper-array precharge before iteration; one wrapper plus its
-five responses consumes six artifact records exactly once. A filtered view must
+exact-list/dict wrapper-array precharge before iteration; an ordinary wrapper
+plus five responses consumes six artifact records exactly once, while a
+10-character clean wrapper plus its two resolution reads consumes eight. A filtered view must
 be an identity-preserving subsequence of those charged arrays. Require an exact
 built-in current raw object/fetch list and an exact positive integer PR number
 before rebuilding its narrow transcript; reject boolean/floating equality
@@ -829,7 +841,10 @@ records remain audit context and cannot supply resolution; synthesized REST
 resolution fields are forbidden. Issue-comment
 snapshots use the authority's full closed schema: canonical API/HTML identity,
 exact actor/App, raw/normalized body, grammar status, `created_at`,
-`updated_at`, edit-aware server time/field, parsed commit, and immutable scope.
+`updated_at`, edit-aware server time/field, parsed full commit, raw clean
+marker/ref, resolution basis, and immutable scope. A short clean additionally
+retains its stable independent resolution companion in the wrapper and
+`evidence_basis`.
 The scope head is current; clean requires its commit to equal that head, while
 an applicable finding may preserve a proved-ancestor artifact commit.
 REST request, reaction, parent, selected, and artifact IDs remain exact
@@ -843,7 +858,8 @@ provider's internal input merge base or whole-PR review coverage. Omit it from
 reaction bases, and keep an absent basis as literal `null`.
 
 Immediately before success, repeat the lifecycle, base/head, unique merge-base,
-complete evidence, pagination, every applicable artifact-time scope receipt, and
+complete evidence, pagination, every applicable artifact-time scope receipt,
+every applicable short-marker initial/final resolution receipt, and
 selected-artifact reads. Require the exact whole-PR scope and the recorded
 `evidence_basis`—source channel, stable ID/URL, server time, artifact commit,
 receipt-bound current scope, and exact artifact GET body/digest/identity—to

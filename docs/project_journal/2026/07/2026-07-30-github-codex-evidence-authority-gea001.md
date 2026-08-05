@@ -3,7 +3,7 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-08-04
+updated: 2026-08-05
 branch: wip/github-codex-evidence-authority
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
@@ -135,8 +135,18 @@ superseded_by:
   remains `confirmed-non-candidate` audit evidence for that frozen interval
   instead of entering candidate entries or count.
 - Terminal comments/reviews count only under the authority's fixed
-  clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
-  `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
+  clean/finding/inline-parent grammar. Clean issue comments carry one exact
+  lowercase 10- or 40-hex `Reviewed commit` marker. A 10-hex marker additionally
+  remains raw `clean-pending-resolution` and non-authoritative until the stable
+  exact-repository commit-resolution companion introduced by the 2026-08-05
+  live-provider compatibility follow-up joins its artifact ID, scope, ref, and
+  resolved current full SHA. Current, complete-history, and sidecar-blind
+  historical paths all require that same join; sidecar-blind may ignore request
+  sidecars but never the resolution companion. The receipt dates prove
+  `artifact GET <= initial resolution <= post-scope snapshot(s) <= final resolution`
+  with same-second equality allowed, so authority does not rest on a prose claim
+  about invocation order. Clean reviews are exact
+  `APPROVED` / native
   current-head `commit_id` / `No findings.` records whose fully paginated
   exact-provider selected-review target-child set is present and empty. A valid
   target child is findings; an unread, incomplete, malformed, or conflicting
@@ -345,14 +355,27 @@ superseded_by:
   a new source commit, released Action commit, full release-tree identity, and
   changed regression evidence. A moving branch, “latest” release, or partial
   runtime-file comparison does not silently replace this baseline.
-- The Action alignment is intentionally asymmetric. Provider-result authority,
-  duplicate-result consumption, and early-result consumption are inherited.
-  Exact whole-PR lifecycle/scope, the artifact-time scope receipt,
-  ancestor-finding projection, local-lane sequencing, warning codes, explicit
-  clean payloads, the narrower full-SHA terminal grammar, and the conditional
-  `+1` fallback are deliberate playbook extensions. Future edits must preserve
-  that split instead of mechanically copying either implementation into the
-  other. The machine-readable base-only-retarget contract is now version 2;
+- The Action alignment is intentionally asymmetric and remains pinned to source
+  `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`
+  and released Action
+  `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`.
+  Provider-result authority, duplicate-result consumption, and early-result
+  consumption are inherited. Short-marker parity is limited to 10/40 carrier
+  lengths and the short carrier's fail-closed exact-repository REST resolution
+  outcome. Lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank
+  boundary, closed lead/tagline/disclosure/native grammar, and independent
+  parent-recorded initial/final receipt evidence remain stricter playbook rules;
+  complete grammar parity with the Action is not claimed. Exact whole-PR
+  lifecycle/scope, the artifact-time scope receipt, ancestor-finding projection,
+  local-lane sequencing, warning codes, explicit clean payloads, and the
+  conditional `+1` fallback are further playbook extensions. The earlier
+  full-SHA-only clean issue-comment rule was superseded after PR 91 live evidence
+  demonstrated the provider's 10-hex carrier and the fixed Action baseline
+  proved its fail-closed REST resolution outcome; finding URLs and native
+  review/inline commit IDs remain full-SHA-only. Future edits must preserve that
+  split instead of mechanically copying either implementation into the other.
+  The machine-readable base-only-retarget
+  contract is now version 2;
   version 1 request-sidecar event semantics are unchanged, and version 2 adds
   only the independent terminal-artifact scope plane.
 - Future provider behaviour may change, but adaptation must select one of the
@@ -894,9 +917,12 @@ but supersedes them wherever they conflict with the rules below.
 Implementation hardening while closing those findings made the bounds and
 plane separation explicit. Endpoint evidence, request-scope sidecars, and
 terminal-artifact scope receipts use three non-borrowing ledgers under the same
-inventory start/deadline; each sidecar or artifact wrapper is pre-counted and
-its five raw responses are byte- and record-bounded before digesting or
-decoding. The artifact ledger is created once for an inventory decision pass;
+inventory start/deadline. Each request sidecar or ordinary artifact wrapper is
+pre-counted with its five raw responses, for six records including the wrapper;
+a lowercase 10-hex clean wrapper adds two independent resolution responses, for
+seven raw responses and eight records. Every response is byte- and record-bounded
+before digesting or decoding. The artifact ledger is created once for an
+inventory decision pass;
 each immutable wrapper is charged and validated once, and candidate ordering,
 audit, profile, outcome, and report consumers reuse that memoized result.
 Per-candidate/scope/recomputation resets and repeated charging are forbidden.
@@ -1199,9 +1225,11 @@ restore request/run binding or erase this rationale.
   then fall back sidecar-blind and reuse the cached artifact. Complete,
   sidecar-blind, and candidate-ordering paths now call one tracker-bound
   exact-list/dict precharge before wrapper iteration. The regression asserts
-  the closed six-record cost for every wrapper (one wrapper record plus five
-  responses), including an accepted
-  `unused-sidecar-unavailable` fallback.
+  the closed ordinary six-record cost (one wrapper record plus five raw
+  scope/artifact responses), including an accepted
+  `unused-sidecar-unavailable` fallback. A lowercase 10-hex clean wrapper instead
+  adds two independent resolution responses and therefore carries seven raw
+  responses for eight records total.
   The next independent pass closed two adjacent aliases: ancestry filtering now
   precharges the original exact arrays before iteration and can bind a filtered
   view only when it is an identity-preserving subsequence, while current raw

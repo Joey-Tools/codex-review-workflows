@@ -62,6 +62,11 @@ jobs:
           python3 -m unittest discover \
             -s personal_codex/skills/review-orchestration-playbook/tests \
             -p 'test_*.py'
+      - name: Verify canonical project journal workflow
+        run: |
+          python3 -m unittest discover \
+            -s personal_codex/skills/project-journal/tests \
+            -p 'test_*.py'
       - name: Verify private overlay sync on macOS
         if: runner.os == 'macOS'
         run: |

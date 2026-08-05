@@ -86,6 +86,15 @@ fallback are local extensions. They must not be
 removed merely because the fixed Action uses a different evidence envelope,
 and they must not be attributed to that Action without a new pinned comparison.
 
+Short-marker compatibility reuses only two facts from the pinned Action: the
+clean marker carrier may be 10 or 40 characters, and a short carrier fails
+closed unless exact-repository REST resolution produces the current full head.
+It does not import the Action's full grammar. This playbook deliberately remains
+stricter on lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank
+disclosure boundary, the closed clean lead/tagline/disclosure and native
+review/inline grammars, and independent parent-recorded initial/final resolution
+receipt evidence.
+
 ### Why Result-Present Acceptance Is Deliberate
 
 “Result-present acceptance” means that a complete, trustworthy current-scope
@@ -769,7 +778,7 @@ Only the following terminal payloads are accepted:
    ```text
    Codex Review: Didn't find any major issues.[ OPTIONAL_TAGLINE]
 
-   **Reviewed commit:** `<FULL_40_HEX_SHA>`
+   **Reviewed commit:** `<LOWERCASE_10_OR_40_HEX_SHA>`
    ```
 
    `OPTIONAL_TAGLINE` is absent; exact ASCII `:rocket:`, `:tada:`, or `:+1:`;
@@ -795,9 +804,33 @@ Only the following terminal payloads are accepted:
    You're on a roll
    ```
 
-   The reviewed commit marker occurs exactly once, uses lowercase full SHA
-   text, and must resolve to the selected current head. The only permitted
-   suffix is two LF characters followed by this exact disclosure block:
+   The reviewed commit marker occurs exactly once and uses exactly 10 or 40
+   lowercase hexadecimal characters. Only the 10/40 carrier lengths and the
+   short carrier's fail-closed REST resolution outcome align with the fixed
+   Action baseline at `16366aa81270ad2c875d2ceb8ce194f5b2308af6`; the closed
+   grammar in this section remains the stricter playbook contract. A
+   40-character reference is
+   used directly and must equal the selected current head. A 10-character
+   reference requires the independent closed
+   `parent-recorded-reviewed-commit-resolution-v1` companion below; its two
+   authenticated exact-repository GitHub REST reads of
+   `/repos/<OWNER>/<REPO>/commits/<PREFIX>` must stably and uniquely resolve
+   the prefix to the same lowercase full 40-character SHA, the SHA must start
+   with the prefix, and it must equal both `parsed_commit` and the selected
+   current head. Missing evidence and `404`, `409`, `422`, `429`, any `5xx`,
+   malformed/non-object JSON, a non-full or non-prefix SHA, ambiguity, drift,
+   or a different head fail closed. A 40-character marker must not carry this
+   resolution companion.
+
+   The only permitted clean-result suffix is exactly two LF characters
+   followed immediately by a nonblank first disclosure line and the official
+   disclosure below. For that clean-result suffix only, trim leading/trailing whitespace
+   from each line, drop blank lines, and require the remaining nine lines to
+   equal this closed sequence exactly. Do not apply this normalization to the
+   result body, clean lead, tagline, marker, or two-LF boundary. A changed
+   link or line, an extra nonempty line, a missing line, a third LF, or an
+   intervening whitespace-only line is malformed. This whitespace-tolerant
+   disclosure rule does not widen top-level finding grammar.
 
    ```text
    <details> <summary>ℹ️ About Codex in GitHub</summary>
@@ -835,8 +868,10 @@ Only the following terminal payloads are accepted:
 3. **Top-level finding.** Require a normalized body with the exact first line
    `### 💡 Codex Review` followed by one or more nonempty LF-delimited finding
    lines. The body either ends after the final finding line or appends exactly
-   two LF characters plus the exact disclosure block above; no other suffix or
-   intervening line is accepted. Each finding line has this exact grammar:
+   two LF characters plus the byte-for-byte line form of the disclosure block
+   above; per-line whitespace normalization is not applied to findings, and no
+   other suffix or intervening line is accepted. Each finding line has this
+   exact grammar:
 
    ```text
    - [P<SEVERITY>] <TITLE> — <BLOB_URL>
@@ -937,6 +972,9 @@ updated_at: <trusted REST server time>
 server_time: <created_at when unedited, otherwise updated_at>
 server_time_field: created_at | updated_at
 parsed_commit: <lowercase full SHA parsed from the accepted body>
+raw_reviewed_commit_marker: <exact marker line for clean, otherwise absent>
+commit_ref: <exact lowercase 10- or 40-character clean marker ref, otherwise absent>
+commit_resolution_basis: direct-full-sha-v1 | parent-recorded-reviewed-commit-resolution-v1
 scope:
   repository: OWNER/REPO
   pr: <positive PR number>
@@ -944,7 +982,10 @@ scope:
   head: <lowercase full SHA>
 ```
 
-The object rejects unknown fields and review-only fields such as `state`,
+The three marker/resolution fields are required together only for accepted
+clean issue comments and absent from finding or malformed records. Even when
+`commit_ref` is 10 characters, `parsed_commit` remains the resolved lowercase
+full 40-character SHA. The object rejects unknown fields and review-only fields such as `state`,
 `submitted_at`, `commit_id`, and inline-thread joins. Require
 `updated_at >= created_at`. When the two times are equal, require
 `server_time == created_at` and `server_time_field == created_at`; when they
@@ -961,6 +1002,49 @@ from `scope.head` only when current raw authority proves it is an ancestor;
 the enclosing scope remains current. Apply the same distinction to a review's
 native `commit_id` and to its joined inline children.
 
+Before this join, a raw lowercase 10-character carrier has semantic and role
+`clean-pending-resolution`; it is non-authoritative and cannot enter clean
+selection. Only an exact companion join on artifact ID, immutable scope,
+`commit_ref`, and resolved full head may normalize it to clean. Apply that same
+closed join in the current path, complete-history path, and sidecar-blind
+historical path. Sidecar-blind may disregard a request-scope sidecar, but it
+must never disregard or synthesize this resolution companion.
+
+The 10-character branch stores the independent parent-owned companion beside,
+not inside, the unchanged closed
+`parent-recorded-terminal-artifact-scope-v1` wrapper:
+
+```yaml
+kind: parent-recorded-reviewed-commit-resolution-v1
+artifact_id: <same positive issue-comment ID>
+scope: <same immutable repository, PR, merge-base, and current-head object>
+commit_ref: <exact lowercase 10-character marker ref>
+resolved_commit: <lowercase full 40-character current head>
+initial_receipt: <closed raw GET response receipt>
+final_receipt: <closed raw GET response receipt>
+```
+
+Each response receipt has exactly `method`, `request_url`, `status`,
+`date_header`, `body_utf8`, and `body_sha256`; `method` is `GET`, the URL is
+the authenticated exact-repository
+`https://api.github.com/repos/<OWNER>/<REPO>/commits/<commit_ref>`, and status
+is exactly `200`. Strict duplicate-key-rejecting JSON parsing must produce one
+object with a lowercase full-SHA top-level `sha`. Recompute the raw UTF-8 body
+digest, require the initial and final raw bodies and resolved SHA to remain
+identical and bind every field to the artifact ID and exact current scope. Parse
+the retained HTTP `Date` fields and require
+`artifact GET <= initial resolution <= every post-scope snapshot <= final resolution`;
+same-second equality is allowed at each of these non-strict edges. These closed
+raw receipts, their digests, and their checked cross-wrapper order are the
+contract evidence. A prose assertion that the parent invoked or authenticated
+the calls in that order, or a self-reported `authenticated` or `tls_attested`
+boolean, cannot substitute for them. The authenticated trusted GitHub reader is
+an execution trust root; the receipt contract does not claim that its raw fields
+alone attest TLS. An ordinary wrapper carries five raw scope/artifact responses
+and costs six records including the wrapper. This companion adds two independent
+resolution responses, so a short-marker wrapper carries seven raw responses and
+costs eight records total.
+
 Before actor or parent classification, validate every associated inline record
 against the same closed nine-field schema: `id`, `url`, `user_login`,
 `user_type`, `pull_request_review_id`, `commit_id`, `original_commit_id`,
@@ -972,7 +1056,9 @@ Audit-only status never permits malformed evidence to disappear.
 
 All other terminal-looking exact-provider comments or reviews are malformed.
 In particular, these near misses never complete clean: a missing or duplicate
-reviewed-commit marker, a 10-character SHA, a mixed-case or mismatched SHA,
+reviewed-commit marker, a short reference without its complete stable
+resolution companion, a marker with any length other than 10 or 40, a
+mixed-case or mismatched SHA,
 `No findings!`, an empty `APPROVED` review, `Looks good.`, an unlisted tagline,
 an extra footer, a short-SHA or cross-repository finding URL, conflicting
 finding SHAs, a malformed percent escape or line anchor, a clean body
@@ -991,6 +1077,10 @@ Codex Review: Didn't find any major issues.
 
 **Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`
 ```
+
+The same clean record with marker `0123456789` is also positive only when its
+closed resolution companion stably resolves that exact prefix to
+`0123456789abcdef0123456789abcdef01234567` on both authenticated reads.
 
 ```yaml
 id: 123456789
@@ -1037,9 +1127,16 @@ The contract fixture matrix is normative:
 | `clean-review-malformed-null-parent-audit-child` | clean pull-request review | null-parent audit child with mismatched normalization | `malformed` |
 | `finding-positive` | top-level finding | none | `findings` |
 | `finding-with-disclosure-positive` | top-level finding | exact provider disclosure suffix | `findings` |
+| `finding-with-whitespace-disclosure` | top-level finding | whitespace-varied disclosure suffix | `malformed` |
 | `inline-parent-positive` | inline-parent review | none | `findings` |
 | `inline-parent-nonempty-positive` | inline-parent review | exact container body and disclosure | `findings` |
-| `clean-issue-short-sha` | clean issue comment | 10-character marker | `malformed` |
+| `clean-issue-short-sha` | clean issue comment | 10-character marker resolved by stable exact-repository receipts | `clean` |
+| `clean-issue-live-disclosure-whitespace-positive` | clean issue comment | 10-character marker plus trimmed closed disclosure lines | `clean` |
+| `clean-issue-disclosure-third-lf` | clean issue comment | three-LF marker-to-disclosure boundary | `malformed` |
+| `clean-issue-disclosure-space-line` | clean issue comment | whitespace-only marker-to-disclosure line | `malformed` |
+| `clean-issue-mutated-disclosure` | clean issue comment | mutated disclosure line | `malformed` |
+| `clean-issue-disclosure-extra-nonempty` | clean issue comment | extra nonempty disclosure line | `malformed` |
+| `clean-issue-disclosure-changed-link` | clean issue comment | changed disclosure link | `malformed` |
 | `clean-issue-missing-marker` | clean issue comment | missing marker | `malformed` |
 | `clean-issue-duplicate-marker` | clean issue comment | duplicate marker | `malformed` |
 | `clean-issue-mixed-case-sha` | clean issue comment | uppercase SHA text | `malformed` |
@@ -1294,9 +1391,12 @@ share the inventory's same monotonic start and 900-second deadline. Count each
 sidecar and artifact-wrapper array before iteration. Each controlled request
 charges one sidecar record plus its five retained raw responses (pre
 pull/compare, POST, and post pull/compare) as five attempts, pages, and records.
-Each terminal artifact charges one wrapper plus its five retained raw
-responses (pre pull/compare, exact artifact GET, and post pull/compare) under
-the same caps. Every response applies the body cap and counts the UTF-8 bytes
+Each ordinary terminal artifact charges one wrapper plus its five retained raw
+responses (pre pull/compare, exact artifact GET, and post pull/compare), six
+records total, under the same caps. A clean issue comment with a 10-character
+commit reference adds the two independent raw GET responses in its
+reviewed-commit resolution companion, for seven raw responses and eight records
+total. Every response applies the body cap and counts the UTF-8 bytes
 of its request URL, `Date`, and body.
 
 Create the artifact-receipt ledger exactly once per inventory decision pass.
@@ -1377,8 +1477,10 @@ built-in list/dict scaffolds enter that path. A filtered projection proves that
 each retained wrapper is an identity-preserving subsequence of the charged
 source arrays before it reuses that ledger: cloned entries, reordering, and
 multiplicity beyond the source are rejected, while an accepted projection is
-seeded without charging the same wrapper array again. The wrapper plus its five
-responses therefore always costs six records exactly once. The outer current
+seeded without charging the same wrapper array again. An ordinary wrapper plus
+its five raw scope/artifact responses costs six records exactly once; a
+10-character clean wrapper adds two independent resolution responses, for seven
+raw responses and eight records. The outer current
 raw inventory likewise requires an exact built-in object/fetch list, exact
 built-in repository and head strings, and an exact positive integer PR number
 before rebuilding the narrow transcript; subclass, boolean, or floating-point
@@ -2428,6 +2530,22 @@ older artifact-time head while the enclosing normalized `scope.head` remains
 current and local ancestry proves applicability. A missing earlier pre-scope
 boundary cannot be supplied by final current metadata, so an unreceipted old
 artifact is not trustworthy current-scope terminal authority.
+For a 10-character clean issue marker only, the wrapper also carries the
+separate closed `reviewed_commit_resolution_receipt` described above. Its
+initial/final raw responses and full resolution appear unchanged in both
+selection snapshots and the selected `evidence_basis`; omission, invalid
+status, exact-repository URL mismatch, invalid or ambiguous JSON, prefix/head
+mismatch, or any reread drift blocks that artifact. The companion is forbidden
+for a 40-character marker and never weakens finding URLs, review `commit_id`,
+or inline child commit IDs from their full-40 contracts.
+The raw 10-character record remains `clean-pending-resolution` until that exact
+join succeeds; it cannot independently supply clean or a normalized full commit.
+Current, complete-history, and sidecar-blind historical consumers all apply the
+same join. The sidecar-blind consumer may omit request-sidecar authority only,
+not resolution-companion authority. Each consumer also verifies from the
+retained raw receipts that the artifact GET precedes or equals initial
+resolution, initial resolution precedes or equals every post-scope snapshot,
+and every post-scope snapshot precedes or equals final resolution.
 Do not copy a truly unreceipted legacy wrapper into those normalized snapshots:
 it remains visible only in the complete raw inventories and the derived closed
 `legacy_unreceipted_artifacts` list. That audit-only omission from normalized
@@ -2896,9 +3014,15 @@ implementation mechanically:
    authority, and a malformed target join still fails closed.
 3. **The closed terminal issue-comment carrier is a playbook extension.** The
    inheritance does not make the fixed Action's internal carrier schema this
-   playbook's schema. The exact Bot/App/API/HTML/body/scope record, parsed
-   commit, edited-comment `updated_at` ordering, final reread, and
-   cross-channel equal-time fail-closed rule remain locally normative.
+   playbook's schema. Parity is limited to the 10/40 carrier lengths and the
+   short carrier's fail-closed exact-repository REST resolution outcome. The
+   playbook additionally requires lowercase-only refs, exact marker spacing,
+   the exact-two-LF/nonblank disclosure boundary, closed lead/tagline/disclosure
+   grammar, independent parent-recorded initial/final resolution receipts, the
+   exact Bot/App/API/HTML/body/scope record, parsed commit, edited-comment
+   `updated_at` ordering, final reread, and cross-channel equal-time fail-closed
+   rule. Native review and inline grammar also remain locally normative; no
+   complete-grammar match with the Action is claimed.
 4. **An empty `APPROVED` review is not clean.** The Action baseline accepts an
    empty or exact `Looks good.` approved-review body under its closed grammar.
    This playbook requires an explicit clean comment/review payload with commit
