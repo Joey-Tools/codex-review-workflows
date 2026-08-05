@@ -42714,7 +42714,8 @@ printf '%s\n' "$trusted_uv"
             "every key is a nonempty model-ID string",
             "every value is an object",
             "`error` and `errors`, when present, are explicitly empty",
-            "`api_error_status`, when present, is `null` or a whitespace-only string",
+            "`api_error_status`, when present on a successful terminal, is `null` or a whitespace-only string",
+            "bounded numeric `api_error_status: 401`",
             "`permission_denials`, when present, is an empty array",
             "nonempty/malformed `permission_denials` fails closed",
             "The canonical Claude Code compatibility range is",
@@ -42920,7 +42921,7 @@ printf '%s\n' "$trusted_uv"
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
         permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
-        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`"
+        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401—including bounded numeric `api_error_status: 401`—explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`"
         token_non_authentication_anchor = "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit errors"
         init_blocker_anchor = "When a non-success terminal follows any deterministic init or terminal blocker, absence of error prose preserves `blocked`"
         fallback_anchor = "The validator emits `classification: blocked` with machine reason `terminal.model-entitlement-denial` or `terminal.organization-policy-denial`"
@@ -43276,6 +43277,15 @@ printf '%s\n' "$trusted_uv"
                 )
             if rule == "null_or_whitespace_string":
                 return value is None or (isinstance(value, str) and not value.strip())
+            if rule == "null_or_whitespace_string_or_http_status_integer":
+                return (
+                    value is None
+                    or (isinstance(value, str) and not value.strip())
+                    or (
+                        type(value) is int
+                        and contract["minimum"] <= value <= contract["maximum"]
+                    )
+                )
             if rule == "empty_array":
                 return value == []
             self.fail(f"unknown optional-field rule: {rule}")

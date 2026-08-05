@@ -20066,11 +20066,16 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
     )
     unknown_fields = set(result) - CLAUDE_FAILURE_ENVELOPE_FIELDS
     unknown_field_count = len(unknown_fields)
-    known_error_payloads_empty = all(
+    known_nonstatus_error_payloads_empty = all(
         result[key] is None
         or (isinstance(result[key], str) and not result[key].strip())
         or (isinstance(result[key], (list, dict)) and not result[key])
         for key in known_error_fields
+        if key != "api_error_status"
+    )
+    api_error_status_empty = "api_error_status" not in result or (
+        api_error_status is None
+        or (isinstance(api_error_status, str) and not api_error_status.strip())
     )
     result_shape = (
         "missing"
@@ -20086,7 +20091,7 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
         and result_shape == "string"
         and unknown_field_count == 0
         and _claude_failure_metadata_is_supported(result)
-        and known_error_payloads_empty
+        and known_nonstatus_error_payloads_empty
     )
     supported_result_success = (
         safe_type == "result"
@@ -20095,7 +20100,8 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
         and raw_result == "OK"
         and unknown_field_count == 0
         and _claude_failure_metadata_is_supported(result)
-        and known_error_payloads_empty
+        and known_nonstatus_error_payloads_empty
+        and api_error_status_empty
     )
     return {
         "api_error_status": safe_api_error_status,

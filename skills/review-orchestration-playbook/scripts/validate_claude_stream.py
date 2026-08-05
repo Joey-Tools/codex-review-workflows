@@ -1180,7 +1180,9 @@ def _load_contract_with_binding() -> tuple[
         "error": {"rule": "explicitly_empty", "failure": "classify"},
         "errors": {"rule": "explicitly_empty", "failure": "classify"},
         "api_error_status": {
-            "rule": "null_or_whitespace_string",
+            "rule": "null_or_whitespace_string_or_http_status_integer",
+            "minimum": 100,
+            "maximum": 599,
             "failure": "classify",
         },
         "permission_denials": {"rule": "empty_array", "failure": "blocked"},
@@ -3173,6 +3175,8 @@ def _collect_error_messages(event: Mapping[str, Any], evidence: _Evidence) -> li
         if value is None or (type(value) is str and not value.strip()):
             pass
         elif type(value) is str:
+            messages.append(f"status {value}")
+        elif type(value) is int and 100 <= value <= 599:
             messages.append(f"status {value}")
         else:
             evidence.inconclusive.add("terminal.api_error_status.malformed")
