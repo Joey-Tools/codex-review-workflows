@@ -95,12 +95,6 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 scripts/validate_sync_manifest_changes.py --base-ref "$BASE_REF"
-      - name: Verify waited-delivery review contract
-        if: runner.os == 'Linux'
-        run: |
-          python3 -m unittest discover \
-            -s personal_codex/skills/waited-delivery/tests \
-            -p 'test_*.py'
       - name: Require source-only Python tree
         if: always()
         run: |
