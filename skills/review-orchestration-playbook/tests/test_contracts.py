@@ -431,6 +431,110 @@ def _github_codex_inline_parent_container(commit_id: str) -> str:
     )
 
 
+def _github_codex_legacy_top_level_review_finding_commit(
+    normalized_body: object,
+    *,
+    repository: str,
+    native_commit_id: str,
+) -> str | None:
+    if (
+        not isinstance(normalized_body, str)
+        or re.fullmatch(r"[0-9a-f]{40}", native_commit_id) is None
+        or "\t" in normalized_body
+    ):
+        return None
+    core, has_disclosure = _strip_official_codex_disclosure(normalized_body)
+    if not has_disclosure:
+        return None
+    if core.endswith("\n    "):
+        grammatical_core = core[:-5]
+    elif core == core.rstrip(" \n"):
+        grammatical_core = core
+    else:
+        return None
+    lines = grammatical_core.split("\n")
+    if len(lines) < 6 or lines[:2] != ["### 💡 Codex Review", ""]:
+        return None
+    blob_url = re.fullmatch(
+        rf"https://github\.com/{re.escape(repository)}/blob/"
+        r"(?P<sha>[0-9a-f]{40})/"
+        r"(?P<path>(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2})+)"
+        r"#L(?P<start>[1-9][0-9]*)(?:-L(?P<end>[1-9][0-9]*))?",
+        lines[2],
+    )
+    badge = re.fullmatch(
+        r"\*\*<sub><sub>!\[P(?P<priority>[0-3]) Badge\]"
+        r"\(https://img\.shields\.io/badge/P(?P=priority)-"
+        r"(?P<color>red|orange|yellow|lightgrey)\?style=flat\)"
+        r"</sub></sub>  (?P<title>.{1,240})\*\*",
+        lines[3],
+    )
+    if (
+        blob_url is None
+        or badge is None
+        or lines[4] != ""
+        or blob_url.group("sha") != native_commit_id
+        or badge.group("color")
+        != {"0": "red", "1": "orange", "2": "yellow", "3": "lightgrey"}[
+            badge.group("priority")
+        ]
+    ):
+        return None
+    try:
+        decoded_path = urllib.parse.unquote_to_bytes(blob_url.group("path")).decode(
+            "utf-8", errors="strict"
+        )
+    except UnicodeDecodeError:
+        return None
+    end_line = blob_url.group("end")
+    if (
+        any(segment in {"", ".", ".."} for segment in decoded_path.split("/"))
+        or "\\" in decoded_path
+        or any(unicodedata.category(char) == "Cc" for char in decoded_path)
+        or (end_line is not None and int(end_line) < int(blob_url.group("start")))
+    ):
+        return None
+    title = badge.group("title")
+    prose_lines = lines[5:]
+    prose = "\n".join(prose_lines)
+    bounded_text = f"{title}\n{prose}"
+    if (
+        title != title.strip(" ")
+        or "**" in title
+        or not prose.strip(" \n")
+        or prose != prose.rstrip(" \n")
+        or len(prose) > 8_000
+        or len(prose_lines) > 32
+        or any(len(line) > 2_000 for line in prose_lines)
+        or any(
+            char != "\n" and unicodedata.category(char) == "Cc" for char in bounded_text
+        )
+        or "<" in bounded_text
+        or ">" in bounded_text
+        or re.search(
+            r"(?:[A-Za-z][A-Za-z0-9+.-]*):(?=\S)|www\.",
+            bounded_text,
+            flags=re.IGNORECASE,
+        )
+        is not None
+        or re.search(
+            r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])",
+            bounded_text,
+        )
+        is not None
+        or len(re.findall(r"https?://", core, flags=re.IGNORECASE)) != 2
+        or len(
+            re.findall(
+                r"(?<![0-9A-Fa-f])[0-9a-f]{40}(?![0-9A-Fa-f])",
+                core,
+            )
+        )
+        != 1
+    ):
+        return None
+    return native_commit_id
+
+
 def _github_codex_invalid_review_state_terminal_signal(
     raw_body: object,
     *,
@@ -458,7 +562,10 @@ def _github_codex_review_body_semantic(
     current_head: str,
     has_associated_children: bool,
     has_target_children: bool,
+    allow_legacy_native_review: bool = False,
 ) -> tuple[str, str | None]:
+    if type(allow_legacy_native_review) is not bool:
+        return ("malformed", None)
     body = _normalize_github_codex_body(raw_body)
     if body is None:
         return ("malformed", None)
@@ -480,6 +587,20 @@ def _github_codex_review_body_semantic(
         if commit_id == current_head and body == "No findings.":
             return ("clean", commit_id)
         return ("malformed", None)
+    if allow_legacy_native_review:
+        legacy_finding_commit = _github_codex_legacy_top_level_review_finding_commit(
+            body,
+            repository=repository,
+            native_commit_id=commit_id,
+        )
+        if legacy_finding_commit is not None:
+            if (
+                state in {"COMMENTED", "CHANGES_REQUESTED"}
+                and not has_associated_children
+                and not has_target_children
+            ):
+                return ("findings", legacy_finding_commit)
+            return ("malformed", None)
     top_level_semantic, finding_commit = _github_codex_issue_body_semantic(
         body,
         repository=repository,
@@ -7538,6 +7659,35 @@ printf '%s\n' "$trusted_uv"
                 parent_review_id=review_id,
             ),
         }
+        legacy_finding_body = "\n".join(
+            (
+                "### 💡 Codex Review",
+                "",
+                "https://github.com/OWNER/REPO/blob/"
+                f"{current_sha}/path/to/file.py#L10-L12",
+                "**<sub><sub>![P2 Badge](https://img.shields.io/badge/"
+                "P2-yellow?style=flat)</sub></sub>  Preserve exact authority**",
+                "",
+                "The _api_error_status: 402 value identifies the concrete review risk.",
+                "    ",
+                "",
+                disclosure,
+            )
+        )
+        legacy_finding = {
+            "channel": "review",
+            "id": review_id + 1,
+            "user_login": "chatgpt-codex-connector[bot]",
+            "user_type": "Bot",
+            "state": "COMMENTED",
+            "commit_id": current_sha,
+            "body": legacy_finding_body,
+            "children": [],
+            "review_thread_pages": _review_thread_pages(
+                [],
+                parent_review_id=review_id + 1,
+            ),
+        }
 
         fixtures: list[tuple[str, str, str, str, dict[str, object]]] = []
 
@@ -7642,6 +7792,270 @@ printf '%s\n' "$trusted_uv"
             clean_review_malformed_null_parent_audit,
         )
         add("finding-positive", "top-level finding", "none", "findings", finding)
+        self.assertEqual(classify(legacy_finding), "malformed")
+        self.assertEqual(
+            _github_codex_legacy_top_level_review_finding_commit(
+                legacy_finding_body,
+                repository="OWNER/REPO",
+                native_commit_id=current_sha,
+            ),
+            current_sha,
+        )
+        legacy_without_padding = legacy_finding_body.replace(
+            "\n    \n\n<details>",
+            "\n\n<details>",
+        )
+        self.assertEqual(
+            _github_codex_legacy_top_level_review_finding_commit(
+                legacy_without_padding,
+                repository="OWNER/REPO",
+                native_commit_id=current_sha,
+            ),
+            current_sha,
+        )
+        disclosure_whitespace_variant = "\n".join(
+            (
+                "  <details> <summary>ℹ️ About Codex in GitHub</summary>  ",
+                "",
+                "  <br/>  ",
+                "   ",
+                "  Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you  ",
+                "  - Open a pull request for review  ",
+                "  - Mark a draft as ready  ",
+                '  - Comment "@codex review".  ',
+                "",
+                "  If Codex has suggestions, it will comment; otherwise it will react with 👍.  ",
+                "",
+                '  When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like "@codex address that feedback".  ',
+                "   ",
+                "  </details>  ",
+            )
+        )
+        legacy_disclosure_whitespace_variant = legacy_finding_body.replace(
+            disclosure,
+            disclosure_whitespace_variant,
+        )
+        self.assertEqual(
+            _github_codex_legacy_top_level_review_finding_commit(
+                legacy_disclosure_whitespace_variant,
+                repository="OWNER/REPO",
+                native_commit_id=current_sha,
+            ),
+            current_sha,
+        )
+        legacy_changes_requested = clone(legacy_finding)
+        legacy_changes_requested["state"] = "CHANGES_REQUESTED"
+        self.assertEqual(classify(legacy_changes_requested), "malformed")
+        self.assertEqual(
+            _github_codex_review_body_semantic(
+                legacy_finding_body,
+                repository="OWNER/REPO",
+                state="COMMENTED",
+                commit_id=current_sha,
+                current_head=current_sha,
+                has_associated_children=False,
+                has_target_children=False,
+            ),
+            ("malformed", None),
+        )
+        self.assertEqual(
+            _github_codex_review_body_semantic(
+                legacy_finding_body,
+                repository="OWNER/REPO",
+                state="COMMENTED",
+                commit_id=current_sha,
+                current_head=current_sha,
+                has_associated_children=False,
+                has_target_children=False,
+                allow_legacy_native_review=True,
+            ),
+            ("findings", current_sha),
+        )
+        for priority, color in {
+            "0": "red",
+            "1": "orange",
+            "2": "yellow",
+            "3": "lightgrey",
+        }.items():
+            priority_variant = clone(legacy_finding)
+            priority_variant["body"] = legacy_finding_body.replace(
+                "P2 Badge",
+                f"P{priority} Badge",
+            ).replace(
+                "P2-yellow",
+                f"P{priority}-{color}",
+            )
+            with self.subTest(legacy_top_level_review_priority=priority):
+                self.assertEqual(
+                    _github_codex_legacy_top_level_review_finding_commit(
+                        priority_variant["body"],
+                        repository="OWNER/REPO",
+                        native_commit_id=current_sha,
+                    ),
+                    current_sha,
+                )
+        expected_badge_colors = {
+            "0": "red",
+            "1": "orange",
+            "2": "yellow",
+            "3": "lightgrey",
+        }
+        for priority, expected_color in expected_badge_colors.items():
+            wrong_color = next(
+                color
+                for color in expected_badge_colors.values()
+                if color != expected_color
+            )
+            mismatched_priority_variant = legacy_finding_body.replace(
+                "P2 Badge",
+                f"P{priority} Badge",
+            ).replace(
+                "P2-yellow",
+                f"P{priority}-{wrong_color}",
+            )
+            with self.subTest(legacy_top_level_review_priority_color_mismatch=priority):
+                self.assertIsNone(
+                    _github_codex_legacy_top_level_review_finding_commit(
+                        mismatched_priority_variant,
+                        repository="OWNER/REPO",
+                        native_commit_id=current_sha,
+                    )
+                )
+        legacy_near_misses: dict[str, dict[str, object]] = {}
+        legacy_near_misses["plain-priority-prose"] = clone(legacy_finding)
+        legacy_near_misses["plain-priority-prose"]["body"] = (
+            "### 💡 Codex Review\n\n[P2] Preserve exact authority\n\n"
+            "This is not the closed provider shape.\n\n"
+            f"{disclosure}"
+        )
+        legacy_near_misses["priority-color-drift"] = clone(legacy_finding)
+        legacy_near_misses["priority-color-drift"]["body"] = (
+            legacy_finding_body.replace("P2-yellow", "P2-orange")
+        )
+        legacy_near_misses["priority-label-drift"] = clone(legacy_finding)
+        legacy_near_misses["priority-label-drift"]["body"] = (
+            legacy_finding_body.replace("P2-yellow", "P1-orange")
+        )
+        legacy_near_misses["p3-blue-drift"] = clone(legacy_finding)
+        legacy_near_misses["p3-blue-drift"]["body"] = legacy_finding_body.replace(
+            "P2 Badge", "P3 Badge"
+        ).replace("P2-yellow", "P3-blue")
+        legacy_near_misses["badge-style-drift"] = clone(legacy_finding)
+        legacy_near_misses["badge-style-drift"]["body"] = legacy_finding_body.replace(
+            "style=flat", "style=flat-square"
+        )
+        legacy_near_misses["commit-mismatch"] = clone(legacy_finding)
+        legacy_near_misses["commit-mismatch"]["body"] = legacy_finding_body.replace(
+            current_sha, other_sha
+        )
+        legacy_near_misses["extra-url"] = clone(legacy_finding)
+        legacy_near_misses["extra-url"]["body"] = legacy_finding_body.replace(
+            "concrete review risk.",
+            "concrete review risk at https://example.com.",
+        )
+        legacy_near_misses["second-sha"] = clone(legacy_finding)
+        legacy_near_misses["second-sha"]["body"] = legacy_finding_body.replace(
+            "concrete review risk.",
+            f"concrete review risk related to {other_sha}.",
+        )
+        legacy_near_misses["html-drift"] = clone(legacy_finding)
+        legacy_near_misses["html-drift"]["body"] = legacy_finding_body.replace(
+            "concrete review risk.",
+            "concrete <em>review</em> risk.",
+        )
+        legacy_near_misses["control-drift"] = clone(legacy_finding)
+        legacy_near_misses["control-drift"]["body"] = legacy_finding_body.replace(
+            "concrete review risk.",
+            "concrete\treview risk.",
+        )
+        legacy_near_misses["unsafe-path"] = clone(legacy_finding)
+        legacy_near_misses["unsafe-path"]["body"] = legacy_finding_body.replace(
+            "path/to/file.py",
+            "path/%2E%2E/file.py",
+        )
+        legacy_near_misses["backward-line-range"] = clone(legacy_finding)
+        legacy_near_misses["backward-line-range"]["body"] = legacy_finding_body.replace(
+            "#L10-L12", "#L12-L10"
+        )
+        legacy_near_misses["missing-disclosure"] = clone(legacy_finding)
+        legacy_near_misses["missing-disclosure"]["body"] = legacy_finding_body.rsplit(
+            "\n\n", 1
+        )[0]
+        legacy_near_misses["disclosure-html-drift"] = clone(legacy_finding)
+        legacy_near_misses["disclosure-html-drift"]["body"] = (
+            legacy_finding_body.replace("<br/>", "<br>")
+        )
+        legacy_near_misses["title-bound"] = clone(legacy_finding)
+        legacy_near_misses["title-bound"]["body"] = legacy_finding_body.replace(
+            "Preserve exact authority",
+            "T" * 241,
+        )
+        legacy_near_misses["prose-bound"] = clone(legacy_finding)
+        legacy_near_misses["prose-bound"]["body"] = legacy_finding_body.replace(
+            "The _api_error_status: 402 value identifies the concrete review risk.",
+            "P" * 8_001,
+        )
+        for padding_name, padding in {
+            "one-space-padding": " ",
+            "three-space-padding": "   ",
+            "five-space-padding": "     ",
+            "two-padding-lines": "    \n    ",
+            "extra-blank-line": "\n    ",
+        }.items():
+            padding_near_miss = clone(legacy_finding)
+            padding_near_miss["body"] = legacy_finding_body.replace(
+                "\n    \n\n<details>",
+                f"\n{padding}\n\n<details>",
+            )
+            legacy_near_misses[padding_name] = padding_near_miss
+        trailing_prose_space = clone(legacy_finding)
+        trailing_prose_space["body"] = legacy_finding_body.replace(
+            "concrete review risk.\n    ",
+            "concrete review risk. \n    ",
+        )
+        legacy_near_misses["trailing-prose-space"] = trailing_prose_space
+        for uri_scheme in (
+            "ftp://example.com/path",
+            "file:///tmp/path",
+            "data:text/plain,example",
+            "mailto:review@example.com",
+            "ssh:review@example.com",
+            "git+ssh://example.com/repo",
+            "javascript:alert(1)",
+            "urn:example:review",
+            "_javascript:alert(1)",
+            "_mailto:review@example.com",
+        ):
+            uri_near_miss = clone(legacy_finding)
+            uri_near_miss["body"] = legacy_finding_body.replace(
+                "concrete review risk.",
+                f"concrete review risk involving {uri_scheme}.",
+            )
+            legacy_near_misses[f"uri-{uri_scheme.split(':', 1)[0]}"] = uri_near_miss
+        for near_miss_name, near_miss in legacy_near_misses.items():
+            with self.subTest(legacy_top_level_review_near_miss=near_miss_name):
+                self.assertIsNone(
+                    _github_codex_legacy_top_level_review_finding_commit(
+                        near_miss["body"],
+                        repository="OWNER/REPO",
+                        native_commit_id=current_sha,
+                    )
+                )
+        for associated_child_kind in ("human", "unrelated-bot"):
+            with self.subTest(legacy_associated_child=associated_child_kind):
+                self.assertEqual(
+                    _github_codex_review_body_semantic(
+                        legacy_finding_body,
+                        repository="OWNER/REPO",
+                        state="COMMENTED",
+                        commit_id=current_sha,
+                        current_head=current_sha,
+                        has_associated_children=True,
+                        has_target_children=False,
+                        allow_legacy_native_review=True,
+                    ),
+                    ("malformed", None),
+                )
         finding_with_disclosure = clone(finding)
         finding_with_disclosure["body"] = f"{finding['body']}\n\n{disclosure}"
         add(
@@ -11643,6 +12057,7 @@ printf '%s\n' "$trusted_uv"
 
         pending_short_clean_semantic = "clean-pending-resolution"
         pending_short_clean_role = "clean-pending-resolution"
+        legacy_finding_native_review_role = "legacy-finding-native-review-v1"
 
         def pending_short_clean_raw_artifact_matches_normalized(
             raw_artifact: object,
@@ -16734,6 +17149,7 @@ printf '%s\n' "$trusted_uv"
             *,
             provider_declaration: object = None,
             current_ancestry: dict[str, int] | None = None,
+            current_legacy_short_commit_resolutions: dict[str, str] | None = None,
             require_current_ancestry_exact: bool = True,
             _tightened_resource_limits: dict[str, int] | None = None,
             _monotonic_clock: object = time.monotonic,
@@ -16905,7 +17321,8 @@ printf '%s\n' "$trusted_uv"
             future_prefix_omission_eligibility_audit: list[dict[str, object]] = []
             seen_scopes: set[tuple[object, ...]] = set()
             seen_detail_pulls: set[int] = set()
-            observed_current_finding_heads: set[str] = set()
+            observed_current_ancestry_heads: set[str] = set()
+            observed_current_legacy_short_commit_prefixes: set[str] = set()
             declaration_match_count = 0
             ancestry = current_ancestry if current_ancestry is not None else {}
             if not isinstance(ancestry, dict) or any(
@@ -16914,6 +17331,24 @@ printf '%s\n' "$trusted_uv"
                 or type(returncode) is not int
                 or returncode not in {0, 1}
                 for candidate, returncode in ancestry.items()
+            ):
+                return None
+            legacy_short_commit_resolutions = (
+                current_legacy_short_commit_resolutions
+                if current_legacy_short_commit_resolutions is not None
+                else {}
+            )
+            if not isinstance(legacy_short_commit_resolutions, dict) or any(
+                not isinstance(raw_prefix, str)
+                or re.fullmatch(r"[0-9a-f]{10}", raw_prefix) is None
+                or not isinstance(resolved_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", resolved_commit) is None
+                or not resolved_commit.startswith(raw_prefix)
+                or current_head.startswith(raw_prefix)
+                or resolved_commit == current_head
+                for raw_prefix, resolved_commit in (
+                    legacy_short_commit_resolutions.items()
+                )
             ):
                 return None
             detail_kinds = set(required_universe_pagination) - {
@@ -17719,6 +18154,19 @@ printf '%s\n' "$trusted_uv"
                         return None
                     body = raw_review.get("body")
                     state = raw_review.get("state")
+                    normalized_review_body = _normalize_github_codex_body(body)
+                    is_legacy_native_review_finding = (
+                        isinstance(normalized_review_body, str)
+                        and state in {"COMMENTED", "CHANGES_REQUESTED"}
+                        and not associated_inline_by_review[review_id]
+                        and not joined
+                        and _github_codex_legacy_top_level_review_finding_commit(
+                            normalized_review_body,
+                            repository=repository,
+                            native_commit_id=review_commit,
+                        )
+                        == review_commit
+                    )
                     for child in inline_by_review[review_id]:
                         normalized_child_body = _normalize_github_codex_body(
                             child.get("body")
@@ -17740,6 +18188,7 @@ printf '%s\n' "$trusted_uv"
                             associated_inline_by_review[review_id]
                         ),
                         has_target_children=bool(joined),
+                        allow_legacy_native_review=True,
                     )
                     if semantic_commit not in {None, review_commit}:
                         return None
@@ -17765,7 +18214,7 @@ printf '%s\n' "$trusted_uv"
                         and semantic == "findings"
                         and current_ancestry is not None
                     ):
-                        observed_current_finding_heads.add(review_commit)
+                        observed_current_ancestry_heads.add(review_commit)
                         relation = ancestry.get(review_commit)
                         if relation is None or (
                             review_commit == head and relation != 0
@@ -17798,7 +18247,13 @@ printf '%s\n' "$trusted_uv"
                             else "terminal-payload"
                         )
                     )
-                    role = artifact_authority_role(raw_artifact_kind, semantic)
+                    role = (
+                        legacy_finding_native_review_role
+                        if is_legacy_native_review_finding
+                        and raw_artifact_kind == "terminal-payload"
+                        and semantic == "findings"
+                        else artifact_authority_role(raw_artifact_kind, semantic)
+                    )
                     if role is None:
                         return None
                     artifact_basis = (
@@ -17856,10 +18311,22 @@ printf '%s\n' "$trusted_uv"
                         semantic == "malformed"
                         and pending_clean_marker is not None
                         and len(pending_clean_marker[1]) == 10
-                        and head.startswith(pending_clean_marker[1])
                     ):
-                        semantic = pending_short_clean_semantic
-                        parsed_commit = pending_clean_marker[1]
+                        short_commit = pending_clean_marker[1]
+                        resolved_ancestor: str | None = None
+                        if head.startswith(short_commit):
+                            resolved_ancestor = head
+                        elif parsed_scope == current_scope_key:
+                            resolved_ancestor = legacy_short_commit_resolutions.get(
+                                short_commit
+                            )
+                            if resolved_ancestor is not None:
+                                observed_current_legacy_short_commit_prefixes.add(
+                                    short_commit
+                                )
+                        if resolved_ancestor is not None:
+                            semantic = pending_short_clean_semantic
+                            parsed_commit = short_commit
                     if semantic == "nonterminal":
                         nonterminal_records.append(
                             (
@@ -17879,7 +18346,7 @@ printf '%s\n' "$trusted_uv"
                     ):
                         if not isinstance(parsed_commit, str):
                             return None
-                        observed_current_finding_heads.add(parsed_commit)
+                        observed_current_ancestry_heads.add(parsed_commit)
                         relation = ancestry.get(parsed_commit)
                         if relation is None or (
                             parsed_commit == head and relation != 0
@@ -18032,7 +18499,12 @@ printf '%s\n' "$trusted_uv"
                 or (
                     current_ancestry is not None
                     and require_current_ancestry_exact
-                    and set(ancestry) != observed_current_finding_heads
+                    and set(ancestry) != observed_current_ancestry_heads
+                )
+                or (
+                    current_legacy_short_commit_resolutions is not None
+                    and set(legacy_short_commit_resolutions)
+                    != observed_current_legacy_short_commit_prefixes
                 )
             ):
                 return None
@@ -19024,6 +19496,7 @@ printf '%s\n' "$trusted_uv"
             request_scope_receipts: object = None,
             provider_declaration: object = None,
             current_ancestry: dict[str, int] | None = None,
+            current_legacy_short_commit_resolutions: dict[str, str] | None = None,
             require_current_ancestry_exact: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
             _tightened_resource_limits: dict[str, int] | None = None,
@@ -19097,6 +19570,9 @@ printf '%s\n' "$trusted_uv"
             policy_binding = {
                 "provider_declaration": provider_declaration,
                 "current_ancestry": current_ancestry,
+                "current_legacy_short_commit_resolutions": (
+                    current_legacy_short_commit_resolutions
+                ),
                 "require_current_ancestry_exact": require_current_ancestry_exact,
                 "history_start_exclusive": history_start_exclusive,
                 "history_as_of_server_time": history_as_of_server_time,
@@ -19133,6 +19609,9 @@ printf '%s\n' "$trusted_uv"
                     value,
                     provider_declaration=provider_declaration,
                     current_ancestry=current_ancestry,
+                    current_legacy_short_commit_resolutions=(
+                        current_legacy_short_commit_resolutions
+                    ),
                     require_current_ancestry_exact=(require_current_ancestry_exact),
                     _tightened_resource_limits=_tightened_resource_limits,
                     _monotonic_clock=_monotonic_clock,
@@ -19376,6 +19855,7 @@ printf '%s\n' "$trusted_uv"
             value: object,
             *,
             current_ancestry: dict[str, int],
+            current_legacy_short_commit_resolutions: dict[str, str],
             require_current_ancestry_exact: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
             _tightened_resource_limits: dict[str, int] | None = None,
@@ -19415,6 +19895,9 @@ printf '%s\n' "$trusted_uv"
                 transcript,
                 request_scope_receipts=value.get("request_scope_receipts"),
                 current_ancestry=current_ancestry,
+                current_legacy_short_commit_resolutions=(
+                    current_legacy_short_commit_resolutions
+                ),
                 require_current_ancestry_exact=require_current_ancestry_exact,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 _tightened_resource_limits=_tightened_resource_limits,
@@ -19460,6 +19943,7 @@ printf '%s\n' "$trusted_uv"
             value: object,
             *,
             current_ancestry: dict[str, int],
+            current_legacy_short_commit_resolutions: dict[str, str] | None = None,
             require_current_ancestry_exact: bool = True,
             prefer_unresolved_thread_blocker: bool = False,
             _tightened_resource_limits: dict[str, int] | None = None,
@@ -19480,6 +19964,11 @@ printf '%s\n' "$trusted_uv"
             result = _parse_current_endpoint_inventory_uncached(
                 value,
                 current_ancestry=current_ancestry,
+                current_legacy_short_commit_resolutions=(
+                    {}
+                    if current_legacy_short_commit_resolutions is None
+                    else current_legacy_short_commit_resolutions
+                ),
                 require_current_ancestry_exact=require_current_ancestry_exact,
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 _tightened_resource_limits=_tightened_resource_limits,
@@ -19499,6 +19988,21 @@ printf '%s\n' "$trusted_uv"
                     "ancestry_return_code": returncodes[candidate],
                 }
                 for candidate in sorted(returncodes)
+            ]
+
+        def legacy_short_commit_resolution_snapshot(
+            resolutions: dict[str, str],
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "raw_prefix": raw_prefix,
+                    "head": current_head,
+                    "disambiguate_return_code": 0,
+                    "disambiguated_object_ids": [resolutions[raw_prefix]],
+                    "commit_object_check_return_code": 0,
+                    "ancestry_return_code": 0,
+                }
+                for raw_prefix in sorted(resolutions)
             ]
 
         report_inventory_context_fields = {
@@ -19668,6 +20172,62 @@ printf '%s\n' "$trusted_uv"
                 ):
                     return None
                 mapping[candidate] = ancestry_return_code
+            return mapping
+
+        def legacy_short_commit_resolution_mapping(
+            candidate_history: object,
+        ) -> dict[str, str] | None:
+            if not isinstance(candidate_history, dict):
+                return None
+            initial = candidate_history.get(
+                "initial_legacy_short_commit_resolution_receipts"
+            )
+            final = candidate_history.get(
+                "final_legacy_short_commit_resolution_receipts"
+            )
+            if (
+                not isinstance(initial, list)
+                or not isinstance(final, list)
+                or not typed_json_equal(initial, final)
+            ):
+                return None
+            expected_fields = {
+                "raw_prefix",
+                "head",
+                "disambiguate_return_code",
+                "disambiguated_object_ids",
+                "commit_object_check_return_code",
+                "ancestry_return_code",
+            }
+            mapping: dict[str, str] = {}
+            previous_prefix = ""
+            for receipt in initial:
+                if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+                    return None
+                raw_prefix = receipt.get("raw_prefix")
+                object_ids = receipt.get("disambiguated_object_ids")
+                if (
+                    not isinstance(raw_prefix, str)
+                    or re.fullmatch(r"[0-9a-f]{10}", raw_prefix) is None
+                    or raw_prefix <= previous_prefix
+                    or current_head.startswith(raw_prefix)
+                    or receipt.get("head") != current_head
+                    or type(receipt.get("disambiguate_return_code")) is not int
+                    or receipt.get("disambiguate_return_code") != 0
+                    or not isinstance(object_ids, list)
+                    or len(object_ids) != 1
+                    or not isinstance(object_ids[0], str)
+                    or re.fullmatch(r"[0-9a-f]{40}", object_ids[0]) is None
+                    or not object_ids[0].startswith(raw_prefix)
+                    or object_ids[0] == current_head
+                    or type(receipt.get("commit_object_check_return_code")) is not int
+                    or receipt.get("commit_object_check_return_code") != 0
+                    or type(receipt.get("ancestry_return_code")) is not int
+                    or receipt.get("ancestry_return_code") != 0
+                ):
+                    return None
+                previous_prefix = raw_prefix
+                mapping[raw_prefix] = object_ids[0]
             return mapping
 
         def stable_scope_discovery_projection_and_eligibility_audit(
@@ -21399,7 +21959,7 @@ printf '%s\n' "$trusted_uv"
             def artifacts_by_identity(
                 artifacts: list[object],
                 *,
-                allow_pending_short_clean: bool,
+                allow_legacy_raw_roles: bool,
             ) -> dict[tuple[str, int], dict[str, object]] | None:
                 by_identity: dict[tuple[str, int], dict[str, object]] = {}
                 for artifact in artifacts:
@@ -21417,8 +21977,11 @@ printf '%s\n' "$trusted_uv"
                             "unresolved-thread-finding",
                             "malformed",
                             *(
-                                {pending_short_clean_role}
-                                if allow_pending_short_clean
+                                {
+                                    pending_short_clean_role,
+                                    legacy_finding_native_review_role,
+                                }
+                                if allow_legacy_raw_roles
                                 else set()
                             ),
                         }
@@ -21437,11 +22000,11 @@ printf '%s\n' "$trusted_uv"
 
             raw_by_identity = artifacts_by_identity(
                 raw_artifacts,
-                allow_pending_short_clean=True,
+                allow_legacy_raw_roles=True,
             )
             normalized_by_identity = artifacts_by_identity(
                 normalized_artifacts,
-                allow_pending_short_clean=False,
+                allow_legacy_raw_roles=False,
             )
             if raw_by_identity is None or normalized_by_identity is None:
                 return None
@@ -21594,14 +22157,21 @@ printf '%s\n' "$trusted_uv"
                 key=lambda item: (str(item[0]), int(item[1])),
             ):
                 artifact = raw_by_identity[identity]
-                if artifact["role"] not in {"clean", "finding"} or not all(
+                if artifact["role"] not in {
+                    legacy_finding_native_review_role,
+                    pending_short_clean_role,
+                } or not all(
                     artifact["server_time"] < boundary for boundary in pre_scope_times
                 ):
                     return None
                 legacy_artifacts.append(
                     {
                         "scope_authority": "unreceipted-audit-only-v1",
-                        "role": artifact["role"],
+                        "role": (
+                            "finding"
+                            if artifact["role"] == legacy_finding_native_review_role
+                            else artifact["role"]
+                        ),
                         "channel": artifact["channel"],
                         "id": artifact["id"],
                         "server_time": artifact["server_time"],
@@ -21906,10 +22476,14 @@ printf '%s\n' "$trusted_uv"
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
+            legacy_short_commit_resolutions = legacy_short_commit_resolution_mapping(
+                candidate_history
+            )
             initial_inventory = candidate_history.get("initial_current_raw_inventory")
             final_inventory = candidate_history.get("final_current_raw_inventory")
             if (
                 ancestry is None
+                or legacy_short_commit_resolutions is None
                 or not isinstance(initial_inventory, dict)
                 or not isinstance(final_inventory, dict)
             ):
@@ -21933,6 +22507,9 @@ printf '%s\n' "$trusted_uv"
             initial_entry = parse_current_endpoint_inventory(
                 initial_inventory,
                 current_ancestry=ancestry,
+                current_legacy_short_commit_resolutions=(
+                    legacy_short_commit_resolutions
+                ),
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 _inventory_validation_context=initial_context,
             )
@@ -21949,6 +22526,9 @@ printf '%s\n' "$trusted_uv"
             final_entry = parse_current_endpoint_inventory(
                 final_inventory,
                 current_ancestry=ancestry,
+                current_legacy_short_commit_resolutions=(
+                    legacy_short_commit_resolutions
+                ),
                 prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                 _inventory_validation_context=final_context,
             )
@@ -22095,8 +22675,15 @@ printf '%s\n' "$trusted_uv"
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> bool:
             ancestry = current_ancestry_mapping(candidate_history)
+            legacy_short_commit_resolutions = legacy_short_commit_resolution_mapping(
+                candidate_history
+            )
             final_inventory = candidate_history.get("final_current_raw_inventory")
-            if ancestry is None or not isinstance(final_inventory, dict):
+            if (
+                ancestry is None
+                or legacy_short_commit_resolutions is None
+                or not isinstance(final_inventory, dict)
+            ):
                 return False
             final_context = (
                 report_inventory_validation_context_for(
@@ -22111,6 +22698,9 @@ printf '%s\n' "$trusted_uv"
             final_entry = parse_current_endpoint_inventory(
                 final_inventory,
                 current_ancestry=ancestry,
+                current_legacy_short_commit_resolutions=(
+                    legacy_short_commit_resolutions
+                ),
                 _inventory_validation_context=final_context,
             )
             expected_final_decision_entry = normalized_current_decision_entry(
@@ -22170,6 +22760,7 @@ printf '%s\n' "$trusted_uv"
             current_raw: dict[str, object] | None = None,
             final_current_raw: dict[str, object] | None = None,
             current_ancestry: dict[str, int] | None = None,
+            legacy_short_commit_resolutions: dict[str, str] | None = None,
         ) -> dict[str, object]:
             raw_scopes: list[dict[str, object]] = []
             for candidate in candidates:
@@ -22196,6 +22787,13 @@ printf '%s\n' "$trusted_uv"
             ancestry_snapshot = current_ancestry_snapshot(
                 {} if current_ancestry is None else current_ancestry
             )
+            legacy_resolution_snapshot = legacy_short_commit_resolution_snapshot(
+                (
+                    {}
+                    if legacy_short_commit_resolutions is None
+                    else legacy_short_commit_resolutions
+                )
+            )
             return {
                 "complete": complete,
                 "repository": current_repository,
@@ -22219,6 +22817,12 @@ printf '%s\n' "$trusted_uv"
                 ),
                 "initial_current_ancestry": clone(ancestry_snapshot),
                 "final_current_ancestry": clone(ancestry_snapshot),
+                "initial_legacy_short_commit_resolution_receipts": clone(
+                    legacy_resolution_snapshot
+                ),
+                "final_legacy_short_commit_resolution_receipts": clone(
+                    legacy_resolution_snapshot
+                ),
                 "initial_candidates": clone(candidates),
                 "final_candidates": clone(candidates),
             }
@@ -22286,6 +22890,8 @@ printf '%s\n' "$trusted_uv"
                 "final_current_raw_inventory",
                 "initial_current_ancestry",
                 "final_current_ancestry",
+                "initial_legacy_short_commit_resolution_receipts",
+                "final_legacy_short_commit_resolution_receipts",
                 "initial_candidates",
                 "final_candidates",
             }
@@ -22544,6 +23150,8 @@ printf '%s\n' "$trusted_uv"
                     "final_current_raw_inventory",
                     "initial_current_ancestry",
                     "final_current_ancestry",
+                    "initial_legacy_short_commit_resolution_receipts",
+                    "final_legacy_short_commit_resolution_receipts",
                     "initial_candidates",
                     "final_candidates",
                 }
@@ -23038,7 +23646,10 @@ printf '%s\n' "$trusted_uv"
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> dict[str, object] | None:
             ancestry = current_ancestry_mapping(candidate_history)
-            if ancestry is None:
+            legacy_short_commit_resolutions = legacy_short_commit_resolution_mapping(
+                candidate_history
+            )
+            if ancestry is None or legacy_short_commit_resolutions is None:
                 return None
             raw_inventories: dict[str, dict[str, object]] = {}
             projected_entries: dict[str, dict[str, object]] = {}
@@ -23049,6 +23660,9 @@ printf '%s\n' "$trusted_uv"
                 projected_entry = parse_current_endpoint_inventory(
                     inventory,
                     current_ancestry=ancestry,
+                    current_legacy_short_commit_resolutions=(
+                        legacy_short_commit_resolutions
+                    ),
                     prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     _inventory_validation_context=(
                         report_inventory_validation_context_for(
@@ -23066,6 +23680,12 @@ printf '%s\n' "$trusted_uv"
 
             initial_ancestry = candidate_history.get("initial_current_ancestry")
             final_ancestry = candidate_history.get("final_current_ancestry")
+            initial_prefix_receipts = candidate_history.get(
+                "initial_legacy_short_commit_resolution_receipts"
+            )
+            final_prefix_receipts = candidate_history.get(
+                "final_legacy_short_commit_resolution_receipts"
+            )
             if require_request_reaction_stability:
                 stable_initial_entry = projected_entries.get("initial")
                 stable_final_entry = projected_entries.get("final")
@@ -23082,6 +23702,12 @@ printf '%s\n' "$trusted_uv"
                 not isinstance(initial_ancestry, list)
                 or not isinstance(final_ancestry, list)
                 or not typed_json_equal(initial_ancestry, final_ancestry)
+                or not isinstance(initial_prefix_receipts, list)
+                or not isinstance(final_prefix_receipts, list)
+                or not typed_json_equal(
+                    initial_prefix_receipts,
+                    final_prefix_receipts,
+                )
                 or stable_initial_entry is None
                 or stable_final_entry is None
                 or not typed_json_equal(
@@ -23101,6 +23727,10 @@ printf '%s\n' "$trusted_uv"
                     "initial": clone(initial_ancestry),
                     "final": clone(final_ancestry),
                 },
+                "local_git_prefix_resolution_receipts": {
+                    "initial": clone(initial_prefix_receipts),
+                    "final": clone(final_prefix_receipts),
+                },
             }
 
         def stable_legacy_unreceipted_artifacts(
@@ -23111,7 +23741,10 @@ printf '%s\n' "$trusted_uv"
             inventory_validation_contexts: dict[str, object] | None = None,
         ) -> list[dict[str, object]] | None:
             ancestry = current_ancestry_mapping(candidate_history)
-            if ancestry is None:
+            legacy_short_commit_resolutions = legacy_short_commit_resolution_mapping(
+                candidate_history
+            )
+            if ancestry is None or legacy_short_commit_resolutions is None:
                 return None
             phase_legacy_artifacts: dict[str, list[dict[str, object]]] = {}
             for phase in ("initial", "final"):
@@ -23129,6 +23762,9 @@ printf '%s\n' "$trusted_uv"
                 raw_entry = parse_current_endpoint_inventory(
                     inventory,
                     current_ancestry=ancestry,
+                    current_legacy_short_commit_resolutions=(
+                        legacy_short_commit_resolutions
+                    ),
                     prefer_unresolved_thread_blocker=(prefer_unresolved_thread_blocker),
                     _inventory_validation_context=inventory_context,
                 )
@@ -28086,6 +28722,8 @@ printf '%s\n' "$trusted_uv"
             ),
             "initial_current_ancestry": [],
             "final_current_ancestry": [],
+            "initial_legacy_short_commit_resolution_receipts": [],
+            "final_legacy_short_commit_resolution_receipts": [],
             "initial_candidates": clone(dual_role_candidates),
             "final_candidates": clone(dual_role_candidates),
         }
@@ -28224,6 +28862,8 @@ printf '%s\n' "$trusted_uv"
                 ),
                 "initial_current_ancestry": [],
                 "final_current_ancestry": [],
+                "initial_legacy_short_commit_resolution_receipts": [],
+                "final_legacy_short_commit_resolution_receipts": [],
                 "initial_candidates": clone(role_candidates),
                 "final_candidates": clone(role_candidates),
             }
@@ -35675,6 +36315,7 @@ printf '%s\n' "$trusted_uv"
                         "raw_endpoint_inventories",
                         "finding_commits",
                         "local_git_ancestry_receipts",
+                        "local_git_prefix_resolution_receipts",
                     },
                 )
                 self.assertTrue(
@@ -36398,6 +37039,720 @@ printf '%s\n' "$trusted_uv"
             assert isinstance(removed_receipt, dict)
             return legacy_artifact
 
+        live_old_review_commit = "832edd60e50392c7f000d67ed856d20959c0d5b2"
+        live_old_clean_commit = "9abfd559e955503fdd3233ecd16073918423fc7a"
+        live_old_clean_ref = "9abfd559e9"
+        rollout_old_clean_commit = "06264ac0a06240634f896e606b5744f747dd825f"
+        rollout_old_clean_ref = "06264ac0a0"
+        live_selected_id = 5_195_502_331
+        live_selected_time = short_issue_terminal_time
+        live_current = clone(current)
+        assert isinstance(live_current, dict)
+        live_selected_artifact = complete_issue_comment_artifact(
+            live_current,
+            live_selected_id,
+            live_selected_time,
+            commit_ref=current_head[:10],
+        )
+        live_selected_body = (
+            "Codex Review: Didn't find any major issues. Keep them coming!\n\n"
+            f"**Reviewed commit:** `{current_head[:10]}`\n\n"
+            f"{_GITHUB_CODEX_DISCLOSURE}"
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            selected_snapshot = live_selected_artifact[snapshot_name]
+            assert isinstance(selected_snapshot, dict)
+            selected_snapshot["body"] = live_selected_body
+            selected_snapshot["normalized_body"] = live_selected_body
+        live_selected_final = live_selected_artifact["final_snapshot"]
+        assert isinstance(live_selected_final, dict)
+        live_selected_artifact["artifact_scope_receipt"] = artifact_scope_receipt(
+            live_selected_final
+        )
+        live_current["evidence_state"]["terminal_payloads"] = [live_selected_artifact]
+        live_current["candidate_basis"] = {
+            "kind": "terminal-payload",
+            "server_time": live_selected_time,
+            "stable_artifact_id": live_selected_id,
+        }
+        restamp(live_current)
+
+        live_legacy_review = complete_review_artifact(
+            live_current,
+            4_863_163_875,
+            live_selected_time - 5,
+            outcome="findings",
+            artifact_commit=live_old_review_commit,
+        )
+        live_legacy_review_body = "\n".join(
+            (
+                "### 💡 Codex Review",
+                "",
+                f"https://github.com/{current_repository}/blob/"
+                f"{live_old_review_commit}/skills/review-orchestration-playbook/"
+                "scripts/review_runtime/providers.py#L20025",
+                "**<sub><sub>![P2 Badge](https://img.shields.io/badge/"
+                "P2-yellow?style=flat)</sub></sub>  "
+                "Do not authenticate non-401 status failures**",
+                "",
+                "When a failure envelope carries any bounded integer status "
+                "(for example `api_error_status: 402`), this now treats that "
+                "status as supported metadata. "
+                "`_claude_supported_failure_category()` does not otherwise "
+                "count that non-401 status as evidence, so if stderr contains "
+                "an auth fragment and the result has the exact login warmup "
+                "text, the attempt is returned as "
+                "`auth`/`structured-authentication` instead of fail-closing "
+                "as mixed or unclassified. Since only status 401 should be "
+                "authentication evidence, non-401 numeric statuses need to "
+                "stay out of the auth path or be treated as conflicting "
+                "evidence.",
+                "    ",
+                "",
+                _GITHUB_CODEX_DISCLOSURE,
+            )
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            legacy_review_snapshot = live_legacy_review[snapshot_name]
+            assert isinstance(legacy_review_snapshot, dict)
+            legacy_review_snapshot["body"] = live_legacy_review_body
+            legacy_review_snapshot["normalized_body"] = live_legacy_review_body
+        live_legacy_review["artifact_scope_receipt"] = artifact_scope_receipt(
+            live_legacy_review["final_snapshot"]
+        )
+        self.assertIsNone(
+            validate_candidate_artifact(
+                live_legacy_review,
+                expected_kind="terminal-payload",
+                expected_scope=current_scope_key,
+            )
+        )
+        live_legacy_review = as_unreceipted_legacy_artifact(live_legacy_review)
+
+        live_legacy_short_clean = complete_issue_comment_artifact(
+            live_current,
+            5_191_165_370,
+            live_selected_time - 3,
+            artifact_commit=live_old_clean_commit,
+            commit_ref=live_old_clean_ref,
+        )
+        live_legacy_short_body = (
+            "Codex Review: Didn't find any major issues. "
+            "Another round soon, please!\n\n"
+            f"**Reviewed commit:** `{live_old_clean_ref}`\n\n"
+            f"{_GITHUB_CODEX_DISCLOSURE}"
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            legacy_clean_snapshot = live_legacy_short_clean[snapshot_name]
+            assert isinstance(legacy_clean_snapshot, dict)
+            legacy_clean_snapshot["body"] = live_legacy_short_body
+            legacy_clean_snapshot["normalized_body"] = live_legacy_short_body
+        live_legacy_short_clean = as_unreceipted_legacy_artifact(
+            live_legacy_short_clean
+        )
+        removed_legacy_resolution = live_legacy_short_clean.pop(
+            "reviewed_commit_resolution_receipt",
+            None,
+        )
+        self.assertIsInstance(removed_legacy_resolution, dict)
+
+        live_raw_current = clone(live_current)
+        assert isinstance(live_raw_current, dict)
+        live_raw_current["evidence_state"]["terminal_payloads"].extend(
+            [live_legacy_review, live_legacy_short_clean]
+        )
+        restamp(live_raw_current)
+        live_ancestry = {
+            live_old_review_commit: 0,
+        }
+        live_prefix_resolutions = {
+            live_old_clean_ref: live_old_clean_commit,
+        }
+        live_history = history(
+            issue_terminal_history,
+            current_raw=live_raw_current,
+            current_ancestry=live_ancestry,
+            legacy_short_commit_resolutions=live_prefix_resolutions,
+        )
+        live_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            live_history,
+            live_current,
+            None,
+        )
+        self.assertIsNotNone(live_report)
+        assert isinstance(live_report, dict)
+        self.assertEqual(
+            live_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        self.assertEqual(live_report["provider_profile"], "terminal-payload")
+        live_basis = live_report["evidence_basis"]
+        self.assertIsInstance(live_basis, dict)
+        assert isinstance(live_basis, dict)
+        self.assertEqual(
+            live_basis["artifact"]["final_snapshot"]["id"],
+            live_selected_id,
+        )
+        expected_live_pending_audit = expected_legacy_unreceipted_audit(
+            live_legacy_short_clean,
+            role=pending_short_clean_role,
+        )
+        expected_live_pending_audit["artifact_commit"] = live_old_clean_ref
+        self.assertEqual(
+            live_basis["legacy_unreceipted_artifacts"],
+            [
+                expected_live_pending_audit,
+                expected_legacy_unreceipted_audit(
+                    live_legacy_review,
+                    role="finding",
+                ),
+            ],
+        )
+        self.assertEqual(
+            live_basis["current_raw_authority"]["local_git_prefix_resolution_receipts"],
+            {
+                "initial": live_history[
+                    "initial_legacy_short_commit_resolution_receipts"
+                ],
+                "final": live_history["final_legacy_short_commit_resolution_receipts"],
+            },
+        )
+        self.assertEqual(
+            set(live_history["initial_legacy_short_commit_resolution_receipts"][0]),
+            {
+                "raw_prefix",
+                "head",
+                "disambiguate_return_code",
+                "disambiguated_object_ids",
+                "commit_object_check_return_code",
+                "ancestry_return_code",
+            },
+        )
+        self.assertEqual(
+            live_basis["current_raw_authority"]["finding_commits"],
+            {
+                "initial": [live_old_review_commit],
+                "final": [live_old_review_commit],
+            },
+        )
+        parsed_live_raw_entry = parse_current_endpoint_inventory(
+            live_history["initial_current_raw_inventory"],
+            current_ancestry=live_ancestry,
+            current_legacy_short_commit_resolutions=live_prefix_resolutions,
+        )
+        self.assertIsNotNone(parsed_live_raw_entry)
+        assert isinstance(parsed_live_raw_entry, dict)
+        parsed_live_raw_authority = parsed_live_raw_entry[
+            "current_authority_projection"
+        ]
+        parsed_live_artifacts = parsed_live_raw_authority["applicable_artifacts"]
+        self.assertEqual(
+            next(
+                artifact["role"]
+                for artifact in parsed_live_artifacts
+                if artifact["id"] == 4_863_163_875
+            ),
+            legacy_finding_native_review_role,
+        )
+        self.assertEqual(
+            {item["role"] for item in live_basis["legacy_unreceipted_artifacts"]},
+            {"finding", pending_short_clean_role},
+        )
+        self.assertTrue(
+            validate_complete_report(
+                live_report,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=live_history,
+                current_record=live_current,
+                local_lane_timing=None,
+            )
+        )
+
+        for associated_actor_name, associated_login, associated_type in (
+            ("human", "octocat", "User"),
+            ("unrelated-bot", "dependabot[bot]", "Bot"),
+        ):
+            associated_child = {
+                "id": 5_300_000_000 + len(associated_actor_name),
+                "url": (
+                    f"https://github.com/{current_repository}/pull/{current_pr}"
+                    f"#discussion_r{5_300_000_000 + len(associated_actor_name)}"
+                ),
+                "user_login": associated_login,
+                "user_type": associated_type,
+                "pull_request_review_id": 4_863_163_875,
+                "commit_id": live_old_review_commit,
+                "original_commit_id": live_old_review_commit,
+                "body": "Associated audit comment.",
+                "normalized_body": "Associated audit comment.",
+            }
+            raw_with_associated_child = clone(live_raw_current)
+            assert isinstance(raw_with_associated_child, dict)
+            raw_with_associated_child["raw_inline_records"] = [
+                raw_inline_record(associated_child)
+            ]
+            associated_child_history = history(
+                issue_terminal_history,
+                current_raw=raw_with_associated_child,
+                current_ancestry=live_ancestry,
+                legacy_short_commit_resolutions=live_prefix_resolutions,
+            )
+            with self.subTest(
+                legacy_native_review_associated_child=associated_actor_name
+            ):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        associated_child_history,
+                        live_current,
+                        None,
+                    )
+                )
+
+        rollout_legacy_short_clean = complete_issue_comment_artifact(
+            live_current,
+            5_194_000_000,
+            live_selected_time - 2,
+            artifact_commit=rollout_old_clean_commit,
+            commit_ref=rollout_old_clean_ref,
+        )
+        rollout_legacy_short_body = (
+            "Codex Review: Didn't find any major issues. "
+            "Another round soon, please!\n\n"
+            f"**Reviewed commit:** `{rollout_old_clean_ref}`\n\n"
+            f"{_GITHUB_CODEX_DISCLOSURE}"
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            rollout_clean_snapshot = rollout_legacy_short_clean[snapshot_name]
+            assert isinstance(rollout_clean_snapshot, dict)
+            rollout_clean_snapshot["body"] = rollout_legacy_short_body
+            rollout_clean_snapshot["normalized_body"] = rollout_legacy_short_body
+        rollout_legacy_short_clean = as_unreceipted_legacy_artifact(
+            rollout_legacy_short_clean
+        )
+        self.assertIsInstance(
+            rollout_legacy_short_clean.pop(
+                "reviewed_commit_resolution_receipt",
+                None,
+            ),
+            dict,
+        )
+        two_prefix_raw = clone(live_raw_current)
+        assert isinstance(two_prefix_raw, dict)
+        two_prefix_raw["evidence_state"]["terminal_payloads"].append(
+            rollout_legacy_short_clean
+        )
+        restamp(two_prefix_raw)
+        two_prefix_resolutions = {
+            live_old_clean_ref: live_old_clean_commit,
+            rollout_old_clean_ref: rollout_old_clean_commit,
+        }
+        two_prefix_history = history(
+            issue_terminal_history,
+            current_raw=two_prefix_raw,
+            current_ancestry=live_ancestry,
+            legacy_short_commit_resolutions=two_prefix_resolutions,
+        )
+        two_prefix_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            two_prefix_history,
+            live_current,
+            None,
+        )
+        self.assertIsNotNone(two_prefix_report)
+        assert isinstance(two_prefix_report, dict)
+        two_prefix_receipts = two_prefix_report["evidence_basis"][
+            "current_raw_authority"
+        ]["local_git_prefix_resolution_receipts"]
+        self.assertEqual(
+            [item["raw_prefix"] for item in two_prefix_receipts["initial"]],
+            sorted(two_prefix_resolutions),
+        )
+        self.assertEqual(
+            two_prefix_receipts["initial"],
+            two_prefix_receipts["final"],
+        )
+        self.assertEqual(
+            {
+                item["artifact_commit"]
+                for item in two_prefix_report["evidence_basis"][
+                    "legacy_unreceipted_artifacts"
+                ]
+                if item["role"] == pending_short_clean_role
+            },
+            set(two_prefix_resolutions),
+        )
+        self.assertTrue(
+            validate_complete_report(
+                two_prefix_report,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=two_prefix_history,
+                current_record=live_current,
+                local_lane_timing=None,
+            )
+        )
+
+        live_raw_drift = clone(live_raw_current)
+        assert isinstance(live_raw_drift, dict)
+        drifted_legacy_review = next(
+            artifact
+            for artifact in live_raw_drift["evidence_state"]["terminal_payloads"]
+            if artifact["final_snapshot"]["id"] == 4_863_163_875
+        )
+        for snapshot_name in ("initial_snapshot", "final_snapshot"):
+            drifted_snapshot = drifted_legacy_review[snapshot_name]
+            drifted_snapshot["body"] = str(drifted_snapshot["body"]).replace(
+                "P2-yellow",
+                "P2-orange",
+            )
+            drifted_snapshot["normalized_body"] = drifted_snapshot["body"]
+        restamp(live_raw_drift)
+        live_drift_history = history(
+            issue_terminal_history,
+            current_raw=live_raw_current,
+            final_current_raw=live_raw_drift,
+            current_ancestry=live_ancestry,
+            legacy_short_commit_resolutions=live_prefix_resolutions,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                live_drift_history,
+                live_current,
+                None,
+            )
+        )
+
+        live_bad_grammar_history = history(
+            issue_terminal_history,
+            current_raw=live_raw_drift,
+            current_ancestry=live_ancestry,
+            legacy_short_commit_resolutions=live_prefix_resolutions,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                live_bad_grammar_history,
+                live_current,
+                None,
+            )
+        )
+
+        short_only_raw = clone(current)
+        assert isinstance(short_only_raw, dict)
+        short_only_raw["evidence_state"]["terminal_payloads"] = [
+            clone(live_legacy_short_clean)
+        ]
+        restamp(short_only_raw)
+        short_only_history = history(
+            issue_terminal_history,
+            current_raw=short_only_raw,
+            legacy_short_commit_resolutions=live_prefix_resolutions,
+        )
+        self.assertIsNone(
+            expected_report_from_inputs(
+                "accepted-terminal-clean",
+                declaration,
+                short_only_history,
+                current,
+                None,
+            )
+        )
+
+        for missing_current_proof in (
+            "artifact-scope-receipt",
+            "reviewed-commit-resolution",
+        ):
+            incomplete_current = clone(live_current)
+            assert isinstance(incomplete_current, dict)
+            incomplete_wrapper = incomplete_current["evidence_state"][
+                "terminal_payloads"
+            ][0]
+            if missing_current_proof == "artifact-scope-receipt":
+                incomplete_wrapper.pop("artifact_scope_receipt")
+            else:
+                incomplete_wrapper.pop("reviewed_commit_resolution_receipt")
+            with self.subTest(
+                live_current_terminal_missing_proof=missing_current_proof,
+            ):
+                self.assertIsNone(
+                    validate_candidate_artifact(
+                        incomplete_wrapper,
+                        expected_kind="terminal-payload",
+                        expected_scope=current_scope_key,
+                    )
+                )
+
+        equal_malformed_raw = clone(live_raw_current)
+        assert isinstance(equal_malformed_raw, dict)
+        equal_malformed_raw["evidence_state"]["malformed_terminal_artifacts"].append(
+            as_unreceipted_legacy_artifact(
+                complete_review_artifact(
+                    live_current,
+                    5_195_502_332,
+                    live_selected_time,
+                    artifact_kind="malformed-terminal-artifact",
+                    outcome="malformed",
+                )
+            )
+        )
+        restamp(equal_malformed_raw)
+        newer_finding_raw = clone(live_raw_current)
+        assert isinstance(newer_finding_raw, dict)
+        newer_finding_raw["evidence_state"]["active_top_level_findings"].append(
+            as_unreceipted_legacy_artifact(
+                complete_issue_comment_artifact(
+                    live_current,
+                    5_195_502_333,
+                    live_selected_time + 1,
+                    artifact_kind="active-top-level-finding",
+                    outcome="findings",
+                )
+            )
+        )
+        restamp(newer_finding_raw)
+        for blocker_name, blocker_raw, blocker_ancestry in (
+            ("equal-malformed", equal_malformed_raw, live_ancestry),
+            (
+                "newer-finding",
+                newer_finding_raw,
+                {**live_ancestry, current_head: 0},
+            ),
+        ):
+            blocker_history = history(
+                issue_terminal_history,
+                current_raw=blocker_raw,
+                current_ancestry=blocker_ancestry,
+                legacy_short_commit_resolutions=live_prefix_resolutions,
+            )
+            with self.subTest(live_raw_blocker=blocker_name):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        blocker_history,
+                        live_current,
+                        None,
+                    )
+                )
+
+        for prefix_receipt_near_miss in ("nonancestor", "missing"):
+            prefix_receipt_history = clone(live_history)
+            assert isinstance(prefix_receipt_history, dict)
+            for phase in ("initial", "final"):
+                checks = prefix_receipt_history[
+                    f"{phase}_legacy_short_commit_resolution_receipts"
+                ]
+                matching_checks = [
+                    check
+                    for check in checks
+                    if check.get("raw_prefix") == live_old_clean_ref
+                ]
+                self.assertEqual(len(matching_checks), 1)
+                if prefix_receipt_near_miss == "nonancestor":
+                    matching_checks[0]["ancestry_return_code"] = 1
+                else:
+                    checks.remove(matching_checks[0])
+            with self.subTest(live_short_clean_prefix_receipt=prefix_receipt_near_miss):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        prefix_receipt_history,
+                        live_current,
+                        None,
+                    )
+                )
+
+        prefix_receipt_near_misses: dict[str, dict[str, object]] = {}
+        for missing_phase in ("initial", "final"):
+            missing_phase_history = clone(live_history)
+            assert isinstance(missing_phase_history, dict)
+            del missing_phase_history[
+                f"{missing_phase}_legacy_short_commit_resolution_receipts"
+            ]
+            prefix_receipt_near_misses[f"missing-{missing_phase}-field"] = (
+                missing_phase_history
+            )
+
+        def mutate_prefix_receipt(
+            name: str,
+            field: str,
+            value: object,
+            *,
+            phases: tuple[str, ...] = ("initial", "final"),
+        ) -> None:
+            mutated_history = clone(live_history)
+            assert isinstance(mutated_history, dict)
+            for phase in phases:
+                receipts = mutated_history[
+                    f"{phase}_legacy_short_commit_resolution_receipts"
+                ]
+                assert isinstance(receipts, list) and len(receipts) == 1
+                receipts[0][field] = clone(value)
+            prefix_receipt_near_misses[name] = mutated_history
+
+        mutate_prefix_receipt(
+            "initial-final-drift",
+            "disambiguated_object_ids",
+            [live_old_clean_ref + "1" * 30],
+            phases=("final",),
+        )
+        mutate_prefix_receipt(
+            "two-object-collision",
+            "disambiguated_object_ids",
+            [
+                live_old_clean_commit,
+                live_old_clean_ref + "2" * 30,
+            ],
+        )
+        mutate_prefix_receipt(
+            "empty-resolution-output",
+            "disambiguated_object_ids",
+            [],
+        )
+        mutate_prefix_receipt(
+            "disambiguation-nonzero",
+            "disambiguate_return_code",
+            1,
+        )
+        mutate_prefix_receipt(
+            "disambiguation-bool",
+            "disambiguate_return_code",
+            True,
+        )
+        mutate_prefix_receipt(
+            "commit-object-check-nonzero",
+            "commit_object_check_return_code",
+            1,
+        )
+        mutate_prefix_receipt(
+            "commit-object-check-bool",
+            "commit_object_check_return_code",
+            False,
+        )
+        mutate_prefix_receipt(
+            "ancestry-error",
+            "ancestry_return_code",
+            128,
+        )
+        mutate_prefix_receipt(
+            "ancestry-bool",
+            "ancestry_return_code",
+            False,
+        )
+        mutate_prefix_receipt(
+            "wrong-head",
+            "head",
+            "1" * 40,
+        )
+        mutate_prefix_receipt(
+            "uppercase-prefix",
+            "raw_prefix",
+            live_old_clean_ref.upper(),
+        )
+        mutate_prefix_receipt(
+            "resolved-object-prefix-mismatch",
+            "disambiguated_object_ids",
+            ["2" * 40],
+        )
+        missing_item_field_history = clone(live_history)
+        assert isinstance(missing_item_field_history, dict)
+        for phase in ("initial", "final"):
+            del missing_item_field_history[
+                f"{phase}_legacy_short_commit_resolution_receipts"
+            ][0]["commit_object_check_return_code"]
+        prefix_receipt_near_misses["missing-item-field"] = missing_item_field_history
+        extra_item_field_history = clone(live_history)
+        assert isinstance(extra_item_field_history, dict)
+        for phase in ("initial", "final"):
+            extra_item_field_history[
+                f"{phase}_legacy_short_commit_resolution_receipts"
+            ][0]["unexpected"] = 0
+        prefix_receipt_near_misses["extra-item-field"] = extra_item_field_history
+        extra_receipt_history = clone(live_history)
+        assert isinstance(extra_receipt_history, dict)
+        extra_resolution_snapshot = legacy_short_commit_resolution_snapshot(
+            {
+                "1111111111": "1" * 40,
+                **live_prefix_resolutions,
+            }
+        )
+        extra_receipt_history["initial_legacy_short_commit_resolution_receipts"] = (
+            clone(extra_resolution_snapshot)
+        )
+        extra_receipt_history["final_legacy_short_commit_resolution_receipts"] = clone(
+            extra_resolution_snapshot
+        )
+        prefix_receipt_near_misses["extra-unused-prefix"] = extra_receipt_history
+
+        omitted_collision_history = clone(live_history)
+        assert isinstance(omitted_collision_history, dict)
+        omitted_collision_commit = live_old_clean_ref + "3" * 30
+        for phase in ("initial", "final"):
+            omitted_collision_history[f"{phase}_current_ancestry"].append(
+                {
+                    "finding_commit": omitted_collision_commit,
+                    "head": current_head,
+                    "object_check_return_code": 0,
+                    "ancestry_return_code": 0,
+                }
+            )
+        prefix_receipt_near_misses["omitted-collision-attempt"] = (
+            omitted_collision_history
+        )
+
+        for near_miss_name, near_miss_history in prefix_receipt_near_misses.items():
+            with self.subTest(legacy_prefix_receipt_near_miss=near_miss_name):
+                self.assertIsNone(
+                    expected_report_from_inputs(
+                        "accepted-terminal-clean",
+                        declaration,
+                        near_miss_history,
+                        live_current,
+                        None,
+                    )
+                )
+
+        missing_report_prefix_receipts = clone(live_report)
+        assert isinstance(missing_report_prefix_receipts, dict)
+        del missing_report_prefix_receipts["evidence_basis"]["current_raw_authority"][
+            "local_git_prefix_resolution_receipts"
+        ]
+        self.assertFalse(
+            validate_complete_report(
+                missing_report_prefix_receipts,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=live_history,
+                current_record=live_current,
+                local_lane_timing=None,
+            )
+        )
+        drifted_report_prefix_receipts = clone(live_report)
+        assert isinstance(drifted_report_prefix_receipts, dict)
+        drifted_report_prefix_receipts["evidence_basis"]["current_raw_authority"][
+            "local_git_prefix_resolution_receipts"
+        ]["final"][0]["ancestry_return_code"] = 1
+        self.assertFalse(
+            validate_complete_report(
+                drifted_report_prefix_receipts,
+                lane_state="accepted-terminal-clean",
+                provider_declaration=declaration,
+                candidate_history=live_history,
+                current_record=live_current,
+                local_lane_timing=None,
+            )
+        )
+
         blocker_legacy_clean_artifact = as_unreceipted_legacy_artifact(
             complete_review_artifact(
                 malformed_current,
@@ -36424,32 +37779,7 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIsNotNone(blocker_legacy_clean_report)
         assert isinstance(blocker_legacy_clean_report, dict)
-        blocker_legacy_clean_basis = blocker_legacy_clean_report["evidence_basis"]
-        self.assertIsInstance(blocker_legacy_clean_basis, dict)
-        assert isinstance(blocker_legacy_clean_basis, dict)
-        self.assertEqual(
-            blocker_legacy_clean_basis["artifact"]["final_snapshot"]["id"],
-            malformed_id,
-        )
-        self.assertEqual(
-            blocker_legacy_clean_basis["legacy_unreceipted_artifacts"],
-            [
-                expected_legacy_unreceipted_audit(
-                    blocker_legacy_clean_artifact,
-                    role="clean",
-                )
-            ],
-        )
-        self.assertTrue(
-            validate_complete_report(
-                blocker_legacy_clean_report,
-                lane_state="inconclusive",
-                provider_declaration=declaration,
-                candidate_history=blocker_legacy_clean_history,
-                current_record=malformed_current,
-                local_lane_timing=normal_lane_timing,
-            )
-        )
+        self.assertIsNone(blocker_legacy_clean_report["evidence_basis"])
 
         legacy_clean_artifact = as_unreceipted_legacy_artifact(
             complete_review_artifact(
@@ -36475,31 +37805,7 @@ printf '%s\n' "$trusted_uv"
             terminal_current,
             normal_lane_timing,
         )
-        self.assertIsNotNone(legacy_clean_report)
-        assert isinstance(legacy_clean_report, dict)
-        self.assertEqual(
-            set(legacy_clean_report),
-            {"request_policy", "provider_profile", "evidence_basis"},
-        )
-        self.assertEqual(
-            legacy_clean_report["evidence_basis"]["legacy_unreceipted_artifacts"],
-            [
-                expected_legacy_unreceipted_audit(
-                    legacy_clean_artifact,
-                    role="clean",
-                )
-            ],
-        )
-        self.assertTrue(
-            validate_complete_report(
-                legacy_clean_report,
-                lane_state="accepted-terminal-clean",
-                provider_declaration=declaration,
-                candidate_history=legacy_clean_history,
-                current_record=terminal_current,
-                local_lane_timing=normal_lane_timing,
-            )
-        )
+        self.assertIsNone(legacy_clean_report)
         invalid_normalized_legacy_clean = clone(terminal_current)
         assert isinstance(invalid_normalized_legacy_clean, dict)
         invalid_normalized_legacy_clean["evidence_state"]["terminal_payloads"].append(
@@ -36542,27 +37848,7 @@ printf '%s\n' "$trusted_uv"
             terminal_current,
             normal_lane_timing,
         )
-        self.assertIsNotNone(legacy_finding_report)
-        assert isinstance(legacy_finding_report, dict)
-        self.assertEqual(
-            legacy_finding_report["evidence_basis"]["legacy_unreceipted_artifacts"],
-            [
-                expected_legacy_unreceipted_audit(
-                    legacy_finding_artifact,
-                    role="finding",
-                )
-            ],
-        )
-        self.assertTrue(
-            validate_complete_report(
-                legacy_finding_report,
-                lane_state="accepted-terminal-clean",
-                provider_declaration=declaration,
-                candidate_history=legacy_finding_history,
-                current_record=terminal_current,
-                local_lane_timing=normal_lane_timing,
-            )
-        )
+        self.assertIsNone(legacy_finding_report)
 
         legacy_clean_before_finding_artifact = as_unreceipted_legacy_artifact(
             complete_review_artifact(
@@ -36589,35 +37875,7 @@ printf '%s\n' "$trusted_uv"
             terminal_findings_current,
             normal_lane_timing,
         )
-        self.assertIsNotNone(legacy_clean_before_finding_report)
-        assert isinstance(legacy_clean_before_finding_report, dict)
-        self.assertEqual(
-            legacy_clean_before_finding_report["evidence_basis"]["artifact"][
-                "final_snapshot"
-            ]["id"],
-            80_200,
-        )
-        self.assertEqual(
-            legacy_clean_before_finding_report["evidence_basis"][
-                "legacy_unreceipted_artifacts"
-            ],
-            [
-                expected_legacy_unreceipted_audit(
-                    legacy_clean_before_finding_artifact,
-                    role="clean",
-                )
-            ],
-        )
-        self.assertTrue(
-            validate_complete_report(
-                legacy_clean_before_finding_report,
-                lane_state="accepted-terminal-findings",
-                provider_declaration=declaration,
-                candidate_history=legacy_clean_before_finding_history,
-                current_record=terminal_findings_current,
-                local_lane_timing=normal_lane_timing,
-            )
-        )
+        self.assertIsNone(legacy_clean_before_finding_report)
 
         equal_boundary_clean_artifact = as_unreceipted_legacy_artifact(
             complete_review_artifact(
@@ -37194,6 +38452,7 @@ printf '%s\n' "$trusted_uv"
             "raw_endpoint_inventories",
             "finding_commits",
             "local_git_ancestry_receipts",
+            "local_git_prefix_resolution_receipts",
         }
         self.assertTrue(current_raw_authority_fields.issubset(report_current))
         self.assertTrue(

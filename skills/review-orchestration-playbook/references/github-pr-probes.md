@@ -194,8 +194,10 @@ neither request/run/artifact lineage nor an ABA-free interval. A missing
 request sidecar still closes only request/reaction authority; a missing or
 unstable artifact receipt blocks the wrapped terminal artifact.
 A truly absent pre-v1 receipt is the narrow audit-only exception: keep the
-strictly older, otherwise well-formed artifact raw, exclude it from normalized
-receipt-bound wrappers, and admit it only through the closed
+strictly older artifact raw only when one of the two raw-internal migration
+classifiers below recognizes it; ordinary unreceipted current-grammar clean or
+finding artifacts remain ineligible. Exclude the recognized carrier from
+normalized receipt-bound wrappers and admit it only through the closed
 `legacy_unreceipted_audit` partition below. It never supplies positive
 authority or becomes the selected completion basis. A later accepted
 receipt-bound result may still have a non-null `evidence_basis` that carries
@@ -429,6 +431,60 @@ pass, prove one-to-one by exact `(channel, positive native id)` that
 Reject a duplicate, overlap, omission, or raw artifact that cannot enter
 exactly one closed member.
 
+The legacy member accepts only two migration-only raw-internal carriers; an
+ordinary unreceipted current-grammar clean or finding cannot enter it. The
+closed `legacy-finding-native-review-v1` carrier reports role `finding` for an exact-provider
+`COMMENTED`/`CHANGES_REQUESTED` review with the exact
+`### 💡 Codex Review` structure, one same-repository full-40-SHA blob
+path/positive-line URL whose SHA equals native `commit_id`, one matched
+`P0/red`, `P1/orange`, `P2/yellow`, or `P3/lightgrey` flat shields badge,
+and bounded title/prose containing neither `www.` nor a URI-scheme prefix
+whose colon is immediately followed by a non-whitespace character. After
+newline normalization, trim every physical disclosure line and drop blank
+lines; the remaining lines must exactly equal the closed nine-line official
+disclosure. It is separated by either no padding line or exactly one line of
+four ASCII spaces, with no other title/prose trailing whitespace or blank line
+before it, and the review has no associated inline child. This grammar is enabled only inside the raw migration
+classifier; it never becomes receipt-bound current/provider grammar. An
+older exact clean issue comment whose raw lowercase 10-hex marker lacks its
+historical resolution companion keeps role `clean-pending-resolution` and its
+raw 10-hex ref. When it is not the current prefix, the parent must capture
+complete history-top-level `initial_legacy_short_commit_resolution_receipts`
+and `final_legacy_short_commit_resolution_receipts`; a preexisting ancestry
+array cannot self-attest this mapping. Each item has exactly `raw_prefix`,
+`head`, `disambiguate_return_code`, `disambiguated_object_ids`,
+`commit_object_check_return_code`, and `ancestry_return_code`. Each phase must
+cover exactly the raw-derived non-current pending-prefix set, with unique items
+sorted by `raw_prefix`; enumerate every matching local Git object with lazy
+fetch and credential prompting disabled; require disambiguation return `0`,
+exactly one full lowercase SHA beginning with the prefix, commit-object check
+return `0`, and `git merge-base --is-ancestor <resolved_commit> <head>` return
+`0`. Require exact current head and type-preserving initial/final equality, and
+retain both arrays under terminal
+`evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts` or
+reaction `evidence_basis.current.local_git_prefix_resolution_receipts`, as
+`{initial: [...], final: [...]}`. A selected current-head short clean stays on
+the independent dual REST resolution path and never enters these arrays. Use that only as ancestor
+applicability and do not report or borrow the full SHA as REST resolution. Neither
+legacy carrier enters current provider selection, supplies a candidate basis,
+or supersedes evidence. A state, actor, repository, SHA, path, line, badge,
+title/prose, disclosure, or inline/thread near-miss is truly malformed and
+cannot use the exception.
+
+The fixed local Git command semantics for each legacy prefix receipt are:
+
+```sh
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git rev-parse --disambiguate=<raw_prefix>
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<sole_full_sha>^{commit}'
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git merge-base --is-ancestor <sole_full_sha> <current_head>
+```
+
+The first command's complete stdout lines become
+`disambiguated_object_ids`; do not select one result from a larger set. The
+three command return codes populate their corresponding closed receipt fields.
+Run all three against the same parent-recorded local repository/object store
+and frozen current head in each phase; do not fetch to make a prefix resolve.
+
 Read the selected newly receipted artifact's two raw pre-scope HTTP `Date`
 values directly from its pull-detail and compare receipts. Every legacy item's
 trusted semantic server time must be strictly earlier than both values in both
@@ -436,11 +492,16 @@ passes. Whole-second equality, a later time, an unknown or malformed time or
 `Date`, a missing boundary, an invalid receipt, or an unprojectable/malformed
 legacy artifact is fail-closed evidence. The selected completion artifact must
 come from the receipt-bound normalized member; the legacy member never supplies
-clean or findings completion. Within that legacy member, old clean is
-audit-only, an old top-level or all-resolved thread finding follows ordinary
-precedence and may be superseded by a later receipt-bound current-head clean,
-and any old unresolved applicable target thread remains blocking. Unresolved,
-malformed, or unknown legacy evidence cannot enter the tolerated list; it makes
+clean or findings completion. Within that legacy member,
+`clean-pending-resolution` and the exact raw-internal
+`legacy-finding-native-review-v1` role `finding` are complete audit-only
+history and do not control ordinary
+precedence. A later receipt-bound current-head clean may supersede the old
+legacy-native finding; ordinary receipt-bound old top-level/all-resolved
+findings remain on the normal precedence plane. Only newer/equal malformed or finding evidence controls ordinary
+selection; an equal/newer legacy item separately fails the strict pre-boundary
+gate. Any old unresolved applicable target thread remains blocking. Truly
+malformed or unknown legacy evidence cannot enter the tolerated list and makes
 the partition fail closed instead.
 
 Require type-preserving equality across the two passes for the provider
@@ -469,7 +530,12 @@ Request policy therefore remains `unknown`, and reaction-only evidence is
 unavailable. Only a later terminal artifact, itself receipt-bound, that
 strictly follows both pre boundaries, closes the partition, passes the complete
 version-1 artifact receipt/final-stability contract, and wins ordinary
-precedence may decide without request/run attribution. This keeps the fixed Action's
+precedence may decide without request/run attribution. If that selected clean
+uses a 10-hex marker, its own initial/final exact-repository resolution receipts
+must resolve to its full current head; no older unresolved prefix may borrow
+that companion. Unrecoverable old request sidecars leave `request_policy`
+`unknown` and forbid another same-head POST, but that producer/audit field alone
+does not null the independently complete selected result. This keeps the fixed Action's
 result-present authority: a provider result, not request lineage, completes the
 lane; ordinary older top-level/resolved findings can be superseded; and the
 existing unresolved-thread rule remains the safety blocker.
@@ -517,7 +583,7 @@ Build one complete current-scope snapshot from:
   and post pull/compare raw responses; and
 - the lifecycle, base/head, merge-base, and check/run observations needed to validate scope and distinguish liveness from terminal evidence.
 
-Normalize stable API IDs, source channel, exact provider identity, artifact commit, enclosing current `scope.head`, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full artifact commit, raw clean marker/ref and resolution basis, and immutable current scope; review-only fields are rejected. Clean must bind the exact current `scope.head`. A finding keeps its parsed/native commit and may remain applicable when local ancestry receipts prove it is current or an ancestor; never rewrite it to current head or omit it from the complete projection. Apply only the authority's fixed terminal-payload grammar: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase 10- or 40-hex `Reviewed commit` marker. Forty hex binds directly to current head. Ten hex requires a separate closed `parent-recorded-reviewed-commit-resolution-v1` companion whose authenticated initial/final exact-repository `/commits/<prefix>` raw receipts both return exact `200`, pass UTF-8/digest/strict-JSON validation, stably expose one lowercase full-40 top-level `sha` starting with the prefix, and resolve to `parsed_commit == scope.head`. Require their retained server times to prove `artifact GET Date <= initial resolution Date <= every post-scope Date <= final resolution Date`; same-second equality is allowed at each of these non-strict edges. Missing, `404`/`409`/`422`/`429`/`5xx`, invalid, ambiguous, drifting, misordered, or non-current evidence fails closed, and the companion is forbidden for full-40. Only the official disclosure suffix trims each line and drops blanks before exact closed nine-line comparison; the lead, tagline, marker, two-LF boundary, extra nonempty text, and links remain strict. Clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Finding URLs, review commit IDs, and inline parent/child commit IDs remain lowercase full-40. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
+Normalize stable API IDs, source channel, exact provider identity, artifact commit, enclosing current `scope.head`, and semantic server time for each candidate. A review uses `submitted_at`; an unedited issue comment uses `created_at`; an issue comment whose current body was edited uses `updated_at`; and a reaction uses `created_at`. Record the selected native field and do not substitute client receipt order or local clock time. Every terminal issue comment must satisfy the authority's closed record schema, including canonical API and HTML URLs, exact Bot/App identity, raw and normalized body, `created_at`, `updated_at`, selected time/field, grammar status, parsed full artifact commit, raw clean marker/ref and resolution basis, and immutable current scope; review-only fields are rejected. Clean must bind the exact current `scope.head`. A finding keeps its parsed/native commit and may remain applicable when local ancestry receipts prove it is current or an ancestor; never rewrite it to current head or omit it from the complete projection. Apply only the authority's fixed terminal-payload grammar to receipt-bound current candidates: clean issue comments use the exact `Codex Review: Didn't find any major issues.` lead plus one lowercase 10- or 40-hex `Reviewed commit` marker. Forty hex binds directly to current head. Ten hex requires a separate closed `parent-recorded-reviewed-commit-resolution-v1` companion whose authenticated initial/final exact-repository `/commits/<prefix>` raw receipts both return exact `200`, pass UTF-8/digest/strict-JSON validation, stably expose one lowercase full-40 top-level `sha` starting with the prefix, and resolve to `parsed_commit == scope.head`. Require their retained server times to prove `artifact GET Date <= initial resolution Date <= every post-scope Date <= final resolution Date`; same-second equality is allowed at each of these non-strict edges. Missing, `404`/`409`/`422`/`429`/`5xx`, invalid, ambiguous, drifting, misordered, or non-current evidence fails closed, and the companion is forbidden for full-40. Only the official disclosure suffix trims each line and drops blanks before exact closed nine-line comparison; the lead, tagline, marker, two-LF boundary, extra nonempty text, and links remain strict. Clean reviews use exact `APPROVED`, a native lowercase full-SHA current-head `commit_id`, and body `No findings.`. Finding URLs, review commit IDs, and inline parent/child commit IDs remain lowercase full-40. Every other terminal-looking exact-provider payload is malformed unless it matches the fixed finding or inline-parent branch, except that the two exact strictly older raw migration carriers may enter only `legacy_unreceipted_audit` under the closed rules above. Review state admissibility is separate from terminal-looking detection: exact `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED` may enter the grammar; `PENDING` is nonterminal; `DISMISSED` is always terminal-looking; and a missing or unknown state is terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each invalid-state terminal signal is a whole-snapshot inconclusive blocker. Do not order it by original `submitted_at` or let a later-looking clean supersede it without a trusted state-transition timestamp. An empty `APPROVED` review is not clean.
 
 Apply the evidence in this order:
 
@@ -526,8 +592,8 @@ Apply the evidence in this order:
    resolution; a malformed target join fails closed. `isOutdated` is not
    resolution.
 2. Discard progress messages and acknowledgements from terminal selection. An untrusted-identity or stale-scope artifact cannot win selection, but retain every terminal-looking instance as fail-closed evidence; do the same for malformed terminal-looking artifacts. Never drop one and expose an older clean as the apparent winner.
-3. Select the latest trustworthy terminal artifact by server time. If the latest equal-time set spans more than one source channel, fail closed before comparing outcomes or numeric IDs. Within one channel, malformed or scope-conflicting evidence blocks, then finding wins over clean, and only a same-channel positive ID may break a remaining tie. A newer malformed terminal artifact is also `triple-inconclusive`.
-4. A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when the ancestor finding remains in the complete projection, no associated thread remains unresolved, and no newer finding or malformed terminal artifact exists. A resolved applicable thread may cease blocking under the thread rule; an unresolved one never does. Reaction-only clean never supersedes a finding.
+3. Select the latest trustworthy receipt-bound terminal artifact by server time. If the latest equal-time set spans more than one source channel, fail closed before comparing outcomes or numeric IDs. Within one channel, malformed or scope-conflicting evidence blocks, then finding wins over clean, and only a same-channel positive ID may break a remaining tie. A newer/equal malformed terminal artifact is `triple-inconclusive`; an older recognized migration-only audit item is retained but cannot control selection.
+4. A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when the ancestor finding remains in the complete projection, no associated thread remains unresolved, and no newer finding or newer/equal malformed terminal artifact exists. A recognized strictly older migration-only audit item cannot control selection, while a true malformed/unknown old near-miss still prevents the partition from closing. A resolved applicable thread may cease blocking under the thread rule; an unresolved one never does. Reaction-only clean never supersedes a finding.
 5. A request or progress artifact after the selected terminal does not replace it. In particular, `R1 -> clean1 -> R2 pending`, `R1 -> clean1 -> R2 -> clean2`, and `R1 -> R2 -> clean1 -> clean2` may all select clean and pass with a request-policy warning. No request/run association is required.
 
 Recompute and report `request_policy`, `provider_profile`, and `evidence_basis` from the final complete snapshot and bounded same-repository history, using this predeclared profile set:

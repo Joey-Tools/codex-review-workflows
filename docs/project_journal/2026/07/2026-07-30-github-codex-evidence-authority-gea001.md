@@ -23,6 +23,11 @@ superseded_by:
   supersede a top-level finding on the same or a proved successor head.
 - Dynamic provider profiles define a narrowly gated `+1` clean fallback while
   preserving terminal-payload priority and treating `eyes` as liveness-only.
+- A newer fully receipted current-head terminal result can restore decision
+  authority while two exact, strictly older pre-v1 carrier shapes remain
+  complete audit-only history; this prevents old transport limitations from
+  defeating the recorded result-present decision without accepting arbitrary
+  legacy prose.
 
 ## Current State
 
@@ -114,6 +119,39 @@ superseded_by:
   remains `triple-inconclusive`. A proved `base-changed-same-head` event cannot
   use the manual path and requires a real new head; empty or anchor commits are
   not recovery mechanisms.
+- The tolerated legacy member is now closed to exactly two raw-internal
+  migration-only carriers; an ordinary unreceipted current-grammar clean or
+  finding cannot enter. `legacy-finding-native-review-v1` reports role
+  `finding` only for an exact-provider
+  `COMMENTED`/`CHANGES_REQUESTED` native review with the exact
+  `### 💡 Codex Review` layout, one same-repository full-SHA blob URL
+  equal to native `commit_id`, one fixed `P0/red`, `P1/orange`, `P2/yellow`,
+  or `P3/lightgrey` shields badge, and bounded title/prose containing neither
+  `www.` nor a URI-scheme prefix whose colon is immediately followed by a
+  non-whitespace character. After newline normalization, every physical
+  disclosure line is trimmed and blank lines are dropped; the remaining lines
+  exactly equal the closed nine-line disclosure. It is separated by either no
+  padding line or exactly one line of four ASCII spaces, with no other
+  title/prose trailing whitespace or blank line before it, and the review has
+  no associated inline child. This grammar is raw-migration-only and never
+  becomes receipt-bound current/provider authority. An exact
+  old short clean issue comment remains role `clean-pending-resolution` with
+  its raw lowercase 10-hex ref. A non-current prefix requires the exact stable
+  parent-owned initial/final local Git prefix-resolution receipt arrays; an
+  ancestry array cannot self-attest it. The receipts completely cover every
+  raw-derived prefix, are unique and sorted by `raw_prefix`, enumerate exactly
+  one prefix-matching full commit with disambiguation/commit/ancestor return
+  codes `0`, and remain type-preservingly identical. They prove only ancestor
+  applicability, and the report still retains the raw 10 hex. Neither becomes a provider carrier, candidate
+  basis, or superseding evidence. Both must be strictly older than both
+  selected-result pre-scope `Date` receipts and stable in the initial/final raw
+  projections. A near-miss, unresolved thread, bad ancestry, equal/newer
+  legacy time, missing selected-artifact scope/resolution receipt, incomplete
+  pagination, or scope/lifecycle/final-read drift still fails closed.
+- Unrecoverable old request sidecars may leave `request_policy` `unknown`; that
+  producer/audit status forbids another same-head POST and disables reaction
+  authority, but it does not independently null a newer complete provider
+  clean. The selected result requires no fabricated request/run binding.
 - Normalized current scope and artifact commit are now explicitly separate.
   `scope.head` always remains the exact current PR head. Clean must bind it;
   a finding keeps its own current-or-proved-ancestor commit and remains in the
@@ -1678,6 +1716,95 @@ and identical-range behavior; it does not read `head_commit`. The playbook
 receipt intentionally takes only its own smaller closed scope projection. It
 must not copy a bare `commits[-1]` check without the Action helper's complete
 count, pagination, and identical-range constraints.
+
+## Live Legacy Provider Recovery
+
+PR #91 exposed a second live anti-drift boundary after the real Compare schema
+was fixed. Its complete provider history contained three relevant exact-bot
+artifacts:
+
+- pull-request review `4863163875`, submitted on
+  `832edd60e50392c7f000d67ed856d20959c0d5b2`, used the provider's older native
+  `### 💡 Codex Review` URL/badge/title/prose/disclosure finding form;
+- issue comment `5191165370` carried the raw short clean marker `9abfd559e9`
+  for `9abfd559e955503fdd3233ecd16073918423fc7a`, before version-1 artifact and
+  dual short-marker receipts existed; and
+- issue comment `5195502331` carried the current-head marker `06264ac0a0` for
+  `06264ac0a06240634f896e606b5744f747dd825f` and had the complete current
+  artifact-scope and independent initial/final full-SHA resolution evidence.
+
+The pre-correction contract treated the first record as arbitrary malformed
+review prose and the second as a malformed unresolved short clean. That made
+the complete old raw history veto the third record even though the third was a
+newer, independently complete current-head No-findings result. The correction
+does not discard or retroactively receipt those old records. It recognizes the
+first only through the closed migration-only
+`legacy-finding-native-review-v1` grammar and the second only as raw role
+`clean-pending-resolution`; both remain in the stable
+`legacy_unreceipted_artifacts` audit projection and neither can become result
+authority, provider profile carrier, candidate basis, or superseding evidence.
+The old 10-hex prefix is admitted only because the history-top-level
+`initial_legacy_short_commit_resolution_receipts` and
+`final_legacy_short_commit_resolution_receipts` completely cover the
+raw-derived pending-prefix set, uniquely enumerate the same prefix-matching
+full commit, prove commit type and ancestry with return codes `0`, and remain
+type-preservingly identical. An ancestry array cannot self-attest that mapping.
+The terminal report retains both arrays under
+`evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
+a reaction report uses
+`evidence_basis.current.local_git_prefix_resolution_receipts`. That local
+mapping is not a REST resolution companion and the audit item continues to
+preserve only `9abfd559e9`. Multiple legacy short refs are supported: each
+phase is unique and sorted by `raw_prefix`; after the next substantive head,
+the expected raw-derived set includes both `9abfd559e9` and `06264ac0a0` as
+ancestor-era clean markers. A selected current-head short clean remains on its
+separate dual REST resolution path.
+The newer artifact decides only because both older semantic times are strictly
+earlier than both of its pre-scope `Date` receipts and every identity, grammar,
+ancestry, thread, pagination, scope, lifecycle, receipt, and final-stability
+gate closes.
+
+This is the intended “result exists means pass” behavior, not a broad legacy
+allowlist. The old native finding grammar requires exact state, provider,
+same-repository full-SHA URL/commit match, one fixed severity/color badge,
+bounded title/prose containing neither `www.` nor a URI-scheme prefix whose
+colon is immediately followed by a non-whitespace character, and the
+normalized closed disclosure. Newlines are normalized, every physical
+disclosure line is trimmed, blank lines are dropped, and the remaining lines
+must exactly equal the nine-line block. Only no padding or one line of four
+ASCII spaces may precede it, with no other title/prose trailing whitespace or
+blank line, and the review has no associated inline child. The old
+short clean remains unresolved and keeps its raw 10-hex value; it never borrows
+the current selected artifact's dual full-SHA resolution. Any near-miss,
+unresolved thread, unknown identity/role, bad ancestry, equal/newer contrary or
+malformed artifact, missing current receipt/resolution, incomplete page, or
+scope/lifecycle drift remains fail-closed. Only newer/equal malformed evidence
+participates in ordinary terminal precedence; an older recognized audit-only
+carrier cannot control, while a truly malformed older near-miss still prevents
+the migration partition from closing.
+
+The legacy badge mapping is pinned from exact REST Bot evidence, independently
+of the Action: `P0/red` in `openai/openai-cookbook#2915` inline comments
+`3707792981`/`3707792985`; `P1/orange` in `ykylee/Devhub_example#592`
+`3409533388`/`3409533389` (also `andreame-code/netrisk#154` `3140609225`);
+`P2/yellow` in PR #91 review `4863163875`; and `P3/lightgrey` in
+`Joey-Tools/codex-debug-triage#5` `3676232685`/`3676232690`. Each observed
+record used exact `chatgpt-codex-connector[bot]` / `Bot` REST identity. The
+pinned `codex-review-gate` Action does not parse badge colors, so this is a
+separate provider-payload provenance baseline rather than claimed Action
+parity.
+
+Old request sidecars were not fabricated. Their absence may leave
+`request_policy: unknown`, which forbids another same-head request and closes
+reaction-only authority, but that producer/audit field alone does not negate
+the complete current provider result. This exactly preserves the fixed
+`codex-review-gate` source and released `codex-review-gate-action` baseline:
+provider-result evidence decides without unavailable request/run lineage, while
+the playbook keeps its stricter scope, thread, lifecycle, pagination, grammar,
+and stability extensions. The repository still has no production live
+evaluator CLI; this PR #91 adjudication therefore remained manual and
+receipt-backed, while the embedded executable contract locks the same three
+live carrier shapes and their near-miss regressions for future automation.
 
 ## Private Release Portability
 
