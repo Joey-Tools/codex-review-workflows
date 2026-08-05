@@ -246,10 +246,14 @@ For each pre-request and post-request phase:
   lowercase `base.sha` and `head.sha`.
 - `compare` is exact `GET` of
   `https://api.github.com/repos/<owner>/<repo>/compare/<base.sha>...<head.sha>`
-  with integer status `200`. Its raw body must repeat both endpoints as
-  `base_commit.sha` and `head_commit.sha` and supplies `pr_merge_base` only
-  from `merge_base_commit.sha`. A response for another head is not scope
-  evidence even when its base and merge-base fields look plausible.
+  with integer status `200`. The pull-derived full head is bound by that exact
+  request URL; the raw body must repeat the base as `base_commit.sha` and
+  supplies `pr_merge_base` only from `merge_base_commit.sha`. GitHub's REST
+  Compare response does not define `head_commit`; an unknown field with that
+  name is ignored like any other forward-compatible extra and is never an
+  authority signal. Do not substitute `commits[-1]`: the list can be paginated
+  or empty. A response URL for another head is not scope evidence even when its
+  base and merge-base fields look plausible.
 - The two independently parsed records derive one exact scope tuple
   `(repository, pr, pr_merge_base, head)`. The pre-request and post-request
   tuples must be type-preserving identical. They must also equal the enclosing
@@ -368,11 +372,12 @@ Each receipt rejects unknown fields and contains exactly:
   response contract.
 
 The artifact GET response, rather than redundant receipt metadata, binds the
-exact repository/PR, channel, native ID, and provider artifact projection. The
-pre/post pull and compare bodies independently bind head and merge base; those
-raw projections together form the immutable
+exact repository/PR, channel, native ID, and provider artifact projection. In
+each pre/post pair, the pull body supplies base/head, the exact derived Compare
+request URL binds that pair, and the Compare body repeats base and supplies
+merge base. Those raw projections together form the immutable
 `(repository, pr, pr_merge_base, head)` join. No sibling ID or scope assertion
-may substitute for projecting the receipt's raw bodies.
+may substitute for projecting the receipt's raw responses.
 
 Strictly parse and retain the complete raw GitHub response bytes and verify
 their digests, but compare the closed authority projection rather than require
@@ -403,9 +408,11 @@ pagination or joins.
 Derive the actual full base and head OIDs from the pull receipt; never
 synthesize either OID from a fixture, PR number, branch name, or enclosing
 summary. Build the canonical compare URL from those parsed OIDs, then require
-the compare body to repeat them as exact `base_commit.sha` and
-`head_commit.sha` while supplying the unique `merge_base_commit.sha`. A compare
-for another head cannot lend its merge base to this artifact scope.
+the compare body to repeat the base as exact `base_commit.sha` while supplying
+the unique `merge_base_commit.sha`. The pull receipt plus exact request URL,
+not a nonexistent compare-body `head_commit` field or paginated `commits[-1]`,
+binds the artifact-time head. A compare for another head cannot lend its merge
+base to this artifact scope.
 
 The time envelope is exact: every pre-scope response `Date` is strictly earlier
 than the artifact semantic server time, the artifact semantic server time is no

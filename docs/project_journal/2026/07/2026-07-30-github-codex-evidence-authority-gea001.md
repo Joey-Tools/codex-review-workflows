@@ -235,8 +235,9 @@ superseded_by:
   Each inventory entry binds scope/order plus carrier, channel, semantic result,
   native identity, and canonical source-record digest; same time/ID cannot
   substitute a reaction for a terminal artifact. Pull scope uses the canonical
-  bare pull-detail request plus a compare response whose `base_commit.sha`,
-  `head_commit.sha`, and `merge_base_commit.sha` bind the exact scope.
+  bare pull-detail request plus an exact pull-derived compare URL; the response
+  body's `base_commit.sha` and `merge_base_commit.sha` bind the remaining exact
+  scope fields.
   Discovery uses the closed `github-codex-evidence-resource-budget-v1`
   profile: at most 512 union-seeded pull requests, 512 controlled requests,
   8,192 fetch attempts, 4,096 retained pages, 20,000 records, 8,388,608 UTF-8
@@ -1271,10 +1272,10 @@ the stricter triple lane:
   evidence, while ignoring a projected identity/scope/time/body field would be
   unsafe.
 - Artifact scope derives the real base/head OIDs from each retained pull body,
-  constructs the canonical compare URL from those values, and requires the
-  compare body to repeat both OIDs plus the unique merge base. Fixture-derived
-  or PR-number-derived synthetic SHAs cannot stand in for production scope,
-  and a compare body for another head cannot lend its merge base.
+  binds both in the canonical compare request URL, and requires the compare
+  body to repeat the base plus the unique merge base. Fixture-derived or
+  PR-number-derived synthetic SHAs cannot stand in for production scope, and a
+  compare response fetched through another head URL cannot lend its merge base.
 - Evidence time and observation time are separate. The frozen reaction-history
   as-of constrains eligible historical artifact semantic time. It does not
   prohibit collecting the exact artifact GET or post-scope receipt later in
@@ -1349,15 +1350,27 @@ prove the lower-information reaction fallback; failure in that historical
 adaptation plane cannot veto an independently trustworthy current terminal
 payload.
 
-The same review also closed two scope-binding mismatches: canonical pull-detail
+The same review also closed the pull-detail URL mismatch: canonical pull-detail
 requests use the bare `/pulls/{number}` URL, while collection endpoints retain
-their explicit pagination query; and every pull/compare receipt now requires
-`compare.head_commit.sha` to equal the pull detail's exact head in addition to
-binding the base and unique merge base. These fields are authority signals, not
-fixture conveniences. Future changes to this decision must update the schema,
-all agent/lane/readiness mirrors, executable anti-drift contracts, and this
-journal together, and must state whether the pinned Action baseline or a
-playbook-only extension changed.
+their explicit pagination query. A later live pre-request probe against
+`github.com` exposed a separate fixture-only assumption before any request was
+posted: the real REST Compare object has `base_commit` and
+`merge_base_commit`, but no `head_commit`. The corrected authority chain derives
+the exact full base/head OIDs from the pull detail, requires that pair in the
+exact Compare request URL, and validates the response body's base and unique
+merge base. It deliberately ignores an unknown `head_commit` extra and never
+uses `commits[-1]`, because that array can be paginated or empty.
+
+This correction is a playbook-only receipt-schema fix. It does not change the
+pinned `codex-review-gate` / released `codex-review-gate-action` consumer rule
+that a stable provider result is authoritative without request/run lineage.
+The exact pinned `src/gate.mjs` blob also binds head from PR detail and the
+exact Compare URL without reading `head_commit`. Its separate ancestry helper
+validates a larger closed status/count/commit-list contract; the playbook does
+not inherit only a fragment of that helper. Future changes to this decision
+must update the schema, all agent/lane/readiness mirrors, executable anti-drift
+contracts, and this journal together, and must state whether the pinned Action
+baseline or a playbook-only extension changed.
 
 ## Schema-v4 Pre-Commit Audit Corrections
 
@@ -1628,6 +1641,43 @@ transcript/projector contract,
 agent/readiness/probe mirrors, regression coverage, and this journal together;
 changing the Action side also requires a new pinned
 source/release/tree/manifest baseline.
+
+## Live REST Compare Schema Correction
+
+The final pre-request probe for public PR #91 deliberately read the real
+current PR detail and Compare endpoint before posting `@codex review`. At
+GitHub server time `2026-08-05 14:48:07 GMT`, the Compare object exposed
+`ahead_by`, `base_commit`, `behind_by`, `commits`, `merge_base_commit`,
+`status`, `total_commits`, and link fields, but no `head_commit`. No provider
+request had been posted for that head, so the candidate contract was corrected
+before it could create unconsumable live evidence.
+
+The authority decision is therefore deliberately split:
+
+In each receipt pair, the pull body supplies base/head, the exact derived
+Compare request URL binds that pair, and the Compare body repeats base and
+supplies merge base.
+
+- Pull detail supplies the exact lowercase full base/head OIDs.
+- Those OIDs form the exact authenticated
+  `/compare/<base>...<head>` request URL, whose raw receipt binds head.
+- The Compare body must repeat `base_commit.sha` and supply the unique
+  `merge_base_commit.sha`; an extra `head_commit` member is an ignored unknown
+  field and cannot strengthen or contradict the projection.
+- `commits[-1]` is not a replacement head signal because Compare commits may
+  be paginated and an identical comparison has no final commit.
+
+This remains a local whole-PR receipt extension rather than a new Action
+inheritance claim. The exact pinned `src/gate.mjs` blob
+`e0b974b27ebd64e412eaef1d069789b5f6bd76ba` (109,096 bytes; raw SHA-256
+`5b25faa7336e3b53603df42d15e52853d4de039e755c9ed5338c51fd528b9415`)
+is shared by the source and released Action manifests below. Its ancestry
+helper binds the exact Compare URL and validates a complete closed combination
+of status, ahead/behind/total counts, bounded commit-list shape, final commit,
+and identical-range behavior; it does not read `head_commit`. The playbook
+receipt intentionally takes only its own smaller closed scope projection. It
+must not copy a bare `commits[-1]` check without the Action helper's complete
+count, pagination, and identical-range constraints.
 
 ## Private Release Portability
 

@@ -6002,6 +6002,22 @@ printf '%s\n' "$trusted_uv"
                     self.assertIn(baseline_id, document)
         journal = anti_drift_documents.get("project-journal")
         github_pr_probes = anti_drift_documents["github-pr-probes"]
+        compare_scope_authority_contract = (
+            "the pull body supplies base/head, the exact derived compare request "
+            "url binds that pair, and the compare body repeats base and supplies "
+            "merge base"
+        )
+        compare_scope_authority_documents = {
+            "authority": authority,
+            "github-pr-probes": github_pr_probes,
+            "review-lane-contracts": anti_drift_documents["review-lane-contracts"],
+        }
+        if journal is not None:
+            compare_scope_authority_documents["project-journal"] = journal
+        for document_name, document in compare_scope_authority_documents.items():
+            normalized_document = " ".join(document.lower().replace("`", "").split())
+            with self.subTest(compare_scope_authority_document=document_name):
+                self.assertIn(compare_scope_authority_contract, normalized_document)
         if readme := anti_drift_documents.get("readme"):
             normalized_readme_text = " ".join(readme.lower().replace("`", "").split())
             self.assertIn(
@@ -9708,7 +9724,6 @@ printf '%s\n' "$trusted_uv"
                         server_time=server_time,
                         body={
                             "base_commit": {"sha": base_oid},
-                            "head_commit": {"sha": head},
                             "merge_base_commit": {"sha": merge_base},
                         },
                     ),
@@ -9801,7 +9816,6 @@ printf '%s\n' "$trusted_uv"
                         server_time=server_time,
                         body={
                             "base_commit": {"sha": base_oid},
-                            "head_commit": {"sha": receipt_head},
                             "merge_base_commit": {"sha": merge_base},
                         },
                     ),
@@ -10248,11 +10262,6 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(compare_body, dict)
                     else None
                 )
-                head_commit = (
-                    compare_body.get("head_commit")
-                    if isinstance(compare_body, dict)
-                    else None
-                )
                 merge_base_commit = (
                     compare_body.get("merge_base_commit")
                     if isinstance(compare_body, dict)
@@ -10273,8 +10282,6 @@ printf '%s\n' "$trusted_uv"
                 if (
                     not isinstance(base_commit, dict)
                     or base_commit.get("sha") != base_oid
-                    or not isinstance(head_commit, dict)
-                    or head_commit.get("sha") != head
                     or parsed_scope is None
                 ):
                     return None
@@ -10813,11 +10820,6 @@ printf '%s\n' "$trusted_uv"
                     if isinstance(compare_body, dict)
                     else None
                 )
-                compare_head = (
-                    compare_body.get("head_commit")
-                    if isinstance(compare_body, dict)
-                    else None
-                )
                 compare_merge_base = (
                     compare_body.get("merge_base_commit")
                     if isinstance(compare_body, dict)
@@ -10826,8 +10828,6 @@ printf '%s\n' "$trusted_uv"
                 if (
                     not isinstance(compare_base, dict)
                     or compare_base.get("sha") != pull_base_sha
-                    or not isinstance(compare_head, dict)
-                    or compare_head.get("sha") != pull_head_sha
                     or not isinstance(compare_merge_base, dict)
                     or compare_merge_base.get("sha") != merge_base
                 ):
@@ -15017,7 +15017,6 @@ printf '%s\n' "$trusted_uv"
                 }
                 compare_record = {
                     "base_commit": {"sha": base_oid},
-                    "head_commit": {"sha": head},
                     "merge_base_commit": {"sha": merge_base},
                     "status": "ahead",
                     "ahead_by": 1,
@@ -17031,7 +17030,6 @@ printf '%s\n' "$trusted_uv"
                     return None
                 compare_record = compare_records[0]
                 base_commit = compare_record.get("base_commit")
-                head_commit = compare_record.get("head_commit")
                 merge_base_commit = compare_record.get("merge_base_commit")
                 merge_base = (
                     merge_base_commit.get("sha")
@@ -17041,8 +17039,6 @@ printf '%s\n' "$trusted_uv"
                 if (
                     not isinstance(base_commit, dict)
                     or base_commit.get("sha") != base_oid
-                    or not isinstance(head_commit, dict)
-                    or head_commit.get("sha") != head
                     or not isinstance(merge_base, str)
                     or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
                 ):
@@ -25328,7 +25324,10 @@ printf '%s\n' "$trusted_uv"
                 compare_body["status"] = "ahead"
                 compare_body["base_commit"]["sha"] = actual_base_sha
                 compare_body["base_commit"]["url"] = "https://api.github.com/base"
-                compare_body["head_commit"]["url"] = "https://api.github.com/head"
+                compare_body["head_commit"] = {
+                    "sha": "f" * 40,
+                    "url": "https://api.github.com/non-authoritative-extra",
+                }
                 compare_body["merge_base_commit"]["parents"] = []
                 replace_raw_json_body(
                     compare_response,
@@ -25402,11 +25401,6 @@ printf '%s\n' "$trusted_uv"
                     ("base_commit", "sha"),
                     "c" * 40,
                 ),
-                "compare-head-sha": (
-                    ("pre_artifact_scope_receipts", "compare"),
-                    ("head_commit", "sha"),
-                    "b" * 40,
-                ),
                 "compare-merge-base-sha": (
                     ("pre_artifact_scope_receipts", "compare"),
                     ("merge_base_commit", "sha"),
@@ -25443,6 +25437,41 @@ printf '%s\n' "$trusted_uv"
                         expected_scope=thread_scope,
                     )
                 )
+
+            for url_endpoint, replacement in (
+                ("base", "a" * 40),
+                ("head", "b" * 40),
+            ):
+                compare_scope_mutation = clone(valid_terminal_artifact)
+                assert isinstance(compare_scope_mutation, dict)
+                compare_receipt = compare_scope_mutation["artifact_scope_receipt"][
+                    "pre_artifact_scope_receipts"
+                ]["compare"]
+                pull_receipt = compare_scope_mutation["artifact_scope_receipt"][
+                    "pre_artifact_scope_receipts"
+                ]["pull"]
+                pull_body = strict_json_loads(pull_receipt["body_utf8"])
+                assert isinstance(pull_body, dict)
+                compare_base = pull_body["base"]["sha"]
+                compare_head = pull_body["head"]["sha"]
+                if url_endpoint == "base":
+                    compare_base = replacement
+                else:
+                    compare_head = replacement
+                compare_receipt["request_url"] = (
+                    f"https://api.github.com/repos/{thread_scope[0]}/compare/"
+                    f"{compare_base}...{compare_head}"
+                )
+                with self.subTest(
+                    artifact_receipt_compare_url_endpoint=(f"{channel}-{url_endpoint}"),
+                ):
+                    self.assertIsNone(
+                        validate_candidate_artifact(
+                            compare_scope_mutation,
+                            expected_kind="terminal-payload",
+                            expected_scope=thread_scope,
+                        )
+                    )
 
             post_base_drift = clone(valid_terminal_artifact)
             assert isinstance(post_base_drift, dict)
@@ -27211,29 +27240,83 @@ printf '%s\n' "$trusted_uv"
                         )
                     )
 
-        for compare_failure in ("missing", "mismatch"):
-            invalid_compare = clone(complete_scope_transcript)
-            assert isinstance(invalid_compare, dict)
+        compare_with_non_authoritative_extra = clone(complete_scope_transcript)
+        assert isinstance(compare_with_non_authoritative_extra, dict)
+        current_fetches = next(
+            scope["fetches"]
+            for scope in compare_with_non_authoritative_extra["scopes"]
+            if scope.get("pull_number") == current_pr
+        )
+        compare_fetch = next(
+            fetch for fetch in current_fetches if fetch.get("kind") == "compare"
+        )
+        compare_page = compare_fetch["pages"][0]
+        compare_body = strict_json_loads(compare_page["body_utf8"])
+        assert isinstance(compare_body, dict)
+        compare_body["head_commit"] = {"sha": "e" * 40}
+        replace_raw_json_body(compare_page, canonical_raw_body(compare_body))
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                compare_with_non_authoritative_extra,
+                request_scope_receipts=complete_scope_history["initial_inventory"][
+                    "request_scope_receipts"
+                ],
+                provider_declaration=declaration,
+            )
+        )
+
+        sidecars_with_non_authoritative_extra = clone(
+            complete_scope_history["initial_inventory"]["request_scope_receipts"]
+        )
+        assert isinstance(sidecars_with_non_authoritative_extra, list)
+        compare_receipt = sidecars_with_non_authoritative_extra[0][
+            "pre_request_scope_receipts"
+        ]["compare"]
+        compare_body = strict_json_loads(compare_receipt["body_utf8"])
+        assert isinstance(compare_body, dict)
+        compare_body["head_commit"] = {"sha": "d" * 40}
+        compare_receipt["body_utf8"] = canonical_raw_body(compare_body)
+        compare_receipt["body_sha256"] = hashlib.sha256(
+            compare_receipt["body_utf8"].encode("utf-8")
+        ).hexdigest()
+        self.assertIsNotNone(
+            parse_discovery_endpoint_transcript(
+                complete_scope_transcript,
+                request_scope_receipts=sidecars_with_non_authoritative_extra,
+                provider_declaration=declaration,
+            )
+        )
+
+        for url_endpoint, replacement in (
+            ("base", "a" * 40),
+            ("head", "b" * 40),
+        ):
+            invalid_compare_url = clone(complete_scope_transcript)
+            assert isinstance(invalid_compare_url, dict)
             current_fetches = next(
                 scope["fetches"]
-                for scope in invalid_compare["scopes"]
+                for scope in invalid_compare_url["scopes"]
                 if scope.get("pull_number") == current_pr
             )
             compare_fetch = next(
                 fetch for fetch in current_fetches if fetch.get("kind") == "compare"
             )
             compare_page = compare_fetch["pages"][0]
-            compare_body = strict_json_loads(compare_page["body_utf8"])
-            assert isinstance(compare_body, dict)
-            if compare_failure == "missing":
-                compare_body.pop("head_commit")
+            compare_prefix, compare_endpoints = compare_page["request_url"].rsplit(
+                "/compare/", 1
+            )
+            compare_base, compare_head = compare_endpoints.split("...", 1)
+            if url_endpoint == "base":
+                compare_base = replacement
             else:
-                compare_body["head_commit"]["sha"] = "e" * 40
-            replace_raw_json_body(compare_page, canonical_raw_body(compare_body))
-            with self.subTest(raw_compare_head=compare_failure):
+                compare_head = replacement
+            compare_page["request_url"] = (
+                f"{compare_prefix}/compare/{compare_base}...{compare_head}"
+            )
+            with self.subTest(raw_compare_url_endpoint=url_endpoint):
                 self.assertIsNone(
                     parse_discovery_endpoint_transcript(
-                        invalid_compare,
+                        invalid_compare_url,
                         request_scope_receipts=complete_scope_history[
                             "initial_inventory"
                         ]["request_scope_receipts"],
@@ -27241,29 +27324,29 @@ printf '%s\n' "$trusted_uv"
                     )
                 )
 
-        for sidecar_compare_failure in ("missing", "mismatch"):
-            invalid_sidecars = clone(
+            invalid_sidecar_url = clone(
                 complete_scope_history["initial_inventory"]["request_scope_receipts"]
             )
-            assert isinstance(invalid_sidecars, list)
-            compare_receipt = invalid_sidecars[0]["pre_request_scope_receipts"][
+            assert isinstance(invalid_sidecar_url, list)
+            compare_receipt = invalid_sidecar_url[0]["pre_request_scope_receipts"][
                 "compare"
             ]
-            compare_body = strict_json_loads(compare_receipt["body_utf8"])
-            assert isinstance(compare_body, dict)
-            if sidecar_compare_failure == "missing":
-                compare_body.pop("head_commit")
+            compare_prefix, compare_endpoints = compare_receipt["request_url"].rsplit(
+                "/compare/", 1
+            )
+            compare_base, compare_head = compare_endpoints.split("...", 1)
+            if url_endpoint == "base":
+                compare_base = replacement
             else:
-                compare_body["head_commit"]["sha"] = "d" * 40
-            compare_receipt["body_utf8"] = canonical_raw_body(compare_body)
-            compare_receipt["body_sha256"] = hashlib.sha256(
-                compare_receipt["body_utf8"].encode("utf-8")
-            ).hexdigest()
-            with self.subTest(request_sidecar_compare_head=sidecar_compare_failure):
+                compare_head = replacement
+            compare_receipt["request_url"] = (
+                f"{compare_prefix}/compare/{compare_base}...{compare_head}"
+            )
+            with self.subTest(request_sidecar_compare_url_endpoint=url_endpoint):
                 self.assertIsNone(
                     parse_discovery_endpoint_transcript(
                         complete_scope_transcript,
-                        request_scope_receipts=invalid_sidecars,
+                        request_scope_receipts=invalid_sidecar_url,
                         provider_declaration=declaration,
                     )
                 )
@@ -40144,7 +40227,6 @@ printf '%s\n' "$trusted_uv"
             elif drift_kind == "head_oid":
                 root_record["head"]["sha"] = replacement_head_oid
                 pull_record["head"]["sha"] = replacement_head_oid
-                compare_record["head_commit"]["sha"] = replacement_head_oid
             elif drift_kind == "merge_base":
                 compare_record["merge_base_commit"]["sha"] = replacement_merge_base
             elif drift_kind == "lifecycle":

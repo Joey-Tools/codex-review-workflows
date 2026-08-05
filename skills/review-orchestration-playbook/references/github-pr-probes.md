@@ -134,11 +134,13 @@ raw pull body and bind them into the pre compare URL. After the one and only
 POST, repeat that derivation for the post compare URL. Convert each response to
 the authority's exact six-field raw receipt
 `{method, request_url, status, date_header, body_utf8, body_sha256}`; do not
-retain only the `--jq` projection. The pull and compare bodies must derive the
-same `(repository, pr, pr_merge_base, head)` before and after the write, and the
-exact `201` POST body must independently project the same controlled request's
-eight fields, including closed `user: {login, type}` actor identity. Preserve
-all individual response Date values and ordering.
+retain only the `--jq` projection. The raw pull/compare receipt pairs must
+derive the same `(repository, pr, pr_merge_base, head)` before and after the
+write: the pull body supplies base/head, the exact derived Compare request URL
+binds that pair, and the Compare body repeats base and supplies merge base. The
+exact `201` POST body must independently project the same controlled request's eight
+fields, including closed `user: {login, type}` actor identity. Preserve all
+individual response Date values and ordering.
 
 Store the resulting `parent-recorded-request-scope-v1` object in the
 parent-owned `request_scope_receipts` sidecar. Every accepted request has
@@ -157,11 +159,14 @@ normalized decision member, retain one singular closed artifact-wrapper field
 `pre_artifact_scope_receipts`, `artifact_get_receipt`, and
 `post_artifact_scope_receipts`, with kind
 `parent-recorded-terminal-artifact-scope-v1`. Convert each raw response to the
-same six-field receipt shape used above. The pre/post pull+compare bodies must
-independently project the same artifact-time head and merge base. Clean and
-malformed evidence require the exact current tuple; a finding may preserve a
+same six-field receipt shape used above. The pre/post raw pull/compare receipt
+pairs must independently project the same artifact-time scope: the pull body
+supplies base/head, the exact derived Compare request URL binds that pair, and
+the Compare body repeats base and supplies merge base. Clean and malformed
+evidence require the exact current tuple; a finding may preserve a
 proved-ancestor artifact-time head while normalized `scope.head` remains
-current. The exact artifact GET must
+current. The exact
+artifact GET must
 bind repository/PR, issue-comment or review channel, native ID, exact provider
 projection, raw body/digest, trusted semantic time, grammar, and artifact
 commit. Lifecycle is still proved by the separate mandatory snapshots; do not
@@ -169,9 +174,12 @@ invent it from these receipt bodies.
 
 Parse the actual full base/head OIDs from each pull response and use those
 values—not a fixture-derived or PR-number-derived SHA—to construct its exact
-compare URL. The compare response must repeat both as `base_commit.sha` and
-`head_commit.sha` and supply the unique `merge_base_commit.sha`; a body for a
-different head is not scope evidence.
+compare URL. The compare response must repeat the base as `base_commit.sha` and
+supply the unique `merge_base_commit.sha`. GitHub's REST Compare schema has no
+`head_commit`; the pull response plus exact compare request URL binds the head.
+Ignore any unknown field with that name and never infer head from the possibly
+paginated or empty `commits` array. A request URL for a different head is not
+scope evidence.
 
 Require every pre response `Date` to be strictly earlier than the artifact
 semantic server time, that time to be no later than the artifact GET response
