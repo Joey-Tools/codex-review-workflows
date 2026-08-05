@@ -453,13 +453,17 @@ complete history-top-level `initial_legacy_short_commit_resolution_receipts`
 and `final_legacy_short_commit_resolution_receipts`; a preexisting ancestry
 array cannot self-attest this mapping. Each item has exactly `raw_prefix`,
 `head`, `disambiguate_return_code`, `disambiguated_object_ids`,
-`commit_object_check_return_code`, and `ancestry_return_code`. Each phase must
+`commit_object_check_return_code`, `object_type`, and `ancestry_return_code`. Each phase must
 cover exactly the raw-derived non-current pending-prefix set, with unique items
-sorted by `raw_prefix`; enumerate every matching local Git object with lazy
-fetch and credential prompting disabled; require disambiguation return `0`,
-exactly one full lowercase SHA beginning with the prefix, commit-object check
-return `0`, and `git merge-base --is-ancestor <resolved_commit> <head>` return
-`0`. Require exact current head and type-preserving initial/final equality, and
+sorted by `raw_prefix`; enumerate every matching local Git object through the
+short-lived sanitized bare Git view below, with lazy fetch, credential
+prompting, replacement objects, local grafts, ambient configuration, and
+commit-graph and multi-pack-index caches excluded; require disambiguation return `0`,
+exactly one full lowercase SHA beginning with the prefix, exact-object type
+check return `0` with `object_type == "commit"`, and
+`git merge-base --is-ancestor <resolved_commit> <head>` return `0`. An
+annotated-tag object that peels to a commit is rejected. Require exact current
+head and type-preserving initial/final equality, and
 retain both arrays under terminal
 `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts` or
 reaction `evidence_basis.current.local_git_prefix_resolution_receipts`, as
@@ -471,19 +475,72 @@ or supersedes evidence. A state, actor, repository, SHA, path, line, badge,
 title/prose, disclosure, or inline/thread near-miss is truly malformed and
 cannot use the exception.
 
-The fixed local Git command semantics for each legacy prefix receipt are:
+For each initial/final phase, independently create a new owner-private,
+short-lived bare Git view using the parent-recorded trusted review-runtime
+bundle's sanitized-view implementation. For a self-policy migration, this
+implementation comes from the independently trusted bundle recorded outside
+the candidate range; never execute candidate-head Python or shell to create the
+view. The view has a minimal bare config for the source object format, empty
+`objects` and `refs`, no `info/grafts`, `shallow`, replace refs, remotes, hooks,
+or worktree, and binds the exact validated locally complete source object
+directory only through `GIT_OBJECT_DIRECTORY`. Reject source alternates,
+promisor dependencies, or an unsafe/ambiguous object directory before use.
+
+The fixed `legacy_sanitized_git_prefix` is this exact token sequence:
+
+```text
+/usr/bin/env
+-i
+PATH=<recorded_trusted_path>
+LANG=C
+LC_ALL=C
+GIT_ATTR_NOSYSTEM=1
+GIT_ASKPASS=/usr/bin/false
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+GIT_NO_LAZY_FETCH=1
+GIT_NO_REPLACE_OBJECTS=1
+GIT_OBJECT_DIRECTORY=<validated_source_object_directory>
+GIT_OPTIONAL_LOCKS=0
+GIT_PAGER=cat
+GIT_TERMINAL_PROMPT=0
+PAGER=cat
+SSH_ASKPASS=/usr/bin/false
+<resolved_trusted_git>
+--no-pager
+-c
+core.fsmonitor=false
+-c
+core.commitGraph=false
+-c
+core.multiPackIndex=false
+-c
+core.hooksPath=/dev/null
+-c
+diff.external=
+--git-dir=<sanitized_git_view>
+```
+
+Append only these fixed read-only queries for each legacy prefix receipt:
 
 ```sh
-GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git rev-parse --disambiguate=<raw_prefix>
-GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<sole_full_sha>^{commit}'
-GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git merge-base --is-ancestor <sole_full_sha> <current_head>
+<legacy_sanitized_git_prefix> rev-parse --disambiguate=<raw_prefix>
+<legacy_sanitized_git_prefix> cat-file -t '<sole_full_sha>'
+<legacy_sanitized_git_prefix> merge-base --is-ancestor <sole_full_sha> <current_head>
 ```
 
 The first command's complete stdout lines become
 `disambiguated_object_ids`; do not select one result from a larger set. The
+second command's stdout must be exactly the single ASCII line `commit` plus
+one terminating LF; removing only that LF yields `object_type == "commit"`.
+Its return code populates `commit_object_check_return_code`. The
 three command return codes populate their corresponding closed receipt fields.
-Run all three against the same parent-recorded local repository/object store
-and frozen current head in each phase; do not fetch to make a prefix resolve.
+Run all three against the same phase-local sanitized view, validated source
+object directory, and frozen current head under one bounded parent-owned
+operation. Destroy that view before the next independent phase. Never run the
+queries against the source repository's Git directory, where `info/grafts`,
+replace refs, shallow state, config, hooks, or object-cache metadata could
+rewrite object identity or ancestry.
 
 Read the selected newly receipted artifact's two raw pre-scope HTTP `Date`
 values directly from its pull-detail and compare receipts. Every legacy item's

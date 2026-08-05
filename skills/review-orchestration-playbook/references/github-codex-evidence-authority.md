@@ -577,14 +577,19 @@ current terminal grammar:
    arrays `initial_legacy_short_commit_resolution_receipts` and
    `final_legacy_short_commit_resolution_receipts`. Each item contains exactly
    `raw_prefix`, `head`, `disambiguate_return_code`,
-   `disambiguated_object_ids`, `commit_object_check_return_code`, and
+   `disambiguated_object_ids`, `commit_object_check_return_code`, `object_type`, and
    `ancestry_return_code`. `raw_prefix` is the exact lowercase 10 hex;
    `head` is the exact current lowercase full SHA; disambiguation returns exact
    `0` and enumerates exactly one lowercase full-SHA object ID beginning with
-   that prefix; the separate commit-object check and
-   `git merge-base --is-ancestor <resolved_commit> <head>` each return exact
-   `0`. Run these local Git operations with lazy fetching and credential
-   prompting disabled. Each array may contain zero or more entries; never
+   that prefix; exact-object `git cat-file -t <resolved_object>` returns exact
+   `0` with `object_type == "commit"`, and
+   `git merge-base --is-ancestor <resolved_commit> <head>` returns exact `0`.
+   An annotated-tag object that peels to a commit is rejected. Run each phase
+   in its own parent-trusted short-lived sanitized bare Git view under the
+   fixed prefix in `github-pr-probes.md`, never against the source Git
+   directory. The view excludes local grafts, ambient config, replace refs,
+   shallow/alternate/promisor dependencies, lazy fetching, credential
+   prompting, and commit-graph/multi-pack-index caches. Each array may contain zero or more entries; never
    assume one legacy prefix. The receipt prefixes are unique and sorted, their set
    equals the complete raw-inventory-derived non-current pending-prefix set,
    and the initial/final arrays are type-preservingly identical. Preserve both
@@ -2327,15 +2332,17 @@ non-current raw 10-hex `clean-pending-resolution` marker. It instead requires
 the closed history-top-level
 `initial_legacy_short_commit_resolution_receipts` and
 `final_legacy_short_commit_resolution_receipts` defined above. Their complete
-raw-prefix set, unique local-object disambiguation, commit-object check,
-ancestor check, exact head, and type-preserving stability supply the local
+raw-prefix set, unique local-object disambiguation, exact commit object type,
+sanitized-view ancestry check, exact head, and type-preserving stability supply the local
 applicability check. The legacy report retains the raw 10 hex, and no GitHub
 REST resolution companion or full `artifact_commit` is fabricated for it.
 
 A missing, duplicate, unsorted, extra, or drifting legacy-prefix receipt; an
 initial/final array mismatch; incomplete raw-derived prefix coverage; a
-disambiguation, commit-object, or ancestry return code other than `0`; zero or
-multiple matching object IDs; a noncanonical prefix/full SHA; or a head
+disambiguation, object-type-check, or ancestry return code other than `0`; an
+`object_type` other than exact `commit`; zero or multiple matching object IDs;
+a source-directory query, absent/unsafe sanitized view, local graft or other
+unexcluded repository ancestry metadata; a noncanonical prefix/full SHA; or a head
 mismatch makes the migration partition unproved. This failure is distinct from
 the ordinary finding-ancestry receipt checks below.
 
@@ -3097,7 +3104,7 @@ identical, while request-scope-sidecar metadata is excluded and reported on
 the request/reaction plane. During legacy migration, the candidate-history
 top-level `initial_legacy_short_commit_resolution_receipts` and
 `final_legacy_short_commit_resolution_receipts` are
-closed to the six fields shown above, are unique and sorted by `raw_prefix`,
+closed to the seven fields shown above, are unique and sorted by `raw_prefix`,
 cover exactly every raw-derived non-current `clean-pending-resolution` prefix,
 and are type-preservingly identical. Zero, one, or multiple sorted entries are
 valid when and only when the raw-derived set has that cardinality; the empty

@@ -5477,6 +5477,9 @@ printf '%s\n' "$trusted_uv"
         probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
             encoding="utf-8"
         )
+        authority = (
+            SKILL_ROOT / "references/github-codex-evidence-authority.md"
+        ).read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
@@ -5487,6 +5490,99 @@ printf '%s\n' "$trusted_uv"
             encoding="utf-8"
         )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        workspace_runtime = (
+            SKILL_ROOT / "scripts/review_runtime/workspace.py"
+        ).read_text(encoding="utf-8")
+        workspace_tests = (SKILL_ROOT / "tests/test_workspace.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "The fixed `legacy_sanitized_git_prefix`",
+            probes,
+        )
+        self.assertIn(
+            "GIT_OBJECT_DIRECTORY=<validated_source_object_directory>",
+            probes,
+        )
+        self.assertIn(
+            "--git-dir=<sanitized_git_view>",
+            probes,
+        )
+        self.assertIn("core.commitGraph=false", probes)
+        self.assertIn("core.multiPackIndex=false", probes)
+        self.assertIn(
+            "<legacy_sanitized_git_prefix> rev-parse --disambiguate=<raw_prefix>",
+            probes,
+        )
+        self.assertIn(
+            "<legacy_sanitized_git_prefix> cat-file -t '<sole_full_sha>'",
+            probes,
+        )
+        self.assertIn(
+            "<legacy_sanitized_git_prefix> merge-base --is-ancestor "
+            "<sole_full_sha> <current_head>",
+            probes,
+        )
+        self.assertIn("no `info/grafts`", probes)
+        self.assertIn(
+            "Never run the queries against the source",
+            " ".join(probes.split()),
+        )
+        self.assertNotIn("git cat-file -e '<sole_full_sha>^{commit}'", probes)
+        self.assertIn(
+            'removing only that LF yields `object_type == "commit"`',
+            probes,
+        )
+        self.assertIn("def _temporary_sanitized_git_view(", workspace_runtime)
+        self.assertIn("def _run_sanitized_git_query(", workspace_runtime)
+        self.assertIn('"GIT_NO_REPLACE_OBJECTS": "1"', workspace_runtime)
+        self.assertIn('"core.commitGraph=false"', workspace_runtime)
+        self.assertIn('"core.multiPackIndex=false"', workspace_runtime)
+        self.assertIn(
+            "test_sanitized_git_query_uses_short_lived_view_and_source_objects",
+            workspace_tests,
+        )
+        self.assertIn(
+            "test_ancestor_check_ignores_local_replace_refs",
+            workspace_tests,
+        )
+        self.assertIn("test_ancestor_check_ignores_local_grafts", workspace_tests)
+        self.assertIn("test_ancestor_check_ignores_stale_commit_graph", workspace_tests)
+        self.assertIn(
+            "test_sanitized_git_query_ignores_corrupt_source_multi_pack_index",
+            workspace_tests,
+        )
+        for document in (skill, authority, readiness, contracts):
+            normalized_document = " ".join(document.split())
+            self.assertIn(
+                "`commit_object_check_return_code`, `object_type`, and "
+                "`ancestry_return_code`",
+                normalized_document,
+            )
+            self.assertIn('`object_type == "commit"`', normalized_document)
+            self.assertIn("sanitized bare Git view", normalized_document)
+            self.assertIn("local grafts", normalized_document)
+            self.assertIn("replace refs", normalized_document)
+            self.assertIn("multi-pack-index", normalized_document)
+        if CI_PROFILE == "canonical":
+            decision_journals = (
+                REPO_ROOT / "docs/project_journal/2026/07/"
+                "2026-07-30-github-codex-evidence-authority-gea001.md",
+                REPO_ROOT / "docs/project_journal/2026/08/"
+                "2026-08-05-claude-api-status-auth-ca401f.md",
+            )
+            for journal_path in decision_journals:
+                journal_text = journal_path.read_text(encoding="utf-8")
+                self.assertIn('`object_type == "commit"`', journal_text)
+                self.assertIn("annotated tag", journal_text.lower())
+                self.assertIn("sanitized bare Git view", journal_text)
+                self.assertTrue(
+                    ".git/info/grafts" in journal_text or "local grafts" in journal_text
+                )
+                self.assertIn("replace refs", journal_text)
+                self.assertIn("multi-pack-index", journal_text)
+                self.assertNotIn("exact six-field entries", journal_text)
 
         for anchor in (
             "only a proven missing PR, unsupported host, or unsupported operating identity establishes third-lane unavailability",
@@ -20000,6 +20096,7 @@ printf '%s\n' "$trusted_uv"
                     "disambiguate_return_code": 0,
                     "disambiguated_object_ids": [resolutions[raw_prefix]],
                     "commit_object_check_return_code": 0,
+                    "object_type": "commit",
                     "ancestry_return_code": 0,
                 }
                 for raw_prefix in sorted(resolutions)
@@ -20197,6 +20294,7 @@ printf '%s\n' "$trusted_uv"
                 "disambiguate_return_code",
                 "disambiguated_object_ids",
                 "commit_object_check_return_code",
+                "object_type",
                 "ancestry_return_code",
             }
             mapping: dict[str, str] = {}
@@ -20222,6 +20320,7 @@ printf '%s\n' "$trusted_uv"
                     or object_ids[0] == current_head
                     or type(receipt.get("commit_object_check_return_code")) is not int
                     or receipt.get("commit_object_check_return_code") != 0
+                    or receipt.get("object_type") != "commit"
                     or type(receipt.get("ancestry_return_code")) is not int
                     or receipt.get("ancestry_return_code") != 0
                 ):
@@ -37227,6 +37326,7 @@ printf '%s\n' "$trusted_uv"
                 "disambiguate_return_code",
                 "disambiguated_object_ids",
                 "commit_object_check_return_code",
+                "object_type",
                 "ancestry_return_code",
             },
         )
@@ -37640,6 +37740,11 @@ printf '%s\n' "$trusted_uv"
             False,
         )
         mutate_prefix_receipt(
+            "annotated-tag-peels-to-commit",
+            "object_type",
+            "tag",
+        )
+        mutate_prefix_receipt(
             "ancestry-error",
             "ancestry_return_code",
             128,
@@ -37671,6 +37776,13 @@ printf '%s\n' "$trusted_uv"
                 f"{phase}_legacy_short_commit_resolution_receipts"
             ][0]["commit_object_check_return_code"]
         prefix_receipt_near_misses["missing-item-field"] = missing_item_field_history
+        missing_object_type_history = clone(live_history)
+        assert isinstance(missing_object_type_history, dict)
+        for phase in ("initial", "final"):
+            del missing_object_type_history[
+                f"{phase}_legacy_short_commit_resolution_receipts"
+            ][0]["object_type"]
+        prefix_receipt_near_misses["missing-object-type"] = missing_object_type_history
         extra_item_field_history = clone(live_history)
         assert isinstance(extra_item_field_history, dict)
         for phase in ("initial", "final"):

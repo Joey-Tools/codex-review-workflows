@@ -699,6 +699,7 @@ class WorkspaceTest(unittest.TestCase):
             self.assertIn(f"--git-dir={git_view}", command)
             self.assertNotIn("-C", command)
             self.assertIn("core.commitGraph=false", command)
+            self.assertIn("core.multiPackIndex=false", command)
             self.assertEqual(
                 command[-4:],
                 ("merge-base", "--is-ancestor", self.base, self.head),
@@ -717,6 +718,27 @@ class WorkspaceTest(unittest.TestCase):
             self.assertFalse((git_view / "info" / "grafts").exists())
 
         self.assertFalse(temporary_root.exists())
+
+    def test_sanitized_git_query_ignores_corrupt_source_multi_pack_index(
+        self,
+    ) -> None:
+        git(self.repo, "repack", "-ad")
+        git(self.repo, "multi-pack-index", "write")
+        multi_pack_index = self.repo / ".git" / "objects" / "pack" / "multi-pack-index"
+        self.assertTrue(multi_pack_index.is_file())
+        multi_pack_index.write_bytes(b"hostile multi-pack-index\n")
+
+        with workspace_runtime._temporary_sanitized_git_view(
+            source_root=self.repo,
+        ) as (git_view, object_directory):
+            result = workspace_runtime._run_sanitized_git_query(
+                git_view=git_view,
+                object_directory=object_directory,
+                args=("cat-file", "-t", self.head),
+                label="sanitized exact-object Git query",
+            )
+
+        self.assertEqual(result.stdout, b"commit\n")
 
     def test_git_environment_ignores_ambient_global_config_override(self) -> None:
         with mock.patch.dict(

@@ -140,8 +140,13 @@ superseded_by:
   parent-owned initial/final local Git prefix-resolution receipt arrays; an
   ancestry array cannot self-attest it. The receipts completely cover every
   raw-derived prefix, are unique and sorted by `raw_prefix`, enumerate exactly
-  one prefix-matching full commit with disambiguation/commit/ancestor return
-  codes `0`, and remain type-preservingly identical. They prove only ancestor
+  one prefix-matching full object, record exact-object `git cat-file -t`
+  success with `object_type == "commit"`, prove ancestry with return code `0`,
+  run all three queries in independent parent-trusted short-lived sanitized
+  bare Git views that exclude local grafts, ambient config, replace refs,
+  shallow/alternate/promisor dependencies, lazy fetch, prompting, and
+  commit-graph/multi-pack-index caches, and remain type-preservingly identical. An annotated tag that peels to a
+  commit fails closed. They prove only ancestor
   applicability, and the report still retains the raw 10 hex. Neither becomes a provider carrier, candidate
   basis, or superseding evidence. Both must be strictly older than both
   selected-result pre-scope `Date` receipts and stable in the initial/final raw
@@ -1747,8 +1752,14 @@ The old 10-hex prefix is admitted only because the history-top-level
 `initial_legacy_short_commit_resolution_receipts` and
 `final_legacy_short_commit_resolution_receipts` completely cover the
 raw-derived pending-prefix set, uniquely enumerate the same prefix-matching
-full commit, prove commit type and ancestry with return codes `0`, and remain
-type-preservingly identical. An ancestry array cannot self-attest that mapping.
+full object, record exact-object `git cat-file -t` success with
+`object_type == "commit"`, prove ancestry with return code `0`, run all three
+queries in independent parent-trusted short-lived sanitized bare Git views
+that exclude `.git/info/grafts`, ambient config, replace refs,
+shallow/alternate/promisor dependencies, lazy fetch, prompting, and
+commit-graph/multi-pack-index caches, and remain
+type-preservingly identical. An annotated tag that peels to a commit fails
+closed. An ancestry array cannot self-attest that mapping.
 The terminal report retains both arrays under
 `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
 a reaction report uses
