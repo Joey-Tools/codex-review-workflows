@@ -20301,6 +20301,9 @@ def _claude_supported_failure_category(
     output_shape = _claude_auth_warmup_output_shape(stdout)
     result_signal_categories = output_shape.get("result_signal_categories")
     if category == "auth":
+        api_error_status = result.get("api_error_status")
+        if type(api_error_status) is int and api_error_status != 401:
+            return None
         if not (
             output_shape.get("event_shape") == "supported-result-error"
             and output_shape.get("result_matches_known_auth_message") is True

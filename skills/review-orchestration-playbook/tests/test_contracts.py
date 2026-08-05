@@ -42922,6 +42922,7 @@ printf '%s\n' "$trusted_uv"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
         permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
         authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401—including bounded numeric `api_error_status: 401`—explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`"
+        non_401_status_anchor = "In the provider compatibility warmup, a present bounded numeric status authorizes the authentication fallback only when it is exactly `401`; any other numeric status conflicts with that fallback and cannot produce `structured-authentication`"
         token_non_authentication_anchor = "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit errors"
         init_blocker_anchor = "When a non-success terminal follows any deterministic init or terminal blocker, absence of error prose preserves `blocked`"
         fallback_anchor = "The validator emits `classification: blocked` with machine reason `terminal.model-entitlement-denial` or `terminal.organization-policy-denial`"
@@ -42930,6 +42931,7 @@ printf '%s\n' "$trusted_uv"
             classifier_anchor,
             permission_anchor,
             authentication_anchor,
+            non_401_status_anchor,
             token_non_authentication_anchor,
             init_blocker_anchor,
             fallback_anchor,
@@ -42944,6 +42946,10 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertLess(
             canonical.index(classifier_anchor), canonical.index(authentication_anchor)
+        )
+        self.assertLess(
+            canonical.index(authentication_anchor),
+            canonical.index(non_401_status_anchor),
         )
 
     def test_codex_authoritative_playbook_source_is_parent_selected_and_exact(
