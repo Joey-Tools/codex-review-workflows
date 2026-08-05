@@ -35,6 +35,7 @@ superseded_by:
 - A named single review of `Joey-Tools/codex-private-workflows` PR 146 reported that generated overlay `providers.py` downgraded exact login text plus numeric `401` to `unverified-auth-failure-envelope`.
 - Canonical-source adjudication assigned the fix to `Joey-Tools/codex-review-workflows` and identified the direct stream validator as a second independent rejection point; fixing only the provider compatibility layer would not have changed the complete named Claude lane outcome.
 - GitHub Codex review of canonical PR 91 identified the converse conflict: a non-401 numeric status could be ignored when stderr supplied authentication prose. The provider compatibility layer now rejects that combination while retaining numeric `401` and recognized transient-status behavior.
+- A fresh whole-range named single review identified that `docs/PROJECT_STATE.md` still pointed to the older 2026-08-03 workstream. The recovery pointer and its contract assertion now select this completed workstream.
 
 ## Next Steps
 
@@ -48,5 +49,5 @@ superseded_by:
 - Canonical documentation contract anchor: 1 test passed in 0.008 seconds.
 - Floating aggregate schema contract case: 1 test passed in 0.003 seconds.
 - PR 91 non-401 conflict regression, canonical documentation anchor, and unchanged direct-stream numeric-status regression passed.
-- Complete review-orchestration suite outside the restricted sandbox: 2,841 tests passed in 1,156.701 seconds with 6 platform-gated skips.
+- Complete review-orchestration suite on the final recovery-pointer state outside the restricted sandbox: 2,841 tests passed in 1,643.517 seconds with 6 platform-gated skips.
 - Ruff lint, aggregate-schema JSON parsing, skill validation, project-journal validation, independent read-only audit, and `git diff --check` passed.

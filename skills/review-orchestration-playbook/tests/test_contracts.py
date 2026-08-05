@@ -2546,7 +2546,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "Latest workstream: "
             "`docs/project_journal/2026/08/"
-            "2026-08-03-claude-2-1-220-stream-schema-c22001.md`",
+            "2026-08-05-claude-api-status-auth-ca401f.md`",
             project_state,
         )
         for evidence in (
