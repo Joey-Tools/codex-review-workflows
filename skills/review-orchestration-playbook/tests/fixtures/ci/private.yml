@@ -2,9 +2,10 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - master
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -17,7 +18,6 @@ jobs:
     name: platform-tests (${{ matrix.os }})
     needs:
       - python-39-compatibility
-      - platform-safety
     strategy:
       fail-fast: false
       matrix:
@@ -105,20 +105,6 @@ jobs:
         run: |
           python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
 
-  broker_reproducibility:
-    name: broker-reproducibility (macos-26)
-    runs-on: macos-26
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Require hosted-runner byte reproduction
-        env:
-          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-        run: |
-          /bin/bash \
-            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
-            --check
-
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
     runs-on: macos-26
@@ -160,6 +146,22 @@ jobs:
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 independent-codex-pr-review --help
+      - uses: actions/setup-python@v5
+        id: setup_latest_python
+        if: always()
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+      - name: Require hosted-runner byte reproduction
+        if: always()
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          /bin/bash \
+            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+            --check
       - name: Require source-only Python tree
         if: always()
         run: |
@@ -1783,7 +1785,9 @@ jobs:
           fi
 
   python-39-compatibility:
-    runs-on: ubuntu-latest
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -1806,22 +1810,13 @@ jobs:
             tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
-      - name: Require source-only Python tree
-        if: always()
-        run: |
-          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
-
-  platform-safety:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup_latest_python
+        if: always()
         with:
           python-version: "3.x"
-      - name: Run platform reconciliation safety tests
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
         run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
       - name: Require source-only Python tree
         if: always()
@@ -1834,24 +1829,20 @@ jobs:
     needs:
       - platform_tests
       - python-39-compatibility
-      - platform-safety
-      - broker_reproducibility
       - independent_supervisor_tests
       - readonly_install_supervisor_tests
-    runs-on: ubuntu-latest
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - name: Require every platform test to pass
         env:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
-          PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
-          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
           READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
-          test "$PLATFORM_SAFETY_RESULT" = "success"
-          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
           test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"

@@ -2318,6 +2318,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "if: github.event_name == 'pull_request_target'",
                 "name: codex/review-gate compatibility publisher",
                 "permissions:\n      statuses: write",
+                "runs-on: ubuntu-slim",
                 "GH_TOKEN: ${{ github.token }}",
                 "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
                 "REPOSITORY: ${{ github.repository }}",
@@ -2346,6 +2347,8 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertEqual(
                 compatibility.count("\n  backfill-open-pull-requests:\n"), 1
             )
+            self.assertEqual(compatibility.count("    runs-on: ubuntu-slim\n"), 2)
+            self.assertNotIn("runs-on: ubuntu-latest", compatibility)
             self.assertEqual(compatibility.count("gh api --paginate --slurp"), 1)
             enumeration = compatibility.index("gh api --paginate --slurp")
             publication = compatibility.index(
@@ -2496,7 +2499,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
     def test_reviewed_ci_snapshots_use_source_only_python_checks(self) -> None:
-        expected_cache_guards = {"canonical": 3, "private": 5}
+        expected_cache_guards = {"canonical": 3, "private": 4}
         for profile, guard_count in expected_cache_guards.items():
             with self.subTest(profile=profile):
                 workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
@@ -2517,6 +2520,112 @@ class RepositoryContractTest(unittest.TestCase):
                     workflow.count("- name: Require source-only Python tree"),
                     guard_count,
                 )
+
+    def test_private_ci_uses_pr_scoped_concurrency_and_compact_job_graph(
+        self,
+    ) -> None:
+        private = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            """on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+""",
+            private,
+        )
+        self.assertNotIn("\n  push:\n", private)
+        self.assertNotIn("\n  broker_reproducibility:\n", private)
+        self.assertNotIn("\n  platform-safety:\n", private)
+        self.assertEqual(private.count("    runs-on: ubuntu-slim\n"), 2)
+        self.assertEqual(
+            private.count(
+                "    # ubuntu-slim supports private repositories and caps jobs "
+                "at 15 minutes.\n"
+            ),
+            2,
+        )
+
+        platform_start = private.index("  platform_tests:")
+        independent_start = private.index("\n  independent_supervisor_tests:")
+        platform_job = private[platform_start:independent_start]
+        self.assertIn(
+            """    needs:
+      - python-39-compatibility
+    strategy:
+""",
+            platform_job,
+        )
+        for runner in ("ubuntu-latest", "macos-latest"):
+            self.assertIn(f"          - {runner}\n", platform_job)
+
+        readonly_start = private.index(
+            "\n  readonly_install_supervisor_tests:",
+            independent_start,
+        )
+        independent_job = private[independent_start + 1 : readonly_start]
+        self.assertIn(
+            """    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+""",
+            independent_job,
+        )
+        reconciliation_step = """      - uses: actions/setup-python@v5
+        id: setup_latest_python
+        if: always()
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+"""
+        broker_step = """      - name: Require hosted-runner byte reproduction
+        if: always()
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          /bin/bash \\
+            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \\
+            --check
+"""
+        self.assertEqual(independent_job.count(reconciliation_step), 1)
+        self.assertEqual(independent_job.count(broker_step), 1)
+        self.assertLess(
+            independent_job.index("      - name: Verify independent review supervisor CLI\n"),
+            independent_job.index(reconciliation_step),
+        )
+        self.assertLess(
+            independent_job.index(reconciliation_step),
+            independent_job.index(broker_step),
+        )
+        self.assertLess(
+            independent_job.index(broker_step),
+            independent_job.index("      - name: Require source-only Python tree\n"),
+        )
+
+        python_39_start = private.index("\n  python-39-compatibility:")
+        test_start = private.index("\n  test:", python_39_start)
+        python_39_job = private[python_39_start + 1 : test_start]
+        self.assertIn("    runs-on: ubuntu-slim\n", python_39_job)
+        self.assertIn("    timeout-minutes: 15\n", python_39_job)
+        self.assertEqual(python_39_job.count(reconciliation_step), 1)
+        self.assertLess(
+            python_39_job.index("      - name: Run Python 3.9 compatibility regressions\n"),
+            python_39_job.index(reconciliation_step),
+        )
+        self.assertLess(
+            python_39_job.index(reconciliation_step),
+            python_39_job.index("      - name: Require source-only Python tree\n"),
+        )
+
+        test_job = private[test_start + 1 :]
+        self.assertIn("    runs-on: ubuntu-slim\n", test_job)
+        self.assertIn("    timeout-minutes: 15\n", test_job)
 
     def test_claude_auth_policy_files_match_distribution_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2587,25 +2696,21 @@ class RepositoryContractTest(unittest.TestCase):
     needs:
       - platform_tests
       - python-39-compatibility
-      - platform-safety
-      - broker_reproducibility
       - independent_supervisor_tests
       - readonly_install_supervisor_tests
-    runs-on: ubuntu-latest
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - name: Require every platform test to pass
         env:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
-          PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
-          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
           READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
-          test "$PLATFORM_SAFETY_RESULT" = "success"
-          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
           test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
 """,
@@ -2669,10 +2774,20 @@ class RepositoryContractTest(unittest.TestCase):
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
             encoding="utf-8"
         )
-        for profile in ("canonical", "private"):
+        job_bounds = {
+            "canonical": (
+                "  broker_reproducibility:",
+                "\n  independent_supervisor_tests:",
+            ),
+            "private": (
+                "  independent_supervisor_tests:",
+                "\n  readonly_install_supervisor_tests:",
+            ),
+        }
+        for profile, (job_start, job_end) in job_bounds.items():
             workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
-            start = workflow.index("  broker_reproducibility:")
-            end = workflow.index("\n  independent_supervisor_tests:", start)
+            start = workflow.index(job_start)
+            end = workflow.index(job_end, start)
             broker_job = workflow[start:end]
             with self.subTest(profile=profile):
                 self.assertNotIn("sudo", broker_job)
@@ -2747,9 +2862,23 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "Latest workstream: "
             "`docs/project_journal/2026/08/"
-            "2026-08-05-claude-api-status-auth-ca401f.md`",
+            "2026-08-06-private-overlay-ci-cost-pci001.md`",
             project_state,
         )
+        ci_cost_journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/08/"
+            / "2026-08-06-private-overlay-ci-cost-pci001.md"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "available to private repositories",
+            "15-minute per-job limit",
+            "https://docs.github.com/en/actions/reference/runners/"
+            "github-hosted-runners#single-cpu-runners",
+            "https://github.blog/changelog/2026-01-22-1-vcpu-linux-runner-"
+            "now-generally-available-in-github-actions/",
+        ):
+            self.assertIn(evidence, ci_cost_journal)
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
