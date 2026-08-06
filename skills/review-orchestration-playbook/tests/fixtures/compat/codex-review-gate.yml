@@ -13,7 +13,7 @@ jobs:
     name: codex/review-gate compatibility publisher
     permissions:
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 1
     env:
       GH_TOKEN: ${{ github.token }}
@@ -42,7 +42,7 @@ jobs:
     permissions:
       pull-requests: read
       statuses: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
