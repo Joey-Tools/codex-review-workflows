@@ -44738,6 +44738,20 @@ printf '%s\n' "$trusted_uv"
         self.assertIsInstance(agents_policy, str)
         assert isinstance(agents_policy, str)
         review_scope_documents.append(agents_policy)
+        for content in (interface, agents_policy):
+            with self.subTest(terminal_clean_disposition=content[:40]):
+                normalized = " ".join(
+                    content.lower().replace("`", "").split()
+                )
+                self.assertIn(
+                    "accepted terminal clean classification is immediately "
+                    "triple-inconclusive",
+                    normalized,
+                )
+                self.assertNotIn(
+                    "missing terminal evidence, a terminal clean classification",
+                    normalized,
+                )
         if CI_PROFILE == "canonical":
             self.assertIsInstance(delivery, str)
             assert isinstance(delivery, str)
@@ -45271,6 +45285,23 @@ printf '%s\n' "$trusted_uv"
         machine = json.loads(machine_path.read_text(encoding="utf-8"))
 
         self.assertEqual(machine["version"], 3)
+        versioned_entrypoints = [
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/pr-readiness.md",
+        ]
+        if CI_PROFILE == "canonical":
+            versioned_entrypoints.append(SKILL_SCOPE_ROOT / "README.md")
+        for path in versioned_entrypoints:
+            with self.subTest(state_machine_version_entrypoint=str(path)):
+                normalized = " ".join(path.read_text(encoding="utf-8").split())
+                self.assertIn("version 3", normalized)
+                for anchor in (
+                    "scope_assurance",
+                    "whole_pr_completion_action",
+                    "clean_action",
+                    "negative_evidence_action",
+                ):
+                    self.assertIn(anchor, normalized)
         self.assertEqual(
             machine["event"],
             "request-time-merge-base-changed-with-same-head",

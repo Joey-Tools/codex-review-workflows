@@ -93,8 +93,10 @@ as-of bounds historical samples and the separate current reaction-only basis
 for `thumbs-up-clean`, not strong current terminal evidence.
 The machine-readable
 [`base-only-retarget-state-machine.json`](skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json)
-is version 2: it preserves version 1 request-sidecar event semantics and adds
-this independent terminal-artifact scope plane.
+is version 3: it preserves version 1 request-sidecar event semantics and
+version 2's independent terminal-artifact scope plane, then adds
+`scope_assurance`, `whole_pr_completion_action`, `clean_action`, and
+`negative_evidence_action`.
 
 For the third lane, re-read a complete authenticated current-scope provider snapshot and classify it under [GitHub Codex Evidence Authority](skills/review-orchestration-playbook/references/github-codex-evidence-authority.md). Record `request_policy`, `provider_profile`, and `evidence_basis`. The provider profiles are `terminal-payload`, `mixed`, `thumbs-up-clean`, and `unknown`. A trustworthy current-scope terminal payload controls artifact classification precedence for `mixed` regardless of reaction ordering: a later `+1`, `eyes`, or other reaction does not overturn it, and `mixed` never accepts reaction-only clean. `eyes` is liveness-only and can block only the weaker reaction-only fallback when it is at or after the selected `+1`.
 
