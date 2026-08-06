@@ -1903,7 +1903,10 @@ def _bind_legacy_source_policy_path(
     ):
         raise NamedLaneGuardError("legacy prefix source access policy is unsafe")
     mode = stat.S_IMODE(metadata.st_mode)
-    if mode & 0o022:
+    sticky_root_custody = (
+        allow_deny_acl and metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
+    )
+    if mode & 0o022 and not sticky_root_custody:
         raise NamedLaneGuardError(
             "legacy prefix source access policy is group/world writable"
         )
@@ -1950,7 +1953,12 @@ def _verify_legacy_source_policy_path(
         raise NamedLaneGuardError(
             "legacy prefix source identity or access policy changed"
         )
-    if binding.mode & 0o022:
+    sticky_root_custody = (
+        binding.allow_deny_acl
+        and binding.owner == 0
+        and bool(binding.mode & stat.S_ISVTX)
+    )
+    if binding.mode & 0o022 and not sticky_root_custody:
         raise NamedLaneGuardError(
             "legacy prefix source access policy is group/world writable"
         )
@@ -2093,7 +2101,6 @@ def _bind_legacy_prefix_source(
             "legacy prefix source object format changed during setup"
         )
     policy_candidates: list[tuple[pathlib.Path, bool]] = [
-        (storage.marker.path.parent.parent, True),
         (storage.marker.path.parent, True),
         (storage.marker.path, not storage.marker.is_gitfile),
         (storage.admin, True),

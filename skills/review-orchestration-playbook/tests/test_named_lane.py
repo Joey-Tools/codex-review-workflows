@@ -2647,6 +2647,48 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertIn("extended ACL grant", payload["reason"])
         self.assertFalse(temporary_path.exists())
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin sticky custody test")
+    def test_legacy_short_prefix_receipts_accept_root_owned_sticky_source_ancestor(
+        self,
+    ) -> None:
+        sticky_parent = pathlib.Path("/private/tmp")
+        try:
+            sticky_metadata = sticky_parent.lstat()
+        except OSError:
+            self.skipTest("root-owned sticky temporary directory is unavailable")
+        if (
+            not stat.S_ISDIR(sticky_metadata.st_mode)
+            or sticky_metadata.st_uid != 0
+            or not stat.S_IMODE(sticky_metadata.st_mode) & stat.S_ISVTX
+        ):
+            self.skipTest("root-owned sticky temporary directory is unavailable")
+
+        base, _middle, head = self.legacy_prefix_history()
+        linked_source = sticky_parent / f"{self.root.name}-legacy-sticky-source"
+        if linked_source.exists():
+            self.fail(f"unexpected sticky-source fixture collision: {linked_source}")
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        temporary_path = self.root / "legacy-sticky-source-view"
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=linked_source.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            shutil.rmtree(linked_source, ignore_errors=True)
+
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            payload["receipts"][0]["disambiguated_object_ids"],
+            [base],
+        )
+        self.assertFalse(temporary_path.exists())
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
     def test_legacy_short_prefix_receipts_revalidate_extended_acl_after_query(
         self,

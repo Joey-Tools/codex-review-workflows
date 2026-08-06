@@ -5704,6 +5704,7 @@ printf '%s\n' "$trusted_uv"
             "test_legacy_short_prefix_receipts_reject_group_world_writable_source_policy",
             "test_legacy_short_prefix_receipts_reject_extended_acl_source_policy",
             "test_legacy_short_prefix_receipts_reject_linked_common_parent_acl_grant",
+            "test_legacy_short_prefix_receipts_accept_root_owned_sticky_source_ancestor",
             "test_legacy_short_prefix_receipts_revalidate_extended_acl_after_query",
             "test_legacy_short_prefix_receipts_bound_object_store_policy_inventory",
             "test_legacy_object_store_policy_limit_precedes_next_inventory_entry",

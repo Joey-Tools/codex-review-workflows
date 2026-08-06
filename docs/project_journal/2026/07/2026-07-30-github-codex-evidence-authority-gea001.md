@@ -1835,6 +1835,12 @@ periodically debit the single receipt deadline. The corrected inventory streams
 each entry, checks the shared limit before metadata inspection or another
 iteration, and checks that same non-resetting phase-global deadline before each
 directory and every 256 entries; uncertainty still returns no partial receipts.
+A final fresh whole-range review then found that the root-owned sticky custody
+exception was canceled by the shared mode check and by retaining the source
+parent in the strict leaf set. The correction applies the same sticky exception
+during custody binding and revalidation, keeps the actual source and Git leaves
+strict, and proves the intended availability with a linked worktree directly
+below `/private/tmp`.
 The terminal report retains both arrays under
 `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
 a reaction report uses
