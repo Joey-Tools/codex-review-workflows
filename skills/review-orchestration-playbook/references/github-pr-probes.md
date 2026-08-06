@@ -456,7 +456,7 @@ array cannot self-attest this mapping. Each item has exactly `raw_prefix`,
 `commit_object_check_return_code`, `object_type`, and `ancestry_return_code`. Each phase must
 cover exactly the raw-derived non-current pending-prefix set, with unique items
 sorted by `raw_prefix`; enumerate every matching local Git object through the
-short-lived sanitized bare Git view below, with lazy fetch, credential
+manifest-bound public guard producer below, with lazy fetch, credential
 prompting, replacement objects, local grafts, ambient configuration, and
 commit-graph and multi-pack-index caches excluded; require disambiguation return `0`,
 exactly one full lowercase SHA beginning with the prefix, exact-object type
@@ -475,72 +475,103 @@ or supersedes evidence. A state, actor, repository, SHA, path, line, badge,
 title/prose, disclosure, or inline/thread near-miss is truly malformed and
 cannot use the exception.
 
-For each initial/final phase, independently create a new owner-private,
-short-lived bare Git view using the parent-recorded trusted review-runtime
-bundle's sanitized-view implementation. For a self-policy migration, this
-implementation comes from the independently trusted bundle recorded outside
-the candidate range; never execute candidate-head Python or shell to create the
-view. The view has a minimal bare config for the source object format, empty
-`objects` and `refs`, no `info/grafts`, `shallow`, replace refs, remotes, hooks,
-or worktree, and binds the exact validated locally complete source object
-directory only through `GIT_OBJECT_DIRECTORY`. Reject source alternates,
-promisor dependencies, or an unsafe/ambiguous object directory before use.
-
-The fixed `legacy_sanitized_git_prefix` is this exact token sequence:
-
-```text
-/usr/bin/env
--i
-PATH=<recorded_trusted_path>
-LANG=C
-LC_ALL=C
-GIT_ATTR_NOSYSTEM=1
-GIT_ASKPASS=/usr/bin/false
-GIT_CONFIG_GLOBAL=/dev/null
-GIT_CONFIG_NOSYSTEM=1
-GIT_NO_LAZY_FETCH=1
-GIT_NO_REPLACE_OBJECTS=1
-GIT_OBJECT_DIRECTORY=<validated_source_object_directory>
-GIT_OPTIONAL_LOCKS=0
-GIT_PAGER=cat
-GIT_TERMINAL_PROMPT=0
-PAGER=cat
-SSH_ASKPASS=/usr/bin/false
-<resolved_trusted_git>
---no-pager
--c
-core.fsmonitor=false
--c
-core.commitGraph=false
--c
-core.multiPackIndex=false
--c
-core.hooksPath=/dev/null
--c
-diff.external=
---git-dir=<sanitized_git_view>
-```
-
-Append only these fixed read-only queries for each legacy prefix receipt:
+For each initial/final phase, invoke only the parent-recorded independently
+trusted bundle's manifest-bound default-profile producer. The fixed formal
+entry is:
 
 ```sh
-<legacy_sanitized_git_prefix> rev-parse --disambiguate=<raw_prefix>
-<legacy_sanitized_git_prefix> cat-file -t '<sole_full_sha>'
-<legacy_sanitized_git_prefix> merge-base --is-ancestor <sole_full_sha> <current_head>
+<trusted-python-absolute-path> -I -B -S \
+  <trusted-bundle-absolute-path>/skills/review-orchestration-playbook/scripts/named_lane_guard \
+  legacy-short-prefix-receipts \
+  --source <absolute-exact-worktree-root> \
+  --temporary-path <absolute-phase-unique-absent-child-under-owner-private-0700-parent> \
+  --head <current-lowercase-full-object-id> \
+  --phase initial \
+  --prefix <raw-lowercase-10-hex> \
+  [--prefix <another-raw-lowercase-10-hex> ...]
+```
+
+Use the fixed clean parent environment from `review-lane-contracts.md`, and
+use `--phase final` plus a different absent temporary path for the final pass.
+The repeatable prefixes are unique, sorted by the producer, and must exactly
+equal that raw inventory's complete non-current pending-prefix set. A prefix
+equal to the first 10 hex of `head` is `inconclusive`; a selected current-head
+short clean remains on its independent dual REST resolution path. Zero
+`--prefix` values are valid: the producer still performs complete
+source/head/view validation and cleanup and must return `receipts: []`.
+
+The producer is part of the default exact three-source manifest-bound guard
+closure through `review_runtime.named_lane`. It applies the materializer-grade
+source worktree, `.git` marker, admin/common/object-directory, linked-worktree
+back-pointer, owner/type/identity/access-policy, object-format, and local
+completeness checks before creating a new minimal owner-private bare control
+view at the exact absent temporary leaf. It rejects source alternates and HTTP
+alternates, common/admin and per-worktree shallow state, promisor/partial-clone
+configuration or pack markers, source pack bitmaps, suffix-DWIM or unsafe
+control paths, and an unsafe/ambiguous object directory. The view and child
+environment exclude `info/grafts`, ambient/system/global config, source refs
+and hooks, replace refs, remotes, lazy fetch, prompting, and commit-graph and
+multi-pack-index consumption. Source config is read only through bounded
+no-follow direct no-include inspection; Git never loads it.
+
+After that setup, the producer first runs these bounded phase-level control
+preflights, in order, against the same invocation-local view:
+
+```sh
+git cat-file -t <head>
+git rev-list --objects --missing=error --quiet <head> --
+```
+
+The exact-object type preflight must return `0` with exact `commit` plus LF;
+the reachable-closure preflight must return `0` without unexpected output.
+Together they prove the exact head commit and its complete reachable object
+closure in the isolated view, even when no prefixes exist. Neither populates a
+receipt field or counts as a per-prefix receipt query. The producer then runs
+exactly these three bounded read-only receipt queries per sorted prefix, in
+order, against that same view:
+
+```sh
+git rev-parse --disambiguate=<raw_prefix>
+git cat-file -t <sole_full_object_id>
+git merge-base --is-ancestor <sole_full_object_id> <head>
 ```
 
 The first command's complete stdout lines become
-`disambiguated_object_ids`; do not select one result from a larger set. The
-second command's stdout must be exactly the single ASCII line `commit` plus
-one terminating LF; removing only that LF yields `object_type == "commit"`.
-Its return code populates `commit_object_check_return_code`. The
-three command return codes populate their corresponding closed receipt fields.
-Run all three against the same phase-local sanitized view, validated source
-object directory, and frozen current head under one bounded parent-owned
-operation. Destroy that view before the next independent phase. Never run the
-queries against the source repository's Git directory, where `info/grafts`,
-replace refs, shallow state, config, hooks, or object-cache metadata could
-rewrite object identity or ancestry.
+`disambiguated_object_ids`; it must return `0` with exactly one well-formed
+lowercase full-width prefix match. The exact-object, non-peeling type check
+must return `0` and exactly the single ASCII line `commit` plus LF, yielding
+`object_type == "commit"`. The ancestry query must return `0`. An annotated
+tag, non-ancestor, zero/multiple/malformed disambiguation, command/output
+near-miss, hostile source state, or uncertain process/revalidation/cleanup
+produces no partial receipt.
+
+Accept only the closed success envelope with
+`schema_version: named-lane-legacy-short-prefix-receipts-v1`, exact
+`status: ok`, matching `phase` and `head`,
+`temporary_cleanup_status: complete`, and generic `receipts`. The array is
+unique and `raw_prefix`-sorted; every item has exactly the seven fields defined
+above and every return code is `0`. Map only this generic array to the matching
+history-top-level initial/final field. A semantic failure is structured
+`inconclusive` with no receipts; source/view/control/process/revalidation or
+cleanup uncertainty is `blocked-safety`, also with no receipts. Success is
+published only after the temporary view and controls are removed.
+
+Revalidate the same trusted bundle path/version/manifest digest before and
+after both independent phase invocations, then require exact prefix coverage,
+head equality, and type-preserving equality of the two seven-field arrays.
+A private workspace helper never supplies receipt evidence. A direct import
+never satisfies this contract. Neither counts as receipt authority. An ad hoc
+wrapper or source-Git-directory query also never counts. The producer does not
+materialize or snapshot the entire object store. Source container
+identity/access policy and full-OID/type/ancestry ordered point-query semantics
+are protected; continuous stability of selected loose-object or pack bytes is
+not. Same-current-UID concurrent object-store content mutation,
+prefix-inventory churn, and intra-phase or inter-phase ABA are not excluded.
+Initial/final equality is two point-in-time observations, not atomicity. For a
+self-policy migration, never execute the candidate-head producer. If the prior
+trusted bundle lacks the subcommand, review and adjudicate under the prior
+trusted policy, merge and release the migration, and only then activate the new
+manifest-bound producer from that trusted release.
 
 Read the selected newly receipted artifact's two raw pre-scope HTTP `Date`
 values directly from its pull-detail and compare receipts. Every legacy item's

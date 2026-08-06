@@ -3,7 +3,7 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-08-05
+updated: 2026-08-06
 branch: wip/github-codex-evidence-authority
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
@@ -142,10 +142,22 @@ superseded_by:
   raw-derived prefix, are unique and sorted by `raw_prefix`, enumerate exactly
   one prefix-matching full object, record exact-object `git cat-file -t`
   success with `object_type == "commit"`, prove ancestry with return code `0`,
-  run all three queries in independent parent-trusted short-lived sanitized
-  bare Git views that exclude local grafts, ambient config, replace refs,
-  shallow/alternate/promisor dependencies, lazy fetch, prompting, and
-  commit-graph/multi-pack-index caches, and remain type-preservingly identical. An annotated tag that peels to a
+  and remain type-preservingly identical. Each phase comes only from the
+  independently trusted bundle's manifest-bound default-profile
+  `named_lane_guard legacy-short-prefix-receipts`, with exact source, distinct
+  absent owner-private temporary path, head, phase, complete repeatable prefix
+  set, fixed success schema
+  `named-lane-legacy-short-prefix-receipts-v1`, and cleanup-complete receipt. It applies
+  materializer-grade source identity/access-policy checks, rejects alternate,
+  HTTP-alternate, common/admin and per-worktree shallow, promisor/partial-clone,
+  bitmap, unsafe config, and incomplete-object state, and isolates local
+  grafts, ambient config, source refs/hooks, replace refs, lazy fetch,
+  prompting, and commit-graph/multi-pack-index consumption. Against that view,
+  the phase-level exact-head-type and reachable-closure controls are
+  `git cat-file -t <head>` and
+  `git rev-list --objects --missing=error --quiet <head> --`; they run even for
+  an empty prefix set and do not count among the exactly three per-prefix
+  receipt queries. An annotated tag that peels to a
   commit fails closed. They prove only ancestor
   applicability, and the report still retains the raw 10 hex. Neither becomes a provider carrier, candidate
   basis, or superseding evidence. Both must be strictly older than both
@@ -514,6 +526,26 @@ superseded_by:
   pinned documentation reference and the executable closed-schema tests
   together; adding a caller-supplied or derived self URL is not a compatible
   extension.
+- The seven-field legacy-prefix array is machine evidence only when a public,
+  manifest-bound producer creates it. Requiring a sanitized view while
+  pointing implementers at a private workspace helper left no callable
+  independently trusted control-plane entry and let unsafe source repository
+  state become an undocumented precondition. The public guard subcommand now
+  owns materializer-grade source validation, phase-level exact-head and
+  reachable-closure controls, the exactly three receipt queries per prefix,
+  bounded process/output handling, success-only cleanup, and a closed schema.
+  A private workspace helper never supplies receipt evidence. A direct import
+  never satisfies this contract. Neither counts as receipt authority. The
+  producer does not materialize or snapshot the entire object store. Source
+  container identity/access policy and full-OID/type/ancestry ordered
+  point-query semantics are protected; continuous stability of selected
+  loose-object or pack bytes is not. Same-current-UID concurrent object-store
+  content mutation, prefix-inventory churn, and intra-phase or inter-phase ABA
+  are not excluded. Initial/final equality is two point-in-time observations,
+  not atomicity. This is also why the migration
+  cannot bootstrap itself: when a prior trusted release lacks the producer,
+  formal review remains under prior policy until the change is merged and
+  released, after which the newly manifest-bound producer may be activated.
 
 ## Latest Formal-Review Disposition
 
@@ -1753,13 +1785,25 @@ The old 10-hex prefix is admitted only because the history-top-level
 `final_legacy_short_commit_resolution_receipts` completely cover the
 raw-derived pending-prefix set, uniquely enumerate the same prefix-matching
 full object, record exact-object `git cat-file -t` success with
-`object_type == "commit"`, prove ancestry with return code `0`, run all three
-queries in independent parent-trusted short-lived sanitized bare Git views
-that exclude `.git/info/grafts`, ambient config, replace refs,
-shallow/alternate/promisor dependencies, lazy fetch, prompting, and
-commit-graph/multi-pack-index caches, and remain
+`object_type == "commit"`, prove ancestry with return code `0`, and remain
 type-preservingly identical. An annotated tag that peels to a commit fails
 closed. An ancestry array cannot self-attest that mapping.
+Each phase is produced only through the independently trusted bundle's
+manifest-bound `named_lane_guard legacy-short-prefix-receipts`. The success
+envelope binds schema, phase, head, cleanup completion, and the sorted generic
+seven-field array after materializer-grade source validation and exactly three
+bounded per-prefix Git queries in a phase-unique owner-private temporary view.
+Before those receipt queries, phase-level `git cat-file -t <head>` and
+`git rev-list --objects --missing=error --quiet <head> --` controls prove the
+exact head commit and its complete reachable object closure in that same view;
+neither creates a receipt field.
+Alternate/HTTP-alternate, common/admin and per-worktree shallow,
+promisor/partial-clone, bitmap, unsafe config, and incomplete source state are
+rejected; `.git/info/grafts`, ambient config, source refs/hooks, replace refs,
+lazy fetch, prompting, and commit-graph/multi-pack-index consumption are
+isolated. Direct imports, private workspace helpers, ad hoc query wrappers, and
+source-directory Git calls do not count. Cleanup completes before success, and
+semantic or safety failure returns no partial receipts.
 The terminal report retains both arrays under
 `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
 a reaction report uses

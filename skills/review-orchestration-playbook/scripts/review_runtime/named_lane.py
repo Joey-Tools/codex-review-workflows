@@ -60,6 +60,11 @@ MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT = 64 * 1024 * 1024
 MATERIALIZER_PACK_BYTES_LIMIT = 256 * 1024 * 1024
 MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES = 1024 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+LOWER_FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+LEGACY_SHORT_OBJECT_PREFIX = re.compile(r"[0-9a-f]{10}\Z")
+LEGACY_PREFIX_RECEIPT_TIMEOUT_SECONDS = 120.0
+LEGACY_PREFIX_RECEIPT_OUTPUT_LIMIT_BYTES = 1024
+LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION = "named-lane-legacy-short-prefix-receipts-v1"
 CLAUDE_ENV_PASSTHROUGH_KEYS = (
     "ALL_PROXY",
     "COLORTERM",
@@ -85,6 +90,21 @@ CLAUDE_ENV_PASSTHROUGH_KEYS = (
 
 class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
+
+
+class LegacyPrefixReceiptInconclusive(ReviewError):
+    """A legacy prefix was deterministically ineligible for a success receipt."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in {
+            "legacy-prefix-is-current-head",
+            "legacy-prefix-not-unique",
+            "legacy-prefix-not-commit",
+            "legacy-prefix-not-ancestor",
+        }:
+            raise ValueError("unknown legacy prefix receipt reason")
+        self.reason = reason
+        super().__init__(reason)
 
 
 class _ClaudeLaunchSnapshotCleanupError(NamedLaneGuardError):
@@ -119,8 +139,7 @@ class _ClaudeLaunchSnapshotCleanupError(NamedLaneGuardError):
                 f"inode={retained_parent_identity[1]}, leaf={retained_leaf}"
             )
         super().__init__(
-            "Claude launch snapshot cleanup failed after "
-            f"{process_reason}; {detail}"
+            f"Claude launch snapshot cleanup failed after {process_reason}; {detail}"
         )
 
 
@@ -177,6 +196,59 @@ class _MaterializerSourceStorage:
     objects: pathlib.Path
     objects_identity: _DirectoryIdentity
     object_format: str
+
+
+@dataclass(frozen=True)
+class _LegacySourcePolicyBinding:
+    path: pathlib.Path
+    device: int
+    inode: int
+    file_type: int
+    owner: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class _LegacySourceContentBinding:
+    path: pathlib.Path
+    label: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _LegacyPrefixSourceBinding:
+    storage: _MaterializerSourceStorage
+    policy_bindings: tuple[_LegacySourcePolicyBinding, ...]
+    content_bindings: tuple[_LegacySourceContentBinding, ...]
+    commondir_present: bool
+
+
+@dataclass(frozen=True)
+class _LegacyPrefixViewBinding:
+    root: pathlib.Path
+    root_identity: _DirectoryIdentity
+    objects_identity: _DirectoryIdentity
+    refs_identity: _DirectoryIdentity
+    config_identity: tuple[int, int, int, int]
+    head_identity: tuple[int, int, int, int]
+    config_bytes: bytes
+    head_bytes: bytes
+
+
+@dataclass(frozen=True)
+class _LegacyPrefixControlBinding:
+    root: pathlib.Path
+    root_identity: _DirectoryIdentity
+    children: tuple[tuple[pathlib.Path, _DirectoryIdentity], ...]
+
+
+@dataclass(frozen=True)
+class LegacyPrefixReceiptResult:
+    phase: str
+    head_sha: str
+    receipts: tuple[dict[str, object], ...]
+    _handoff_signal_mask: set[signal.Signals] | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +449,108 @@ def _verify_materializer_parent(
         raise NamedLaneGuardError(
             "materialized worktree parent changed during materialization"
         )
+
+
+def _open_legacy_prefix_parent_descriptor(
+    parent: pathlib.Path,
+    expected: _DirectoryIdentity,
+) -> int:
+    descriptor = -1
+    bound = False
+    try:
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or _directory_identity(metadata) != expected
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix temporary parent descriptor is not bound safely"
+            )
+        bound = True
+        return descriptor
+    except NamedLaneGuardError:
+        raise
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix temporary parent descriptor cannot be opened"
+        ) from error
+    finally:
+        if descriptor >= 0 and not bound:
+            os.close(descriptor)
+
+
+def _legacy_prefix_retained_evidence(
+    *,
+    label: str,
+    path: pathlib.Path,
+    expected_identity: _DirectoryIdentity | None,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+    parent_fd: int,
+) -> str:
+    descriptor_bound = False
+    try:
+        descriptor_metadata = os.fstat(parent_fd)
+        descriptor_bound = (
+            stat.S_ISDIR(descriptor_metadata.st_mode)
+            and descriptor_metadata.st_uid == _current_user_id()
+            and _directory_identity(descriptor_metadata) == parent_identity
+        )
+    except OSError:
+        descriptor_metadata = None
+    if descriptor_bound and expected_identity is not None:
+        try:
+            _verify_materializer_parent(parent, parent_identity)
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except (NamedLaneGuardError, OSError, RuntimeError):
+            pass
+        else:
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_uid == _current_user_id()
+                and resolved == path
+                and path.parent == parent
+                and _directory_identity(metadata) == expected_identity
+            ):
+                return f"retained legacy prefix {label} path: {path}"
+    return (
+        f"retained legacy prefix {label} locator: "
+        f"parent device={parent_identity.device}, "
+        f"inode={parent_identity.inode}, leaf={path.name}"
+    )
+
+
+def _cleanup_legacy_prefix_path(
+    path: pathlib.Path,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+    expected_identity: _DirectoryIdentity | None,
+) -> pathlib.Path | None:
+    retained = _cleanup_materializer_path(
+        path,
+        parent,
+        parent_identity,
+        expected_identity,
+    )
+    try:
+        _verify_materializer_parent(parent, parent_identity)
+    except NamedLaneGuardError:
+        # Lexical absence after parent replacement does not prove that the
+        # bound original parent's leaf was removed. Preserve descriptor-locator
+        # evidence even when the generic lexical cleanup reported absence.
+        return path
+    return retained
 
 
 def _resolve_materializer_source(
@@ -585,12 +759,14 @@ def _validate_materializer_git_version(
     git: pathlib.Path,
     environment: Mapping[str, str],
     cwd: pathlib.Path,
+    *,
+    timeout_seconds: float = 30.0,
 ) -> None:
     capture = run_bounded_capture(
         (str(git), "--version"),
         cwd=cwd,
         env=dict(environment),
-        timeout_seconds=30.0,
+        timeout_seconds=timeout_seconds,
         stdout_limit_bytes=1024,
         stderr_limit_bytes=1024,
     )
@@ -1074,32 +1250,23 @@ def _verify_materializer_source_back_pointer(
         )
 
 
-def _materializer_source_object_format(
-    common: pathlib.Path,
+def _materializer_source_object_format_from_payload(
+    config_payload: bytearray,
     oid_length: int,
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
+    *,
+    timeout_seconds: float = MATERIALIZER_GIT_TIMEOUT_SECONDS,
 ) -> str:
-    try:
-        config_payload = _read_materializer_control_file(
-            common / "config",
-            label="Git config",
-        )
-    except NamedLaneGuardError as error:
-        raise NamedLaneGuardError(
-            "materializer source must name an exact Git worktree root"
-        ) from error
-    try:
-        parsed = _materializer_git_capture(
-            git,
-            environment,
-            hooks,
-            ("config", "--file", "-", "--no-includes", "--null", "--list"),
-            stdin=config_payload,
-        )
-    finally:
-        config_payload[:] = b"\x00" * len(config_payload)
+    parsed = _materializer_git_capture(
+        git,
+        environment,
+        hooks,
+        ("config", "--file", "-", "--no-includes", "--null", "--list"),
+        stdin=config_payload,
+        timeout_seconds=timeout_seconds,
+    )
     records = _parse_git_config_records(
         parsed,
         label="materializer source Git config",
@@ -1143,6 +1310,37 @@ def _materializer_source_object_format(
             "materializer source Git object format does not match frozen object IDs"
         )
     return expected
+
+
+def _materializer_source_object_format(
+    common: pathlib.Path,
+    oid_length: int,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+    *,
+    timeout_seconds: float = MATERIALIZER_GIT_TIMEOUT_SECONDS,
+) -> str:
+    try:
+        config_payload = _read_materializer_control_file(
+            common / "config",
+            label="Git config",
+        )
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        ) from error
+    try:
+        return _materializer_source_object_format_from_payload(
+            config_payload,
+            oid_length,
+            git,
+            environment,
+            hooks,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        config_payload[:] = b"\x00" * len(config_payload)
 
 
 def _verify_materializer_source_storage(
@@ -1254,6 +1452,8 @@ def _validate_materializer_source_repository(
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
+    *,
+    timeout_seconds: float = MATERIALIZER_GIT_TIMEOUT_SECONDS,
 ) -> _MaterializerSourceStorage:
     _verify_materializer_source_marker(marker_binding, source)
     marker = marker_binding.path
@@ -1325,6 +1525,7 @@ def _validate_materializer_source_repository(
         git,
         environment,
         hooks,
+        timeout_seconds=timeout_seconds,
     )
     objects = common / "objects"
     try:
@@ -1359,6 +1560,1101 @@ def _validate_materializer_source_repository(
     )
     _verify_materializer_source_storage(storage)
     return storage
+
+
+def _bind_legacy_source_policy_path(
+    path: pathlib.Path,
+    *,
+    expect_directory: bool,
+) -> _LegacySourcePolicyBinding:
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "legacy prefix source access policy cannot be inspected"
+        ) from error
+    expected_type = stat.S_IFDIR if expect_directory else stat.S_IFREG
+    if (
+        stat.S_IFMT(metadata.st_mode) != expected_type
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+        or resolved != path
+    ):
+        raise NamedLaneGuardError("legacy prefix source access policy is unsafe")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022:
+        raise NamedLaneGuardError(
+            "legacy prefix source access policy is group/world writable"
+        )
+    return _LegacySourcePolicyBinding(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        file_type=stat.S_IFMT(metadata.st_mode),
+        owner=metadata.st_uid,
+        mode=mode,
+    )
+
+
+def _verify_legacy_source_policy_path(
+    binding: _LegacySourcePolicyBinding,
+) -> None:
+    try:
+        metadata = binding.path.lstat()
+        resolved = binding.path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "legacy prefix source access policy cannot be revalidated"
+        ) from error
+    current = (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+    expected = (
+        binding.device,
+        binding.inode,
+        binding.file_type,
+        binding.owner,
+        binding.mode,
+    )
+    if (
+        current != expected
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != binding.path
+    ):
+        raise NamedLaneGuardError(
+            "legacy prefix source identity or access policy changed"
+        )
+    if binding.mode & 0o022:
+        raise NamedLaneGuardError(
+            "legacy prefix source access policy is group/world writable"
+        )
+
+
+def _legacy_source_content_binding(
+    path: pathlib.Path,
+    label: str,
+    payload: bytes | bytearray,
+) -> _LegacySourceContentBinding:
+    return _LegacySourceContentBinding(
+        path=path,
+        label=label,
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _read_legacy_source_content_binding(
+    path: pathlib.Path,
+    label: str,
+) -> _LegacySourceContentBinding:
+    payload = _read_materializer_control_file(path, label=label)
+    try:
+        return _legacy_source_content_binding(path, label, payload)
+    finally:
+        payload[:] = b"\x00" * len(payload)
+
+
+def _bind_legacy_prefix_source(
+    storage: _MaterializerSourceStorage,
+    oid_length: int,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+    *,
+    timeout_seconds: float,
+) -> _LegacyPrefixSourceBinding:
+    _verify_materializer_source_storage(storage)
+    config_payload = _read_materializer_control_file(
+        storage.common / "config",
+        label="Git config",
+    )
+    try:
+        object_format = _materializer_source_object_format_from_payload(
+            config_payload,
+            oid_length,
+            git,
+            environment,
+            hooks,
+            timeout_seconds=timeout_seconds,
+        )
+        content_bindings = [
+            _legacy_source_content_binding(
+                storage.common / "config",
+                "Git config",
+                config_payload,
+            )
+        ]
+    finally:
+        config_payload[:] = b"\x00" * len(config_payload)
+    if object_format != storage.object_format:
+        raise NamedLaneGuardError(
+            "legacy prefix source object format changed during setup"
+        )
+    policy_candidates: list[tuple[pathlib.Path, bool]] = [
+        (storage.marker.path.parent, True),
+        (storage.marker.path, not storage.marker.is_gitfile),
+        (storage.admin, True),
+        (storage.common, True),
+        (storage.objects, True),
+        (storage.common / "config", False),
+    ]
+    if storage.marker.is_gitfile:
+        policy_candidates.append((storage.admin / "gitdir", False))
+        content_bindings.extend(
+            (
+                _read_legacy_source_content_binding(
+                    storage.marker.path,
+                    "Git admin marker",
+                ),
+                _read_legacy_source_content_binding(
+                    storage.admin / "gitdir",
+                    "Git admin back-pointer",
+                ),
+            )
+        )
+    commondir = storage.admin / "commondir"
+    try:
+        commondir.lstat()
+    except FileNotFoundError:
+        commondir_present = False
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix source common-directory marker cannot be inspected"
+        ) from error
+    else:
+        commondir_present = True
+        policy_candidates.append((commondir, False))
+        content_bindings.append(
+            _read_legacy_source_content_binding(
+                commondir,
+                "Git common-directory marker",
+            )
+        )
+    policy_bindings: list[_LegacySourcePolicyBinding] = []
+    seen_paths: set[pathlib.Path] = set()
+    for path, expect_directory in policy_candidates:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        policy_bindings.append(
+            _bind_legacy_source_policy_path(
+                path,
+                expect_directory=expect_directory,
+            )
+        )
+    # Directory device/inode/type/owner protects object identity; regular-file
+    # identity plus exact config/marker semantics protects the control inputs.
+    # Mode is the separate access-policy signal. We intentionally ignore
+    # mtime, ctime, nlink, directory size, and ordinary object child churn.
+    binding = _LegacyPrefixSourceBinding(
+        storage=storage,
+        policy_bindings=tuple(policy_bindings),
+        content_bindings=tuple(content_bindings),
+        commondir_present=commondir_present,
+    )
+    _verify_legacy_prefix_source(binding)
+    return binding
+
+
+def _verify_legacy_prefix_source(binding: _LegacyPrefixSourceBinding) -> None:
+    storage = binding.storage
+    _verify_materializer_source_storage(storage)
+    for policy_binding in binding.policy_bindings:
+        _verify_legacy_source_policy_path(policy_binding)
+    commondir = storage.admin / "commondir"
+    try:
+        commondir.lstat()
+    except FileNotFoundError:
+        if binding.commondir_present:
+            raise NamedLaneGuardError(
+                "legacy prefix source common-directory marker changed"
+            )
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix source common-directory marker cannot be revalidated"
+        ) from error
+    else:
+        if not binding.commondir_present:
+            raise NamedLaneGuardError(
+                "legacy prefix source common-directory marker changed"
+            )
+        commondir_payload = _read_materializer_control_file(
+            commondir,
+            label="Git common-directory marker",
+        )
+        try:
+            current_common = _materializer_control_path(
+                commondir_payload,
+                relative_to=storage.admin,
+                label="Git common-directory marker",
+            )
+        finally:
+            commondir_payload[:] = b"\x00" * len(commondir_payload)
+        if current_common != storage.common:
+            raise NamedLaneGuardError(
+                "legacy prefix source common-directory marker changed"
+            )
+    for content_binding in binding.content_bindings:
+        payload = _read_materializer_control_file(
+            content_binding.path,
+            label=content_binding.label,
+        )
+        try:
+            if (
+                len(payload) != content_binding.size
+                or hashlib.sha256(payload).hexdigest() != content_binding.sha256
+            ):
+                raise NamedLaneGuardError(
+                    "legacy prefix source control content changed during "
+                    "receipt generation"
+                )
+        finally:
+            payload[:] = b"\x00" * len(payload)
+    _verify_materializer_source_storage(storage)
+
+
+def _legacy_prefix_view_config(object_format: str) -> bytes:
+    repository_version = "1" if object_format == "sha256" else "0"
+    payload = (
+        "[core]\n"
+        f"\trepositoryformatversion = {repository_version}\n"
+        "\tfilemode = true\n"
+        "\tbare = true\n"
+        "\tlogallrefupdates = false\n"
+        "\tcommitGraph = false\n"
+        "\tmultiPackIndex = false\n"
+    )
+    if object_format == "sha256":
+        payload += "[extensions]\n\tobjectformat = sha256\n"
+    return payload.encode("ascii")
+
+
+def _legacy_prefix_file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+    )
+
+
+def _write_legacy_prefix_view_file(
+    path: pathlib.Path, payload: bytes
+) -> tuple[int, int, int, int]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(descriptor_metadata.st_mode) != 0o600
+            or descriptor_metadata.st_nlink != 1
+            or descriptor_metadata.st_size != len(payload)
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix Git view file could not be bound safely"
+            )
+        identity = _legacy_prefix_file_identity(descriptor_metadata)
+    except NamedLaneGuardError:
+        raise
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view file could not be created safely"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        lexical_metadata = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view file could not be revalidated"
+        ) from error
+    if (
+        _legacy_prefix_file_identity(lexical_metadata) != identity
+        or stat.S_IMODE(lexical_metadata.st_mode) != 0o600
+        or lexical_metadata.st_nlink != 1
+    ):
+        raise NamedLaneGuardError("legacy prefix Git view file changed during setup")
+    return identity
+
+
+def _make_legacy_prefix_view(
+    root: pathlib.Path,
+    root_identity: _DirectoryIdentity,
+    object_format: str,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+) -> _LegacyPrefixViewBinding:
+    _verify_materializer_parent(parent, parent_identity)
+    objects = root / "objects"
+    refs = root / "refs"
+    directory_identities: dict[str, _DirectoryIdentity] = {}
+    for path in (objects, refs):
+        try:
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "legacy prefix Git view directories could not be created safely"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or resolved != path
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix Git view directories are not owner-private"
+            )
+        directory_identities[path.name] = _directory_identity(metadata)
+    config_bytes = _legacy_prefix_view_config(object_format)
+    head_bytes = b"ref: refs/heads/named-lane-empty\n"
+    config_identity = _write_legacy_prefix_view_file(root / "config", config_bytes)
+    head_identity = _write_legacy_prefix_view_file(root / "HEAD", head_bytes)
+    binding = _LegacyPrefixViewBinding(
+        root=root,
+        root_identity=root_identity,
+        objects_identity=directory_identities["objects"],
+        refs_identity=directory_identities["refs"],
+        config_identity=config_identity,
+        head_identity=head_identity,
+        config_bytes=config_bytes,
+        head_bytes=head_bytes,
+    )
+    _verify_legacy_prefix_view(binding, parent, parent_identity)
+    return binding
+
+
+def _verify_legacy_prefix_view_file(
+    path: pathlib.Path,
+    expected_identity: tuple[int, int, int, int],
+    expected_payload: bytes,
+) -> None:
+    payload = _read_materializer_control_file(
+        path,
+        label="legacy prefix Git view file",
+    )
+    try:
+        metadata = path.lstat()
+        if (
+            _legacy_prefix_file_identity(metadata) != expected_identity
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or bytes(payload) != expected_payload
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix Git view file changed during receipt generation"
+            )
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view file cannot be inspected"
+        ) from error
+    finally:
+        payload[:] = b"\x00" * len(payload)
+
+
+def _verify_legacy_prefix_view(
+    binding: _LegacyPrefixViewBinding,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+) -> None:
+    # Root/objects/refs device+inode+type+owner protect view object identity;
+    # exact 0700/0600 modes protect its owner-only access policy; no-follow,
+    # single-link identity plus exact bytes protect config/HEAD content
+    # stability. Directory timestamps and link counts are not mutation evidence.
+    _verify_materializer_parent(parent, parent_identity)
+    root = binding.root
+    try:
+        root_metadata = root.lstat()
+        root_resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view cannot be inspected"
+        ) from error
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or root_metadata.st_uid != _current_user_id()
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or root_resolved != root
+        or root.parent != parent
+        or _directory_identity(root_metadata) != binding.root_identity
+    ):
+        raise NamedLaneGuardError(
+            "legacy prefix Git view changed during receipt generation"
+        )
+    try:
+        root_entries = sorted(entry.name for entry in os.scandir(root))
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view inventory cannot be inspected"
+        ) from error
+    if root_entries != ["HEAD", "config", "objects", "refs"]:
+        raise NamedLaneGuardError(
+            "legacy prefix Git view inventory changed during receipt generation"
+        )
+    for name, expected in (
+        ("objects", binding.objects_identity),
+        ("refs", binding.refs_identity),
+    ):
+        path = root / name
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+            entries = tuple(os.scandir(path))
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "legacy prefix Git view storage cannot be inspected"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or resolved != path
+            or _directory_identity(metadata) != expected
+            or entries
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix Git view storage changed during receipt generation"
+            )
+    _verify_legacy_prefix_view_file(
+        root / "config",
+        binding.config_identity,
+        binding.config_bytes,
+    )
+    _verify_legacy_prefix_view_file(
+        root / "HEAD",
+        binding.head_identity,
+        binding.head_bytes,
+    )
+    _verify_materializer_parent(parent, parent_identity)
+
+
+def _bind_legacy_prefix_control(
+    root: pathlib.Path,
+    root_identity: _DirectoryIdentity,
+    directories: Mapping[str, pathlib.Path],
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+) -> _LegacyPrefixControlBinding:
+    children: list[tuple[pathlib.Path, _DirectoryIdentity]] = []
+    for name in ("home", "hooks", "template", "tmp", "xdg"):
+        path = directories[name]
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "legacy prefix control directory cannot be bound"
+            ) from error
+        children.append((path, _directory_identity(metadata)))
+    binding = _LegacyPrefixControlBinding(
+        root=root,
+        root_identity=root_identity,
+        children=tuple(children),
+    )
+    _verify_legacy_prefix_control(binding, parent, parent_identity)
+    return binding
+
+
+def _verify_legacy_prefix_control(
+    binding: _LegacyPrefixControlBinding,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+) -> None:
+    # Device/inode/type/owner bind the control hierarchy's object identity;
+    # exact 0700 and empty fixed inventory bind its access policy and exclude
+    # attacker-selected config, hooks, templates, and cwd content. Directory
+    # mtime/ctime/nlink churn is not used as mutation evidence.
+    _verify_materializer_parent(parent, parent_identity)
+    try:
+        root_metadata = binding.root.lstat()
+        root_resolved = binding.root.resolve(strict=True)
+        with os.scandir(binding.root) as entries:
+            root_entries = sorted(entry.name for entry in entries)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "legacy prefix control directory cannot be revalidated"
+        ) from error
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or root_metadata.st_uid != _current_user_id()
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or root_resolved != binding.root
+        or binding.root.parent != parent
+        or _directory_identity(root_metadata) != binding.root_identity
+        or root_entries != ["home", "hooks", "template", "tmp", "xdg"]
+    ):
+        raise NamedLaneGuardError(
+            "legacy prefix control directory changed during receipt generation"
+        )
+    for path, expected_identity in binding.children:
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+            with os.scandir(path) as entries:
+                has_entries = next(entries, None) is not None
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "legacy prefix control child cannot be revalidated"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or resolved != path
+            or path.parent != binding.root
+            or _directory_identity(metadata) != expected_identity
+            or has_entries
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix control child changed during receipt generation"
+            )
+    _verify_materializer_parent(parent, parent_identity)
+
+
+def _legacy_prefix_git_environment(objects: pathlib.Path) -> dict[str, str]:
+    return {
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OBJECT_DIRECTORY": str(objects),
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PAGER": "cat",
+        "PATH": TRUSTED_PATH,
+        "SSH_ASKPASS": "/usr/bin/false",
+    }
+
+
+def _legacy_prefix_git_prefix(
+    git: pathlib.Path,
+    view: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        str(git),
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        f"--git-dir={view}",
+    )
+
+
+def _legacy_prefix_git_capture(
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    cwd: pathlib.Path,
+    view: _LegacyPrefixViewBinding,
+    source: _LegacyPrefixSourceBinding,
+    control: _LegacyPrefixControlBinding,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+    arguments: Sequence[str],
+    allowed_returncodes: frozenset[int],
+    deadline_monotonic: float,
+) -> tuple[int, bytes]:
+    _verify_legacy_prefix_source(source)
+    _verify_legacy_prefix_view(view, parent, parent_identity)
+    _verify_legacy_prefix_control(control, parent, parent_identity)
+    command = (*_legacy_prefix_git_prefix(git, view.root), *arguments)
+    capture = None
+    process_error: BaseException | None = None
+    try:
+        try:
+            capture = run_bounded_capture(
+                command,
+                cwd=cwd,
+                env=dict(environment),
+                timeout_seconds=min(
+                    30.0,
+                    _remaining_deadline_seconds(
+                        deadline_monotonic,
+                        "legacy prefix receipt",
+                    ),
+                ),
+                stdout_limit_bytes=LEGACY_PREFIX_RECEIPT_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes=LEGACY_PREFIX_RECEIPT_OUTPUT_LIMIT_BYTES,
+            )
+        except BaseException as error:
+            process_error = error
+        try:
+            _verify_legacy_prefix_source(source)
+            _verify_legacy_prefix_view(view, parent, parent_identity)
+            _verify_legacy_prefix_control(control, parent, parent_identity)
+        except BaseException as revalidation_error:
+            if process_error is not None:
+                raise revalidation_error from process_error
+            raise
+        if process_error is not None:
+            raise process_error
+        assert capture is not None
+        if capture.stderr or capture.returncode not in allowed_returncodes:
+            raise NamedLaneGuardError("legacy-prefix-git-process")
+        return capture.returncode, bytes(capture.stdout)
+    finally:
+        if capture is not None:
+            capture.stdout[:] = b"\x00" * len(capture.stdout)
+            capture.stderr[:] = b"\x00" * len(capture.stderr)
+
+
+def _parse_legacy_disambiguation(
+    payload: bytes,
+    raw_prefix: str,
+    oid_length: int,
+) -> str:
+    if not payload or not payload.endswith(b"\n") or b"\r" in payload:
+        raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-unique")
+    lines = payload[:-1].split(b"\n")
+    if len(lines) != 1:
+        raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-unique")
+    try:
+        object_id = lines[0].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-unique") from error
+    if (
+        len(object_id) != oid_length
+        or LOWER_FULL_OBJECT_ID.fullmatch(object_id) is None
+        or not object_id.startswith(raw_prefix)
+    ):
+        raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-unique")
+    return object_id
+
+
+def _parse_legacy_object_type(payload: bytes) -> str:
+    if (
+        not payload.endswith(b"\n")
+        or payload.count(b"\n") != 1
+        or b"\r" in payload
+        or not payload[:-1]
+    ):
+        raise NamedLaneGuardError("legacy-prefix-git-output")
+    try:
+        object_type = payload[:-1].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise NamedLaneGuardError("legacy-prefix-git-output") from error
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", object_type) is None:
+        raise NamedLaneGuardError("legacy-prefix-git-output")
+    return object_type
+
+
+def legacy_short_prefix_receipts(
+    source: pathlib.Path,
+    temporary_path: pathlib.Path,
+    head_sha: str,
+    phase: str,
+    prefixes: Sequence[str],
+    *,
+    defer_signal_handoff: bool = False,
+) -> LegacyPrefixReceiptResult:
+    if LOWER_FULL_OBJECT_ID.fullmatch(head_sha) is None:
+        raise NamedLaneGuardError(
+            "legacy prefix receipt head must be a full lowercase Git object ID"
+        )
+    if phase not in {"initial", "final"}:
+        raise NamedLaneGuardError("legacy prefix receipt phase is invalid")
+    if len(prefixes) > 1_024:
+        raise NamedLaneGuardError("legacy prefix receipt count limit exceeded")
+    if any(LEGACY_SHORT_OBJECT_PREFIX.fullmatch(prefix) is None for prefix in prefixes):
+        raise NamedLaneGuardError(
+            "legacy prefix receipt prefixes must be exact lowercase 10-hex values"
+        )
+    if len(set(prefixes)) != len(prefixes):
+        raise NamedLaneGuardError("legacy prefix receipt prefixes must be unique")
+    sorted_prefixes = tuple(sorted(prefixes))
+
+    frozen_head = head_sha
+    resolved_source, source_marker = _resolve_materializer_source(source)
+    view_path, parent, parent_identity = _validate_materializer_parent(temporary_path)
+    git = resolve_git()
+    parent_fd = _open_legacy_prefix_parent_descriptor(parent, parent_identity)
+    deadline = time.monotonic() + LEGACY_PREFIX_RECEIPT_TIMEOUT_SECONDS
+    control: pathlib.Path | None = None
+    directories: dict[str, pathlib.Path] | None = None
+    control_identity: _DirectoryIdentity | None = None
+    control_binding: _LegacyPrefixControlBinding | None = None
+    view_started = False
+    view_identity: _DirectoryIdentity | None = None
+    failure: BaseException | None = None
+    result: LegacyPrefixReceiptResult | None = None
+    cleanup_mask: set[signal.Signals] | None = None
+    cleanup_acquisition_signal: ForwardedSignal | None = None
+    try:
+        control_setup_mask = block_forwarded_signals()
+        if control_setup_mask is None:
+            raise NamedLaneGuardError(
+                "legacy prefix control setup requires main-thread signal masking"
+            )
+        try:
+            control, directories, control_identity = (
+                _make_materializer_control_directory(
+                    parent,
+                    parent_identity,
+                )
+            )
+            control_binding = _bind_legacy_prefix_control(
+                control,
+                control_identity,
+                directories,
+                parent,
+                parent_identity,
+            )
+            control_setup_signal = consume_pending_forwarded_signal()
+            if control_setup_signal is not None:
+                raise ForwardedSignal(control_setup_signal)
+        except BaseException:
+            if defer_signal_handoff:
+                _restore_materializer_terminal_failure_mask(control_setup_mask)
+            else:
+                restore_signal_mask(control_setup_mask)
+            raise
+        else:
+            restore_signal_mask(control_setup_mask)
+        materializer_environment = _materializer_git_environment(
+            directories,
+            parent,
+        )
+        _validate_materializer_git_version(
+            git,
+            materializer_environment,
+            directories["tmp"],
+            timeout_seconds=min(
+                30.0,
+                _remaining_deadline_seconds(
+                    deadline,
+                    "legacy prefix receipt",
+                ),
+            ),
+        )
+        _verify_legacy_prefix_control(
+            control_binding,
+            parent,
+            parent_identity,
+        )
+        source_storage = _validate_materializer_source_repository(
+            resolved_source,
+            source_marker,
+            len(frozen_head),
+            git,
+            materializer_environment,
+            directories["hooks"],
+            timeout_seconds=_remaining_deadline_seconds(
+                deadline,
+                "legacy prefix receipt",
+            ),
+        )
+        _verify_legacy_prefix_control(
+            control_binding,
+            parent,
+            parent_identity,
+        )
+        source_binding = _bind_legacy_prefix_source(
+            source_storage,
+            len(frozen_head),
+            git,
+            materializer_environment,
+            directories["hooks"],
+            timeout_seconds=_remaining_deadline_seconds(
+                deadline,
+                "legacy prefix receipt",
+            ),
+        )
+        _verify_legacy_prefix_control(
+            control_binding,
+            parent,
+            parent_identity,
+        )
+        view_setup_mask = block_forwarded_signals()
+        if view_setup_mask is None:
+            raise NamedLaneGuardError(
+                "legacy prefix view setup requires main-thread signal masking"
+            )
+        try:
+            _verify_materializer_parent(parent, parent_identity)
+            view_path.mkdir(mode=0o700)
+            view_started = True
+            view_metadata = view_path.lstat()
+            view_identity = _directory_identity(view_metadata)
+            view_path.chmod(0o700)
+            if (
+                not stat.S_ISDIR(view_metadata.st_mode)
+                or stat.S_ISLNK(view_metadata.st_mode)
+                or view_metadata.st_uid != _current_user_id()
+                or view_path.resolve(strict=True) != view_path
+                or stat.S_IMODE(view_path.lstat().st_mode) != 0o700
+                or _directory_identity(view_path.lstat()) != view_identity
+            ):
+                raise NamedLaneGuardError(
+                    "legacy prefix Git view must be an owner-private real directory"
+                )
+            view_binding = _make_legacy_prefix_view(
+                view_path,
+                view_identity,
+                source_storage.object_format,
+                parent,
+                parent_identity,
+            )
+            view_setup_signal = consume_pending_forwarded_signal()
+            if view_setup_signal is not None:
+                raise ForwardedSignal(view_setup_signal)
+        except BaseException:
+            if defer_signal_handoff:
+                _restore_materializer_terminal_failure_mask(view_setup_mask)
+            else:
+                restore_signal_mask(view_setup_mask)
+            raise
+        else:
+            restore_signal_mask(view_setup_mask)
+        query_environment = _legacy_prefix_git_environment(source_storage.objects)
+        head_returncode, head_type_payload = _legacy_prefix_git_capture(
+            git,
+            query_environment,
+            directories["tmp"],
+            view_binding,
+            source_binding,
+            control_binding,
+            parent,
+            parent_identity,
+            ("cat-file", "-t", frozen_head),
+            frozenset({0}),
+            deadline,
+        )
+        if (
+            head_returncode != 0
+            or _parse_legacy_object_type(head_type_payload) != "commit"
+        ):
+            raise NamedLaneGuardError(
+                "legacy prefix receipt head must name an exact commit"
+            )
+        completeness_returncode, completeness_payload = _legacy_prefix_git_capture(
+            git,
+            query_environment,
+            directories["tmp"],
+            view_binding,
+            source_binding,
+            control_binding,
+            parent,
+            parent_identity,
+            (
+                "rev-list",
+                "--objects",
+                "--missing=error",
+                "--quiet",
+                frozen_head,
+                "--",
+            ),
+            frozenset({0}),
+            deadline,
+        )
+        if completeness_returncode != 0 or completeness_payload:
+            raise NamedLaneGuardError("legacy-prefix-git-output")
+        if any(prefix == frozen_head[:10] for prefix in sorted_prefixes):
+            raise LegacyPrefixReceiptInconclusive("legacy-prefix-is-current-head")
+
+        receipts: list[dict[str, object]] = []
+        for raw_prefix in sorted_prefixes:
+            disambiguate_returncode, disambiguated_payload = _legacy_prefix_git_capture(
+                git,
+                query_environment,
+                directories["tmp"],
+                view_binding,
+                source_binding,
+                control_binding,
+                parent,
+                parent_identity,
+                ("rev-parse", f"--disambiguate={raw_prefix}"),
+                frozenset({0}),
+                deadline,
+            )
+            resolved_object = _parse_legacy_disambiguation(
+                disambiguated_payload,
+                raw_prefix,
+                len(frozen_head),
+            )
+            type_returncode, type_payload = _legacy_prefix_git_capture(
+                git,
+                query_environment,
+                directories["tmp"],
+                view_binding,
+                source_binding,
+                control_binding,
+                parent,
+                parent_identity,
+                ("cat-file", "-t", resolved_object),
+                frozenset({0}),
+                deadline,
+            )
+            object_type = _parse_legacy_object_type(type_payload)
+            if object_type != "commit":
+                raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-commit")
+            ancestry_returncode, ancestry_payload = _legacy_prefix_git_capture(
+                git,
+                query_environment,
+                directories["tmp"],
+                view_binding,
+                source_binding,
+                control_binding,
+                parent,
+                parent_identity,
+                (
+                    "merge-base",
+                    "--is-ancestor",
+                    resolved_object,
+                    frozen_head,
+                ),
+                frozenset({0, 1}),
+                deadline,
+            )
+            if ancestry_payload:
+                raise NamedLaneGuardError("legacy-prefix-git-output")
+            if ancestry_returncode == 1:
+                raise LegacyPrefixReceiptInconclusive("legacy-prefix-not-ancestor")
+            # The full object ID binds the selected object; the exact type and
+            # ancestry queries bind the semantics observed by these ordered
+            # point queries. Source-container identity/access revalidation does
+            # not freeze loose or packed object bytes: same-UID content or
+            # prefix-inventory churn, intra-phase ABA, and ABA between
+            # independent initial/final invocations remain outside the claim.
+            receipts.append(
+                {
+                    "raw_prefix": raw_prefix,
+                    "head": frozen_head,
+                    "disambiguate_return_code": disambiguate_returncode,
+                    "disambiguated_object_ids": [resolved_object],
+                    "commit_object_check_return_code": type_returncode,
+                    "object_type": object_type,
+                    "ancestry_return_code": ancestry_returncode,
+                }
+            )
+        _verify_legacy_prefix_source(source_binding)
+        _verify_legacy_prefix_view(view_binding, parent, parent_identity)
+        _verify_legacy_prefix_control(control_binding, parent, parent_identity)
+        result = LegacyPrefixReceiptResult(
+            phase=phase,
+            head_sha=frozen_head,
+            receipts=tuple(receipts),
+        )
+    except BaseException as error:
+        failure = error
+    finally:
+        cleanup_mask, cleanup_acquisition_signal = _block_materializer_cleanup_signals()
+
+    if cleanup_acquisition_signal is not None and failure is None:
+        failure = cleanup_acquisition_signal
+    if defer_signal_handoff and cleanup_mask is None and failure is None:
+        failure = NamedLaneGuardError(
+            "legacy prefix receipt handoff requires main-thread signal masking"
+        )
+    retained_view: pathlib.Path | None = None
+    if view_started:
+        retained_view = _cleanup_legacy_prefix_path(
+            view_path,
+            parent,
+            parent_identity,
+            view_identity,
+        )
+    retained_control: pathlib.Path | None = None
+    if control is not None and control_identity is not None:
+        retained_control = _cleanup_legacy_prefix_path(
+            control,
+            parent,
+            parent_identity,
+            control_identity,
+        )
+    pending_cleanup_signal = (
+        consume_pending_forwarded_signal() if cleanup_mask is not None else None
+    )
+    if pending_cleanup_signal is not None and failure is None:
+        failure = ForwardedSignal(pending_cleanup_signal)
+    retained: list[str] = []
+    if retained_view is not None:
+        retained.append(
+            _legacy_prefix_retained_evidence(
+                label="temporary",
+                path=retained_view,
+                expected_identity=view_identity,
+                parent=parent,
+                parent_identity=parent_identity,
+                parent_fd=parent_fd,
+            )
+        )
+    if retained_control is not None:
+        retained.append(
+            _legacy_prefix_retained_evidence(
+                label="control",
+                path=retained_control,
+                expected_identity=control_identity,
+                parent=parent,
+                parent_identity=parent_identity,
+                parent_fd=parent_fd,
+            )
+        )
+    with contextlib.suppress(OSError):
+        os.close(parent_fd)
+    if retained:
+        detail = "; ".join(retained)
+        terminal_failure = NamedLaneGuardError(detail)
+        if defer_signal_handoff:
+            _restore_materializer_terminal_failure_mask(cleanup_mask)
+        else:
+            restore_signal_mask(cleanup_mask)
+        if failure is None:
+            raise terminal_failure
+        raise terminal_failure from failure
+    if failure is not None:
+        if defer_signal_handoff:
+            _restore_materializer_terminal_failure_mask(cleanup_mask)
+        else:
+            restore_signal_mask(cleanup_mask)
+        raise failure
+    if control is None or directories is None or control_identity is None:
+        if defer_signal_handoff:
+            _restore_materializer_terminal_failure_mask(cleanup_mask)
+        else:
+            restore_signal_mask(cleanup_mask)
+        raise NamedLaneGuardError("legacy prefix receipt setup was incomplete")
+    assert result is not None
+    if defer_signal_handoff:
+        assert cleanup_mask is not None
+        object.__setattr__(result, "_handoff_signal_mask", cleanup_mask)
+    else:
+        restore_signal_mask(cleanup_mask)
+    return result
 
 
 def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
@@ -3473,10 +4769,7 @@ def _validate_node_extra_ca_certs(path: pathlib.Path) -> str:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | nofollow
-            | nonblocking,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
         )
     except OSError as error:
         raise NamedLaneGuardError(
@@ -4122,7 +5415,9 @@ def _restore_claude_snapshot_signal_mask(
             # The POSIX mask change completed before Python dispatched the
             # pending signal through the installed structured handler.
             if control_error is not None:
-                raise control_error.with_traceback(control_error.__traceback__) from error
+                raise control_error.with_traceback(
+                    control_error.__traceback__
+                ) from error
             return error.signum
         except OSError as error:
             failures.append(error)
@@ -4384,7 +5679,9 @@ def run_claude(
                             capture.stderr[:] = b"\x00" * len(capture.stderr)
                         raise ForwardedSignal(deferred_signal)
                 else:
-                    deferred_signal = _restore_claude_snapshot_signal_mask(snapshot_mask)
+                    deferred_signal = _restore_claude_snapshot_signal_mask(
+                        snapshot_mask
+                    )
                     if deferred_signal is not None:
                         raise ForwardedSignal(deferred_signal)
             if process_error is not None:
@@ -4554,6 +5851,24 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--head", required=True)
     validate.add_argument("--guidance", action="append", default=[])
 
+    legacy_prefixes = subparsers.add_parser(
+        "legacy-short-prefix-receipts",
+        help="Resolve legacy short commit prefixes in a private sanitized Git view.",
+    )
+    legacy_prefixes.add_argument("--source", required=True)
+    legacy_prefixes.add_argument("--temporary-path", required=True)
+    legacy_prefixes.add_argument("--head", required=True)
+    legacy_prefixes.add_argument(
+        "--phase",
+        required=True,
+        choices=("initial", "final"),
+    )
+    legacy_prefixes.add_argument(
+        "--prefix",
+        action="append",
+        default=[],
+    )
+
     claude = subparsers.add_parser(
         "run-claude",
         help="Run an exact Claude executable under bounded process supervision.",
@@ -4684,10 +5999,43 @@ def _emit_materialized_receipt(result: MaterializedWorktree) -> None:
     restore_signal_mask(handoff_mask)
 
 
+def _emit_legacy_prefix_receipt(result: LegacyPrefixReceiptResult) -> None:
+    handoff_mask = result._handoff_signal_mask
+    if handoff_mask is None:
+        raise NamedLaneGuardError(
+            "legacy prefix receipt handoff does not own a signal mask"
+        )
+    try:
+        pending_before_receipt = consume_pending_forwarded_signal()
+        if pending_before_receipt is not None:
+            raise ForwardedSignal(pending_before_receipt)
+        _emit(
+            {
+                "status": "ok",
+                "schema_version": LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
+                "phase": result.phase,
+                "head": result.head_sha,
+                "temporary_cleanup_status": "complete",
+                "receipts": list(result.receipts),
+            }
+        )
+        sys.stdout.flush()
+    except BaseException:
+        _restore_materializer_terminal_failure_mask(handoff_mask)
+        raise
+    # The temporary view and its control directory are already proved absent.
+    # Keep a signal concurrent with the complete flushed envelope from turning
+    # that committed receipt into a false terminal failure.
+    _install_post_terminal_signal_handlers()
+    consume_pending_forwarded_signal()
+    restore_signal_mask(handoff_mask)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     safety_command = args.command_name in {
+        "legacy-short-prefix-receipts",
         "materialize-worktree",
         "validate-worktree",
     }
@@ -4735,6 +6083,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "guidance_count": result.guidance_count,
                     }
                 )
+            return 0
+
+        if args.command_name == "legacy-short-prefix-receipts":
+            with _structured_forwarded_signals() as signal_state:
+                result = legacy_short_prefix_receipts(
+                    pathlib.Path(args.source),
+                    pathlib.Path(args.temporary_path),
+                    args.head,
+                    args.phase,
+                    args.prefix,
+                    defer_signal_handoff=True,
+                )
+                _emit_legacy_prefix_receipt(result)
+                signal_state.commit()
             return 0
 
         command = list(args.claude_argv)
@@ -4798,6 +6160,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         _emit(payload, stream=sys.stderr)
         return 2
+    except LegacyPrefixReceiptInconclusive as error:
+        _emit(
+            {"status": "inconclusive", "reason": error.reason},
+            stream=sys.stderr,
+        )
+        return 75
     except ForwardedSignal as error:
         status = "blocked-safety" if safety_command else "inconclusive"
         _emit(

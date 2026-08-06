@@ -82,12 +82,28 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    `disambiguate_return_code`, `disambiguated_object_ids`,
    `commit_object_check_return_code`, `object_type`, and `ancestry_return_code`. Each phase
    exactly covers the raw-derived non-current pending-prefix set with unique
-   `raw_prefix`-sorted entries. Run all three local queries in independently
-   created parent-trusted short-lived sanitized bare Git views under the exact
-   fixed prefix in `github-pr-probes.md`, never against the source Git directory.
-   The view excludes local grafts, ambient config, replace refs,
-   shallow/alternate/promisor dependencies, lazy fetch, prompting, and
-   commit-graph/multi-pack-index caches. Disambiguation enumerates every matching object and
+   `raw_prefix`-sorted entries. Produce each phase only through an independent
+   invocation of the recorded trusted bundle's manifest-bound default-profile
+   `named_lane_guard legacy-short-prefix-receipts`, using the exact source
+   worktree, a distinct phase-unique absent child under an owner-private mode
+   `0700` parent, exact full current head, matching `--phase initial|final`, and
+   every repeatable prefix. A zero-prefix phase still runs full
+   source/head/view validation and cleanup and returns only `receipts: []`.
+   Accept only schema
+   `named-lane-legacy-short-prefix-receipts-v1` with `status: ok`, matching
+   phase/head, `temporary_cleanup_status: complete`, and its generic sorted
+   `receipts`; map only that array to the matching history-top-level field.
+   The producer applies materializer-grade source marker/admin/common/object
+   validation; rejects alternate/HTTP-alternate, common/admin and per-worktree
+   shallow, promisor/partial-clone, bitmap, unsafe config, and incomplete-object
+   state; and isolates local grafts, ambient config, replace refs, source refs,
+   lazy fetch, prompting, and commit-graph/multi-pack-index consumption.
+   Before any prefix receipt query, require the phase-level
+   `git cat-file -t <head>` exact-commit preflight and
+   `git rev-list --objects --missing=error --quiet <head> --` reachable-closure
+   preflight against that same isolated view. They run even for an empty prefix
+   set and do not count among the exactly three per-prefix receipt queries.
+   Disambiguation enumerates every matching object and
    must return `0`
    with exactly one full lowercase prefix-matching SHA; exact-object
    `git cat-file -t <resolved_object>` returns `0` with `object_type == "commit"`,
@@ -123,7 +139,25 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    no independently valid stable receipt-bound blocker basis, use literal
    `evidence_basis: null` rather than promoting the legacy item. State that
    neither initial/final digest equality nor the scope receipts prove
-   intermediate ABA or post-final-digest stability. Recover either after a
+   intermediate ABA or post-final-digest stability. A private workspace helper
+   never supplies receipt evidence. A direct import never satisfies this
+   contract. Neither counts as receipt authority. An ad hoc query wrapper or
+   source Git-directory query also never counts. The producer does not
+   materialize or snapshot the entire object store. Source container
+   identity/access policy and full-OID/type/ancestry ordered point-query
+   semantics are protected; continuous stability of selected loose-object or
+   pack bytes is not. Same-current-UID concurrent object-store content
+   mutation, prefix-inventory churn, and intra-phase or inter-phase ABA are not
+   excluded. Initial/final equality is two point-in-time observations, not
+   atomicity. Semantic rejection is `inconclusive` with no partial receipts;
+   source/view/control/process/revalidation or cleanup uncertainty is
+   `blocked-safety`, also with no partial receipts. Revalidate the same trusted
+   bundle path/version/manifest digest around both calls and require
+   type-preserving initial/final receipt-array equality. For a
+   self-policy migration, if the prior trusted bundle lacks the producer, use
+   the prior trusted policy to adjudicate and review, merge and release, then
+   activate the released producer; never bootstrap with candidate-head code.
+   Recover either after a
    separately authorized ordinary substantive
    change creates a new head, or after the caller explicitly makes one
    caller-owned manual exact `@codex review` trigger on the unchanged head. The
@@ -749,7 +783,7 @@ A qualifying third-lane result must prove all of the following:
 - The frozen reaction-history `as_of_server_time` bounds eligible historical artifact semantic times, not receipt collection time. An exact artifact GET or post-scope receipt may have a later `Date` when collected during the bounded decision/final reread; do not reject it solely for being observed after that cutoff.
 - A strong current `terminal-payload` or `mixed` result may also have semantic time after declaration discovery when it arrives during the bounded provider wait. The frozen as-of bounds historical samples and the separate current reaction-only basis for `thumbs-up-clean`, not strong current terminal evidence.
 - The evidence snapshot completely enumerated issue comments, reviews, every relevant review's raw REST associated inline comments, raw GraphQL review-thread and nested-comment pages, and relevant request-comment reactions. It canonically joins every exact-provider selected-review REST target child exactly once to GraphQL evidence. Fully fetched human, unrelated-bot, null-parent, and unrelated-only records remain audit context and cannot contribute resolution. Incomplete pagination, a broken cursor/link chain, missing target review association, duplicate/orphaned target, or missing typed target `isResolved` fails closed.
-- Every local legacy-prefix disambiguation, exact-object type check, and ancestry query runs in an independently created parent-trusted short-lived sanitized bare Git view under the exact fixed prefix in `github-pr-probes.md`, never against the source Git directory. The view excludes local grafts, ambient config, replace refs, shallow/alternate/promisor dependencies, lazy fetch, prompting, and commit-graph/multi-pack-index caches; none can rewrite the enumerated object's type or ancestry into acceptable evidence.
+- Every local legacy-prefix disambiguation, exact-object type check, and ancestry query is produced only by an independent invocation of the trusted bundle's manifest-bound default-profile `named_lane_guard legacy-short-prefix-receipts`, with exact source worktree, phase-unique absent owner-private temporary path, full current head, matching phase, and complete repeatable non-current prefix set. Require success schema `named-lane-legacy-short-prefix-receipts-v1`, exact `status: ok`, matching phase/head, `temporary_cleanup_status: complete`, sorted exact seven-field receipts, and type-preserving initial/final equality. After materializer-grade source identity/access-policy validation, the producer requires the phase-level `git cat-file -t <head>` exact-commit and `git rev-list --objects --missing=error --quiet <head> --` reachable-closure preflights against the isolated view, including for an empty prefix set; neither is one of the exactly three bounded read-only receipt queries per prefix. It rejects alternate/HTTP-alternate, common/admin and per-worktree shallow, promisor/partial-clone, bitmap, unsafe config, or incomplete state; its minimal view isolates local grafts, ambient config, source refs/hooks, replace refs, lazy fetch, prompting, and commit-graph/multi-pack-index consumption. A current-head prefix or semantic near-miss is `inconclusive` without partial receipts; source/view/process/revalidation/cleanup uncertainty is `blocked-safety`, also without partial receipts. Direct imports, private workspace helpers, ad hoc wrappers, and source Git-directory queries never count. Revalidate the same trusted bundle manifest around both invocations. For a self-policy migration, use prior trusted policy until a prior-reviewed migration is merged/released if that prior bundle lacks the producer; candidate-head code never bootstraps its own evidence.
 - Every counted provider artifact has exact REST `login: chatgpt-codex-connector[bot]` and exact REST `type: Bot`. The enclosing normalized `scope.head` is always the exact current `headRefOid`. A strong clean artifact's parsed/native commit equals that head and contains an explicit provider-authored no-findings outcome. Action parity for clean issue comments is limited to the 10/40 carrier lengths and the short carrier's fail-closed exact-repository REST resolution outcome; it is not full-grammar parity. The playbook accepts only a lowercase exact 10- or 40-hex marker: 40 binds directly to current head and forbids a companion; raw 10 remains `clean-pending-resolution` and non-authoritative until the independent closed `parent-recorded-reviewed-commit-resolution-v1` companion joins the exact artifact ID, scope, ref, and full head. Its initial/final exact-repository `/commits/<prefix>` raw `200` receipts must resolve one prefix-matching full-40 SHA equal to `parsed_commit` and current head, and their retained dates must prove `artifact GET <= initial resolution <= every post-scope snapshot <= final resolution`, allowing same-second equality. Missing, `404`/`409`/`422`/`429`/`5xx`, malformed, ambiguous, drifting, misordered, or non-current resolution fails closed. Apply the same companion join in current, complete-history, and sidecar-blind historical paths; sidecar-blind may ignore request sidecars but never the resolution companion. Retain the raw marker/ref and resolution basis while `parsed_commit` remains full. Lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank boundary, and the closed lead/tagline/disclosure/native grammar are stricter playbook rules. Only the official disclosure suffix trims lines and drops blanks before exact closed nine-line matching; the result body and two-LF boundary remain strict. A finding keeps its own artifact commit and may remain applicable on a proved ancestor through its parent-owned local Git ancestry receipt; it is never rewritten to current head or omitted merely to make projections agree. Finding URLs, reviews, and inline commits remain full-40. A terminal issue comment also satisfies the authority's closed canonical API/HTML, exact App, raw/normalized body, grammar, parsed-commit, immutable-current-scope, and edit-aware time schema. An empty `APPROVED` review is not clean evidence.
 - A proved non-ancestor is raw audit-only and must not appear in normalized `active_top_level_findings` or `unresolved_thread_findings`. Treat any such normalized injection as a raw/normalized projection mismatch and select `unknown`; it cannot become a terminal finding or blocker candidate.
 - Review state admissibility is separate from terminal-looking detection. A submitted review artifact uses exact state `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`. `PENDING` is nonterminal. `DISMISSED` is always terminal-looking; a missing or unknown state is likewise terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each is a whole-snapshot inconclusive blocker: original `submitted_at` is not a trusted state-transition time, so no later-looking clean may supersede it. See the authority's closed review-state rule.

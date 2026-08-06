@@ -585,11 +585,30 @@ current terminal grammar:
    `0` with `object_type == "commit"`, and
    `git merge-base --is-ancestor <resolved_commit> <head>` returns exact `0`.
    An annotated-tag object that peels to a commit is rejected. Run each phase
-   in its own parent-trusted short-lived sanitized bare Git view under the
-   fixed prefix in `github-pr-probes.md`, never against the source Git
-   directory. The view excludes local grafts, ambient config, replace refs,
-   shallow/alternate/promisor dependencies, lazy fetching, credential
-   prompting, and commit-graph/multi-pack-index caches. Each array may contain zero or more entries; never
+   only through the independently trusted bundle's manifest-bound default
+   guard subcommand `legacy-short-prefix-receipts`, with exact source worktree,
+   phase-unique absent owner-private temporary path, full current head,
+   `--phase initial|final`, and the complete repeatable prefix set. Accept only
+   its closed success envelope with
+   `schema_version: named-lane-legacy-short-prefix-receipts-v1`, matching phase
+   and head, `temporary_cleanup_status: complete`, and sorted generic
+   `receipts`; map that array to the matching history-top-level phase field.
+   The producer validates materializer-grade source marker/admin/common/object
+   identity and access policy, rejects alternate/HTTP-alternate, common/admin
+   and per-worktree shallow, promisor/partial-clone, bitmap, unsafe config, and
+   incomplete-object state, and isolates local grafts, ambient config, replace
+   refs, source refs/hooks, lazy fetch, prompting, and
+   commit-graph/multi-pack-index consumption. Against that isolated view, it
+   first runs the phase-level `git cat-file -t <head>` exact-commit preflight
+   and `git rev-list --objects --missing=error --quiet <head> --`
+   reachable-closure completeness preflight. Those controls run even for an
+   empty prefix set and do not count among the exactly three per-prefix receipt
+   queries. It then runs
+   exactly the closed disambiguation, exact-object type, and ancestry queries
+   documented in `github-pr-probes.md`. A private workspace helper never
+   supplies receipt evidence. A direct import never satisfies this contract.
+   Neither counts as receipt authority. An ad hoc query wrapper or
+   source-Git-directory query also never counts. Each array may contain zero or more entries; never
    assume one legacy prefix. The receipt prefixes are unique and sorted, their set
    equals the complete raw-inventory-derived non-current pending-prefix set,
    and the initial/final arrays are type-preservingly identical. Preserve both
@@ -609,6 +628,24 @@ current terminal grammar:
    selected current-head short clean uses only that existing REST dual
    resolution contract and never enters the local legacy-prefix receipt arrays. A malformed
    clean body or a marker of any other shape is not this exception.
+
+   The producer is success-only. A current-head prefix, zero/multiple or
+   malformed disambiguation, non-commit object, non-ancestor, or other semantic
+   rejection returns structured `inconclusive` with no partial receipts;
+   source/view/control/process/revalidation/cleanup uncertainty returns
+   `blocked-safety`, also with no partial receipts. Revalidate the same trusted
+   bundle path/version/manifest digest before and after both independent phase
+   invocations. The producer does not materialize or snapshot the entire object
+   store. Source container identity/access policy and full-OID/type/ancestry
+   ordered point-query semantics are protected; continuous stability of
+   selected loose-object or pack bytes is not. Same-current-UID concurrent
+   object-store content mutation, prefix-inventory churn, and intra-phase or
+   inter-phase ABA are not excluded. Initial/final equality is two
+   point-in-time observations, not atomicity. For a self-policy migration,
+   candidate-head code cannot produce
+   its own evidence. If the prior trusted bundle lacks the subcommand, apply
+   the prior trusted policy to adjudicate and review the migration, merge and
+   release it, then activate the producer only from that trusted release.
 
 No third carrier exists. An ordinary unreceipted clean or finding, including
 one accepted by the receipt-bound terminal grammar, cannot be relabeled as
@@ -2333,7 +2370,7 @@ the closed history-top-level
 `initial_legacy_short_commit_resolution_receipts` and
 `final_legacy_short_commit_resolution_receipts` defined above. Their complete
 raw-prefix set, unique local-object disambiguation, exact commit object type,
-sanitized-view ancestry check, exact head, and type-preserving stability supply the local
+manifest-bound guard ancestry check, exact head, and type-preserving stability supply the local
 applicability check. The legacy report retains the raw 10 hex, and no GitHub
 REST resolution companion or full `artifact_commit` is fabricated for it.
 
@@ -2341,10 +2378,17 @@ A missing, duplicate, unsorted, extra, or drifting legacy-prefix receipt; an
 initial/final array mismatch; incomplete raw-derived prefix coverage; a
 disambiguation, object-type-check, or ancestry return code other than `0`; an
 `object_type` other than exact `commit`; zero or multiple matching object IDs;
-a source-directory query, absent/unsafe sanitized view, local graft or other
-unexcluded repository ancestry metadata; a noncanonical prefix/full SHA; or a head
-mismatch makes the migration partition unproved. This failure is distinct from
-the ordinary finding-ancestry receipt checks below.
+a current-head prefix; a noncanonical prefix/full SHA; a head mismatch; a
+producer result other than exact success schema
+`named-lane-legacy-short-prefix-receipts-v1` with matching phase/head and
+`temporary_cleanup_status: complete`; a private-helper/direct-import/ad hoc or
+source-directory query; absent/unsafe temporary view; local graft, replace,
+alternate/HTTP-alternate, common/admin or per-worktree shallow, promisor,
+ambient-config, commit-graph, multi-pack-index, or other unexcluded repository
+ancestry metadata; or a source/control/process/revalidation/cleanup failure
+makes the migration partition unproved. No partial producer receipts can cure
+that failure. This failure is distinct from the ordinary finding-ancestry
+receipt checks below.
 
 A missing ancestry receipt, missing local object, duplicate or extra ancestry
 receipt, a return code other than the exact values above, a raw-derived

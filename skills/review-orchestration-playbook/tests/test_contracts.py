@@ -5494,81 +5494,195 @@ printf '%s\n' "$trusted_uv"
             encoding="utf-8"
         )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
-        workspace_runtime = (
-            SKILL_ROOT / "scripts/review_runtime/workspace.py"
+        named_lane_guard = (SKILL_ROOT / "scripts/named_lane_guard").read_text(
+            encoding="utf-8"
+        )
+        named_lane_runtime = (
+            SKILL_ROOT / "scripts/review_runtime/named_lane.py"
         ).read_text(encoding="utf-8")
-        workspace_tests = (SKILL_ROOT / "tests/test_workspace.py").read_text(
+        named_lane_tests = (SKILL_ROOT / "tests/test_named_lane.py").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn(
-            "The fixed `legacy_sanitized_git_prefix`",
-            probes,
+        public_producer_documents = (skill, authority, readiness, contracts, probes)
+        negative_authority_sentences = (
+            "A private workspace helper never supplies receipt evidence.",
+            "A direct import never satisfies this contract.",
+            "Neither counts as receipt authority.",
         )
-        self.assertIn(
-            "GIT_OBJECT_DIRECTORY=<validated_source_object_directory>",
-            probes,
+        protected_property_anchors = (
+            "does not materialize or snapshot the entire object store",
+            "Source container identity/access policy and "
+            "full-OID/type/ancestry ordered point-query semantics are protected",
+            "continuous stability of selected loose-object or pack bytes is not",
+            "Same-current-UID concurrent object-store content mutation, "
+            "prefix-inventory churn, and intra-phase or inter-phase ABA are not "
+            "excluded",
+            "Initial/final equality is two point-in-time observations, not atomicity",
         )
-        self.assertIn(
-            "--git-dir=<sanitized_git_view>",
-            probes,
+        forbidden_legacy_helper_wording = (
+            "legacy_sanitized_git_prefix",
+            "_temporary_sanitized_git_view",
+            "_run_sanitized_git_query",
+            "private workspace helper supplies",
+            "private workspace helper satisfies",
+            "private workspace helper counts",
+            "direct import supplies",
+            "direct import satisfies",
+            "direct import counts",
+            "selected object bytes",
         )
-        self.assertIn("core.commitGraph=false", probes)
-        self.assertIn("core.multiPackIndex=false", probes)
-        self.assertIn(
-            "<legacy_sanitized_git_prefix> rev-parse --disambiguate=<raw_prefix>",
-            probes,
-        )
-        self.assertIn(
-            "<legacy_sanitized_git_prefix> cat-file -t '<sole_full_sha>'",
-            probes,
-        )
-        self.assertIn(
-            "<legacy_sanitized_git_prefix> merge-base --is-ancestor "
-            "<sole_full_sha> <current_head>",
-            probes,
-        )
-        self.assertIn("no `info/grafts`", probes)
-        self.assertIn(
-            "Never run the queries against the source",
-            " ".join(probes.split()),
-        )
-        self.assertNotIn("git cat-file -e '<sole_full_sha>^{commit}'", probes)
-        self.assertIn(
-            'removing only that LF yields `object_type == "commit"`',
-            probes,
-        )
-        self.assertIn("def _temporary_sanitized_git_view(", workspace_runtime)
-        self.assertIn("def _run_sanitized_git_query(", workspace_runtime)
-        self.assertIn('"GIT_NO_REPLACE_OBJECTS": "1"', workspace_runtime)
-        self.assertIn('"core.commitGraph=false"', workspace_runtime)
-        self.assertIn('"core.multiPackIndex=false"', workspace_runtime)
-        self.assertIn(
-            "test_sanitized_git_query_uses_short_lived_view_and_source_objects",
-            workspace_tests,
-        )
-        self.assertIn(
-            "test_ancestor_check_ignores_local_replace_refs",
-            workspace_tests,
-        )
-        self.assertIn("test_ancestor_check_ignores_local_grafts", workspace_tests)
-        self.assertIn("test_ancestor_check_ignores_stale_commit_graph", workspace_tests)
-        self.assertIn(
-            "test_sanitized_git_query_ignores_corrupt_source_multi_pack_index",
-            workspace_tests,
-        )
-        for document in (skill, authority, readiness, contracts):
+        for document in public_producer_documents:
             normalized_document = " ".join(document.split())
+            self.assertIn("legacy-short-prefix-receipts", normalized_document)
+            self.assertIn(
+                "named-lane-legacy-short-prefix-receipts-v1",
+                normalized_document,
+            )
+            self.assertIn("temporary_cleanup_status", normalized_document)
+            for sentence in negative_authority_sentences:
+                self.assertIn(sentence, normalized_document)
+            for anchor in protected_property_anchors:
+                self.assertIn(anchor, normalized_document)
+            for forbidden in forbidden_legacy_helper_wording:
+                self.assertNotIn(forbidden, normalized_document.lower())
+            self.assertIn("candidate-head", normalized_document)
             self.assertIn(
                 "`commit_object_check_return_code`, `object_type`, and "
                 "`ancestry_return_code`",
                 normalized_document,
             )
             self.assertIn('`object_type == "commit"`', normalized_document)
-            self.assertIn("sanitized bare Git view", normalized_document)
             self.assertIn("local grafts", normalized_document)
             self.assertIn("replace refs", normalized_document)
             self.assertIn("multi-pack-index", normalized_document)
+            self.assertIn("phase-level", normalized_document)
+            self.assertIn("git cat-file -t <head>", normalized_document)
+            self.assertIn(
+                "git rev-list --objects --missing=error --quiet <head> --",
+                normalized_document,
+            )
+
+        formal_guard_example = (
+            "<trusted-python-absolute-path> -I -B -S \\\n"
+            "  <trusted-bundle-absolute-path>/skills/review-orchestration-"
+            "playbook/scripts/named_lane_guard \\\n"
+            "  legacy-short-prefix-receipts"
+        )
+        self.assertIn(formal_guard_example, contracts)
+        for argument in (
+            "--source",
+            "--temporary-path",
+            "--head",
+            "--phase",
+            "--prefix",
+        ):
+            self.assertIn(argument, contracts)
+            self.assertIn(f'"{argument}"', named_lane_runtime)
+        self.assertIn('choices=("initial", "final")', named_lane_runtime)
+        self.assertIn('action="append"', named_lane_runtime)
+        self.assertIn("default=[]", named_lane_runtime)
+        schema_literal_assignment = (
+            "LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION = "
+            '"named-lane-legacy-short-prefix-receipts-v1"'
+        )
+        self.assertIn(schema_literal_assignment, named_lane_runtime)
+        self.assertIn(f"`{schema_literal_assignment}`", contracts)
+        for runtime_boundary in (
+            "not freeze loose or packed object bytes",
+            "same-UID content or",
+            "prefix-inventory churn, intra-phase ABA",
+            "ABA between",
+            "independent initial/final invocations remain outside the claim",
+        ):
+            self.assertIn(runtime_boundary, named_lane_runtime)
+        self.assertIn(
+            '("review_runtime.named_lane", "named_lane.py", False)',
+            named_lane_guard,
+        )
+        self.assertIn(
+            "return _load_default_entrypoint(scripts_root), argv",
+            named_lane_guard,
+        )
+        self.assertIn(
+            "parsed and dispatched by the manifest-bound `review_runtime.named_lane`",
+            " ".join(contracts.split()),
+        )
+        self.assertIn("default exact three-source closure", contracts)
+        self.assertIn("does not create another profile", contracts)
+
+        normalized_public_producer_contracts = " ".join(contracts.split())
+        for anchor in (
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "per-worktree shallow state",
+            "promisor/partial-clone config or pack markers",
+            "source pack bitmaps",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "core.commitGraph=false",
+            "core.multiPackIndex=false",
+            "group/world-writable (`0o022`)",
+            "`mtime`, `ctime`, `nlink`",
+            "generated-view config and `HEAD` bytes protect those control "
+            "files' content stability",
+            "two point-in-time observations",
+            "intra-phase or inter-phase ABA",
+            "no partial `receipts`",
+            "Semantic rejection returns a closed structured `inconclusive`",
+            "returns structured `blocked-safety`",
+            "an output-limit exception does not identify whether stdout or stderr overflowed",
+            "is not an interruptible wall-clock guarantee",
+        ):
+            self.assertIn(anchor, normalized_public_producer_contracts)
+        for query in (
+            "git rev-parse --disambiguate=<raw_prefix>",
+            "git cat-file -t <sole_full_object_id>",
+            "git merge-base --is-ancestor <sole_full_object_id> <head>",
+        ):
+            self.assertIn(query, contracts)
+            self.assertIn(query, probes)
+        self.assertIn("bounded phase-level control preflights", contracts)
+        self.assertIn(
+            "git rev-list --objects --missing=error --quiet <head> --",
+            contracts,
+        )
+        self.assertIn(
+            "git rev-list --objects --missing=error --quiet <head> --",
+            probes,
+        )
+        self.assertIn(
+            "Neither creates a receipt field",
+            normalized_public_producer_contracts,
+        )
+        self.assertIn(
+            "counts as a per-prefix receipt query",
+            normalized_public_producer_contracts,
+        )
+        self.assertIn("zero-prefix phase", contracts)
+        self.assertIn("receipts: []", contracts)
+        self.assertNotIn("git cat-file -e '<sole_full_sha>^{commit}'", probes)
+
+        for test_pointer in (
+            "test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime",
+            "test_legacy_short_prefix_receipts_emit_sorted_closed_schema_and_fixed_git_queries",
+            "test_legacy_short_prefix_receipts_allow_empty_complete_array",
+            "test_legacy_short_prefix_receipts_reject_current_head_prefix_without_receipts",
+            "test_legacy_short_prefix_receipts_reject_missing_and_ambiguous_prefixes",
+            "test_legacy_short_prefix_receipts_reject_alternates_http_shallow_and_promisor_sources",
+            "test_legacy_short_prefix_receipts_reject_linked_per_worktree_shallow_source",
+            "test_legacy_short_prefix_receipts_reject_group_world_writable_source_policy",
+            "test_legacy_short_prefix_receipts_reject_incomplete_head_object_closure",
+            "test_legacy_short_prefix_receipts_ignore_source_grafts_and_replace_refs",
+            "test_legacy_short_prefix_receipts_accept_unrelated_object_child_churn",
+            "test_legacy_short_prefix_receipts_revalidate_source_config_after_each_query",
+            "test_legacy_short_prefix_receipts_revalidate_view_content_after_each_query",
+            "test_legacy_short_prefix_receipts_revalidate_source_object_identity_after_query",
+            "test_legacy_short_prefix_receipts_revalidate_control_access_policy",
+            "test_legacy_short_prefix_receipts_cleanup_failure_never_publishes_success",
+            "test_legacy_short_prefix_receipts_cleanup_parent_drift_reports_descriptor_locator",
+        ):
+            self.assertIn(test_pointer, named_lane_tests)
+
         if CI_PROFILE == "canonical":
             decision_journals = (
                 REPO_ROOT / "docs/project_journal/2026/07/"
@@ -5580,12 +5694,32 @@ printf '%s\n' "$trusted_uv"
                 journal_text = journal_path.read_text(encoding="utf-8")
                 self.assertIn('`object_type == "commit"`', journal_text)
                 self.assertIn("annotated tag", journal_text.lower())
-                self.assertIn("sanitized bare Git view", journal_text)
+                self.assertIn("legacy-short-prefix-receipts", journal_text)
+                self.assertIn(
+                    "named-lane-legacy-short-prefix-receipts-v1",
+                    journal_text,
+                )
+                self.assertIn("private workspace helper", journal_text.lower())
+                self.assertIn("manifest-bound", journal_text)
+                normalized_journal = " ".join(journal_text.split())
+                for sentence in negative_authority_sentences:
+                    self.assertIn(sentence, normalized_journal)
+                for anchor in protected_property_anchors:
+                    self.assertIn(anchor, normalized_journal)
+                for forbidden in forbidden_legacy_helper_wording:
+                    self.assertNotIn(forbidden, normalized_journal.lower())
                 self.assertTrue(
                     ".git/info/grafts" in journal_text or "local grafts" in journal_text
                 )
                 self.assertIn("replace refs", journal_text)
+                self.assertIn("per-worktree shallow", journal_text)
+                self.assertIn("promisor", journal_text)
                 self.assertIn("multi-pack-index", journal_text)
+                self.assertIn("phase-level", journal_text)
+                self.assertIn(
+                    "git rev-list --objects --missing=error --quiet <head> --",
+                    journal_text,
+                )
                 self.assertNotIn("exact six-field entries", journal_text)
 
         for anchor in (
