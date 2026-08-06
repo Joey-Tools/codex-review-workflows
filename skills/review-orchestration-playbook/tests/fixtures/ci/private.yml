@@ -1814,14 +1814,6 @@ jobs:
             tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
-      - uses: actions/setup-python@v5
-        id: setup_latest_python
-        if: always()
-        with:
-          python-version: "3.x"
-      - name: Run platform reconciliation safety tests (Python 3.x)
-        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
       - name: Require source-only Python tree
         if: always()
         run: |

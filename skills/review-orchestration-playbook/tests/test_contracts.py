@@ -2560,6 +2560,12 @@ concurrency:
         )
         for runner in ("ubuntu-latest", "macos-latest"):
             self.assertIn(f"          - {runner}\n", platform_job)
+        linux_full_discovery_step = """      - name: Build and verify private overlay
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover -s tests
+"""
+        self.assertEqual(platform_job.count(linux_full_discovery_step), 1)
 
         readonly_start = private.index(
             "\n  readonly_install_supervisor_tests:",
@@ -2570,6 +2576,7 @@ concurrency:
             independent_job.count("\n    timeout-minutes: 20\n"),
             1,
         )
+        self.assertIn("    runs-on: macos-26\n", independent_job)
         self.assertIn(
             """    steps:
       - uses: actions/checkout@v4
@@ -2587,7 +2594,7 @@ concurrency:
         run: |
           python3 -m tests.run_required_deterministic_supervisor
 """
-        budgeted_reconciliation_step = """      - uses: actions/setup-python@v5
+        budgeted_macos_reconciliation_step = """      - uses: actions/setup-python@v5
         id: setup_latest_python
         if: always()
         timeout-minutes: 2
@@ -2596,15 +2603,6 @@ concurrency:
       - name: Run platform reconciliation safety tests (Python 3.x)
         if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
         timeout-minutes: 2
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
-"""
-        reconciliation_step = """      - uses: actions/setup-python@v5
-        id: setup_latest_python
-        if: always()
-        with:
-          python-version: "3.x"
-      - name: Run platform reconciliation safety tests (Python 3.x)
-        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
         run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
 """
         broker_step = """      - name: Require hosted-runner byte reproduction
@@ -2618,7 +2616,10 @@ concurrency:
             --check
 """
         self.assertEqual(independent_job.count(deterministic_step), 1)
-        self.assertEqual(independent_job.count(budgeted_reconciliation_step), 1)
+        self.assertEqual(
+            independent_job.count(budgeted_macos_reconciliation_step),
+            1,
+        )
         self.assertEqual(independent_job.count(broker_step), 1)
         self.assertEqual(
             independent_job.count("\n        timeout-minutes: 10\n"),
@@ -2630,10 +2631,10 @@ concurrency:
         )
         self.assertLess(
             independent_job.index("      - name: Verify independent review supervisor CLI\n"),
-            independent_job.index(budgeted_reconciliation_step),
+            independent_job.index(budgeted_macos_reconciliation_step),
         )
         self.assertLess(
-            independent_job.index(budgeted_reconciliation_step),
+            independent_job.index(budgeted_macos_reconciliation_step),
             independent_job.index(broker_step),
         )
         self.assertLess(
@@ -2646,13 +2647,42 @@ concurrency:
         python_39_job = private[python_39_start + 1 : test_start]
         self.assertIn("    runs-on: ubuntu-slim\n", python_39_job)
         self.assertIn("    timeout-minutes: 15\n", python_39_job)
-        self.assertEqual(python_39_job.count(reconciliation_step), 1)
-        self.assertLess(
-            python_39_job.index("      - name: Run Python 3.9 compatibility regressions\n"),
-            python_39_job.index(reconciliation_step),
+        python_39_setup_step = """      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+"""
+        self.assertEqual(
+            python_39_job.count("      - uses: actions/setup-python@v5\n"),
+            1,
+        )
+        self.assertEqual(python_39_job.count(python_39_setup_step), 1)
+        for selector in (
+            "tests.test_personal_sync_reconciliation_safety."
+            "PendingLinkTransactionSafetyTests."
+            "test_empty_record_empty_state_transaction_parses_and_recovers",
+            "tests.test_personal_sync_reconciliation_safety."
+            "PendingLinkTransactionSafetyTests."
+            "test_oversized_json_integer_is_normalized_to_sync_error",
+        ):
+            self.assertEqual(python_39_job.count(selector), 1)
+        self.assertNotIn("        id: setup_latest_python\n", python_39_job)
+        self.assertNotIn(
+            "      - name: Run platform reconciliation safety tests (Python 3.x)\n",
+            python_39_job,
+        )
+        self.assertNotIn(
+            "        run: python3 -m unittest "
+            "tests.test_personal_sync_reconciliation_safety\n",
+            python_39_job,
+        )
+        self.assertEqual(
+            python_39_job.count("      - name: Require source-only Python tree\n"),
+            1,
         )
         self.assertLess(
-            python_39_job.index(reconciliation_step),
+            python_39_job.index(
+                "      - name: Run Python 3.9 compatibility regressions\n"
+            ),
             python_39_job.index("      - name: Require source-only Python tree\n"),
         )
 
