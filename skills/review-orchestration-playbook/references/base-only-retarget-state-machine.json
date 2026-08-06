@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "event": "request-time-merge-base-changed-with-same-head",
   "request_scope_receipt_sidecar": {
     "required_kind_for_event": "parent-recorded-request-scope-v1",
@@ -53,7 +53,7 @@
       "post_action": "forbid-another-post",
       "reaction_action": "exclude",
       "local_lane_action": "independent-scope-gates",
-      "terminal_payload_action": "independent-artifact-scope-receipt-and-result-gates"
+      "terminal_payload_action": "publication-scope-audit-or-negative-evidence-only"
     },
     "scope_epoch_classification": {
       "exact_current_scope": {
@@ -110,9 +110,15 @@
       "status": "triple-inconclusive"
     },
     "independent_of_request_scope_sidecar": true,
+    "scope_assurance": "artifact-publication-only",
+    "proves_provider_input_merge_base": false,
     "proves_request_run_artifact_lineage": false,
     "proves_continuous_scope_stability": false,
-    "proves_no_intermediate_aba": false
+    "proves_no_intermediate_aba": false,
+    "whole_pr_completion_action": "triple-inconclusive",
+    "clean_action": "audit-only-no-merge-ready",
+    "negative_evidence_action": "block-and-report-no-whole-pr-completion",
+    "future_completion_requirement": "provider-authenticated-input-base-or-request-run-artifact-binding"
   },
   "range_origin": {
     "record_location": "parent-owned-audit",

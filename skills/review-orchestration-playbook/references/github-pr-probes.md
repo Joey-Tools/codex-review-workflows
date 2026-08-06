@@ -2,6 +2,8 @@
 
 Use these recipes when `$review-orchestration-playbook` needs PR metadata, review threads, branch protection, rules, check status, or merge state.
 
+A legacy unreceipted artifact never becomes the selected completion basis.
+
 ## GitHub Codex Availability And Current-Head Evidence
 
 Before requesting the third lane, record the PR URL, host, authenticated/operating identity, lifecycle tuple `state` / `merged` / `merged_at`, `baseRefName`, `baseRefOid`, and `headRefOid`, then independently validate the selected PR's unique local merge base. Only exact `state == "open"`, `merged == false`, and `merged_at == null` is an eligible lifecycle.
@@ -150,8 +152,8 @@ to `discovery_endpoint_transcript` schema version 4 or invent another fetch
 kind. If any observed request lacks a valid one-to-one sidecar, set
 `request_policy.status: unknown`, do not POST again, and exclude that request
 and its reactions from reaction-profile authority. Continue to evaluate an
-independently complete terminal payload normally, but only through its own
-artifact-time scope receipt below.
+independently complete terminal payload for classification, but only through
+its own artifact-time scope receipt below; it cannot complete triple.
 
 For each terminal-looking exact-provider artifact admitted to the receipt-bound
 normalized decision member, retain one singular closed artifact-wrapper field
@@ -199,22 +201,23 @@ classifiers below recognizes it; ordinary unreceipted current-grammar clean or
 finding artifacts remain ineligible. Exclude the recognized carrier from
 normalized receipt-bound wrappers and admit it only through the closed
 `legacy_unreceipted_audit` partition below. It never supplies positive
-authority or becomes the selected completion basis. A later accepted
-receipt-bound result may still have a non-null `evidence_basis` that carries
+classification authority or becomes the selected classification basis. A later
+classified receipt-bound result may still have a non-null `evidence_basis` that carries
 the item in `legacy_unreceipted_artifacts`; the legacy item does not by itself
 veto that result when every migration gate closes.
 
 This v1 envelope uses **artifact-publication scope**. If its complete
-pre/GET/post receipt binds the current tuple, that tuple authorizes the artifact
-even when request history is unbound or a caller says the provider started work
-under an earlier merge base. The receipt does not attest the provider's
+pre/GET/post receipt binds the current tuple, that tuple authorizes artifact-level
+classification even when request history is unbound or a caller says the provider
+started work under an earlier merge base. It never authorizes triple completion
+or merge readiness. The receipt does not attest the provider's
 internal input merge base. Only a valid same-head/different-merge-base request
 sidecar proves `base-changed-same-head`; a missing or malformed sidecar is
-`not-proved`, makes request policy unknown, and cannot veto an independently
-trustworthy terminal result. Requiring an unavailable launch-time tuple would
-restore the rejected request/run/artifact binding. A future
-provider-authenticated input-base marker governed by a predeclared provider
-profile may change this policy explicitly.
+`not-proved`, makes request policy unknown, and cannot be bypassed by an
+independently trustworthy publication receipt. A future predeclared provider
+profile with provider-authenticated input-base or request/run/artifact binding
+may change this policy explicitly; the current accepted terminal-binding schema
+set is empty.
 
 The strict pre edge is intentional: GitHub supplies only whole-second time
 authority for these fields, so equality cannot distinguish an artifact created
@@ -594,9 +597,16 @@ values directly from its pull-detail and compare receipts. Every legacy item's
 trusted semantic server time must be strictly earlier than both values in both
 passes. Whole-second equality, a later time, an unknown or malformed time or
 `Date`, a missing boundary, an invalid receipt, or an unprojectable/malformed
-legacy artifact is fail-closed evidence. The selected completion artifact must
-come from the receipt-bound normalized member; the legacy member never supplies
-clean or findings completion. Within that legacy member,
+legacy artifact is fail-closed evidence. The selected terminal-classification
+artifact must come from the receipt-bound normalized member; the legacy member
+never supplies terminal clean classification or whole-PR completion. A
+receipt-bound terminal clean supplies only artifact-level classification with
+`scope_assurance: artifact-publication-only` and
+`whole_pr_completion_action: audit-only-no-merge-ready`; receipt-bound terminal
+findings supplies only blocking negative evidence with
+`whole_pr_completion_action: block-and-report-no-whole-pr-completion`. Neither
+completes the third lane. Only a complete `thumbs-up-clean` reaction basis can
+complete the third lane. Within that legacy member,
 `clean-pending-resolution` and the exact raw-internal
 `legacy-finding-native-review-v1` role `finding` are complete audit-only
 history and do not control ordinary
@@ -634,15 +644,16 @@ Request policy therefore remains `unknown`, and reaction-only evidence is
 unavailable. Only a later terminal artifact, itself receipt-bound, that
 strictly follows both pre boundaries, closes the partition, passes the complete
 version-1 artifact receipt/final-stability contract, and wins ordinary
-precedence may decide without request/run attribution. If that selected clean
+precedence may classify without request/run attribution. If that selected clean
 uses a 10-hex marker, its own initial/final exact-repository resolution receipts
 must resolve to its full current head; no older unresolved prefix may borrow
 that companion. Unrecoverable old request sidecars leave `request_policy`
 `unknown` and forbid another same-head POST, but that producer/audit field alone
-does not null the independently complete selected result. This keeps the fixed Action's
-result-present authority: a provider result, not request lineage, completes the
-lane; ordinary older top-level/resolved findings can be superseded; and the
-existing unresolved-thread rule remains the safety blocker.
+does not null the independently complete terminal classification or blocking
+negative finding. This keeps the fixed Action's result-present parsing
+authority independent of request lineage; it does not complete the lane.
+Ordinary older top-level/resolved findings can be superseded, while the existing
+unresolved-thread rule remains the safety blocker.
 A proved `base-changed-same-head` event cannot use the manual path and requires
 a real new head. Otherwise remain `triple-inconclusive`; never manufacture an
 empty or anchor commit to create a new epoch.
@@ -652,24 +663,33 @@ empty or anchor commit to create a new epoch.
 Use [github-codex-evidence-authority.md](github-codex-evidence-authority.md) as
 the authoritative decision contract.
 
-Only provider-result authority is inherited from the fixed atomic baseline:
+Only provider-result parsing authority is inherited from the fixed atomic baseline:
 source `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`,
 released Action
 `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`,
 common tree `d03de9035d20f285e6a93986d436403b4a30e9bc`, the complete 15-path
 manifest, and the result-present regression rationale pinned in that reference.
 Floating refs, prose-only comparisons, and partial runtime diffs are not
-anti-drift evidence. The inherited decision is:
-complete trustworthy current-scope results decide without request/run
-attribution, and early or duplicate requests remain outcome-neutral producer
-warnings. Bounded dual-source discovery schema version 4, raw target-thread proof,
+anti-drift evidence. That inherited authority yields artifact-level clean/findings classification
+under the fixed grammar and precedence without request/run attribution, but it
+does not establish whole-PR input binding or merge readiness. Early or duplicate
+requests remain outcome-neutral producer warnings. Bounded dual-source discovery
+schema version 4, raw target-thread proof,
 exact whole-PR lifecycle/scope, the closed terminal carrier, request-time scope
 sidecars, independent artifact-time whole-PR scope receipts,
 ancestor-finding projection, declaration discovery, and conditional `+1`
-fallback are deliberate playbook extensions, not behaviour attributed to the
-fixed Action. Findings, malformed terminal artifacts, unresolved
+fallback are deliberate playbook extensions, not behaviour attributed to the fixed Action.
+Findings, malformed terminal artifacts, unresolved
 applicable target threads, incomplete pagination, stale scope, and unstable
 final evidence still fail closed.
+
+A terminal payload therefore cannot complete triple or make the PR merge-ready;
+`scope_assurance: artifact-publication-only` attests only the receipt-bound
+publication tuple, not the provider input merge base or lineage. Terminal findings remain blocking negative evidence.
+Only a complete `thumbs-up-clean` reaction basis
+can complete the lane under the current policy. Any future positive terminal
+authority requires a predeclared provider profile with provider-authenticated input-base or request/run/artifact binding.
+The current accepted terminal-binding schema set is empty.
 
 Build one complete current-scope snapshot from:
 
@@ -698,24 +718,25 @@ Apply the evidence in this order:
 2. Discard progress messages and acknowledgements from terminal selection. An untrusted-identity or stale-scope artifact cannot win selection, but retain every terminal-looking instance as fail-closed evidence; do the same for malformed terminal-looking artifacts. Never drop one and expose an older clean as the apparent winner.
 3. Select the latest trustworthy receipt-bound terminal artifact by server time. If the latest equal-time set spans more than one source channel, fail closed before comparing outcomes or numeric IDs. Within one channel, malformed or scope-conflicting evidence blocks, then finding wins over clean, and only a same-channel positive ID may break a remaining tie. A newer/equal malformed terminal artifact is `triple-inconclusive`; an older recognized migration-only audit item is retained but cannot control selection.
 4. A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when the ancestor finding remains in the complete projection, no associated thread remains unresolved, and no newer finding or newer/equal malformed terminal artifact exists. A recognized strictly older migration-only audit item cannot control selection, while a true malformed/unknown old near-miss still prevents the partition from closing. A resolved applicable thread may cease blocking under the thread rule; an unresolved one never does. Reaction-only clean never supersedes a finding.
-5. A request or progress artifact after the selected terminal does not replace it. In particular, `R1 -> clean1 -> R2 pending`, `R1 -> clean1 -> R2 -> clean2`, and `R1 -> R2 -> clean1 -> clean2` may all select clean and pass with a request-policy warning. No request/run association is required.
+5. A request or progress artifact after the selected terminal does not replace it. In particular, `R1 -> clean1 -> R2 pending`, `R1 -> clean1 -> R2 -> clean2`, and `R1 -> R2 -> clean1 -> clean2` may all select the same artifact-level clean classification with a request-policy warning. No request/run association is required for classification, but none of these terminal selections completes triple or merge readiness.
 
 Recompute and report `request_policy`, `provider_profile`, and `evidence_basis` from the final complete snapshot and bounded same-repository history, using this predeclared profile set:
 
-- `terminal-payload`: the default; accept clean only from a commit-bound explicit no-findings comment/review.
-- `mixed`: reaction and payload carriers coexist; terminal payload remains authoritative regardless of reaction recency.
+- `terminal-payload`: the default; classify clean only from a commit-bound explicit no-findings comment/review, without treating it as completion.
+- `mixed`: reaction and payload carriers coexist; terminal payload remains authoritative for classification regardless of reaction recency.
 - `thumbs-up-clean`: reaction-only weak fallback, enabled only by every condition in the authority reference.
 - `unknown`: reaction-only evidence cannot pass.
 
 An independently trustworthy current terminal clean/findings artifact selects
-`terminal-payload` even when the provider declaration is missing or a failure
+`terminal-payload` classification even when the provider declaration is missing or a failure
 is confined to historical traversal, pagination, endpoint/artifact budget, or
 request-sidecar validation. Those historical adaptation-plane failures prevent
-only `mixed` and weak reaction authority. Run that optional history before a
+`mixed` and weak reaction authority, and any sidecar failure keeps completion
+unavailable rather than being bypassed by a publication receipt. Run that optional history before a
 fresh final current reread, and do not age a completed inventory's tracker with
 elapsed work from another inventory. A current endpoint/artifact receipt failure
 or current identity, scope, lifecycle, thread, ancestry, grammar, selection, or
-final-stability failure still blocks.
+final-stability failure still blocks classification.
 
 For `thumbs-up-clean`, accept declaration authority only from a directly fetched and finally stable canonical GitHub REST issue-comment artifact with exact provider Bot/App identity and the predeclared line `If Codex has suggestions, it will comment; otherwise it will react with 👍.`. Record its exact repository/PR/API/HTML identity, artifact ID, server times, asserted text, GitHub `+1` mapping, normalization, and digest; arbitrary issuer/source labels, copied prose, self-hashed paraphrases, and caller-synthesized records are not authority. Preserve closed initial/final GET receipts with exact method/URL/integer status/canonical Date/raw body/body digest, independently project each declaration snapshot from its receipt body, and reject unknown receipt fields such as self-reported TLS booleans. Build the complete deterministic 30-day same-repository historical candidate universe before profile selection. Freeze the exact `(as_of - 2592000, as_of]` interval from the initial receipt: `as_of_receipt` is that exact receipt, `as_of_api_url` is its canonical URL, and `as_of_server_time` is its parsed Date. A final declaration re-read must be no earlier and never moves the window. Exclude the exact current scope and collapse duplicate records to one final outcome per repository/PR/`pr_merge_base`/head key.
 
@@ -770,7 +791,8 @@ memoized result through candidate ordering, audit, profile, outcome, and report
 projection; a consumer must never create a per-candidate, per-scope, or
 recomputation tracker or recharge the same wrapper. Sidecar overflow makes
 request policy unknown and disables reaction authority without erasing an
-independently complete terminal payload. Aggregate artifact-ledger overflow
+independently complete terminal classification; it also prevents completion.
+Aggregate artifact-ledger overflow
 invalidates the complete terminal-artifact projection and selects `unknown`,
 never a validated prefix. Before memo lookup, apply the fixed
 `github-codex-memo-fingerprint-guard-v1`: an iterative no-hash strict-JSON
@@ -813,7 +835,7 @@ work unit). The 512 raw-union-seeded PRs, 512 controlled requests, 8192 attempts
 4096 retained pages, and 900-second deadline are playbook extensions for
 bounded discovery evidence. Stable future-prefix projection is also a
 playbook extension; do not attribute these rules to the pinned Action or use
-them to change its provider-result authority baseline.
+them to change its provider-result parsing authority baseline.
 
 The inventory stores `request_scope_receipts` beside that raw transcript. The
 version-4 root remains exactly
@@ -957,8 +979,9 @@ response with `updated_at == created_at`; an edited request cannot enter
 reaction authority without a future predeclared edit-receipt version.
 
 Those normalized current snapshots are necessary derived views but are not
-authority for terminal clean/findings or reaction clean. For every accepted
-current provider result, the parent performs independent complete initial and
+authority for terminal clean/findings classification or reaction clean. For
+every classified current terminal artifact or accepted reaction clean, the
+parent performs independent complete initial and
 final raw current endpoint traversals and embeds both inventories in
 `evidence_basis`. Each covers the current pull detail, compare, issue comments,
 reviews, associated inline comments, raw GraphQL threads/comments, and every
@@ -981,7 +1004,8 @@ ancestry receipt, another return code, commit-set mismatch,
 provider-artifact/thread/finding projection drift, or ancestry-receipt drift
 makes the provider result `unknown`. A missing, malformed, or sidecar-only
 request-scope drift instead makes request policy and reaction authority
-`unknown` without vetoing a separately stable terminal result. The complete
+`unknown` without erasing a separately stable terminal classification; the
+publication receipt cannot promote that classification to completion. The complete
 raw request/reaction pages must nevertheless remain fully fetched and
 parseable. Stable or changing duplicate/pending requests and reactions stay on
 their own audit/policy plane and do not veto terminal selection. The complete
@@ -1030,12 +1054,13 @@ positive JSON integers; quoted decimal strings are invalid. An
 ID/time/commit summary alone is not acceptance evidence.
 
 Serialize exact nested `scope_assurance: artifact-publication-only` in every
-accepted terminal or stable terminal-blocker `evidence_basis`. This field
+classified terminal or stable terminal-blocker `evidence_basis`. This field
 attests only the receipt-bound publication-time scope; it does not attest the
 provider's internal input merge base or whole-PR review coverage. Omit it from
 reaction bases, and keep an absent basis as literal `null`.
 
-Immediately before success, repeat the lifecycle, base/head, unique merge-base,
+Immediately before accepting `thumbs-up-clean` or finalizing terminal classification,
+repeat the lifecycle, base/head, unique merge-base,
 complete evidence, pagination, every applicable artifact-time scope receipt,
 every applicable short-marker initial/final resolution receipt, and
 selected-artifact reads. Require the exact whole-PR scope and the recorded
@@ -1092,8 +1117,10 @@ stop before local lanes as specified by the state-machine input contract. A
 missing or malformed sidecar cannot prove this retarget event and therefore
 does not invoke that transition; it instead closes only the request/reaction
 planes, makes request policy unknown, and forbids another POST while
-independently scoped local lanes and terminal evidence keep their own gates;
-terminal evidence still requires its separate artifact-time receipt. An
+independently scoped local lanes and terminal classification keep their own
+gates. An artifact-time publication receipt may support classification, but it
+cannot bypass the missing sidecar, complete triple, or establish merge
+readiness. An
 exact current range newly supplied by the caller recovers local lanes for
 caller-origin state; normal exact-current rederivation recovers them for
 PR-derived state. Either recovery proceeds to local lanes but keeps readiness
@@ -1104,7 +1131,7 @@ head, and no empty or anchor commit may manufacture that epoch. Neither the
 request sidecar nor an artifact receipt's matching point reads prove that an
 intermediate ABA transition did not occur.
 
-Posting `@codex review` is request transport, not completion or proof that the service started. Accept strong terminal payloads only from exact REST `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`. When app/check evidence is used for service-start detection, accept only exact `app.slug == "chatgpt-codex-connector"`, exact current `head_sha`, and non-null `started_at` after an observed request. A check/run is service-start evidence only and never completes triple or proves no findings, even when `status == "completed"` and `conclusion == "success"`. Unknown or lookalike identities prove neither start nor completion.
+Posting `@codex review` is request transport, not completion or proof that the service started. Classify strong terminal payloads only from exact REST `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`. When app/check evidence is used for service-start detection, accept only exact `app.slug == "chatgpt-codex-connector"`, exact current `head_sha`, and non-null `started_at` after an observed request. A check/run is service-start evidence only and never completes triple or proves no findings, even when `status == "completed"` and `conclusion == "success"`. Unknown or lookalike identities prove neither start nor classification.
 
 The fixed authority baseline has no accepted no-start body grammar, so free-form exact-bot prose cannot currently prove unavailability. A future policy version may activate that path only with the provider-backed immutable grammar and regression contract required by the authority reference. An acknowledgement, review activity, or exact-App current-head check/run proves service start only. When no complete `thumbs-up-clean` reaction fallback is accepted, no terminal response, an otherwise valid nonterminal/check-only state, or a retryable transport/read failure remains pending while bounded waiting is meaningful. After that wait is exhausted, it is `triple-inconclusive`. Unknown identity, malformed or stale evidence, a non-retryable request failure, or permanently incomplete enumeration is immediately inconclusive and never proves clean completion.
 
@@ -1115,7 +1142,9 @@ Classify precisely, applying selected-PR range alignment before the availability
 - Any existing PR with current `headRefOid != head_sha` and no separate PR-mutation authorization is a readiness `blocked-authorization` result. For a still-eligible PR, report `requested: triple`, `effective: triple-inconclusive`, and GitHub lane status `blocked-authorization`.
 - For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue.
 - Only after an existing PR is head-aligned and its frozen range is exactly `pr_merge_base..pr_head_oid`, classify an unsupported host/identity as third-lane unavailable and effective double. The fixed baseline accepts no structured integration/service availability schema and no no-start body grammar, so integration/service uncertainty cannot currently enter this branch. A future pinned schema or authenticated no-start grammar may join it only after an explicit policy update. No PR is also effective double without a selected-PR range comparison.
-- Service ran and returned findings: available lane with findings; fix and rerequest after the new head.
+- Service ran and returned terminal findings: preserve the blocking negative evidence, report `requested: triple`, `effective: triple-inconclusive`, and record `evidence_action: block-and-report-no-whole-pr-completion`; fix and rerequest only after a substantive new head.
+- A complete terminal clean supplies classification only: immediately report `requested: triple`, `effective: triple-inconclusive`, and `evidence_action: audit-only-no-merge-ready`; it cannot satisfy merge readiness.
+- Only a complete `thumbs-up-clean` basis supplies positive third-lane completion under the current policy.
 - When no complete `thumbs-up-clean` reaction fallback is accepted, missing terminal evidence that proves neither unavailable nor started is `pending` while bounded waiting remains meaningful; when that wait is exhausted, report `requested: triple`, `effective: triple-inconclusive`.
 - A started service with ambiguous authorship, stale head/range, malformed evidence, or a permanently incomplete association is immediately `requested: triple`, `effective: triple-inconclusive`.
 - A started service with no complete `thumbs-up-clean` reaction fallback and otherwise valid nonterminal/check-only evidence, missing terminal payload, or retryable incomplete pagination remains `pending` while bounded waiting is meaningful; after exhaustion, report `requested: triple`, `effective: triple-inconclusive`. Neither branch may become effective double, completed triple, or clean evidence.

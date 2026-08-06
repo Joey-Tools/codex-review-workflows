@@ -1050,17 +1050,16 @@ def _github_provider_repository_policy_files(
     repo_root: pathlib.Path,
     profile: str,
 ) -> dict[str, str]:
-    policy_paths: dict[str, pathlib.Path] = {}
-    if profile == "canonical":
-        policy_paths = {
-            "repository policy": _repository_agents_path(repo_root, profile),
-            "change delivery": (
-                _repository_policy_scope_root(repo_root, profile)
-                / "skills/change-delivery-workflow/SKILL.md"
-            ),
-        }
-    elif profile != "private":
+    if profile not in {"canonical", "private"}:
         raise AssertionError(f"unsupported repository policy profile: {profile}")
+    policy_paths = {
+        "repository policy": _repository_agents_path(repo_root, profile),
+    }
+    if profile == "canonical":
+        policy_paths["change delivery"] = (
+            _repository_policy_scope_root(repo_root, profile)
+            / "skills/change-delivery-workflow/SKILL.md"
+        )
     return {
         name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
     }
@@ -2455,6 +2454,11 @@ class RepositoryContractTest(unittest.TestCase):
             policy_root = repo_root / "personal_codex"
             private_skill_root = policy_root / "skills/review-orchestration-playbook"
             private_skill_root.mkdir(parents=True)
+            private_agents = policy_root / "AGENTS.md"
+            private_agents.write_text(
+                "- Require whole-PR evidence binding.\n",
+                encoding="utf-8",
+            )
 
             self.assertEqual(
                 _ci_contract_context(private_skill_root),
@@ -2472,8 +2476,11 @@ class RepositoryContractTest(unittest.TestCase):
             )
             self.assertEqual(
                 _github_provider_repository_policy_files(repo_root, "private"),
-                {},
+                {"repository policy": private_agents.read_text(encoding="utf-8")},
             )
+            private_agents.unlink()
+            with self.assertRaises(FileNotFoundError):
+                _github_provider_repository_policy_files(repo_root, "private")
             self.assertEqual(
                 _secret_admission_repository_policy_files(repo_root, "private"),
                 {},
@@ -5692,6 +5699,32 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("zero-prefix phase", contracts)
         self.assertIn("receipts: []", contracts)
         self.assertNotIn("git cat-file -e '<sole_full_sha>^{commit}'", probes)
+        normalized_probes = " ".join(probes.split())
+        self.assertIn(
+            "The selected terminal-classification artifact must come from the "
+            "receipt-bound normalized member",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`scope_assurance: artifact-publication-only`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`whole_pr_completion_action: audit-only-no-merge-ready`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`whole_pr_completion_action: "
+            "block-and-report-no-whole-pr-completion`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "Only a complete `thumbs-up-clean` reaction basis can complete the "
+            "third lane",
+            normalized_probes,
+        )
+        self.assertNotIn("selected completion artifact", normalized_probes.lower())
+        self.assertNotIn("clean or findings completion", normalized_probes.lower())
 
         for test_pointer in (
             "test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime",
@@ -5954,12 +5987,12 @@ printf '%s\n' "$trusted_uv"
         unquoted = normalized.replace("`", "")
         for anchor in (
             "duplicate-observed is warning-only",
-            "does not require request/run attribution",
             "latest trustworthy terminal artifact",
             "if an accepted request already exists, it does not post another one",
             "a lone request that was posted under producer policy and is still pending",
             "compliant, not a warning",
-            "does not independently invalidate complete provider-result evidence",
+            "cannot complete triple or make the pr merge-ready",
+            "terminal findings remain blocking negative evidence",
             "base-changed-same-head",
             "does not erase later live current-scope request-policy evidence",
             "neither case admits r2 into historical samples or the weak reaction fallback",
@@ -5976,6 +6009,13 @@ printf '%s\n' "$trusted_uv"
             SKILL_ROOT / "references/github-codex-evidence-authority.md"
         ).read_text(encoding="utf-8")
         normalized = " ".join(authority.split()).lower()
+        repository_policy_files = _github_provider_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        repository_policy = repository_policy_files.get("repository policy")
+        self.assertIsInstance(repository_policy, str)
+        assert isinstance(repository_policy, str)
 
         for anchor in (
             "unresolved thread finding",
@@ -6240,7 +6280,8 @@ printf '%s\n' "$trusted_uv"
         ]
         self.assertEqual(len(mixed_profile_lines), 1)
         self.assertIn(
-            "terminal payload remains the only clean authority",
+            "terminal payload controls artifact classification and "
+            "negative-evidence precedence only",
             mixed_profile_lines[0],
         )
         self.assertIn(
@@ -6742,9 +6783,8 @@ printf '%s\n' "$trusted_uv"
             "skill": anti_drift_documents["skill"],
             "github-pr-probes": github_pr_probes,
             "pr-readiness": anti_drift_documents["pr-readiness"],
+            "repository policy": repository_policy,
         }
-        if journal is not None:
-            artifact_publication_documents["project-journal"] = journal
         for document_name, document in artifact_publication_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
             with self.subTest(artifact_publication_document=document_name):
@@ -6754,25 +6794,18 @@ printf '%s\n' "$trusted_uv"
                     normalized_document,
                 )
                 self.assertIn(
-                    "only a valid same-head/different-merge-base request sidecar "
-                    "proves base-changed-same-head",
+                    "cannot complete triple or make the pr merge-ready",
                     normalized_document,
                 )
                 self.assertIn(
-                    "a missing or malformed sidecar is not-proved, makes request "
-                    "policy unknown, and cannot veto an independently trustworthy "
-                    "terminal result",
+                    "provider-authenticated input-base or request/run/artifact binding",
                     normalized_document,
                 )
                 self.assertIn(
-                    "restore the rejected request/run/artifact binding",
+                    "terminal findings remain blocking negative evidence",
                     normalized_document,
                 )
-                self.assertIn(
-                    "provider-authenticated input-base marker governed by a "
-                    "predeclared provider profile",
-                    normalized_document,
-                )
+                self.assertIn("thumbs-up-clean", normalized_document)
 
         for document_name, document in artifact_publication_documents.items():
             normalized_document = " ".join(document.lower().replace("`", "").split())
@@ -7419,84 +7452,25 @@ printf '%s\n' "$trusted_uv"
         result_present_sections = {
             "authority": section_text(
                 authority,
-                "### Why Result-Present Acceptance Is Deliberate",
+                "### Why Result-Present Evidence Is Not Whole-PR Completion",
             ),
             "skill": discovery_v4_sections["skill"],
             "github-pr-probes": discovery_v4_sections["github-pr-probes"],
             "pr-readiness": discovery_v4_sections["pr-readiness"],
         }
-        result_present_contracts = {
-            "authority": (
-                "a complete, trustworthy current-scope provider result can "
-                "establish the outcome without proving which request or run caused it",
-                "duplicate or mistimed requests are still actionable orchestration "
-                "defects, but they do not contradict what the provider reported",
-                "result-present acceptance is not optimistic acceptance. a newer "
-                "finding or malformed terminal artifact, unresolved thread, "
-                "incomplete page",
-            ),
-            "skill": (
-                "complete trustworthy results decide regardless of request/run "
-                "lineage. producer warnings do not negate them",
-                "the producer-policy violation is outcome-neutral. a pending later "
-                "request does not erase an already selected current-scope clean "
-                "artifact",
-                "an unresolved exact-provider selected-review target-thread finding "
-                "blocks",
-            ),
-            "github-pr-probes": (
-                "complete trustworthy current-scope results decide without "
-                "request/run attribution",
-                "early or duplicate requests remain outcome-neutral producer warnings",
-                "findings, malformed terminal artifacts, unresolved applicable "
-                "target threads, incomplete pagination, stale scope, and unstable "
-                "final evidence still fail closed",
-            ),
-            "pr-readiness": (
-                "request history is producer/audit evidence, not verdict authority",
-                "neither duplicate count, missing request/run lineage, nor a "
-                "request-sidecar failure invalidates a separately trustworthy "
-                "current-head terminal artifact",
-                "an unresolved target-thread finding or malformed target join blocks "
-                "even when a later clean payload exists",
-            ),
-        }
-        if journal is not None:
-            result_present_sections["project-journal"] = section_text(
-                journal,
-                "## Decision Rationale",
-            )
-            result_present_contracts["project-journal"] = (
-                "provider evidence is therefore the verdict authority, while "
-                "requests remain producer controls and audit records",
-                "duplicate or mistimed requests are still actionable orchestration "
-                "defects, but they do not contradict what the provider reported",
-                "silently weaken identity, scope, pagination, finding, or "
-                "final-stability gates",
-            )
-        for document_name, anchors in result_present_contracts.items():
-            for anchor in anchors:
+        for document_name, section in result_present_sections.items():
+            normalized_section = " ".join(section.lower().replace("`", "").split())
+            for anchor in (
+                "artifact-level clean/findings classification",
+                "cannot complete triple or make the pr merge-ready",
+                "provider-authenticated input-base or request/run/artifact binding",
+                "terminal findings remain blocking negative evidence",
+            ):
                 with self.subTest(
                     result_present_document=document_name,
                     result_present_contract=anchor,
                 ):
-                    self.assertIn(anchor, result_present_sections[document_name])
-        if journal is not None:
-            v7_correction_section = section_text(
-                journal,
-                "## v7 Named-Single Superseding Corrections",
-            )
-            for anchor in (
-                "a trustworthy result being present is sufficient verdict evidence",
-                "a request records producer intent and orchestration compliance; it is "
-                "not the consumer verdict",
-                "must not silently restore request/run binding or erase this rationale",
-                "the 20,000-item, 8-mib-response, and 64-mib-run magnitudes align",
-                "the 512 seeded-pr, 512 controlled-request, 8,192 fetch-attempt, "
-                "4,096 retained-page, and 900-second limits are playbook-specific "
-                "extensions",
-            ):
-                self.assertIn(anchor, v7_correction_section)
+                    self.assertIn(anchor, normalized_section)
 
         action_boundary_sections = {
             "authority": section_text(
@@ -7509,40 +7483,33 @@ printf '%s\n' "$trusted_uv"
         }
         action_boundary_contracts = {
             "authority": (
-                "only the provider-result authority is inherited from the fixed "
+                "only provider-result parsing authority is inherited from the fixed "
                 "action baseline",
+                "does not establish whole-pr input binding or merge readiness",
                 "the stricter evidence carriers and scope gates below are "
                 "deliberate playbook extensions",
             ),
             "skill": (
-                "the inherited rule is provider-result authority—complete "
-                "trustworthy results decide regardless of request/run lineage",
+                "only provider-result parsing authority is inherited",
+                "does not establish whole-pr input binding or merge readiness",
                 "playbook extensions, not claims about the action",
             ),
             "github-pr-probes": (
-                "only provider-result authority is inherited from the fixed "
+                "only provider-result parsing authority is inherited from the fixed "
                 "atomic baseline",
+                "does not establish whole-pr input binding or merge readiness",
                 "are deliberate playbook extensions, not behaviour attributed to "
                 "the fixed action",
             ),
             "pr-readiness": (
-                "only provider-result authority is inherited",
+                "only provider-result parsing authority is inherited",
+                "does not establish whole-pr input binding or merge readiness",
                 "raw thread proof, whole-pr lifecycle/scope, the closed "
                 "issue-comment carrier, request-time and artifact-time scope "
                 "receipts, ancestor-finding projection, declaration discovery, "
                 "and +1 fallback are playbook extensions",
             ),
         }
-        if journal is not None:
-            action_boundary_sections["project-journal"] = result_present_sections[
-                "project-journal"
-            ]
-            action_boundary_contracts["project-journal"] = (
-                "the action alignment is intentionally asymmetric and remains pinned",
-                "provider-result authority, duplicate-result consumption, and "
-                "early-result consumption are inherited",
-                "are further playbook extensions",
-            )
         for document_name, anchors in action_boundary_contracts.items():
             for anchor in anchors:
                 with self.subTest(
@@ -7577,19 +7544,6 @@ printf '%s\n' "$trusted_uv"
             "early-result consumption aligns with the action",
         ):
             self.assertIn(anchor, normalized)
-        if journal is not None:
-            journal_normalized = " ".join(journal.split()).lower()
-            for anchor in (
-                "provider-result authority",
-                "duplicate/early-result consumption",
-                "warning/report fields",
-                "local-lane sequencing",
-                "stricter whole-pr lifecycle and scope",
-                "explicit terminal-payload grammar",
-                "conditional `+1` fallback",
-            ):
-                self.assertIn(anchor, journal_normalized)
-
         for anchor in (
             "fixed authority baseline intentionally defines no accepted no-start body grammar",
             "free-form prose that appears to say",
@@ -19499,8 +19453,6 @@ printf '%s\n' "$trusted_uv"
                         request_scope_kinds[request_id] = "base-changed-same-head"
                     else:
                         request_scope_kinds[request_id] = "invalid"
-                if "base-changed-same-head" in request_scope_kinds.values():
-                    return None
                 (
                     terminal_ok,
                     selected,
@@ -19527,6 +19479,8 @@ printf '%s\n' "$trusted_uv"
                     source_ordering_key = None
                     source_evidence = None
                 else:
+                    if "base-changed-same-head" in request_scope_kinds.values():
+                        return None
                     if request_times and (
                         receipt_mapping is None
                         or set(request_receipt_bindings) != set(request_times)
@@ -24942,6 +24896,67 @@ printf '%s\n' "$trusted_uv"
                 local_lane_timing,
             )
             return complete_report_matches_expected(report, expected)
+
+        def whole_pr_completion_decision(
+            lane_state: str,
+            report: object,
+            *,
+            provider_declaration: dict[str, object] | None,
+            candidate_history: dict[str, object],
+            current_record: dict[str, object],
+            local_lane_timing: object,
+        ) -> dict[str, object] | None:
+            """Apply the fail-closed whole-PR gate after provider report parsing."""
+            if (
+                not validate_complete_report(
+                    report,
+                    lane_state=lane_state,
+                    provider_declaration=provider_declaration,
+                    candidate_history=candidate_history,
+                    current_record=current_record,
+                    local_lane_timing=local_lane_timing,
+                )
+                or not isinstance(report, dict)
+                or set(report)
+                != {"request_policy", "provider_profile", "evidence_basis"}
+                or not isinstance(report.get("request_policy"), dict)
+                or not isinstance(report.get("evidence_basis"), dict)
+            ):
+                return None
+            provider_profile = report.get("provider_profile")
+            evidence_basis = report["evidence_basis"]
+            if lane_state in {
+                "accepted-terminal-clean",
+                "accepted-terminal-findings",
+            }:
+                if (
+                    provider_profile not in {"terminal-payload", "mixed"}
+                    or evidence_basis.get("scope_assurance")
+                    != "artifact-publication-only"
+                ):
+                    return None
+                return {
+                    "status": "triple-inconclusive",
+                    "merge_ready_eligible": False,
+                    "evidence_action": (
+                        "audit-only-no-merge-ready"
+                        if lane_state == "accepted-terminal-clean"
+                        else "block-and-report-no-whole-pr-completion"
+                    ),
+                }
+            if lane_state == "accepted-reaction-clean":
+                if (
+                    provider_profile != "thumbs-up-clean"
+                    or evidence_basis.get("kind") != "reaction"
+                    or "scope_assurance" in evidence_basis
+                ):
+                    return None
+                return {
+                    "status": "completed",
+                    "merge_ready_eligible": True,
+                    "evidence_action": "none",
+                }
+            return None
 
         samples = [sample(pr) for pr in (2, 3, 4)]
         current_request = request(10, 10, pr=current_pr)
@@ -34527,6 +34542,21 @@ printf '%s\n' "$trusted_uv"
             terminal_without_receipt_report["request_policy"],
             {"status": "unknown", "warnings": []},
         )
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-terminal-clean",
+                terminal_without_receipt_report,
+                provider_declaration=declaration,
+                candidate_history=terminal_without_receipt_history,
+                current_record=terminal_without_request_receipt,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "audit-only-no-merge-ready",
+            },
+        )
         terminal_with_malformed_request_receipt = clone(terminal_current)
         assert isinstance(terminal_with_malformed_request_receipt, dict)
         terminal_with_malformed_request_receipt["request_scope_receipts"][0][
@@ -34550,6 +34580,21 @@ printf '%s\n' "$trusted_uv"
             terminal_with_malformed_receipt_report["request_policy"],
             {"status": "unknown", "warnings": []},
         )
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-terminal-clean",
+                terminal_with_malformed_receipt_report,
+                provider_declaration=declaration,
+                candidate_history=terminal_with_malformed_receipt_history,
+                current_record=terminal_with_malformed_request_receipt,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "audit-only-no-merge-ready",
+            },
+        )
         terminal_with_base_changed_request = clone(terminal_current)
         assert isinstance(terminal_with_base_changed_request, dict)
         base_changed_scope = clone(terminal_with_base_changed_request["scope"])
@@ -34566,14 +34611,33 @@ printf '%s\n' "$trusted_uv"
             terminal_history,
             current_raw=terminal_with_base_changed_request,
         )
-        self.assertIsNone(
-            expected_report_from_inputs(
+        base_changed_terminal_report = expected_report_from_inputs(
+            "accepted-terminal-clean",
+            declaration,
+            base_changed_terminal_history,
+            terminal_with_base_changed_request,
+            normal_lane_timing,
+        )
+        self.assertIsNotNone(base_changed_terminal_report)
+        assert isinstance(base_changed_terminal_report, dict)
+        self.assertEqual(
+            base_changed_terminal_report["request_policy"],
+            {"status": "unknown", "warnings": []},
+        )
+        self.assertEqual(
+            whole_pr_completion_decision(
                 "accepted-terminal-clean",
-                declaration,
-                base_changed_terminal_history,
-                terminal_with_base_changed_request,
-                normal_lane_timing,
-            )
+                base_changed_terminal_report,
+                provider_declaration=declaration,
+                candidate_history=base_changed_terminal_history,
+                current_record=terminal_with_base_changed_request,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "audit-only-no-merge-ready",
+            },
         )
 
         terminal_with_unproved_base_change = clone(terminal_with_base_changed_request)
@@ -34600,6 +34664,21 @@ printf '%s\n' "$trusted_uv"
         self.assertEqual(
             unproved_base_change_report["request_policy"],
             {"status": "unknown", "warnings": []},
+        )
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-terminal-clean",
+                unproved_base_change_report,
+                provider_declaration=declaration,
+                candidate_history=unproved_base_change_history,
+                current_record=terminal_with_unproved_base_change,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "audit-only-no-merge-ready",
+            },
         )
 
         terminal_with_old_epoch_request = clone(terminal_current)
@@ -36482,6 +36561,21 @@ printf '%s\n' "$trusted_uv"
                     terminal_report_basis["kind"],
                     expected_terminal_kind,
                 )
+                self.assertEqual(
+                    whole_pr_completion_decision(
+                        "accepted-terminal-clean",
+                        terminal_report,
+                        provider_declaration=declaration,
+                        candidate_history=terminal_report_history,
+                        current_record=terminal_report_current,
+                        local_lane_timing=normal_lane_timing,
+                    ),
+                    {
+                        "status": "triple-inconclusive",
+                        "merge_ready_eligible": False,
+                        "evidence_action": "audit-only-no-merge-ready",
+                    },
+                )
                 self.assertTrue(
                     typed_json_equal(
                         terminal_report_basis["selection_snapshots"]["initial"],
@@ -36669,14 +36763,15 @@ printf '%s\n' "$trusted_uv"
             80_200,
             artifact_outcome="findings",
         )
+        terminal_findings_history = history(
+            samples,
+            current_raw=terminal_findings_current,
+            current_ancestry={current_head: 0},
+        )
         terminal_findings_report = expected_report_from_inputs(
             "accepted-terminal-findings",
             declaration,
-            history(
-                samples,
-                current_raw=terminal_findings_current,
-                current_ancestry={current_head: 0},
-            ),
+            terminal_findings_history,
             terminal_findings_current,
             normal_lane_timing,
         )
@@ -36684,6 +36779,109 @@ printf '%s\n' "$trusted_uv"
         assert isinstance(terminal_findings_report, dict)
         self.assertEqual(terminal_findings_report["provider_profile"], "mixed")
         self.assertIsNotNone(terminal_findings_report["evidence_basis"])
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-terminal-findings",
+                terminal_findings_report,
+                provider_declaration=declaration,
+                candidate_history=terminal_findings_history,
+                current_record=terminal_findings_current,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "block-and-report-no-whole-pr-completion",
+            },
+        )
+        terminal_findings_sidecar_cases: dict[str, dict[str, object]] = {}
+        terminal_findings_without_request_receipt = clone(terminal_findings_current)
+        assert isinstance(terminal_findings_without_request_receipt, dict)
+        terminal_findings_without_request_receipt["request_scope_receipts"] = []
+        restamp(terminal_findings_without_request_receipt)
+        terminal_findings_sidecar_cases["missing"] = (
+            terminal_findings_without_request_receipt
+        )
+
+        terminal_findings_with_malformed_request_receipt = clone(
+            terminal_findings_current
+        )
+        assert isinstance(terminal_findings_with_malformed_request_receipt, dict)
+        terminal_findings_with_malformed_request_receipt[
+            "request_scope_receipts"
+        ][0]["authority_override"] = True
+        restamp(terminal_findings_with_malformed_request_receipt)
+        terminal_findings_sidecar_cases["malformed"] = (
+            terminal_findings_with_malformed_request_receipt
+        )
+
+        terminal_findings_with_base_changed_request = clone(
+            terminal_findings_current
+        )
+        assert isinstance(terminal_findings_with_base_changed_request, dict)
+        findings_base_changed_scope = clone(
+            terminal_findings_with_base_changed_request["scope"]
+        )
+        assert isinstance(findings_base_changed_scope, dict)
+        findings_base_changed_scope["pr_merge_base"] = "e" * 40
+        terminal_findings_with_base_changed_request["request_scope_receipts"] = [
+            request_scope_receipt(
+                terminal_findings_with_base_changed_request["requests"][0],
+                findings_base_changed_scope,
+            )
+        ]
+        restamp(terminal_findings_with_base_changed_request)
+        terminal_findings_sidecar_cases["valid-same-head-retarget"] = (
+            terminal_findings_with_base_changed_request
+        )
+
+        terminal_findings_with_unproved_base_change = clone(
+            terminal_findings_with_base_changed_request
+        )
+        assert isinstance(terminal_findings_with_unproved_base_change, dict)
+        terminal_findings_with_unproved_base_change["request_scope_receipts"] = []
+        restamp(terminal_findings_with_unproved_base_change)
+        terminal_findings_sidecar_cases["unproved-retarget"] = (
+            terminal_findings_with_unproved_base_change
+        )
+
+        for case_name, findings_current in terminal_findings_sidecar_cases.items():
+            findings_history = history(
+                samples,
+                current_raw=findings_current,
+                current_ancestry={current_head: 0},
+            )
+            findings_report = expected_report_from_inputs(
+                "accepted-terminal-findings",
+                declaration,
+                findings_history,
+                findings_current,
+                normal_lane_timing,
+            )
+            with self.subTest(terminal_findings_request_sidecar=case_name):
+                self.assertIsNotNone(findings_report)
+                assert isinstance(findings_report, dict)
+                self.assertEqual(
+                    findings_report["request_policy"],
+                    {"status": "unknown", "warnings": []},
+                )
+                self.assertEqual(
+                    whole_pr_completion_decision(
+                        "accepted-terminal-findings",
+                        findings_report,
+                        provider_declaration=declaration,
+                        candidate_history=findings_history,
+                        current_record=findings_current,
+                        local_lane_timing=normal_lane_timing,
+                    ),
+                    {
+                        "status": "triple-inconclusive",
+                        "merge_ready_eligible": False,
+                        "evidence_action": (
+                            "block-and-report-no-whole-pr-completion"
+                        ),
+                    },
+                )
         terminal_findings_with_bad_historical_receipt_history = (
             history_with_malformed_historical_reaction_receipt(
                 terminal_findings_current,
@@ -36782,6 +36980,25 @@ printf '%s\n' "$trusted_uv"
                 current_record=issue_findings_current,
                 local_lane_timing=normal_lane_timing,
             )
+        )
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-terminal-findings",
+                issue_findings_report,
+                provider_declaration=declaration,
+                candidate_history=history(
+                    samples,
+                    current_raw=issue_findings_current,
+                    current_ancestry={current_head: 0},
+                ),
+                current_record=issue_findings_current,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "triple-inconclusive",
+                "merge_ready_eligible": False,
+                "evidence_action": "block-and-report-no-whole-pr-completion",
+            },
         )
         issue_comment_near_misses: dict[str, dict[str, object]] = {}
         wrong_issue_time_field = clone(issue_terminal_current)
@@ -38716,6 +38933,35 @@ printf '%s\n' "$trusted_uv"
             },
         )
         self.assertNotIn("scope_assurance", complete_basis)
+        self.assertEqual(
+            whole_pr_completion_decision(
+                "accepted-reaction-clean",
+                complete_report,
+                provider_declaration=declaration,
+                candidate_history=duplicate_history,
+                current_record=duplicate_current,
+                local_lane_timing=normal_lane_timing,
+            ),
+            {
+                "status": "completed",
+                "merge_ready_eligible": True,
+                "evidence_action": "none",
+            },
+        )
+        self.assertIsNone(
+            whole_pr_completion_decision(
+                "accepted-reaction-clean",
+                {
+                    "request_policy": {},
+                    "provider_profile": "thumbs-up-clean",
+                    "evidence_basis": {"kind": "reaction"},
+                },
+                provider_declaration=declaration,
+                candidate_history=duplicate_history,
+                current_record=duplicate_current,
+                local_lane_timing=normal_lane_timing,
+            )
+        )
         report_current = complete_basis["current"]
         report_samples = complete_basis["samples"]
         report_declaration = complete_basis["provider_declaration"]
@@ -44515,12 +44761,26 @@ printf '%s\n' "$trusted_uv"
         normalized_authority = " ".join(authority.split()).lower()
 
         review_scope_documents = [skill, readiness, probes, contracts, interface]
+        self.assertIsInstance(agents_policy, str)
+        assert isinstance(agents_policy, str)
+        review_scope_documents.append(agents_policy)
+        for content in (interface, agents_policy):
+            with self.subTest(terminal_clean_disposition=content[:40]):
+                normalized = " ".join(
+                    content.lower().replace("`", "").split()
+                )
+                self.assertIn(
+                    "accepted terminal clean classification is immediately "
+                    "triple-inconclusive",
+                    normalized,
+                )
+                self.assertNotIn(
+                    "missing terminal evidence, a terminal clean classification",
+                    normalized,
+                )
         if CI_PROFILE == "canonical":
-            self.assertIsInstance(agents_policy, str)
             self.assertIsInstance(delivery, str)
-            assert isinstance(agents_policy, str)
             assert isinstance(delivery, str)
-            review_scope_documents.append(agents_policy)
         for content in review_scope_documents:
             self.assertIn("blocked-input", content)
             self.assertIn("explicit", content)
@@ -44838,7 +45098,7 @@ printf '%s\n' "$trusted_uv"
             )
         self.assertIn("never post a second", templates.lower())
         self.assertIn(
-            "does not require request/run attribution",
+            "provider-authenticated input-base or request/run/artifact binding",
             authority.lower(),
         )
         self.assertIn(
@@ -45050,7 +45310,24 @@ printf '%s\n' "$trusted_uv"
         machine_path = SKILL_ROOT / "references/base-only-retarget-state-machine.json"
         machine = json.loads(machine_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(machine["version"], 2)
+        self.assertEqual(machine["version"], 3)
+        versioned_entrypoints = [
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/pr-readiness.md",
+        ]
+        if CI_PROFILE == "canonical":
+            versioned_entrypoints.append(SKILL_SCOPE_ROOT / "README.md")
+        for path in versioned_entrypoints:
+            with self.subTest(state_machine_version_entrypoint=str(path)):
+                normalized = " ".join(path.read_text(encoding="utf-8").split())
+                self.assertIn("version 3", normalized)
+                for anchor in (
+                    "scope_assurance",
+                    "whole_pr_completion_action",
+                    "clean_action",
+                    "negative_evidence_action",
+                ):
+                    self.assertIn(anchor, normalized)
         self.assertEqual(
             machine["event"],
             "request-time-merge-base-changed-with-same-head",
@@ -45145,7 +45422,7 @@ printf '%s\n' "$trusted_uv"
                 "reaction_action": "exclude",
                 "local_lane_action": "independent-scope-gates",
                 "terminal_payload_action": (
-                    "independent-artifact-scope-receipt-and-result-gates"
+                    "publication-scope-audit-or-negative-evidence-only"
                 ),
             },
         )
@@ -45192,9 +45469,19 @@ printf '%s\n' "$trusted_uv"
                     "status": "triple-inconclusive",
                 },
                 "independent_of_request_scope_sidecar": True,
+                "scope_assurance": "artifact-publication-only",
+                "proves_provider_input_merge_base": False,
                 "proves_request_run_artifact_lineage": False,
                 "proves_continuous_scope_stability": False,
                 "proves_no_intermediate_aba": False,
+                "whole_pr_completion_action": "triple-inconclusive",
+                "clean_action": "audit-only-no-merge-ready",
+                "negative_evidence_action": (
+                    "block-and-report-no-whole-pr-completion"
+                ),
+                "future_completion_requirement": (
+                    "provider-authenticated-input-base-or-request-run-artifact-binding"
+                ),
             },
         )
         self.assertEqual(
@@ -45404,7 +45691,9 @@ printf '%s\n' "$trusted_uv"
             "identity in `{hoteng, hoteng_cisco}`",
             "`requested: triple`, `effective: double`",
             "Posting the comment requests the third lane but does not complete it",
-            "complete terminal provider-authored current-head findings payload",
+            "artifact-publication scope",
+            "cannot complete triple or make the PR merge-ready",
+            "terminal findings remain blocking negative evidence",
             "service-start evidence only",
             "never completes triple or proves clean/no-findings",
             "effective: triple-inconclusive",
