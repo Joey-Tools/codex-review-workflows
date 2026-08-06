@@ -2566,6 +2566,10 @@ concurrency:
             independent_start,
         )
         independent_job = private[independent_start + 1 : readonly_start]
+        self.assertEqual(
+            independent_job.count("\n    timeout-minutes: 20\n"),
+            1,
+        )
         self.assertIn(
             """    steps:
       - uses: actions/checkout@v4
@@ -2575,6 +2579,25 @@ concurrency:
 """,
             independent_job,
         )
+        deterministic_step = """      - name: Run deterministic independent supervisor tests
+        timeout-minutes: 10
+        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{ runner.temp }}
+        run: |
+          python3 -m tests.run_required_deterministic_supervisor
+"""
+        budgeted_reconciliation_step = """      - uses: actions/setup-python@v5
+        id: setup_latest_python
+        if: always()
+        timeout-minutes: 2
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
+        timeout-minutes: 2
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+"""
         reconciliation_step = """      - uses: actions/setup-python@v5
         id: setup_latest_python
         if: always()
@@ -2586,6 +2609,7 @@ concurrency:
 """
         broker_step = """      - name: Require hosted-runner byte reproduction
         if: always()
+        timeout-minutes: 2
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
         run: |
@@ -2593,14 +2617,23 @@ concurrency:
             personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \\
             --check
 """
-        self.assertEqual(independent_job.count(reconciliation_step), 1)
+        self.assertEqual(independent_job.count(deterministic_step), 1)
+        self.assertEqual(independent_job.count(budgeted_reconciliation_step), 1)
         self.assertEqual(independent_job.count(broker_step), 1)
-        self.assertLess(
-            independent_job.index("      - name: Verify independent review supervisor CLI\n"),
-            independent_job.index(reconciliation_step),
+        self.assertEqual(
+            independent_job.count("\n        timeout-minutes: 10\n"),
+            1,
+        )
+        self.assertEqual(
+            independent_job.count("\n        timeout-minutes: 2\n"),
+            3,
         )
         self.assertLess(
-            independent_job.index(reconciliation_step),
+            independent_job.index("      - name: Verify independent review supervisor CLI\n"),
+            independent_job.index(budgeted_reconciliation_step),
+        )
+        self.assertLess(
+            independent_job.index(budgeted_reconciliation_step),
             independent_job.index(broker_step),
         )
         self.assertLess(
@@ -2873,6 +2906,13 @@ concurrency:
         for evidence in (
             "available to private repositories",
             "15-minute per-job limit",
+            "fresh-context review identified a P2 timeout-budget risk",
+            "run `31074970581`",
+            "5m48s",
+            "reproduction took 24s",
+            "macOS reconciliation took 45s",
+            "20-minute job budget",
+            "10/2/2/2-minute step caps",
             "https://docs.github.com/en/actions/reference/runners/"
             "github-hosted-runners#single-cpu-runners",
             "https://github.blog/changelog/2026-01-22-1-vcpu-linux-runner-"
@@ -3649,13 +3689,22 @@ concurrency:
             "canonical": (
                 "test",
                 "skills/review-orchestration-playbook",
+                15,
+                None,
             ),
             "private": (
                 "python-39-compatibility",
                 "personal_codex/skills/review-orchestration-playbook",
+                20,
+                10,
             ),
         }
-        for profile, (next_job, skill_root) in profile_contracts.items():
+        for profile, (
+            next_job,
+            skill_root,
+            supervisor_timeout,
+            deterministic_timeout,
+        ) in profile_contracts.items():
             workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
             start = workflow.index("  independent_supervisor_tests:")
             readonly_start = workflow.index(
@@ -3667,7 +3716,12 @@ concurrency:
             readonly_job = workflow[readonly_start + 1 : end]
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
-                self.assertIn("timeout-minutes: 15", supervisor_job)
+                self.assertEqual(
+                    supervisor_job.count(
+                        f"\n    timeout-minutes: {supervisor_timeout}\n"
+                    ),
+                    1,
+                )
                 self.assertIn(
                     """      - name: Report hosted no-child runtime fingerprint
         run: |
@@ -3679,6 +3733,11 @@ concurrency:
 """,
                     supervisor_job,
                 )
+                deterministic_budget = (
+                    f"        timeout-minutes: {deterministic_timeout}\n"
+                    if deterministic_timeout is not None
+                    else ""
+                )
                 self.assertIn(
                     f"""      - name: Match hosted no-child blocker signature
         working-directory: {skill_root}/scripts/independent_codex_pr_review
@@ -3688,7 +3747,7 @@ concurrency:
         run: |
           python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
-        working-directory: {skill_root}/scripts/independent_codex_pr_review
+{deterministic_budget}        working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{{{ runner.temp }}}}
         run: |
