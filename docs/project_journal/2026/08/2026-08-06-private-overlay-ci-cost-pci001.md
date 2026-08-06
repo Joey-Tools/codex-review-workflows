@@ -52,6 +52,10 @@ superseded_by:
 - The removed Linux repetition was redundant: `platform_tests` already runs
   `python3 -m unittest discover -s tests` on Ubuntu, while the independent
   macOS job intentionally retains its two-minute reconciliation budget.
+- A follow-up fresh-context review found that the initial deduplication
+  contract pinned only two of the eight Python 3.9 selectors. The contract now
+  compares the complete step byte-for-byte and requires exactly eight selector
+  lines, so removing or adding a compatibility case cannot pass silently.
 
 ## Next Steps
 
@@ -74,6 +78,10 @@ superseded_by:
 - The independent-supervisor job in the same run failed while Actions was
   downloading an action with `Service Unavailable`, before repository steps
   ran; that is infrastructure evidence and requires no code change here.
+- Fresh-context review of `77531f0c..35b84e8d` reported one P2 contract gap:
+  the workflow retained eight compatibility selectors, but the source test
+  explicitly bound only the two reconciliation selectors. The follow-up test
+  fix binds the full command block and its exact selector count.
 - The 20-minute job budget leaves about 13m03s of headroom against that
   observed combined runtime. The 10/2/2/2-minute step caps bound the longest
   merged gates and retain practical margin for later failure-independent

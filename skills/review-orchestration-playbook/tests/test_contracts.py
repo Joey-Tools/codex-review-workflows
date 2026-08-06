@@ -2656,15 +2656,29 @@ concurrency:
             1,
         )
         self.assertEqual(python_39_job.count(python_39_setup_step), 1)
-        for selector in (
-            "tests.test_personal_sync_reconciliation_safety."
-            "PendingLinkTransactionSafetyTests."
-            "test_empty_record_empty_state_transaction_parses_and_recovers",
-            "tests.test_personal_sync_reconciliation_safety."
-            "PendingLinkTransactionSafetyTests."
-            "test_oversized_json_integer_is_normalized_to_sync_error",
-        ):
-            self.assertEqual(python_39_job.count(selector), 1)
+        compatibility_start = python_39_job.index(
+            "      - name: Run Python 3.9 compatibility regressions\n"
+        )
+        source_only_start = python_39_job.index(
+            "      - name: Require source-only Python tree\n"
+        )
+        compatibility_step = python_39_job[
+            compatibility_start:source_only_start
+        ]
+        expected_compatibility_step = """      - name: Run Python 3.9 compatibility regressions
+        run: |
+          python3 -m unittest \\
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_empty_record_empty_state_transaction_parses_and_recovers \\
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_oversized_json_integer_is_normalized_to_sync_error \\
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_deep_json_as_package_error \\
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_oversized_integer_as_package_error \\
+            tests.test_release_manifest_baseline.ReleaseManifestBaselineTests.test_release_baseline_accepts_verified_release_history \\
+            tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \\
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \\
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
+"""
+        self.assertEqual(compatibility_step, expected_compatibility_step)
+        self.assertEqual(compatibility_step.count("\n            tests."), 8)
         self.assertNotIn("        id: setup_latest_python\n", python_39_job)
         self.assertNotIn(
             "      - name: Run platform reconciliation safety tests (Python 3.x)\n",
@@ -2679,12 +2693,7 @@ concurrency:
             python_39_job.count("      - name: Require source-only Python tree\n"),
             1,
         )
-        self.assertLess(
-            python_39_job.index(
-                "      - name: Run Python 3.9 compatibility regressions\n"
-            ),
-            python_39_job.index("      - name: Require source-only Python tree\n"),
-        )
+        self.assertLess(compatibility_start, source_only_start)
 
         test_job = private[test_start + 1 :]
         self.assertIn("    runs-on: ubuntu-slim\n", test_job)
