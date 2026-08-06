@@ -2732,6 +2732,8 @@ def _frozen_command(
         "-c",
         "core.commitGraph=false",
         "-c",
+        "core.multiPackIndex=false",
+        "-c",
         f"core.hooksPath={os.devnull}",
         "-c",
         "diff.external=",

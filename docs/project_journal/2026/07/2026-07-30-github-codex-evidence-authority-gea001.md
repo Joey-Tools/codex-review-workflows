@@ -3,7 +3,7 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-08-04
+updated: 2026-08-06
 branch: wip/github-codex-evidence-authority
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
@@ -23,6 +23,11 @@ superseded_by:
   supersede a top-level finding on the same or a proved successor head.
 - Dynamic provider profiles define a narrowly gated `+1` clean fallback while
   preserving terminal-payload priority and treating `eyes` as liveness-only.
+- A newer fully receipted current-head terminal result can restore decision
+  authority while two exact, strictly older pre-v1 carrier shapes remain
+  complete audit-only history; this prevents old transport limitations from
+  defeating the recorded result-present decision without accepting arbitrary
+  legacy prose.
 
 ## Current State
 
@@ -114,6 +119,56 @@ superseded_by:
   remains `triple-inconclusive`. A proved `base-changed-same-head` event cannot
   use the manual path and requires a real new head; empty or anchor commits are
   not recovery mechanisms.
+- The tolerated legacy member is now closed to exactly two raw-internal
+  migration-only carriers; an ordinary unreceipted current-grammar clean or
+  finding cannot enter. `legacy-finding-native-review-v1` reports role
+  `finding` only for an exact-provider
+  `COMMENTED`/`CHANGES_REQUESTED` native review with the exact
+  `### 💡 Codex Review` layout, one same-repository full-SHA blob URL
+  equal to native `commit_id`, one fixed `P0/red`, `P1/orange`, `P2/yellow`,
+  or `P3/lightgrey` shields badge, and bounded title/prose containing neither
+  `www.` nor a URI-scheme prefix whose colon is immediately followed by a
+  non-whitespace character. After newline normalization, every physical
+  disclosure line is trimmed and blank lines are dropped; the remaining lines
+  exactly equal the closed nine-line disclosure. It is separated by either no
+  padding line or exactly one line of four ASCII spaces, with no other
+  title/prose trailing whitespace or blank line before it, and the review has
+  no associated inline child. This grammar is raw-migration-only and never
+  becomes receipt-bound current/provider authority. An exact
+  old short clean issue comment remains role `clean-pending-resolution` with
+  its raw lowercase 10-hex ref. A non-current prefix requires the exact stable
+  parent-owned initial/final local Git prefix-resolution receipt arrays; an
+  ancestry array cannot self-attest it. The receipts completely cover every
+  raw-derived prefix, are unique and sorted by `raw_prefix`, enumerate exactly
+  one prefix-matching full object, record exact-object `git cat-file -t`
+  success with `object_type == "commit"`, prove ancestry with return code `0`,
+  and remain type-preservingly identical. Each phase comes only from the
+  independently trusted bundle's manifest-bound default-profile
+  `named_lane_guard legacy-short-prefix-receipts`, with exact source, distinct
+  absent owner-private temporary path, head, phase, complete repeatable prefix
+  set, fixed success schema
+  `named-lane-legacy-short-prefix-receipts-v1`, and cleanup-complete receipt. It applies
+  materializer-grade source identity/access-policy checks, rejects alternate,
+  HTTP-alternate, common/admin and per-worktree shallow, promisor/partial-clone,
+  bitmap, unsafe config, and incomplete-object state, and isolates local
+  grafts, ambient config, source refs/hooks, replace refs, lazy fetch,
+  prompting, and commit-graph/multi-pack-index consumption. Against that view,
+  the phase-level exact-head-type and reachable-closure controls are
+  `git cat-file -t <head>` and
+  `git rev-list --objects --missing=error --quiet <head> --`; they run even for
+  an empty prefix set and do not count among the exactly three per-prefix
+  receipt queries. An annotated tag that peels to a
+  commit fails closed. They prove only ancestor
+  applicability, and the report still retains the raw 10 hex. Neither becomes a provider carrier, candidate
+  basis, or superseding evidence. Both must be strictly older than both
+  selected-result pre-scope `Date` receipts and stable in the initial/final raw
+  projections. A near-miss, unresolved thread, bad ancestry, equal/newer
+  legacy time, missing selected-artifact scope/resolution receipt, incomplete
+  pagination, or scope/lifecycle/final-read drift still fails closed.
+- Unrecoverable old request sidecars may leave `request_policy` `unknown`; that
+  producer/audit status forbids another same-head POST and disables reaction
+  authority, but it does not independently null a newer complete provider
+  clean. The selected result requires no fabricated request/run binding.
 - Normalized current scope and artifact commit are now explicitly separate.
   `scope.head` always remains the exact current PR head. Clean must bind it;
   a finding keeps its own current-or-proved-ancestor commit and remains in the
@@ -135,8 +190,18 @@ superseded_by:
   remains `confirmed-non-candidate` audit evidence for that frozen interval
   instead of entering candidate entries or count.
 - Terminal comments/reviews count only under the authority's fixed
-  clean/finding/inline-parent grammar. Clean issue comments carry one full-SHA
-  `Reviewed commit` marker; clean reviews are exact `APPROVED` / native
+  clean/finding/inline-parent grammar. Clean issue comments carry one exact
+  lowercase 10- or 40-hex `Reviewed commit` marker. A 10-hex marker additionally
+  remains raw `clean-pending-resolution` and non-authoritative until the stable
+  exact-repository commit-resolution companion introduced by the 2026-08-05
+  live-provider compatibility follow-up joins its artifact ID, scope, ref, and
+  resolved current full SHA. Current, complete-history, and sidecar-blind
+  historical paths all require that same join; sidecar-blind may ignore request
+  sidecars but never the resolution companion. The receipt dates prove
+  `artifact GET <= initial resolution <= post-scope snapshot(s) <= final resolution`
+  with same-second equality allowed, so authority does not rest on a prose claim
+  about invocation order. Clean reviews are exact
+  `APPROVED` / native
   current-head `commit_id` / `No findings.` records whose fully paginated
   exact-provider selected-review target-child set is present and empty. A valid
   target child is findings; an unread, incomplete, malformed, or conflicting
@@ -225,8 +290,9 @@ superseded_by:
   Each inventory entry binds scope/order plus carrier, channel, semantic result,
   native identity, and canonical source-record digest; same time/ID cannot
   substitute a reaction for a terminal artifact. Pull scope uses the canonical
-  bare pull-detail request plus a compare response whose `base_commit.sha`,
-  `head_commit.sha`, and `merge_base_commit.sha` bind the exact scope.
+  bare pull-detail request plus an exact pull-derived compare URL; the response
+  body's `base_commit.sha` and `merge_base_commit.sha` bind the remaining exact
+  scope fields.
   Discovery uses the closed `github-codex-evidence-resource-budget-v1`
   profile: at most 512 union-seeded pull requests, 512 controlled requests,
   8,192 fetch attempts, 4,096 retained pages, 20,000 records, 8,388,608 UTF-8
@@ -345,14 +411,27 @@ superseded_by:
   a new source commit, released Action commit, full release-tree identity, and
   changed regression evidence. A moving branch, “latest” release, or partial
   runtime-file comparison does not silently replace this baseline.
-- The Action alignment is intentionally asymmetric. Provider-result authority,
-  duplicate-result consumption, and early-result consumption are inherited.
-  Exact whole-PR lifecycle/scope, the artifact-time scope receipt,
-  ancestor-finding projection, local-lane sequencing, warning codes, explicit
-  clean payloads, the narrower full-SHA terminal grammar, and the conditional
-  `+1` fallback are deliberate playbook extensions. Future edits must preserve
-  that split instead of mechanically copying either implementation into the
-  other. The machine-readable base-only-retarget contract is now version 2;
+- The Action alignment is intentionally asymmetric and remains pinned to source
+  `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`
+  and released Action
+  `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`.
+  Provider-result authority, duplicate-result consumption, and early-result
+  consumption are inherited. Short-marker parity is limited to 10/40 carrier
+  lengths and the short carrier's fail-closed exact-repository REST resolution
+  outcome. Lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank
+  boundary, closed lead/tagline/disclosure/native grammar, and independent
+  parent-recorded initial/final receipt evidence remain stricter playbook rules;
+  complete grammar parity with the Action is not claimed. Exact whole-PR
+  lifecycle/scope, the artifact-time scope receipt, ancestor-finding projection,
+  local-lane sequencing, warning codes, explicit clean payloads, and the
+  conditional `+1` fallback are further playbook extensions. The earlier
+  full-SHA-only clean issue-comment rule was superseded after PR 91 live evidence
+  demonstrated the provider's 10-hex carrier and the fixed Action baseline
+  proved its fail-closed REST resolution outcome; finding URLs and native
+  review/inline commit IDs remain full-SHA-only. Future edits must preserve that
+  split instead of mechanically copying either implementation into the other.
+  The machine-readable base-only-retarget
+  contract is now version 2;
   version 1 request-sidecar event semantics are unchanged, and version 2 adds
   only the independent terminal-artifact scope plane.
 - Future provider behaviour may change, but adaptation must select one of the
@@ -447,6 +526,43 @@ superseded_by:
   pinned documentation reference and the executable closed-schema tests
   together; adding a caller-supplied or derived self URL is not a compatible
   extension.
+- The seven-field legacy-prefix array is machine evidence only when a public,
+  manifest-bound producer creates it. Requiring a sanitized view while
+  pointing implementers at a private workspace helper left no callable
+  independently trusted control-plane entry and let unsafe source repository
+  state become an undocumented precondition. The public guard subcommand now
+  owns materializer-grade source validation, phase-level exact-head and
+  reachable-closure controls, the exactly three receipt queries per prefix,
+  bounded process/output handling, success-only cleanup, and a closed schema.
+  A private workspace helper never supplies receipt evidence. A direct import
+  never satisfies this contract. Neither counts as receipt authority. The
+  producer does not materialize or snapshot the entire object store. Source
+  container identity/access policy and full-OID/type/ancestry ordered
+  point-query semantics are protected; continuous stability of selected
+  loose-object or pack bytes is not. Descriptor-relative custody revalidation
+  walks complete root-to-leaf chains for the source worktree, admin, common, and
+  objects directories and for the temporary parent. On Darwin, each custody
+  ancestor accepts only an empty or deny-only extended ACL; any allow entry or
+  unknown/uninspectable ACL is `blocked-safety`. A root-owned sticky custody
+  ancestor is the only group/world-writable special case; every bound source,
+  object-store, temporary-parent, control, or view leaf remains
+  current-user-owned and rejects every extended ACL. Mode bits and ACL state are
+  separate access-policy signals.
+  The source object-store policy inventory streams one entry at a time, increments
+  and checks
+  `LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT`
+  before metadata inspection or requesting another entry, and checks the same
+  phase-global receipt deadline before each directory and every 256 entries
+  without resetting it. Limit exhaustion, deadline expiry,
+  or incomplete inventory inspection is `blocked-safety`. These point
+  revalidations are point-in-time observations and do not claim continuous
+  atomicity. Same-current-UID concurrent object-store
+  content mutation, prefix-inventory churn, and intra-phase or inter-phase ABA
+  are not excluded. Initial/final equality is two point-in-time observations,
+  not atomicity. This is also why the migration
+  cannot bootstrap itself: when a prior trusted release lacks the producer,
+  formal review remains under prior policy until the change is merged and
+  released, after which the newly manifest-bound producer may be activated.
 
 ## Latest Formal-Review Disposition
 
@@ -894,9 +1010,12 @@ but supersedes them wherever they conflict with the rules below.
 Implementation hardening while closing those findings made the bounds and
 plane separation explicit. Endpoint evidence, request-scope sidecars, and
 terminal-artifact scope receipts use three non-borrowing ledgers under the same
-inventory start/deadline; each sidecar or artifact wrapper is pre-counted and
-its five raw responses are byte- and record-bounded before digesting or
-decoding. The artifact ledger is created once for an inventory decision pass;
+inventory start/deadline. Each request sidecar or ordinary artifact wrapper is
+pre-counted with its five raw responses, for six records including the wrapper;
+a lowercase 10-hex clean wrapper adds two independent resolution responses, for
+seven raw responses and eight records. Every response is byte- and record-bounded
+before digesting or decoding. The artifact ledger is created once for an
+inventory decision pass;
 each immutable wrapper is charged and validated once, and candidate ordering,
 audit, profile, outcome, and report consumers reuse that memoized result.
 Per-candidate/scope/recomputation resets and repeated charging are forbidden.
@@ -1199,9 +1318,11 @@ restore request/run binding or erase this rationale.
   then fall back sidecar-blind and reuse the cached artifact. Complete,
   sidecar-blind, and candidate-ordering paths now call one tracker-bound
   exact-list/dict precharge before wrapper iteration. The regression asserts
-  the closed six-record cost for every wrapper (one wrapper record plus five
-  responses), including an accepted
-  `unused-sidecar-unavailable` fallback.
+  the closed ordinary six-record cost (one wrapper record plus five raw
+  scope/artifact responses), including an accepted
+  `unused-sidecar-unavailable` fallback. A lowercase 10-hex clean wrapper instead
+  adds two independent resolution responses and therefore carries seven raw
+  responses for eight records total.
   The next independent pass closed two adjacent aliases: ancestry filtering now
   precharges the original exact arrays before iteration and can bind a filtered
   view only when it is an identity-preserving subsequence, while current raw
@@ -1243,10 +1364,10 @@ the stricter triple lane:
   evidence, while ignoring a projected identity/scope/time/body field would be
   unsafe.
 - Artifact scope derives the real base/head OIDs from each retained pull body,
-  constructs the canonical compare URL from those values, and requires the
-  compare body to repeat both OIDs plus the unique merge base. Fixture-derived
-  or PR-number-derived synthetic SHAs cannot stand in for production scope,
-  and a compare body for another head cannot lend its merge base.
+  binds both in the canonical compare request URL, and requires the compare
+  body to repeat the base plus the unique merge base. Fixture-derived or
+  PR-number-derived synthetic SHAs cannot stand in for production scope, and a
+  compare response fetched through another head URL cannot lend its merge base.
 - Evidence time and observation time are separate. The frozen reaction-history
   as-of constrains eligible historical artifact semantic time. It does not
   prohibit collecting the exact artifact GET or post-scope receipt later in
@@ -1321,15 +1442,27 @@ prove the lower-information reaction fallback; failure in that historical
 adaptation plane cannot veto an independently trustworthy current terminal
 payload.
 
-The same review also closed two scope-binding mismatches: canonical pull-detail
+The same review also closed the pull-detail URL mismatch: canonical pull-detail
 requests use the bare `/pulls/{number}` URL, while collection endpoints retain
-their explicit pagination query; and every pull/compare receipt now requires
-`compare.head_commit.sha` to equal the pull detail's exact head in addition to
-binding the base and unique merge base. These fields are authority signals, not
-fixture conveniences. Future changes to this decision must update the schema,
-all agent/lane/readiness mirrors, executable anti-drift contracts, and this
-journal together, and must state whether the pinned Action baseline or a
-playbook-only extension changed.
+their explicit pagination query. A later live pre-request probe against
+`github.com` exposed a separate fixture-only assumption before any request was
+posted: the real REST Compare object has `base_commit` and
+`merge_base_commit`, but no `head_commit`. The corrected authority chain derives
+the exact full base/head OIDs from the pull detail, requires that pair in the
+exact Compare request URL, and validates the response body's base and unique
+merge base. It deliberately ignores an unknown `head_commit` extra and never
+uses `commits[-1]`, because that array can be paginated or empty.
+
+This correction is a playbook-only receipt-schema fix. It does not change the
+pinned `codex-review-gate` / released `codex-review-gate-action` consumer rule
+that a stable provider result is authoritative without request/run lineage.
+The exact pinned `src/gate.mjs` blob also binds head from PR detail and the
+exact Compare URL without reading `head_commit`. Its separate ancestry helper
+validates a larger closed status/count/commit-list contract; the playbook does
+not inherit only a fragment of that helper. Future changes to this decision
+must update the schema, all agent/lane/readiness mirrors, executable anti-drift
+contracts, and this journal together, and must state whether the pinned Action
+baseline or a playbook-only extension changed.
 
 ## Schema-v4 Pre-Commit Audit Corrections
 
@@ -1600,6 +1733,170 @@ transcript/projector contract,
 agent/readiness/probe mirrors, regression coverage, and this journal together;
 changing the Action side also requires a new pinned
 source/release/tree/manifest baseline.
+
+## Live REST Compare Schema Correction
+
+The final pre-request probe for public PR #91 deliberately read the real
+current PR detail and Compare endpoint before posting `@codex review`. At
+GitHub server time `2026-08-05 14:48:07 GMT`, the Compare object exposed
+`ahead_by`, `base_commit`, `behind_by`, `commits`, `merge_base_commit`,
+`status`, `total_commits`, and link fields, but no `head_commit`. No provider
+request had been posted for that head, so the candidate contract was corrected
+before it could create unconsumable live evidence.
+
+The authority decision is therefore deliberately split:
+
+In each receipt pair, the pull body supplies base/head, the exact derived
+Compare request URL binds that pair, and the Compare body repeats base and
+supplies merge base.
+
+- Pull detail supplies the exact lowercase full base/head OIDs.
+- Those OIDs form the exact authenticated
+  `/compare/<base>...<head>` request URL, whose raw receipt binds head.
+- The Compare body must repeat `base_commit.sha` and supply the unique
+  `merge_base_commit.sha`; an extra `head_commit` member is an ignored unknown
+  field and cannot strengthen or contradict the projection.
+- `commits[-1]` is not a replacement head signal because Compare commits may
+  be paginated and an identical comparison has no final commit.
+
+This remains a local whole-PR receipt extension rather than a new Action
+inheritance claim. The exact pinned `src/gate.mjs` blob
+`e0b974b27ebd64e412eaef1d069789b5f6bd76ba` (109,096 bytes; raw SHA-256
+`5b25faa7336e3b53603df42d15e52853d4de039e755c9ed5338c51fd528b9415`)
+is shared by the source and released Action manifests below. Its ancestry
+helper binds the exact Compare URL and validates a complete closed combination
+of status, ahead/behind/total counts, bounded commit-list shape, final commit,
+and identical-range behavior; it does not read `head_commit`. The playbook
+receipt intentionally takes only its own smaller closed scope projection. It
+must not copy a bare `commits[-1]` check without the Action helper's complete
+count, pagination, and identical-range constraints.
+
+## Live Legacy Provider Recovery
+
+PR #91 exposed a second live anti-drift boundary after the real Compare schema
+was fixed. Its complete provider history contained three relevant exact-bot
+artifacts:
+
+- pull-request review `4863163875`, submitted on
+  `832edd60e50392c7f000d67ed856d20959c0d5b2`, used the provider's older native
+  `### 💡 Codex Review` URL/badge/title/prose/disclosure finding form;
+- issue comment `5191165370` carried the raw short clean marker `9abfd559e9`
+  for `9abfd559e955503fdd3233ecd16073918423fc7a`, before version-1 artifact and
+  dual short-marker receipts existed; and
+- issue comment `5195502331` carried the current-head marker `06264ac0a0` for
+  `06264ac0a06240634f896e606b5744f747dd825f` and had the complete current
+  artifact-scope and independent initial/final full-SHA resolution evidence.
+
+The pre-correction contract treated the first record as arbitrary malformed
+review prose and the second as a malformed unresolved short clean. That made
+the complete old raw history veto the third record even though the third was a
+newer, independently complete current-head No-findings result. The correction
+does not discard or retroactively receipt those old records. It recognizes the
+first only through the closed migration-only
+`legacy-finding-native-review-v1` grammar and the second only as raw role
+`clean-pending-resolution`; both remain in the stable
+`legacy_unreceipted_artifacts` audit projection and neither can become result
+authority, provider profile carrier, candidate basis, or superseding evidence.
+The old 10-hex prefix is admitted only because the history-top-level
+`initial_legacy_short_commit_resolution_receipts` and
+`final_legacy_short_commit_resolution_receipts` completely cover the
+raw-derived pending-prefix set, uniquely enumerate the same prefix-matching
+full object, record exact-object `git cat-file -t` success with
+`object_type == "commit"`, prove ancestry with return code `0`, and remain
+type-preservingly identical. An annotated tag that peels to a commit fails
+closed. An ancestry array cannot self-attest that mapping.
+Each phase is produced only through the independently trusted bundle's
+manifest-bound `named_lane_guard legacy-short-prefix-receipts`. The success
+envelope binds schema, phase, head, cleanup completion, and the sorted generic
+seven-field array after materializer-grade source validation and exactly three
+bounded per-prefix Git queries in a phase-unique owner-private temporary view.
+Before those receipt queries, phase-level `git cat-file -t <head>` and
+`git rev-list --objects --missing=error --quiet <head> --` controls prove the
+exact head commit and its complete reachable object closure in that same view;
+neither creates a receipt field.
+Alternate/HTTP-alternate, common/admin and per-worktree shallow,
+promisor/partial-clone, bitmap, unsafe config, and incomplete source state are
+rejected; `.git/info/grafts`, ambient config, source refs/hooks, replace refs,
+lazy fetch, prompting, and commit-graph/multi-pack-index consumption are
+isolated. Direct imports, private workspace helpers, ad hoc query wrappers, and
+source-directory Git calls do not count. Cleanup completes before success, and
+semantic or safety failure returns no partial receipts.
+A second independent audit found that the first ACL correction left a P1
+custody gap above linked-worktree common storage: an ACL grant on an unchecked
+parent could authorize path replacement despite safe named leaves. The
+correction binds and point-revalidates every descriptor-relative root-to-leaf
+source/admin/common/objects and temporary-parent chain, admits only empty or
+deny-only ancestor ACLs plus the root-owned sticky mode exception, and retains
+the current-user-owned, ACL-free leaf rule. Any allow, unknown, or unreadable
+ACL is `blocked-safety`.
+The same audit found a P2 resource-bound gap because tuple-buffering `scandir`
+could exhaust memory before the entry cap, while the recursive walk did not
+periodically debit the single receipt deadline. The corrected inventory streams
+each entry, checks the shared limit before metadata inspection or another
+iteration, and checks that same non-resetting phase-global deadline before each
+directory and every 256 entries; uncertainty still returns no partial receipts.
+A final fresh whole-range review then found that the root-owned sticky custody
+exception was canceled by the shared mode check and by retaining the source
+parent in the strict leaf set. The correction applies the same sticky exception
+during custody binding and revalidation, keeps the actual source and Git leaves
+strict, and proves the intended availability with a linked worktree directly
+below `/private/tmp`.
+The terminal report retains both arrays under
+`evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
+a reaction report uses
+`evidence_basis.current.local_git_prefix_resolution_receipts`. That local
+mapping is not a REST resolution companion and the audit item continues to
+preserve only `9abfd559e9`. Multiple legacy short refs are supported: each
+phase is unique and sorted by `raw_prefix`; after the next substantive head,
+the expected raw-derived set includes both `9abfd559e9` and `06264ac0a0` as
+ancestor-era clean markers. A selected current-head short clean remains on its
+separate dual REST resolution path.
+The newer artifact decides only because both older semantic times are strictly
+earlier than both of its pre-scope `Date` receipts and every identity, grammar,
+ancestry, thread, pagination, scope, lifecycle, receipt, and final-stability
+gate closes.
+
+This is the intended “result exists means pass” behavior, not a broad legacy
+allowlist. The old native finding grammar requires exact state, provider,
+same-repository full-SHA URL/commit match, one fixed severity/color badge,
+bounded title/prose containing neither `www.` nor a URI-scheme prefix whose
+colon is immediately followed by a non-whitespace character, and the
+normalized closed disclosure. Newlines are normalized, every physical
+disclosure line is trimmed, blank lines are dropped, and the remaining lines
+must exactly equal the nine-line block. Only no padding or one line of four
+ASCII spaces may precede it, with no other title/prose trailing whitespace or
+blank line, and the review has no associated inline child. The old
+short clean remains unresolved and keeps its raw 10-hex value; it never borrows
+the current selected artifact's dual full-SHA resolution. Any near-miss,
+unresolved thread, unknown identity/role, bad ancestry, equal/newer contrary or
+malformed artifact, missing current receipt/resolution, incomplete page, or
+scope/lifecycle drift remains fail-closed. Only newer/equal malformed evidence
+participates in ordinary terminal precedence; an older recognized audit-only
+carrier cannot control, while a truly malformed older near-miss still prevents
+the migration partition from closing.
+
+The legacy badge mapping is pinned from exact REST Bot evidence, independently
+of the Action: `P0/red` in `openai/openai-cookbook#2915` inline comments
+`3707792981`/`3707792985`; `P1/orange` in `ykylee/Devhub_example#592`
+`3409533388`/`3409533389` (also `andreame-code/netrisk#154` `3140609225`);
+`P2/yellow` in PR #91 review `4863163875`; and `P3/lightgrey` in
+`Joey-Tools/codex-debug-triage#5` `3676232685`/`3676232690`. Each observed
+record used exact `chatgpt-codex-connector[bot]` / `Bot` REST identity. The
+pinned `codex-review-gate` Action does not parse badge colors, so this is a
+separate provider-payload provenance baseline rather than claimed Action
+parity.
+
+Old request sidecars were not fabricated. Their absence may leave
+`request_policy: unknown`, which forbids another same-head request and closes
+reaction-only authority, but that producer/audit field alone does not negate
+the complete current provider result. This exactly preserves the fixed
+`codex-review-gate` source and released `codex-review-gate-action` baseline:
+provider-result evidence decides without unavailable request/run lineage, while
+the playbook keeps its stricter scope, thread, lifecycle, pagination, grammar,
+and stability extensions. The repository still has no production live
+evaluator CLI; this PR #91 adjudication therefore remained manual and
+receipt-backed, while the embedded executable contract locks the same three
+live carrier shapes and their near-miss regressions for future automation.
 
 ## Private Release Portability
 

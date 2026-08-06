@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import py_compile
+import pwd
 import re
 import shutil
 import signal
@@ -36,9 +37,11 @@ from review_runtime.common import (  # noqa: E402
     TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
+    LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
     MATERIALIZER_BASE_REF,
     MATERIALIZER_HEAD_REF,
     SYMLINK_COUNT_LIMIT,
+    LegacyPrefixReceiptInconclusive,
     NamedLaneGuardError,
     _read_symlink_blobs,
     _validate_materializer_git_version,
@@ -1729,6 +1732,1522 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "add registered gitlink")
         git(self.repo, "submodule", "deinit", "-f", "--", path)
         return git(self.repo, "rev-parse", "HEAD")
+
+    def legacy_prefix_history(self) -> tuple[str, str, str]:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("legacy base")
+        (self.repo / "middle.txt").write_text("middle\n", encoding="utf-8")
+        middle = self.commit("legacy middle")
+        (self.repo / "head.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("legacy head")
+        return base, middle, head
+
+    def invoke_legacy_prefix_cli(
+        self,
+        *,
+        source: pathlib.Path,
+        temporary_path: pathlib.Path,
+        head: str,
+        prefixes: tuple[str, ...] = (),
+        phase: str = "initial",
+    ) -> tuple[int, str, str]:
+        argv = [
+            "legacy-short-prefix-receipts",
+            "--source",
+            str(source),
+            "--temporary-path",
+            str(temporary_path),
+            "--head",
+            head,
+            "--phase",
+            phase,
+        ]
+        for prefix in prefixes:
+            argv.extend(("--prefix", prefix))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(tuple(argv))
+        return returncode, stdout.getvalue(), stderr.getvalue()
+
+    def test_legacy_short_prefix_receipts_emit_sorted_closed_schema_and_fixed_git_queries(
+        self,
+    ) -> None:
+        base, middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-prefix-view"
+        supplied_prefixes = (middle[:10], base[:10])
+        original_capture = named_lane_runtime.run_bounded_capture
+        observed_queries: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def record_queries(argv: object, **kwargs: object) -> object:
+            command = tuple(argv)
+            if f"--git-dir={temporary_path}" in command:
+                observed_queries.append((command, dict(kwargs.get("env", {}))))
+            return original_capture(command, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.root / "ambient"),
+                    "GIT_DIR": str(self.root / "ambient.git"),
+                    "GIT_REPLACE_REF_BASE": "refs/replace-hostile/",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=record_queries,
+            ),
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=supplied_prefixes,
+            )
+
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(
+            set(payload),
+            {
+                "status",
+                "schema_version",
+                "phase",
+                "head",
+                "temporary_cleanup_status",
+                "receipts",
+            },
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            payload["schema_version"],
+            LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertEqual(payload["phase"], "initial")
+        self.assertEqual(payload["head"], head)
+        self.assertEqual(payload["temporary_cleanup_status"], "complete")
+        expected_prefixes = sorted(supplied_prefixes)
+        self.assertEqual(
+            [receipt["raw_prefix"] for receipt in payload["receipts"]],
+            expected_prefixes,
+        )
+        resolved = {base[:10]: base, middle[:10]: middle}
+        receipt_keys = {
+            "raw_prefix",
+            "head",
+            "disambiguate_return_code",
+            "disambiguated_object_ids",
+            "commit_object_check_return_code",
+            "object_type",
+            "ancestry_return_code",
+        }
+        for receipt in payload["receipts"]:
+            raw_prefix = receipt["raw_prefix"]
+            self.assertEqual(set(receipt), receipt_keys)
+            self.assertEqual(receipt["head"], head)
+            self.assertEqual(receipt["disambiguate_return_code"], 0)
+            self.assertEqual(
+                receipt["disambiguated_object_ids"],
+                [resolved[raw_prefix]],
+            )
+            self.assertEqual(receipt["commit_object_check_return_code"], 0)
+            self.assertEqual(receipt["object_type"], "commit")
+            self.assertEqual(receipt["ancestry_return_code"], 0)
+
+        git_prefix = (
+            str(named_lane_runtime.resolve_git()),
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=false",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "diff.external=",
+            f"--git-dir={temporary_path}",
+        )
+        expected_commands: list[tuple[str, ...]] = [
+            (*git_prefix, "cat-file", "-t", head),
+            (
+                *git_prefix,
+                "rev-list",
+                "--objects",
+                "--missing=error",
+                "--quiet",
+                head,
+                "--",
+            ),
+        ]
+        for raw_prefix in expected_prefixes:
+            object_id = resolved[raw_prefix]
+            expected_commands.extend(
+                (
+                    (*git_prefix, "rev-parse", f"--disambiguate={raw_prefix}"),
+                    (*git_prefix, "cat-file", "-t", object_id),
+                    (
+                        *git_prefix,
+                        "merge-base",
+                        "--is-ancestor",
+                        object_id,
+                        head,
+                    ),
+                )
+            )
+        self.assertEqual(
+            [command for command, _environment in observed_queries],
+            expected_commands,
+        )
+        expected_environment = {
+            "GIT_ASKPASS": "/usr/bin/false",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OBJECT_DIRECTORY": str(self.repo.resolve() / ".git" / "objects"),
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PAGER": "cat",
+            "PATH": TRUSTED_PATH,
+            "SSH_ASKPASS": "/usr/bin/false",
+        }
+        for _command, environment in observed_queries:
+            self.assertEqual(environment, expected_environment)
+            self.assertNotIn("GIT_ALTERNATE_OBJECT_DIRECTORIES", environment)
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertNotIn("GIT_REPLACE_REF_BASE", environment)
+        self.assertFalse(temporary_path.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_legacy_short_prefix_receipts_allow_empty_complete_array(self) -> None:
+        _base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-prefix-empty-view"
+
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=self.repo.resolve(),
+            temporary_path=temporary_path,
+            head=head,
+            prefixes=(),
+            phase="final",
+        )
+
+        self.assertEqual(returncode, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["phase"], "final")
+        self.assertEqual(payload["receipts"], [])
+        self.assertEqual(payload["temporary_cleanup_status"], "complete")
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_support_sha256_object_format(self) -> None:
+        sha256_repo = self.root / "legacy-sha256-repo"
+        sha256_repo.mkdir()
+        git(sha256_repo, "init", "--object-format=sha256", "-b", "master")
+        git(sha256_repo, "config", "user.name", "Named Lane Test")
+        git(sha256_repo, "config", "user.email", "named-lane@example.invalid")
+        git(sha256_repo, "config", "commit.gpgsign", "false")
+        (sha256_repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        git(sha256_repo, "add", "AGENTS.md")
+        git(sha256_repo, "commit", "-m", "sha256 legacy base")
+        base = git(sha256_repo, "rev-parse", "HEAD")
+        (sha256_repo / "head.txt").write_text("head\n", encoding="utf-8")
+        git(sha256_repo, "add", "head.txt")
+        git(sha256_repo, "commit", "-m", "sha256 legacy head")
+        head = git(sha256_repo, "rev-parse", "HEAD")
+        temporary_path = self.root / "legacy-sha256-view"
+
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=sha256_repo.resolve(),
+            temporary_path=temporary_path,
+            head=head,
+            prefixes=(base[:10],),
+        )
+
+        self.assertEqual(len(base), 64)
+        self.assertEqual(len(head), 64)
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        receipt = json.loads(stdout)["receipts"][0]
+        self.assertEqual(receipt["disambiguated_object_ids"], [base])
+        self.assertEqual(receipt["object_type"], "commit")
+        self.assertFalse(temporary_path.exists())
+
+    def test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        scripts, guard = self.copy_guard_bundle()
+        workspace_marker = self.root / "workspace-module-loaded.marker"
+        (scripts / "review_runtime/workspace.py").write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(workspace_marker)!r}).write_text('loaded')\n",
+            encoding="utf-8",
+        )
+        temporary_path = self.root / "guard-legacy-prefix-view"
+
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                guard,
+                "legacy-short-prefix-receipts",
+                "--source",
+                str(self.repo.resolve()),
+                "--temporary-path",
+                str(temporary_path),
+                "--head",
+                head,
+                "--phase",
+                "initial",
+                "--prefix",
+                base[:10],
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            payload["schema_version"],
+            LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertEqual(payload["receipts"][0]["raw_prefix"], base[:10])
+        self.assertFalse(workspace_marker.exists())
+        self.assertFalse(temporary_path.exists())
+        self.assertEqual(list(scripts.rglob("__pycache__")), [])
+
+    def test_legacy_short_prefix_receipts_reject_current_head_prefix_without_receipts(
+        self,
+    ) -> None:
+        _base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-current-prefix-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        observed_queries: list[tuple[str, ...]] = []
+
+        def record_queries(argv: object, **kwargs: object) -> object:
+            command = tuple(argv)
+            if f"--git-dir={temporary_path}" in command:
+                observed_queries.append(command)
+            return original_capture(command, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=record_queries,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(head[:10],),
+            )
+
+        self.assertEqual(returncode, 75)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {
+                "status": "inconclusive",
+                "reason": "legacy-prefix-is-current-head",
+            },
+        )
+        git_prefix = named_lane_runtime._legacy_prefix_git_prefix(
+            named_lane_runtime.resolve_git(),
+            temporary_path,
+        )
+        self.assertEqual(
+            observed_queries,
+            [
+                (*git_prefix, "cat-file", "-t", head),
+                (
+                    *git_prefix,
+                    "rev-list",
+                    "--objects",
+                    "--missing=error",
+                    "--quiet",
+                    head,
+                    "--",
+                ),
+            ],
+        )
+        self.assertFalse(temporary_path.exists())
+
+        missing_head = "0" * 40
+        missing_head_path = self.root / "legacy-current-missing-head-view"
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=self.repo.resolve(),
+            temporary_path=missing_head_path,
+            head=missing_head,
+            prefixes=(missing_head[:10],),
+        )
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["status"], "blocked-safety")
+        self.assertFalse(missing_head_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_missing_and_ambiguous_prefixes(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        missing_prefix = "0000000000"
+        if head.startswith(missing_prefix):
+            missing_prefix = "ffffffffff"
+        temporary_path = self.root / "legacy-missing-prefix-view"
+
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=self.repo.resolve(),
+            temporary_path=temporary_path,
+            head=head,
+            prefixes=(missing_prefix,),
+        )
+
+        self.assertEqual(returncode, 75)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "inconclusive", "reason": "legacy-prefix-not-unique"},
+        )
+        with self.assertRaisesRegex(
+            LegacyPrefixReceiptInconclusive,
+            "legacy-prefix-not-unique",
+        ):
+            named_lane_runtime._parse_legacy_disambiguation(
+                (
+                    b"1234567890aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+                    b"1234567890bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+                ),
+                "1234567890",
+                40,
+            )
+        self.assertFalse(temporary_path.exists())
+
+        overflow_path = self.root / "legacy-ambiguous-overflow-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+
+        def overflow_disambiguation(argv: object, **kwargs: object) -> object:
+            command = tuple(argv)
+            if f"--git-dir={overflow_path}" in command and "rev-parse" in command:
+                # The bounded capture exception does not identify whether
+                # stdout or stderr overflowed. It therefore cannot prove
+                # semantic ambiguity and must remain a safety failure.
+                raise ReviewOutputLimitError("synthetic unclassified output overflow")
+            return original_capture(command, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=overflow_disambiguation,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=overflow_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "blocked-safety", "reason": "output-limit"},
+        )
+        self.assertFalse(overflow_path.exists())
+
+    def test_legacy_short_prefix_receipts_second_failure_has_no_partial_stdout(
+        self,
+    ) -> None:
+        base, middle, head = self.legacy_prefix_history()
+        ordered_prefixes = tuple(sorted((base[:10], middle[:10])))
+        resolved = {base[:10]: base, middle[:10]: middle}
+        first_prefix, failing_prefix = ordered_prefixes
+        temporary_path = self.root / "legacy-second-prefix-failure-view"
+        original_capture = named_lane_runtime._legacy_prefix_git_capture
+        observed_receipt_queries: list[tuple[str, ...]] = []
+
+        def fail_second_disambiguation(*args: object, **kwargs: object) -> object:
+            arguments = tuple(args[8])
+            if arguments[0] in {"rev-parse", "cat-file", "merge-base"}:
+                observed_receipt_queries.append(arguments)
+            if arguments == ("rev-parse", f"--disambiguate={failing_prefix}"):
+                return 0, b""
+            return original_capture(*args, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_legacy_prefix_git_capture",
+            side_effect=fail_second_disambiguation,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=ordered_prefixes,
+            )
+
+        first_object = resolved[first_prefix]
+        self.assertIn(
+            ("merge-base", "--is-ancestor", first_object, head),
+            observed_receipt_queries,
+        )
+        self.assertEqual(returncode, 75)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "inconclusive", "reason": "legacy-prefix-not-unique"},
+        )
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_annotated_tag_exact_type(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        git(self.repo, "tag", "-a", "legacy-annotated", "-m", "legacy", base)
+        tag_object = git(self.repo, "rev-parse", "refs/tags/legacy-annotated")
+        temporary_path = self.root / "legacy-tag-prefix-view"
+
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=self.repo.resolve(),
+            temporary_path=temporary_path,
+            head=head,
+            prefixes=(tag_object[:10],),
+        )
+
+        self.assertEqual(returncode, 75)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "inconclusive", "reason": "legacy-prefix-not-commit"},
+        )
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_nonancestor_commit(self) -> None:
+        _base, _middle, head = self.legacy_prefix_history()
+        tree = git(self.repo, "rev-parse", f"{head}^{{tree}}")
+        nonancestor = git(self.repo, "commit-tree", tree, "-m", "nonancestor")
+        temporary_path = self.root / "legacy-nonancestor-prefix-view"
+
+        returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+            source=self.repo.resolve(),
+            temporary_path=temporary_path,
+            head=head,
+            prefixes=(nonancestor[:10],),
+        )
+
+        self.assertEqual(returncode, 75)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "inconclusive", "reason": "legacy-prefix-not-ancestor"},
+        )
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_incomplete_head_object_closure(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        blob = git(self.repo, "rev-parse", f"{head}:head.txt")
+        blob_path = self.repo / ".git" / "objects" / blob[:2] / blob[2:]
+        retained_blob = self.root / "temporarily-missing-head-blob"
+        self.assertTrue(blob_path.is_file())
+        blob_path.rename(retained_blob)
+        temporary_path = self.root / "legacy-incomplete-head-view"
+
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            retained_blob.rename(blob_path)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertEqual(payload["reason"], "legacy-prefix-git-process")
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_ignore_source_grafts_and_replace_refs(
+        self,
+    ) -> None:
+        base, middle, head = self.legacy_prefix_history()
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        grafts = info / "grafts"
+        grafts.write_text(f"{middle}\n", encoding="ascii")
+        replace_ref = f"refs/replace/{base}"
+        git(self.repo, "update-ref", replace_ref, middle)
+        temporary_path = self.root / "legacy-source-metadata-isolation-view"
+
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            git(self.repo, "update-ref", "-d", replace_ref)
+            grafts.unlink(missing_ok=True)
+
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["receipts"][0]["disambiguated_object_ids"],
+            [base],
+        )
+        self.assertEqual(payload["receipts"][0]["ancestry_return_code"], 0)
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_alternates_http_shallow_and_promisor_sources(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        objects = self.repo / ".git" / "objects"
+        info = objects / "info"
+        pack = objects / "pack"
+        info.mkdir(exist_ok=True)
+        pack.mkdir(exist_ok=True)
+        config = self.repo / ".git" / "config"
+        original_config = config.read_bytes()
+        cases = (
+            (info / "alternates", b"", "alternates"),
+            (info / "http-alternates", b"", "HTTP alternates"),
+            (self.repo / ".git" / "shallow", b"", "shallow"),
+            (pack / "legacy.promisor", b"", "promisor state"),
+            (pack / "legacy.BiTmAp", b"", "bitmap cache"),
+        )
+
+        for index, (state_path, content, expected_reason) in enumerate(cases):
+            with self.subTest(state_path=state_path.name):
+                state_path.write_bytes(content)
+                temporary_path = self.root / f"legacy-hostile-source-{index}"
+                try:
+                    returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                        source=self.repo.resolve(),
+                        temporary_path=temporary_path,
+                        head=head,
+                        prefixes=(base[:10],),
+                    )
+                finally:
+                    state_path.unlink(missing_ok=True)
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout, "")
+                payload = json.loads(stderr)
+                self.assertEqual(payload["status"], "blocked-safety")
+                self.assertIn(expected_reason, payload["reason"])
+                self.assertFalse(temporary_path.exists())
+
+        config.write_bytes(original_config + b'[remote "origin"]\n\tpromisor = true\n')
+        temporary_path = self.root / "legacy-promisor-config-source"
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            config.write_bytes(original_config)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("promisor configuration", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_linked_per_worktree_shallow_source(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        linked_source = self.root / "legacy-linked-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        linked_admin = pathlib.Path(
+            git(linked_source, "rev-parse", "--absolute-git-dir")
+        )
+        shallow = linked_admin / "shallow"
+        shallow.write_bytes(b"")
+        temporary_path = self.root / "legacy-linked-shallow-view"
+
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=linked_source.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            shallow.unlink(missing_ok=True)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("per-worktree shallow", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_reject_group_world_writable_source_policy(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        policy_paths = (
+            self.repo,
+            self.repo / ".git",
+            self.repo / ".git" / "objects",
+            self.repo / ".git" / "config",
+        )
+
+        for index, policy_path in enumerate(policy_paths):
+            with self.subTest(policy_path=policy_path):
+                original_mode = stat.S_IMODE(policy_path.lstat().st_mode)
+                policy_path.chmod(original_mode | 0o022)
+                temporary_path = self.root / f"legacy-unsafe-mode-view-{index}"
+                try:
+                    returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                        source=self.repo.resolve(),
+                        temporary_path=temporary_path,
+                        head=head,
+                        prefixes=(base[:10],),
+                    )
+                finally:
+                    policy_path.chmod(original_mode)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout, "")
+                payload = json.loads(stderr)
+                self.assertEqual(payload["status"], "blocked-safety")
+                self.assertIn("group/world writable", payload["reason"])
+                self.assertFalse(temporary_path.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_reject_extended_acl_source_policy(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        objects = self.repo / ".git" / "objects"
+        loose_object = objects / base[:2] / base[2:]
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        for index, policy_path in enumerate((objects, loose_object)):
+            with self.subTest(policy_path=policy_path):
+                add_acl = subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        f"user:{username} allow write",
+                        str(policy_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if add_acl.returncode != 0:
+                    self.skipTest("filesystem does not support Darwin extended ACLs")
+                listing = subprocess.run(
+                    ["/bin/ls", "-lde", str(policy_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if listing.returncode != 0 or len(listing.stdout.splitlines()) < 2:
+                    subprocess.run(
+                        ["/bin/chmod", "-N", str(policy_path)],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                    )
+                    self.skipTest("filesystem did not retain a Darwin extended ACL")
+
+                temporary_path = self.root / f"legacy-extended-acl-source-view-{index}"
+                try:
+                    returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                        source=self.repo.resolve(),
+                        temporary_path=temporary_path,
+                        head=head,
+                        prefixes=(base[:10],),
+                    )
+                finally:
+                    subprocess.run(
+                        ["/bin/chmod", "-N", str(policy_path)],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout, "")
+                payload = json.loads(stderr)
+                self.assertEqual(payload["status"], "blocked-safety")
+                self.assertIn("extended ACL", payload["reason"])
+                self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_bound_object_store_policy_inventory(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-object-policy-inventory-limit-view"
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT",
+            0,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("object-store entry limit", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_object_store_policy_limit_precedes_next_inventory_entry(
+        self,
+    ) -> None:
+        class Inventory:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __enter__(self) -> Inventory:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self) -> Inventory:
+                return self
+
+            def __next__(self) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    return mock.Mock(name="first")
+                raise AssertionError("inventory was materialized beyond its limit")
+
+        inventory = Inventory()
+        storage = mock.Mock(objects=self.repo / ".git" / "objects")
+        with (
+            mock.patch.object(named_lane_runtime.os, "scandir", return_value=inventory),
+            mock.patch.object(
+                named_lane_runtime,
+                "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT",
+                0,
+            ),
+            self.assertRaisesRegex(NamedLaneGuardError, "entry limit"),
+        ):
+            named_lane_runtime._verify_legacy_object_store_access_policy(
+                storage,
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(inventory.calls, 1)
+
+    def test_legacy_object_store_policy_inventory_checks_global_deadline(
+        self,
+    ) -> None:
+        objects = self.root / "legacy-deadline-objects"
+        objects.mkdir(mode=0o700)
+        for index in range(256):
+            (objects / f"object-{index:03d}").write_bytes(b"object")
+        storage = mock.Mock(objects=objects)
+        checks = 0
+
+        def check_deadline(_deadline: float, _label: str) -> float:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise ReviewTimeoutError("inventory deadline expired")
+            return 10.0
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_remaining_deadline_seconds",
+                side_effect=check_deadline,
+            ),
+            self.assertRaisesRegex(ReviewTimeoutError, "deadline expired"),
+        ):
+            named_lane_runtime._verify_legacy_object_store_access_policy(
+                storage,
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(checks, 2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_reject_linked_common_parent_acl_grant(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        source_parent = self.root / "legacy-linked-source-parent"
+        source_parent.mkdir(mode=0o700)
+        linked_source = source_parent / "worktree"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        add_acl = subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                f"user:{username} allow write,delete,delete_child",
+                str(self.repo),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if add_acl.returncode != 0:
+            self.skipTest("filesystem does not support Darwin extended ACLs")
+        temporary_parent = self.root / "legacy-linked-safe-temporary-parent"
+        temporary_parent.mkdir(mode=0o700)
+        temporary_path = temporary_parent / "view"
+
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=linked_source.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            subprocess.run(
+                ["/bin/chmod", "-N", str(self.repo)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("extended ACL grant", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin sticky custody test")
+    def test_legacy_short_prefix_receipts_accept_root_owned_sticky_source_ancestor(
+        self,
+    ) -> None:
+        sticky_parent = pathlib.Path("/private/tmp")
+        try:
+            sticky_metadata = sticky_parent.lstat()
+        except OSError:
+            self.skipTest("root-owned sticky temporary directory is unavailable")
+        if (
+            not stat.S_ISDIR(sticky_metadata.st_mode)
+            or sticky_metadata.st_uid != 0
+            or not stat.S_IMODE(sticky_metadata.st_mode) & stat.S_ISVTX
+        ):
+            self.skipTest("root-owned sticky temporary directory is unavailable")
+
+        base, _middle, head = self.legacy_prefix_history()
+        linked_source = sticky_parent / f"{self.root.name}-legacy-sticky-source"
+        if linked_source.exists():
+            self.fail(f"unexpected sticky-source fixture collision: {linked_source}")
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        temporary_path = self.root / "legacy-sticky-source-view"
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=linked_source.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            shutil.rmtree(linked_source, ignore_errors=True)
+
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            payload["receipts"][0]["disambiguated_object_ids"],
+            [base],
+        )
+        self.assertFalse(temporary_path.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_revalidate_extended_acl_after_query(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        objects = self.repo / ".git" / "objects"
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        temporary_path = self.root / "legacy-extended-acl-drift-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def add_acl_after_query(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and "rev-parse" in command
+            ):
+                completed = subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        f"user:{username} allow write",
+                        str(objects),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError("Darwin extended ACL fixture is unavailable")
+                mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=add_acl_after_query,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=self.repo.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            subprocess.run(
+                ["/bin/chmod", "-N", str(objects)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+        if not mutated:
+            self.skipTest("filesystem does not support Darwin extended ACLs")
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("extended ACL", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_revalidate_source_config_after_each_query(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        config = self.repo / ".git" / "config"
+        original_config = config.read_bytes()
+        temporary_path = self.root / "legacy-source-config-drift-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def mutate_source_config(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and "rev-parse" in command
+            ):
+                config.write_bytes(original_config + b"# hostile drift\n")
+                mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=mutate_source_config,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=self.repo.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            config.write_bytes(original_config)
+
+        self.assertTrue(mutated)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("control content changed", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_revalidate_linked_back_pointer_bytes(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        linked_source = self.root / "legacy-linked-content-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        linked_admin = pathlib.Path(
+            git(linked_source, "rev-parse", "--absolute-git-dir")
+        )
+        back_pointer = linked_admin / "gitdir"
+        original_back_pointer = back_pointer.read_bytes()
+        equivalent_back_pointer = f"{linked_source}/./.git\n".encode("utf-8")
+        temporary_path = self.root / "legacy-linked-content-drift-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def mutate_back_pointer(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and command[-3:] == ("cat-file", "-t", head)
+            ):
+                back_pointer.write_bytes(equivalent_back_pointer)
+                mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=mutate_back_pointer,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=linked_source.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            back_pointer.write_bytes(original_back_pointer)
+
+        self.assertTrue(mutated)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("control content changed", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_revalidate_view_content_after_each_query(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-view-config-drift"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def mutate_view_config(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and command[-3:] == ("cat-file", "-t", head)
+            ):
+                config = temporary_path / "config"
+                config.write_bytes(config.read_bytes() + b"# hostile drift\n")
+                mutated = True
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=mutate_view_config,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertTrue(mutated)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("view file changed", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_revalidate_source_object_identity_after_query(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-source-object-replacement-view"
+        objects = self.repo / ".git" / "objects"
+        original_objects = self.repo / ".git" / "objects.bound-original"
+        objects_mode = stat.S_IMODE(objects.lstat().st_mode)
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def replace_source_objects(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and command[-3:] == ("cat-file", "-t", head)
+            ):
+                objects.rename(original_objects)
+                objects.mkdir(mode=objects_mode)
+                objects.chmod(objects_mode)
+                mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=replace_source_objects,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=self.repo.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            if mutated:
+                objects.rmdir()
+                original_objects.rename(objects)
+
+        self.assertTrue(mutated)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("object directory changed", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_accept_unrelated_object_child_churn(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-source-child-churn-view"
+        unrelated_payload = self.root / "legacy-unrelated-object"
+        unrelated_payload.write_bytes(b"unrelated object child churn\n")
+        original_capture = named_lane_runtime.run_bounded_capture
+        added_object: str | None = None
+
+        def add_unrelated_object(argv: object, **kwargs: object) -> object:
+            nonlocal added_object
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                added_object is None
+                and f"--git-dir={temporary_path}" in command
+                and command[-3:] == ("cat-file", "-t", head)
+            ):
+                added_object = git(
+                    self.repo,
+                    "hash-object",
+                    "-w",
+                    str(unrelated_payload),
+                )
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=add_unrelated_object,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertIsNotNone(added_object)
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["receipts"][0]["disambiguated_object_ids"],
+            [base],
+        )
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_revalidate_control_access_policy(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-control-mode-drift-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def mutate_control_tmp(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            cwd = pathlib.Path(kwargs["cwd"])
+            if not mutated and command[-1:] == ("--version",) and cwd.name == "tmp":
+                cwd.chmod(0o755)
+                mutated = True
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=mutate_control_tmp,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertTrue(mutated)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("control child changed", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "legacy view setup signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_legacy_short_prefix_receipts_cleanup_signal_after_view_binding(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-view-setup-signal"
+        original_make_view = named_lane_runtime._make_legacy_prefix_view
+        interrupted = False
+
+        def interrupt_after_view_binding(*args: object, **kwargs: object) -> object:
+            nonlocal interrupted
+            result = original_make_view(*args, **kwargs)
+            interrupted = True
+            signal.raise_signal(signal.SIGINT)
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_make_legacy_prefix_view",
+            side_effect=interrupt_after_view_binding,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(returncode, 128 + signal.SIGINT)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(temporary_path.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_legacy_short_prefix_receipts_cleanup_failure_never_publishes_success(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-retained-view"
+        original_rmtree = named_lane_runtime.shutil.rmtree
+
+        def retain_view(path: object, *args: object, **kwargs: object) -> None:
+            if pathlib.Path(path) == temporary_path:
+                raise OSError("simulated legacy view cleanup failure")
+            original_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime.shutil,
+            "rmtree",
+            side_effect=retain_view,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn(
+            f"retained legacy prefix temporary path: {temporary_path}",
+            payload["reason"],
+        )
+        self.assertTrue(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_commit_signal_during_success_emit(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-receipt-signal-view"
+        original_emit = named_lane_runtime._emit
+        interrupted = False
+
+        def interrupt_success_emit(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            nonlocal interrupted
+            if (
+                not interrupted
+                and payload.get("schema_version")
+                == LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION
+            ):
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            original_emit(payload, stream=stream)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_emit",
+            side_effect=interrupt_success_emit,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["status"], "ok")
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_emit_failure_never_publishes_success(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-receipt-failure-view"
+        original_emit = named_lane_runtime._emit
+        receipt_failed = False
+
+        def fail_success_emit(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            nonlocal receipt_failed
+            if (
+                not receipt_failed
+                and payload.get("schema_version")
+                == LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION
+            ):
+                receipt_failed = True
+                raise BrokenPipeError("simulated legacy receipt failure")
+            original_emit(payload, stream=stream)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_emit",
+            side_effect=fail_success_emit,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertTrue(receipt_failed)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {
+                "status": "blocked-safety",
+                "reason": "simulated legacy receipt failure",
+            },
+        )
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_cleanup_parent_drift_reports_descriptor_locator(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        private_parent = self.root / "legacy-cleanup-parent"
+        private_parent.mkdir(mode=0o700)
+        private_parent.chmod(0o700)
+        original_parent = self.root / "legacy-cleanup-parent.bound-original"
+        temporary_path = private_parent / "legacy-parent-drift-view"
+        original_rmtree = named_lane_runtime.shutil.rmtree
+        drifted = False
+
+        def drift_parent(path: object, *args: object, **kwargs: object) -> None:
+            nonlocal drifted
+            if not drifted and pathlib.Path(path) == temporary_path:
+                private_parent.rename(original_parent)
+                private_parent.mkdir(mode=0o700)
+                private_parent.chmod(0o700)
+                drifted = True
+                raise OSError("simulated parent replacement during cleanup")
+            original_rmtree(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime.shutil,
+                "rmtree",
+                side_effect=drift_parent,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=self.repo.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            if drifted:
+                private_parent.rmdir()
+                original_parent.rename(private_parent)
+
+        self.assertTrue(drifted)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn(
+            "retained legacy prefix temporary locator: parent device=",
+            payload["reason"],
+        )
+        self.assertIn("leaf=legacy-parent-drift-view", payload["reason"])
+        self.assertNotIn(str(temporary_path), payload["reason"])
 
     def test_materializer_checks_out_exact_head_without_running_status(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
@@ -7502,6 +9021,22 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "blocked-safety",
             ),
             (
+                "legacy-short-prefix-receipts",
+                "review_runtime.named_lane.legacy_short_prefix_receipts",
+                (
+                    "legacy-short-prefix-receipts",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--temporary-path",
+                    str(self.root / "classified-legacy-prefix-view"),
+                    "--head",
+                    "0" * 40,
+                    "--phase",
+                    "initial",
+                ),
+                "blocked-safety",
+            ),
+            (
                 "run-claude",
                 "review_runtime.named_lane.run_claude",
                 (
@@ -7572,6 +9107,20 @@ class NamedLaneGuardTest(unittest.TestCase):
                     str(self.repo.resolve()),
                     "--head",
                     head,
+                ),
+                "blocked-safety",
+            ),
+            (
+                (
+                    "legacy-short-prefix-receipts",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--temporary-path",
+                    str(self.root / "thread-start-legacy-prefix-view"),
+                    "--head",
+                    head,
+                    "--phase",
+                    "initial",
                 ),
                 "blocked-safety",
             ),

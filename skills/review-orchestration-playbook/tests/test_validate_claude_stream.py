@@ -787,6 +787,15 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"result", "modelUsage"},
         )
         self.assertEqual(
+            terminal_contract["optional_field_contracts"]["api_error_status"],
+            {
+                "rule": "null_or_whitespace_string_or_http_status_integer",
+                "minimum": 100,
+                "maximum": 599,
+                "failure": "classify",
+            },
+        )
+        self.assertEqual(
             terminal_contract["profiles"], validator.TERMINAL_PROFILE_CONTRACT
         )
         for profile_name, failure_subtypes in terminal_contract["profiles"][
@@ -3323,6 +3332,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self._validate(failure_with(api_error_status="401")),
             "blocked-authentication",
         )
+        numeric_status = failure_with(
+            result="Not logged in - please run /login",
+            modelUsage={"claude-opus-4-8": {}},
+            api_error_status=401,
+        )
+        self.assertEqual(
+            self._validate(numeric_status),
+            {
+                "classification": "blocked-authentication",
+                "reasons": ["terminal.authentication-error"],
+            },
+        )
         self.assert_fail_closed(
             self._validate(
                 failure_with(errors=["HTTP 401 Unauthorized", "child exit code 1"])
@@ -3333,6 +3354,55 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         contradictory_success[-1]["error"] = "HTTP 401"
 
         self.assert_fail_closed(self._validate(contradictory_success), "inconclusive")
+
+    def test_numeric_api_error_status_is_bounded_and_failure_only(self) -> None:
+        def failure_with_status(status: object) -> list[dict[str, object]]:
+            events = self._full_events()
+            events[-1].update(
+                {
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "request failed",
+                    "api_error_status": status,
+                }
+            )
+            return events
+
+        for status in (100, 599):
+            with self.subTest(status=status):
+                outcome = self._validate(failure_with_status(status))
+                self.assertEqual(outcome["classification"], "inconclusive")
+                self.assertIn("terminal.unclassified-error", outcome["reasons"])
+                self.assertNotIn(
+                    "terminal.api_error_status.malformed",
+                    outcome["reasons"],
+                )
+
+        for status in (99, 600, True, 401.0, {"status": 401}):
+            with self.subTest(malformed_status=status):
+                outcome = self._validate(failure_with_status(status))
+                self.assertEqual(outcome["classification"], "inconclusive")
+                self.assertIn(
+                    "terminal.api_error_status.malformed",
+                    outcome["reasons"],
+                )
+
+        contradictory_success = self._full_events()
+        contradictory_success[-1]["api_error_status"] = 401
+        self.assertEqual(
+            self._validate(contradictory_success),
+            {
+                "classification": "inconclusive",
+                "reasons": ["terminal.success-with-error"],
+            },
+        )
+
+        blank_status_success = self._full_events()
+        blank_status_success[-1]["api_error_status"] = " \t"
+        self.assertEqual(
+            self._validate(blank_status_success),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
 
     def test_nonzero_preserves_valid_structured_authentication_failures(self) -> None:
         authentication_messages = (

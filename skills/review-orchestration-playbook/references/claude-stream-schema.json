@@ -706,7 +706,9 @@
         "failure": "classify"
       },
       "api_error_status": {
-        "rule": "null_or_whitespace_string",
+        "rule": "null_or_whitespace_string_or_http_status_integer",
+        "minimum": 100,
+        "maximum": 599,
         "failure": "classify"
       },
       "permission_denials": {

@@ -17,6 +17,205 @@ The bundle identity is operational evidence, not a free-form label:
 - The complete formal-profile byte-binding list includes `CLAUDE_RELEASE_KEY_BYTES`, `COMPATIBILITY_JSON_BYTES`, `BASELINE_SCHEMA_BYTES`, `PROFILE_SCHEMA_BYTES`, `CAPABILITY_SOURCE_BYTES`, and `FD_EXEC_BYTES` where applicable. For the formal default and `preflight-claude` profiles, the guard injects the exact manifest-bound process-companion bytes as `review_runtime.common.FD_EXEC_BYTES`. Descriptor-backed launches validate and compile only those injected bytes, then execute them through the trusted Python interpreter's isolated `-I -B -S -c` bootstrap; they never reopen the `review_runtime/fd_exec.py` path.
 - The optional profiles must not widen this control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`.
 
+## Legacy Short-Prefix Receipt Producer
+
+The only formal producer for parent-trusted local Git receipts that resolve
+raw, non-current legacy 10-hex clean markers is the default-profile guard
+subcommand `legacy-short-prefix-receipts`. It is parsed and dispatched by the
+manifest-bound `review_runtime.named_lane` source already present in the
+default exact three-source closure; it does not create another profile or add
+an unmanifested runtime source. Invoke it only through the recorded trusted
+Python and bundle launcher described above. A private workspace helper never
+supplies receipt evidence. A direct import never satisfies this contract.
+Neither counts as receipt authority. An ad hoc query reimplementation or a
+source-Git-directory query also never counts. The manifest-bound runtime
+declares the exact literal
+`LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION = "named-lane-legacy-short-prefix-receipts-v1"`;
+changing either side is a schema migration, not a compatible implementation
+detail.
+
+Use this exact argv shape under the fixed clean parent environment. Repeat
+`--prefix` once for every unique raw-derived non-current lowercase 10-hex
+prefix; zero or more are accepted:
+
+```sh
+<trusted-python-absolute-path> -I -B -S \
+  <trusted-bundle-absolute-path>/skills/review-orchestration-playbook/scripts/named_lane_guard \
+  legacy-short-prefix-receipts \
+  --source <absolute-exact-worktree-root> \
+  --temporary-path <absolute-phase-unique-absent-child-under-owner-private-0700-parent> \
+  --head <current-lowercase-full-object-id> \
+  --phase initial \
+  --prefix <lowercase-10-hex> \
+  [--prefix <another-lowercase-10-hex> ...]
+```
+
+For the final pass, use `--phase final` and a different phase-unique absent
+`--temporary-path`; do not delete and reuse the initial pathname as evidence
+of an independently created view. The source is the exact worktree root, not
+its `.git` path. `head` is the exact lowercase full-width commit object ID for
+the repository format. Prefixes must be unique, and a prefix equal to the
+first 10 hex of `head` is semantic `inconclusive`: current-head short cleans
+belong only to the independent dual REST resolution path. When the complete
+derived set is empty, omit `--prefix`; the producer still performs the full
+source/head/view validation and cleanup and succeeds only with `receipts: []`.
+
+Before any receipt query, the producer applies the materializer's source
+repository trust boundary: bind the exact worktree root, `.git` marker,
+resolved admin/common/object directories, linked-worktree forward target and
+back-pointer, object format, owner, type, device/inode identity, and relevant
+access policy through bounded no-follow control-file reads and repeated
+storage revalidation. Object identity is `(st_dev, st_ino, file type, st_uid)`;
+access policy is separate and rejects group/world-writable (`0o022`) source
+worktree and `.git` marker parents, bound admin/common/object directories, and
+relevant config/back-pointer files. Descriptor-relative custody revalidation
+walks complete root-to-leaf chains for the source worktree, admin, common, and
+objects directories and for the temporary parent. On Darwin, each custody
+ancestor accepts only an empty or deny-only extended ACL; any allow entry or
+unknown/uninspectable ACL is `blocked-safety`. A root-owned sticky custody
+ancestor is the only group/world-writable special case; every bound source,
+object-store, temporary-parent, control, or view leaf remains current-user-owned
+and rejects every extended ACL. Mode bits and ACL state are separate
+access-policy signals.
+The source object-store policy inventory streams one entry at a time, increments
+and checks
+`LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT`
+before metadata inspection or requesting another entry, and checks the same
+phase-global receipt deadline before each directory and every 256 entries
+without resetting it. Limit exhaustion, deadline expiry, or
+incomplete inventory inspection is `blocked-safety`. These point revalidations
+are point-in-time observations and do not claim continuous atomicity. Benign
+`mtime`, `ctime`, `nlink`, or
+object-directory child-entry churn alone is not mutation of either protected
+property. Reject suffix-DWIM or replaced control paths,
+`objects/info/alternates`, `objects/info/http-alternates`, common/admin shallow
+state including per-worktree shallow state, promisor/partial-clone config or
+pack markers, source pack bitmaps, an unsafe or ambiguous object directory,
+and missing or incomplete local objects. Source configuration is inspected
+only as a bounded direct no-include byte stream for the required object-format
+and hostile-state checks; Git never loads source config, refs, hooks, remotes,
+worktree state, or a source Git directory.
+
+Create a minimal bare control view only at the exact absent temporary leaf.
+It has owner-private control/config roots; empty refs, remotes, hooks, and
+worktree state; no `info/grafts`, shallow file, replace ref, alternate, HTTP
+alternate, or promisor dependency; and it exposes only the validated source
+object directory through the fixed object-directory environment. Rebuild the
+Git environment from the fixed allowlist, disable lazy fetch and prompting,
+set `GIT_NO_REPLACE_OBJECTS=1`, isolate system/global configuration, and force
+`core.commitGraph=false` plus `core.multiPackIndex=false` on every command.
+This protects object type and ancestry from local grafts, replace refs,
+shallow boundaries, ambient config, commit-graph data, and multi-pack-index
+consumption without claiming that source object-store child churn is itself a
+mutation. The producer does not materialize or snapshot the entire object
+store. Source container identity/access policy and full-OID/type/ancestry
+ordered point-query semantics are protected; continuous stability of selected
+loose-object or pack bytes is not.
+The exact owner-only mode-`0700` temporary/view root protects identity and
+access policy, while bounded exact generated-view config and `HEAD` bytes
+protect those control files' content stability. Revalidate each protected
+property independently rather than treating a timestamp delta as proof that
+object semantics changed. Same-current-UID concurrent object-store content
+mutation, prefix-inventory churn, and intra-phase or inter-phase ABA are not
+excluded. Initial/final equality is two point-in-time observations, not
+atomicity.
+
+After that non-receipt setup, run these bounded phase-level control preflights
+against the same invocation-local view, in order:
+
+```sh
+git cat-file -t <head>
+git rev-list --objects --missing=error --quiet <head> --
+```
+
+Require the first command to return `0` with exactly `commit` and LF, proving
+the full head's exact object type. Require the second to return `0` without
+unexpected output, proving the view contains the head's complete reachable
+object closure. Both run even for a zero-prefix phase. Neither creates a
+receipt field or counts as a per-prefix receipt query. After both phase-level
+preflights pass, run exactly these three bounded read-only receipt queries, in
+this order, for each sorted prefix against that same view:
+
+```sh
+git rev-parse --disambiguate=<raw_prefix>
+git cat-file -t <sole_full_object_id>
+git merge-base --is-ancestor <sole_full_object_id> <head>
+```
+
+The first command must return `0` and exactly one well-formed lowercase full
+object ID of the repository's hash width that begins with `raw_prefix`. The
+second is an exact-object, non-peeling type check and must return `0` with the
+single ASCII line `commit` plus LF. The third must return `0`. A zero/multiple
+or malformed disambiguation, a tag or other non-commit object, a non-ancestor,
+the current-head prefix, unexpected stdout/stderr, timeout, output overflow,
+process/drain uncertainty, source revalidation failure, or any other
+near-miss produces no usable receipt. A complete zero/multiple-OID stdout is a
+semantic rejection, but an output-limit exception does not identify whether
+stdout or stderr overflowed and is therefore `blocked-safety`, never evidence
+of ambiguity. Query count and aggregate subprocess output are capped; Git
+subprocesses share the 120-second monotonic phase deadline and bounded process
+cleanup. Synchronous filesystem identity/access-policy revalidation is
+fail-closed but is not an interruptible wall-clock guarantee: a stalled
+filesystem can exceed the subprocess deadline and supplies no receipt. At
+most the phase's fixed temporary view and control path can require retained
+cleanup evidence.
+
+Success is a closed JSON object with exactly these top-level fields and this
+schema version:
+
+```json
+{
+  "status": "ok",
+  "schema_version": "named-lane-legacy-short-prefix-receipts-v1",
+  "phase": "initial",
+  "head": "<current-lowercase-full-object-id>",
+  "temporary_cleanup_status": "complete",
+  "receipts": [
+    {
+      "raw_prefix": "<lowercase-10-hex>",
+      "head": "<current-lowercase-full-object-id>",
+      "disambiguate_return_code": 0,
+      "disambiguated_object_ids": ["<sole-full-object-id>"],
+      "commit_object_check_return_code": 0,
+      "object_type": "commit",
+      "ancestry_return_code": 0
+    }
+  ]
+}
+```
+
+`receipts` is unique and sorted by `raw_prefix`; each item has exactly the
+seven fields shown. The producer is success-only: it publishes `status: ok`
+only after every prefix has a fully accepting seven-field receipt, the source
+has passed final revalidation, all child processes are drained/reaped, and the
+temporary view/control state has been removed. Semantic rejection returns a
+closed structured `inconclusive` result with no partial `receipts`; source,
+view, control, process, revalidation, or cleanup ambiguity returns structured
+`blocked-safety`, also with no partial `receipts`. A cleanup failure can report
+only its safely revalidated retained path or descriptor-bound locator; it can
+never coexist with `temporary_cleanup_status: complete` or a success receipt.
+
+Derive the complete non-current prefix set independently from each complete
+initial/final raw inventory, invoke the producer independently for each phase,
+and map only the successful generic `receipts` array to the corresponding
+history-top-level `initial_legacy_short_commit_resolution_receipts` or
+`final_legacy_short_commit_resolution_receipts`. Recompute and revalidate the
+same independently trusted bundle path, version, and canonical manifest digest
+before and after both invocations. Require exact head/prefix coverage and
+type-preserving equality of the two seven-field arrays; a changed bundle,
+failed invocation, missing/extra/duplicate/unsorted receipt, or drift is
+fail-closed. These independent invocations retain only the two point-in-time
+observations described above; they do not widen the protected properties or
+turn the equality comparison into an atomic source-object-store transaction.
+
+For a self-policy migration, candidate-head Python and this candidate
+subcommand remain review subject, never review control. If the prior trusted
+bundle lacks `legacy-short-prefix-receipts`, adjudicate the migration and run
+its formal review under the prior trusted policy, merge and release it, then
+bind the released bundle manifest before activating this producer. Never run
+the candidate-head subcommand, a private helper, or source-directory Git
+queries to bootstrap evidence for its own migration.
+
 ## Shared Frozen-Range Contract
 
 For every local logical lane:
@@ -132,18 +331,20 @@ The parent executes these controls in order and never treats one control's succe
 ## GitHub Codex Lane Contract
 
 - The third lane exists only on an authenticated selected PR with exact lifecycle `state == "open"`, `merged == false`, and `merged_at == null`, exact host `github.com`, and an operating identity outside `{hoteng, hoteng_cisco}`. The fixed baseline does not require pre-proved integration availability: its empty accepted structured capability/installation schema set leaves integration/service state unknown until provider evidence appears. Missing/contradictory lifecycle evidence is `blocked-input` (`pr-lifecycle-unverified`) and triple-inconclusive; closed-unmerged is `selected-pr-closed` and directly unavailable only before any request/service start when a separate frozen local range exists; merged is terminal `already-merged` / `selected-pr-merged`. An observed non-open lifecycle at any mandated snapshot after request/service start invalidates evidence and remains triple-inconclusive. Revalidate lifecycle at selection, before posting, before accepting a result, and before readiness/merge. These point-in-time snapshots do not prove that no intermediate close-and-reopen occurred between them. Every other host, including every GitHub Enterprise host, is unsupported.
-- Evidence-consumption changes remain pinned atomically to source `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`, released Action `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`, common tree `d03de9035d20f285e6a93986d436403b4a30e9bc`, the complete 15-path blob manifest, and the result-present regression rationale in the evidence authority. A floating ref, prose-only match, or partial runtime diff is not anti-drift evidence. Result-present/request-run independence is inherited; artifact-time whole-PR receipts, ancestor-finding projection, raw threads, lifecycle, and the conditional reaction fallback are explicit playbook extensions.
-- Every independent historical discovery traversal and current raw endpoint traversal carries a parent-owned `resource_budget` sibling beside, never inside, the unchanged transcript-v4 envelope. Its closed profile is `{profile: github-codex-evidence-resource-budget-v1, schema_version: 1, max_seeded_pull_requests: 512, max_controlled_requests: 512, max_fetch_attempts: 8192, max_retained_pages: 4096, max_records: 20000, max_page_body_bytes: 8388608, max_retained_utf8_bytes: 67108864, deadline_seconds: 900}`. Historical discovery combines an updated-desc pull boundary, a fully paginated since-cutoff repository issue-comment feed, and exact current/declaration anchors; fully traverse every PR in that union. The 512 cap counts only union/detail scopes, never cumulative repository history or old boundary witnesses. Apply the profile to three non-borrowing endpoint, request-scope-sidecar, and terminal-artifact-scope-receipt ledgers sharing the same inventory start/deadline; pre-count each sidecar or artifact wrapper and its five raw responses. Create the artifact ledger once per inventory decision pass, validate each immutable wrapper once, and thread its memoized result through candidate ordering, audit, profile, outcome, and report projection; never reset it per candidate/scope/recomputation or recharge the same wrapper. Sidecar overflow closes request/reaction authority without erasing an independently complete terminal payload. Aggregate artifact-ledger overflow invalidates the complete terminal projection and selects `unknown`; accepting a validated prefix is forbidden. Charge attempts and known page/record counts before cloning or serialization, bytes before hashing/decoding/accumulation, and recheck time before success. A current raw inventory parses its real detail fetch set once, without a synthetic seed, duplicate pull parse, second deadline, or post-budget mutation. Endpoint overflow or an unverifiable bound discards that traversal and selects `unknown`; never truncate and continue. The 20,000-record, 8-MiB response, and 64-MiB run magnitudes align with the pinned released Action; the seeded-PR, controlled-request, fetch-attempt, retained-page, and 900-second caps are playbook extensions.
+- Evidence-consumption changes remain pinned atomically to source `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`, released Action `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`, common tree `d03de9035d20f285e6a93986d436403b4a30e9bc`, the complete 15-path blob manifest, and the result-present regression rationale in the evidence authority. A floating ref, prose-only match, or partial runtime diff is not anti-drift evidence. Result-present/request-run independence is inherited. Short-marker parity is limited to 10/40 carrier lengths and the short carrier's fail-closed exact-repository REST resolution outcome; lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank boundary, closed lead/tagline/disclosure/native grammar, independent parent-recorded initial/final resolution receipts, artifact-time whole-PR receipts, ancestor-finding projection, raw threads, lifecycle, and the conditional reaction fallback are explicit stricter playbook rules or extensions. Full grammar parity with the Action is not claimed.
+- Every independent historical discovery traversal and current raw endpoint traversal carries a parent-owned `resource_budget` sibling beside, never inside, the unchanged transcript-v4 envelope. Its closed profile is `{profile: github-codex-evidence-resource-budget-v1, schema_version: 1, max_seeded_pull_requests: 512, max_controlled_requests: 512, max_fetch_attempts: 8192, max_retained_pages: 4096, max_records: 20000, max_page_body_bytes: 8388608, max_retained_utf8_bytes: 67108864, deadline_seconds: 900}`. Historical discovery combines an updated-desc pull boundary, a fully paginated since-cutoff repository issue-comment feed, and exact current/declaration anchors; fully traverse every PR in that union. The 512 cap counts only union/detail scopes, never cumulative repository history or old boundary witnesses. Apply the profile to three non-borrowing endpoint, request-scope-sidecar, and terminal-artifact-scope-receipt ledgers sharing the same inventory start/deadline. Pre-count each sidecar or artifact wrapper: an ordinary artifact wrapper plus five raw scope/artifact responses costs six records, while a lowercase 10-hex clean wrapper adds two independent resolution responses, for seven raw responses and eight records. Create the artifact ledger once per inventory decision pass, validate each immutable wrapper once, and thread its memoized result through candidate ordering, audit, profile, outcome, and report projection; never reset it per candidate/scope/recomputation or recharge the same wrapper. Sidecar overflow closes request/reaction authority without erasing an independently complete terminal payload. Aggregate artifact-ledger overflow invalidates the complete terminal projection and selects `unknown`; accepting a validated prefix is forbidden. Charge attempts and known page/record counts before cloning or serialization, bytes before hashing/decoding/accumulation, and recheck time before success. A current raw inventory parses its real detail fetch set once, without a synthetic seed, duplicate pull parse, second deadline, or post-budget mutation. Endpoint overflow or an unverifiable bound discards that traversal and selects `unknown`; never truncate and continue. The 20,000-record, 8-MiB response, and 64-MiB run magnitudes align with the pinned released Action; the seeded-PR, controlled-request, fetch-attempt, retained-page, and 900-second caps are playbook extensions.
 - Before posting, inspect complete authenticated request history and the bounded audit record. Producer policy permits one exact `@codex review` request for an unchanged current scope, only after both local lanes are terminal, and never permits a second or third request. Capture the one parent-owned write with closed pre/post pull-detail and compare receipts plus the exact `201` POST response; reuse observed state rather than writing again.
-- Separate producer policy from consumer outcome. Every request admitted by request-policy or reaction logic has exactly one `parent-recorded-request-scope-v1` sidecar whose two scope projections equal the enclosing tuple and whose POST response projects the same eight request fields, including closed `user: {login, type}` actor identity. Store that sidecar beside, never inside, unchanged raw transcript schema version 4. A missing, malformed, extra, or unmatched sidecar makes `request_policy` `unknown`, forbids another POST while same-scope history is unproved, and disables the affected reaction evidence without invalidating an independently trustworthy terminal provider artifact. A valid old-head receipt remains old-epoch audit evidence and does not count as a current-head request; an old-epoch-only request/reaction seeded scope produces no current result entry and remains audit-only. A valid same-head/different-merge-base receipt is never this audit-only exception: it instead takes `base-changed-same-head` and forbids a replacement request. Record `early-request-observed` for an early bound request and `duplicate-observed` when more than one bound same-scope request exists, including an overlapping or pending extra request; neither warning invalidates a trustworthy terminal provider artifact. A lone compliant pending request is not a warning and remains pending unless a trustworthy terminal artifact already exists. The sidecar does not supply one-to-one request/run association, and matching pre/post observations do not prove an ABA-free interval.
-- Every terminal-looking exact-provider artifact admitted to the receipt-bound normalized decision member has one singular closed `artifact_scope_receipt` of kind `parent-recorded-terminal-artifact-scope-v1`. It contains exactly `kind`, `pre_artifact_scope_receipts`, `artifact_get_receipt`, and `post_artifact_scope_receipts`. Project the raw pre/post pull+compare bodies to exact head/merge-base scope, independently preserve mandatory lifecycle snapshots, and project the exact artifact GET to repository/PR, channel, native ID, provider identity, semantic time, body, digest, grammar, and artifact commit. Require `pre Date < artifact semantic time <= artifact GET Date <= post Date`; whole-second equality at the pre edge is inconclusive because it cannot order a same-second same-head base retarget. An old artifact may count only through a previously persisted still-identical receipt that already bracketed it; if it does not strictly follow every trustworthy pre observation, it is inconclusive. This receipt is independent of request sidecars and does not establish request/run/artifact lineage or an ABA-free interval. Missing request sidecars close request/reaction authority only; missing or unstable artifact receipts block the wrapped artifact. A truly absent pre-v1 receipt is the narrow audit-only exception: keep the strictly older, otherwise well-formed artifact raw and admit it only through the authority's closed `legacy_unreceipted_audit` partition. It never supplies positive authority or becomes the selected completion basis. A later accepted receipt-bound result may still have a non-null `evidence_basis` that carries the item in `legacy_unreceipted_artifacts`; the legacy item does not by itself veto that result when every migration gate closes. A malformed or unstable receipt is not this exception.
+- Separate producer policy from consumer outcome. Every request admitted by request-policy or reaction logic has exactly one `parent-recorded-request-scope-v1` sidecar whose two scope projections equal the enclosing tuple and whose POST response projects the same eight request fields, including closed `user: {login, type}` actor identity. Store that sidecar beside, never inside, unchanged raw transcript schema version 4. A missing, malformed, extra, or unmatched sidecar makes `request_policy` `unknown`, forbids another POST while same-scope history is unproved, and disables the affected reaction evidence without invalidating an independently trustworthy terminal provider artifact. Unrecoverable old request sidecars may therefore leave that producer/audit field `unknown`; it alone does not null a newer independently complete provider clean and never authorizes another same-head POST. A valid old-head receipt remains old-epoch audit evidence and does not count as a current-head request; an old-epoch-only request/reaction seeded scope produces no current result entry and remains audit-only. A valid same-head/different-merge-base receipt is never this audit-only exception: it instead takes `base-changed-same-head` and forbids a replacement request. Record `early-request-observed` for an early bound request and `duplicate-observed` when more than one bound same-scope request exists, including an overlapping or pending extra request; neither warning invalidates a trustworthy terminal provider artifact. A lone compliant pending request is not a warning and remains pending unless a trustworthy terminal artifact already exists. The sidecar does not supply one-to-one request/run association, and matching pre/post observations do not prove an ABA-free interval.
+- Every terminal-looking exact-provider artifact admitted to the receipt-bound normalized decision member has one singular closed `artifact_scope_receipt` of kind `parent-recorded-terminal-artifact-scope-v1`. It contains exactly `kind`, `pre_artifact_scope_receipts`, `artifact_get_receipt`, and `post_artifact_scope_receipts`. In each raw pre/post pair, the pull body supplies base/head, the exact derived Compare request URL binds that pair, and the Compare body repeats base and supplies merge base; independently preserve mandatory lifecycle snapshots, and project the exact artifact GET to repository/PR, channel, native ID, provider identity, semantic time, body, digest, grammar, and artifact commit. Require `pre Date < artifact semantic time <= artifact GET Date <= post Date`; whole-second equality at the pre edge is inconclusive because it cannot order a same-second same-head base retarget. A raw lowercase 10-hex clean issue carrier remains `clean-pending-resolution` and non-authoritative until an exact `parent-recorded-reviewed-commit-resolution-v1` companion joins its artifact ID, scope, ref, and full current head. Its independent raw initial/final resolution receipts must also prove `artifact GET Date <= initial resolution Date <= every post-scope Date <= final resolution Date`, allowing same-second equality; retained receipt bytes/digests and checked dates are required contract evidence, not a prose assumption about parent invocation. Apply the same join in current, complete-history, and sidecar-blind historical paths. Sidecar-blind may ignore request-scope sidecars but never the resolution companion. An old artifact may count only through a previously persisted still-identical receipt that already bracketed it; if it does not strictly follow every trustworthy pre observation, it is inconclusive. This receipt is independent of request sidecars and does not establish request/run/artifact lineage or an ABA-free interval. Missing request sidecars close request/reaction authority only; missing or unstable artifact or resolution receipts block the wrapped artifact. A truly absent pre-v1 receipt is the narrow audit-only exception: keep the strictly older artifact raw only when the raw-internal migration classifier recognizes one of exactly two carriers, and admit it only through the authority's closed `legacy_unreceipted_audit` partition; an ordinary unreceipted current-grammar clean or finding cannot enter. Raw-internal `legacy-finding-native-review-v1` reports role `finding` only for `COMMENTED`/`CHANGES_REQUESTED`, exact `### 💡 Codex Review`, one same-repository full-SHA blob path/line URL equal to native `commit_id`, one fixed `P0/red`, `P1/orange`, `P2/yellow`, or `P3/lightgrey` badge, and bounded title/prose containing neither `www.` nor a URI-scheme prefix whose colon is immediately followed by a non-whitespace character. After newline normalization, trim every physical disclosure line and drop blank lines; the remaining lines exactly equal the closed nine-line disclosure. It is separated by either no padding line or exactly one line of four ASCII spaces, with no other title/prose trailing whitespace or blank line before it, and the review has no associated inline child. It is never enabled for receipt-bound current/provider authority. The only other carrier is an exact old short clean issue comment retained as `clean-pending-resolution` with the raw lowercase 10-hex ref. Both remain complete audit-only history, never positive authority, provider carriers, candidate bases, or superseding evidence. A later accepted receipt-bound current-head result may still have a non-null `evidence_basis` that carries them in `legacy_unreceipted_artifacts`; they do not veto that result when their semantic times are strictly older than both selected pre-scope `Date` receipts and every migration/time/stability/precedence/thread gate closes. If the selected clean is short, its own dual exact-repository receipts must resolve its full current head; an old raw prefix cannot borrow them. A present-but-malformed or unstable receipt, a legacy near-miss, unresolved thread, bad ancestry, equal/newer legacy time, or raw projection drift is not this exception and fails closed.
+- No legacy item supplies the selected completion basis, and a recognized strictly older audit item does not by itself veto that result. For every raw-derived non-current `clean-pending-resolution` prefix, require candidate-history top-level `initial_legacy_short_commit_resolution_receipts` and `final_legacy_short_commit_resolution_receipts`; an ancestry array cannot self-attest the mapping. Produce both arrays only through the public manifest-bound `legacy-short-prefix-receipts` contract above. Each unique `raw_prefix`-sorted item is closed to `raw_prefix`, `head`, `disambiguate_return_code`, `disambiguated_object_ids`, `commit_object_check_return_code`, `object_type`, and `ancestry_return_code`; every code is `0`, disambiguation yields one exact prefix-matching full object, `object_type == "commit"`, and ancestry is proved. Exact source/head/prefix coverage, cleanup-complete success schema, trusted-bundle identity, and type-preserving initial/final equality are mandatory. Direct imports, private workspace helpers, ad hoc wrappers, and source Git-directory queries never count. Preserve both arrays as terminal `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts` or reaction `evidence_basis.current.local_git_prefix_resolution_receipts`, with `{initial: [...], final: [...]}`. This is ancestor-applicability evidence only: the item remains audit-only, its report preserves the raw 10 hex, and it acquires neither a REST resolution companion nor a full reported commit. A selected current-head short clean remains governed by its own dual REST resolution receipts and never enters these local arrays.
 - The request comment is not completion. Only the complete current-scope provider evidence snapshot can complete the lane under [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
 - Record PR URL, complete request audit, current head and merge base, selected evidence URL/server-time/stable ID when one exists, `request_policy`, `provider_profile`, `evidence_basis`, and status.
 - Reject stale evidence after any push.
-- Fully paginate issue comments, reviews, associated inline comments, review threads with explicit resolution, and relevant reactions. Keep the enclosing normalized `scope.head` equal to current PR head. Clean commit binding must equal that head; a finding's artifact commit may be current or a locally proved ancestor and remains in the complete projection under that ancestry receipt. Unresolved applicable thread-backed findings block. Otherwise select the latest trustworthy exact-bot terminal artifact by server time: a finding wins over clean at the same time, a newer malformed terminal artifact fails closed, and incompatible cross-channel equal-time artifacts are `triple-inconclusive`.
+- Fully paginate issue comments, reviews, associated inline comments, review threads with explicit resolution, and relevant reactions. Keep the enclosing normalized `scope.head` equal to current PR head. Clean commit binding must equal that head; a finding's artifact commit may be current or a locally proved ancestor and remains in the complete projection under that ancestry receipt. Unresolved applicable thread-backed findings block. Otherwise select the latest trustworthy receipt-bound exact-bot terminal artifact by server time: a finding wins over clean at the same time, a newer/equal malformed terminal artifact fails closed, and incompatible cross-channel equal-time artifacts are `triple-inconclusive`. A recognized strictly older migration-only audit item remains complete history but cannot control selection; a truly malformed/unknown old near-miss still prevents the partition from closing.
 - Review state admissibility is separate from terminal-looking detection. A submitted review artifact uses exact state `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`. `PENDING` is nonterminal. `DISMISSED` is always terminal-looking; a missing or unknown state is likewise terminal-looking when a nonempty body or associated inline child supplies a terminal signal. Each is a whole-snapshot inconclusive blocker: original `submitted_at` is not a trusted state-transition time, so no later-looking clean may supersede it. See the authority's closed review-state rule.
-- A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when every thread-backed finding is resolved and no newer finding or malformed terminal artifact exists. A request or progress message does not supersede terminal evidence.
+- A later strong current-head clean may supersede an older top-level finding on the same or a proven ancestor head only when every thread-backed finding is resolved and no newer finding or newer/equal malformed terminal artifact exists. A request or progress message does not supersede terminal evidence.
 - Use `terminal-payload` by default. An independently trustworthy current terminal clean/findings artifact remains `terminal-payload` when the provider declaration is missing or historical traversal, pagination, endpoint/artifact budget, or sidecar validation fails; those adaptation-plane failures prevent only `mixed` and weak reaction authority. Run optional history before the final current reread and create fresh current trackers afterward; another phase's elapsed time cannot expire a completed inventory. A current endpoint/artifact receipt failure or current identity, scope, lifecycle, thread, ancestry, grammar, selection, or final-stability failure still blocks. In `mixed`, a trustworthy current-scope terminal payload remains authoritative regardless of reaction ordering; a later `+1`, `eyes`, or other reaction never overturns it, and `mixed` never accepts reaction-only clean. Admit comments/reviews only under the authority's fixed terminal-payload grammar; every other terminal-looking exact-provider artifact is malformed. `thumbs-up-clean` is a narrowly qualified reaction-only fallback and never supersedes a finding. `unknown` cannot pass from reactions. `eyes` proves liveness only and affects only reaction-only fallback, where an `eyes` at or after the selected `+1` prevents weak clean.
+- The fixed terminal-payload grammar remains exclusive for receipt-bound current candidates. Only the two exact strictly older raw carriers described above may bypass it, and only into `legacy_unreceipted_audit`; a near-miss remains malformed and cannot become audit-only by age.
 - Do not pool historical and current reaction evidence. Build the complete bounded candidate universe from the schema-version-4 dual-source discovery union before profile selection and never skip an incomplete, conflicting, or unfavourable candidate. The fallback requires 3–10 eligible historical outcomes from distinct non-current scopes; validate the exact current scope separately and never count it toward that minimum. Each historical sample and the separate current snapshot binds one selected exact `@codex review` parent's eight fields, exact request-time scope sidecar, and individual child exact-bot `+1`, with strict `reaction.created_at > request.request_server_time`. Both receipt-derived tuples equal the sample scope; an old-epoch request or reaction cannot be reattached. Each scope also enumerates every accepted same-scope request parent, repeats each sidecar, and fully paginates every parent's individual reactions so a newer request or cross-parent conflict cannot be hidden. The selected `+1` parent is the unique latest request by semantic time.
 - Apply the frozen as-of cutoff only after complete schema, native-ID, canonical-URL/parent-join, timestamp, and actor validation. A confirmed-different non-request issue comment created wholly after the cutoff, confirmed-different submitted review after the cutoff, or confirmed-different reaction after the cutoff remains in raw pages but may be excluded as a raw-only irrelevant suffix from the semantic projection. A controlled `@codex review` request, exact-provider or ambiguous/provider-like record, exact/ambiguous child under an otherwise excludable review, or issue comment created at or before the cutoff but edited after it remains fail-closed. Transcript v4 has no inline-child timestamp, so it cannot infer that a later reply on an in-cutoff provider review is removable suffix noise.
 - Accept the declaration only as the canonical GitHub REST issue-comment resource that the parent reads directly and re-fetches unchanged during final revalidation, with exact `user.login == "chatgpt-codex-connector[bot]"`, `user.type == "Bot"`, `performed_via_github_app.slug == "chatgpt-codex-connector"`, exact repository/PR/API-URL/HTML-URL bindings, and the exact `If Codex has suggestions, it will comment; otherwise it will react with 👍.` line. Both bounded dual-source discovery passes include its bound PR as an explicit anchor, fully traverse it, and find that exact record once. Declaration authority and terminal classification are orthogonal: the same artifact may prove the declaration and independently classify as clean, findings, or malformed. Only an independently nonterminal declaration record and the closed progress-only grammar are audit-only; a declaration-only nonterminal PR is a confirmed non-candidate. Any other exact-provider free-form prose fails closed, and in-window terminal-looking malformed prose remains a candidate. A fully parsed malformed record at or before the exclusive lower boundary remains audit-only confirmed-non-candidate evidence. Generic issuer/source fields, caller-supplied records, and self-hashed paraphrases do not qualify.

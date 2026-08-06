@@ -30877,6 +30877,28 @@ class ProviderPolicyTest(unittest.TestCase):
             ("No findings.", "claude-opus-4-8"),
         )
 
+    def test_claude_rejects_success_with_numeric_api_error_status(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "OK",
+                "modelUsage": {model: {}},
+                "api_error_status": 401,
+            }
+        ).encode()
+
+        self.assertEqual(
+            providers._claude_auth_warmup_output_shape(stdout)["event_shape"],
+            "unsupported",
+        )
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            (None, model),
+        )
+
     def test_claude_rejects_unknown_or_malformed_error_payloads(self) -> None:
         for field, value in (
             ("errors", [{"exception": "failed"}]),
@@ -31166,6 +31188,67 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(attempt.category, category)
                 self.assertEqual(attempt.reason, reason)
                 self.assertIsNone(attempt.final_text)
+
+    def test_exact_auth_accepts_verified_api_error_status(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Not logged in - please run /login",
+                "modelUsage": {model: {}},
+                "api_error_status": 401,
+            }
+        ).encode()
+
+        shape = providers._claude_auth_warmup_output_shape(stdout)
+        self.assertEqual(shape["event_shape"], "supported-result-error")
+        self.assertEqual(shape["api_error_status"], 401)
+        self.assertEqual(
+            providers._claude_supported_failure_category(
+                stdout,
+                requested_model=model,
+            ),
+            "auth",
+        )
+        attempt = self.record_claude_result(stdout, index=155)
+        self.assertEqual(attempt.category, "auth")
+        self.assertEqual(attempt.reason, "structured-authentication")
+        self.assertIsNone(attempt.final_text)
+
+    def test_exact_auth_rejects_non_401_numeric_api_error_status(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Not logged in - please run /login",
+                "modelUsage": {model: {}},
+                "api_error_status": 402,
+            }
+        ).encode()
+        stderr = b"Authentication failed"
+
+        shape = providers._claude_auth_warmup_output_shape(stdout)
+        self.assertEqual(shape["event_shape"], "supported-result-error")
+        self.assertEqual(shape["api_error_status"], 402)
+        self.assertIsNone(
+            providers._claude_supported_failure_category(
+                stdout,
+                stderr=stderr,
+                requested_model=model,
+            )
+        )
+        attempt = self.record_claude_result(
+            stdout,
+            index=156,
+            stderr=stderr,
+        )
+        self.assertEqual(attempt.category, "inconclusive")
+        self.assertEqual(attempt.reason, "unverified-auth-failure-envelope")
+        self.assertIsNone(attempt.final_text)
 
     def test_exact_auth_rejects_raw_line_breaks_before_normalization(self) -> None:
         model = providers.CLAUDE_MODELS[0]
