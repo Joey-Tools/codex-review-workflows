@@ -2569,13 +2569,6 @@ concurrency:
         self.assertIn(
             """    steps:
       - uses: actions/checkout@v4
-      - name: Require hosted-runner byte reproduction
-        env:
-          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-        run: |
-          /bin/bash \\
-            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \\
-            --check
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -2583,18 +2576,35 @@ concurrency:
             independent_job,
         )
         reconciliation_step = """      - uses: actions/setup-python@v5
+        id: setup_latest_python
+        if: always()
         with:
           python-version: "3.x"
       - name: Run platform reconciliation safety tests (Python 3.x)
+        if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
         run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
 """
+        broker_step = """      - name: Require hosted-runner byte reproduction
+        if: always()
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          /bin/bash \\
+            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \\
+            --check
+"""
         self.assertEqual(independent_job.count(reconciliation_step), 1)
+        self.assertEqual(independent_job.count(broker_step), 1)
         self.assertLess(
             independent_job.index("      - name: Verify independent review supervisor CLI\n"),
             independent_job.index(reconciliation_step),
         )
         self.assertLess(
             independent_job.index(reconciliation_step),
+            independent_job.index(broker_step),
+        )
+        self.assertLess(
+            independent_job.index(broker_step),
             independent_job.index("      - name: Require source-only Python tree\n"),
         )
 

@@ -28,6 +28,9 @@ superseded_by:
   `master` pushes.
 - Reconciliation safety remains explicit under Python `3.x` on both Linux and
   macOS without restoring a standalone macOS runner.
+- Consolidated gates use failure-independent continuations, so a compatibility
+  or supervisor failure does not suppress later reconciliation, broker, or
+  source-tree diagnostics while the job still reports failure.
 - The full macOS review and project-journal suites, independent supervisor,
   and read-only installed supervisor remain required because they exercise
   Darwin ACL, kqueue, Xcode, codesign, and Seatbelt behavior.
