@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -64,6 +65,7 @@ LOWER_FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 LEGACY_SHORT_OBJECT_PREFIX = re.compile(r"[0-9a-f]{10}\Z")
 LEGACY_PREFIX_RECEIPT_TIMEOUT_SECONDS = 120.0
 LEGACY_PREFIX_RECEIPT_OUTPUT_LIMIT_BYTES = 1024
+LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT
 LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION = "named-lane-legacy-short-prefix-receipts-v1"
 CLAUDE_ENV_PASSTHROUGH_KEYS = (
     "ALL_PROXY",
@@ -206,6 +208,8 @@ class _LegacySourcePolicyBinding:
     file_type: int
     owner: int
     mode: int
+    allowed_owners: tuple[int, ...]
+    allow_deny_acl: bool
 
 
 @dataclass(frozen=True)
@@ -222,6 +226,7 @@ class _LegacyPrefixSourceBinding:
     policy_bindings: tuple[_LegacySourcePolicyBinding, ...]
     content_bindings: tuple[_LegacySourceContentBinding, ...]
     commondir_present: bool
+    deadline_monotonic: float
 
 
 @dataclass(frozen=True)
@@ -234,6 +239,7 @@ class _LegacyPrefixViewBinding:
     head_identity: tuple[int, int, int, int]
     config_bytes: bytes
     head_bytes: bytes
+    deadline_monotonic: float
 
 
 @dataclass(frozen=True)
@@ -241,6 +247,7 @@ class _LegacyPrefixControlBinding:
     root: pathlib.Path
     root_identity: _DirectoryIdentity
     children: tuple[tuple[pathlib.Path, _DirectoryIdentity], ...]
+    deadline_monotonic: float
 
 
 @dataclass(frozen=True)
@@ -368,6 +375,310 @@ def _current_user_id() -> int:
     return int(get_effective_user_id())
 
 
+def _legacy_extended_acl_tag_types(
+    descriptor: int,
+    *,
+    label: str,
+) -> tuple[int, ...]:
+    """Return every Darwin extended-ACL entry tag from a bound descriptor."""
+
+    if sys.platform != "darwin":
+        return ()
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_get_entry = libc.acl_get_entry
+        acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        acl_get_entry.restype = ctypes.c_int
+        acl_get_tag_type = libc.acl_get_tag_type
+        acl_get_tag_type.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        acl_get_tag_type.restype = ctypes.c_int
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} extended ACL cannot be inspected"
+        ) from error
+
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(descriptor, 0x00000100)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT:
+            return ()
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} extended ACL cannot be inspected"
+        )
+    tag_types: list[int] = []
+    try:
+        entry_id = 0
+        while True:
+            entry = ctypes.c_void_p()
+            ctypes.set_errno(0)
+            entry_status = acl_get_entry(acl, entry_id, ctypes.byref(entry))
+            entry_error = ctypes.get_errno()
+            if entry_status == -1 and entry_error == errno.EINVAL:
+                break
+            if entry_status != 0 or not entry:
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} extended ACL cannot be inspected"
+                )
+            tag_type = ctypes.c_int()
+            ctypes.set_errno(0)
+            if acl_get_tag_type(entry, ctypes.byref(tag_type)) != 0:
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} extended ACL cannot be inspected"
+                )
+            tag_types.append(int(tag_type.value))
+            entry_id = -1
+    finally:
+        acl_free(acl)
+    return tuple(tag_types)
+
+
+def _require_no_legacy_extended_acl(descriptor: int, *, label: str) -> None:
+    """Reject every Darwin extended ACL on a bound filesystem object.
+
+    POSIX mode bits are an incomplete access-policy signal on macOS because an
+    NFSv4-style extended ACL can grant another principal write or delete access
+    while the ordinary mode remains owner-only.  The accepted ACL state is the
+    singleton empty state, so every bind and revalidation can reject rather
+    than serialize ACL entries into identity evidence.
+    """
+
+    if _legacy_extended_acl_tag_types(descriptor, label=label):
+        raise NamedLaneGuardError(f"legacy prefix {label} has an extended ACL")
+
+
+def _require_no_legacy_acl_allow_entry(descriptor: int, *, label: str) -> None:
+    """Reject an ACL grant on a source ancestor while tolerating deny-only ACLs."""
+
+    tag_types = _legacy_extended_acl_tag_types(descriptor, label=label)
+    if any(tag_type != 2 for tag_type in tag_types):
+        raise NamedLaneGuardError(f"legacy prefix {label} has an extended ACL grant")
+
+
+def _legacy_custody_path_metadata(
+    path: pathlib.Path,
+    *,
+    label: str,
+    allowed_owners: tuple[int, ...],
+    deadline_monotonic: float,
+) -> os.stat_result:
+    """Bind a real directory through a descriptor-relative chain from root."""
+
+    if not path.is_absolute():
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} custody path is not canonical"
+        )
+    try:
+        resolved_path = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} custody path cannot be inspected"
+        ) from error
+    if resolved_path != path:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} custody path is not canonical"
+        )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = -1
+    current_path = pathlib.Path(path.anchor)
+    try:
+        _remaining_deadline_seconds(deadline_monotonic, label)
+        descriptor = os.open(path.anchor, directory_flags)
+        components = path.parts[1:]
+        for component in (None, *components):
+            _remaining_deadline_seconds(deadline_monotonic, label)
+            if component is not None:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=descriptor,
+                )
+                try:
+                    lexical_metadata = os.stat(
+                        component,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    opened_metadata = os.fstat(child_descriptor)
+                except BaseException:
+                    os.close(child_descriptor)
+                    raise
+                lexical_identity = (
+                    lexical_metadata.st_dev,
+                    lexical_metadata.st_ino,
+                    stat.S_IFMT(lexical_metadata.st_mode),
+                    lexical_metadata.st_uid,
+                )
+                opened_identity = (
+                    opened_metadata.st_dev,
+                    opened_metadata.st_ino,
+                    stat.S_IFMT(opened_metadata.st_mode),
+                    opened_metadata.st_uid,
+                )
+                if lexical_identity != opened_identity:
+                    os.close(child_descriptor)
+                    raise NamedLaneGuardError(
+                        f"legacy prefix {label} custody edge changed"
+                    )
+                os.close(descriptor)
+                descriptor = child_descriptor
+                current_path /= component
+            metadata = os.fstat(descriptor)
+            mode = stat.S_IMODE(metadata.st_mode)
+            sticky_root_custody = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid not in allowed_owners
+            ):
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} custody access policy is unsafe"
+                )
+            if mode & 0o022 and not sticky_root_custody:
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} custody access policy is "
+                    "group/world writable"
+                )
+            _require_no_legacy_acl_allow_entry(descriptor, label=label)
+        if current_path != path:
+            raise NamedLaneGuardError(f"legacy prefix {label} custody path changed")
+        return os.fstat(descriptor)
+    except NamedLaneGuardError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} custody path cannot be inspected"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _legacy_policy_path_metadata(
+    path: pathlib.Path,
+    *,
+    expect_directory: bool,
+    label: str,
+    allowed_owners: tuple[int, ...] | None = None,
+    allow_deny_acl: bool = False,
+    deadline_monotonic: float | None = None,
+) -> os.stat_result:
+    """Bind one real path object and reject unsafe Darwin ACL policy."""
+
+    accepted_owners = allowed_owners or (_current_user_id(),)
+    if allow_deny_acl:
+        if not expect_directory:
+            raise NamedLaneGuardError(
+                f"legacy prefix {label} custody object must be a directory"
+            )
+        return _legacy_custody_path_metadata(
+            path,
+            label=label,
+            allowed_owners=accepted_owners,
+            deadline_monotonic=(
+                deadline_monotonic if deadline_monotonic is not None else float("inf")
+            ),
+        )
+
+    descriptor = -1
+    expected_type = stat.S_IFDIR if expect_directory else stat.S_IFREG
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or nonblocking is None:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} requires no-follow nonblocking inspection"
+        )
+    try:
+        lexical_metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nonblocking | no_follow
+        if expect_directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
+        opened_metadata = os.fstat(descriptor)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} access policy cannot be inspected"
+        ) from error
+    try:
+        lexical_identity = (
+            lexical_metadata.st_dev,
+            lexical_metadata.st_ino,
+            stat.S_IFMT(lexical_metadata.st_mode),
+            lexical_metadata.st_uid,
+            stat.S_IMODE(lexical_metadata.st_mode),
+        )
+        opened_identity = (
+            opened_metadata.st_dev,
+            opened_metadata.st_ino,
+            stat.S_IFMT(opened_metadata.st_mode),
+            opened_metadata.st_uid,
+            stat.S_IMODE(opened_metadata.st_mode),
+        )
+        if (
+            lexical_identity != opened_identity
+            or stat.S_IFMT(opened_metadata.st_mode) != expected_type
+            or stat.S_ISLNK(lexical_metadata.st_mode)
+            or opened_metadata.st_uid not in accepted_owners
+            or resolved != path
+        ):
+            raise NamedLaneGuardError(
+                f"legacy prefix {label} identity or access policy is unsafe"
+            )
+        _require_no_legacy_extended_acl(descriptor, label=label)
+        return opened_metadata
+    finally:
+        os.close(descriptor)
+
+
+def _verify_legacy_prefix_parent(
+    parent: pathlib.Path,
+    expected: _DirectoryIdentity,
+    deadline_monotonic: float | None = None,
+) -> None:
+    _legacy_custody_path_metadata(
+        parent,
+        label="temporary parent ancestor",
+        allowed_owners=tuple(sorted({_current_user_id(), 0})),
+        deadline_monotonic=(
+            deadline_monotonic if deadline_monotonic is not None else float("inf")
+        ),
+    )
+    _verify_materializer_parent(parent, expected)
+    metadata = _legacy_policy_path_metadata(
+        parent,
+        expect_directory=True,
+        label="temporary parent",
+    )
+    if (
+        _directory_identity(metadata) != expected
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError(
+            "legacy prefix temporary parent access policy changed"
+        )
+
+
 def _directory_identity(metadata: os.stat_result) -> _DirectoryIdentity:
     return _DirectoryIdentity(
         device=metadata.st_dev,
@@ -475,6 +786,10 @@ def _open_legacy_prefix_parent_descriptor(
             raise NamedLaneGuardError(
                 "legacy prefix temporary parent descriptor is not bound safely"
             )
+        _require_no_legacy_extended_acl(
+            descriptor,
+            label="temporary parent",
+        )
         bound = True
         return descriptor
     except NamedLaneGuardError:
@@ -1566,20 +1881,25 @@ def _bind_legacy_source_policy_path(
     path: pathlib.Path,
     *,
     expect_directory: bool,
+    allowed_owners: tuple[int, ...] | None = None,
+    allow_deny_acl: bool = False,
+    deadline_monotonic: float,
 ) -> _LegacySourcePolicyBinding:
-    try:
-        metadata = path.lstat()
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise NamedLaneGuardError(
-            "legacy prefix source access policy cannot be inspected"
-        ) from error
+    _remaining_deadline_seconds(deadline_monotonic, "legacy prefix source policy")
+    accepted_owners = allowed_owners or (_current_user_id(),)
+    metadata = _legacy_policy_path_metadata(
+        path,
+        expect_directory=expect_directory,
+        label="source path",
+        allowed_owners=accepted_owners,
+        allow_deny_acl=allow_deny_acl,
+        deadline_monotonic=deadline_monotonic,
+    )
     expected_type = stat.S_IFDIR if expect_directory else stat.S_IFREG
     if (
         stat.S_IFMT(metadata.st_mode) != expected_type
         or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != _current_user_id()
-        or resolved != path
+        or metadata.st_uid not in accepted_owners
     ):
         raise NamedLaneGuardError("legacy prefix source access policy is unsafe")
     mode = stat.S_IMODE(metadata.st_mode)
@@ -1594,19 +1914,24 @@ def _bind_legacy_source_policy_path(
         file_type=stat.S_IFMT(metadata.st_mode),
         owner=metadata.st_uid,
         mode=mode,
+        allowed_owners=accepted_owners,
+        allow_deny_acl=allow_deny_acl,
     )
 
 
 def _verify_legacy_source_policy_path(
     binding: _LegacySourcePolicyBinding,
+    deadline_monotonic: float,
 ) -> None:
-    try:
-        metadata = binding.path.lstat()
-        resolved = binding.path.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise NamedLaneGuardError(
-            "legacy prefix source access policy cannot be revalidated"
-        ) from error
+    _remaining_deadline_seconds(deadline_monotonic, "legacy prefix source policy")
+    metadata = _legacy_policy_path_metadata(
+        binding.path,
+        expect_directory=binding.file_type == stat.S_IFDIR,
+        label="source path",
+        allowed_owners=binding.allowed_owners,
+        allow_deny_acl=binding.allow_deny_acl,
+        deadline_monotonic=deadline_monotonic,
+    )
     current = (
         metadata.st_dev,
         metadata.st_ino,
@@ -1621,11 +1946,7 @@ def _verify_legacy_source_policy_path(
         binding.owner,
         binding.mode,
     )
-    if (
-        current != expected
-        or stat.S_ISLNK(metadata.st_mode)
-        or resolved != binding.path
-    ):
+    if current != expected or stat.S_ISLNK(metadata.st_mode):
         raise NamedLaneGuardError(
             "legacy prefix source identity or access policy changed"
         )
@@ -1633,6 +1954,81 @@ def _verify_legacy_source_policy_path(
         raise NamedLaneGuardError(
             "legacy prefix source access policy is group/world writable"
         )
+
+
+def _verify_legacy_object_store_access_policy(
+    storage: _MaterializerSourceStorage,
+    deadline_monotonic: float,
+) -> None:
+    """Reject unsafe modes, extended ACLs, and special objects recursively.
+
+    Prefix disambiguation observes the complete object-store namespace, not
+    only the current head closure.  Stable access-policy admission therefore
+    covers every filesystem entry that Git could consult.  Ordinary entry
+    creation/removal remains child churn and is reevaluated at each query
+    boundary; this scan is not a content snapshot or atomicity claim.
+    """
+
+    entry_count = 0
+    pending = [storage.objects]
+    while pending:
+        _remaining_deadline_seconds(
+            deadline_monotonic,
+            "legacy prefix object-store policy inventory",
+        )
+        directory = pending.pop()
+        directory_metadata = _legacy_policy_path_metadata(
+            directory,
+            expect_directory=True,
+            label="source object-store directory",
+        )
+        if stat.S_IMODE(directory_metadata.st_mode) & 0o022:
+            raise NamedLaneGuardError(
+                "legacy prefix source object-store access policy is group/world writable"
+            )
+        try:
+            with os.scandir(directory) as iterator:
+                for entry in iterator:
+                    entry_count += 1
+                    if entry_count & 0xFF == 0:
+                        _remaining_deadline_seconds(
+                            deadline_monotonic,
+                            "legacy prefix object-store policy inventory",
+                        )
+                    if entry_count > LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT:
+                        raise NamedLaneGuardError(
+                            "legacy prefix source object-store entry limit exceeded"
+                        )
+                    path = directory / entry.name
+                    try:
+                        metadata = path.lstat()
+                    except OSError as error:
+                        raise NamedLaneGuardError(
+                            "legacy prefix source object-store entry cannot be inspected"
+                        ) from error
+                    file_type = stat.S_IFMT(metadata.st_mode)
+                    if file_type == stat.S_IFDIR:
+                        pending.append(path)
+                        continue
+                    if file_type != stat.S_IFREG:
+                        raise NamedLaneGuardError(
+                            "legacy prefix source object-store contains a special entry"
+                        )
+                    bound_metadata = _legacy_policy_path_metadata(
+                        path,
+                        expect_directory=False,
+                        label="source object-store file",
+                    )
+                    if stat.S_IMODE(bound_metadata.st_mode) & 0o022:
+                        raise NamedLaneGuardError(
+                            "legacy prefix source object-store access policy is group/world writable"
+                        )
+        except NamedLaneGuardError:
+            raise
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "legacy prefix source object-store inventory cannot be inspected"
+            ) from error
 
 
 def _legacy_source_content_binding(
@@ -1667,6 +2063,7 @@ def _bind_legacy_prefix_source(
     hooks: pathlib.Path,
     *,
     timeout_seconds: float,
+    deadline_monotonic: float,
 ) -> _LegacyPrefixSourceBinding:
     _verify_materializer_source_storage(storage)
     config_payload = _read_materializer_control_file(
@@ -1696,6 +2093,7 @@ def _bind_legacy_prefix_source(
             "legacy prefix source object format changed during setup"
         )
     policy_candidates: list[tuple[pathlib.Path, bool]] = [
+        (storage.marker.path.parent.parent, True),
         (storage.marker.path.parent, True),
         (storage.marker.path, not storage.marker.is_gitfile),
         (storage.admin, True),
@@ -1736,15 +2134,46 @@ def _bind_legacy_prefix_source(
             )
         )
     policy_bindings: list[_LegacySourcePolicyBinding] = []
-    seen_paths: set[pathlib.Path] = set()
-    for path, expect_directory in policy_candidates:
-        if path in seen_paths:
+    # Git receives absolute source paths. Bind every real ancestor that keeps
+    # those paths in custody so another local UID cannot rename an unchecked
+    # linked-worktree common directory between the point revalidations. Root-
+    # owned ancestors are accepted; deny-only Darwin ACLs (for example the
+    # standard home-directory delete denial) cannot grant mutation authority.
+    custody_candidates: set[pathlib.Path] = set()
+    for path, _expect_directory in policy_candidates:
+        ancestor = path.parent
+        while True:
+            custody_candidates.add(ancestor)
+            if ancestor.parent == ancestor:
+                break
+            ancestor = ancestor.parent
+    custody_owners = tuple(sorted({_current_user_id(), 0}))
+    custody_seen_paths: set[pathlib.Path] = set()
+    for path in sorted(
+        custody_candidates, key=lambda item: (len(item.parts), str(item))
+    ):
+        if path in custody_seen_paths:
             continue
-        seen_paths.add(path)
+        custody_seen_paths.add(path)
+        policy_bindings.append(
+            _bind_legacy_source_policy_path(
+                path,
+                expect_directory=True,
+                allowed_owners=custody_owners,
+                allow_deny_acl=True,
+                deadline_monotonic=deadline_monotonic,
+            )
+        )
+    strict_seen_paths: set[pathlib.Path] = set()
+    for path, expect_directory in policy_candidates:
+        if path in strict_seen_paths:
+            continue
+        strict_seen_paths.add(path)
         policy_bindings.append(
             _bind_legacy_source_policy_path(
                 path,
                 expect_directory=expect_directory,
+                deadline_monotonic=deadline_monotonic,
             )
         )
     # Directory device/inode/type/owner protects object identity; regular-file
@@ -1756,7 +2185,9 @@ def _bind_legacy_prefix_source(
         policy_bindings=tuple(policy_bindings),
         content_bindings=tuple(content_bindings),
         commondir_present=commondir_present,
+        deadline_monotonic=deadline_monotonic,
     )
+    _verify_legacy_object_store_access_policy(storage, deadline_monotonic)
     _verify_legacy_prefix_source(binding)
     return binding
 
@@ -1765,7 +2196,10 @@ def _verify_legacy_prefix_source(binding: _LegacyPrefixSourceBinding) -> None:
     storage = binding.storage
     _verify_materializer_source_storage(storage)
     for policy_binding in binding.policy_bindings:
-        _verify_legacy_source_policy_path(policy_binding)
+        _verify_legacy_source_policy_path(
+            policy_binding,
+            binding.deadline_monotonic,
+        )
     commondir = storage.admin / "commondir"
     try:
         commondir.lstat()
@@ -1815,6 +2249,10 @@ def _verify_legacy_prefix_source(binding: _LegacyPrefixSourceBinding) -> None:
                 )
         finally:
             payload[:] = b"\x00" * len(payload)
+    _verify_legacy_object_store_access_policy(
+        storage,
+        binding.deadline_monotonic,
+    )
     _verify_materializer_source_storage(storage)
 
 
@@ -1870,6 +2308,10 @@ def _write_legacy_prefix_view_file(
             raise NamedLaneGuardError(
                 "legacy prefix Git view file could not be bound safely"
             )
+        _require_no_legacy_extended_acl(
+            descriptor,
+            label="Git view file",
+        )
         identity = _legacy_prefix_file_identity(descriptor_metadata)
     except NamedLaneGuardError:
         raise
@@ -1901,8 +2343,21 @@ def _make_legacy_prefix_view(
     object_format: str,
     parent: pathlib.Path,
     parent_identity: _DirectoryIdentity,
+    deadline_monotonic: float,
 ) -> _LegacyPrefixViewBinding:
-    _verify_materializer_parent(parent, parent_identity)
+    _verify_legacy_prefix_parent(parent, parent_identity, deadline_monotonic)
+    bound_root_metadata = _legacy_policy_path_metadata(
+        root,
+        expect_directory=True,
+        label="Git view root",
+    )
+    if (
+        _directory_identity(bound_root_metadata) != root_identity
+        or stat.S_IMODE(bound_root_metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError(
+            "legacy prefix Git view root access policy changed during setup"
+        )
     objects = root / "objects"
     refs = root / "refs"
     directory_identities: dict[str, _DirectoryIdentity] = {}
@@ -1926,6 +2381,15 @@ def _make_legacy_prefix_view(
             raise NamedLaneGuardError(
                 "legacy prefix Git view directories are not owner-private"
             )
+        bound_metadata = _legacy_policy_path_metadata(
+            path,
+            expect_directory=True,
+            label="Git view directory",
+        )
+        if _directory_identity(bound_metadata) != _directory_identity(metadata):
+            raise NamedLaneGuardError(
+                "legacy prefix Git view directory changed during setup"
+            )
         directory_identities[path.name] = _directory_identity(metadata)
     config_bytes = _legacy_prefix_view_config(object_format)
     head_bytes = b"ref: refs/heads/named-lane-empty\n"
@@ -1940,6 +2404,7 @@ def _make_legacy_prefix_view(
         head_identity=head_identity,
         config_bytes=config_bytes,
         head_bytes=head_bytes,
+        deadline_monotonic=deadline_monotonic,
     )
     _verify_legacy_prefix_view(binding, parent, parent_identity)
     return binding
@@ -1955,7 +2420,11 @@ def _verify_legacy_prefix_view_file(
         label="legacy prefix Git view file",
     )
     try:
-        metadata = path.lstat()
+        metadata = _legacy_policy_path_metadata(
+            path,
+            expect_directory=False,
+            label="Git view file",
+        )
         if (
             _legacy_prefix_file_identity(metadata) != expected_identity
             or stat.S_IMODE(metadata.st_mode) != 0o600
@@ -1982,10 +2451,18 @@ def _verify_legacy_prefix_view(
     # exact 0700/0600 modes protect its owner-only access policy; no-follow,
     # single-link identity plus exact bytes protect config/HEAD content
     # stability. Directory timestamps and link counts are not mutation evidence.
-    _verify_materializer_parent(parent, parent_identity)
+    _verify_legacy_prefix_parent(
+        parent,
+        parent_identity,
+        binding.deadline_monotonic,
+    )
     root = binding.root
     try:
-        root_metadata = root.lstat()
+        root_metadata = _legacy_policy_path_metadata(
+            root,
+            expect_directory=True,
+            label="Git view root",
+        )
         root_resolved = root.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise NamedLaneGuardError(
@@ -2019,7 +2496,11 @@ def _verify_legacy_prefix_view(
     ):
         path = root / name
         try:
-            metadata = path.lstat()
+            metadata = _legacy_policy_path_metadata(
+                path,
+                expect_directory=True,
+                label="Git view storage",
+            )
             resolved = path.resolve(strict=True)
             entries = tuple(os.scandir(path))
         except (OSError, RuntimeError) as error:
@@ -2048,7 +2529,11 @@ def _verify_legacy_prefix_view(
         binding.head_identity,
         binding.head_bytes,
     )
-    _verify_materializer_parent(parent, parent_identity)
+    _verify_legacy_prefix_parent(
+        parent,
+        parent_identity,
+        binding.deadline_monotonic,
+    )
 
 
 def _bind_legacy_prefix_control(
@@ -2057,12 +2542,28 @@ def _bind_legacy_prefix_control(
     directories: Mapping[str, pathlib.Path],
     parent: pathlib.Path,
     parent_identity: _DirectoryIdentity,
+    deadline_monotonic: float,
 ) -> _LegacyPrefixControlBinding:
+    _verify_legacy_prefix_parent(parent, parent_identity, deadline_monotonic)
+    root_metadata = _legacy_policy_path_metadata(
+        root,
+        expect_directory=True,
+        label="control root",
+    )
+    if (
+        _directory_identity(root_metadata) != root_identity
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError("legacy prefix control root access policy is unsafe")
     children: list[tuple[pathlib.Path, _DirectoryIdentity]] = []
     for name in ("home", "hooks", "template", "tmp", "xdg"):
         path = directories[name]
         try:
-            metadata = path.lstat()
+            metadata = _legacy_policy_path_metadata(
+                path,
+                expect_directory=True,
+                label="control child",
+            )
         except OSError as error:
             raise NamedLaneGuardError(
                 "legacy prefix control directory cannot be bound"
@@ -2072,6 +2573,7 @@ def _bind_legacy_prefix_control(
         root=root,
         root_identity=root_identity,
         children=tuple(children),
+        deadline_monotonic=deadline_monotonic,
     )
     _verify_legacy_prefix_control(binding, parent, parent_identity)
     return binding
@@ -2086,9 +2588,17 @@ def _verify_legacy_prefix_control(
     # exact 0700 and empty fixed inventory bind its access policy and exclude
     # attacker-selected config, hooks, templates, and cwd content. Directory
     # mtime/ctime/nlink churn is not used as mutation evidence.
-    _verify_materializer_parent(parent, parent_identity)
+    _verify_legacy_prefix_parent(
+        parent,
+        parent_identity,
+        binding.deadline_monotonic,
+    )
     try:
-        root_metadata = binding.root.lstat()
+        root_metadata = _legacy_policy_path_metadata(
+            binding.root,
+            expect_directory=True,
+            label="control root",
+        )
         root_resolved = binding.root.resolve(strict=True)
         with os.scandir(binding.root) as entries:
             root_entries = sorted(entry.name for entry in entries)
@@ -2111,7 +2621,11 @@ def _verify_legacy_prefix_control(
         )
     for path, expected_identity in binding.children:
         try:
-            metadata = path.lstat()
+            metadata = _legacy_policy_path_metadata(
+                path,
+                expect_directory=True,
+                label="control child",
+            )
             resolved = path.resolve(strict=True)
             with os.scandir(path) as entries:
                 has_entries = next(entries, None) is not None
@@ -2132,7 +2646,11 @@ def _verify_legacy_prefix_control(
             raise NamedLaneGuardError(
                 "legacy prefix control child changed during receipt generation"
             )
-    _verify_materializer_parent(parent, parent_identity)
+    _verify_legacy_prefix_parent(
+        parent,
+        parent_identity,
+        binding.deadline_monotonic,
+    )
 
 
 def _legacy_prefix_git_environment(objects: pathlib.Path) -> dict[str, str]:
@@ -2298,12 +2816,15 @@ def legacy_short_prefix_receipts(
         raise NamedLaneGuardError("legacy prefix receipt prefixes must be unique")
     sorted_prefixes = tuple(sorted(prefixes))
 
+    deadline = time.monotonic() + LEGACY_PREFIX_RECEIPT_TIMEOUT_SECONDS
     frozen_head = head_sha
+    _remaining_deadline_seconds(deadline, "legacy prefix receipt")
     resolved_source, source_marker = _resolve_materializer_source(source)
+    _remaining_deadline_seconds(deadline, "legacy prefix receipt")
     view_path, parent, parent_identity = _validate_materializer_parent(temporary_path)
     git = resolve_git()
+    _verify_legacy_prefix_parent(parent, parent_identity, deadline)
     parent_fd = _open_legacy_prefix_parent_descriptor(parent, parent_identity)
-    deadline = time.monotonic() + LEGACY_PREFIX_RECEIPT_TIMEOUT_SECONDS
     control: pathlib.Path | None = None
     directories: dict[str, pathlib.Path] | None = None
     control_identity: _DirectoryIdentity | None = None
@@ -2333,6 +2854,7 @@ def legacy_short_prefix_receipts(
                 directories,
                 parent,
                 parent_identity,
+                deadline,
             )
             control_setup_signal = consume_pending_forwarded_signal()
             if control_setup_signal is not None:
@@ -2393,6 +2915,7 @@ def legacy_short_prefix_receipts(
                 deadline,
                 "legacy prefix receipt",
             ),
+            deadline_monotonic=deadline,
         )
         _verify_legacy_prefix_control(
             control_binding,
@@ -2405,10 +2928,14 @@ def legacy_short_prefix_receipts(
                 "legacy prefix view setup requires main-thread signal masking"
             )
         try:
-            _verify_materializer_parent(parent, parent_identity)
+            _verify_legacy_prefix_parent(parent, parent_identity, deadline)
             view_path.mkdir(mode=0o700)
             view_started = True
-            view_metadata = view_path.lstat()
+            view_metadata = _legacy_policy_path_metadata(
+                view_path,
+                expect_directory=True,
+                label="Git view root",
+            )
             view_identity = _directory_identity(view_metadata)
             view_path.chmod(0o700)
             if (
@@ -2428,6 +2955,7 @@ def legacy_short_prefix_receipts(
                 source_storage.object_format,
                 parent,
                 parent_identity,
+                deadline,
             )
             view_setup_signal = consume_pending_forwarded_signal()
             if view_setup_signal is not None:

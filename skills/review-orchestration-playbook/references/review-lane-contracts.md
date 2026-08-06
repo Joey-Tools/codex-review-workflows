@@ -68,7 +68,24 @@ access policy through bounded no-follow control-file reads and repeated
 storage revalidation. Object identity is `(st_dev, st_ino, file type, st_uid)`;
 access policy is separate and rejects group/world-writable (`0o022`) source
 worktree and `.git` marker parents, bound admin/common/object directories, and
-relevant config/back-pointer files. Benign `mtime`, `ctime`, `nlink`, or
+relevant config/back-pointer files. Descriptor-relative custody revalidation
+walks complete root-to-leaf chains for the source worktree, admin, common, and
+objects directories and for the temporary parent. On Darwin, each custody
+ancestor accepts only an empty or deny-only extended ACL; any allow entry or
+unknown/uninspectable ACL is `blocked-safety`. A root-owned sticky custody
+ancestor is the only group/world-writable special case; every bound source,
+object-store, temporary-parent, control, or view leaf remains current-user-owned
+and rejects every extended ACL. Mode bits and ACL state are separate
+access-policy signals.
+The source object-store policy inventory streams one entry at a time, increments
+and checks
+`LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT`
+before metadata inspection or requesting another entry, and checks the same
+phase-global receipt deadline before each directory and every 256 entries
+without resetting it. Limit exhaustion, deadline expiry, or
+incomplete inventory inspection is `blocked-safety`. These point revalidations
+are point-in-time observations and do not claim continuous atomicity. Benign
+`mtime`, `ctime`, `nlink`, or
 object-directory child-entry churn alone is not mutation of either protected
 property. Reject suffix-DWIM or replaced control paths,
 `objects/info/alternates`, `objects/info/http-alternates`, common/admin shallow

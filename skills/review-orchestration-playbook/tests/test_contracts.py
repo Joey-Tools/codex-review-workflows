@@ -5515,6 +5515,25 @@ printf '%s\n' "$trusted_uv"
             "Source container identity/access policy and "
             "full-OID/type/ancestry ordered point-query semantics are protected",
             "continuous stability of selected loose-object or pack bytes is not",
+            "Descriptor-relative custody revalidation walks complete root-to-leaf "
+            "chains for the source worktree, admin, common, and objects directories "
+            "and for the temporary parent",
+            "each custody ancestor accepts only an empty or deny-only extended ACL",
+            "any allow entry or unknown/uninspectable ACL is `blocked-safety`",
+            "A root-owned sticky custody ancestor is the only group/world-writable "
+            "special case",
+            "every bound source, object-store, temporary-parent, control, or view "
+            "leaf remains current-user-owned and rejects every extended ACL",
+            "Mode bits and ACL state are separate access-policy signals",
+            "streams one entry at a time, increments and checks",
+            "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT",
+            "before metadata inspection or requesting another entry, and checks the "
+            "same phase-global receipt deadline before each directory and every 256 "
+            "entries without resetting it",
+            "Limit exhaustion, deadline expiry, or incomplete inventory inspection "
+            "is `blocked-safety`",
+            "These point revalidations are point-in-time observations and do not "
+            "claim continuous atomicity",
             "Same-current-UID concurrent object-store content mutation, "
             "prefix-inventory churn, and intra-phase or inter-phase ABA are not "
             "excluded",
@@ -5594,6 +5613,18 @@ printf '%s\n' "$trusted_uv"
             "prefix-inventory churn, intra-phase ABA",
             "ABA between",
             "independent initial/final invocations remain outside the claim",
+            "def _legacy_extended_acl_tag_types(",
+            "def _require_no_legacy_extended_acl(",
+            "def _require_no_legacy_acl_allow_entry(",
+            "def _legacy_custody_path_metadata(",
+            "extended ACL cannot be inspected",
+            "sticky_root_custody",
+            "def _verify_legacy_object_store_access_policy(",
+            "this scan is not a content snapshot or atomicity claim",
+            "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT",
+            "for entry in iterator:",
+            "if entry_count & 0xFF == 0:",
+            "if entry_count > LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT:",
         ):
             self.assertIn(runtime_boundary, named_lane_runtime)
         self.assertIn(
@@ -5671,6 +5702,12 @@ printf '%s\n' "$trusted_uv"
             "test_legacy_short_prefix_receipts_reject_alternates_http_shallow_and_promisor_sources",
             "test_legacy_short_prefix_receipts_reject_linked_per_worktree_shallow_source",
             "test_legacy_short_prefix_receipts_reject_group_world_writable_source_policy",
+            "test_legacy_short_prefix_receipts_reject_extended_acl_source_policy",
+            "test_legacy_short_prefix_receipts_reject_linked_common_parent_acl_grant",
+            "test_legacy_short_prefix_receipts_revalidate_extended_acl_after_query",
+            "test_legacy_short_prefix_receipts_bound_object_store_policy_inventory",
+            "test_legacy_object_store_policy_limit_precedes_next_inventory_entry",
+            "test_legacy_object_store_policy_inventory_checks_global_deadline",
             "test_legacy_short_prefix_receipts_reject_incomplete_head_object_closure",
             "test_legacy_short_prefix_receipts_ignore_source_grafts_and_replace_refs",
             "test_legacy_short_prefix_receipts_accept_unrelated_object_child_churn",

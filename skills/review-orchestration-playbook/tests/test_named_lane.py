@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import py_compile
+import pwd
 import re
 import shutil
 import signal
@@ -2434,6 +2435,284 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertEqual(payload["status"], "blocked-safety")
                 self.assertIn("group/world writable", payload["reason"])
                 self.assertFalse(temporary_path.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_reject_extended_acl_source_policy(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        objects = self.repo / ".git" / "objects"
+        loose_object = objects / base[:2] / base[2:]
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        for index, policy_path in enumerate((objects, loose_object)):
+            with self.subTest(policy_path=policy_path):
+                add_acl = subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        f"user:{username} allow write",
+                        str(policy_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if add_acl.returncode != 0:
+                    self.skipTest("filesystem does not support Darwin extended ACLs")
+                listing = subprocess.run(
+                    ["/bin/ls", "-lde", str(policy_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if listing.returncode != 0 or len(listing.stdout.splitlines()) < 2:
+                    subprocess.run(
+                        ["/bin/chmod", "-N", str(policy_path)],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                    )
+                    self.skipTest("filesystem did not retain a Darwin extended ACL")
+
+                temporary_path = self.root / f"legacy-extended-acl-source-view-{index}"
+                try:
+                    returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                        source=self.repo.resolve(),
+                        temporary_path=temporary_path,
+                        head=head,
+                        prefixes=(base[:10],),
+                    )
+                finally:
+                    subprocess.run(
+                        ["/bin/chmod", "-N", str(policy_path)],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout, "")
+                payload = json.loads(stderr)
+                self.assertEqual(payload["status"], "blocked-safety")
+                self.assertIn("extended ACL", payload["reason"])
+                self.assertFalse(temporary_path.exists())
+
+    def test_legacy_short_prefix_receipts_bound_object_store_policy_inventory(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        temporary_path = self.root / "legacy-object-policy-inventory-limit-view"
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT",
+            0,
+        ):
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=self.repo.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("object-store entry limit", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    def test_legacy_object_store_policy_limit_precedes_next_inventory_entry(
+        self,
+    ) -> None:
+        class Inventory:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __enter__(self) -> Inventory:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self) -> Inventory:
+                return self
+
+            def __next__(self) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    return mock.Mock(name="first")
+                raise AssertionError("inventory was materialized beyond its limit")
+
+        inventory = Inventory()
+        storage = mock.Mock(objects=self.repo / ".git" / "objects")
+        with (
+            mock.patch.object(named_lane_runtime.os, "scandir", return_value=inventory),
+            mock.patch.object(
+                named_lane_runtime,
+                "LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT",
+                0,
+            ),
+            self.assertRaisesRegex(NamedLaneGuardError, "entry limit"),
+        ):
+            named_lane_runtime._verify_legacy_object_store_access_policy(
+                storage,
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(inventory.calls, 1)
+
+    def test_legacy_object_store_policy_inventory_checks_global_deadline(
+        self,
+    ) -> None:
+        objects = self.root / "legacy-deadline-objects"
+        objects.mkdir(mode=0o700)
+        for index in range(256):
+            (objects / f"object-{index:03d}").write_bytes(b"object")
+        storage = mock.Mock(objects=objects)
+        checks = 0
+
+        def check_deadline(_deadline: float, _label: str) -> float:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise ReviewTimeoutError("inventory deadline expired")
+            return 10.0
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_remaining_deadline_seconds",
+                side_effect=check_deadline,
+            ),
+            self.assertRaisesRegex(ReviewTimeoutError, "deadline expired"),
+        ):
+            named_lane_runtime._verify_legacy_object_store_access_policy(
+                storage,
+                time.monotonic() + 10.0,
+            )
+        self.assertEqual(checks, 2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_reject_linked_common_parent_acl_grant(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        source_parent = self.root / "legacy-linked-source-parent"
+        source_parent.mkdir(mode=0o700)
+        linked_source = source_parent / "worktree"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        add_acl = subprocess.run(
+            [
+                "/bin/chmod",
+                "+a",
+                f"user:{username} allow write,delete,delete_child",
+                str(self.repo),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if add_acl.returncode != 0:
+            self.skipTest("filesystem does not support Darwin extended ACLs")
+        temporary_parent = self.root / "legacy-linked-safe-temporary-parent"
+        temporary_parent.mkdir(mode=0o700)
+        temporary_path = temporary_parent / "view"
+
+        try:
+            returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                source=linked_source.resolve(),
+                temporary_path=temporary_path,
+                head=head,
+                prefixes=(base[:10],),
+            )
+        finally:
+            subprocess.run(
+                ["/bin/chmod", "-N", str(self.repo)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("extended ACL grant", payload["reason"])
+        self.assertFalse(temporary_path.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_legacy_short_prefix_receipts_revalidate_extended_acl_after_query(
+        self,
+    ) -> None:
+        base, _middle, head = self.legacy_prefix_history()
+        objects = self.repo / ".git" / "objects"
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        temporary_path = self.root / "legacy-extended-acl-drift-view"
+        original_capture = named_lane_runtime.run_bounded_capture
+        mutated = False
+
+        def add_acl_after_query(argv: object, **kwargs: object) -> object:
+            nonlocal mutated
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if (
+                not mutated
+                and f"--git-dir={temporary_path}" in command
+                and "rev-parse" in command
+            ):
+                completed = subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        f"user:{username} allow write",
+                        str(objects),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError("Darwin extended ACL fixture is unavailable")
+                mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=add_acl_after_query,
+            ):
+                returncode, stdout, stderr = self.invoke_legacy_prefix_cli(
+                    source=self.repo.resolve(),
+                    temporary_path=temporary_path,
+                    head=head,
+                    prefixes=(base[:10],),
+                )
+        finally:
+            subprocess.run(
+                ["/bin/chmod", "-N", str(objects)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+        if not mutated:
+            self.skipTest("filesystem does not support Darwin extended ACLs")
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("extended ACL", payload["reason"])
+        self.assertFalse(temporary_path.exists())
 
     def test_legacy_short_prefix_receipts_revalidate_source_config_after_each_query(
         self,

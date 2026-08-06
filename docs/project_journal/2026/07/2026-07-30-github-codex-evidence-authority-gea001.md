@@ -539,7 +539,24 @@ superseded_by:
   producer does not materialize or snapshot the entire object store. Source
   container identity/access policy and full-OID/type/ancestry ordered
   point-query semantics are protected; continuous stability of selected
-  loose-object or pack bytes is not. Same-current-UID concurrent object-store
+  loose-object or pack bytes is not. Descriptor-relative custody revalidation
+  walks complete root-to-leaf chains for the source worktree, admin, common, and
+  objects directories and for the temporary parent. On Darwin, each custody
+  ancestor accepts only an empty or deny-only extended ACL; any allow entry or
+  unknown/uninspectable ACL is `blocked-safety`. A root-owned sticky custody
+  ancestor is the only group/world-writable special case; every bound source,
+  object-store, temporary-parent, control, or view leaf remains
+  current-user-owned and rejects every extended ACL. Mode bits and ACL state are
+  separate access-policy signals.
+  The source object-store policy inventory streams one entry at a time, increments
+  and checks
+  `LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT`
+  before metadata inspection or requesting another entry, and checks the same
+  phase-global receipt deadline before each directory and every 256 entries
+  without resetting it. Limit exhaustion, deadline expiry,
+  or incomplete inventory inspection is `blocked-safety`. These point
+  revalidations are point-in-time observations and do not claim continuous
+  atomicity. Same-current-UID concurrent object-store
   content mutation, prefix-inventory churn, and intra-phase or inter-phase ABA
   are not excluded. Initial/final equality is two point-in-time observations,
   not atomicity. This is also why the migration
@@ -1804,6 +1821,20 @@ lazy fetch, prompting, and commit-graph/multi-pack-index consumption are
 isolated. Direct imports, private workspace helpers, ad hoc query wrappers, and
 source-directory Git calls do not count. Cleanup completes before success, and
 semantic or safety failure returns no partial receipts.
+A second independent audit found that the first ACL correction left a P1
+custody gap above linked-worktree common storage: an ACL grant on an unchecked
+parent could authorize path replacement despite safe named leaves. The
+correction binds and point-revalidates every descriptor-relative root-to-leaf
+source/admin/common/objects and temporary-parent chain, admits only empty or
+deny-only ancestor ACLs plus the root-owned sticky mode exception, and retains
+the current-user-owned, ACL-free leaf rule. Any allow, unknown, or unreadable
+ACL is `blocked-safety`.
+The same audit found a P2 resource-bound gap because tuple-buffering `scandir`
+could exhaust memory before the entry cap, while the recursive walk did not
+periodically debit the single receipt deadline. The corrected inventory streams
+each entry, checks the shared limit before metadata inspection or another
+iteration, and checks that same non-resetting phase-global deadline before each
+directory and every 256 entries; uncertainty still returns no partial receipts.
 The terminal report retains both arrays under
 `evidence_basis.current_raw_authority.local_git_prefix_resolution_receipts`;
 a reaction report uses

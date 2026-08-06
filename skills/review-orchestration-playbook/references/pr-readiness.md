@@ -146,7 +146,23 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    materialize or snapshot the entire object store. Source container
    identity/access policy and full-OID/type/ancestry ordered point-query
    semantics are protected; continuous stability of selected loose-object or
-   pack bytes is not. Same-current-UID concurrent object-store content
+   pack bytes is not. Descriptor-relative custody revalidation walks complete
+   root-to-leaf chains for the source worktree, admin, common, and objects
+   directories and for the temporary parent. On Darwin, each custody ancestor
+   accepts only an empty or deny-only extended ACL; any allow entry or
+   unknown/uninspectable ACL is `blocked-safety`. A root-owned sticky custody
+   ancestor is the only group/world-writable special case; every bound source,
+   object-store, temporary-parent, control, or view leaf remains
+   current-user-owned and rejects every extended ACL. Mode bits and ACL state
+   are separate access-policy signals. The source object-store policy inventory
+   streams one entry at a time, increments and checks
+   `LEGACY_PREFIX_OBJECT_STORE_ENTRY_LIMIT = MATERIALIZER_OBJECT_COUNT_LIMIT`
+   before metadata inspection or requesting another entry, and checks the same
+   phase-global receipt deadline before each directory and every 256 entries
+   without resetting it. Limit exhaustion, deadline expiry,
+   or incomplete inventory inspection is `blocked-safety`. These point
+   revalidations are point-in-time observations and do not claim continuous
+   atomicity. Same-current-UID concurrent object-store content
    mutation, prefix-inventory churn, and intra-phase or inter-phase ABA are not
    excluded. Initial/final equality is two point-in-time observations, not
    atomicity. Semantic rejection is `inconclusive` with no partial receipts;
