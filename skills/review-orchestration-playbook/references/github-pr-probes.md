@@ -597,9 +597,16 @@ values directly from its pull-detail and compare receipts. Every legacy item's
 trusted semantic server time must be strictly earlier than both values in both
 passes. Whole-second equality, a later time, an unknown or malformed time or
 `Date`, a missing boundary, an invalid receipt, or an unprojectable/malformed
-legacy artifact is fail-closed evidence. The selected completion artifact must
-come from the receipt-bound normalized member; the legacy member never supplies
-clean or findings completion. Within that legacy member,
+legacy artifact is fail-closed evidence. The selected terminal-classification
+artifact must come from the receipt-bound normalized member; the legacy member
+never supplies terminal clean classification or whole-PR completion. A
+receipt-bound terminal clean supplies only artifact-level classification with
+`scope_assurance: artifact-publication-only` and
+`whole_pr_completion_action: audit-only-no-merge-ready`; receipt-bound terminal
+findings supplies only blocking negative evidence with
+`whole_pr_completion_action: block-and-report-no-whole-pr-completion`. Neither
+completes the third lane. Only a complete `thumbs-up-clean` reaction basis can
+complete the third lane. Within that legacy member,
 `clean-pending-resolution` and the exact raw-internal
 `legacy-finding-native-review-v1` role `finding` are complete audit-only
 history and do not control ordinary

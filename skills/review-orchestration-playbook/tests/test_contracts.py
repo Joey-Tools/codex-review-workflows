@@ -5699,6 +5699,32 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("zero-prefix phase", contracts)
         self.assertIn("receipts: []", contracts)
         self.assertNotIn("git cat-file -e '<sole_full_sha>^{commit}'", probes)
+        normalized_probes = " ".join(probes.split())
+        self.assertIn(
+            "The selected terminal-classification artifact must come from the "
+            "receipt-bound normalized member",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`scope_assurance: artifact-publication-only`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`whole_pr_completion_action: audit-only-no-merge-ready`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "`whole_pr_completion_action: "
+            "block-and-report-no-whole-pr-completion`",
+            normalized_probes,
+        )
+        self.assertIn(
+            "Only a complete `thumbs-up-clean` reaction basis can complete the "
+            "third lane",
+            normalized_probes,
+        )
+        self.assertNotIn("selected completion artifact", normalized_probes.lower())
+        self.assertNotIn("clean or findings completion", normalized_probes.lower())
 
         for test_pointer in (
             "test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime",
