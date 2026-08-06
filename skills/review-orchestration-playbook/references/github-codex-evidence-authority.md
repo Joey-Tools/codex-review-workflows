@@ -13,6 +13,8 @@ overriding a newer fully receipted current-head terminal result.
 This is a policy contract. It does not introduce a GitHub client, a runtime
 evaluator, or a new provider API.
 
+A legacy unreceipted artifact never becomes a selected terminal-classification basis or selected completion basis.
+
 ## Fixed Authority Baseline
 
 The decision is grounded in these immutable upstream snapshots:
@@ -79,9 +81,10 @@ result-present regression remains authoritative or why the decision changed.
 Until that comparison is recorded, this exact baseline and rationale remain
 normative.
 
-Only the provider-result authority is inherited: trustworthy provider results
-decide the outcome, while requests and run markers remain producer/audit
-evidence. The playbook's raw REST/GraphQL review-thread proof, exact whole-PR
+Only provider-result parsing authority is inherited: trustworthy provider
+results classify the artifact outcome and supply blocking negative evidence,
+while requests and run markers remain producer/audit evidence. The playbook's
+raw REST/GraphQL review-thread proof, exact whole-PR
 scope and lifecycle gates, closed terminal issue-comment carrier and edit-time
 rules, independent artifact-time whole-PR scope receipt, and conditional `+1`
 fallback are local extensions. They must not be
@@ -97,23 +100,35 @@ disclosure boundary, the closed clean lead/tagline/disclosure and native
 review/inline grammars, and independent parent-recorded initial/final resolution
 receipt evidence.
 
-### Why Result-Present Acceptance Is Deliberate
+### Why Result-Present Evidence Is Not Whole-PR Completion
 
-“Result-present acceptance” means that a complete, trustworthy current-scope
-provider result can establish the outcome without proving which request or run
-caused it. This is deliberate for three reasons:
+“Result-present evidence” means that a complete, trustworthy current-scope
+provider artifact can supply an artifact-level clean/findings classification
+without proving which request or run caused it. This is deliberately narrower
+than lane completion for three reasons:
 
 1. A provider-authored terminal payload carries the actual finding/no-findings
-   decision and commit scope; a request comment carries only intent to start.
+   decision and commit scope of that artifact; it does not authenticate the
+   provider's input merge base. A request comment carries only intent to start.
 2. GitHub review and issue-comment APIs do not expose a general request/run
-   lineage. Requiring one would turn valid results into permanent
-   `triple-inconclusive` solely because transport metadata is unavailable.
+   lineage. That absence means the current policy cannot prove positive
+   whole-PR completion from a terminal payload; it does not authorize the
+   playbook to infer the missing binding.
 3. Duplicate or mistimed requests are still actionable orchestration defects,
-   but they do not contradict what the provider reported. Keeping them in
-   `request_policy` preserves the warning without corrupting the result plane.
+   but they do not contradict what the provider reported. Keeping them
+   in `request_policy` preserves the warning without corrupting the result
+   plane.
 
-The fixed source baseline locks this choice in
-`test/gate-runner.test.mjs`. Its named regressions include
+With `scope_assurance: artifact-publication-only`, a terminal payload cannot complete triple or make the PR merge-ready.
+Under this rule, terminal findings remain blocking negative evidence even
+though terminal clean is classification-only. Positive whole-PR completion would require a
+predeclared provider-authenticated input-base or request/run/artifact binding;
+the current accepted schema set for both forms is empty. At this baseline, only the complete `thumbs-up-clean`
+reaction basis can complete the GitHub Codex lane.
+
+The fixed source baseline locks the result-present parsing choice—not positive
+whole-PR lane completion—in `test/gate-runner.test.mjs`. Its named regressions
+include
 `valid current-head clean passes without creating a review marker`,
 `current-head clean passes regardless of marker timing or deadline` (including
 `clean predates active marker`), and
@@ -122,7 +137,7 @@ conflicting trusted markers). Because the released Action files are blob-aligned
 with that source snapshot, these tests are the comparison baseline for future
 playbook changes.
 
-Result-present acceptance is not optimistic acceptance. A newer finding or
+Result-present parsing is not optimistic acceptance. A newer finding or
 malformed terminal artifact, unresolved thread, incomplete page, conflicting
 same-time channel evidence, a missing artifact-time scope
 receipt on an artifact claimed as receipt-bound authority, stale scope, or
@@ -132,7 +147,7 @@ selection is newer or equal-time; a truly malformed older legacy near-miss
 instead blocks by preventing the migration partition from closing.
 Request-sidecar-only instability
 instead closes request/reaction authority without erasing a stable terminal
-result. Likewise, request edits, request/reaction relative ordering, selected
+classification. Likewise, request edits, request/reaction relative ordering, selected
 reaction IDs, and legal reaction contents remain audited but cannot invalidate
 a complete terminal carrier; those constraints become result authority only
 for the reaction-only fallback.
@@ -140,8 +155,8 @@ An unresolved thread finding is not superseded by a later clean artifact.
 A truly absent pre-v1 receipt is the narrow legacy exception: a strictly older
 raw artifact recognized as exactly one of the two raw-internal migration
 carriers below may remain only in the closed
-`legacy_unreceipted_audit` partition. It is never positive terminal authority
-or the selected completion basis. A later accepted receipt-bound result may
+`legacy_unreceipted_audit` partition. It is never terminal-classification or
+completion authority and never becomes a selected basis. A later classified receipt-bound result may
 still have a non-null `evidence_basis` that carries the item in
 `legacy_unreceipted_artifacts`; the legacy item does not by itself veto that
 result when every legacy-migration partition, time, stability,
@@ -164,13 +179,15 @@ actually reported.
 | Plane | Inputs | Authority |
 | --- | --- | --- |
 | Request policy | Exact request comments, their server IDs and times, local-lane ordering, and complete request enumeration | Warn, wait, or forbid another request |
-| Provider result | Exact-bot terminal issue comments or pull-request reviews, associated inline comments, review-thread resolution, reactions allowed by the selected profile, and current scope | Determine `clean`, `findings`, `pending`, or `inconclusive` |
+| Provider result | Exact-bot terminal issue comments or pull-request reviews, associated inline comments, review-thread resolution, reactions allowed by the selected profile, and current scope | Classify `clean`, `findings`, `pending`, or `inconclusive`; only a complete `thumbs-up-clean` reaction basis supplies positive lane completion |
 
 A request is never itself a review result. Conversely, a producer-side request
 policy violation does not erase otherwise complete provider-authored result
-evidence. Result consumption does not require request/run attribution when the
-complete snapshot, provider identity, terminal grammar, evidence ordering, and
-current scope independently establish the result.
+evidence. Artifact classification and blocking negative-evidence consumption do
+not require request/run attribution when the complete snapshot, provider
+identity, terminal grammar, evidence ordering, and current scope independently
+establish that artifact outcome. Neither outcome supplies positive lane
+completion without a complete accepted reaction basis under the current policy.
 
 The orchestrator must still avoid creating duplicates. Before posting, it
 fully enumerates accepted requests for the exact current scope. If an accepted
@@ -207,7 +224,8 @@ request_policy:
   to classify producer timing is incomplete. It forbids a new request but does
   not independently invalidate complete provider-result evidence. If the same
   read failure also makes a required provider-evidence page incomplete, that
-  separate provider gate blocks completion.
+  separate provider gate blocks the affected classification or completion
+  path.
 - `not-applicable` is used only when no eligible request plane exists, such as
   a proved no-PR or unsupported-host/identity path.
 
@@ -356,8 +374,8 @@ continuous lifecycle attestation, or run identifier.
 
 ## Terminal-Artifact Scope Receipt
 
-Result-present acceptance removes request/run lineage as a consumer gate; it
-does not permit the current PR metadata to retroactively assign whole-PR scope
+Result-present parsing removes request/run lineage as an artifact-classification
+gate; it does not permit the current PR metadata to retroactively assign whole-PR scope
 to an older provider artifact. Every terminal-looking exact-provider artifact
 that enters the receipt-bound normalized decision member, including the
 selected clean or findings artifact and any receipt-bound malformed blocker,
@@ -458,8 +476,10 @@ as-of would conflate evidence time with observation time.
 
 The cutoff also does not cap the semantic time of a current
 `terminal-payload` or `mixed` result: such a result may arrive during the
-bounded provider wait after declaration discovery and still decide the current
-scope. The cutoff applies to historical reaction-profile samples and to the
+bounded provider wait after declaration discovery and still classify the
+current artifact outcome or supply blocking negative evidence. It cannot by
+itself complete the lane. The cutoff applies to historical reaction-profile
+samples and to the
 separately bounded current reaction-only basis used by `thumbs-up-clean`, not
 to strong current terminal evidence.
 
@@ -473,17 +493,18 @@ ledger under the fixed evidence resource profile; no receipt may create an
 unbudgeted traversal or fresh deadline inside one decision pass.
 
 The v1 contract deliberately defines **artifact-publication scope**. A
-complete receipt authorizes the artifact for the whole-PR tuple observed around
-its publication even when request history is unbound or an external narrative
+complete receipt binds the artifact to the PR tuple observed around its
+publication even when request history is unbound or an external narrative
 says provider work began under an earlier merge base. It does not attest the
-provider's internal input merge base. Only a valid same-head/different-merge-base
+provider's internal input merge base and does not prove whole-PR review or
+merge readiness. Only a valid same-head/different-merge-base
 request sidecar proves `base-changed-same-head`; a missing or malformed sidecar
 is `not-proved`, makes request policy unknown, and cannot veto an independently
-trustworthy terminal result. Requiring unavailable launch-time scope would
-restore the rejected request/run/artifact binding. A future
-provider-authenticated input-base marker governed by a predeclared provider
-profile may change this policy explicitly; inference from request timing or
-caller narrative may not.
+trustworthy terminal classification or blocking finding. Positive completion
+requires a future provider-authenticated input-base or request/run/artifact
+binding governed by a predeclared provider profile and closed schema. The
+current accepted schema set is empty; inference from request timing or caller
+narrative may not substitute.
 
 ### Legacy Receipt Migration
 
@@ -491,7 +512,7 @@ Legacy receipt migration never adopts an old artifact retroactively. A
 same-head request or terminal result observed before the parent captured the
 version-1 artifact pre-scope boundary cannot acquire
 `parent-recorded-terminal-artifact-scope-v1` authority from a later
-current-scope read. Before any migration decision can complete, derive the raw
+current-scope read. Before any migration classification can close, derive the raw
 applicable artifact set from each complete current endpoint inventory, after
 the ordinary actor, carrier, grammar, commit-applicability, inline-join, and
 thread checks plus the two migration-only legacy carrier checks below. An
@@ -506,11 +527,11 @@ raw_applicable_artifacts
 ```
 
 Here, receipt-bound normalized artifacts (normalized decision records backed
-by their own valid version-1 artifact receipt) are the only positive terminal
-authority. The legacy unreceipted audit is the closed negative/audit
-projection for exactly the two raw-internal migration carriers below; it is
-not a general home for artifacts that lack a receipt and is not another
-completion source. In particular, an ordinary current-grammar `clean` or
+by their own valid version-1 artifact receipt) are the only terminal
+classification authority. The legacy unreceipted audit is the closed
+negative/audit projection for exactly the two raw-internal migration carriers
+below; it is not a general home for artifacts that lack a receipt and is not
+another classification or completion source. In particular, an ordinary current-grammar `clean` or
 `finding` does not enter this member merely because it is unreceipted. Match
 the three sets one-to-one by exact
 `(channel, positive native id)`. Every raw applicable artifact appears exactly
@@ -700,11 +721,11 @@ unknown or malformed semantic time or `Date`, an absent boundary, an invalid
 receipt, or an unprojectable/malformed legacy artifact fails closed. A final
 current-scope read never supplies the missing earlier boundary.
 
-The legacy list is audit-only for positive authority. Recognized strictly
+The legacy list is audit-only for terminal classification and positive completion authority. Recognized strictly
 older entries do not control ordinary terminal precedence:
 
 - An old `clean-pending-resolution` marker is audit-only and can never
-  establish clean, become the selected completion basis, enter a provider
+  establish clean, become a selected terminal-classification or completion basis, enter a provider
   profile as a clean carrier, or supersede any finding.
 - An exact old `legacy-finding-native-review-v1` carrier remains audit-only
   history. Separately, an ordinary receipt-bound old top-level finding or
@@ -720,24 +741,24 @@ join, or unknown/malformed required item field likewise cannot enter the
 tolerated legacy list. Each makes the partition unproved and fails closed; do
 not hide it under an audit role.
 
-Every completed terminal clean or findings result must therefore select an
+Every classified terminal clean or findings result must therefore select an
 artifact from `receipt_bound_normalized_artifacts` and embed that artifact's
-valid receipt. No `legacy_unreceipted_audit` item may become a completion
-basis. A legacy unresolved-thread blocker instead leaves the lane
+valid receipt. No `legacy_unreceipted_audit` item may become a
+terminal-classification basis. A legacy unresolved-thread blocker instead leaves the lane
 `triple-inconclusive` and is never promoted into a receipt-bound basis. If no
 independently validated stable receipt-bound blocker basis exists, report
 literal `evidence_basis: null`; do not manufacture a basis merely to display
 the rejected legacy artifact.
 
 Preserve both complete initial and final raw endpoint inventories. For
-migration completion, their provider decision-authority projections—terminal
+migration classification, their provider decision-authority projections—terminal
 artifacts, applicable findings, joined thread state, canonical provider
 nonterminal audit records, the receipt-bound normalized member, and the closed
 legacy member—must be type-preserving identical, and the disjoint partition
 must close independently in both passes. Raw request, reaction, and
 request-sidecar bytes remain on their separate plane: preserve and reevaluate
 them, but request/reaction-only drift does not overturn an otherwise identical
-receipt-bound terminal decision. This is the same result-present boundary used
+receipt-bound terminal classification. This is the same result-present boundary used
 outside migration.
 
 Every non-null terminal-shaped `evidence_basis` exposes the single stable
@@ -778,8 +799,9 @@ There are only two recovery paths:
    evidence is unavailable. Only a later terminal artifact that strictly
    follows the recorded pre boundary, satisfies the complete version-1 artifact
    receipt and final-stability contract, closes the raw/normalized legacy
-   partition above, and wins normal terminal precedence may decide. It need not
-   be attributed to the manual request.
+   partition above, and wins normal terminal precedence may classify the
+   artifact outcome or supply blocking negative evidence. It cannot complete
+   triple. It need not be attributed to the manual request.
 
 A proved `base-changed-same-head` event is not a legacy-receipt gap and cannot
 use the manual path; only a real new head can recover that lane.
@@ -787,10 +809,11 @@ use the manual path; only a real new head can recover that lane.
 If neither path produces a newly receipted terminal artifact, or the new
 artifact is equal to the pre boundary at whole-second authority, the lane
 remains `triple-inconclusive`. This migration rule preserves result-present
-authority without weakening whole-PR publication scope or creating a hidden
-request/run/artifact join. It also preserves alignment with the fixed Action
-rationale: completion still comes from a trustworthy provider result without
-request/run attribution; request markers and audit history remain separate;
+classification authority without weakening artifact-publication scope or
+creating a hidden request/run/artifact join. It also preserves alignment with
+the fixed Action rationale: artifact classification still comes from a
+trustworthy provider result without request/run attribution; request markers
+and audit history remain separate;
 and an ordinary older top-level or resolved-thread finding may be superseded by
 a later current-head clean. Treating an unresolved provider thread as a blocker
 is the existing playbook thread-safety extension, not a request-history veto.
@@ -812,7 +835,7 @@ that no intermediate provider-state ABA occurred, and no final digest proves
 that GitHub state stayed unchanged after that digest was computed. Preserve
 both limitations in reports rather than describing the envelope as continuous
 scope or post-read stability attestation; a later observation invalidates the
-prior completion decision.
+prior terminal-classification decision.
 
 ## Terminal Artifact Precedence
 
@@ -835,7 +858,8 @@ Evaluate provider artifacts independently of request count:
    terminal-looking exact-provider artifact admitted to the receipt-bound
    normalized decision member. Validate its pre/artifact/post time envelope,
    exact artifact-time scope, and artifact body/digest/identity binding before
-   using it as positive authority. Clean and malformed evidence require the
+   using it as classification or blocking authority. Clean and malformed
+   evidence require the
    exact current scope; a finding may use the proved-ancestor head rule above.
    A missing earlier boundary cannot be manufactured by a later fetch. A
    strictly older pre-v1 artifact recognized by one of the two raw-internal
@@ -889,13 +913,13 @@ Evaluate provider artifacts independently of request count:
    below.
 9. If no trustworthy current-scope terminal payload exists, apply the selected
    provider profile. Only `thumbs-up-clean` can reach the weak `+1` fallback;
-   `mixed` still requires terminal payload for a clean result. Any later legal
+   `mixed` still requires terminal payload for a clean classification. Any later legal
    exact-provider reaction—including `+1`, `eyes`, `heart`, or `confused`—
    remains audit evidence; it does not demote, replace, or reorder an already
    selected terminal payload. Only the reaction-only fallback restricts
    semantic content to `+1` plus compatible earlier `eyes`; every other
    exact-provider reaction content makes that weaker candidate `unknown`.
-10. Perform the final re-read. Terminal clean/findings count only if scope,
+10. Perform the final re-read. Terminal clean/findings classifications count only if scope,
    lifecycle, the provider artifact/thread/finding projection, canonical
    nonterminal provider audit records, every applicable artifact-scope receipt,
    and the selected artifact are unchanged, and every raw channel remains
@@ -913,6 +937,13 @@ Evaluate provider artifacts independently of request count:
    inputs, a new independent raw final current endpoint inventory, and repeated
    parent-owned local Git ancestry receipts for every raw-derived finding
    commit; normalized snapshot equality alone is insufficient.
+
+A terminal-payload clean classification leaves the GitHub lane
+`triple-inconclusive`; it is not positive completion evidence. A terminal
+findings classification likewise leaves the lane `triple-inconclusive` and
+remains blocking negative evidence. Only the complete reaction fallback below
+can report the third lane completed under the current empty positive-binding
+schema set.
 
 An exact-App check or check run is service-start evidence only. It is not a
 terminal provider artifact and never proves clean, even when its conclusion is
@@ -1469,9 +1500,9 @@ not copy them into the raw record schema. A derived reader-facing
 be recomputable field for field from those pages.
 
 An unresolved target-thread finding is not superseded. A later clean terminal
-artifact can establish the provider's latest terminal outcome, but the lane
-and PR readiness cannot claim completed-clean while any applicable
-target-thread finding remains unresolved. Resolution on a human-only,
+artifact can classify the provider's latest terminal outcome but cannot
+complete the lane; the unresolved finding additionally blocks PR readiness.
+Resolution on a human-only,
 unrelated-bot-only, null-parent-only, or otherwise unrelated thread is audit
 context and cannot resolve a target finding.
 
@@ -1506,14 +1537,14 @@ inferred from one convenient reaction.
 
 | Profile | Meaning |
 | --- | --- |
-| `terminal-payload` | Default. Clean requires an explicit closed-grammar issue comment or review with exact commit binding. Reactions are not clean evidence. |
-| `mixed` | The provider has eligible terminal-payload and reaction-only behaviour. Terminal payload remains the only clean authority; reaction-only evidence cannot independently pass, even when no current-scope payload exists or the reaction is newer. |
+| `terminal-payload` | Default. A closed-grammar issue comment or review with exact commit binding supplies artifact-level classification and blocking negative evidence only. Reactions are not clean evidence. |
+| `mixed` | The provider has eligible terminal-payload and reaction-only behaviour. Terminal payload controls artifact classification and negative-evidence precedence only. Reaction-only evidence cannot independently pass; neither terminal payload nor reaction-only evidence can complete the lane in this profile, even when no current-scope payload exists or the reaction is newer. |
 | `thumbs-up-clean` | The provider has explicitly defined `+1` as completed-clean and the bounded eligible history proves consistent reaction-only operation with no clean payload. |
 | `unknown` | The available evidence cannot establish either terminal-payload or eligible reaction-only semantics. A reaction-only outcome remains pending or inconclusive. |
 
 The bounded history is mandatory before reaction-only clean can pass and before
 reaction behaviour can upgrade a profile to `mixed`. It is not a veto over an
-independently complete current-scope terminal artifact. If historical
+independently stable current-scope terminal classification. If historical
 provider declaration is missing, a historical traversal or pagination chain is
 incomplete, a historical endpoint or artifact ledger exceeds its budget, or
 historical request-scope sidecars are missing, malformed, or unstable, but the
@@ -1522,18 +1553,22 @@ receipts still prove a trustworthy stable terminal clean or findings payload,
 select `terminal-payload`, set affected request policy to `unknown` where
 applicable, and reject only `mixed` plus reaction-derived authority. Do not
 report `mixed` from unverifiable reaction history, and do not turn a strong
-current terminal result into `unknown` merely because the weaker adaptation
-plane failed. This exception is plane-scoped: a failed current endpoint
+current terminal classification into `unknown` merely because the weaker
+adaptation plane failed. This exception is plane-scoped: a failed current endpoint
 traversal or current artifact ledger/receipt, or any current identity, scope,
 lifecycle, thread, ancestry, grammar, selection, or final-stability failure,
 still blocks that terminal result.
+
+Do not turn a strong current terminal result into unknown merely because a
+separate historical, request, or reaction plane failed. Retain only its strict
+artifact classification and apply the whole-PR completion gate independently.
 
 Evaluate optional historical adaptation before the final current-evidence
 reread. Allocate fresh current endpoint/sidecar/artifact trackers after that
 history attempt, even if an earlier current probe already exists. Each
 inventory deadline bounds that inventory's active validation and is sealed
 when the phase completes; elapsed time spent in another inventory must not age
-out an already completed phase. Immediately before report success, recheck the
+out an already completed phase. Immediately before report finalization, recheck the
 fresh final-current deadline and require every retained phase tracker to have
 completed without failure. This ordering keeps a historical timeout from
 leaking into current authority while preserving the current final-reread gate.
@@ -2325,7 +2360,8 @@ eligible terminal-payload plus reaction-only behaviour selects `mixed`;
 reaction-only behaviour selects `thumbs-up-clean` only when every activation
 condition holds; every other case selects `unknown`. A current trustworthy
 terminal payload plus selected reaction-only history is therefore `mixed`,
-never an implementation choice between profiles.
+never an implementation choice between profiles. It remains classification or
+blocking evidence only and cannot complete the lane.
 
 ### Current Raw Provider-Evidence Authority
 
@@ -2335,8 +2371,9 @@ that the current endpoint universe was fetched or that every current/ancestor
 finding commit was checked locally. It is insufficient for terminal clean,
 terminal findings, or `+1` clean.
 
-Before accepting any current terminal clean/findings result or current
-reaction-only clean, the parent independently fetches two complete raw current
+Before classifying any current terminal clean/findings result or accepting
+current reaction-only clean, the parent independently fetches two complete raw
+current
 endpoint inventories: one initial traversal and a new final traversal
 immediately before acceptance. Each inventory has the closed endpoint shape
 `{repository, pull_number, head, resource_budget, fetches}` and may additionally
@@ -2416,7 +2453,7 @@ inventory. Request-scope sidecars remain a separate plane: their absence,
 malformation, or reread drift cannot veto a stable terminal payload, but it
 makes request policy and reaction authority `unknown`.
 
-For ordinary terminal completion, the complete raw projection must equal the
+For ordinary terminal classification, the complete raw projection must equal the
 normalized current record before terminal precedence is applied. Legacy
 receipt migration instead proves the explicit raw-to-receipt-qualified join
 `raw_applicable_artifacts = receipt_bound_normalized_artifacts ⊎
@@ -2432,8 +2469,9 @@ For reaction completion, any applicable top-level finding blocks clean, and
 any applicable target-thread finding whose raw GraphQL thread has typed
 `isResolved == false` also blocks clean. Human, unrelated-bot, null-parent,
 and unrelated-only thread state cannot contribute resolution, while a
-malformed target join still fails closed. Every accepted terminal or reaction
-`evidence_basis` embeds both independent raw current endpoint inventories and
+malformed target join still fails closed. Every classified terminal or accepted
+reaction `evidence_basis` embeds both independent raw current endpoint
+inventories and
 both parent-owned local Git ancestry-receipt arrays; external ledgers or
 normalized current snapshots do not replace them.
 
@@ -2585,7 +2623,7 @@ joint initial-final coordinator removes a scope from the stable comparison only
 when it is present in exactly one union and eligible there; a PR observed in
 both unions is retained and compared exactly.
 
-For every accepted terminal basis and stable terminal blocking basis, include
+For every classified terminal basis and stable terminal blocking basis, include
 the exact nested field
 `evidence_basis.scope_assurance: artifact-publication-only`. The artifact is
 independently trustworthy for the selected publication-time evidence scope,
@@ -2595,6 +2633,13 @@ never turns an unreceipted historical artifact into current-scope evidence.
 This closed field records the accepted trust boundary without adding
 request/run/artifact lineage. Reaction bases omit `scope_assurance`, and a
 `null` basis remains literal `null` rather than an object carrying assurance.
+
+When a non-null terminal basis carries that assurance, report its clean or
+findings outcome as `classification-only` and the GitHub lane as
+`triple-inconclusive`; it cannot satisfy merge readiness. Findings additionally
+remain a blocking negative result. Report the lane completed only for an
+accepted `thumbs-up-clean` reaction basis that satisfies every fallback
+condition.
 
 ```yaml
 request_policy:
@@ -2692,14 +2737,15 @@ fragment, replaces only the named sentinel leaves with the exact copy and raw
 response receipts, requires type-preserving equality with the generated closed
 artifact, and round-trips the complete report through the closed validator.
 
-| Lane state | `provider_profile` | `evidence_basis` |
-| --- | --- | --- |
-| Proved pre-provider ineligibility or blocker: no PR, unsupported host/identity, selected PR closed before start, or scope/lifecycle failure before provider evaluation | `null` | `null`; report the exact effective-double or blocker reason separately |
-| Eligible and waiting with no selected provider artifact | Computed profile, or `unknown` when it cannot yet be established | `null` |
-| Accepted terminal clean or findings result | `terminal-payload` or `mixed` | Selected issue comment or pull-request review plus complete initial/final raw current authority |
-| Accepted weak reaction clean | `thumbs-up-clean` | Exact accepted `+1` reaction plus its controlled request and scope; provider declaration identity/digest and every ordered historical request/reaction sample |
-| Future accepted authenticated no-start rejection after an explicit grammar policy activates it | Actually recomputed profile, normally `terminal-payload` or `mixed` | Exact `no-start-rejection` issue comment plus its controlled request and scope |
-| Inconclusive evidence | Computed profile or `unknown` | Stable blocking artifact when one exists; otherwise `null` |
+| Lane state | `provider_profile` | `evidence_basis` | Lane disposition |
+| --- | --- | --- | --- |
+| Proved pre-provider ineligibility or blocker: no PR, unsupported host/identity, selected PR closed before start, or scope/lifecycle failure before provider evaluation | `null` | `null`; report the exact effective-double or blocker reason separately | Report the exact fallback or blocker state |
+| Eligible and waiting with no selected provider artifact | Computed profile, or `unknown` when it cannot yet be established | `null` | `pending` while bounded waiting remains meaningful; otherwise `triple-inconclusive` |
+| Accepted terminal clean result | `terminal-payload` or `mixed` | Selected issue comment or pull-request review plus complete initial/final raw current authority | `classification-only`; `triple-inconclusive`; not merge-ready |
+| Accepted terminal findings result | `terminal-payload` or `mixed` | Selected issue comment or pull-request review plus complete initial/final raw current authority | `classification-only`; blocking negative evidence; `triple-inconclusive`; not merge-ready |
+| Accepted weak reaction clean | `thumbs-up-clean` | Exact accepted `+1` reaction plus its controlled request and scope; provider declaration identity/digest and every ordered historical request/reaction sample | Third lane completed; continue separate readiness gates |
+| Future accepted authenticated no-start rejection after an explicit grammar policy activates it | Actually recomputed profile, normally `terminal-payload` or `mixed` | Exact `no-start-rejection` issue comment plus its controlled request and scope | Effective-double availability evidence, never clean completion |
+| Inconclusive evidence | Computed profile or `unknown` | Stable blocking artifact when one exists; otherwise `null` | `triple-inconclusive` |
 
 An inconclusive blocking basis reuses the terminal basis shape above: `kind`
 is the carrier channel, `scope_assurance` is exactly
@@ -2724,7 +2770,7 @@ unresolved target-thread `(server_time, stable_artifact_id)` before ordinary
 terminal channel arbitration. Therefore an equal-time clean or malformed
 artifact on another channel can keep the overall verdict inconclusive without
 erasing the independently stable unresolved blocker basis. This exception
-changes only the reported blocker selection; ordinary terminal acceptance
+changes only the reported blocker selection; ordinary terminal classification
 continues to fail closed on equal-time cross-channel ambiguity.
 
 For a pull-request review, `server_time` is the exact REST `submitted_at` and
@@ -2756,7 +2802,8 @@ from each raw inventory, require the two projections to be type-preserving
 identical, and emit only their common canonical `(channel, id)`-sorted value.
 Prove that the raw applicable artifact set is exactly the disjoint union of the
 receipt-bound normalized decision projection and this list. The selected
-completion artifact must be in the receipt-bound member. Revalidate that every
+terminal-classification artifact must be in the receipt-bound member.
+Revalidate that every
 legacy semantic time is strictly earlier than both of the selected artifact
 receipt's pre-scope `Date` values; equality, later/unknown time, malformed
 projection, overlap, omission, or drift selects `triple-inconclusive`. Legacy
@@ -3158,7 +3205,7 @@ scope without changing transcript schema version 4. The parent-owned
 `current.local_git_ancestry_receipts.initial` and `.final` cover exactly those
 sets and accept only local object-check return code `0` plus ancestry return
 code `0` or `1`. The two receipt arrays and raw authority projections must be
-type-preserving identical for reaction completion. For terminal completion,
+type-preserving identical for reaction completion. For terminal classification,
 the two ancestry-receipt arrays and terminal-decision projections must be
 identical, while request-scope-sidecar metadata is excluded and reported on
 the request/reaction plane. During legacy migration, the candidate-history
@@ -3258,17 +3305,18 @@ findings. Do not reduce the basis to prose such as “Codex completed”.
 
 ## Alignment And Intentional Differences From The Fixed Action Baseline
 
-Only the provider-result authority is inherited from the fixed Action
-baseline. The stricter evidence carriers and scope gates below are deliberate
-playbook extensions and must not be “corrected” by copying the Action
-implementation mechanically:
+The inherited boundary is exact: only provider-result parsing authority is inherited from the fixed action baseline.
+It does not establish whole-PR input binding or merge readiness; the stricter evidence carriers and scope gates below are deliberate playbook extensions and must not be “corrected” by
+copying the Action implementation mechanically:
 
 1. **Whole-PR scope and lifecycle are stricter.** The Action baseline binds a
    clean artifact to the current head and validates a complete evidence
    snapshot. This playbook additionally requires exact selected-PR lifecycle,
    base OID, head OID, one local merge base, and equality with the frozen
    whole-PR range, plus the independent artifact-time scope receipt described
-   below. A base-only retarget on the same head remains
+   below. Those checks bind publication-time evidence and report scope; they do
+   not attest the provider's input base or complete the lane. A base-only
+   retarget on the same head remains
    `base-changed-same-head`.
 2. **Raw thread resolution is a playbook extension.** This playbook requires
    complete raw REST inline-comment records, complete raw GraphQL thread and
@@ -3308,15 +3356,19 @@ implementation mechanically:
 7. **Duplicate result consumption aligns with the Action; warning codes are a
    playbook extension.** Stable current-head result evidence is not rejected by
    marker or audit history in the fixed baseline. This playbook inherits that
-   consumer rule, while adding `duplicate-observed` and the producer rule that
+   parsing and negative-evidence precedence rule, while adding
+   `duplicate-observed` and the producer rule that
    the orchestrator must never create another same-scope request.
 8. **Early-result consumption aligns with the Action; local-lane sequencing is
-   a playbook extension.** The fixed baseline accepts stable clean evidence
+   a playbook extension.** The fixed baseline parses stable clean evidence
    regardless of marker timing. This playbook additionally requires local
    terminal artifacts before it sends a new GitHub request and reports
    `early-request-observed` when that producer order was violated. Do not
-   discard a later independently trustworthy provider result solely because of
-   that producer-side sequencing defect.
+   discard a later independently trustworthy provider classification or
+   blocking finding solely because of that producer-side sequencing defect.
+   Do not discard a later independently trustworthy provider result solely
+   because of that producer-side sequencing defect; retain its strict artifact
+   classification or blocking value and apply completion separately.
 9. **Bounded dual-source discovery schema version 4 is a playbook extension.**
    This playbook combines an updated-desc boundary traversal, a since-cutoff
    repository issue-comment feed, and current/declaration anchors; it traverses
@@ -3338,14 +3390,17 @@ implementation mechanically:
     scope, and fails the request/reaction planes closed when the sidecar is
     absent. It neither changes raw transcript schema version 4 nor creates
     request/run lineage, and it does not veto an independently trustworthy
-    terminal payload with its own complete artifact-time scope receipt.
+    terminal classification or blocking finding with its own complete
+    artifact-time scope receipt.
 11. **Artifact-time whole-PR receipts are a playbook extension.** Result-present
-    acceptance is inherited, but the fixed Action comparison does not prove an
+    parsing is inherited, but the fixed Action comparison does not prove an
     artifact's merge base at its semantic server time. This playbook requires
     the singular closed `parent-recorded-terminal-artifact-scope-v1` receipt
     with pre pull/compare, exact artifact GET, and post pull/compare responses.
-    The envelope binds the artifact body/digest/identity and artifact-time
-    whole-PR scope without naming a request or run. Clean and malformed
+    The envelope binds the artifact body/digest/identity to the PR tuple
+    observed around publication without naming a request or run. It neither
+    authenticates the provider's input merge base nor supplies merge readiness.
+    Clean and malformed
     evidence require the current tuple; a proved-ancestor finding preserves its
     artifact-time head while normalized `scope.head` remains current. An
     artifact that does not strictly follow every trustworthy pre observation
@@ -3377,6 +3432,8 @@ implementation mechanically:
 
 - Do not treat checks, status contexts, acknowledgements, progress comments,
   `eyes`, sticky state, deadlines, or request markers as clean results.
+- Do not treat terminal-payload clean as triple completion or merge readiness;
+  it is artifact classification only, while terminal findings remain blocking.
 - Do not weaken exact bot identity or full pagination to make a profile fit.
 - Do not use a version-3 transcript, truncated discovery union, normalized
   current snapshot, or external ancestry ledger as reaction-clean authority.
