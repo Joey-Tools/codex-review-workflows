@@ -7,7 +7,7 @@
 
 ## Recovery Pointers
 
-- Latest workstream: `docs/project_journal/2026/08/2026-08-05-claude-api-status-auth-ca401f.md`
+- Latest workstream: `docs/project_journal/2026/08/2026-08-06-private-overlay-ci-cost-pci001.md`
 
 ## Global Blockers
 

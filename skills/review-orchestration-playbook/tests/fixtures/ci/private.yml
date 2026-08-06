@@ -121,8 +121,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Run platform reconciliation safety tests
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
       - name: Check independent review supervisor syntax without bytecode
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
@@ -155,6 +153,11 @@ jobs:
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 independent-codex-pr-review --help
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
       - name: Require source-only Python tree
         if: always()
         run: |
@@ -1778,7 +1781,9 @@ jobs:
           fi
 
   python-39-compatibility:
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -1801,6 +1806,11 @@ jobs:
             tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
       - name: Require source-only Python tree
         if: always()
         run: |
@@ -1814,7 +1824,9 @@ jobs:
       - python-39-compatibility
       - independent_supervisor_tests
       - readonly_install_supervisor_tests
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - name: Require every platform test to pass
         env:

@@ -26,8 +26,8 @@ superseded_by:
 
 - The private fixture no longer repeats the complete Linux/macOS CI graph on
   `master` pushes.
-- The duplicate Linux reconciliation job is removed; the Linux full suite
-  already covers it, while the Darwin execution remains explicit on macOS.
+- Reconciliation safety remains explicit under Python `3.x` on both Linux and
+  macOS without restoring a standalone macOS runner.
 - The full macOS review and project-journal suites, independent supervisor,
   and read-only installed supervisor remain required because they exercise
   Darwin ACL, kqueue, Xcode, codesign, and Seatbelt behavior.
@@ -45,5 +45,8 @@ superseded_by:
   complete nine-job CI graph on the PR and the same-tree squash push.
 - The most recent four same-tree squash pushes repeated about 115 raw macOS
   job-minutes and 56 raw Ubuntu job-minutes in aggregate.
-- GitHub documents `ubuntu-slim` as a one-core runner intended for short
-  automation, with a 15-minute per-job limit.
+- GitHub documents `ubuntu-slim` as available to private repositories, with a
+  15-minute per-job limit:
+  <https://docs.github.com/en/actions/reference/runners/github-hosted-runners#single-cpu-runners>.
+- GitHub announced the one-vCPU Linux runner as generally available:
+  <https://github.blog/changelog/2026-01-22-1-vcpu-linux-runner-now-generally-available-in-github-actions/>.

@@ -2540,6 +2540,13 @@ concurrency:
         self.assertNotIn("\n  broker_reproducibility:\n", private)
         self.assertNotIn("\n  platform-safety:\n", private)
         self.assertEqual(private.count("    runs-on: ubuntu-slim\n"), 2)
+        self.assertEqual(
+            private.count(
+                "    # ubuntu-slim supports private repositories and caps jobs "
+                "at 15 minutes.\n"
+            ),
+            2,
+        )
 
         platform_start = private.index("  platform_tests:")
         independent_start = private.index("\n  independent_supervisor_tests:")
@@ -2572,16 +2579,43 @@ concurrency:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Run platform reconciliation safety tests
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
 """,
             independent_job,
+        )
+        reconciliation_step = """      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests (Python 3.x)
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+"""
+        self.assertEqual(independent_job.count(reconciliation_step), 1)
+        self.assertLess(
+            independent_job.index("      - name: Verify independent review supervisor CLI\n"),
+            independent_job.index(reconciliation_step),
+        )
+        self.assertLess(
+            independent_job.index(reconciliation_step),
+            independent_job.index("      - name: Require source-only Python tree\n"),
         )
 
         python_39_start = private.index("\n  python-39-compatibility:")
         test_start = private.index("\n  test:", python_39_start)
         python_39_job = private[python_39_start + 1 : test_start]
         self.assertIn("    runs-on: ubuntu-slim\n", python_39_job)
+        self.assertIn("    timeout-minutes: 15\n", python_39_job)
+        self.assertEqual(python_39_job.count(reconciliation_step), 1)
+        self.assertLess(
+            python_39_job.index("      - name: Run Python 3.9 compatibility regressions\n"),
+            python_39_job.index(reconciliation_step),
+        )
+        self.assertLess(
+            python_39_job.index(reconciliation_step),
+            python_39_job.index("      - name: Require source-only Python tree\n"),
+        )
+
+        test_job = private[test_start + 1 :]
+        self.assertIn("    runs-on: ubuntu-slim\n", test_job)
+        self.assertIn("    timeout-minutes: 15\n", test_job)
 
     def test_claude_auth_policy_files_match_distribution_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2654,7 +2688,9 @@ concurrency:
       - python-39-compatibility
       - independent_supervisor_tests
       - readonly_install_supervisor_tests
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - name: Require every platform test to pass
         env:
@@ -2816,9 +2852,23 @@ concurrency:
         self.assertIn(
             "Latest workstream: "
             "`docs/project_journal/2026/08/"
-            "2026-08-05-claude-api-status-auth-ca401f.md`",
+            "2026-08-06-private-overlay-ci-cost-pci001.md`",
             project_state,
         )
+        ci_cost_journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/08/"
+            / "2026-08-06-private-overlay-ci-cost-pci001.md"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "available to private repositories",
+            "15-minute per-job limit",
+            "https://docs.github.com/en/actions/reference/runners/"
+            "github-hosted-runners#single-cpu-runners",
+            "https://github.blog/changelog/2026-01-22-1-vcpu-linux-runner-"
+            "now-generally-available-in-github-actions/",
+        ):
+            self.assertIn(evidence, ci_cost_journal)
         for evidence in (
             "read-only installed releases",
             "untrusted `01777` ancestors",
