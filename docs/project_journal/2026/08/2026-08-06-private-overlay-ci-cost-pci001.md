@@ -26,10 +26,16 @@ superseded_by:
 
 - The private fixture no longer repeats the complete Linux/macOS CI graph on
   `master` pushes.
-- Reconciliation safety remains explicit under Python `3.x` on both Linux and
-  macOS without restoring a standalone macOS runner.
-- Consolidated gates use failure-independent continuations, so a compatibility
-  or supervisor failure does not suppress later reconciliation, broker, or
+- Reconciliation safety remains covered by the Linux full private test
+  discovery and by the explicit budgeted Python `3.x` step in the existing
+  macOS independent-supervisor job.
+- The Python 3.9 `ubuntu-slim` job retains its eight compatibility selectors
+  and failure-independent source-tree guard, but no longer invokes a second
+  nominal `python-version: "3.x"` setup step or repeats the complete
+  reconciliation-safety module. That nominal step resolved to CPython 3.9.25
+  in run `31116849182`.
+- The macOS consolidated gates use failure-independent continuations, so a
+  supervisor failure does not suppress later reconciliation, broker, or
   source-tree diagnostics while the job still reports failure.
 - A fresh-context review identified a P2 timeout-budget risk: the consolidated
   private macOS gates could consume the original 15-minute job budget before
@@ -43,6 +49,13 @@ superseded_by:
   Darwin ACL, kqueue, Xcode, codesign, and Seatbelt behavior.
 - The compatibility-status workflow uses `ubuntu-slim` for its bounded GitHub
   API-only jobs, with its reviewed fixture kept byte-identical.
+- The removed Linux repetition was redundant: `platform_tests` already runs
+  `python3 -m unittest discover -s tests` on Ubuntu, while the independent
+  macOS job intentionally retains its two-minute reconciliation budget.
+- A follow-up fresh-context review found that the initial deduplication
+  contract pinned only two of the eight Python 3.9 selectors. The contract now
+  compares the complete step byte-for-byte and requires exactly eight selector
+  lines, so removing or adding a compatibility case cannot pass silently.
 
 ## Next Steps
 
@@ -56,6 +69,19 @@ superseded_by:
 - In run `31074970581`, the independent supervisor took 5m48s, broker
   reproduction took 24s, and macOS reconciliation took 45s, for about 6m57s
   combined.
+- Private PR #153 run `31116849182` passed all eight Python 3.9 selectors, then
+  the duplicate full reconciliation module ran 305 tests and reported 18
+  failing cases (16 failures and 2 errors, with 1 skipped) because its `/tmp`
+  fixtures and the workspace were on different devices. Removing that repeat
+  avoids the cross-device-only failure without reducing Linux or macOS suite
+  coverage.
+- The independent-supervisor job in the same run failed while Actions was
+  downloading an action with `Service Unavailable`, before repository steps
+  ran; that is infrastructure evidence and requires no code change here.
+- Fresh-context review of `77531f0c..35b84e8d` reported one P2 contract gap:
+  the workflow retained eight compatibility selectors, but the source test
+  explicitly bound only the two reconciliation selectors. The follow-up test
+  fix binds the full command block and its exact selector count.
 - The 20-minute job budget leaves about 13m03s of headroom against that
   observed combined runtime. The 10/2/2/2-minute step caps bound the longest
   merged gates and retain practical margin for later failure-independent
