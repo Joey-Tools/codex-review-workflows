@@ -44799,6 +44799,11 @@ printf '%s\n' "$trusted_uv"
         }
         if CI_PROFILE == "canonical":
             documents["README"] = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            documents["WME journal"] = (
+                REPO_ROOT
+                / "docs/project_journal/2026/08/"
+                / "2026-08-07-large-repo-range-materialization-wme001.md"
+            ).read_text(encoding="utf-8")
 
         for name, content in documents.items():
             with self.subTest(document=name):
@@ -44826,6 +44831,7 @@ printf '%s\n' "$trusted_uv"
             "`GIT_CONFIG_NOSYSTEM=1`",
             "`GIT_CONFIG_GLOBAL=/dev/null`",
             "`GIT_CONFIG_SYSTEM=/dev/null`",
+            "`GIT_GRAFT_FILE=/dev/null`",
             "`GIT_ATTR_NOSYSTEM=1`",
             "`GIT_CEILING_DIRECTORIES=<destination-parent>`",
             "`GIT_NO_LAZY_FETCH=1`",
@@ -44833,8 +44839,11 @@ printf '%s\n' "$trusted_uv"
             "`GIT_TERMINAL_PROMPT=0`",
             "-c core.hooksPath=<empty-private-hooks>",
             "-c core.commitGraph=false",
+            "-c core.checkStat=default",
             "-c core.multiPackIndex=false",
             "-c core.fsmonitor=false",
+            "-c core.ignoreStat=false",
+            "-c core.trustCtime=true",
             "-c core.attributesFile=/dev/null",
             "-c submodule.recurse=false",
             "pack-objects --stdout --no-reuse-delta --no-reuse-object",
@@ -44843,12 +44852,17 @@ printf '%s\n' "$trusted_uv"
             "exact `.git` marker",
             "bounded full object-validity `git fsck`",
             "no `commondir`, `config.worktree`, per-worktree config",
+            "owner-private real `.git/info` directory at exact mode `0700`",
+            "`info/grafts`",
             "executable clean/smudge/process filter",
             "Pack ownership is signal-atomic",
             "must equal the source's `--ancestry-path` projection",
             "250,000 parent-edge occurrences",
             "(commit_count + 250,000) * (object-id-width + 1)",
-            "`commit_count` and `parent_edge_count`",
+            "`commit_count`, `parent_edge_count`, `parent_graph_sha256`",
+            "`parent_graph_sha256`",
+            "`local_config_sha256`",
+            "type-preserving exact equality for all seven fields",
             "The guard's forced ordinary/staged status is the first status query",
             "recorded device, inode, and owner",
         ):
@@ -44917,6 +44931,34 @@ printf '%s\n' "$trusted_uv"
                 self.assertIn("parent-edge", content)
                 self.assertIn("commit_count", content)
                 self.assertIn("parent_edge_count", content)
+                self.assertIn("parent_graph_sha256", content)
+                self.assertIn("local_config_sha256", content)
+
+        for name, content in {
+            "lane contracts": contracts,
+            "Claude lane": claude,
+            "prompt templates": templates,
+            "PR readiness": readiness,
+            "repository policy": repository_policy,
+        }.items():
+            with self.subTest(control_binding_contract=name):
+                self.assertIn("config.worktree", content)
+                self.assertIn("info/grafts", content)
+                self.assertIn("GIT_GRAFT_FILE", content)
+                self.assertIn("core.checkStat=default", content)
+                self.assertIn("core.ignoreStat=false", content)
+                self.assertIn("core.trustCtime=true", content)
+
+        if CI_PROFILE == "canonical":
+            readme = documents["README"]
+            journal = documents["WME journal"]
+            for content in (readme, journal):
+                self.assertIn("parent_graph_sha256", content)
+                self.assertIn("local_config_sha256", content)
+                self.assertIn("GIT_GRAFT_FILE=/dev/null", content)
+                self.assertIn("core.checkStat=default", content)
+                self.assertIn("core.ignoreStat=false", content)
+                self.assertIn("core.trustCtime=true", content)
 
         self.assertIn("never use `git worktree add`", shared)
         self.assertIn("never loaded by Git", shared)
@@ -44931,6 +44973,128 @@ printf '%s\n' "$trusted_uv"
             "Before launch, require `git status --porcelain`",
             contracts,
         )
+
+    def test_named_lane_formal_controls_and_receipts_are_tamper_bound(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+        runtime_tests = (SKILL_ROOT / "tests/test_named_lane.py").read_text(
+            encoding="utf-8"
+        )
+
+        def function_body(name: str) -> str:
+            return runtime.split(f"def {name}(", 1)[1].split("\ndef ", 1)[0]
+
+        for function_name in (
+            "_git_capture",
+            "_materializer_git_prefix",
+            "_parse_direct_local_config",
+        ):
+            with self.subTest(stat_safe_prefix=function_name):
+                body = function_body(function_name)
+                for setting in (
+                    "core.checkStat=default",
+                    "core.ignoreStat=false",
+                    "core.trustCtime=true",
+                ):
+                    self.assertIn(setting, body)
+
+        self.assertGreaterEqual(runtime.count('"GIT_GRAFT_FILE": os.devnull'), 2)
+        direct_config_audit = function_body("_audit_direct_local_config")
+        for key in (
+            'b"core.checkstat"',
+            'b"core.ignorestat"',
+            'b"core.trustctime"',
+        ):
+            self.assertIn(key, direct_config_audit)
+        self.assertIn("key.lower() in forbidden_stat_keys", direct_config_audit)
+        self.assertIn(
+            "direct core.checkStat, core.trustCtime, and core.ignoreStat settings",
+            direct_config_audit,
+        )
+
+        self.assertNotIn("allow_worktree_config", runtime)
+        self.assertIn('worktree_config = git_directory / "config.worktree"', runtime)
+        self.assertIn(
+            "materialized per-worktree Git config is not allowed",
+            runtime,
+        )
+
+        info_binding = runtime.split("class _GitInfoBinding:", 1)[1].split(
+            "@dataclass", 1
+        )[0]
+        for field in ("device", "inode", "file_type", "owner", "mode"):
+            self.assertIn(f"{field}:", info_binding)
+        for excluded_field in ("mtime", "ctime", "link_count", "size"):
+            self.assertNotIn(f"{excluded_field}:", info_binding)
+
+        info_guard = function_body("_bind_materialized_git_info")
+        for anchor in (
+            "stat.S_IMODE(opened.st_mode) != 0o700",
+            "_require_no_legacy_extended_acl(",
+            'os.stat("grafts", dir_fd=descriptor, follow_symlinks=False)',
+            "binding != expected",
+        ):
+            self.assertIn(anchor, info_guard)
+
+        parent_graph = function_body("_parse_parent_graph")
+        for anchor in (
+            'digest.update(b"named-lane-parent-graph-v1\\0")',
+            'digest.update(str(oid_length).encode("ascii"))',
+            "for commit, parents in sorted(parents_by_commit.items()):",
+            "for parent in parents:",
+        ):
+            self.assertIn(anchor, parent_graph)
+
+        self.assertEqual(runtime.count('"worktree": str(result.root)'), 2)
+        self.assertEqual(
+            runtime.count('"parent_graph_sha256": result.parent_graph_sha256'),
+            2,
+        )
+        self.assertEqual(
+            runtime.count('"local_config_sha256": result.local_config_sha256'),
+            2,
+        )
+
+        normalized_contracts = " ".join(contracts.split())
+        self.assertIn(
+            "bind `.git/config` object identity and access policy",
+            normalized_contracts,
+        )
+        self.assertIn(
+            "digest equality protects config content",
+            normalized_contracts,
+        )
+        self.assertIn(
+            "a metadata delta is not itself a content mutation finding",
+            normalized_contracts,
+        )
+        self.assertIn(
+            "must not snapshot or rehash the full ordinary-file tree",
+            normalized_contracts,
+        )
+        for document in (skill, canonical):
+            self.assertIn("local_config_sha256", document)
+            self.assertIn("parent_graph_sha256", document)
+            self.assertIn("GIT_GRAFT_FILE=/dev/null", document)
+
+        for test_pointer in (
+            "test_parent_graph_digest_preserves_merge_parent_order",
+            "test_validate_worktree_cli_requires_base_and_receipts_frozen_range",
+            "test_validator_rejects_any_config_worktree_before_repository_query",
+            "test_validator_rejects_direct_stat_weakening_before_repository_query",
+            "test_validator_rejects_target_graft_before_topology_query",
+            "test_materializer_rejects_graft_injected_before_topology_import",
+            "test_materializer_cli_receipt_commits_a_signal_during_emit",
+        ):
+            self.assertIn(test_pointer, runtime_tests)
 
     def test_named_lane_source_marker_bitmap_and_path_envelope_contracts(
         self,
@@ -47720,6 +47884,10 @@ printf '%s\n' "$trusted_uv"
             self.assertIn("safe `-c` flags", content)
             self.assertIn("-C", content)
             self.assertIn("--no-ext-diff --no-textconv", content)
+            self.assertIn("GIT_GRAFT_FILE", content)
+            self.assertIn("core.checkStat=default", content)
+            self.assertIn("core.ignoreStat=false", content)
+            self.assertIn("core.trustCtime=true", content)
         self.assertIn("never run bare `git`", reviewer)
         self.assertIn("forbid bare `git`", templates)
         self.assertIn("another worktree are forbidden", skill)
@@ -47738,6 +47906,7 @@ printf '%s\n' "$trusted_uv"
             "`GIT_CONFIG_GLOBAL=/dev/null`",
             "`GIT_CONFIG_SYSTEM=/dev/null`",
             "`GIT_CONFIG_NOSYSTEM=1`",
+            "`GIT_GRAFT_FILE=/dev/null`",
             "`GIT_NO_LAZY_FETCH=1`",
             "`GIT_TERMINAL_PROMPT=0`",
             "`GIT_NO_REPLACE_OBJECTS=1`",
@@ -47746,8 +47915,11 @@ printf '%s\n' "$trusted_uv"
             "`GIT_PAGER=cat`",
             "`--no-pager",
             "core.commitGraph=false",
+            "core.checkStat=default",
             "core.multiPackIndex=false",
             "core.fsmonitor=false",
+            "core.ignoreStat=false",
+            "core.trustCtime=true",
             "core.fileMode=true",
             "core.hooksPath=/dev/null",
             "core.attributesFile=/dev/null",
@@ -47791,6 +47963,9 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("forces `core.fileMode=true`", contracts)
         self.assertIn("forces `core.commitGraph=false`", contracts)
         self.assertIn("`core.multiPackIndex=false`", contracts)
+        self.assertIn("`core.checkStat=default`", contracts)
+        self.assertIn("`core.ignoreStat=false`", contracts)
+        self.assertIn("`core.trustCtime=true`", contracts)
         self.assertIn("`diff.external`", contracts)
         self.assertIn("`diff.<driver>.command`", contracts)
         self.assertIn("`diff.<driver>.textconv`", contracts)
@@ -47809,8 +47984,17 @@ printf '%s\n' "$trusted_uv"
             "_match_submodule_active_pathspecs",
             '"core.fileMode=true"',
             '"core.commitGraph=false"',
+            '"core.checkStat=default"',
             '"core.multiPackIndex=false"',
+            '"core.ignoreStat=false"',
+            '"core.trustCtime=true"',
+            '"GIT_GRAFT_FILE": os.devnull',
+            'git_directory / "config.worktree"',
+            "_bind_materialized_git_info",
+            "parent_graph_sha256",
+            "local_config_sha256",
             "_validate_executable_git_config",
+            "_revalidate_materialized_controls",
             "_validate_materialized_gitlink",
             "_status_has_disallowed_changes",
         ):
@@ -47834,9 +48018,21 @@ printf '%s\n' "$trusted_uv"
         )
         self.assertIn("Keep the guard property-scoped", contracts)
         self.assertIn("must not treat `mtime`, `ctime`", contracts)
-        self.assertIn("must not snapshot or rehash ordinary file contents", contracts)
-        self.assertIn("does not compare `mtime`/`ctime`", canonical)
-        self.assertIn("or snapshot ordinary file contents", canonical)
+        self.assertIn(
+            "must not snapshot or rehash the full ordinary-file tree",
+            contracts,
+        )
+        self.assertIn("identity/content/access policy", contracts)
+        self.assertIn("Git stat signals", contracts)
+        self.assertIn(
+            "a metadata delta is not itself a content mutation finding",
+            contracts,
+        )
+        self.assertIn("Git stat signals may cause a content reread", canonical)
+        self.assertIn(
+            "no full ordinary-file tree content snapshot or rehash is performed",
+            canonical,
+        )
         for overstrict_implementation in (
             "st_mtime",
             "st_ctime",
@@ -47867,16 +48063,13 @@ printf '%s\n' "$trusted_uv"
             self.assertIn("reviewer Git", content)
         self.assertIn("A built-in daemon (`true`)", contracts)
         self.assertIn("a no-value declaration", contracts)
-        self.assertIn(
-            "direct local/per-worktree precedence remains effective", contracts
-        )
+        self.assertIn("A formal lane has no `.git/config.worktree`", contracts)
         self.assertNotIn("effective included `core.fsmonitor`", contracts)
         self.assertNotIn("an earlier included path overridden by a later", contracts)
         for anchor in (
             "_validate_core_fsmonitor_config",
+            "_validate_core_fsmonitor_config(records)",
             '"core.fsmonitor=false"',
-            "neutralize_fsmonitor=False",
-            '"config", "--no-includes", "--null", "--get", "core.fsmonitor"',
         ):
             self.assertIn(anchor, runtime)
 
@@ -47915,6 +48108,7 @@ printf '%s\n' "$trusted_uv"
             "GIT_NO_REPLACE_OBJECTS=1",
             "GIT_CONFIG_GLOBAL=/dev/null",
             "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_GRAFT_FILE=/dev/null",
             "GIT_OPTIONAL_LOCKS=0",
             "GIT_ASKPASS=/usr/bin/false",
             "GIT_ATTR_NOSYSTEM=1",
@@ -47940,6 +48134,7 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("(st_dev, st_ino)", canonical)
 
         self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
+        self.assertIn('"GIT_GRAFT_FILE": os.devnull', runtime)
         self.assertIn("pwd.getpwuid(os.getuid())", runtime)
         self.assertIn(
             "env=_claude_environment(root, inherit_node_extra_ca_certs)",

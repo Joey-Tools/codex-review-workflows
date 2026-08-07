@@ -108,6 +108,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         return git(self.repo, "rev-parse", "HEAD")
 
     def bind_formal_validator_range(self, base: str, head: str) -> None:
+        info = self.repo / ".git" / "info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        info.chmod(0o700)
         for ref_name, object_id in (
             (MATERIALIZER_BASE_REF, base),
             (MATERIALIZER_HEAD_REF, head),
@@ -3310,6 +3313,14 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertEqual(counts.commit_count, 2)
         self.assertEqual(counts.parent_edge_count, 2)
+        canonical = (
+            b"named-lane-parent-graph-v1\0"
+            b"40\0" + base + b"\0\n" + head + b"\0" + base + b"\0" + base + b"\0\n"
+        )
+        self.assertEqual(
+            counts.parent_graph_sha256,
+            hashlib.sha256(canonical).hexdigest(),
+        )
         with (
             mock.patch.object(
                 named_lane_runtime,
@@ -3329,6 +3340,37 @@ class NamedLaneGuardTest(unittest.TestCase):
                 label="test parent graph",
                 scope_mismatch_message="scope mismatch",
             )
+
+    def test_parent_graph_digest_preserves_merge_parent_order(self) -> None:
+        base = b"1" * 40
+        left = b"2" * 40
+        right = b"3" * 40
+        head = b"4" * 40
+        expected_commits = frozenset((base, left, right, head))
+        common_rows = left + b" " + base + b"\n" + right + b" " + base + b"\n"
+        left_right = named_lane_runtime._parse_parent_graph(
+            head + b" " + left + b" " + right + b"\n" + common_rows + base + b"\n",
+            expected_commits,
+            base,
+            40,
+            label="left-right graph",
+            scope_mismatch_message="scope mismatch",
+        )
+        right_left = named_lane_runtime._parse_parent_graph(
+            base + b"\n" + common_rows + head + b" " + right + b" " + left + b"\n",
+            expected_commits,
+            base,
+            40,
+            label="right-left graph",
+            scope_mismatch_message="scope mismatch",
+        )
+
+        self.assertEqual(left_right.commit_count, right_left.commit_count)
+        self.assertEqual(left_right.parent_edge_count, right_left.parent_edge_count)
+        self.assertNotEqual(
+            left_right.parent_graph_sha256,
+            right_left.parent_graph_sha256,
+        )
 
     def test_small_merge_parent_edge_budget_is_shared_and_fails_before_pack(
         self,
@@ -3377,6 +3419,16 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(materialized.parent_edge_count, 4)
         self.assertEqual(validated.commit_count, 4)
         self.assertEqual(validated.parent_edge_count, 4)
+        self.assertEqual(
+            materialized.parent_graph_sha256,
+            validated.parent_graph_sha256,
+        )
+        self.assertEqual(
+            materialized.local_config_sha256,
+            validated.local_config_sha256,
+        )
+        self.assertRegex(materialized.parent_graph_sha256, r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(materialized.local_config_sha256, r"\A[0-9a-f]{64}\Z")
         parent_calls = [
             call
             for call in capture.call_args_list
@@ -3474,6 +3526,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(result.head_sha, head)
         self.assertEqual(result.commit_count, 2)
         self.assertEqual(result.parent_edge_count, 1)
+        self.assertRegex(result.parent_graph_sha256, r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(result.local_config_sha256, r"\A[0-9a-f]{64}\Z")
         self.assertEqual(git(destination, "rev-parse", "HEAD"), head)
         self.assertEqual(
             git(destination, "rev-parse", MATERIALIZER_BASE_REF),
@@ -3556,6 +3610,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(validated.head_sha, head)
         self.assertEqual(validated.commit_count, 2)
         self.assertEqual(validated.parent_edge_count, 1)
+        self.assertEqual(result.parent_graph_sha256, validated.parent_graph_sha256)
+        self.assertEqual(result.local_config_sha256, validated.local_config_sha256)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
         self.assertEqual(
             list(self.root.glob(".named-lane-materializer-*")),
@@ -3568,8 +3624,14 @@ class NamedLaneGuardTest(unittest.TestCase):
             if command[-1:] != ("--version",):
                 commit_graph_index = command.index("core.commitGraph=false")
                 self.assertEqual(command[commit_graph_index - 1], "-c")
+                check_stat_index = command.index("core.checkStat=default")
+                self.assertEqual(command[check_stat_index - 1], "-c")
+                ignore_stat_index = command.index("core.ignoreStat=false")
+                self.assertEqual(command[ignore_stat_index - 1], "-c")
                 multi_pack_index = command.index("core.multiPackIndex=false")
                 self.assertEqual(command[multi_pack_index - 1], "-c")
+                trust_ctime_index = command.index("core.trustCtime=true")
+                self.assertEqual(command[trust_ctime_index - 1], "-c")
         for forbidden in ("clone", "fetch", "upload-pack"):
             self.assertFalse(any(forbidden in command for command in commands))
         init = next(command for command in commands if "init" in command)
@@ -3613,6 +3675,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "GIT_CONFIG_GLOBAL",
                 "GIT_CONFIG_NOSYSTEM",
                 "GIT_CONFIG_SYSTEM",
+                "GIT_GRAFT_FILE",
                 "GIT_NO_LAZY_FETCH",
                 "GIT_NO_REPLACE_OBJECTS",
                 "GIT_OPTIONAL_LOCKS",
@@ -3634,6 +3697,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(init_environment["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(init_environment["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(init_environment["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(init_environment["GIT_GRAFT_FILE"], os.devnull)
         self.assertEqual(init_environment["GIT_ATTR_NOSYSTEM"], "1")
         self.assertEqual(init_environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(init_environment["GIT_NO_REPLACE_OBJECTS"], "1")
@@ -4770,8 +4834,14 @@ class NamedLaneGuardTest(unittest.TestCase):
         for command in validator_commands:
             commit_graph_index = command.index("core.commitGraph=false")
             self.assertEqual(command[commit_graph_index - 1], "-c")
+            check_stat_index = command.index("core.checkStat=default")
+            self.assertEqual(command[check_stat_index - 1], "-c")
+            ignore_stat_index = command.index("core.ignoreStat=false")
+            self.assertEqual(command[ignore_stat_index - 1], "-c")
             multi_pack_index = command.index("core.multiPackIndex=false")
             self.assertEqual(command[multi_pack_index - 1], "-c")
+            trust_ctime_index = command.index("core.trustCtime=true")
+            self.assertEqual(command[trust_ctime_index - 1], "-c")
         first_status_index = next(
             index
             for index, command in enumerate(validator_commands)
@@ -4910,7 +4980,12 @@ class NamedLaneGuardTest(unittest.TestCase):
         (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
         head = self.commit("head")
         destination = self.root / "formal-cli-range"
-        materialize_worktree(self.repo.resolve(), destination, base, head)
+        materialized = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            base,
+            head,
+        )
 
         missing_base_stderr = io.StringIO()
         with (
@@ -4945,47 +5020,361 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertEqual(returncode, 0)
         receipt = json.loads(stdout.getvalue())
-        self.assertEqual(receipt["base"], base)
-        self.assertEqual(receipt["head"], head)
-        self.assertEqual(receipt["commit_count"], 2)
-        self.assertEqual(receipt["parent_edge_count"], 1)
+        self.assertEqual(
+            receipt,
+            {
+                "status": "ok",
+                "worktree": str(destination),
+                "base": base,
+                "head": head,
+                "commit_count": 2,
+                "parent_edge_count": 1,
+                "parent_graph_sha256": materialized.parent_graph_sha256,
+                "local_config_sha256": materialized.local_config_sha256,
+                "symlink_count": 0,
+                "guidance_count": 1,
+            },
+        )
 
     def test_validator_fences_a_nonrepository_from_its_ancestor(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit("ancestor")
         nested = self.repo / "not-a-worktree"
         nested.mkdir(mode=0o700)
-        original_capture = named_lane_runtime.run_bounded_capture
-        observed_returncode: int | None = None
-        observed_environment: dict[str, str] | None = None
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_git_capture",
+                wraps=named_lane_runtime._git_capture,
+            ) as capture,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not have a private Git directory",
+            ),
+        ):
+            validate_worktree(nested.resolve(), head, head)
 
-        def observe_probe(argv: object, **kwargs: object) -> object:
-            nonlocal observed_returncode, observed_environment
-            command = tuple(argv)
+        capture.assert_not_called()
+
+    def test_validator_rejects_any_config_worktree_before_repository_query(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "config-worktree-lane"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        (destination / ".git" / "config.worktree").write_text(
+            "[core]\n\tfsmonitor = false\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_git_capture",
+                wraps=named_lane_runtime._git_capture,
+            ) as capture,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "per-worktree Git config is not allowed",
+            ),
+        ):
+            validate_worktree(destination, head, head)
+
+        capture.assert_not_called()
+
+    def test_validator_rejects_direct_stat_weakening_before_repository_query(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        for index, (key, value) in enumerate(
+            (
+                ("core.checkStat", "minimal"),
+                ("core.trustCtime", "false"),
+                ("core.ignoreStat", "true"),
+            )
+        ):
+            with self.subTest(key=key):
+                destination = self.root / f"unsafe-stat-{index}"
+                materialize_worktree(self.repo.resolve(), destination, head, head)
+                git(destination, "config", key, value)
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_git_capture",
+                        wraps=named_lane_runtime._git_capture,
+                    ) as capture,
+                    self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "direct core.checkStat, core.trustCtime, and core.ignoreStat",
+                    ),
+                ):
+                    validate_worktree(destination, head, head)
+                capture.assert_not_called()
+
+    def test_validator_rejects_target_graft_before_topology_query(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "grafted-lane"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        (destination / ".git" / "info" / "grafts").write_text(
+            f"{head}\n",
+            encoding="ascii",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_git_capture",
+                wraps=named_lane_runtime._git_capture,
+            ) as capture,
+            self.assertRaisesRegex(NamedLaneGuardError, "graft state is not allowed"),
+        ):
+            validate_worktree(destination, head, head)
+
+        capture.assert_not_called()
+
+    def test_materializer_rejects_graft_injected_before_topology_import(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "materializer-graft-lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+        injected = False
+        commands_after_injection: list[tuple[str, ...]] = []
+
+        def inject_graft(argv: object, **kwargs: object) -> object:
+            nonlocal injected
+            command = tuple(str(item) for item in argv)
             result = original_capture(command, **kwargs)
-            if "--show-toplevel" in command:
-                observed_returncode = result.returncode
-                observed_environment = dict(kwargs["env"])
+            if injected:
+                commands_after_injection.append(command)
+            elif (
+                destination.exists()
+                and (destination / ".git" / "info").is_dir()
+                and "config" in command
+                and "--file" in command
+                and "-" in command
+                and "--list" in command
+            ):
+                (destination / ".git" / "info" / "grafts").write_text(
+                    f"{head}\n",
+                    encoding="ascii",
+                )
+                injected = True
             return result
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=inject_graft,
+            ),
+            self.assertRaisesRegex(NamedLaneGuardError, "graft state is not allowed"),
+        ):
+            materialize_worktree(self.repo.resolve(), destination, head, head)
+
+        self.assertTrue(injected)
+        self.assertFalse(destination.exists())
+        for command in commands_after_injection:
+            self.assertTrue(
+                {"rev-list", "merge-base", "pack-objects"}.isdisjoint(command)
+            )
+
+    def test_validator_rejects_non_private_git_info_mode(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "info-mode-lane"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        (destination / ".git" / "info").chmod(0o755)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_git_capture",
+                wraps=named_lane_runtime._git_capture,
+            ) as capture,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "info directory must be an owner-private real directory",
+            ),
+        ):
+            validate_worktree(destination, head, head)
+
+        capture.assert_not_called()
+
+    def test_status_detects_same_size_tracked_content_with_restored_mtime(
+        self,
+    ) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("AAAA\n", encoding="ascii")
+        head = self.commit("base")
+        before = tracked.stat()
+        tracked.write_text("BBBB\n", encoding="ascii")
+        os.utime(tracked, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = tracked.stat()
+        self.assertEqual(after.st_size, before.st_size)
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "worktree must be clean"):
+            self.validate_repo(head)
+
+    def test_validator_rejects_same_length_config_replacement_with_old_mtime(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "config-replacement-lane"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        config = destination / ".git" / "config"
+        original_validate = named_lane_runtime._validate_guidance_file
+        replaced = False
+
+        def replace_config(*args: object, **kwargs: object) -> None:
+            nonlocal replaced
+            original_validate(*args, **kwargs)
+            if replaced:
+                return
+            before = config.stat()
+            original = config.read_bytes()
+            mutated = bytes((original[0] ^ 1,)) + original[1:]
+            replacement = config.with_name("config.same-length-replacement")
+            replacement.write_bytes(mutated)
+            replacement.chmod(stat.S_IMODE(before.st_mode))
+            os.utime(
+                replacement,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.replace(replacement, config)
+            self.assertEqual(config.stat().st_size, before.st_size)
+            self.assertEqual(config.stat().st_mtime_ns, before.st_mtime_ns)
+            replaced = True
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_validate_guidance_file",
+                side_effect=replace_config,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "local Git config changed during the protected window",
+            ),
+        ):
+            validate_worktree(destination, head, head)
+
+        self.assertTrue(replaced)
+
+    def test_validator_allows_config_timestamp_churn_without_property_change(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "config-timestamp-lane"
+        materialized = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            head,
+            head,
+        )
+        config = destination / ".git" / "config"
+        original_validate = named_lane_runtime._validate_guidance_file
+        touched = False
+
+        def touch_config(*args: object, **kwargs: object) -> None:
+            nonlocal touched
+            original_validate(*args, **kwargs)
+            if not touched:
+                metadata = config.stat()
+                os.utime(
+                    config,
+                    ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+                )
+                touched = True
 
         with mock.patch.object(
             named_lane_runtime,
-            "run_bounded_capture",
-            side_effect=observe_probe,
+            "_validate_guidance_file",
+            side_effect=touch_config,
         ):
-            with self.assertRaisesRegex(
-                NamedLaneGuardError,
-                "bounded local Git preflight failed",
-            ):
-                validate_worktree(nested.resolve(), head, head)
+            validated = validate_worktree(destination, head, head)
 
-        self.assertIsNotNone(observed_returncode)
-        self.assertNotEqual(observed_returncode, 0)
-        assert observed_environment is not None
+        self.assertTrue(touched)
         self.assertEqual(
-            observed_environment["GIT_CEILING_DIRECTORIES"],
-            str(nested.resolve().parent),
+            validated.local_config_sha256,
+            materialized.local_config_sha256,
         )
+
+    def test_receipts_bind_config_content_across_guard_invocations(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "config-receipt-lane"
+        materialized = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            head,
+            head,
+        )
+        config = destination / ".git" / "config"
+        original = config.read_bytes()
+        original_mode = stat.S_IMODE(config.stat().st_mode)
+        replacement = config.with_name("config.same-content-replacement")
+        replacement.write_bytes(original)
+        replacement.chmod(original_mode)
+        os.replace(replacement, config)
+
+        same_content = validate_worktree(destination, head, head)
+        self.assertEqual(
+            same_content.local_config_sha256,
+            materialized.local_config_sha256,
+        )
+
+        with config.open("ab") as handle:
+            handle.write(b"\n# receipt drift\n")
+        changed_content = validate_worktree(destination, head, head)
+        self.assertEqual(
+            changed_content.parent_graph_sha256,
+            materialized.parent_graph_sha256,
+        )
+        self.assertNotEqual(
+            changed_content.local_config_sha256,
+            materialized.local_config_sha256,
+        )
+
+    def test_validator_rejects_git_info_identity_drift_after_guidance(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "info-replacement-lane"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        info = destination / ".git" / "info"
+        original_info = destination / ".git" / "info.original"
+        original_validate = named_lane_runtime._validate_guidance_file
+        replaced = False
+
+        def replace_info(*args: object, **kwargs: object) -> None:
+            nonlocal replaced
+            original_validate(*args, **kwargs)
+            if replaced:
+                return
+            info.rename(original_info)
+            info.mkdir(mode=0o700)
+            info.chmod(0o700)
+            replaced = True
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_validate_guidance_file",
+                side_effect=replace_info,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "Git info directory changed during the protected window",
+            ),
+        ):
+            validate_worktree(destination, head, head)
+
+        self.assertTrue(replaced)
 
     def test_materializer_requires_git_245_or_newer(self) -> None:
         environment = named_lane_runtime._git_environment()
@@ -5686,7 +6075,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "include directives",
             ),
             ("alias", "alias.review", f"!{probe}", "aliases"),
-            ("credential", "credential.helper", str(probe), "credential helpers"),
+            ("credential", "credential.helper", str(probe), "credential configuration"),
             ("fsck", "fsck.skipList", os.devnull, "fsck policy"),
             ("fsmonitor", "core.fsmonitor", str(probe), "fsmonitor"),
             ("fsmonitor-no-value", "core.fsmonitor", None, "fsmonitor"),
@@ -6280,6 +6669,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "head": head,
                 "commit_count": 2,
                 "parent_edge_count": 1,
+                "parent_graph_sha256": mock.ANY,
+                "local_config_sha256": mock.ANY,
             },
         )
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
@@ -6762,19 +7153,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             "submodule.unrelated.url",
             str(self.root / "unrelated"),
         )
-        clean = self.validate_repo(head)
-        self.assertEqual(clean.head_sha, head)
-
-        for suffix, value in (
-            ("url", str(self.root / "submodule-source")),
-            ("active", "true"),
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "per-worktree Git config is not allowed",
         ):
-            key = f"submodule.vendor.{suffix}"
-            with self.subTest(key=key):
-                git(self.repo, "config", "--worktree", key, value)
-                with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
-                    self.validate_repo(head)
-                git(self.repo, "config", "--worktree", "--unset-all", key)
+            self.validate_repo(head)
 
     def test_global_submodule_active_uses_git_pathspec_precedence(self) -> None:
         head = self.add_deinitialized_gitlink()
@@ -6812,7 +7195,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         head = self.add_deinitialized_gitlink()
         git(self.repo, "config", "extensions.worktreeConfig", "true")
         git(self.repo, "config", "--worktree", "submodule.active", "vendor")
-        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "per-worktree Git config is not allowed",
+        ):
             self.validate_repo(head)
         git(
             self.repo,
@@ -6821,6 +7207,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "--unset-all",
             "submodule.active",
         )
+        (self.repo / ".git" / "config.worktree").unlink()
+        git(self.repo, "config", "--unset-all", "extensions.worktreeConfig")
 
         included = self.root / "included-submodule-active.config"
         included.write_text("[submodule]\n\tactive = vendor\n", encoding="utf-8")
@@ -6885,7 +7273,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "config", "--worktree", "submodule.named.path", "vendor")
         git(self.repo, "config", "--worktree", "submodule.named.active", "true")
 
-        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "per-worktree Git config is not allowed",
+        ):
             self.validate_repo(head)
 
     def test_raw_gitlink_without_mapping_honors_global_submodule_active(
@@ -7066,6 +7457,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         tracked.write_text("two\n", encoding="utf-8")
         second = self.commit("second")
 
+        self.bind_formal_validator_range(first, first)
         with self.assertRaisesRegex(NamedLaneGuardError, "does not match"):
             validate_worktree(self.repo.resolve(), first, first)
 
@@ -7211,7 +7603,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ((), "Git config aliases are not allowed before reviewer launch"),
             (
                 ("--worktree",),
-                "Git config aliases are not allowed before reviewer launch",
+                "materialized per-worktree Git config is not allowed",
             ),
         )
         for scope, expected_reason in cases:
@@ -7271,7 +7663,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "executable Git filter or diff commands",
+            "per-worktree Git config is not allowed",
         ):
             self.validate_repo(head)
 
@@ -7306,7 +7698,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
             self.validate_repo(head)
 
-    def test_core_fsmonitor_uses_local_and_worktree_precedence(
+    def test_core_fsmonitor_cannot_use_worktree_precedence(
         self,
     ) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -7322,15 +7714,10 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         git(self.repo, "config", "extensions.worktreeConfig", "true")
         git(self.repo, "config", "--worktree", "core.fsmonitor", "false")
-        clean = self.validate_repo(head)
-        self.assertEqual(clean.head_sha, head)
-
-        git(self.repo, "config", "--worktree", "core.fsmonitor", "true")
-        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
-            self.validate_repo(head)
-
-        git(self.repo, "config", "--worktree", "core.fsmonitor", str(probe))
-        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "per-worktree Git config is not allowed",
+        ):
             self.validate_repo(head)
         self.assertFalse(marker.exists())
 
@@ -7357,7 +7744,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             self.validate_repo(head)
         self.assertFalse(marker.exists())
 
-    def test_malformed_external_include_fails_closed_during_identity_probe(
+    def test_malformed_external_include_is_rejected_without_reading_it(
         self,
     ) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -7368,7 +7755,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "bounded local Git preflight failed",
+            "Git config include directives are not allowed",
         ):
             self.validate_repo(head)
 
@@ -7400,7 +7787,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "Git config include directives are not allowed",
+            "per-worktree Git config is not allowed",
         ):
             self.validate_repo(head)
 
@@ -8406,6 +8793,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(child["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(child["GIT_GRAFT_FILE"], os.devnull)
         self.assertEqual(child["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(child["GIT_CONFIG_NOSYSTEM"], "1")
