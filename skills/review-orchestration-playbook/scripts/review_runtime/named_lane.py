@@ -58,7 +58,7 @@ MATERIALIZER_LOGICAL_OBJECT_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
 MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT = 100_000
 MATERIALIZER_CHECKOUT_BLOB_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
 MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT = 64 * 1024 * 1024
-MATERIALIZER_PACK_BYTES_LIMIT = 256 * 1024 * 1024
+MATERIALIZER_PACK_BYTES_LIMIT = 768 * 1024 * 1024
 MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES = 1024 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 LOWER_FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -154,6 +154,7 @@ def _checkout_tree_output_limit(oid_length: int) -> int:
 @dataclass(frozen=True)
 class WorktreeValidation:
     root: pathlib.Path
+    base_sha: str
     head_sha: str
     symlink_count: int
     guidance_count: int
@@ -3192,7 +3193,11 @@ def legacy_short_prefix_receipts(
     return result
 
 
-def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
+def _validate_materialized_admin_directory(
+    root: pathlib.Path,
+    *,
+    allow_worktree_config: bool = False,
+) -> pathlib.Path:
     git_directory = root / ".git"
     try:
         metadata = git_directory.lstat()
@@ -3236,23 +3241,27 @@ def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
         ) from error
     else:
         raise NamedLaneGuardError("materialized Git commondir state is not allowed")
-    worktree_config = git_directory / "config.worktree"
-    try:
-        worktree_config.lstat()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        raise NamedLaneGuardError(
-            "materialized per-worktree Git config cannot be inspected"
-        ) from error
-    else:
-        raise NamedLaneGuardError("materialized per-worktree Git config is not allowed")
+    if not allow_worktree_config:
+        worktree_config = git_directory / "config.worktree"
+        try:
+            worktree_config.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "materialized per-worktree Git config cannot be inspected"
+            ) from error
+        else:
+            raise NamedLaneGuardError(
+                "materialized per-worktree Git config is not allowed"
+            )
     return git_directory
 
 
 def _validate_materialized_object_storage(
     git_directory: pathlib.Path,
     *,
+    expected_shallow_boundary: str | None = None,
     remove_bitmaps: bool = False,
 ) -> None:
     objects = git_directory / "objects"
@@ -3308,19 +3317,39 @@ def _validate_materialized_object_storage(
             ) from error
         raise NamedLaneGuardError(f"materialized Git {label} must be absent")
 
-    for candidate, label in (
-        (git_directory / "shallow", "shallow repository state"),
-        (git_directory / "info" / "sparse-checkout", "sparse checkout state"),
-    ):
+    shallow = git_directory / "shallow"
+    if expected_shallow_boundary is None:
         try:
-            candidate.lstat()
+            shallow.lstat()
         except FileNotFoundError:
-            continue
+            pass
         except OSError as error:
             raise NamedLaneGuardError(
-                f"materialized Git {label} cannot be inspected"
+                "materialized Git shallow repository state cannot be inspected"
             ) from error
-        raise NamedLaneGuardError(f"materialized Git {label} is not allowed")
+        else:
+            raise NamedLaneGuardError(
+                "materialized Git shallow repository state is not allowed"
+            )
+    else:
+        _materializer_verify_shallow_boundary(
+            git_directory,
+            expected_shallow_boundary,
+        )
+
+    sparse_checkout = git_directory / "info" / "sparse-checkout"
+    try:
+        sparse_checkout.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git sparse checkout state cannot be inspected"
+        ) from error
+    else:
+        raise NamedLaneGuardError(
+            "materialized Git sparse checkout state is not allowed"
+        )
 
     pack = objects / "pack"
     try:
@@ -3521,10 +3550,239 @@ def _materializer_alternate_environment(
     return alternate_environment
 
 
+def _materializer_review_commit_manifest(
+    root: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> frozenset[bytes]:
+    oid_length = len(head_sha)
+    expected_base = base_sha.encode("ascii")
+
+    def parse_manifest(payload: bytes, label: str) -> frozenset[bytes]:
+        if payload and not payload.endswith(b"\n"):
+            raise NamedLaneGuardError(f"{label} is malformed")
+        range_commits = payload[:-1].split(b"\n") if payload else []
+        expected_pattern = re.compile(
+            rb"[0-9a-f]{" + str(oid_length).encode("ascii") + rb"}\Z"
+        )
+        if any(expected_pattern.fullmatch(commit) is None for commit in range_commits):
+            raise NamedLaneGuardError(f"{label} is malformed")
+        commits = frozenset((expected_base, *range_commits))
+        if len(commits) != len(range_commits) + 1:
+            raise NamedLaneGuardError(f"{label} contains duplicate commits")
+        if len(commits) > MATERIALIZER_OBJECT_COUNT_LIMIT:
+            raise NamedLaneGuardError(f"{label} exceeds the object-count limit")
+        return commits
+
+    merge_bases = _materializer_git_capture(
+        git,
+        environment,
+        hooks,
+        ("merge-base", "--all", base_sha, head_sha),
+        root=root,
+        allow_no_match=True,
+        output_limit_bytes=2 * (oid_length + 1),
+    )
+    if merge_bases != expected_base + b"\n":
+        raise NamedLaneGuardError(
+            "frozen base must be the unique merge base of the frozen head"
+        )
+
+    manifest_output_limit = MATERIALIZER_OBJECT_COUNT_LIMIT * (oid_length + 1)
+    try:
+        raw_manifest = _materializer_git_capture(
+            git,
+            environment,
+            hooks,
+            (
+                "rev-list",
+                "--no-object-names",
+                "--missing=error",
+                head_sha,
+                f"^{base_sha}",
+                "--",
+            ),
+            root=root,
+            output_limit_bytes=manifest_output_limit,
+        )
+    except ReviewOutputLimitError as error:
+        raise NamedLaneGuardError(
+            "materializer review commit manifest exceeds the object-count limit"
+        ) from error
+    review_commits = parse_manifest(
+        raw_manifest,
+        "materializer review commit manifest",
+    )
+    try:
+        raw_ancestry = _materializer_git_capture(
+            git,
+            environment,
+            hooks,
+            (
+                "rev-list",
+                "--no-object-names",
+                "--missing=error",
+                "--ancestry-path",
+                head_sha,
+                f"^{base_sha}",
+                "--",
+            ),
+            root=root,
+            output_limit_bytes=manifest_output_limit,
+        )
+    except ReviewOutputLimitError as error:
+        raise NamedLaneGuardError(
+            "materializer ancestry-path commit manifest exceeds the object-count limit"
+        ) from error
+    ancestry_commits = parse_manifest(
+        raw_ancestry,
+        "materializer ancestry-path commit manifest",
+    )
+    if ancestry_commits != review_commits:
+        raise NamedLaneGuardError(
+            "materializer review graph cannot be represented by the sole shallow boundary"
+        )
+    return review_commits
+
+
+def _materializer_shallow_boundary_payload(base_sha: str) -> bytes:
+    return base_sha.encode("ascii") + b"\n"
+
+
+def _materializer_verify_shallow_boundary(
+    git_directory: pathlib.Path,
+    base_sha: str,
+) -> None:
+    # Each point validation binds the opened object by device/inode/type/owner,
+    # enforces the single-link owner-only access policy with mode/nlink, and
+    # protects the range semantics with exact BASE-plus-LF content. Timestamps
+    # are irrelevant to those properties. A safe same-content replacement
+    # between complete validations is therefore harmless, while replacement
+    # during a validation, content drift, or access-policy drift fails closed.
+    path = git_directory / "shallow"
+    expected_payload = _materializer_shallow_boundary_payload(base_sha)
+    descriptor = -1
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size != len(expected_payload)
+        ):
+            raise NamedLaneGuardError("materialized Git shallow boundary is not safe")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        descriptor_metadata = os.fstat(descriptor)
+        identity = (
+            descriptor_metadata.st_dev,
+            descriptor_metadata.st_ino,
+            stat.S_IFMT(descriptor_metadata.st_mode),
+            descriptor_metadata.st_uid,
+        )
+        if (
+            identity
+            != (
+                metadata.st_dev,
+                metadata.st_ino,
+                stat.S_IFMT(metadata.st_mode),
+                metadata.st_uid,
+            )
+            or stat.S_IMODE(descriptor_metadata.st_mode) != 0o600
+            or descriptor_metadata.st_nlink != 1
+            or descriptor_metadata.st_size != len(expected_payload)
+        ):
+            raise NamedLaneGuardError(
+                "materialized Git shallow boundary changed during inspection"
+            )
+        payload = os.read(descriptor, len(expected_payload) + 1)
+        final_descriptor_metadata = os.fstat(descriptor)
+        if (
+            payload != expected_payload
+            or final_descriptor_metadata.st_dev != descriptor_metadata.st_dev
+            or final_descriptor_metadata.st_ino != descriptor_metadata.st_ino
+            or final_descriptor_metadata.st_mode != descriptor_metadata.st_mode
+            or final_descriptor_metadata.st_uid != descriptor_metadata.st_uid
+            or final_descriptor_metadata.st_nlink != descriptor_metadata.st_nlink
+            or final_descriptor_metadata.st_size != descriptor_metadata.st_size
+        ):
+            raise NamedLaneGuardError(
+                "materialized Git shallow boundary changed during inspection"
+            )
+    except NamedLaneGuardError:
+        raise
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git shallow boundary cannot be inspected"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        final_metadata = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git shallow boundary cannot be revalidated"
+        ) from error
+    if (
+        final_metadata.st_dev != metadata.st_dev
+        or final_metadata.st_ino != metadata.st_ino
+        or final_metadata.st_mode != metadata.st_mode
+        or final_metadata.st_uid != metadata.st_uid
+        or final_metadata.st_nlink != metadata.st_nlink
+        or final_metadata.st_size != metadata.st_size
+    ):
+        raise NamedLaneGuardError(
+            "materialized Git shallow boundary changed during inspection"
+        )
+
+
+def _materializer_write_shallow_boundary(
+    git_directory: pathlib.Path,
+    base_sha: str,
+) -> None:
+    path = git_directory / "shallow"
+    payload = _materializer_shallow_boundary_payload(base_sha)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git shallow boundary cannot be created safely"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _materializer_verify_shallow_boundary(git_directory, base_sha)
+
+
 def _materializer_reachable_manifest(
     root: pathlib.Path,
     base_sha: str,
     head_sha: str,
+    expected_commits: frozenset[bytes],
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
@@ -3633,6 +3891,16 @@ def _materializer_reachable_manifest(
                 "materializer reachable objects exceed the logical-byte limit"
             )
         metadata[expected_oid] = (object_type, object_size)
+    materialized_commits = frozenset(
+        object_id
+        for object_id, (object_type, _object_size) in metadata.items()
+        if object_type == b"commit"
+    )
+    if materialized_commits != expected_commits:
+        manifest[:] = b"\x00" * len(manifest)
+        raise NamedLaneGuardError(
+            "materializer shallow commit closure does not match the frozen source range"
+        )
     return manifest, metadata
 
 
@@ -3704,13 +3972,95 @@ def _materializer_validate_checkout_manifest(
             )
 
 
+def _write_materializer_pack_zero_chunk(
+    view: memoryview,
+    offset: int,
+    chunk_size: int,
+    zeroes: bytes,
+) -> None:
+    view[offset : offset + chunk_size] = zeroes[:chunk_size]
+
+
+def _zeroize_materializer_pack(
+    payload: bytearray,
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    """Wipe and clear a pack before propagating any cleanup-window signal."""
+
+    cleanup_mask, acquisition_signal = _block_materializer_cleanup_signals()
+    pending_signal: signal.Signals | None = None
+    cleanup_error: BaseException | None = None
+    try:
+        if payload:
+            zeroes = b"\x00" * min(len(payload), 64 * 1024)
+            view = memoryview(payload)
+            try:
+                offset = 0
+                while offset < len(view):
+                    chunk_size = min(len(zeroes), len(view) - offset)
+                    _write_materializer_pack_zero_chunk(
+                        view,
+                        offset,
+                        chunk_size,
+                        zeroes,
+                    )
+                    offset += chunk_size
+            finally:
+                view.release()
+        payload.clear()
+        if cleanup_mask is not None:
+            pending_signal = consume_pending_forwarded_signal()
+    except BaseException as error:
+        cleanup_error = error
+    try:
+        restore_signal_mask(cleanup_mask)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+    if cleanup_error is not None:
+        if primary_error is not None and isinstance(cleanup_error, ForwardedSignal):
+            return
+        raise cleanup_error
+    if primary_error is not None:
+        return
+    if acquisition_signal is not None:
+        raise acquisition_signal
+    if pending_signal is not None:
+        raise ForwardedSignal(pending_signal)
+
+
+@dataclass
+class _MaterializerPackPayloadOwner:
+    """Keep the pack reachable across the callee-return assignment boundary."""
+
+    payload: bytearray | None = None
+
+    def publish(self, payload: bytearray) -> None:
+        if self.payload is not None:
+            raise NamedLaneGuardError(
+                "materializer pack payload ownership is ambiguous"
+            )
+        self.payload = payload
+
+    def zeroize(self, *, primary_error: BaseException | None = None) -> None:
+        payload = self.payload
+        if payload is None:
+            return
+        try:
+            _zeroize_materializer_pack(payload, primary_error=primary_error)
+        finally:
+            self.payload = None
+
+
 def _materializer_pack_manifest(
     root: pathlib.Path,
     manifest: bytearray,
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
-) -> bytearray:
+    owner: _MaterializerPackPayloadOwner,
+) -> None:
     command = (
         *_materializer_git_prefix(git, hooks),
         "-C",
@@ -3723,30 +4073,56 @@ def _materializer_pack_manifest(
         "--no-reuse-delta",
         "--no-reuse-object",
     )
-    try:
-        capture = run_bounded_capture(
-            command,
-            cwd=hooks.parent / "tmp",
-            env=dict(environment),
-            stdin=manifest,
-            timeout_seconds=MATERIALIZER_GIT_TIMEOUT_SECONDS,
-            stdout_limit_bytes=MATERIALIZER_PACK_BYTES_LIMIT,
-            stderr_limit_bytes=1024 * 1024,
-        )
-    except ReviewOutputLimitError as error:
+    # The bounded runner temporarily manages forwarded signals itself, then
+    # restores this caller-blocked mask before returning. That makes both its
+    # return assignment and the caller-visible owner publication atomic with
+    # respect to forwarded-signal delivery.
+    handoff_mask, acquisition_signal = _block_materializer_cleanup_signals()
+    if handoff_mask is None:
         raise NamedLaneGuardError(
-            "materializer reachable pack exceeds the compressed-byte limit"
-        ) from error
+            "materializer pack ownership handoff requires main-thread signal masking"
+        )
+    capture = None
     transferred = False
+    handoff_pending_signal: signal.Signals | None = None
     try:
+        if acquisition_signal is not None:
+            raise acquisition_signal
+        try:
+            capture = run_bounded_capture(
+                command,
+                cwd=hooks.parent / "tmp",
+                env=dict(environment),
+                stdin=manifest,
+                timeout_seconds=MATERIALIZER_GIT_TIMEOUT_SECONDS,
+                stdout_limit_bytes=MATERIALIZER_PACK_BYTES_LIMIT,
+                stderr_limit_bytes=1024 * 1024,
+            )
+        except ReviewOutputLimitError as error:
+            raise NamedLaneGuardError(
+                "materializer reachable pack exceeds the compressed-byte limit"
+            ) from error
         if capture.returncode != 0:
             raise NamedLaneGuardError("bounded materializer Git pack-objects failed")
+        owner.publish(capture.stdout)
         transferred = True
-        return capture.stdout
+        handoff_pending_signal = consume_pending_forwarded_signal()
     finally:
-        capture.stderr[:] = b"\x00" * len(capture.stderr)
-        if not transferred:
-            capture.stdout[:] = b"\x00" * len(capture.stdout)
+        try:
+            if capture is not None:
+                if not transferred:
+                    _zeroize_materializer_pack(
+                        capture.stdout,
+                        primary_error=sys.exc_info()[1],
+                    )
+                capture.stderr[:] = b"\x00" * len(capture.stderr)
+            late_signal = consume_pending_forwarded_signal()
+            if handoff_pending_signal is None:
+                handoff_pending_signal = late_signal
+        finally:
+            restore_signal_mask(handoff_mask)
+    if handoff_pending_signal is not None:
+        raise ForwardedSignal(handoff_pending_signal)
 
 
 def _materializer_import_reachable_objects(
@@ -3776,7 +4152,7 @@ def _materializer_import_reachable_objects(
         alternate_environment,
         hooks,
     )
-    manifest, metadata = _materializer_reachable_manifest(
+    expected_commits = _materializer_review_commit_manifest(
         root,
         base_sha,
         head_sha,
@@ -3784,7 +4160,21 @@ def _materializer_import_reachable_objects(
         alternate_environment,
         hooks,
     )
-    pack_payload: bytearray | None = None
+    _materializer_write_shallow_boundary(root / ".git", base_sha)
+    _validate_materialized_object_storage(
+        root / ".git",
+        expected_shallow_boundary=base_sha,
+    )
+    manifest, metadata = _materializer_reachable_manifest(
+        root,
+        base_sha,
+        head_sha,
+        expected_commits,
+        git,
+        alternate_environment,
+        hooks,
+    )
+    pack_owner = _MaterializerPackPayloadOwner()
     try:
         _materializer_validate_checkout_manifest(
             root,
@@ -3795,13 +4185,19 @@ def _materializer_import_reachable_objects(
             hooks,
         )
         _verify_materializer_source_storage(storage)
-        pack_payload = _materializer_pack_manifest(
+        _materializer_pack_manifest(
             root,
             manifest,
             git,
             alternate_environment,
             hooks,
+            pack_owner,
         )
+        pack_payload = pack_owner.payload
+        if pack_payload is None:
+            raise NamedLaneGuardError(
+                "materializer pack payload ownership was not transferred"
+            )
         _verify_materializer_source_storage(storage)
         if len(pack_payload) > MATERIALIZER_PACK_BYTES_LIMIT:
             raise NamedLaneGuardError(
@@ -3822,9 +4218,9 @@ def _materializer_import_reachable_objects(
         )
         return frozenset(metadata)
     finally:
+        primary_error = sys.exc_info()[1]
+        pack_owner.zeroize(primary_error=primary_error)
         manifest[:] = b"\x00" * len(manifest)
-        if pack_payload is not None:
-            pack_payload[:] = b"\x00" * len(pack_payload)
 
 
 def _materializer_verify_exact_object_manifest(
@@ -4080,7 +4476,10 @@ def materialize_worktree(
             environment,
             directories["hooks"],
         )
-        _validate_materialized_object_storage(git_directory)
+        _validate_materialized_object_storage(
+            git_directory,
+            expected_shallow_boundary=frozen_base,
+        )
         _materializer_verify_exact_object_manifest(
             destination,
             imported_objects,
@@ -4130,7 +4529,10 @@ def materialize_worktree(
             environment,
             directories["hooks"],
         )
-        _validate_materialized_object_storage(git_directory)
+        _validate_materialized_object_storage(
+            git_directory,
+            expected_shallow_boundary=frozen_base,
+        )
         _materializer_verify_complete_objects(
             destination,
             frozen_base,
@@ -4189,7 +4591,10 @@ def materialize_worktree(
             environment,
             directories["hooks"],
         )
-        _validate_materialized_object_storage(git_directory)
+        _validate_materialized_object_storage(
+            git_directory,
+            expected_shallow_boundary=frozen_base,
+        )
         result = MaterializedWorktree(
             root=destination,
             base_sha=frozen_base,
@@ -4918,13 +5323,196 @@ def _validate_guidance_file(
         )
 
 
+def _validate_materialized_ref(
+    root: pathlib.Path,
+    ref_name: str,
+    expected_sha: str,
+) -> None:
+    actual = _git_capture(
+        root,
+        ("show-ref", "--hash", "--verify", ref_name),
+        output_limit_bytes=len(expected_sha) + 1,
+    )
+    if actual != expected_sha.encode("ascii") + b"\n":
+        raise NamedLaneGuardError(
+            f"materialized {ref_name} does not match the frozen object ID"
+        )
+
+
+def _parse_validator_commit_rows(
+    payload: bytes,
+    oid_length: int,
+    *,
+    label: str,
+) -> tuple[tuple[bytes, ...], ...]:
+    if payload and not payload.endswith(b"\n"):
+        raise NamedLaneGuardError(f"{label} is malformed")
+    rows = (
+        tuple(line.split(b" ") for line in payload[:-1].split(b"\n")) if payload else ()
+    )
+    oid_pattern = re.compile(rb"[0-9a-f]{" + str(oid_length).encode("ascii") + rb"}\Z")
+    if any(
+        not row or any(oid_pattern.fullmatch(object_id) is None for object_id in row)
+        for row in rows
+    ):
+        raise NamedLaneGuardError(f"{label} is malformed")
+    if len(rows) > MATERIALIZER_OBJECT_COUNT_LIMIT:
+        raise NamedLaneGuardError(f"{label} exceeds the object-count limit")
+    return rows
+
+
+def _validate_materialized_frozen_range(
+    root: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+) -> None:
+    git_directory = _validate_materialized_admin_directory(
+        root,
+        allow_worktree_config=True,
+    )
+    _validate_materialized_object_storage(
+        git_directory,
+        expected_shallow_boundary=base_sha,
+    )
+    _validate_materialized_ref(root, MATERIALIZER_BASE_REF, base_sha)
+    _validate_materialized_ref(root, MATERIALIZER_HEAD_REF, head_sha)
+
+    for revision, expected in ((base_sha, base_sha), (head_sha, head_sha)):
+        actual = os.fsdecode(
+            _git_capture(
+                root,
+                ("rev-parse", "--verify", f"{revision}^{{commit}}"),
+                output_limit_bytes=len(expected) + 1,
+            )
+        ).strip()
+        if actual != expected:
+            raise NamedLaneGuardError(
+                "materialized frozen endpoint is not the exact commit object"
+            )
+
+    merge_bases = _git_capture(
+        root,
+        ("merge-base", "--all", base_sha, head_sha),
+        allow_no_match=True,
+        output_limit_bytes=2 * (len(head_sha) + 1),
+    )
+    if merge_bases != base_sha.encode("ascii") + b"\n":
+        raise NamedLaneGuardError(
+            "frozen base must be the unique merge base of the frozen head"
+        )
+
+    commit_output_limit = MATERIALIZER_OBJECT_COUNT_LIMIT * (len(head_sha) + 1)
+    range_rows = _parse_validator_commit_rows(
+        _git_capture(
+            root,
+            (
+                "rev-list",
+                "--no-object-names",
+                "--missing=error",
+                "--ancestry-path",
+                head_sha,
+                f"^{base_sha}",
+                "--",
+            ),
+            output_limit_bytes=commit_output_limit,
+        ),
+        len(head_sha),
+        label="materialized frozen-range commit traversal",
+    )
+    if any(len(row) != 1 for row in range_rows):
+        raise NamedLaneGuardError(
+            "materialized frozen-range commit traversal is malformed"
+        )
+    expected_commits = frozenset(
+        (base_sha.encode("ascii"), *(row[0] for row in range_rows))
+    )
+    if len(expected_commits) != len(range_rows) + 1:
+        raise NamedLaneGuardError(
+            "materialized frozen-range commit traversal contains duplicate commits"
+        )
+    if len(expected_commits) > MATERIALIZER_OBJECT_COUNT_LIMIT:
+        raise NamedLaneGuardError(
+            "materialized frozen-range commit traversal exceeds the object-count limit"
+        )
+
+    parent_rows = _parse_validator_commit_rows(
+        _git_capture(
+            root,
+            (
+                "rev-list",
+                "--parents",
+                "--missing=error",
+                head_sha,
+                "--",
+            ),
+            output_limit_bytes=GIT_OUTPUT_LIMIT_BYTES,
+        ),
+        len(head_sha),
+        label="materialized shallow parent traversal",
+    )
+    parents_by_commit: dict[bytes, tuple[bytes, ...]] = {}
+    for row in parent_rows:
+        commit, *parents = row
+        if commit in parents_by_commit:
+            raise NamedLaneGuardError(
+                "materialized shallow parent traversal contains duplicate commits"
+            )
+        parents_by_commit[commit] = tuple(parents)
+    if frozenset(parents_by_commit) != expected_commits:
+        raise NamedLaneGuardError(
+            "materialized shallow commit scope does not match the frozen range"
+        )
+    frozen_base = base_sha.encode("ascii")
+    if parents_by_commit.get(frozen_base) != ():
+        raise NamedLaneGuardError(
+            "materialized frozen base is not the sole shallow boundary"
+        )
+    if any(
+        parent not in expected_commits
+        for commit, parents in parents_by_commit.items()
+        if commit != frozen_base
+        for parent in parents
+    ):
+        raise NamedLaneGuardError("materialized commit parent escapes the frozen range")
+
+    # Revalidate the range-bearing storage and refs after graph traversal so a
+    # changed shallow boundary or endpoint cannot be handed to the first status.
+    final_git_directory = _validate_materialized_admin_directory(
+        root,
+        allow_worktree_config=True,
+    )
+    _validate_materialized_object_storage(
+        final_git_directory,
+        expected_shallow_boundary=base_sha,
+    )
+    _validate_materialized_ref(root, MATERIALIZER_BASE_REF, base_sha)
+    _validate_materialized_ref(root, MATERIALIZER_HEAD_REF, head_sha)
+    final_head = _git_capture(
+        root,
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        output_limit_bytes=len(head_sha) + 1,
+    )
+    if final_head != head_sha.encode("ascii") + b"\n":
+        raise NamedLaneGuardError(
+            "materialized HEAD changed during frozen-range validation"
+        )
+
+
 def validate_worktree(
     worktree: pathlib.Path,
+    base_sha: str,
     head_sha: str,
     guidance_paths: Sequence[str] = (),
 ) -> WorktreeValidation:
+    if FULL_OBJECT_ID.fullmatch(base_sha) is None:
+        raise NamedLaneGuardError("frozen base must be a full Git object ID")
     if FULL_OBJECT_ID.fullmatch(head_sha) is None:
         raise NamedLaneGuardError("frozen head must be a full Git object ID")
+    if len(base_sha) != len(head_sha):
+        raise NamedLaneGuardError(
+            "frozen base and head must use the same Git object format"
+        )
+    frozen_base = base_sha.lower()
     root = _resolve_worktree_root(worktree)
     actual_head = os.fsdecode(
         _git_capture(root, ("rev-parse", "--verify", "HEAD^{commit}"))
@@ -4934,6 +5522,15 @@ def validate_worktree(
     ).strip()
     if not actual_head or actual_head != frozen_head:
         raise NamedLaneGuardError("worktree HEAD does not match the frozen head")
+    if frozen_head != head_sha.lower():
+        raise NamedLaneGuardError(
+            "materialized frozen head is not the exact commit object"
+        )
+    _validate_materialized_frozen_range(
+        root,
+        frozen_base,
+        frozen_head,
+    )
     tree = _parse_tree(
         _git_capture(
             root,
@@ -5008,6 +5605,7 @@ def validate_worktree(
         _validate_guidance_file(root, path, tree.get(path))
     return WorktreeValidation(
         root=root,
+        base_sha=frozen_base,
         head_sha=frozen_head,
         symlink_count=len(symlinks),
         guidance_count=len(guidance),
@@ -6383,6 +6981,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validate tracked symlink containment for a frozen named-lane worktree.",
     )
     validate.add_argument("--worktree", required=True)
+    validate.add_argument("--base", required=True)
     validate.add_argument("--head", required=True)
     validate.add_argument("--guidance", action="append", default=[])
 
@@ -6607,12 +7206,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             with _structured_forwarded_signals():
                 result = validate_worktree(
                     pathlib.Path(args.worktree),
+                    args.base,
                     args.head,
                     args.guidance,
                 )
                 _emit(
                     {
                         "status": "ok",
+                        "base": result.base_sha,
                         "head": result.head_sha,
                         "symlink_count": result.symlink_count,
                         "guidance_count": result.guidance_count,

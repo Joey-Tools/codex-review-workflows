@@ -122,6 +122,18 @@ class Completed:
     stderr: bytes
 
 
+_CAPTURE_ZEROIZE_CHUNK = bytes(64 * 1024)
+
+
+def _zeroize_bytearray(buffer: bytearray) -> None:
+    chunk_size = len(_CAPTURE_ZEROIZE_CHUNK)
+    for offset in range(0, len(buffer), chunk_size):
+        overwrite_size = min(chunk_size, len(buffer) - offset)
+        buffer[offset : offset + overwrite_size] = _CAPTURE_ZEROIZE_CHUNK[
+            :overwrite_size
+        ]
+
+
 @dataclass(frozen=True)
 class BoundedCapture:
     argv: tuple[str, ...]
@@ -130,8 +142,8 @@ class BoundedCapture:
     stderr: bytearray
 
     def zeroize(self) -> None:
-        self.stdout[:] = b"\x00" * len(self.stdout)
-        self.stderr[:] = b"\x00" * len(self.stderr)
+        _zeroize_bytearray(self.stdout)
+        _zeroize_bytearray(self.stderr)
 
 
 class _BytearrayWriter:
@@ -1293,8 +1305,8 @@ def run_bounded_capture(
     stderr = _BytearrayWriter()
 
     def zeroize_output() -> None:
-        stdout.data[:] = b"\x00" * len(stdout.data)
-        stderr.data[:] = b"\x00" * len(stderr.data)
+        _zeroize_bytearray(stdout.data)
+        _zeroize_bytearray(stderr.data)
 
     try:
         if deadline is not None and deadline - time.monotonic() <= 0:
