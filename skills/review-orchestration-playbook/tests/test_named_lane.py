@@ -5462,6 +5462,91 @@ class NamedLaneGuardTest(unittest.TestCase):
                     {"status": "blocked-safety", "reason": expected_reason},
                 )
 
+    def test_validator_reports_config_input_inspection_failures(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        cases = (
+            ("malformed", b'[core "broken"\n'),
+            (
+                "oversized",
+                b"#"
+                * (named_lane_runtime.MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES + 1),
+            ),
+        )
+
+        for case, config_payload in cases:
+            with self.subTest(case=case):
+                destination = self.root / f"config-input-reason-{case}"
+                materialize_worktree(self.repo.resolve(), destination, head, head)
+                (destination / ".git" / "config").write_bytes(config_payload)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(
+                        (
+                            "validate-worktree",
+                            "--worktree",
+                            str(destination),
+                            "--base",
+                            head,
+                            "--head",
+                            head,
+                        )
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {
+                        "status": "blocked-safety",
+                        "reason": "materialized-git-config-inspection-failure",
+                    },
+                )
+
+    def test_validator_reports_config_record_inspection_failure(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        destination = self.root / "config-record-reason"
+        materialize_worktree(self.repo.resolve(), destination, head, head)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_parse_git_config_records",
+                side_effect=NamedLaneGuardError("synthetic malformed record"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    head,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "blocked-safety",
+                "reason": "materialized-git-config-inspection-failure",
+            },
+        )
+
     def test_validator_reports_distinct_git_info_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")

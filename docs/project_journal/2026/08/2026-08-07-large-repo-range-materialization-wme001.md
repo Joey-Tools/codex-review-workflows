@@ -109,13 +109,16 @@ superseded_by:
 - Fresh-review finding addressed: config and Git-info control checks no longer
   collapse deletion, inspection failure, identity replacement, content drift,
   and access-policy drift into indistinguishable machine-visible reasons.
+- Follow-up fresh-review finding addressed: malformed, oversized, unparseable,
+  or malformed-record local Git config inputs now retain the stable config
+  inspection-failure reason instead of leaking free-form parser prose.
 - Contract regression coverage is in
   `skills/review-orchestration-playbook/tests/test_contracts.py`. The focused
   canonical contract run covered materialization ordering, formal control and
   receipt binding, Codex-prefix isolation, pristine/property-scoped guards,
   fsmonitor rejection, and direct-Claude environment isolation: 7 tests ran
   and all passed.
-- Current full local coverage passed 226 named-lane tests and 113 contract
+- Current full local coverage passed 228 named-lane tests and 113 contract
   tests. The other unchanged runtime partitions completed 708 tests with one
   filesystem capability skip and no failures, and 433 tests with three
   platform skips and no failures. A final 1,429-test partition had 22 platform

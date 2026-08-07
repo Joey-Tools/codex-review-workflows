@@ -1448,8 +1448,9 @@ def _read_local_config(
     nofollow = getattr(os, "O_NOFOLLOW", None)
     nonblocking = getattr(os, "O_NONBLOCK", None)
     if nofollow is None or nonblocking is None:
-        raise NamedLaneGuardError(
-            "materialized local Git config requires no-follow inspection"
+        raise _ControlObjectGuardError(
+            "materialized-git-config-inspection-failure",
+            "materialized local Git config requires no-follow inspection",
         )
     descriptor = -1
     payload = bytearray()
@@ -1473,7 +1474,10 @@ def _read_local_config(
                 "materialized local Git config has an unsafe access policy",
             )
         if before.st_size > MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES:
-            raise NamedLaneGuardError("materialized local Git config is too large")
+            raise _ControlObjectGuardError(
+                "materialized-git-config-inspection-failure",
+                "materialized local Git config is too large",
+            )
         descriptor = os.open(
             path,
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
@@ -1501,7 +1505,10 @@ def _read_local_config(
                 break
             payload.extend(chunk)
         if len(payload) > MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES:
-            raise NamedLaneGuardError("materialized local Git config is too large")
+            raise _ControlObjectGuardError(
+                "materialized-git-config-inspection-failure",
+                "materialized local Git config is too large",
+            )
         after_open = os.fstat(descriptor)
         _require_no_control_extended_acl(
             descriptor,
@@ -1600,27 +1607,49 @@ def _parse_direct_local_config(
         "--null",
         "--list",
     )
-    capture = run_bounded_capture(
-        command,
-        cwd=cwd,
-        env=dict(environment),
-        stdin=payload,
-        timeout_seconds=MATERIALIZER_GIT_TIMEOUT_SECONDS,
-        stdout_limit_bytes=4 * MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES,
-        stderr_limit_bytes=1024 * 1024,
-    )
+    capture = None
     try:
-        if capture.returncode != 0 or capture.stderr:
-            raise NamedLaneGuardError(
-                "materialized direct local Git config cannot be parsed safely"
+        try:
+            capture = run_bounded_capture(
+                command,
+                cwd=cwd,
+                env=dict(environment),
+                stdin=payload,
+                timeout_seconds=MATERIALIZER_GIT_TIMEOUT_SECONDS,
+                stdout_limit_bytes=4 * MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES,
+                stderr_limit_bytes=1024 * 1024,
             )
-        return _parse_git_config_records(
-            bytes(capture.stdout),
-            label="materialized direct local Git config",
-        )
+        except (
+            ReviewTimeoutError,
+            ReviewOutputLimitError,
+            ReviewOutputDrainError,
+            ReviewProcessLeakError,
+        ):
+            raise
+        except (ReviewError, OSError, ValueError) as error:
+            raise _ControlObjectGuardError(
+                "materialized-git-config-inspection-failure",
+                "materialized direct local Git config cannot be parsed safely",
+            ) from error
+        if capture.returncode != 0 or capture.stderr:
+            raise _ControlObjectGuardError(
+                "materialized-git-config-inspection-failure",
+                "materialized direct local Git config cannot be parsed safely",
+            )
+        try:
+            return _parse_git_config_records(
+                bytes(capture.stdout),
+                label="materialized direct local Git config",
+            )
+        except (ReviewError, OSError, ValueError) as error:
+            raise _ControlObjectGuardError(
+                "materialized-git-config-inspection-failure",
+                "materialized direct local Git config records are malformed",
+            ) from error
     finally:
-        capture.stdout[:] = b"\x00" * len(capture.stdout)
-        capture.stderr[:] = b"\x00" * len(capture.stderr)
+        if capture is not None:
+            capture.stdout[:] = b"\x00" * len(capture.stdout)
+            capture.stderr[:] = b"\x00" * len(capture.stderr)
 
 
 def _audit_direct_local_config(

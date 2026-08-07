@@ -45113,6 +45113,8 @@ printf '%s\n' "$trusted_uv"
             "test_validator_rejects_target_graft_before_topology_query",
             "test_materializer_rejects_graft_injected_before_topology_import",
             "test_validator_reports_distinct_local_config_failures",
+            "test_validator_reports_config_input_inspection_failures",
+            "test_validator_reports_config_record_inspection_failure",
             "test_validator_reports_distinct_git_info_failures",
             "test_control_object_reason_is_stable_across_safety_commands",
             "test_materializer_cli_receipt_commits_a_signal_during_emit",
