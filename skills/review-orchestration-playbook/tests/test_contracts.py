@@ -2630,7 +2630,9 @@ concurrency:
             3,
         )
         self.assertLess(
-            independent_job.index("      - name: Verify independent review supervisor CLI\n"),
+            independent_job.index(
+                "      - name: Verify independent review supervisor CLI\n"
+            ),
             independent_job.index(budgeted_macos_reconciliation_step),
         )
         self.assertLess(
@@ -2662,9 +2664,7 @@ concurrency:
         source_only_start = python_39_job.index(
             "      - name: Require source-only Python tree\n"
         )
-        compatibility_step = python_39_job[
-            compatibility_start:source_only_start
-        ]
+        compatibility_step = python_39_job[compatibility_start:source_only_start]
         expected_compatibility_step = """      - name: Run Python 3.9 compatibility regressions
         run: |
           python3 -m unittest \\
@@ -5611,7 +5611,7 @@ printf '%s\n' "$trusted_uv"
             self.assertIn(anchor, skill)
 
         for anchor in (
-            "pre-status isolated reachable-object import",
+            "pre-status isolated exact-range object import",
             "Never derive a formal named-lane range from a dirty working tree",
             "Expose the workspace and Git metadata for read-only reviewer behavior",
             "free of generated prompts, diff files, manifests, state directories, and helper control artifacts",
@@ -5941,8 +5941,7 @@ printf '%s\n' "$trusted_uv"
             normalized_probes,
         )
         self.assertIn(
-            "`whole_pr_completion_action: "
-            "block-and-report-no-whole-pr-completion`",
+            "`whole_pr_completion_action: block-and-report-no-whole-pr-completion`",
             normalized_probes,
         )
         self.assertIn(
@@ -37034,17 +37033,15 @@ printf '%s\n' "$trusted_uv"
             terminal_findings_current
         )
         assert isinstance(terminal_findings_with_malformed_request_receipt, dict)
-        terminal_findings_with_malformed_request_receipt[
-            "request_scope_receipts"
-        ][0]["authority_override"] = True
+        terminal_findings_with_malformed_request_receipt["request_scope_receipts"][0][
+            "authority_override"
+        ] = True
         restamp(terminal_findings_with_malformed_request_receipt)
         terminal_findings_sidecar_cases["malformed"] = (
             terminal_findings_with_malformed_request_receipt
         )
 
-        terminal_findings_with_base_changed_request = clone(
-            terminal_findings_current
-        )
+        terminal_findings_with_base_changed_request = clone(terminal_findings_current)
         assert isinstance(terminal_findings_with_base_changed_request, dict)
         findings_base_changed_scope = clone(
             terminal_findings_with_base_changed_request["scope"]
@@ -37104,9 +37101,7 @@ printf '%s\n' "$trusted_uv"
                     {
                         "status": "triple-inconclusive",
                         "merge_ready_eligible": False,
-                        "evidence_action": (
-                            "block-and-report-no-whole-pr-completion"
-                        ),
+                        "evidence_action": ("block-and-report-no-whole-pr-completion"),
                     },
                 )
         terminal_findings_with_bad_historical_receipt_history = (
@@ -44816,7 +44811,7 @@ printf '%s\n' "$trusted_uv"
             )
         ]
         ordered_anchors = (
-            "pre-status isolated reachable-object import",
+            "pre-status isolated",
             "Before checkout",
             "Materialize `head_sha` only after that audit",
             "As the first worktree-status operation",
@@ -44842,30 +44837,96 @@ printf '%s\n' "$trusted_uv"
             "-c core.fsmonitor=false",
             "-c core.attributesFile=/dev/null",
             "-c submodule.recurse=false",
-            "250,000 reachable objects",
-            "2 GiB of reachable logical object bytes",
-            "256 MiB compressed pack",
             "pack-objects --stdout --no-reuse-delta --no-reuse-object",
-            "index-pack --stdin --strict --max-input-size=<256 MiB>",
-            "destination's complete object inventory",
             "promisor markers/configuration",
             "sibling `.bundle` / `.git` suffix discovery",
             "exact `.git` marker",
             "bounded full object-validity `git fsck`",
             "no `commondir`, `config.worktree`, per-worktree config",
-            "alternate, HTTP-alternate, shallow, sparse, promisor, or pack `.bitmap` state",
             "executable clean/smudge/process filter",
+            "Pack ownership is signal-atomic",
+            "must equal the source's `--ancestry-path` projection",
+            "250,000 parent-edge occurrences",
+            "(commit_count + 250,000) * (object-id-width + 1)",
+            "`commit_count` and `parent_edge_count`",
             "The guard's forced ordinary/staged status is the first status query",
             "recorded device, inode, and owner",
         ):
             self.assertIn(anchor, shared)
+
+        materialization_contracts = {
+            "skill": " ".join(skill.split()),
+            "Claude lane": " ".join(claude.split()),
+        }
+        for name, content in materialization_contracts.items():
+            with self.subTest(materialization_contract=name):
+                for anchor in (
+                    "exact source commit scope as `{base_sha} ∪ (base_sha..head_sha)`",
+                    "materializer-owned destination shallow boundary",
+                    "complete recursive tree/blob snapshot closure",
+                    "pre-existing, missing, additional, duplicated, malformed, or changed destination shallow",
+                    "250,000",
+                    "parent-edge",
+                    "2 GiB",
+                    "100,000",
+                    "768 MiB",
+                    "`index-pack --max-input-size=<768 MiB>`",
+                    "imported commit set equals the source",
+                    "total object inventory equals",
+                ):
+                    self.assertIn(anchor, content)
+
+        self.assertIn("source repository to be full, non-shallow", skill)
+        self.assertIn(
+            "graph shape that exposes an outside parent fails `blocked-safety`",
+            skill,
+        )
+        self.assertIn(
+            "shallow, promisor, partial, or incomplete sources",
+            claude,
+        )
+        self.assertIn(
+            "outside parent fails closed instead of creating another boundary",
+            claude,
+        )
+        self.assertIn(
+            "blocks forwarded signals before bounded capture",
+            claude,
+        )
+        self.assertIn("arbitrary, pre-existing", claude)
+        for anchor in (
+            "250,000 manifest objects",
+            "250,000 parent-edge occurrences",
+            "2 GiB of logical object bytes",
+            "100,000 head entries",
+            "2 GiB of repeated checkout blob-occurrence bytes",
+            "64 MiB of aggregate head path bytes",
+            "768 MiB compressed pack",
+        ):
+            self.assertIn(anchor, skill)
+
+        for name, content in {
+            "lane contracts": contracts,
+            "Claude lane": claude,
+            "prompt templates": templates,
+            "PR readiness": readiness,
+            "repository policy": repository_policy,
+        }.items():
+            with self.subTest(parent_graph_contract=name):
+                self.assertIn("250,000", content)
+                self.assertIn("parent-edge", content)
+                self.assertIn("commit_count", content)
+                self.assertIn("parent_edge_count", content)
 
         self.assertIn("never use `git worktree add`", shared)
         self.assertIn("never loaded by Git", shared)
         self.assertIn("cleanup failure must report the exact retained path", skill)
         self.assertIn("complete flushed success receipt", skill)
         self.assertNotIn("parent-validated native Git", shared)
-        self.assertIn("prior-policy bootstrap", templates)
+        self.assertIn(
+            "independently trusted prior bundle reviews the candidate through its prior interface",
+            templates,
+        )
         self.assertNotIn(
             "Before launch, require `git status --porcelain`",
             contracts,
@@ -44993,9 +45054,7 @@ printf '%s\n' "$trusted_uv"
         review_scope_documents.append(agents_policy)
         for content in (interface, agents_policy):
             with self.subTest(terminal_clean_disposition=content[:40]):
-                normalized = " ".join(
-                    content.lower().replace("`", "").split()
-                )
+                normalized = " ".join(content.lower().replace("`", "").split())
                 self.assertIn(
                     "accepted terminal clean classification is immediately "
                     "triple-inconclusive",
@@ -45703,9 +45762,7 @@ printf '%s\n' "$trusted_uv"
                 "proves_no_intermediate_aba": False,
                 "whole_pr_completion_action": "triple-inconclusive",
                 "clean_action": "audit-only-no-merge-ready",
-                "negative_evidence_action": (
-                    "block-and-report-no-whole-pr-completion"
-                ),
+                "negative_evidence_action": ("block-and-report-no-whole-pr-completion"),
                 "future_completion_requirement": (
                     "provider-authenticated-input-base-or-request-run-artifact-binding"
                 ),
@@ -45951,7 +46008,7 @@ printf '%s\n' "$trusted_uv"
             "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
             "owner-private lane-local repository",
-            "private destination inventory is exact",
+            "destination's total object inventory equals the exact manifest",
             "remote transport",
             "GIT_NO_LAZY_FETCH=1",
             "locally complete",
@@ -47551,7 +47608,7 @@ printf '%s\n' "$trusted_uv"
         ordered_controls = (
             "trusted bundle digest binds",
             "selects and publisher-verifies",
-            "final clean/safety launch gate",
+            "final range/topology/storage and clean/safety launch gate",
             "launches that snapshot as its direct child",
             "runs only after that parent receipt comparison",
         )

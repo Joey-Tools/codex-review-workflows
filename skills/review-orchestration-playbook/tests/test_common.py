@@ -3268,6 +3268,32 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, bytearray(b"relative"))
 
+    def test_bounded_capture_zeroize_overwrites_in_fixed_chunks(self) -> None:
+        class RecordingBuffer:
+            def __init__(self, payload: bytes) -> None:
+                self.data = bytearray(payload)
+                self.overwrite_sizes: list[int] = []
+
+            def __len__(self) -> int:
+                return len(self.data)
+
+            def __setitem__(self, key: slice, value: bytes) -> None:
+                self.overwrite_sizes.append(len(value))
+                self.data[key] = value
+
+        self.assertEqual(len(common._CAPTURE_ZEROIZE_CHUNK), 64 * 1024)
+        stdout = RecordingBuffer(b"s" * 19)
+        stderr = RecordingBuffer(b"e" * 17)
+        capture = common.BoundedCapture(("reviewer",), 1, stdout, stderr)
+
+        with mock.patch.object(common, "_CAPTURE_ZEROIZE_CHUNK", bytes(8)):
+            capture.zeroize()
+
+        self.assertEqual(stdout.data, bytearray(19))
+        self.assertEqual(stderr.data, bytearray(17))
+        self.assertEqual(stdout.overwrite_sizes, [8, 8, 3])
+        self.assertEqual(stderr.overwrite_sizes, [8, 8, 1])
+
     def test_control_flow_cancellation_is_not_replaced_and_zeroizes_output(
         self,
     ) -> None:
@@ -3300,6 +3326,11 @@ class ChildEnvironmentTest(unittest.TestCase):
                     "_run_logged_process",
                     side_effect=cancel_after_output,
                 ),
+                mock.patch.object(
+                    common,
+                    "_zeroize_bytearray",
+                    wraps=common._zeroize_bytearray,
+                ) as zeroize_bytearray,
                 self.assertRaises(type(cancellation)) as raised,
             ):
                 common.run_bounded_capture(
@@ -3313,6 +3344,72 @@ class ChildEnvironmentTest(unittest.TestCase):
                 self.assertIs(raised.exception, cancellation)
             self.assertEqual(writers["stdout"].data, bytearray(16))
             self.assertEqual(writers["stderr"].data, bytearray(16))
+            self.assertEqual(zeroize_bytearray.call_count, 2)
+            self.assertIs(
+                zeroize_bytearray.call_args_list[0].args[0],
+                writers["stdout"].data,
+            )
+            self.assertIs(
+                zeroize_bytearray.call_args_list[1].args[0],
+                writers["stderr"].data,
+            )
+
+    def test_failure_paths_zeroize_output_with_chunked_helper(self) -> None:
+        for failure, expected_error in (
+            (
+                subprocess.TimeoutExpired(("reviewer",), 1),
+                common.ReviewTimeoutError,
+            ),
+            (
+                common.ReviewOutputLimitError("output limit exceeded"),
+                common.ReviewOutputLimitError,
+            ),
+        ):
+            writers: dict[str, object] = {}
+
+            def fail_after_output(*_args: object, **kwargs: object) -> int:
+                stdout = kwargs["stdout_handle"]
+                stderr = kwargs["stderr_handle"]
+                writers["stdout"] = stdout
+                writers["stderr"] = stderr
+                stdout.write(b"sensitive stdout")
+                stderr.write(b"sensitive stderr")
+                raise failure
+
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(
+                    common,
+                    "_run_logged_process",
+                    side_effect=fail_after_output,
+                ),
+                mock.patch.object(
+                    common,
+                    "_zeroize_bytearray",
+                    wraps=common._zeroize_bytearray,
+                ) as zeroize_bytearray,
+                self.assertRaises(expected_error) as raised,
+            ):
+                common.run_bounded_capture(
+                    ("reviewer",),
+                    timeout_seconds=1,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            if isinstance(failure, common.ReviewOutputLimitError):
+                self.assertIs(raised.exception, failure)
+            self.assertEqual(writers["stdout"].data, bytearray(16))
+            self.assertEqual(writers["stderr"].data, bytearray(16))
+            self.assertEqual(zeroize_bytearray.call_count, 2)
+            self.assertIs(
+                zeroize_bytearray.call_args_list[0].args[0],
+                writers["stdout"].data,
+            )
+            self.assertIs(
+                zeroize_bytearray.call_args_list[1].args[0],
+                writers["stderr"].data,
+            )
 
     @unittest.skipUnless(
         hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
