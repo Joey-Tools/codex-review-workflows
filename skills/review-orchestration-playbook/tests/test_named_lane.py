@@ -5237,9 +5237,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 return
             before = config.stat()
             original = config.read_bytes()
-            mutated = bytes((original[0] ^ 1,)) + original[1:]
             replacement = config.with_name("config.same-length-replacement")
-            replacement.write_bytes(mutated)
+            replacement.write_bytes(original)
             replacement.chmod(stat.S_IMODE(before.st_mode))
             os.utime(
                 replacement,
@@ -5258,7 +5257,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 NamedLaneGuardError,
-                "local Git config changed during the protected window",
+                "local Git config identity changed during the protected window",
             ),
         ):
             validate_worktree(destination, head, head)
@@ -5369,12 +5368,180 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 NamedLaneGuardError,
-                "Git info directory changed during the protected window",
+                "Git info directory identity changed during the protected window",
             ),
         ):
             validate_worktree(destination, head, head)
 
         self.assertTrue(replaced)
+
+    def test_validator_reports_distinct_local_config_failures(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        cases = (
+            ("missing", "materialized-git-config-missing"),
+            ("unreadable", "materialized-git-config-inspection-failure"),
+            ("identity", "materialized-git-config-object-identity-mismatch"),
+            ("content", "materialized-git-config-content-mismatch"),
+            ("access-policy", "materialized-git-config-access-policy-mismatch"),
+        )
+
+        for case, expected_reason in cases:
+            with self.subTest(case=case):
+                destination = self.root / f"config-reason-{case}"
+                materialize_worktree(self.repo.resolve(), destination, head, head)
+                config = destination / ".git" / "config"
+                original_validate = named_lane_runtime._validate_guidance_file
+                original_open = os.open
+                injected = False
+
+                def inject_failure(*args: object, **kwargs: object) -> None:
+                    nonlocal injected
+                    original_validate(*args, **kwargs)
+                    if injected:
+                        return
+                    injected = True
+                    if case == "missing":
+                        config.unlink()
+                    elif case == "identity":
+                        metadata = config.stat()
+                        replacement = config.with_name("config.identity-replacement")
+                        replacement.write_bytes(config.read_bytes())
+                        replacement.chmod(stat.S_IMODE(metadata.st_mode))
+                        os.replace(replacement, config)
+                    elif case == "content":
+                        with config.open("r+b") as handle:
+                            original = handle.read(1)
+                            self.assertTrue(original)
+                            handle.seek(0)
+                            handle.write(bytes((original[0] ^ 1,)))
+                    elif case == "access-policy":
+                        original_mode = stat.S_IMODE(config.stat().st_mode)
+                        config.chmod(original_mode ^ stat.S_IRGRP)
+
+                def deny_read(path: object, *args: object, **kwargs: object) -> int:
+                    if (
+                        case == "unreadable"
+                        and injected
+                        and os.fspath(path) == os.fspath(config)
+                    ):
+                        raise PermissionError("synthetic config read denial")
+                    return original_open(path, *args, **kwargs)
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_validate_guidance_file",
+                        side_effect=inject_failure,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime.os, "open", side_effect=deny_read
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(
+                        (
+                            "validate-worktree",
+                            "--worktree",
+                            str(destination),
+                            "--base",
+                            head,
+                            "--head",
+                            head,
+                        )
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": "blocked-safety", "reason": expected_reason},
+                )
+
+    def test_validator_reports_distinct_git_info_failures(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        cases = (
+            ("missing", "materialized-git-info-missing"),
+            ("unreadable", "materialized-git-info-inspection-failure"),
+            ("identity", "materialized-git-info-object-identity-mismatch"),
+            ("content", "materialized-git-info-content-mismatch"),
+            ("access-policy", "materialized-git-info-access-policy-mismatch"),
+        )
+
+        for case, expected_reason in cases:
+            with self.subTest(case=case):
+                destination = self.root / f"info-reason-{case}"
+                materialize_worktree(self.repo.resolve(), destination, head, head)
+                info = destination / ".git" / "info"
+                retained_info = destination / ".git" / f"info.retained-{case}"
+                original_validate = named_lane_runtime._validate_guidance_file
+                original_open = os.open
+                injected = False
+
+                def inject_failure(*args: object, **kwargs: object) -> None:
+                    nonlocal injected
+                    original_validate(*args, **kwargs)
+                    if injected:
+                        return
+                    injected = True
+                    if case == "missing":
+                        info.rename(retained_info)
+                    elif case == "identity":
+                        info.rename(retained_info)
+                        info.mkdir(mode=0o700)
+                        info.chmod(0o700)
+                    elif case == "content":
+                        (info / "grafts").write_text(f"{head}\n", encoding="ascii")
+                    elif case == "access-policy":
+                        info.chmod(0o755)
+
+                def deny_read(path: object, *args: object, **kwargs: object) -> int:
+                    if (
+                        case == "unreadable"
+                        and injected
+                        and os.fspath(path) == os.fspath(info)
+                    ):
+                        raise PermissionError("synthetic info read denial")
+                    return original_open(path, *args, **kwargs)
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_validate_guidance_file",
+                        side_effect=inject_failure,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime.os, "open", side_effect=deny_read
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(
+                        (
+                            "validate-worktree",
+                            "--worktree",
+                            str(destination),
+                            "--base",
+                            head,
+                            "--head",
+                            head,
+                        )
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": "blocked-safety", "reason": expected_reason},
+                )
 
     def test_materializer_requires_git_245_or_newer(self) -> None:
         environment = named_lane_runtime._git_environment()
@@ -10395,6 +10562,56 @@ class NamedLaneGuardTest(unittest.TestCase):
                 },
             },
         )
+
+    def test_control_object_reason_is_stable_across_safety_commands(self) -> None:
+        reason = "materialized-git-config-content-mismatch"
+        error = named_lane_runtime._ControlObjectGuardError(
+            reason,
+            "human-readable control-object detail",
+        )
+        commands = (
+            (
+                "review_runtime.named_lane.materialize_worktree",
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(self.root / "control-reason-materialized-worktree"),
+                    "--base",
+                    "0" * 40,
+                    "--head",
+                    "0" * 40,
+                ),
+            ),
+            (
+                "review_runtime.named_lane.validate_worktree",
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--base",
+                    "0" * 40,
+                    "--head",
+                    "0" * 40,
+                ),
+            ),
+        )
+
+        for target, argv in commands:
+            with self.subTest(command=argv[0]):
+                stderr = io.StringIO()
+                with (
+                    mock.patch(target, side_effect=error),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": "blocked-safety", "reason": reason},
+                )
 
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (

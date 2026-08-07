@@ -95,6 +95,31 @@ class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
 
 
+class _ControlObjectGuardError(NamedLaneGuardError):
+    """A materialized control object failed with a stable machine reason."""
+
+    _REASONS = frozenset(
+        {
+            "materialized-git-config-missing",
+            "materialized-git-config-inspection-failure",
+            "materialized-git-config-object-identity-mismatch",
+            "materialized-git-config-content-mismatch",
+            "materialized-git-config-access-policy-mismatch",
+            "materialized-git-info-missing",
+            "materialized-git-info-inspection-failure",
+            "materialized-git-info-object-identity-mismatch",
+            "materialized-git-info-content-mismatch",
+            "materialized-git-info-access-policy-mismatch",
+        }
+    )
+
+    def __init__(self, reason: str, message: str) -> None:
+        if reason not in self._REASONS:
+            raise ValueError("unknown materialized control-object reason")
+        self.reason = reason
+        super().__init__(message)
+
+
 class LegacyPrefixReceiptInconclusive(ReviewError):
     """A legacy prefix was deterministically ineligible for a success receipt."""
 
@@ -1259,23 +1284,166 @@ def _git_config_value_is_false(value: bytes | None) -> bool:
     }
 
 
-def _local_config_metadata(
-    metadata: os.stat_result,
-) -> tuple[int, int, int, int, int, int, int, int]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        stat.S_IFMT(metadata.st_mode),
-        metadata.st_uid,
-        metadata.st_gid,
-        stat.S_IMODE(metadata.st_mode),
-        metadata.st_nlink,
-        metadata.st_size,
+def _require_control_properties_unchanged(
+    label: str,
+    reason_prefix: str,
+    context: str,
+    *,
+    actual_identity: tuple[object, ...],
+    expected_identity: tuple[object, ...],
+    actual_content: tuple[object, ...] | None,
+    expected_content: tuple[object, ...] | None,
+    actual_access_policy: tuple[object, ...],
+    expected_access_policy: tuple[object, ...],
+) -> None:
+    # Device/inode/type protect object identity. Ownership/mode/link count
+    # protect the admitted access policy, while size/digest protect content.
+    # The order gives simultaneous drift one deterministic machine reason.
+    if actual_identity != expected_identity:
+        raise _ControlObjectGuardError(
+            f"{reason_prefix}-object-identity-mismatch",
+            f"{label} identity changed {context}",
+        )
+    if actual_access_policy != expected_access_policy:
+        raise _ControlObjectGuardError(
+            f"{reason_prefix}-access-policy-mismatch",
+            f"{label} access policy changed {context}",
+        )
+    if (
+        actual_content is not None
+        and expected_content is not None
+        and actual_content != expected_content
+    ):
+        raise _ControlObjectGuardError(
+            f"{reason_prefix}-content-mismatch",
+            f"{label} content changed {context}",
+        )
+
+
+def _require_no_control_extended_acl(
+    descriptor: int,
+    *,
+    label: str,
+    reason_prefix: str,
+) -> None:
+    try:
+        tag_types = _legacy_extended_acl_tag_types(descriptor, label=label)
+    except NamedLaneGuardError as error:
+        raise _ControlObjectGuardError(
+            f"{reason_prefix}-inspection-failure",
+            f"{label} extended ACL cannot be inspected",
+        ) from error
+    if tag_types:
+        raise _ControlObjectGuardError(
+            f"{reason_prefix}-access-policy-mismatch",
+            f"{label} has an extended ACL",
+        )
+
+
+def _require_local_config_metadata_unchanged(
+    actual: os.stat_result,
+    expected: os.stat_result,
+    *,
+    context: str,
+) -> None:
+    _require_control_properties_unchanged(
+        "materialized local Git config",
+        "materialized-git-config",
+        context,
+        actual_identity=(
+            actual.st_dev,
+            actual.st_ino,
+            stat.S_IFMT(actual.st_mode),
+        ),
+        expected_identity=(
+            expected.st_dev,
+            expected.st_ino,
+            stat.S_IFMT(expected.st_mode),
+        ),
+        actual_content=(actual.st_size,),
+        expected_content=(expected.st_size,),
+        actual_access_policy=(
+            actual.st_uid,
+            actual.st_gid,
+            stat.S_IMODE(actual.st_mode),
+            actual.st_nlink,
+        ),
+        expected_access_policy=(
+            expected.st_uid,
+            expected.st_gid,
+            stat.S_IMODE(expected.st_mode),
+            expected.st_nlink,
+        ),
+    )
+
+
+def _require_local_config_matches_binding(
+    actual: os.stat_result,
+    expected: _LocalConfigBinding,
+    *,
+    context: str,
+) -> None:
+    _require_control_properties_unchanged(
+        "materialized local Git config",
+        "materialized-git-config",
+        context,
+        actual_identity=(
+            actual.st_dev,
+            actual.st_ino,
+            stat.S_IFMT(actual.st_mode),
+        ),
+        expected_identity=(expected.device, expected.inode, expected.file_type),
+        actual_content=(actual.st_size,),
+        expected_content=(expected.size,),
+        actual_access_policy=(
+            actual.st_uid,
+            actual.st_gid,
+            stat.S_IMODE(actual.st_mode),
+            actual.st_nlink,
+        ),
+        expected_access_policy=(
+            expected.owner,
+            expected.group,
+            expected.mode,
+            expected.link_count,
+        ),
+    )
+
+
+def _require_local_config_binding_unchanged(
+    actual: _LocalConfigBinding,
+    expected: _LocalConfigBinding,
+    *,
+    context: str,
+) -> None:
+    _require_control_properties_unchanged(
+        "materialized local Git config",
+        "materialized-git-config",
+        context,
+        actual_identity=(actual.device, actual.inode, actual.file_type),
+        expected_identity=(expected.device, expected.inode, expected.file_type),
+        actual_content=(actual.size, actual.sha256),
+        expected_content=(expected.size, expected.sha256),
+        actual_access_policy=(
+            actual.owner,
+            actual.group,
+            actual.mode,
+            actual.link_count,
+        ),
+        expected_access_policy=(
+            expected.owner,
+            expected.group,
+            expected.mode,
+            expected.link_count,
+        ),
     )
 
 
 def _read_local_config(
     path: pathlib.Path,
+    *,
+    expected: _LocalConfigBinding | None = None,
+    expected_context: str = "during the protected window",
 ) -> tuple[_LocalConfigBinding, bytearray]:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     nonblocking = getattr(os, "O_NONBLOCK", None)
@@ -1287,29 +1455,39 @@ def _read_local_config(
     payload = bytearray()
     try:
         before = path.lstat()
+        if expected is not None:
+            _require_local_config_matches_binding(
+                before,
+                expected,
+                context=expected_context,
+            )
         if (
             not stat.S_ISREG(before.st_mode)
             or stat.S_ISLNK(before.st_mode)
             or before.st_uid != _current_user_id()
             or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) & 0o022
-            or before.st_size > MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES
         ):
-            raise NamedLaneGuardError(
-                "materialized local Git config has an unsafe identity or access policy"
+            raise _ControlObjectGuardError(
+                "materialized-git-config-access-policy-mismatch",
+                "materialized local Git config has an unsafe access policy",
             )
+        if before.st_size > MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES:
+            raise NamedLaneGuardError("materialized local Git config is too large")
         descriptor = os.open(
             path,
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
         )
         opened = os.fstat(descriptor)
-        if _local_config_metadata(opened) != _local_config_metadata(before):
-            raise NamedLaneGuardError(
-                "materialized local Git config changed during inspection"
-            )
-        _require_no_legacy_extended_acl(
+        _require_local_config_metadata_unchanged(
+            opened,
+            before,
+            context="during inspection",
+        )
+        _require_no_control_extended_acl(
             descriptor,
             label="materialized local Git config",
+            reason_prefix="materialized-git-config",
         )
         while len(payload) <= MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES:
             chunk = os.read(
@@ -1325,19 +1503,26 @@ def _read_local_config(
         if len(payload) > MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES:
             raise NamedLaneGuardError("materialized local Git config is too large")
         after_open = os.fstat(descriptor)
-        _require_no_legacy_extended_acl(
+        _require_no_control_extended_acl(
             descriptor,
             label="materialized local Git config",
+            reason_prefix="materialized-git-config",
         )
         after_path = path.lstat()
-        expected_metadata = _local_config_metadata(opened)
-        if (
-            _local_config_metadata(after_open) != expected_metadata
-            or _local_config_metadata(after_path) != expected_metadata
-            or len(payload) != opened.st_size
-        ):
-            raise NamedLaneGuardError(
-                "materialized local Git config changed during inspection"
+        _require_local_config_metadata_unchanged(
+            after_open,
+            opened,
+            context="during inspection",
+        )
+        _require_local_config_metadata_unchanged(
+            after_path,
+            opened,
+            context="during inspection",
+        )
+        if len(payload) != opened.st_size:
+            raise _ControlObjectGuardError(
+                "materialized-git-config-content-mismatch",
+                "materialized local Git config content changed during inspection",
             )
         binding = _LocalConfigBinding(
             device=opened.st_dev,
@@ -1350,14 +1535,27 @@ def _read_local_config(
             size=opened.st_size,
             sha256=hashlib.sha256(payload).hexdigest(),
         )
+        if expected is not None:
+            _require_local_config_binding_unchanged(
+                binding,
+                expected,
+                context=expected_context,
+            )
         return binding, payload
     except NamedLaneGuardError:
         payload[:] = b"\x00" * len(payload)
         raise
+    except FileNotFoundError as error:
+        payload[:] = b"\x00" * len(payload)
+        raise _ControlObjectGuardError(
+            "materialized-git-config-missing",
+            "materialized local Git config is missing",
+        ) from error
     except OSError as error:
         payload[:] = b"\x00" * len(payload)
-        raise NamedLaneGuardError(
-            "materialized local Git config cannot be inspected"
+        raise _ControlObjectGuardError(
+            "materialized-git-config-inspection-failure",
+            "materialized local Git config cannot be inspected",
         ) from error
     finally:
         if descriptor >= 0:
@@ -1433,21 +1631,26 @@ def _audit_direct_local_config(
     *,
     expected: _LocalConfigBinding | None = None,
 ) -> tuple[_LocalConfigBinding, tuple[tuple[bytes, bytes | None], ...]]:
-    binding, payload = _read_local_config(path)
+    binding, payload = _read_local_config(
+        path,
+        expected=expected,
+        expected_context="during the protected window",
+    )
     try:
-        if expected is not None and binding != expected:
-            raise NamedLaneGuardError(
-                "materialized local Git config changed during the protected window"
-            )
         records = _parse_direct_local_config(payload, git, environment, cwd)
     finally:
         payload[:] = b"\x00" * len(payload)
-    rechecked_binding, rechecked_payload = _read_local_config(path)
+    rechecked_binding, rechecked_payload = _read_local_config(
+        path,
+        expected=binding,
+        expected_context="during direct audit",
+    )
     try:
-        if rechecked_binding != binding:
-            raise NamedLaneGuardError(
-                "materialized local Git config changed during direct audit"
-            )
+        _require_local_config_binding_unchanged(
+            rechecked_binding,
+            binding,
+            context="during direct audit",
+        )
     finally:
         rechecked_payload[:] = b"\x00" * len(rechecked_payload)
     configured_keys = frozenset(key for key, _value in records)
@@ -3509,7 +3712,11 @@ def legacy_short_prefix_receipts(
     return result
 
 
-def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
+def _validate_materialized_admin_directory(
+    root: pathlib.Path,
+    *,
+    expected_local_config: _LocalConfigBinding | None = None,
+) -> pathlib.Path:
     git_directory = root / ".git"
     try:
         metadata = git_directory.lstat()
@@ -3530,17 +3737,30 @@ def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
     config = git_directory / "config"
     try:
         config_metadata = config.lstat()
-    except OSError as error:
-        raise NamedLaneGuardError(
-            "materialized Git config is not a private regular file"
+    except FileNotFoundError as error:
+        raise _ControlObjectGuardError(
+            "materialized-git-config-missing",
+            "materialized local Git config is missing",
         ) from error
+    except OSError as error:
+        raise _ControlObjectGuardError(
+            "materialized-git-config-inspection-failure",
+            "materialized local Git config cannot be inspected",
+        ) from error
+    if expected_local_config is not None:
+        _require_local_config_matches_binding(
+            config_metadata,
+            expected_local_config,
+            context="during the protected window",
+        )
     if (
         not stat.S_ISREG(config_metadata.st_mode)
         or stat.S_ISLNK(config_metadata.st_mode)
         or config_metadata.st_uid != _current_user_id()
     ):
-        raise NamedLaneGuardError(
-            "materialized Git config is not a private regular file"
+        raise _ControlObjectGuardError(
+            "materialized-git-config-access-policy-mismatch",
+            "materialized local Git config has an unsafe access policy",
         )
     commondir = git_directory / "commondir"
     try:
@@ -3565,6 +3785,35 @@ def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
     else:
         raise NamedLaneGuardError("materialized per-worktree Git config is not allowed")
     return git_directory
+
+
+def _git_info_binding(metadata: os.stat_result) -> _GitInfoBinding:
+    return _GitInfoBinding(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        file_type=stat.S_IFMT(metadata.st_mode),
+        owner=metadata.st_uid,
+        mode=stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _require_git_info_binding_unchanged(
+    actual: _GitInfoBinding,
+    expected: _GitInfoBinding,
+    *,
+    context: str,
+) -> None:
+    _require_control_properties_unchanged(
+        "materialized Git info directory",
+        "materialized-git-info",
+        context,
+        actual_identity=(actual.device, actual.inode, actual.file_type),
+        expected_identity=(expected.device, expected.inode, expected.file_type),
+        actual_content=None,
+        expected_content=None,
+        actual_access_policy=(actual.owner, actual.mode),
+        expected_access_policy=(expected.owner, expected.mode),
+    )
 
 
 def _bind_materialized_git_info(
@@ -3592,6 +3841,13 @@ def _bind_materialized_git_info(
     descriptor = -1
     try:
         before = info.lstat()
+        before_binding = _git_info_binding(before)
+        if expected is not None:
+            _require_git_info_binding_unchanged(
+                before_binding,
+                expected,
+                context="during the protected window",
+            )
         resolved = info.resolve(strict=True)
         descriptor = os.open(
             info,
@@ -3602,73 +3858,80 @@ def _bind_materialized_git_info(
             | nonblocking,
         )
         opened = os.fstat(descriptor)
-
-        def identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
-            return (
-                metadata.st_dev,
-                metadata.st_ino,
-                stat.S_IFMT(metadata.st_mode),
-                metadata.st_uid,
-                stat.S_IMODE(metadata.st_mode),
-            )
-
+        opened_binding = _git_info_binding(opened)
+        _require_git_info_binding_unchanged(
+            opened_binding,
+            before_binding,
+            context="during inspection",
+        )
         if (
-            identity(before) != identity(opened)
-            or not stat.S_ISDIR(opened.st_mode)
+            not stat.S_ISDIR(opened.st_mode)
             or stat.S_ISLNK(before.st_mode)
             or opened.st_uid != _current_user_id()
             or stat.S_IMODE(opened.st_mode) != 0o700
             or resolved != info
         ):
-            raise NamedLaneGuardError(
-                "materialized Git info directory must be an owner-private real directory"
+            raise _ControlObjectGuardError(
+                "materialized-git-info-access-policy-mismatch",
+                "materialized Git info directory must be an owner-private real directory",
             )
-        _require_no_legacy_extended_acl(
+        _require_no_control_extended_acl(
             descriptor,
             label="materialized Git info directory",
+            reason_prefix="materialized-git-info",
         )
         try:
             os.stat("grafts", dir_fd=descriptor, follow_symlinks=False)
         except FileNotFoundError:
             pass
         except OSError as error:
-            raise NamedLaneGuardError(
-                "materialized Git graft state cannot be inspected"
+            raise _ControlObjectGuardError(
+                "materialized-git-info-inspection-failure",
+                "materialized Git graft state cannot be inspected",
             ) from error
         else:
-            raise NamedLaneGuardError("materialized Git graft state is not allowed")
+            raise _ControlObjectGuardError(
+                "materialized-git-info-content-mismatch",
+                "materialized Git graft state is not allowed",
+            )
         final_opened = os.fstat(descriptor)
         final_path = info.lstat()
-        _require_no_legacy_extended_acl(
+        _require_no_control_extended_acl(
             descriptor,
             label="materialized Git info directory",
+            reason_prefix="materialized-git-info",
         )
-        if identity(final_opened) != identity(opened) or identity(
-            final_path
-        ) != identity(opened):
-            raise NamedLaneGuardError(
-                "materialized Git info directory changed during inspection"
-            )
-        binding = _GitInfoBinding(
-            device=opened.st_dev,
-            inode=opened.st_ino,
-            file_type=stat.S_IFMT(opened.st_mode),
-            owner=opened.st_uid,
-            mode=stat.S_IMODE(opened.st_mode),
+        _require_git_info_binding_unchanged(
+            _git_info_binding(final_opened),
+            opened_binding,
+            context="during inspection",
         )
-        if expected is not None and binding != expected:
-            raise NamedLaneGuardError(
-                "materialized Git info directory changed during the protected window"
+        _require_git_info_binding_unchanged(
+            _git_info_binding(final_path),
+            opened_binding,
+            context="during inspection",
+        )
+        if expected is not None:
+            _require_git_info_binding_unchanged(
+                opened_binding,
+                expected,
+                context="during the protected window",
             )
         # Child-entry churn changes timestamps, link count, and directory size
         # without changing custody. These are intentionally excluded; the
         # opened identity/access policy and graft absence are the properties.
-        return binding
+        return opened_binding
     except NamedLaneGuardError:
         raise
+    except FileNotFoundError as error:
+        raise _ControlObjectGuardError(
+            "materialized-git-info-missing",
+            "materialized Git info directory is missing",
+        ) from error
     except (OSError, RuntimeError) as error:
-        raise NamedLaneGuardError(
-            "materialized Git info directory cannot be inspected"
+        raise _ControlObjectGuardError(
+            "materialized-git-info-inspection-failure",
+            "materialized Git info directory cannot be inspected",
         ) from error
     finally:
         if descriptor >= 0:
@@ -5918,7 +6181,10 @@ def _revalidate_materialized_controls(
     local_config_binding: _LocalConfigBinding,
     info_binding: _GitInfoBinding,
 ) -> None:
-    current_git_directory = _validate_materialized_admin_directory(root)
+    current_git_directory = _validate_materialized_admin_directory(
+        root,
+        expected_local_config=local_config_binding,
+    )
     if current_git_directory != git_directory:
         raise NamedLaneGuardError(
             "materialized Git admin directory changed during validation"
@@ -6052,7 +6318,10 @@ def _validate_materialized_frozen_range(
         local_config_binding,
         info_binding,
     )
-    final_git_directory = _validate_materialized_admin_directory(root)
+    final_git_directory = _validate_materialized_admin_directory(
+        root,
+        expected_local_config=local_config_binding,
+    )
     _validate_materialized_object_storage(
         final_git_directory,
         expected_shallow_boundary=base_sha,
@@ -7676,6 +7945,12 @@ def _emit_structured_terminal_failure(
     restore_signal_mask(terminal_mask)
 
 
+def _machine_reason(error: BaseException) -> str:
+    if isinstance(error, _ControlObjectGuardError):
+        return error.reason
+    return str(error)
+
+
 def _materializer_failure_payload(
     error: BaseException,
 ) -> tuple[int, dict[str, object]]:
@@ -7693,7 +7968,7 @@ def _materializer_failure_payload(
     elif isinstance(error, ReviewProcessLeakError):
         reason = "process-leak"
     else:
-        reason = str(error)
+        reason = _machine_reason(error)
     return 2, {"status": "blocked-safety", "reason": reason}
 
 
@@ -7957,7 +8232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (NamedLaneGuardError, ReviewError, OSError, ValueError) as error:
         status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
-            {"status": status, "reason": str(error)},
+            {"status": status, "reason": _machine_reason(error)},
             stream=sys.stderr,
         )
         return 2

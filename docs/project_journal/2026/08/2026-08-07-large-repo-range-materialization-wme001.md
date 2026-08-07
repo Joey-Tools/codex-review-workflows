@@ -59,6 +59,10 @@ superseded_by:
   validation. It creates and binds owner-private `.git/info`, rejects
   `info/grafts`, and revalidates the directory and graft absence around graph
   traversal and before the first status or receipt handoff.
+- Structured control-object failures now preserve distinct stable machine
+  reasons for missing, inspection failure, object-identity mismatch, protected
+  content mismatch, and access-policy mismatch. Human-readable detail remains
+  available without forcing the parent to parse generic `changed` prose.
 - Materializer, validator, Codex-reviewer, and direct-Claude Git environments
   fix `GIT_GRAFT_FILE=/dev/null`; materializer, validator, and Codex prefixes
   force `core.checkStat=default`, `core.ignoreStat=false`, and
@@ -102,13 +106,16 @@ superseded_by:
   could alter topology or clean-state interpretation between point checks.
   The exact graph/config digests, graft-free info binding, fixed Git
   environment/prefix, and formal config rejection above close those gaps.
+- Fresh-review finding addressed: config and Git-info control checks no longer
+  collapse deletion, inspection failure, identity replacement, content drift,
+  and access-policy drift into indistinguishable machine-visible reasons.
 - Contract regression coverage is in
   `skills/review-orchestration-playbook/tests/test_contracts.py`. The focused
   canonical contract run covered materialization ordering, formal control and
   receipt binding, Codex-prefix isolation, pristine/property-scoped guards,
   fsmonitor rejection, and direct-Claude environment isolation: 7 tests ran
   and all passed.
-- Current full local coverage passed 223 named-lane tests and 113 contract
+- Current full local coverage passed 226 named-lane tests and 113 contract
   tests. The other unchanged runtime partitions completed 708 tests with one
   filesystem capability skip and no failures, and 433 tests with three
   platform skips and no failures. A final 1,429-test partition had 22 platform

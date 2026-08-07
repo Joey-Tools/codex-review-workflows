@@ -45038,11 +45038,25 @@ printf '%s\n' "$trusted_uv"
         info_guard = function_body("_bind_materialized_git_info")
         for anchor in (
             "stat.S_IMODE(opened.st_mode) != 0o700",
-            "_require_no_legacy_extended_acl(",
+            "_require_no_control_extended_acl(",
             'os.stat("grafts", dir_fd=descriptor, follow_symlinks=False)',
-            "binding != expected",
+            "_require_git_info_binding_unchanged(",
         ):
             self.assertIn(anchor, info_guard)
+
+        for reason in (
+            "materialized-git-config-missing",
+            "materialized-git-config-inspection-failure",
+            "materialized-git-config-object-identity-mismatch",
+            "materialized-git-config-content-mismatch",
+            "materialized-git-config-access-policy-mismatch",
+            "materialized-git-info-missing",
+            "materialized-git-info-inspection-failure",
+            "materialized-git-info-object-identity-mismatch",
+            "materialized-git-info-content-mismatch",
+            "materialized-git-info-access-policy-mismatch",
+        ):
+            self.assertIn(reason, runtime)
 
         parent_graph = function_body("_parse_parent_graph")
         for anchor in (
@@ -45080,6 +45094,12 @@ printf '%s\n' "$trusted_uv"
             "must not snapshot or rehash the full ordinary-file tree",
             normalized_contracts,
         )
+        self.assertIn(
+            "structured `blocked-safety` output keeps missing, inspection failure, "
+            "object-identity mismatch, protected-content mismatch, and access-policy "
+            "mismatch as distinct stable machine reasons",
+            normalized_contracts,
+        )
         for document in (skill, canonical):
             self.assertIn("local_config_sha256", document)
             self.assertIn("parent_graph_sha256", document)
@@ -45092,6 +45112,9 @@ printf '%s\n' "$trusted_uv"
             "test_validator_rejects_direct_stat_weakening_before_repository_query",
             "test_validator_rejects_target_graft_before_topology_query",
             "test_materializer_rejects_graft_injected_before_topology_import",
+            "test_validator_reports_distinct_local_config_failures",
+            "test_validator_reports_distinct_git_info_failures",
+            "test_control_object_reason_is_stable_across_safety_commands",
             "test_materializer_cli_receipt_commits_a_signal_during_emit",
         ):
             self.assertIn(test_pointer, runtime_tests)
