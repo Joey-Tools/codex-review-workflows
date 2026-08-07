@@ -44846,6 +44846,9 @@ printf '%s\n' "$trusted_uv"
             "executable clean/smudge/process filter",
             "Pack ownership is signal-atomic",
             "must equal the source's `--ancestry-path` projection",
+            "250,000 parent-edge occurrences",
+            "(commit_count + 250,000) * (object-id-width + 1)",
+            "`commit_count` and `parent_edge_count`",
             "The guard's forced ordinary/staged status is the first status query",
             "recorded device, inode, and owner",
         ):
@@ -44863,6 +44866,7 @@ printf '%s\n' "$trusted_uv"
                     "complete recursive tree/blob snapshot closure",
                     "pre-existing, missing, additional, duplicated, malformed, or changed destination shallow",
                     "250,000",
+                    "parent-edge",
                     "2 GiB",
                     "100,000",
                     "768 MiB",
@@ -44892,6 +44896,7 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("arbitrary, pre-existing", claude)
         for anchor in (
             "250,000 manifest objects",
+            "250,000 parent-edge occurrences",
             "2 GiB of logical object bytes",
             "100,000 head entries",
             "2 GiB of repeated checkout blob-occurrence bytes",
@@ -44899,6 +44904,19 @@ printf '%s\n' "$trusted_uv"
             "768 MiB compressed pack",
         ):
             self.assertIn(anchor, skill)
+
+        for name, content in {
+            "lane contracts": contracts,
+            "Claude lane": claude,
+            "prompt templates": templates,
+            "PR readiness": readiness,
+            "repository policy": repository_policy,
+        }.items():
+            with self.subTest(parent_graph_contract=name):
+                self.assertIn("250,000", content)
+                self.assertIn("parent-edge", content)
+                self.assertIn("commit_count", content)
+                self.assertIn("parent_edge_count", content)
 
         self.assertIn("never use `git worktree add`", shared)
         self.assertIn("never loaded by Git", shared)

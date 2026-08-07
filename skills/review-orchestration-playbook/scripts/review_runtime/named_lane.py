@@ -54,6 +54,7 @@ MATERIALIZER_MINIMUM_GIT_VERSION = (2, 45, 0)
 MATERIALIZER_BASE_REF = "refs/named-lane/base"
 MATERIALIZER_HEAD_REF = "refs/named-lane/head"
 MATERIALIZER_OBJECT_COUNT_LIMIT = 250_000
+MATERIALIZER_PARENT_EDGE_COUNT_LIMIT = 250_000
 MATERIALIZER_LOGICAL_OBJECT_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
 MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT = 100_000
 MATERIALIZER_CHECKOUT_BLOB_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
@@ -151,11 +152,27 @@ def _checkout_tree_output_limit(oid_length: int) -> int:
     )
 
 
+def _parent_graph_output_limit(commit_count: int, oid_length: int) -> int:
+    if commit_count <= 0:
+        raise NamedLaneGuardError("frozen commit count must be positive")
+    if oid_length not in (40, 64):
+        raise NamedLaneGuardError("frozen object ID width is unsupported")
+    return (commit_count + MATERIALIZER_PARENT_EDGE_COUNT_LIMIT) * (oid_length + 1)
+
+
+@dataclass(frozen=True)
+class _ParentGraphCounts:
+    commit_count: int
+    parent_edge_count: int
+
+
 @dataclass(frozen=True)
 class WorktreeValidation:
     root: pathlib.Path
     base_sha: str
     head_sha: str
+    commit_count: int
+    parent_edge_count: int
     symlink_count: int
     guidance_count: int
 
@@ -165,6 +182,8 @@ class MaterializedWorktree:
     root: pathlib.Path
     base_sha: str
     head_sha: str
+    commit_count: int
+    parent_edge_count: int
     _parent: pathlib.Path
     _parent_identity: _DirectoryIdentity
     _root_identity: _DirectoryIdentity
@@ -3648,6 +3667,100 @@ def _materializer_review_commit_manifest(
     return review_commits
 
 
+def _parse_parent_graph(
+    payload: bytes,
+    expected_commits: frozenset[bytes],
+    base_sha: bytes,
+    oid_length: int,
+    *,
+    label: str,
+    scope_mismatch_message: str,
+) -> _ParentGraphCounts:
+    if payload and not payload.endswith(b"\n"):
+        raise NamedLaneGuardError(f"{label} is malformed")
+    rows = payload[:-1].split(b"\n") if payload else []
+    fields_by_row = [row.split(b" ") for row in rows]
+    parent_edge_count = sum(max(0, len(fields) - 1) for fields in fields_by_row)
+    if parent_edge_count > MATERIALIZER_PARENT_EDGE_COUNT_LIMIT:
+        raise NamedLaneGuardError(
+            "frozen commit parent graph exceeds the parent-edge budget"
+        )
+    oid_pattern = re.compile(rb"[0-9a-f]{" + str(oid_length).encode("ascii") + rb"}\Z")
+    if any(
+        not fields
+        or any(oid_pattern.fullmatch(object_id) is None for object_id in fields)
+        for fields in fields_by_row
+    ):
+        raise NamedLaneGuardError(f"{label} is malformed")
+    parents_by_commit: dict[bytes, tuple[bytes, ...]] = {}
+    for fields in fields_by_row:
+        commit, *parents = fields
+        if commit in parents_by_commit:
+            raise NamedLaneGuardError(f"{label} contains duplicate commits")
+        parents_by_commit[commit] = tuple(parents)
+    if frozenset(parents_by_commit) != expected_commits:
+        raise NamedLaneGuardError(scope_mismatch_message)
+    if parents_by_commit.get(base_sha) != ():
+        raise NamedLaneGuardError(
+            "materialized frozen base is not the sole shallow boundary"
+        )
+    if any(
+        parent not in expected_commits
+        for commit, parents in parents_by_commit.items()
+        if commit != base_sha
+        for parent in parents
+    ):
+        raise NamedLaneGuardError("materialized commit parent escapes the frozen range")
+    return _ParentGraphCounts(
+        commit_count=len(expected_commits),
+        parent_edge_count=parent_edge_count,
+    )
+
+
+def _materializer_parent_graph(
+    root: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    expected_commits: frozenset[bytes],
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> _ParentGraphCounts:
+    output_limit = _parent_graph_output_limit(
+        len(expected_commits),
+        len(head_sha),
+    )
+    try:
+        payload = _materializer_git_capture(
+            git,
+            environment,
+            hooks,
+            (
+                "rev-list",
+                "--parents",
+                "--missing=error",
+                head_sha,
+                "--",
+            ),
+            root=root,
+            output_limit_bytes=output_limit,
+        )
+    except ReviewOutputLimitError as error:
+        raise NamedLaneGuardError(
+            "frozen commit parent graph exceeds the parent-edge budget"
+        ) from error
+    return _parse_parent_graph(
+        payload,
+        expected_commits,
+        base_sha.encode("ascii"),
+        len(head_sha),
+        label="materializer shallow parent traversal",
+        scope_mismatch_message=(
+            "materializer shallow commit closure does not match the frozen source range"
+        ),
+    )
+
+
 def _materializer_shallow_boundary_payload(base_sha: str) -> bytes:
     return base_sha.encode("ascii") + b"\n"
 
@@ -4085,6 +4198,7 @@ def _materializer_pack_manifest(
     capture = None
     transferred = False
     handoff_pending_signal: signal.Signals | None = None
+    handoff_restore_signal: signal.Signals | None = None
     try:
         if acquisition_signal is not None:
             raise acquisition_signal
@@ -4120,7 +4234,18 @@ def _materializer_pack_manifest(
             if handoff_pending_signal is None:
                 handoff_pending_signal = late_signal
         finally:
-            restore_signal_mask(handoff_mask)
+            restore_primary_error = sys.exc_info()[1]
+            try:
+                restore_signal_mask(handoff_mask)
+            except ForwardedSignal as error:
+                # The POSIX mask change completed before Python dispatched the
+                # pending signal through the installed structured handler. A
+                # restore-window signal must not replace an active capture or
+                # cleanup failure.
+                if restore_primary_error is None:
+                    handoff_restore_signal = error.signum
+    if handoff_pending_signal is None:
+        handoff_pending_signal = handoff_restore_signal
     if handoff_pending_signal is not None:
         raise ForwardedSignal(handoff_pending_signal)
 
@@ -4133,7 +4258,7 @@ def _materializer_import_reachable_objects(
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
-) -> frozenset[bytes]:
+) -> tuple[frozenset[bytes], _ParentGraphCounts]:
     _verify_materializer_source_storage(storage)
     alternate_environment = _materializer_alternate_environment(environment, storage)
     _materializer_verify_revision(
@@ -4164,6 +4289,15 @@ def _materializer_import_reachable_objects(
     _validate_materialized_object_storage(
         root / ".git",
         expected_shallow_boundary=base_sha,
+    )
+    parent_graph = _materializer_parent_graph(
+        root,
+        base_sha,
+        head_sha,
+        expected_commits,
+        git,
+        alternate_environment,
+        hooks,
     )
     manifest, metadata = _materializer_reachable_manifest(
         root,
@@ -4216,7 +4350,7 @@ def _materializer_import_reachable_objects(
             root=root,
             stdin=pack_payload,
         )
-        return frozenset(metadata)
+        return frozenset(metadata), parent_graph
     finally:
         primary_error = sys.exc_info()[1]
         pack_owner.zeroize(primary_error=primary_error)
@@ -4467,7 +4601,7 @@ def materialize_worktree(
             directories["hooks"],
         )
         _validate_materialized_object_storage(git_directory)
-        imported_objects = _materializer_import_reachable_objects(
+        imported_objects, parent_graph = _materializer_import_reachable_objects(
             destination,
             frozen_base,
             frozen_head,
@@ -4599,6 +4733,8 @@ def materialize_worktree(
             root=destination,
             base_sha=frozen_base,
             head_sha=frozen_head,
+            commit_count=parent_graph.commit_count,
+            parent_edge_count=parent_graph.parent_edge_count,
             _parent=parent,
             _parent_identity=parent_identity,
             _root_identity=destination_identity,
@@ -5365,7 +5501,7 @@ def _validate_materialized_frozen_range(
     root: pathlib.Path,
     base_sha: str,
     head_sha: str,
-) -> None:
+) -> _ParentGraphCounts:
     git_directory = _validate_materialized_admin_directory(
         root,
         allow_worktree_config=True,
@@ -5435,8 +5571,12 @@ def _validate_materialized_frozen_range(
             "materialized frozen-range commit traversal exceeds the object-count limit"
         )
 
-    parent_rows = _parse_validator_commit_rows(
-        _git_capture(
+    parent_output_limit = _parent_graph_output_limit(
+        len(expected_commits),
+        len(head_sha),
+    )
+    try:
+        parent_payload = _git_capture(
             root,
             (
                 "rev-list",
@@ -5445,35 +5585,22 @@ def _validate_materialized_frozen_range(
                 head_sha,
                 "--",
             ),
-            output_limit_bytes=GIT_OUTPUT_LIMIT_BYTES,
-        ),
+            output_limit_bytes=parent_output_limit,
+        )
+    except ReviewOutputLimitError as error:
+        raise NamedLaneGuardError(
+            "frozen commit parent graph exceeds the parent-edge budget"
+        ) from error
+    parent_graph = _parse_parent_graph(
+        parent_payload,
+        expected_commits,
+        base_sha.encode("ascii"),
         len(head_sha),
         label="materialized shallow parent traversal",
-    )
-    parents_by_commit: dict[bytes, tuple[bytes, ...]] = {}
-    for row in parent_rows:
-        commit, *parents = row
-        if commit in parents_by_commit:
-            raise NamedLaneGuardError(
-                "materialized shallow parent traversal contains duplicate commits"
-            )
-        parents_by_commit[commit] = tuple(parents)
-    if frozenset(parents_by_commit) != expected_commits:
-        raise NamedLaneGuardError(
+        scope_mismatch_message=(
             "materialized shallow commit scope does not match the frozen range"
-        )
-    frozen_base = base_sha.encode("ascii")
-    if parents_by_commit.get(frozen_base) != ():
-        raise NamedLaneGuardError(
-            "materialized frozen base is not the sole shallow boundary"
-        )
-    if any(
-        parent not in expected_commits
-        for commit, parents in parents_by_commit.items()
-        if commit != frozen_base
-        for parent in parents
-    ):
-        raise NamedLaneGuardError("materialized commit parent escapes the frozen range")
+        ),
+    )
 
     # Revalidate the range-bearing storage and refs after graph traversal so a
     # changed shallow boundary or endpoint cannot be handed to the first status.
@@ -5496,6 +5623,7 @@ def _validate_materialized_frozen_range(
         raise NamedLaneGuardError(
             "materialized HEAD changed during frozen-range validation"
         )
+    return parent_graph
 
 
 def validate_worktree(
@@ -5526,7 +5654,7 @@ def validate_worktree(
         raise NamedLaneGuardError(
             "materialized frozen head is not the exact commit object"
         )
-    _validate_materialized_frozen_range(
+    parent_graph = _validate_materialized_frozen_range(
         root,
         frozen_base,
         frozen_head,
@@ -5607,6 +5735,8 @@ def validate_worktree(
         root=root,
         base_sha=frozen_base,
         head_sha=frozen_head,
+        commit_count=parent_graph.commit_count,
+        parent_edge_count=parent_graph.parent_edge_count,
         symlink_count=len(symlinks),
         guidance_count=len(guidance),
     )
@@ -7105,6 +7235,8 @@ def _emit_materialized_receipt(result: MaterializedWorktree) -> None:
                 "worktree": str(result.root),
                 "base": result.base_sha,
                 "head": result.head_sha,
+                "commit_count": result.commit_count,
+                "parent_edge_count": result.parent_edge_count,
             }
         )
         sys.stdout.flush()
@@ -7215,6 +7347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "status": "ok",
                         "base": result.base_sha,
                         "head": result.head_sha,
+                        "commit_count": result.commit_count,
+                        "parent_edge_count": result.parent_edge_count,
                         "symlink_count": result.symlink_count,
                         "guidance_count": result.guidance_count,
                     }

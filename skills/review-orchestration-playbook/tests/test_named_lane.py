@@ -3277,6 +3277,164 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertIn("leaf=legacy-parent-drift-view", payload["reason"])
         self.assertNotIn(str(temporary_path), payload["reason"])
 
+    def test_parent_graph_output_limit_uses_exact_hash_width_formula(self) -> None:
+        limit = named_lane_runtime.MATERIALIZER_PARENT_EDGE_COUNT_LIMIT
+        self.assertEqual(
+            named_lane_runtime._parent_graph_output_limit(3, 40),
+            (3 + limit) * 41,
+        )
+        self.assertEqual(
+            named_lane_runtime._parent_graph_output_limit(3, 64),
+            (3 + limit) * 65,
+        )
+
+    def test_parent_graph_edge_boundary_counts_duplicate_parent_tokens(self) -> None:
+        base = b"1" * 40
+        head = b"2" * 40
+        payload = head + b" " + base + b" " + base + b"\n" + base + b"\n"
+        expected_commits = frozenset((base, head))
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "MATERIALIZER_PARENT_EDGE_COUNT_LIMIT",
+            2,
+        ):
+            counts = named_lane_runtime._parse_parent_graph(
+                payload,
+                expected_commits,
+                base,
+                40,
+                label="test parent graph",
+                scope_mismatch_message="scope mismatch",
+            )
+
+        self.assertEqual(counts.commit_count, 2)
+        self.assertEqual(counts.parent_edge_count, 2)
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "MATERIALIZER_PARENT_EDGE_COUNT_LIMIT",
+                1,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "parent-edge budget",
+            ),
+        ):
+            named_lane_runtime._parse_parent_graph(
+                payload,
+                expected_commits,
+                base,
+                40,
+                label="test parent graph",
+                scope_mismatch_message="scope mismatch",
+            )
+
+    def test_small_merge_parent_edge_budget_is_shared_and_fails_before_pack(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        tree = git(self.repo, "rev-parse", f"{base}^{{tree}}")
+        left = git(self.repo, "commit-tree", tree, "-p", base, "-m", "left")
+        right = git(self.repo, "commit-tree", tree, "-p", base, "-m", "right")
+        head = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-p",
+            left,
+            "-p",
+            right,
+            "-m",
+            "merge",
+        )
+        git(self.repo, "update-ref", "refs/heads/master", head, base)
+        destination = self.root / "parent-budget-merge-lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "MATERIALIZER_PARENT_EDGE_COUNT_LIMIT",
+                4,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                wraps=original_capture,
+            ) as capture,
+        ):
+            materialized = materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+            validated = validate_worktree(destination, base, head)
+
+        self.assertEqual(materialized.commit_count, 4)
+        self.assertEqual(materialized.parent_edge_count, 4)
+        self.assertEqual(validated.commit_count, 4)
+        self.assertEqual(validated.parent_edge_count, 4)
+        parent_calls = [
+            call
+            for call in capture.call_args_list
+            if "rev-list" in tuple(call.args[0]) and "--parents" in tuple(call.args[0])
+        ]
+        self.assertEqual(len(parent_calls), 2)
+        expected_output_limit = (4 + 4) * (len(head) + 1)
+        self.assertTrue(
+            all(
+                call.kwargs["stdout_limit_bytes"] == expected_output_limit
+                for call in parent_calls
+            )
+        )
+
+        rejected_destination = self.root / "parent-budget-rejected-lane"
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "MATERIALIZER_PARENT_EDGE_COUNT_LIMIT",
+                3,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                wraps=original_capture,
+            ) as rejected_capture,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "parent-edge budget",
+            ),
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                rejected_destination,
+                base,
+                head,
+            )
+
+        rejected_commands = [
+            tuple(call.args[0]) for call in rejected_capture.call_args_list
+        ]
+        self.assertFalse(
+            any("pack-objects" in command for command in rejected_commands)
+        )
+        self.assertFalse(rejected_destination.exists())
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "MATERIALIZER_PARENT_EDGE_COUNT_LIMIT",
+                3,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "parent-edge budget",
+            ),
+        ):
+            validate_worktree(destination, base, head)
+
     def test_materializer_checks_out_exact_head_without_running_status(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -3314,6 +3472,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(result.root, destination)
         self.assertEqual(result.base_sha, base)
         self.assertEqual(result.head_sha, head)
+        self.assertEqual(result.commit_count, 2)
+        self.assertEqual(result.parent_edge_count, 1)
         self.assertEqual(git(destination, "rev-parse", "HEAD"), head)
         self.assertEqual(
             git(destination, "rev-parse", MATERIALIZER_BASE_REF),
@@ -3394,6 +3554,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         validated = validate_worktree(destination, base, head)
         self.assertEqual(validated.head_sha, head)
+        self.assertEqual(validated.commit_count, 2)
+        self.assertEqual(validated.parent_edge_count, 1)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
         self.assertEqual(
             list(self.root.glob(".named-lane-materializer-*")),
@@ -3737,6 +3899,78 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(payload.before_clear, b"\x00" * 19)
         self.assertEqual(payload, bytearray())
         self.assertIsNone(owner.payload)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "pack capture cleanup requires POSIX pthread_sigmask",
+    )
+    def test_materializer_pack_failure_survives_signal_during_final_restore(
+        self,
+    ) -> None:
+        class AuditedPack(bytearray):
+            before_clear: bytes | None = None
+
+            def clear(self) -> None:
+                self.before_clear = bytes(self)
+                super().clear()
+
+        payload = AuditedPack(b"failed-pack-payload")
+        capture = mock.Mock(
+            returncode=1,
+            stdout=payload,
+            stderr=bytearray(b"failure detail"),
+        )
+        owner = named_lane_runtime._MaterializerPackPayloadOwner()
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def interrupt_final_restore(
+            mask: set[signal.Signals] | None,
+        ) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 2:
+                signal.raise_signal(signal.SIGTERM)
+            real_restore(mask)
+
+        with named_lane_runtime._structured_forwarded_signals():
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    return_value=capture,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "restore_signal_mask",
+                    side_effect=interrupt_final_restore,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "bounded materializer Git pack-objects failed",
+                ),
+            ):
+                named_lane_runtime._materializer_pack_manifest(
+                    self.repo,
+                    bytearray(b"manifest\n"),
+                    pathlib.Path("/usr/bin/git"),
+                    {},
+                    self.root / "hooks",
+                    owner,
+                )
+
+        self.assertEqual(restore_calls, 2)
+        self.assertEqual(payload.before_clear, b"\x00" * 19)
+        self.assertEqual(payload, bytearray())
+        self.assertEqual(capture.stderr, bytearray(b"\x00" * 14))
+        self.assertIsNone(owner.payload)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
@@ -4713,6 +4947,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         receipt = json.loads(stdout.getvalue())
         self.assertEqual(receipt["base"], base)
         self.assertEqual(receipt["head"], head)
+        self.assertEqual(receipt["commit_count"], 2)
+        self.assertEqual(receipt["parent_edge_count"], 1)
 
     def test_validator_fences_a_nonrepository_from_its_ancestor(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -6042,6 +6278,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "worktree": str(destination),
                 "base": base,
                 "head": head,
+                "commit_count": 2,
+                "parent_edge_count": 1,
             },
         )
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)

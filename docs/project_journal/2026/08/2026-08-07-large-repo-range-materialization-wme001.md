@@ -24,7 +24,9 @@ superseded_by:
 - The WME large-repository fixture's exact inclusive-range union produced a
   629,546,021-byte pack. The bounded exact-range pack ceiling is therefore
   768 MiB, while the 250,000-object, 2 GiB logical-object, checkout, path, and
-  legacy-prefix budgets remain unchanged.
+  legacy-prefix budgets remain unchanged. A separate 250,000 parent-edge
+  occurrence budget now closes materialization and validation over the same
+  bounded parent traversal.
 
 ## Current State
 
@@ -35,6 +37,10 @@ superseded_by:
   equal the source scope. The total destination object inventory must then
   equal the range snapshot manifest before `fsck`, local completeness checks,
   and detached checkout.
+- Materialization counts every parent token before object import under a
+  format-aware output ceiling; validation independently repeats the same graph
+  count. Their success receipts bind equal `commit_count` and
+  `parent_edge_count` values.
 - The full source `base_sha..head_sha` set must equal its `--ancestry-path`
   projection; off-corridor side history is rejected so materialization and the
   source-independent formal validator bind the same topology.
