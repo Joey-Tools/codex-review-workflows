@@ -39,8 +39,10 @@ superseded_by:
   and detached checkout.
 - Materialization counts every parent token before object import under a
   format-aware output ceiling; validation independently repeats the same graph
-  count. Their success receipts bind equal `commit_count` and
-  `parent_edge_count` values.
+  count. Their success receipts bind type-preserving equal `base`, `head`,
+  `worktree`, `commit_count`, `parent_edge_count`, `parent_graph_sha256`, and
+  `local_config_sha256` values. The canonical graph digest byte-sorts commit
+  rows while retaining each row's parent-token order and duplicate tokens.
 - The full source `base_sha..head_sha` set must equal its `--ancestry-path`
   projection; off-corridor side history is rejected so materialization and the
   source-independent formal validator bind the same topology.
@@ -51,6 +53,23 @@ superseded_by:
 - Arbitrary, pre-existing, missing, additional, malformed, replaced, or
   content/access-policy-drifted destination shallow state is rejected.
   Timestamp-only churn is not treated as range mutation.
+- A formal destination rejects `.git/config.worktree`, binds the exact local
+  config bytes plus its object identity and access policy within each guard
+  invocation, and compares `local_config_sha256` across materialization and
+  validation. It creates and binds owner-private `.git/info`, rejects
+  `info/grafts`, and revalidates the directory and graft absence around graph
+  traversal and before the first status or receipt handoff.
+- Structured control-object failures now preserve distinct stable machine
+  reasons for missing, inspection failure, object-identity mismatch, protected
+  content mismatch, and access-policy mismatch. Human-readable detail remains
+  available without forcing the parent to parse generic `changed` prose.
+- Materializer, validator, Codex-reviewer, and direct-Claude Git environments
+  fix `GIT_GRAFT_FILE=/dev/null`; materializer, validator, and Codex prefixes
+  force `core.checkStat=default`, `core.ignoreStat=false`, and
+  `core.trustCtime=true`, while direct repository stat-key definitions are
+  rejected. Stat changes trigger Git content revalidation but are not treated
+  as content mutation by themselves, and the guard does not unconditionally
+  rehash the full ordinary-file tree.
 - The captured pack remains one bounded in-memory bytearray. Cleanup overwrites
   it with fixed 64 KiB chunks and clears it, avoiding a second pack-sized wipe
   allocation. Forwarded signals remain blocked across capture ownership
@@ -82,3 +101,28 @@ superseded_by:
 - Runtime and focused regressions:
   `skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py`
   and `skills/review-orchestration-playbook/tests/test_named_lane.py`.
+- Reviewer finding addressed: equal commit/edge counts alone did not prove the
+  same ordered parent graph, and a target graft or weakened stat configuration
+  could alter topology or clean-state interpretation between point checks.
+  The exact graph/config digests, graft-free info binding, fixed Git
+  environment/prefix, and formal config rejection above close those gaps.
+- Fresh-review finding addressed: config and Git-info control checks no longer
+  collapse deletion, inspection failure, identity replacement, content drift,
+  and access-policy drift into indistinguishable machine-visible reasons.
+- Follow-up fresh-review finding addressed: malformed, oversized, unparseable,
+  or malformed-record local Git config inputs now retain the stable config
+  inspection-failure reason instead of leaking free-form parser prose.
+- Contract regression coverage is in
+  `skills/review-orchestration-playbook/tests/test_contracts.py`. The focused
+  canonical contract run covered materialization ordering, formal control and
+  receipt binding, Codex-prefix isolation, pristine/property-scoped guards,
+  fsmonitor rejection, and direct-Claude environment isolation: 7 tests ran
+  and all passed.
+- Current full local coverage passed 228 named-lane tests and 113 contract
+  tests. The other unchanged runtime partitions completed 708 tests with one
+  filesystem capability skip and no failures, and 433 tests with three
+  platform skips and no failures. A final 1,429-test partition had 22 platform
+  skips plus 18 unchanged provider tests blocked by the local sandbox's
+  Unix-socket policy; Joey authorized skipping unchanged permission-only
+  failures. Its one Python-3.12-only opcode-tracing mismatch passed when rerun
+  under the repository's Python 3.13 interpreter.
