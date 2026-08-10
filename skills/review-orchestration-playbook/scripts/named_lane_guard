@@ -32,6 +32,11 @@ _SOURCE_LIMIT_BYTES = 1024 * 1024
 _DEFAULT_RUNTIME_SOURCES = (
     ("review_runtime", "__init__.py", True),
     ("review_runtime.common", "common.py", False),
+    (
+        "review_runtime.claude_version_policy",
+        "claude_version_policy.py",
+        False,
+    ),
     ("review_runtime.named_lane", "named_lane.py", False),
 )
 _CLAUDE_PREFLIGHT_SOURCES = (
@@ -189,9 +194,7 @@ def _read_bound_source(
     nonblocking = getattr(os, "O_NONBLOCK", None)
     if nonblocking is None:
         raise _fail("this platform cannot open bound sources without blocking")
-    flags = (
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | nonblocking
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | nonblocking
     descriptor: int | None = None
     try:
         descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)

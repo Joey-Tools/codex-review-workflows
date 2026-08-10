@@ -209,6 +209,7 @@ def load_stream_contract(
             "init_field_values",
             "intermediate_event_field_sets",
             "intermediate_session_binding",
+            "named_direct_expected_session_binding",
             "terminal_field_set",
             "terminal_variants",
             "model_identity",

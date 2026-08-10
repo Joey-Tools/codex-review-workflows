@@ -52,6 +52,19 @@
       ]
     }
   },
+  "named_direct_session_binding": {
+    "launch_profile": "named-direct",
+    "minimum_inclusive": "2.1.226",
+    "field": "session_id",
+    "expected_source": "validator_argument",
+    "required_event": "init",
+    "propagated_events": [
+      "intermediate",
+      "terminal"
+    ],
+    "rule": "exact_expected_lowercase_uuid_v4",
+    "failure": "inconclusive"
+  },
   "stream_contract": {
     "encoding": "utf-8",
     "format": "jsonl",
