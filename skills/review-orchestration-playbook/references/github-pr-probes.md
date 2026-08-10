@@ -503,8 +503,9 @@ short clean remains on its independent dual REST resolution path. Zero
 `--prefix` values are valid: the producer still performs complete
 source/head/view validation and cleanup and must return `receipts: []`.
 
-The producer is part of the default exact three-source manifest-bound guard
-closure through `review_runtime.named_lane`. It applies the materializer-grade
+The producer is part of the default exact four-source manifest-bound guard
+closure through `review_runtime.named_lane`, including the canonical Claude
+version-policy source. It applies the materializer-grade
 source worktree, `.git` marker, admin/common/object-directory, linked-worktree
 back-pointer, owner/type/identity/access-policy, object-format, and local
 completeness checks before creating a new minimal owner-private bare control

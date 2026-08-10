@@ -32,6 +32,23 @@ def supported_help(*, safe_mode: str | None = None) -> str:
 
 
 class ClaudeCapabilitiesTest(unittest.TestCase):
+    def test_named_direct_session_capability_starts_at_2_1_226(self) -> None:
+        baseline = capabilities.CLAUDE_REQUIRED_OPTIONS
+        before = capabilities.named_direct_required_options("2.1.225")
+        gated = capabilities.named_direct_required_options("2.1.226")
+
+        self.assertEqual(before, baseline)
+        self.assertNotIn("--session-id", before)
+        self.assertEqual(gated.count("--session-id"), 1)
+        self.assertEqual(
+            gated.index("--session-id"),
+            baseline.index("--safe-mode"),
+        )
+        self.assertEqual(
+            tuple(option for option in gated if option != "--session-id"),
+            baseline,
+        )
+
     def test_version_range_floats_within_major_two(self) -> None:
         for version in ("2.1.211", "2.1.212", "2.1.216", "2.99.999"):
             with self.subTest(version=version):

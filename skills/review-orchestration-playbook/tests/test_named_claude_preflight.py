@@ -31,9 +31,17 @@ from review_runtime import named_claude_preflight as preflight_module  # noqa: E
 
 class NamedClaudePreflightTest(unittest.TestCase):
     @staticmethod
-    def _supported_help() -> bytes:
+    def _supported_help(version: str = "2.1.212") -> bytes:
         lines = ["Usage: claude [options]", "", "Options:"]
-        for option in claude_capabilities.CLAUDE_REQUIRED_OPTIONS:
+        try:
+            required_options = claude_capabilities.named_direct_required_options(
+                version
+            )
+        except claude_version_policy.ClaudeVersionPolicyError:
+            # Out-of-range fixtures still need syntactically valid help so the
+            # preflight itself, rather than the fixture builder, rejects them.
+            required_options = claude_capabilities.CLAUDE_REQUIRED_OPTIONS
+        for option in required_options:
             if option == "--safe-mode":
                 description = (
                     "Start with all customizations (CLAUDE.md, skills, plugins, "
@@ -62,7 +70,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
         if marker is not None:
             lines.append(f"printf '%s\\n' executed >> {shlex.quote(str(marker))}")
         lines.append('if [ "${1-}" = "--help" ]; then')
-        for line in self._supported_help().decode("utf-8").splitlines():
+        for line in self._supported_help(version).decode("utf-8").splitlines():
             lines.append(f"  printf '%s\\n' {shlex.quote(line)}")
         lines.extend(
             (
@@ -135,7 +143,11 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 b"",
             ),
             help_probe_result=help_probe_result
-            or preflight_module.ProbeResult(0, self._supported_help(), b""),
+            or preflight_module.ProbeResult(
+                0,
+                self._supported_help(release_version),
+                b"",
+            ),
         )
 
     def _verified_with_probe(
@@ -182,7 +194,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_compatible_stable_release_matrix_is_not_rejected_by_version(self) -> None:
-        for version in ("2.1.211", "2.1.216", "2.99.999"):
+        for version in ("2.1.211", "2.1.216", "2.1.226", "2.99.999"):
             with (
                 self.subTest(version=version),
                 tempfile.TemporaryDirectory() as temporary,
@@ -202,6 +214,44 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     value["compatible_version_range"],
                     claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
                 )
+
+    def test_2_1_226_requires_session_id_capability_without_backporting_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary) / "home"
+            installed = home / ".local/share/claude/versions/2.1.226"
+            self._write_candidate(installed, version="2.1.226")
+
+            def verifier(
+                path: pathlib.Path,
+                release_version: str,
+                _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
+            ) -> preflight_module.VerifiedCandidate:
+                return self._verified(
+                    path,
+                    release_version=release_version,
+                    help_probe_result=preflight_module.ProbeResult(
+                        0,
+                        self._supported_help("2.1.225"),
+                        b"",
+                    ),
+                )
+
+            value = preflight_module.preflight(home=home, verifier=verifier)
+
+            self.assertEqual(value["classification"], "blocked")
+            self.assertEqual(value["reason"], "capability-contract-mismatch")
+
+        self.assertNotIn(
+            "--session-id",
+            claude_capabilities.named_direct_required_options("2.1.225"),
+        )
+        self.assertIn(
+            "--session-id",
+            claude_capabilities.named_direct_required_options("2.1.226"),
+        )
 
     def test_explicit_arbitrary_path_accepts_a_separate_compatible_version(
         self,
