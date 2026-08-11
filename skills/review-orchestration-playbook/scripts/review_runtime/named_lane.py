@@ -8538,11 +8538,39 @@ def run_claude(
                             capture.stderr[:] = b"\x00" * len(capture.stderr)
                         raise ForwardedSignal(deferred_signal)
                 else:
-                    deferred_signal = _restore_claude_snapshot_signal_mask(
-                        snapshot_mask
-                    )
+                    try:
+                        deferred_signal = _restore_claude_snapshot_signal_mask(
+                            snapshot_mask
+                        )
+                    except BaseException as mask_restore_error:
+                        if isinstance(
+                            lifecycle_error,
+                            _ClaudeSessionEnvCleanupError,
+                        ):
+                            prior_link = lifecycle_error.__cause__
+                            if prior_link is None:
+                                prior_link = lifecycle_error.__context__
+                            with contextlib.suppress(Exception):
+                                mask_restore_error.__context__ = prior_link
+                            raise lifecycle_error.with_traceback(
+                                lifecycle_error.__traceback__
+                            ) from mask_restore_error
+                        raise
                     if deferred_signal is not None:
-                        raise ForwardedSignal(deferred_signal)
+                        signal_error = ForwardedSignal(deferred_signal)
+                        if isinstance(
+                            lifecycle_error,
+                            _ClaudeSessionEnvCleanupError,
+                        ):
+                            prior_link = lifecycle_error.__cause__
+                            if prior_link is None:
+                                prior_link = lifecycle_error.__context__
+                            with contextlib.suppress(Exception):
+                                signal_error.__context__ = prior_link
+                            raise lifecycle_error.with_traceback(
+                                lifecycle_error.__traceback__
+                            ) from signal_error
+                        raise signal_error
             if process_error is not None:
                 raise process_error.with_traceback(process_error.__traceback__)
             if capture is None:

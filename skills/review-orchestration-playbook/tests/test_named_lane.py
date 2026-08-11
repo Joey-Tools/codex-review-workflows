@@ -9138,6 +9138,137 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(observed["mode"], 0o700)
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "prelaunch session cleanup requires POSIX pthread_sigmask",
+    )
+    def test_prelaunch_session_cleanup_precedes_signal_restore_failures(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        session_parent = home / ".claude" / "session-env"
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_restore = named_lane_runtime.restore_signal_mask
+
+        for label in ("mask-restore", "deferred-signal"):
+            with self.subTest(label=label):
+                leaf = session_parent / (
+                    "00000000-0000-4000-8000-"
+                    f"{1 if label == 'mask-restore' else 2:012d}"
+                )
+                prepare_error: (
+                    named_lane_runtime._ClaudeSessionEnvCleanupError | None
+                ) = None
+                prepare_cause = OSError("synthetic prelaunch validation failure")
+                mask_restore_error = NamedLaneGuardError(
+                    "synthetic signal mask restoration failure"
+                )
+
+                def fail_after_leaf_creation(
+                    candidate_home: pathlib.Path,
+                ) -> object:
+                    nonlocal prepare_error
+                    self.assertEqual(candidate_home, home)
+                    leaf.mkdir(mode=0o700)
+                    leaf.chmod(0o700)
+                    parent_metadata = session_parent.stat()
+                    leaf_metadata = leaf.stat()
+                    prepare_error = named_lane_runtime._ClaudeSessionEnvCleanupError(
+                        None,
+                        "prelaunch",
+                        retained_parent_identity=(
+                            parent_metadata.st_dev,
+                            parent_metadata.st_ino,
+                        ),
+                        retained_leaf=leaf.name,
+                        retained_leaf_identity=(
+                            leaf_metadata.st_dev,
+                            leaf_metadata.st_ino,
+                        ),
+                    )
+                    if label == "mask-restore":
+                        try:
+                            raise prepare_cause
+                        except OSError:
+                            raise prepare_error
+                    raise prepare_error from prepare_cause
+
+                def restore_with_secondary(
+                    previous_mask: set[signal.Signals],
+                ) -> signal.Signals | None:
+                    real_restore(previous_mask)
+                    if label == "deferred-signal":
+                        return signal.SIGTERM
+                    raise mask_restore_error
+
+                try:
+                    with (
+                        mock.patch(
+                            "pwd.getpwuid",
+                            return_value=self.claude_account(home),
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "_prepare_claude_session_env",
+                            side_effect=fail_after_leaf_creation,
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "_restore_claude_snapshot_signal_mask",
+                            side_effect=restore_with_secondary,
+                        ),
+                        self.assertRaises(
+                            named_lane_runtime._ClaudeSessionEnvCleanupError
+                        ) as context,
+                    ):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"prelaunch-{label}.out",
+                            stderr_path=self.root / f"prelaunch-{label}.err",
+                            command=(str(executable),),
+                            prompt=b"",
+                            timeout_seconds=2.0,
+                            stream_limit_bytes=16 * 1024,
+                        )
+
+                    error = context.exception
+                    self.assertIs(error, prepare_error)
+                    self.assertEqual(error.process_reason, "prelaunch")
+                    self.assertIsNone(error.retained_path)
+                    parent_metadata = session_parent.stat()
+                    leaf_metadata = leaf.stat()
+                    self.assertEqual(
+                        error.retained_parent_identity,
+                        (parent_metadata.st_dev, parent_metadata.st_ino),
+                    )
+                    self.assertEqual(error.retained_leaf, leaf.name)
+                    self.assertEqual(
+                        error.retained_leaf_identity,
+                        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+                    )
+                    self.assertTrue(leaf.is_dir())
+                    if label == "mask-restore":
+                        self.assertIs(error.__cause__, mask_restore_error)
+                    else:
+                        self.assertIsInstance(error.__cause__, ForwardedSignal)
+                        self.assertEqual(error.__cause__.signum, signal.SIGTERM)
+                    self.assertIs(error.__cause__.__context__, prepare_cause)
+                    self.assertIsNot(error.__cause__.__context__, error)
+                    self.assertEqual(
+                        signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                        initial_mask,
+                    )
+                    self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+                    self.assertFalse((self.root / f"prelaunch-{label}.out").exists())
+                    self.assertFalse((self.root / f"prelaunch-{label}.err").exists())
+                finally:
+                    real_restore(initial_mask)
+                    if leaf.exists():
+                        leaf.rmdir()
+
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
     def test_claude_session_env_is_retained_without_quiescence_proof(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
