@@ -186,6 +186,7 @@ class _ClaudeSessionEnvCleanupError(NamedLaneGuardError):
         retained_parent_identity: tuple[int, int] | None = None,
         retained_leaf: str | None = None,
         retained_leaf_identity: tuple[int, int] | None = None,
+        retained_for_quiescence: bool = False,
     ) -> None:
         if retained_path is None and (
             retained_parent_identity is None or retained_leaf is None
@@ -194,11 +195,21 @@ class _ClaudeSessionEnvCleanupError(NamedLaneGuardError):
                 "descriptor-bound session environment cleanup evidence requires "
                 "parent identity and leaf"
             )
+        if retained_for_quiescence and (
+            retained_parent_identity is None
+            or retained_leaf is None
+            or retained_leaf_identity is None
+        ):
+            raise ValueError(
+                "unquiescent session environment evidence requires parent and "
+                "leaf identities"
+            )
         self.retained_path = retained_path
         self.process_reason = process_reason
         self.retained_parent_identity = retained_parent_identity
         self.retained_leaf = retained_leaf
         self.retained_leaf_identity = retained_leaf_identity
+        self.retained_for_quiescence = retained_for_quiescence
         detail = f"retained path: {retained_path}"
         if retained_path is None:
             assert retained_parent_identity is not None
@@ -213,9 +224,11 @@ class _ClaudeSessionEnvCleanupError(NamedLaneGuardError):
                     f", leaf device={retained_leaf_identity[0]}, "
                     f"inode={retained_leaf_identity[1]}"
                 )
+        failure = "cleanup failed"
+        if retained_for_quiescence:
+            failure = "was retained because process quiescence was not proven"
         super().__init__(
-            "Claude session environment cleanup failed after "
-            f"{process_reason}; {detail}"
+            f"Claude session environment {failure} after {process_reason}; {detail}"
         )
 
 
@@ -7398,6 +7411,8 @@ def _claude_session_env_path_names_bound_directory(
 def _claude_session_env_cleanup_error(
     session: _ClaudeSessionEnv,
     process_reason: str,
+    *,
+    retained_for_quiescence: bool = False,
 ) -> _ClaudeSessionEnvCleanupError:
     retained_path = (
         session.parent_path / session.session_id
@@ -7410,6 +7425,7 @@ def _claude_session_env_cleanup_error(
         retained_parent_identity=session.parent_identity,
         retained_leaf=session.session_id,
         retained_leaf_identity=session.leaf_identity[:2],
+        retained_for_quiescence=retained_for_quiescence,
     )
 
 
@@ -7448,6 +7464,7 @@ def _command_has_claude_session_selector(command: Sequence[str]) -> bool:
         "--session-id=",
         "--resume=",
         "--continue=",
+        "--fork-session=",
         "--from-pr=",
         "--teleport=",
         "--cloud=",
@@ -7463,6 +7480,7 @@ def _command_has_claude_session_selector(command: Sequence[str]) -> bool:
         argument in exact
         or argument.startswith(prefixes)
         or (argument.startswith("-r") and len(argument) > 2)
+        or (argument.startswith("-c") and len(argument) > 2)
         or (argument.startswith("-w") and len(argument) > 2)
         for argument in command
     )
@@ -8250,6 +8268,44 @@ def run_claude(
             session_env: _ClaudeSessionEnv | None = None
             capture = None
             process_error: BaseException | None = None
+            process_supervision_started = False
+            process_quiescence_proven = False
+            session_cleanup_attempted = False
+            session_cleanup_error: BaseException | None = None
+            session_parent_custody_error: BaseException | None = None
+            session_control_error: (
+                _ClaudeSessionEnvCleanupError | _ClaudeSessionEnvCustodyError | None
+            ) = None
+
+            def mark_process_quiescent() -> None:
+                nonlocal process_quiescence_proven
+                process_quiescence_proven = True
+
+            def finalize_session_env() -> None:
+                nonlocal session_cleanup_attempted
+                nonlocal session_cleanup_error
+                nonlocal session_parent_custody_error
+                if session_cleanup_attempted:
+                    raise NamedLaneGuardError(
+                        "Claude session environment finalization ran more than once"
+                    )
+                session_cleanup_attempted = True
+                assert session_env is not None
+                try:
+                    _revalidate_claude_session_env_parent(session_env)
+                except BaseException as error:
+                    session_parent_custody_error = error
+                try:
+                    _cleanup_claude_session_env(session_env)
+                except BaseException as error:
+                    session_cleanup_error = error
+                    return
+                try:
+                    _revalidate_claude_session_env_parent(session_env)
+                except BaseException as error:
+                    if session_parent_custody_error is None:
+                        session_parent_custody_error = error
+
             try:
                 if session_env_required:
                     session_env = _prepare_claude_session_env(
@@ -8270,17 +8326,23 @@ def run_claude(
                 snapshot_command = (str(snapshot.path), *snapshot_arguments)
                 restore_signal_mask(snapshot_mask)
                 try:
+                    process_timeout = _remaining_deadline_seconds(
+                        deadline,
+                        "Claude process supervision",
+                    )
+                    capture_options: dict[str, object] = {}
+                    if session_env is not None:
+                        capture_options["on_process_quiescent"] = mark_process_quiescent
+                    process_supervision_started = True
                     capture = run_bounded_capture(
                         snapshot_command,
                         cwd=root,
                         env=child_environment,
                         stdin=bytearray(prompt),
-                        timeout_seconds=_remaining_deadline_seconds(
-                            deadline,
-                            "Claude process supervision",
-                        ),
+                        timeout_seconds=process_timeout,
                         stdout_limit_bytes=stream_limit,
                         stderr_limit_bytes=stream_limit,
+                        **capture_options,
                     )
                 except BaseException as error:
                     process_error = error
@@ -8289,9 +8351,6 @@ def run_claude(
                     process_error if process_error is not None else sys.exc_info()[1]
                 )
                 cleanup_error: BaseException | None = None
-                session_control_error: (
-                    _ClaudeSessionEnvCleanupError | _ClaudeSessionEnvCustodyError | None
-                ) = None
                 if snapshot is not None or session_env is not None:
                     cleanup_mask_acquired = False
                     try:
@@ -8307,7 +8366,28 @@ def run_claude(
                         cleanup_error = error
                     if session_env is not None:
                         try:
-                            if not cleanup_mask_acquired:
+                            if (
+                                process_supervision_started
+                                and not process_quiescence_proven
+                            ):
+                                retained_reason = _claude_process_failure_reason(
+                                    lifecycle_error
+                                )
+                                if retained_reason == "complete":
+                                    retained_reason = "process-leak"
+                                session_control_error = (
+                                    _claude_session_env_cleanup_error(
+                                        session_env,
+                                        retained_reason,
+                                        retained_for_quiescence=True,
+                                    )
+                                )
+                                if lifecycle_error is None:
+                                    lifecycle_error = ReviewProcessLeakError(
+                                        "Claude process quiescence was not proven"
+                                    )
+                                session_control_error.__cause__ = lifecycle_error
+                            elif not cleanup_mask_acquired:
                                 session_control_error = (
                                     _claude_session_env_cleanup_error(
                                         session_env,
@@ -8315,45 +8395,37 @@ def run_claude(
                                     )
                                 )
                             else:
-                                parent_custody_error: BaseException | None = None
-                                try:
-                                    _revalidate_claude_session_env_parent(session_env)
-                                except BaseException as error:
-                                    parent_custody_error = error
-                                try:
-                                    _cleanup_claude_session_env(session_env)
-                                except BaseException as error:
-                                    session_control_error = (
-                                        _claude_session_env_cleanup_error(
-                                            session_env,
-                                            (
-                                                "parent-custody"
-                                                if parent_custody_error is not None
-                                                else _claude_process_failure_reason(
-                                                    lifecycle_error
-                                                )
-                                            ),
-                                        )
-                                    )
-                                    session_control_error.__cause__ = error
-                                else:
-                                    try:
-                                        _revalidate_claude_session_env_parent(
-                                            session_env
-                                        )
-                                    except BaseException as error:
-                                        if parent_custody_error is None:
-                                            parent_custody_error = error
-                                    if parent_custody_error is not None:
-                                        session_control_error = (
-                                            _claude_session_env_custody_error(
-                                                session_env,
-                                                "parent-custody",
+                                finalize_session_env()
+                            if (
+                                session_control_error is None
+                                and session_cleanup_error is not None
+                            ):
+                                session_control_error = (
+                                    _claude_session_env_cleanup_error(
+                                        session_env,
+                                        (
+                                            "parent-custody"
+                                            if session_parent_custody_error is not None
+                                            else _claude_process_failure_reason(
+                                                lifecycle_error
                                             )
-                                        )
-                                        session_control_error.__cause__ = (
-                                            parent_custody_error
-                                        )
+                                        ),
+                                    )
+                                )
+                                session_control_error.__cause__ = session_cleanup_error
+                            elif (
+                                session_control_error is None
+                                and session_parent_custody_error is not None
+                            ):
+                                session_control_error = (
+                                    _claude_session_env_custody_error(
+                                        session_env,
+                                        "parent-custody",
+                                    )
+                                )
+                                session_control_error.__cause__ = (
+                                    session_parent_custody_error
+                                )
                         finally:
                             for descriptor in (
                                 session_env.leaf_fd,
@@ -8386,17 +8458,32 @@ def run_claude(
                                 session_control_error,
                                 _ClaudeSessionEnvCleanupError,
                             ):
-                                session_control_error = _ClaudeSessionEnvCleanupError(
-                                    session_control_error.retained_path,
-                                    process_reason,
-                                    retained_parent_identity=(
-                                        session_control_error.retained_parent_identity
-                                    ),
-                                    retained_leaf=(session_control_error.retained_leaf),
-                                    retained_leaf_identity=(
-                                        session_control_error.retained_leaf_identity
-                                    ),
-                                )
+                                if session_control_error.retained_for_quiescence:
+                                    secondary_error = mask_restore_error
+                                    if secondary_error is None:
+                                        assert deferred_signal is not None
+                                        secondary_error = ForwardedSignal(
+                                            deferred_signal
+                                        )
+                                    prior_cause = session_control_error.__cause__
+                                    if prior_cause is not None:
+                                        with contextlib.suppress(Exception):
+                                            secondary_error.__context__ = prior_cause
+                                    session_control_error.__cause__ = secondary_error
+                                else:
+                                    session_control_error = _ClaudeSessionEnvCleanupError(
+                                        session_control_error.retained_path,
+                                        process_reason,
+                                        retained_parent_identity=(
+                                            session_control_error.retained_parent_identity
+                                        ),
+                                        retained_leaf=(
+                                            session_control_error.retained_leaf
+                                        ),
+                                        retained_leaf_identity=(
+                                            session_control_error.retained_leaf_identity
+                                        ),
+                                    )
                             else:
                                 session_control_error = _ClaudeSessionEnvCustodyError(
                                     session_control_error.session_id,
@@ -8982,6 +9069,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif session_env.retained_path is not None:
             session_recovery = {"retained_path": str(session_env.retained_path)}
+            if session_env.retained_for_quiescence:
+                assert session_env.retained_parent_identity is not None
+                assert session_env.retained_leaf is not None
+                assert session_env.retained_leaf_identity is not None
+                session_recovery["retained_locator"] = {
+                    "parent_device": session_env.retained_parent_identity[0],
+                    "parent_inode": session_env.retained_parent_identity[1],
+                    "leaf": session_env.retained_leaf,
+                    "leaf_device": session_env.retained_leaf_identity[0],
+                    "leaf_inode": session_env.retained_leaf_identity[1],
+                }
         else:
             assert session_env.retained_parent_identity is not None
             assert session_env.retained_leaf is not None
@@ -9001,7 +9099,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(
             {
                 "status": "inconclusive",
-                "reason": "control-cleanup",
+                "reason": (
+                    "process-leak"
+                    if isinstance(session_env, _ClaudeSessionEnvCleanupError)
+                    and session_env.retained_for_quiescence
+                    else "control-cleanup"
+                ),
                 "snapshot": {
                     "process_reason": snapshot.process_reason,
                     **snapshot_recovery,
@@ -9037,12 +9140,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _ClaudeSessionEnvCleanupError as error:
         payload: dict[str, object] = {
             "status": "inconclusive",
-            "reason": "session-env-cleanup",
+            "reason": (
+                "process-leak"
+                if error.retained_for_quiescence
+                else "session-env-cleanup"
+            ),
             "process_reason": error.process_reason,
         }
         if error.retained_path is not None:
             payload["retained_path"] = str(error.retained_path)
-        else:
+        if error.retained_path is None or error.retained_for_quiescence:
             assert error.retained_parent_identity is not None
             assert error.retained_leaf is not None
             retained_locator: dict[str, object] = {

@@ -157,9 +157,14 @@ parent/leaf device-inode-directory identity, current-account ownership and acces
 policy, and leaf emptiness. Directory `mtime`, `ctime`, `nlink`, and benign parent
 child-entry churn are not mutation evidence. Missing, replaced, nonempty, and
 unreadable or otherwise unprovable state remain distinct fail-closed conditions.
-Cleanup is descriptor-relative and nonrecursive, never adopts an `EEXIST` leaf or
-deletes unexpected children, and reports either a revalidated retained path or a
-parent/leaf identity locator when `rmdir` cannot complete. A non-cooperative
+The bounded supervisor's callback supplies only positive proof of process
+quiescence; it neither performs nor triggers descriptor cleanup. After that proof,
+the outer cleanup path separately acquires a forwarded-signal mask before any
+descriptor-relative, nonrecursive removal, and never adopts an `EEXIST` leaf or
+deletes unexpected children. If that callback does not run, the guard retains the
+possibly active fence, emits `process-leak`, preserves the original supervision
+failure in `process_reason`, and reports parent/leaf identity together with any
+revalidated path. A non-cooperative
 same-UID ABA replacement in the final check-to-`rmdir` window is outside the
 guarantee.
 

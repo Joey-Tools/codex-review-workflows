@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
+    BoundedCapture,
     ForwardedSignal,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
@@ -9138,6 +9139,530 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_is_retained_without_quiescence_proof(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        for label, process_error, process_reason in (
+            ("process-leak", ReviewProcessLeakError("synthetic leak"), "process-leak"),
+            (
+                "output-drain",
+                ReviewOutputDrainError("synthetic drain failure"),
+                "output-drain",
+            ),
+        ):
+            with self.subTest(label=label):
+
+                def fail_without_quiescence(
+                    argv: object,
+                    **kwargs: object,
+                ) -> object:
+                    if str(tuple(argv)[0]).startswith(
+                        str(self.root / ".named-lane-launch-")
+                    ):
+                        self.assertTrue(callable(kwargs["on_process_quiescent"]))
+                        raise process_error
+                    return real_capture(argv, **kwargs)
+
+                retained: pathlib.Path | None = None
+                try:
+                    with (
+                        mock.patch(
+                            "pwd.getpwuid",
+                            return_value=self.claude_account(home),
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "run_bounded_capture",
+                            side_effect=fail_without_quiescence,
+                        ),
+                        self.assertRaises(
+                            named_lane_runtime._ClaudeSessionEnvCleanupError
+                        ) as context,
+                    ):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"unquiescent-{label}.out",
+                            stderr_path=self.root / f"unquiescent-{label}.err",
+                            command=(str(executable),),
+                            prompt=b"",
+                            timeout_seconds=2.0,
+                            stream_limit_bytes=16 * 1024,
+                        )
+
+                    error = context.exception
+                    retained = error.retained_path
+                    self.assertEqual(error.process_reason, process_reason)
+                    self.assertTrue(error.retained_for_quiescence)
+                    self.assertIsNotNone(retained)
+                    assert retained is not None
+                    parent_metadata = retained.parent.stat()
+                    leaf_metadata = retained.stat()
+                    self.assertEqual(
+                        error.retained_parent_identity,
+                        (parent_metadata.st_dev, parent_metadata.st_ino),
+                    )
+                    self.assertEqual(error.retained_leaf, retained.name)
+                    self.assertEqual(
+                        error.retained_leaf_identity,
+                        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+                    )
+                    self.assertEqual(list(retained.iterdir()), [])
+                    self.assertFalse((self.root / f"unquiescent-{label}.out").exists())
+                    self.assertFalse((self.root / f"unquiescent-{label}.err").exists())
+                finally:
+                    if retained is not None:
+                        retained.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_is_retained_when_capture_returns_without_proof(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        retained: pathlib.Path | None = None
+
+        def complete_without_quiescence(
+            argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained
+            arguments = tuple(str(argument) for argument in argv)
+            if not arguments[0].startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(argv, **kwargs)
+            session_index = arguments.index("--session-id")
+            retained = home / ".claude" / "session-env" / arguments[session_index + 1]
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            return BoundedCapture(arguments, 0, bytearray(), bytearray())
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=complete_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "capture-without-proof.out",
+                    stderr_path=self.root / "capture-without-proof.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(error.process_reason, "process-leak")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained)
+            self.assertIsInstance(error.__cause__, ReviewProcessLeakError)
+            assert retained is not None
+            self.assertTrue(retained.is_dir())
+            self.assertEqual(list(retained.iterdir()), [])
+            self.assertFalse((self.root / "capture-without-proof.out").exists())
+            self.assertFalse((self.root / "capture-without-proof.err").exists())
+        finally:
+            if retained is not None:
+                retained.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_unquiescent_session_env_survives_cleanup_mask_acquisition_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_block = named_lane_runtime.block_forwarded_signals
+        real_capture = named_lane_runtime.run_bounded_capture
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        block_calls = 0
+        capture_entered = False
+        process_error = ReviewProcessLeakError("synthetic process leak")
+        retained_leaf: pathlib.Path | None = None
+        retained_snapshot: pathlib.Path | None = None
+
+        def fail_cleanup_mask() -> set[signal.Signals] | None:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 2:
+                return None
+            return real_block()
+
+        def fail_without_quiescence(
+            _argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal capture_entered, retained_leaf, retained_snapshot
+            arguments = tuple(_argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(_argv, **kwargs)
+            capture_entered = True
+            retained_snapshot = pathlib.Path(str(arguments[0]))
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "block_forwarded_signals",
+                    side_effect=fail_cleanup_mask,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeControlCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-mask-acquire.out",
+                    stderr_path=self.root / "unquiescent-mask-acquire.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            session_error = context.exception.session_env
+            self.assertTrue(capture_entered)
+            self.assertEqual(block_calls, 2)
+            self.assertEqual(session_error.process_reason, "process-leak")
+            self.assertTrue(session_error.retained_for_quiescence)
+            self.assertIs(session_error.__cause__, process_error)
+            self.assertEqual(session_error.retained_path, retained_leaf)
+            self.assertEqual(
+                context.exception.snapshot.retained_path, retained_snapshot
+            )
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertEqual(list(retained_leaf.iterdir()), [])
+            self.assertFalse((self.root / "unquiescent-mask-acquire.out").exists())
+            self.assertFalse((self.root / "unquiescent-mask-acquire.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+            if retained_snapshot is not None:
+                retained_snapshot.unlink()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_quiescent_session_env_survives_cleanup_mask_acquisition_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_block = named_lane_runtime.block_forwarded_signals
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        block_calls = 0
+        retained_leaf: pathlib.Path | None = None
+        retained_snapshot: pathlib.Path | None = None
+
+        def fail_cleanup_mask() -> set[signal.Signals] | None:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 2:
+                return None
+            return real_block()
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "block_forwarded_signals",
+                    side_effect=fail_cleanup_mask,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeControlCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "quiescent-mask-acquire.out",
+                    stderr_path=self.root / "quiescent-mask-acquire.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            session_error = context.exception.session_env
+            self.assertEqual(block_calls, 2)
+            self.assertEqual(session_error.process_reason, "signal-mask-unavailable")
+            self.assertFalse(session_error.retained_for_quiescence)
+            retained_leaf = session_error.retained_path
+            retained_snapshot = context.exception.snapshot.retained_path
+            self.assertIsNotNone(retained_leaf)
+            self.assertIsNotNone(retained_snapshot)
+            assert retained_leaf is not None
+            assert retained_snapshot is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertTrue(retained_snapshot.is_file())
+            self.assertFalse((self.root / "quiescent-mask-acquire.out").exists())
+            self.assertFalse((self.root / "quiescent-mask-acquire.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+            if retained_snapshot is not None:
+                retained_snapshot.unlink()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_unquiescent_session_env_preserves_output_drain_after_mask_restore_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        restore_calls = 0
+        capture_entered = False
+        process_error = ReviewOutputDrainError("synthetic output drain failure")
+        retained_leaf: pathlib.Path | None = None
+
+        def fail_cleanup_mask_restores(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 1:
+                real_restore(previous)
+                return
+            raise OSError("synthetic cleanup mask restore failure")
+
+        def fail_without_quiescence(
+            _argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal capture_entered, retained_leaf
+            arguments = tuple(_argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(_argv, **kwargs)
+            capture_entered = True
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "restore_signal_mask",
+                    side_effect=fail_cleanup_mask_restores,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-mask-restore.out",
+                    stderr_path=self.root / "unquiescent-mask-restore.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertTrue(capture_entered)
+            self.assertEqual(restore_calls, 3)
+            self.assertEqual(error.process_reason, "output-drain")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained_leaf)
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertEqual(list(retained_leaf.iterdir()), [])
+            self.assertFalse((self.root / "unquiescent-mask-restore.out").exists())
+            self.assertFalse((self.root / "unquiescent-mask-restore.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_unquiescent_session_env_preserves_output_drain_after_deferred_signal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        process_error = ReviewOutputDrainError("synthetic output drain failure")
+        retained_leaf: pathlib.Path | None = None
+
+        def fail_without_quiescence(
+            argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained_leaf
+            arguments = tuple(argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(argv, **kwargs)
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_restore_claude_snapshot_signal_mask",
+                    return_value=signal.SIGTERM,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-deferred-signal.out",
+                    stderr_path=self.root / "unquiescent-deferred-signal.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(error.process_reason, "output-drain")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained_leaf)
+            self.assertIsInstance(error.__cause__, ForwardedSignal)
+            self.assertEqual(error.__cause__.signum, signal.SIGTERM)
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertFalse((self.root / "unquiescent-deferred-signal.out").exists())
+            self.assertFalse((self.root / "unquiescent-deferred-signal.err").exists())
+        finally:
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_is_removed_after_proven_quiescence(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        for label, process_error in (
+            ("deadline", ReviewTimeoutError("synthetic deadline")),
+            ("output-limit", ReviewOutputLimitError("synthetic output limit")),
+            ("process-leak", ReviewProcessLeakError("conservative synthetic leak")),
+        ):
+            with self.subTest(label=label):
+
+                def fail_after_quiescence(
+                    argv: object,
+                    **kwargs: object,
+                ) -> object:
+                    if str(tuple(argv)[0]).startswith(
+                        str(self.root / ".named-lane-launch-")
+                    ):
+                        callback = kwargs["on_process_quiescent"]
+                        assert callable(callback)
+                        callback()
+                        raise process_error
+                    return real_capture(argv, **kwargs)
+
+                with (
+                    mock.patch(
+                        "pwd.getpwuid",
+                        return_value=self.claude_account(home),
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "run_bounded_capture",
+                        side_effect=fail_after_quiescence,
+                    ),
+                    self.assertRaises(type(process_error)) as context,
+                ):
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"quiescent-{label}.out",
+                        stderr_path=self.root / f"quiescent-{label}.err",
+                        command=(str(executable),),
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+
+                self.assertIs(context.exception, process_error)
+                self.assertEqual(
+                    list((home / ".claude" / "session-env").iterdir()),
+                    [],
+                )
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
     def test_claude_2_1_225_does_not_receive_a_guard_owned_session(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
@@ -9397,7 +9922,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             ("--resume", "fixture"),
             ("-rfixture",),
             ("--continue",),
+            ("-cfixture",),
             ("--fork-session",),
+            ("--fork-session=true",),
             ("--from-pr=123",),
             ("--teleport", "fixture"),
             ("--cloud=fixture",),
@@ -11068,6 +11595,68 @@ class NamedLaneGuardTest(unittest.TestCase):
             },
         )
 
+    def test_cli_preserves_unquiescent_supervision_reason_with_session_locator(
+        self,
+    ) -> None:
+        for process_reason in ("process-leak", "output-drain"):
+            with self.subTest(process_reason=process_reason):
+                stderr = io.StringIO()
+                retained = self.root / "retained-unquiescent-session"
+                error = named_lane_runtime._ClaudeSessionEnvCleanupError(
+                    retained,
+                    process_reason,
+                    retained_parent_identity=(29, 53),
+                    retained_leaf="00000000-0000-4000-8000-000000000000",
+                    retained_leaf_identity=(31, 59),
+                    retained_for_quiescence=True,
+                )
+                argv = (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.root / "unused-unquiescent-preflight.json"),
+                    "--stdout-path",
+                    str(self.root / "unused-unquiescent.stdout"),
+                    "--stderr-path",
+                    str(self.root / "unused-unquiescent.stderr"),
+                    "--",
+                    "/usr/bin/false",
+                )
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_read_control_prompt",
+                        return_value=b"",
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "run_claude",
+                        side_effect=error,
+                    ),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {
+                        "status": "inconclusive",
+                        "reason": "process-leak",
+                        "process_reason": process_reason,
+                        "retained_path": str(retained),
+                        "retained_locator": {
+                            "parent_device": 29,
+                            "parent_inode": 53,
+                            "leaf": "00000000-0000-4000-8000-000000000000",
+                            "leaf_device": 31,
+                            "leaf_inode": 59,
+                        },
+                    },
+                )
+
     def test_cli_reports_removed_session_env_with_parent_custody_drift(self) -> None:
         stderr = io.StringIO()
         error = named_lane_runtime._ClaudeSessionEnvCustodyError(
@@ -11170,6 +11759,60 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "control-cleanup")
         self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
         self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
+
+    def test_cli_process_leak_precedes_combined_control_cleanup(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeControlCleanupError(
+            named_lane_runtime._ClaudeLaunchSnapshotCleanupError(
+                None,
+                "output-drain",
+                retained_parent_identity=(43, 71),
+                retained_leaf=".named-lane-launch-retained",
+            ),
+            named_lane_runtime._ClaudeSessionEnvCleanupError(
+                None,
+                "output-drain",
+                retained_parent_identity=(47, 73),
+                retained_leaf="00000000-0000-4000-8000-000000000000",
+                retained_leaf_identity=(53, 79),
+                retained_for_quiescence=True,
+            ),
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-process-leak-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-process-leak.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-process-leak.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["reason"], "process-leak")
+        self.assertEqual(payload["session_env"]["process_reason"], "output-drain")
+        self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
+        self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
 
     def test_control_object_reason_is_stable_across_safety_commands(self) -> None:
         reason = "materialized-git-config-content-mismatch"
