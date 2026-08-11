@@ -691,6 +691,36 @@ class PublicPoolScannerTest(unittest.TestCase):
                 raw_occurrence_values=(accepted,),
             )
 
+    def test_frozen_tree_search_budget_is_endpoint_derived(self) -> None:
+        generic = workspace.LegacyOccurrenceBudget.default()
+        frozen = workspace.LegacyOccurrenceBudget.frozen_tree()
+
+        self.assertEqual(
+            frozen.remaining_search_bytes,
+            workspace.MAX_FROZEN_TREE_EXACT_SEARCH_PASSES
+            * (
+                workspace.MAX_FROZEN_TREE_SECRET_SCAN_BYTES
+                + workspace.MAX_TREE_METADATA_BYTES
+            ),
+        )
+        self.assertEqual(
+            generic.remaining_search_bytes,
+            workspace.MAX_LEGACY_SEARCH_BYTES,
+        )
+        self.assertGreater(
+            frozen.remaining_search_bytes,
+            generic.remaining_search_bytes,
+        )
+        for _ in range(workspace.MAX_FROZEN_TREE_EXACT_SEARCH_PASSES):
+            frozen.consume_search(workspace.MAX_FROZEN_TREE_SECRET_SCAN_BYTES)
+            frozen.consume_search(workspace.MAX_TREE_METADATA_BYTES)
+        self.assertEqual(frozen.remaining_search_bytes, 0)
+        with self.assertRaisesRegex(
+            workspace.ReviewError,
+            "legacy synthetic search limit",
+        ):
+            frozen.consume_search(1)
+
     def test_overlapping_legacy_occurrences_track_unembedded_values_across_chunks(
         self,
     ) -> None:

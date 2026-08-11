@@ -313,6 +313,15 @@ MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 # Frozen endpoint scans share the named-lane 2 GiB checkout envelope, but keep
 # each cat-file subprocess output small enough to supervise and discard eagerly.
 MAX_FROZEN_TREE_SECRET_SCAN_BYTES = 2 * 1024 * 1024 * 1024
+# Exact occurrence counting uses one native bytes search per pattern. Permit
+# 32 complete passes over both bounded frozen endpoint surfaces: blob bytes and
+# raw paths. MAX_TREE_METADATA_BYTES conservatively bounds aggregate raw paths
+# because every path is contained in that already bounded metadata stream.
+MAX_FROZEN_TREE_EXACT_SEARCH_PASSES = 32
+MAX_FROZEN_TREE_EXACT_SEARCH_BYTES = (
+    MAX_FROZEN_TREE_EXACT_SEARCH_PASSES
+    * (MAX_FROZEN_TREE_SECRET_SCAN_BYTES + MAX_TREE_METADATA_BYTES)
+)
 MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
 MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES = 8_192
 # A 2 GiB occurrence budget with 64 MiB blobs needs at most 32 next-fit
@@ -1267,6 +1276,14 @@ class LegacyOccurrenceBudget:
         return cls(
             MAX_LEGACY_OCCURRENCE_EVENTS,
             MAX_LEGACY_SEARCH_BYTES,
+            MAX_LEGACY_CONTAINMENT_CHECKS,
+        )
+
+    @classmethod
+    def frozen_tree(cls) -> "LegacyOccurrenceBudget":
+        return cls(
+            MAX_LEGACY_OCCURRENCE_EVENTS,
+            MAX_FROZEN_TREE_EXACT_SEARCH_BYTES,
             MAX_LEGACY_CONTAINMENT_CHECKS,
         )
 
@@ -6152,6 +6169,7 @@ def _scan_frozen_tree_values(
         or MAX_FROZEN_TREE_SCAN_BATCH_INVOCATIONS <= 0
         or MAX_CAT_FILE_BATCH_HEADER_BYTES < maximum_header_bytes
         or MAX_FROZEN_TREE_SECRET_SCAN_BYTES < 0
+        or MAX_FROZEN_TREE_EXACT_SEARCH_BYTES <= 0
         or FROZEN_TREE_SECRET_SCAN_TIMEOUT_SECONDS <= 0
     ):
         raise ReviewError("frozen Git tree scan limits are invalid")
@@ -6170,7 +6188,7 @@ def _scan_frozen_tree_values(
     accepted_index = _index_accepted_values(accepted)
     exact_index = _index_exact_values(raw_occurrences)
     event_budget = SecretScanBudget.default()
-    occurrence_budget = LegacyOccurrenceBudget.default()
+    occurrence_budget = LegacyOccurrenceBudget.frozen_tree()
     unextractable_container_budget = (
         _unextractable_container_budget
         if _unextractable_container_budget is not None

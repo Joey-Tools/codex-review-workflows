@@ -5434,6 +5434,68 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assert_secret_delta_status(review, "clean")
 
+    def test_frozen_endpoint_exact_search_uses_catalog_scale_budget(self) -> None:
+        values = tuple(
+            b"HistoricalCatalogPattern"
+            + f"{index:02d}".encode("ascii")
+            + b"A" * 16
+            for index in range(17)
+        )
+        catalog = self.catalog_with_legacy_values(
+            values,
+            rule="generic-secret-assignment",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "load_catalog",
+                return_value=catalog,
+            ),
+            mock.patch.object(workspace_runtime, "MAX_LEGACY_SEARCH_BYTES", 1),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["location_status"], "complete")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+        self.assertFalse(summary["reviewer_started"])
+
+    def test_frozen_endpoint_exact_search_budget_still_fails_closed(self) -> None:
+        catalog = self.catalog_with_legacy_values(
+            (b"HistoricalCatalogPattern00" + b"A" * 16,),
+            rule="generic-secret-assignment",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "load_catalog",
+                return_value=catalog,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_EXACT_SEARCH_BYTES",
+                1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "exact-value-scan-incomplete")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+        self.assertFalse(summary["reviewer_started"])
+
     def test_oversized_frozen_endpoint_scan_marks_secret_delta_inconclusive(
         self,
     ) -> None:
