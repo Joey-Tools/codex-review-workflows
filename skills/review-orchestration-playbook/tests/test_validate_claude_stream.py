@@ -434,7 +434,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         try:
             guard_session_required = (
                 launch_profile == "named-direct"
-                and claude_version_policy.requires_guard_owned_session(selected_version)
+                and claude_version_policy.requires_guard_managed_session(
+                    selected_version
+                )
             )
         except claude_version_policy.ClaudeVersionPolicyError:
             pass

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -37,7 +38,7 @@ from .common import (
     run_bounded_capture,
 )
 from .claude_version_policy import (
-    CLAUDE_GUARD_OWNED_SESSION_MINIMUM_VERSION,
+    CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
 )
@@ -47,6 +48,19 @@ DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
 CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES = 16 * 1024
 CLAUDE_BINARY_LIMIT_BYTES = 1024 * 1024 * 1024
+CLAUDE_SESSION_ENV_IDENTITY_BINDING = "first-no-follow-open-after-exclusive-mkdir"
+CLAUDE_SESSION_ENV_CREATION_ORIGIN_GUARANTEE = (
+    "best-effort-122-bit-uuidv4-leaf-immediate-nofollow-open-"
+    "cooperative-claude-control-directory-flock-same-uid-host-tcb"
+)
+CLAUDE_SESSION_ENV_NAMESPACE_EXCLUSIVITY_GUARANTEE = (
+    "exclusive-advisory-claude-control-directory-flock-cooperative-same-uid-host-tcb"
+)
+CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
+    "descriptor-custody-emptiness-revalidation-nonrecursive-rmdir-"
+    "cooperative-claude-control-directory-flock-same-uid-host-tcb"
+)
+CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
@@ -176,7 +190,7 @@ class _ClaudeLaunchSnapshotCleanupError(NamedLaneGuardError):
 
 
 class _ClaudeSessionEnvCleanupError(NamedLaneGuardError):
-    """A guard-created Claude session environment directory remains."""
+    """A guard-bound Claude session environment directory remains."""
 
     def __init__(
         self,
@@ -468,6 +482,8 @@ class _ClaudeDirectoryComponent:
 
 @dataclass(frozen=True)
 class _ClaudeSessionEnv:
+    namespace_fd: int
+    namespace_identity: tuple[int, int, int, int]
     parent_path: pathlib.Path
     parent_fd: int
     parent_identity: tuple[int, int]
@@ -7067,7 +7083,13 @@ def _open_claude_session_env_parent(
     home: pathlib.Path,
     *,
     create: bool = False,
-) -> tuple[pathlib.Path, int, tuple[_ClaudeDirectoryComponent, ...]]:
+    acquire_namespace_lock: bool = False,
+) -> tuple[
+    pathlib.Path,
+    int,
+    tuple[_ClaudeDirectoryComponent, ...],
+    int | None,
+]:
     if not home.is_absolute():
         raise NamedLaneGuardError("Claude account home must be absolute")
     parent = home / ".claude" / "session-env"
@@ -7086,7 +7108,9 @@ def _open_claude_session_env_parent(
 
     flags = _claude_session_directory_flags()
     descriptor = -1
+    namespace_descriptor = -1
     keep_descriptor = False
+    keep_namespace_descriptor = False
     components: list[_ClaudeDirectoryComponent] = []
     current_path = pathlib.Path(parent.anchor)
     try:
@@ -7156,10 +7180,50 @@ def _open_claude_session_env_parent(
                     owner=metadata.st_uid,
                 )
             )
+            if acquire_namespace_lock and current_path == parent.parent:
+                try:
+                    namespace_descriptor = os.dup(descriptor)
+                    os.set_inheritable(namespace_descriptor, False)
+                    fcntl.flock(
+                        namespace_descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError as error:
+                    raise NamedLaneGuardError(
+                        "Claude control directory namespace lease is already held"
+                    ) from error
+                except OSError as error:
+                    raise NamedLaneGuardError(
+                        "Claude control directory namespace lease is unavailable"
+                    ) from error
+                locked = os.fstat(namespace_descriptor)
+                if _claude_directory_stat_identity(
+                    locked
+                ) != _claude_directory_stat_identity(metadata) or os.get_inheritable(
+                    namespace_descriptor
+                ):
+                    raise NamedLaneGuardError(
+                        "Claude control directory namespace lease changed"
+                    )
+                _validate_claude_session_directory_policy(
+                    namespace_descriptor,
+                    locked,
+                    label="ancestor",
+                )
         if current_path != parent:
             raise NamedLaneGuardError("Claude session environment custody path changed")
+        if acquire_namespace_lock and namespace_descriptor < 0:
+            raise NamedLaneGuardError(
+                "Claude control directory namespace lease was not acquired"
+            )
         keep_descriptor = True
-        return parent, descriptor, tuple(components)
+        keep_namespace_descriptor = True
+        return (
+            parent,
+            descriptor,
+            tuple(components),
+            namespace_descriptor if namespace_descriptor >= 0 else None,
+        )
     except NamedLaneGuardError:
         raise
     except (OSError, RuntimeError) as error:
@@ -7169,9 +7233,27 @@ def _open_claude_session_env_parent(
     finally:
         if descriptor >= 0 and not keep_descriptor:
             os.close(descriptor)
+        if namespace_descriptor >= 0 and not keep_namespace_descriptor:
+            os.close(namespace_descriptor)
+
+
+def _revalidate_held_claude_namespace(session: _ClaudeSessionEnv) -> None:
+    held = os.fstat(session.namespace_fd)
+    if _claude_directory_stat_identity(held) != session.namespace_identity:
+        raise NamedLaneGuardError("Claude control directory namespace identity changed")
+    if os.get_inheritable(session.namespace_fd):
+        raise NamedLaneGuardError(
+            "Claude control directory namespace lease became inheritable"
+        )
+    _validate_claude_session_directory_policy(
+        session.namespace_fd,
+        held,
+        label="ancestor",
+    )
 
 
 def _revalidate_held_claude_session_env_parent(session: _ClaudeSessionEnv) -> None:
+    _revalidate_held_claude_namespace(session)
     held = os.fstat(session.parent_fd)
     expected = session.parent_components[-1]
     if _claude_directory_stat_identity(held) != (
@@ -7192,10 +7274,13 @@ def _revalidate_held_claude_session_env_parent(session: _ClaudeSessionEnv) -> No
 
 def _revalidate_claude_session_env_parent(session: _ClaudeSessionEnv) -> None:
     _revalidate_held_claude_session_env_parent(session)
-    parent_path, descriptor, components = _open_claude_session_env_parent(
-        session.parent_path.parents[1],
-        create=False,
+    parent_path, descriptor, components, namespace_descriptor = (
+        _open_claude_session_env_parent(
+            session.parent_path.parents[1],
+            create=False,
+        )
     )
+    assert namespace_descriptor is None
     try:
         if (
             parent_path != session.parent_path
@@ -7220,10 +7305,12 @@ def _new_claude_session_id() -> str:
 
 
 def _prepare_claude_session_env(home: pathlib.Path) -> _ClaudeSessionEnv:
-    parent_path, parent_fd, components = _open_claude_session_env_parent(
+    parent_path, parent_fd, components, namespace_fd = _open_claude_session_env_parent(
         home,
         create=True,
+        acquire_namespace_lock=True,
     )
+    assert namespace_fd is not None
     session_id: str | None = None
     leaf_fd = -1
     session: _ClaudeSessionEnv | None = None
@@ -7284,6 +7371,13 @@ def _prepare_claude_session_env(home: pathlib.Path) -> _ClaudeSessionEnv:
                 retained_leaf=session_id,
             )
         session = _ClaudeSessionEnv(
+            namespace_fd=namespace_fd,
+            namespace_identity=(
+                components[-2].device,
+                components[-2].inode,
+                stat.S_IFDIR,
+                components[-2].owner,
+            ),
             parent_path=parent_path,
             parent_fd=parent_fd,
             parent_identity=(components[-1].device, components[-1].inode),
@@ -7316,6 +7410,8 @@ def _prepare_claude_session_env(home: pathlib.Path) -> _ClaudeSessionEnv:
                     leaf_fd = -1
                 os.close(parent_fd)
                 parent_fd = -1
+                os.close(namespace_fd)
+                namespace_fd = -1
                 raise retained from cleanup_error
         elif session_id is not None and not isinstance(
             error,
@@ -7334,44 +7430,65 @@ def _prepare_claude_session_env(home: pathlib.Path) -> _ClaudeSessionEnv:
             os.close(leaf_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
+        if namespace_fd >= 0:
+            os.close(namespace_fd)
         raise error
 
 
-def _cleanup_claude_session_env(session: _ClaudeSessionEnv) -> None:
-    _revalidate_held_claude_session_env_parent(session)
-    opened = os.fstat(session.leaf_fd)
-    if _claude_directory_stat_identity(opened) != session.leaf_identity:
-        raise NamedLaneGuardError(
-            "Claude session environment leaf identity or access policy changed"
+def _revalidate_claude_session_env_leaf(
+    session: _ClaudeSessionEnv,
+    *,
+    require_exact_mode: bool,
+    require_lexical_parent: bool,
+) -> None:
+    def revalidate_binding() -> None:
+        opened = os.fstat(session.leaf_fd)
+        if _claude_directory_stat_identity(opened) != session.leaf_identity:
+            raise NamedLaneGuardError(
+                "Claude session environment leaf identity changed"
+            )
+        try:
+            lexical = os.stat(
+                session.session_id,
+                dir_fd=session.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise NamedLaneGuardError(
+                "Claude session environment leaf is missing"
+            ) from error
+        if _claude_directory_stat_identity(lexical) != session.leaf_identity:
+            raise NamedLaneGuardError("Claude session environment leaf was replaced")
+        _validate_claude_session_directory_policy(
+            session.leaf_fd,
+            opened,
+            label="leaf",
         )
-    try:
-        lexical = os.stat(
-            session.session_id,
-            dir_fd=session.parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError as error:
-        raise NamedLaneGuardError(
-            "Claude session environment leaf is missing"
-        ) from error
-    if _claude_directory_stat_identity(lexical) != session.leaf_identity:
-        raise NamedLaneGuardError("Claude session environment leaf was replaced")
-    _validate_claude_session_directory_policy(
-        session.leaf_fd,
-        opened,
-        label="leaf",
+        if require_exact_mode and stat.S_IMODE(opened.st_mode) != 0o700:
+            raise NamedLaneGuardError(
+                "Claude session environment leaf handoff mode changed"
+            )
+
+    revalidate_parent = (
+        _revalidate_claude_session_env_parent
+        if require_lexical_parent
+        else _revalidate_held_claude_session_env_parent
     )
+    revalidate_parent(session)
+    revalidate_binding()
     with os.scandir(session.leaf_fd) as entries:
         if next(entries, None) is not None:
             raise NamedLaneGuardError("Claude session environment leaf is not empty")
-    if (
-        _claude_directory_stat_identity(os.fstat(session.leaf_fd))
-        != session.leaf_identity
-    ):
-        raise NamedLaneGuardError(
-            "Claude session environment leaf changed during cleanup"
-        )
-    _revalidate_held_claude_session_env_parent(session)
+    revalidate_binding()
+    revalidate_parent(session)
+
+
+def _cleanup_claude_session_env(session: _ClaudeSessionEnv) -> None:
+    _revalidate_claude_session_env_leaf(
+        session,
+        require_exact_mode=False,
+        require_lexical_parent=False,
+    )
     final_lexical = os.stat(
         session.session_id,
         dir_fd=session.parent_fd,
@@ -8243,7 +8360,7 @@ def run_claude(
         command_path=executable,
     )
     session_env_required = (
-        binding.selected_version >= CLAUDE_GUARD_OWNED_SESSION_MINIMUM_VERSION
+        binding.selected_version >= CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
     )
     if session_env_required and _command_has_claude_session_selector(command[1:]):
         raise NamedLaneGuardError(
@@ -8324,6 +8441,12 @@ def run_claude(
                         *snapshot_arguments,
                     )
                 snapshot_command = (str(snapshot.path), *snapshot_arguments)
+                if session_env is not None:
+                    _revalidate_claude_session_env_leaf(
+                        session_env,
+                        require_exact_mode=True,
+                        require_lexical_parent=True,
+                    )
                 restore_signal_mask(snapshot_mask)
                 try:
                     process_timeout = _remaining_deadline_seconds(
@@ -8430,6 +8553,7 @@ def run_claude(
                             for descriptor in (
                                 session_env.leaf_fd,
                                 session_env.parent_fd,
+                                session_env.namespace_fd,
                             ):
                                 with contextlib.suppress(OSError):
                                     os.close(descriptor)
@@ -8626,7 +8750,24 @@ def run_claude(
                     if session_env is not None:
                         launch_binding["session_id"] = session_env.session_id
                         launch_binding["session_env"] = {
-                            "cleanup_status": "removed",
+                            "identity_binding": CLAUDE_SESSION_ENV_IDENTITY_BINDING,
+                            "creation_origin_proven": False,
+                            "creation_origin_guarantee": (
+                                CLAUDE_SESSION_ENV_CREATION_ORIGIN_GUARANTEE
+                            ),
+                            "namespace_exclusivity_guarantee": (
+                                CLAUDE_SESSION_ENV_NAMESPACE_EXCLUSIVITY_GUARANTEE
+                            ),
+                            "cleanup_guarantee": (CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE),
+                            "cleanup_observation": (
+                                CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION
+                            ),
+                            "namespace_identity": {
+                                "device": session_env.namespace_identity[0],
+                                "inode": session_env.namespace_identity[1],
+                                "file_type": session_env.namespace_identity[2],
+                                "uid": session_env.namespace_identity[3],
+                            },
                             "parent_identity": {
                                 "device": session_env.parent_identity[0],
                                 "inode": session_env.parent_identity[1],
