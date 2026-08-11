@@ -128,8 +128,8 @@ superseded_by:
 
 ## Remaining Gates
 
-- Complete focused and full canonical tests, fresh review, exact-secret
-  admission, PR/CI, merge, and immutable public/private release publication.
+- Publish the feature branch and PR, complete CI and the applicable GitHub Codex
+  lane, merge, and publish immutable public/private releases.
 - Install the resulting private overlay and re-run required admission for WME
   range
   `982b02b6d29ad6b26b2e8aa0fbb306e78a1f20aa..e66e22604d60b9525fa6501613a508ec4cf0bca2`
