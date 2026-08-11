@@ -4,6 +4,7 @@ import base64
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -22,6 +23,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime import synthetic_tokens as synthetic_tokens_runtime  # noqa: E402
 from review_runtime import workspace as workspace_runtime  # noqa: E402
 from review_runtime.common import ForwardedSignal, ReviewError  # noqa: E402
@@ -326,6 +328,30 @@ class WorkspaceTest(unittest.TestCase):
             workspace_runtime,
             "_secret_delta_addition_locations",
             side_effect=OSError("location scan failed"),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=added_secret_head,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["location_status"], "inconclusive")
+        self.assertTrue(summary["secret_delta"]["violations"])
+
+    def test_secret_admission_preserves_violation_when_location_blob_limit_fails(
+        self,
+    ) -> None:
+        added_secret_head = self.commit_bytes(
+            "credential.txt",
+            b"password: " + unregistered_generic_credential() + b"\n",
+            "Add credential",
+        )
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_CHANGED_BLOB_SCAN_BYTES",
+            1,
         ):
             exit_code, summary = workspace_runtime.secret_admission(
                 repo=self.repo,
@@ -5396,10 +5422,24 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(secret_delta["location_status"], "complete")
         self.assertIn(b"+two", review.diff_file.read_bytes())
 
-    def test_oversized_changed_blob_scan_marks_secret_delta_inconclusive(self) -> None:
+    def test_changed_blob_limit_does_not_cap_frozen_endpoint_scan(self) -> None:
         with mock.patch.object(
             workspace_runtime,
             "MAX_CHANGED_BLOB_SCAN_BYTES",
+            1,
+        ):
+            review = self.prepare_range(
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assert_secret_delta_status(review, "clean")
+
+    def test_oversized_frozen_endpoint_scan_marks_secret_delta_inconclusive(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_FROZEN_TREE_SECRET_SCAN_BYTES",
             1,
         ):
             review = self.prepare_range(
@@ -5413,6 +5453,501 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(secret_delta["location_status"], "inconclusive")
         self.assertIn(b"+two", review.diff_file.read_bytes())
+
+    def test_frozen_endpoint_scan_chunks_cat_file_output(self) -> None:
+        original_run = workspace_runtime._run_bounded_process_to_file
+        blob_batch_sizes: list[tuple[int, int]] = []
+
+        def observe_blob_batches(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if kwargs.get("label") == "frozen Git tree scan blob batch":
+                blob_batch_sizes.append((kwargs["byte_limit"], result.output_bytes))
+            return result
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_run_bounded_process_to_file",
+                side_effect=observe_blob_batches,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertGreater(len(blob_batch_sizes), 2)
+        self.assertTrue(all(limit == actual for limit, actual in blob_batch_sizes))
+
+    def test_frozen_endpoint_scan_uses_one_decreasing_deadline(self) -> None:
+        object_ids = ("a" * 40, "b" * 40)
+        payloads = {
+            object_ids[0]: b"first\n",
+            object_ids[1]: b"second\n",
+        }
+        metadata = b"".join(
+            f"100644 blob {object_id} {len(payload)}\t{index}.txt\0".encode(
+                "ascii"
+            )
+            for index, (object_id, payload) in enumerate(payloads.items())
+        )
+        observed_timeouts: list[float] = []
+        current_time = [100.0]
+
+        def fake_monotonic() -> float:
+            value = current_time[0]
+            current_time[0] += 1.0
+            return value
+
+        def fake_run(command, **kwargs):
+            timeout_seconds = kwargs.get("timeout_seconds")
+            self.assertIsNotNone(timeout_seconds)
+            observed_timeouts.append(timeout_seconds)
+            destination = kwargs["destination"]
+            if "ls-tree" in command:
+                output = metadata
+            else:
+                requested = kwargs["input_handle"].read().splitlines()
+                output = b"".join(
+                    object_id
+                    + b" blob "
+                    + str(len(payloads[object_id.decode("ascii")])).encode("ascii")
+                    + b"\n"
+                    + payloads[object_id.decode("ascii")]
+                    + b"\n"
+                    for object_id in requested
+                )
+            self.assertLessEqual(len(output), kwargs["byte_limit"])
+            destination.write(output)
+            return workspace_runtime.BoundedProcessResult(
+                output_bytes=len(output),
+                returncode=0,
+                stderr=b"",
+            )
+
+        with (
+            mock.patch.object(
+                workspace_runtime.time,
+                "monotonic",
+                side_effect=fake_monotonic,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_run_bounded_process_to_file",
+                side_effect=fake_run,
+            ),
+        ):
+            result = workspace_runtime._scan_frozen_tree_values(
+                git_view=pathlib.Path("/private/git-view"),
+                object_directory=pathlib.Path("/private/objects"),
+                commit="c" * 40,
+                accepted_values=(),
+            )
+
+        self.assertIsNone(result.blocking_rule)
+        self.assertIsNone(result.unextractable_rule)
+        self.assertEqual(len(observed_timeouts), 3)
+        self.assertTrue(
+            all(
+                earlier > later
+                for earlier, later in zip(
+                    observed_timeouts,
+                    observed_timeouts[1:],
+                )
+            )
+        )
+
+    def test_frozen_endpoint_scan_caps_batch_invocations(self) -> None:
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_INVOCATIONS",
+                1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "exact-value-scan-incomplete")
+
+    def test_scan_batch_blob_bounds_headers_and_checks_size_before_payload(
+        self,
+    ) -> None:
+        object_id = "a" * 40
+        secret = unregistered_generic_credential()
+        malformed = secret + b"X" * (
+            workspace_runtime.MAX_CAT_FILE_BATCH_HEADER_BYTES + 1 - len(secret)
+        )
+        with self.assertRaisesRegex(ReviewError, "header is malformed") as error:
+            workspace_runtime._scan_batch_blob(
+                cat_input=None,
+                cat_output=io.BytesIO(malformed),
+                object_id=object_id,
+                scanned_bytes=0,
+            )
+        self.assertNotIn(secret.decode("ascii"), str(error.exception))
+
+        mismatched = io.BytesIO(
+            f"{object_id} blob 4\n".encode("ascii") + b"data\n"
+        )
+        with (
+            mock.patch.object(workspace_runtime, "_stream_secret_scan") as scanner,
+            self.assertRaisesRegex(ReviewError, "does not match frozen tree metadata"),
+        ):
+            workspace_runtime._scan_batch_blob(
+                cat_input=None,
+                cat_output=mismatched,
+                object_id=object_id,
+                scanned_bytes=0,
+                expected_size=3,
+            )
+        scanner.assert_not_called()
+
+        missing_delimiter = io.BytesIO(
+            f"{object_id} blob 4\n".encode("ascii") + b"dataX"
+        )
+        with self.assertRaisesRegex(ReviewError, "missing delimiter"):
+            workspace_runtime._scan_batch_blob(
+                cat_input=None,
+                cat_output=missing_delimiter,
+                object_id=object_id,
+                scanned_bytes=0,
+                expected_size=4,
+            )
+
+    def test_scan_batch_blob_uses_complete_context_only_when_requested(self) -> None:
+        object_id = "a" * 40
+        payload = b"complete blob context\n"
+        output = io.BytesIO(
+            f"{object_id} blob {len(payload)}\n".encode("ascii")
+            + payload
+            + b"\n"
+        )
+        expected = workspace_runtime.SecretScanResult.empty()
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_scan_secret_value",
+                return_value=expected,
+            ) as complete_scan,
+            mock.patch.object(workspace_runtime, "_stream_secret_scan") as stream_scan,
+        ):
+            actual, scanned_bytes = workspace_runtime._scan_batch_blob(
+                cat_input=None,
+                cat_output=output,
+                object_id=object_id,
+                scanned_bytes=7,
+                expected_size=len(payload),
+                complete_blob_context=True,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(scanned_bytes, 7 + len(payload))
+        complete_scan.assert_called_once()
+        self.assertEqual(complete_scan.call_args.args, (payload,))
+        stream_scan.assert_not_called()
+
+        output = io.BytesIO(
+            f"{object_id} blob {len(payload)}\n".encode("ascii")
+            + payload
+            + b"\n"
+        )
+
+        def consume_stream(stream, *, size, **_kwargs):
+            self.assertEqual(stream.read(size), payload)
+            return expected
+
+        with (
+            mock.patch.object(workspace_runtime, "_scan_secret_value") as complete_scan,
+            mock.patch.object(
+                workspace_runtime,
+                "_stream_secret_scan",
+                side_effect=consume_stream,
+            ) as stream_scan,
+        ):
+            actual, scanned_bytes = workspace_runtime._scan_batch_blob(
+                cat_input=None,
+                cat_output=output,
+                object_id=object_id,
+                scanned_bytes=7,
+                expected_size=len(payload),
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(scanned_bytes, 7 + len(payload))
+        complete_scan.assert_not_called()
+        stream_scan.assert_called_once()
+
+    def test_stream_secret_scan_retreats_across_multiple_incomplete_prefixes(
+        self,
+    ) -> None:
+        calls: list[tuple[int, int]] = []
+        event_budget = workspace_runtime.SecretScanBudget(
+            workspace_runtime.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=4,
+            remaining_prefix_proof_work_bytes=100,
+        )
+
+        def incomplete(start: int, retention_start: int):
+            result = workspace_runtime.SecretScanResult.empty()
+            result.incomplete_suffix_start = start
+            result.incomplete_suffix_retention_start = retention_start
+            return result
+
+        def fake_scan(_value, **kwargs):
+            calls.append((kwargs["minimum_end"], kwargs["maximum_end"]))
+            if len(calls) <= 3:
+                self.assertTrue(
+                    kwargs["_prefix_proof_tracker"].consume(
+                        0,
+                        kwargs["maximum_end"],
+                    )
+                )
+            if len(calls) == 1:
+                return incomplete(6, 2)
+            if len(calls) == 2:
+                return incomplete(3, 1)
+            return workspace_runtime.SecretScanResult.empty()
+
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SECRET_PREFIX_PROOF_BYTES", 8),
+            mock.patch.object(workspace_runtime, "STREAM_SCAN_OVERLAP", 4),
+            mock.patch.object(workspace_runtime, "STREAM_SCAN_CHUNK_BYTES", 8),
+            mock.patch.object(
+                workspace_runtime,
+                "_scan_secret_value",
+                side_effect=fake_scan,
+            ),
+        ):
+            result = workspace_runtime._stream_secret_scan(
+                io.BytesIO(b"x" * 20),
+                size=20,
+                _event_budget=event_budget,
+            )
+
+        self.assertIsNone(result.blocking_rule)
+        self.assertEqual(calls, [(0, 8), (0, 6), (0, 3), (3, 20)])
+        self.assertEqual(event_budget.remaining_prefix_proof_bytes, 1)
+        self.assertEqual(event_budget.remaining_prefix_proof_work_bytes, 83)
+
+    def test_stream_secret_scan_caps_incomplete_prefix_retreats(self) -> None:
+        calls = 0
+
+        def fake_scan(_value, **_kwargs):
+            nonlocal calls
+            calls += 1
+            result = workspace_runtime.SecretScanResult.empty()
+            result.incomplete_suffix_start = 8 - calls * 2
+            result.incomplete_suffix_retention_start = 0
+            return result
+
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SECRET_PREFIX_PROOF_BYTES", 8),
+            mock.patch.object(workspace_runtime, "STREAM_SCAN_OVERLAP", 4),
+            mock.patch.object(workspace_runtime, "STREAM_SCAN_CHUNK_BYTES", 8),
+            mock.patch.object(workspace_runtime, "MAX_SECRET_PREFIX_RETREAT_STEPS", 1),
+            mock.patch.object(
+                workspace_runtime,
+                "_scan_secret_value",
+                side_effect=fake_scan,
+            ),
+            self.assertRaisesRegex(ReviewError, "retreat limit"),
+        ):
+            workspace_runtime._stream_secret_scan(
+                io.BytesIO(b"x" * 20),
+                size=20,
+            )
+
+        self.assertEqual(calls, 2)
+
+    def test_frozen_endpoint_scan_budget_counts_duplicate_blob_occurrences(
+        self,
+    ) -> None:
+        payload = b"ordinary duplicate payload\n"
+        (self.repo / "duplicate-a.txt").write_bytes(payload)
+        (self.repo / "duplicate-b.txt").write_bytes(payload)
+        git(self.repo, "add", "duplicate-a.txt", "duplicate-b.txt")
+        git(self.repo, "commit", "-m", "Add duplicate ordinary blobs")
+        duplicate_head = git(self.repo, "rev-parse", "HEAD")
+
+        def endpoint_blob_bytes(commit: str) -> int:
+            completed = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "ls-tree",
+                    "-r",
+                    "-l",
+                    "-z",
+                    "--full-tree",
+                    commit,
+                ),
+                check=True,
+                env=test_git_environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            total = 0
+            for record in completed.stdout.split(b"\0"):
+                if not record:
+                    continue
+                _mode, _kind, _object_id, _path, size = (
+                    workspace_runtime._parse_sized_tree_record(record)
+                )
+                if size is not None:
+                    total += size
+            return total
+
+        exact_limit = max(
+            endpoint_blob_bytes(self.head),
+            endpoint_blob_bytes(duplicate_head),
+        )
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SECRET_SCAN_BYTES",
+                exact_limit,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=duplicate_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SECRET_SCAN_BYTES",
+                exact_limit - 1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=duplicate_head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+
+    def test_frozen_endpoint_scan_limit_matches_named_lane_checkout_contract(
+        self,
+    ) -> None:
+        self.assertEqual(
+            workspace_runtime.MAX_FROZEN_TREE_SECRET_SCAN_BYTES,
+            named_lane_runtime.MATERIALIZER_CHECKOUT_BLOB_BYTES_LIMIT,
+        )
+        self.assertEqual(
+            workspace_runtime.FROZEN_TREE_SECRET_SCAN_TIMEOUT_SECONDS,
+            900.0,
+        )
+
+    def test_chunked_endpoint_scan_preserves_duplicate_blob_counts(self) -> None:
+        value = unregistered_generic_credential()
+        payload = b"password: " + value + b"\n"
+        secret_base = self.commit_bytes(
+            "credential-a.txt",
+            payload,
+            "Add credential",
+        )
+        duplicate_head = self.commit_bytes(
+            "credential-b.txt",
+            payload,
+            "Duplicate credential blob",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+            1,
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=secret_base,
+                head_ref=duplicate_head,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(len(summary["secret_delta"]["violations"]), 1)
+        violation = summary["secret_delta"]["violations"][0]
+        self.assertEqual(violation["base_count"], 1)
+        self.assertEqual(violation["head_count"], 2)
+        self.assertEqual(violation["delta"], 1)
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(value).hexdigest(),
+        )
+
+    def test_parse_sized_tree_record_accepts_blob_and_gitlink_sizes(self) -> None:
+        blob_object = "a" * 40
+        self.assertEqual(
+            workspace_runtime._parse_sized_tree_record(
+                f"100644 blob {blob_object}      12\tpath with spaces".encode(
+                    "ascii"
+                )
+            ),
+            (
+                "100644",
+                "blob",
+                blob_object,
+                pathlib.PurePosixPath("path with spaces"),
+                12,
+            ),
+        )
+        commit_object = "b" * 40
+        self.assertEqual(
+            workspace_runtime._parse_sized_tree_record(
+                f"160000 commit {commit_object}       -\tsubmodule".encode("ascii")
+            ),
+            (
+                "160000",
+                "commit",
+                commit_object,
+                pathlib.PurePosixPath("submodule"),
+                None,
+            ),
+        )
+        with self.assertRaisesRegex(ReviewError, "negative blob size"):
+            workspace_runtime._parse_sized_tree_record(
+                f"100644 blob {blob_object} -1\tnegative".encode("ascii")
+            )
 
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
@@ -8977,6 +9512,11 @@ class WorkspaceTest(unittest.TestCase):
                 "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
                 0,
             ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
+            ),
         ):
             exit_code, summary = workspace_runtime.secret_admission(
                 repo=self.repo,
@@ -8996,6 +9536,11 @@ class WorkspaceTest(unittest.TestCase):
                 workspace_runtime,
                 "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
                 0,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES",
+                1,
             ),
         ):
             exit_code, summary = workspace_runtime.secret_admission(

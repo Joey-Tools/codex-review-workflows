@@ -310,6 +310,15 @@ MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
+# Frozen endpoint scans share the named-lane 2 GiB checkout envelope, but keep
+# each cat-file subprocess output small enough to supervise and discard eagerly.
+MAX_FROZEN_TREE_SECRET_SCAN_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
+MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES = 8_192
+# A 2 GiB occurrence budget with 64 MiB blobs needs at most 32 next-fit
+# payload batches; retain margin for the independent entry-count boundary.
+MAX_FROZEN_TREE_SCAN_BATCH_INVOCATIONS = 64
+MAX_CAT_FILE_BATCH_HEADER_BYTES = 128
 MAX_SECRET_SCAN_EVENTS = 1_000_000
 MAX_SECRET_REDUCTION_CANDIDATES = 128
 MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
@@ -329,6 +338,7 @@ MAX_SECRET_PREFIX_PROOF_BYTES = 4 * 1024 * 1024
 MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_SECRET_PREFIX_PROOF_WORK_BYTES = 512 * 1024 * 1024
 MAX_SECRET_PREFIX_PROOF_RANGES = 100_000
+MAX_SECRET_PREFIX_RETREAT_STEPS = 1_024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
@@ -348,6 +358,7 @@ SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES = 64 * 1024
 MAX_PRIVATE_GIT_STDERR_BYTES = 64 * 1024
 MAX_PRIVATE_FSCK_OUTPUT_BYTES = 4 * 1024 * 1024
 PRIVATE_GIT_TIMEOUT_SECONDS = 300.0
+FROZEN_TREE_SECRET_SCAN_TIMEOUT_SECONDS = 900.0
 REVIEW_ROOT_BASE = pathlib.Path("/tmp")
 REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"
 REVIEW_CONTAINER_PATTERN = re.compile(r"isolated-review-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}")
@@ -4832,6 +4843,30 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
     return mode, object_type, object_id, relative
 
 
+def _parse_sized_tree_record(
+    record: bytes,
+) -> tuple[str, str, str, pathlib.PurePosixPath, int | None]:
+    try:
+        metadata, raw_path = record.split(b"\t", 1)
+        raw_mode, raw_type, raw_object, raw_size = metadata.split()
+    except ValueError as error:
+        raise ReviewError("malformed sized record from git ls-tree") from error
+    mode, object_type, object_id, relative = _parse_tree_record(
+        b" ".join((raw_mode, raw_type, raw_object)) + b"\t" + raw_path
+    )
+    if object_type == "blob":
+        try:
+            size = int(raw_size)
+        except ValueError as error:
+            raise ReviewError("malformed blob size from git ls-tree") from error
+        if size < 0:
+            raise ReviewError("negative blob size from git ls-tree")
+        return mode, object_type, object_id, relative, size
+    if mode == "160000" and object_type == "commit" and raw_size == b"-":
+        return mode, object_type, object_id, relative, None
+    raise ReviewError("unsupported sized object from git ls-tree")
+
+
 def _uses_review_cleanup_quarantine_namespace(
     relative: pathlib.PurePosixPath,
 ) -> bool:
@@ -5942,6 +5977,10 @@ def _scan_batch_blob(
     cat_output: BinaryIO,
     object_id: str,
     scanned_bytes: int,
+    expected_size: int | None = None,
+    complete_blob_context: bool = False,
+    total_scan_byte_limit: int | None = None,
+    total_scan_label: str = "changed Git blobs",
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
@@ -5955,40 +5994,74 @@ def _scan_batch_blob(
     exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> tuple[SecretScanResult, int]:
+    if total_scan_byte_limit is None:
+        total_scan_byte_limit = MAX_CHANGED_BLOB_SCAN_BYTES
     if cat_input is not None:
         cat_input.write(object_id.encode("ascii") + b"\n")
         cat_input.flush()
-    header = cat_output.readline()
-    fields = header.rstrip(b"\n").split(b" ")
-    if len(fields) != 3 or fields[1] != b"blob":
-        raise ReviewError(f"unexpected git cat-file scan header: {header!r}")
+    if expected_size is not None and (
+        type(expected_size) is not int or expected_size < 0
+    ):
+        raise ReviewError("expected git cat-file blob size is invalid")
+    header = cat_output.readline(MAX_CAT_FILE_BATCH_HEADER_BYTES + 1)
+    if len(header) > MAX_CAT_FILE_BATCH_HEADER_BYTES or not header.endswith(b"\n"):
+        raise ReviewError("git cat-file scan header is malformed")
+    fields = header[:-1].split(b" ")
+    if (
+        len(fields) != 3
+        or fields[1] != b"blob"
+        or re.fullmatch(rb"(?:0|[1-9][0-9]*)", fields[2]) is None
+    ):
+        raise ReviewError("git cat-file scan header is malformed")
     try:
         actual_object = fields[0].decode("ascii")
         size = int(fields[2])
     except (UnicodeDecodeError, ValueError) as error:
-        raise ReviewError(f"invalid git cat-file scan header: {header!r}") from error
+        raise ReviewError("git cat-file scan header is malformed") from error
     if actual_object != object_id:
-        raise ReviewError(f"unexpected git cat-file scan object: {header!r}")
+        raise ReviewError("git cat-file scan returned an unexpected object")
+    if expected_size is not None and size != expected_size:
+        raise ReviewError("git cat-file blob size does not match frozen tree metadata")
     if size > MAX_SNAPSHOT_BLOB_BYTES:
         raise ReviewError("changed Git blob exceeds the per-file review scan limit")
-    if size > MAX_CHANGED_BLOB_SCAN_BYTES - scanned_bytes:
-        raise ReviewError("changed Git blobs exceed the total review scan limit")
-    scan = _stream_secret_scan(
-        cat_output,
-        size=size,
-        accepted_values=accepted_values,
-        raw_occurrence_values=raw_occurrence_values,
-        capture_accepted_candidates=capture_accepted_candidates,
-        capture_blocking_candidates=capture_blocking_candidates,
-        capture_reduction_offsets=capture_reduction_offsets,
-        reduced_secret_values=reduced_secret_values,
-        _accepted_index=accepted_index,
-        _event_budget=event_budget,
-        _exact_index=exact_index,
-        _occurrence_budget=occurrence_budget,
-        exact_only=exact_only,
-        _continue_after_blocking=_continue_after_blocking,
-    )
+    if size > total_scan_byte_limit - scanned_bytes:
+        raise ReviewError(
+            f"{total_scan_label} exceed the total review scan limit"
+        )
+    if complete_blob_context:
+        value = _read_exact(cat_output, size)
+        scan = _scan_secret_value(
+            value,
+            accepted_values=tuple(accepted_values),
+            raw_occurrence_values=tuple(raw_occurrence_values),
+            capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            capture_reduction_offsets=capture_reduction_offsets,
+            reduced_secret_values=reduced_secret_values,
+            _accepted_index=accepted_index,
+            _event_budget=event_budget,
+            _exact_index=exact_index,
+            _occurrence_budget=occurrence_budget,
+            exact_only=exact_only,
+            _continue_after_blocking=_continue_after_blocking,
+        )
+    else:
+        scan = _stream_secret_scan(
+            cat_output,
+            size=size,
+            accepted_values=accepted_values,
+            raw_occurrence_values=raw_occurrence_values,
+            capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            capture_reduction_offsets=capture_reduction_offsets,
+            reduced_secret_values=reduced_secret_values,
+            _accepted_index=accepted_index,
+            _event_budget=event_budget,
+            _exact_index=exact_index,
+            _occurrence_budget=occurrence_budget,
+            exact_only=exact_only,
+            _continue_after_blocking=_continue_after_blocking,
+        )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
     return scan, scanned_bytes + size
@@ -6067,6 +6140,31 @@ def _scan_frozen_tree_values(
     _continue_after_blocking: bool = False,
     _unextractable_container_budget: _UnextractableContainerBudget | None = None,
 ) -> SecretScanResult:
+    maximum_header_bytes = (
+        64
+        + len(b" blob ")
+        + len(str(MAX_SNAPSHOT_BLOB_BYTES).encode("ascii"))
+        + 1
+    )
+    if (
+        MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES < MAX_SNAPSHOT_BLOB_BYTES
+        or MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES <= 0
+        or MAX_FROZEN_TREE_SCAN_BATCH_INVOCATIONS <= 0
+        or MAX_CAT_FILE_BATCH_HEADER_BYTES < maximum_header_bytes
+        or MAX_FROZEN_TREE_SECRET_SCAN_BYTES < 0
+        or FROZEN_TREE_SECRET_SCAN_TIMEOUT_SECONDS <= 0
+    ):
+        raise ReviewError("frozen Git tree scan limits are invalid")
+    deadline = time.monotonic() + FROZEN_TREE_SECRET_SCAN_TIMEOUT_SECONDS
+
+    def remaining_scan_time() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError(
+                "frozen Git tree scan exceeded the private Git time limit"
+            )
+        return remaining
+
     accepted = tuple(accepted_values)
     raw_occurrences = tuple(raw_occurrence_values)
     accepted_index = _index_accepted_values(accepted)
@@ -6087,7 +6185,7 @@ def _scan_frozen_tree_values(
         _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
-                args=("ls-tree", "-rz", "--full-tree", "-r", commit),
+                args=("ls-tree", "-r", "-l", "-z", "--full-tree", commit),
             ),
             environment=_git_environment(object_directory=object_directory),
             destination=tree_metadata,
@@ -6095,16 +6193,127 @@ def _scan_frozen_tree_values(
             byte_limit=MAX_TREE_METADATA_BYTES,
             record_limit=MAX_SNAPSHOT_ENTRIES,
             record_separator=b"\0",
+            timeout_seconds=remaining_scan_time(),
         )
         tree_metadata.seek(0)
-        blob_count = 0
+        blob_batch: list[tuple[str, str, bytes, int]] = []
+        batch_payload_bytes = 0
+        batch_invocations = 0
+        scanned_bytes = 0
+
+        def scan_blob_batch() -> None:
+            nonlocal batch_invocations, batch_payload_bytes, scanned_bytes
+            if not blob_batch:
+                return
+            if batch_invocations >= MAX_FROZEN_TREE_SCAN_BATCH_INVOCATIONS:
+                raise ReviewError(
+                    "frozen Git tree scan exceeds the batch invocation limit"
+                )
+            batch_invocations += 1
+            batch_input.seek(0)
+            batch_input.truncate(0)
+            batch_output.seek(0)
+            batch_output.truncate(0)
+            for _mode, object_id, _raw_path, _expected_size in blob_batch:
+                batch_input.write(object_id.encode("ascii") + b"\n")
+            batch_input.flush()
+            batch_input.seek(0)
+            batch_output_bytes = sum(
+                expected_size
+                + len(object_id.encode("ascii"))
+                + len(b" blob ")
+                + len(str(expected_size).encode("ascii"))
+                + 2
+                for _mode, object_id, _raw_path, expected_size in blob_batch
+            )
+            _run_bounded_process_to_file(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                environment=_git_environment(object_directory=object_directory),
+                input_handle=batch_input,
+                destination=batch_output,
+                label="frozen Git tree scan blob batch",
+                byte_limit=batch_output_bytes,
+                timeout_seconds=remaining_scan_time(),
+            )
+            batch_output.seek(0)
+            for mode, object_id, raw_path, expected_size in blob_batch:
+                remaining_scan_time()
+                scan, scanned_bytes = _scan_batch_blob(
+                    cat_input=None,
+                    cat_output=batch_output,
+                    object_id=object_id,
+                    scanned_bytes=scanned_bytes,
+                    expected_size=expected_size,
+                    complete_blob_context=True,
+                    total_scan_byte_limit=MAX_FROZEN_TREE_SECRET_SCAN_BYTES,
+                    total_scan_label="frozen Git tree blobs",
+                    accepted_values=accepted,
+                    raw_occurrence_values=raw_occurrences,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    capture_reduction_offsets=capture_reduction_identities,
+                    reduced_secret_values=reduced_secret_values,
+                    accepted_index=accepted_index,
+                    event_budget=event_budget,
+                    exact_index=exact_index,
+                    occurrence_budget=occurrence_budget,
+                    exact_only=exact_only,
+                    _continue_after_blocking=_continue_after_blocking,
+                )
+                remaining_scan_time()
+                if scan.unextractable_rule is not None:
+                    unextractable_container_budget.record(
+                        result.unextractable_container_counts,
+                        surface="blob",
+                        identity=object_id.encode("ascii"),
+                    )
+                if capture_reduction_identities:
+                    for descriptor, offsets in scan.reduction_occurrence_offsets.items():
+                        identities = scan.reduction_occurrence_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    for descriptor, offsets in scan.reduction_unembedded_offsets.items():
+                        identities = scan.reduction_unembedded_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    scan.reduction_occurrence_offsets.clear()
+                    scan.reduction_unembedded_offsets.clear()
+                result.merge(scan)
+            if batch_output.read(1):
+                raise ReviewError(
+                    "frozen Git tree scan batch output contains unexpected trailing data"
+                )
+            blob_batch.clear()
+            batch_payload_bytes = 0
+            remaining_scan_time()
+
         for record in _iter_nul_records(
             tree_metadata,
             byte_limit=MAX_TREE_METADATA_BYTES,
             record_limit=MAX_SNAPSHOT_ENTRIES,
             label="frozen Git tree scan metadata",
         ):
-            mode, object_type, object_id, _relative = _parse_tree_record(record)
+            mode, object_type, object_id, _relative, size = (
+                _parse_sized_tree_record(record)
+            )
             _metadata, raw_path = record.split(b"\t", 1)
             path_scan = _scan_secret_value(
                 raw_path,
@@ -6129,93 +6338,37 @@ def _scan_frozen_tree_values(
                 )
             if mode == "160000" and object_type == "commit":
                 continue
-            if object_type != "blob":
+            if size is None:
                 raise ReviewError(
                     f"unsupported object in frozen Git tree scan: {object_type}"
                 )
-            batch_input.write(object_id.encode("ascii") + b"\n")
-            blob_count += 1
-        if blob_count:
-            batch_input.seek(0)
-            _run_bounded_process_to_file(
-                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
-                environment=_git_environment(object_directory=object_directory),
-                input_handle=batch_input,
-                destination=batch_output,
-                label="frozen Git tree scan blobs",
-                byte_limit=MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES,
-            )
-        tree_metadata.seek(0)
-        batch_output.seek(0)
-        scanned_bytes = 0
-        for record in _iter_nul_records(
-            tree_metadata,
-            byte_limit=MAX_TREE_METADATA_BYTES,
-            record_limit=MAX_SNAPSHOT_ENTRIES,
-            label="frozen Git tree scan metadata",
-        ):
-            mode, object_type, object_id, _relative = _parse_tree_record(record)
-            _metadata, raw_path = record.split(b"\t", 1)
-            if mode == "160000" and object_type == "commit":
-                continue
-            scan, scanned_bytes = _scan_batch_blob(
-                cat_input=None,
-                cat_output=batch_output,
-                object_id=object_id,
-                scanned_bytes=scanned_bytes,
-                accepted_values=accepted,
-                raw_occurrence_values=raw_occurrences,
-                capture_accepted_candidates=capture_accepted_candidates,
-                capture_blocking_candidates=capture_blocking_candidates,
-                capture_reduction_offsets=capture_reduction_identities,
-                reduced_secret_values=reduced_secret_values,
-                accepted_index=accepted_index,
-                event_budget=event_budget,
-                exact_index=exact_index,
-                occurrence_budget=occurrence_budget,
-                exact_only=exact_only,
-                _continue_after_blocking=_continue_after_blocking,
-            )
-            if scan.unextractable_rule is not None:
-                unextractable_container_budget.record(
-                    result.unextractable_container_counts,
-                    surface="blob",
-                    identity=object_id.encode("ascii"),
+            if size > MAX_SNAPSHOT_BLOB_BYTES:
+                raise ReviewError(
+                    "changed Git blob exceeds the per-file review scan limit"
                 )
-            if capture_reduction_identities:
-                for descriptor, offsets in scan.reduction_occurrence_offsets.items():
-                    identities = scan.reduction_occurrence_identities.setdefault(
-                        descriptor,
-                        set(),
-                    )
-                    identities.update(
-                        _secret_reduction_occurrence_identity(
-                            raw_path=raw_path,
-                            git_mode=mode,
-                            offset=offset,
-                        )
-                        for offset in offsets
-                    )
-                for descriptor, offsets in scan.reduction_unembedded_offsets.items():
-                    identities = scan.reduction_unembedded_identities.setdefault(
-                        descriptor,
-                        set(),
-                    )
-                    identities.update(
-                        _secret_reduction_occurrence_identity(
-                            raw_path=raw_path,
-                            git_mode=mode,
-                            offset=offset,
-                        )
-                        for offset in offsets
-                    )
-                scan.reduction_occurrence_offsets.clear()
-                scan.reduction_unembedded_offsets.clear()
-            result.merge(scan)
-        if batch_output.read(1):
-            raise ReviewError(
-                "frozen Git scan batch output contains unexpected trailing data"
-            )
+            if size > (
+                MAX_FROZEN_TREE_SECRET_SCAN_BYTES
+                - scanned_bytes
+                - batch_payload_bytes
+            ):
+                raise ReviewError(
+                    "frozen Git tree blobs exceed the total review scan limit"
+                )
+            if blob_batch and (
+                len(blob_batch) >= MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES
+                or size
+                > MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES - batch_payload_bytes
+            ):
+                scan_blob_batch()
+            blob_batch.append((mode, object_id, raw_path, size))
+            batch_payload_bytes += size
+            if (
+                len(blob_batch) == MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES
+                or batch_payload_bytes == MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES
+            ):
+                scan_blob_batch()
+        scan_blob_batch()
+        remaining_scan_time()
     return result
 
 
@@ -14527,8 +14680,17 @@ def _stream_secret_scan(
                 local_minimum,
                 min(local_maximum, pending_scan.incomplete_suffix_start),
             )
-            if safe_local_maximum > local_minimum:
-                committed_budget = event_budget.clone()
+            retreat_steps = 0
+            while safe_local_maximum > local_minimum:
+                if retreat_steps >= MAX_SECRET_PREFIX_RETREAT_STEPS:
+                    raise ReviewError(
+                        "sensitive scanner exceeds the incomplete-prefix "
+                        "retreat limit"
+                    )
+                retreat_steps += 1
+                committed_budget = event_budget.clone(
+                    allow_prefix_proof_overdraft=True
+                )
                 committed_proof_tracker = prefix_proof_tracker.clone(
                     committed_budget,
                     coordinate_offset=pending_offset,
@@ -14551,11 +14713,35 @@ def _stream_secret_scan(
                     _capture_only_legacy_evidence=capture_only_legacy_evidence,
                 )
                 if committed_scan.incomplete_suffix_start is not None:
-                    raise ReviewError(
-                        "sensitive scanner could not establish a complete diff prefix"
+                    if committed_scan.incomplete_suffix_retention_start is None:
+                        raise ReviewError(
+                            "sensitive scanner lost an incomplete retention boundary"
+                        )
+                    replay_retention_start = (
+                        pending_offset
+                        + committed_scan.incomplete_suffix_retention_start
                     )
+                    incomplete_retention_start = min(
+                        incomplete_retention_start,
+                        replay_retention_start,
+                    )
+                    next_safe_local_maximum = max(
+                        local_minimum,
+                        min(
+                            safe_local_maximum,
+                            committed_scan.incomplete_suffix_start,
+                        ),
+                    )
+                    if next_safe_local_maximum >= safe_local_maximum:
+                        raise ReviewError(
+                            "sensitive scanner incomplete-prefix retreat did not "
+                            "make progress"
+                        )
+                    safe_local_maximum = next_safe_local_maximum
+                    continue
                 prefix_proof_tracker.commit_from(committed_proof_tracker)
                 result.merge(committed_scan)
+                break
             # Commit the complete prefix, but retain the deferred assignment
             # inside the overlap so it is re-evaluated with the next read.
             next_committed_end = pending_offset + safe_local_maximum
