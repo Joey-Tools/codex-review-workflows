@@ -1,0 +1,91 @@
+---
+id: 20260811-wme002
+title: Large-Tree Secret Admission Streaming
+status: completed
+created: 2026-08-11
+updated: 2026-08-11
+branch: wip/large-tree-secret-admission
+pr:
+supersedes: []
+superseded_by:
+---
+
+# Large-Tree Secret Admission Streaming
+
+## Summary
+
+- Required PR/master secret admission now scans complete frozen endpoint trees
+  without first buffering the endpoint's entire blob payload under the helper's
+  512 MiB materialization budget.
+- The endpoint scanner retains the 64 MiB per-blob bound and charges every
+  tree-entry blob occurrence against a 2 GiB total matching the named-lane
+  checkout contract. Duplicate OIDs remain separate occurrences for exact and
+  opaque multiplicity.
+- Sized tree metadata drives bounded `cat-file --batch` groups. Every response
+  is bound to its expected OID, type, size, delimiter, and exact output ceiling.
+
+## Current State
+
+- Endpoint metadata, blob batches, and per-blob parsing share one 900-second
+  deadline that is rechecked at every blob boundary. A scan
+  is also capped at 64 blob-batch invocations, 128 MiB payload and 8,192 entries
+  per batch, 100,000 tree entries, and 128 MiB of tree metadata.
+- The batch payload bound is asserted to be at least the existing 64 MiB
+  per-blob limit, so batching cannot silently introduce a second per-file cap.
+- The canonical `cat-file` header parser reads at most 128 bytes and does not
+  include untrusted header bytes in errors. Frozen-tree size mismatches fail
+  before any payload scan.
+- Each frozen-tree blob uses one complete context already bounded to 64 MiB;
+  the endpoint itself remains streamed. This avoids quadratic prefix replay
+  when arbitrary binary chunk boundaries expose overlapping incomplete
+  assignment shapes. The generic streaming scanner separately permits at most
+  1,024 monotonic retreats under its unchanged shared proof-work budget.
+- Event, exact-value, legacy-occurrence, reduction-provenance, and opaque
+  container budgets persist across batches. Per-blob streaming state resets at
+  each object boundary, and path-sensitive reduction identities are derived
+  before offsets are discarded.
+- Changed-location scanning remains separately capped at 512 MiB. A location
+  failure cannot erase an exact-value growth violation proved by the complete
+  endpoint count.
+
+## Evidence
+
+- Focused regression coverage exercises decreasing shared timeouts, batch
+  invocation exhaustion, exact batch-output ceilings, bounded non-disclosing
+  headers, pre-payload size mismatch rejection, missing delimiters, duplicate
+  OID exact counts, duplicate opaque multiplicity, occurrence-based total
+  boundaries, and independent changed-location failure. Multi-retreat
+  streaming coverage also consumes real proof ranges: discarded speculative
+  coverage may temporarily overdraft, the final complete replay must fit the
+  committed coverage budget, and all speculative proof work remains charged.
+- The 2 GiB endpoint limit is contract-tested against
+  `MATERIALIZER_CHECKOUT_BLOB_BYTES_LIMIT` rather than copied without a drift
+  detector.
+- The real WME range completed all four internal count passes against its full
+  local object store. Base/head discovery took 550.318 and 552.406 seconds;
+  base/head exact-only counting took 3.149 and 3.217 seconds. The earlier
+  35,388,008-byte Mach-O regression object completes in 11.3 seconds with the
+  size-bound complete-context path instead of exhausting prefix-proof work.
+- Python 3.10 validation completed 300 `test_workspace.py` tests with one
+  expected skip and 228 `test_named_lane.py` tests with no failures. Full
+  discovery ran 2,924 tests with 15 expected skips; its only failure was the
+  macOS nested-sandbox probe rejected by the outer Codex sandbox with
+  `sandbox_apply: Operation not permitted`, and that exact test passed when
+  rerun outside the outer sandbox.
+- The public `isolated_review secret-admission` command completed for WME range
+  `982b02b6d29ad6b26b2e8aa0fbb306e78a1f20aa..e66e22604d60b9525fa6501613a508ec4cf0bca2`
+  with exit code 0, `status: clean`, `location_status: complete`,
+  `temporary_cleanup_status: complete`, and `reviewer_started: false`.
+- Runtime implementation:
+  `skills/review-orchestration-playbook/scripts/review_runtime/workspace.py`.
+- Regression coverage:
+  `skills/review-orchestration-playbook/tests/test_workspace.py`.
+
+## Downstream Deployment
+
+- Release the canonical change through the private overlay before relying on
+  it for WME admission.
+- Re-run required admission for WME range
+  `982b02b6d29ad6b26b2e8aa0fbb306e78a1f20aa..e66e22604d60b9525fa6501613a508ec4cf0bca2`
+  with the installed trusted release. A clean result with complete temporary
+  cleanup is the downstream acceptance gate.
