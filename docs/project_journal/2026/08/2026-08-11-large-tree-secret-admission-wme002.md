@@ -1,10 +1,10 @@
 ---
 id: 20260811-wme002
 title: Large-Tree Secret Admission Streaming
-status: completed
+status: in_progress
 created: 2026-08-11
 updated: 2026-08-11
-branch: wip/large-tree-secret-admission
+branch: wip/private-catalog-exact-scan-budget
 pr:
 supersedes: []
 superseded_by:
@@ -23,6 +23,9 @@ superseded_by:
   opaque multiplicity.
 - Sized tree metadata drives bounded `cat-file --batch` groups. Every response
   is bound to its expected OID, type, size, delimiter, and exact output ceiling.
+- The installed private overlay exposed a second large-tree boundary that the
+  public catalog could not exercise: 17 exact legacy values require more than
+  the generic 16 GiB occurrence-search budget across the real WME endpoint.
 
 ## Current State
 
@@ -44,6 +47,9 @@ superseded_by:
   container budgets persist across batches. Per-blob streaming state resets at
   each object boundary, and path-sensitive reduction identities are derived
   before offsets are discarded.
+- Frozen endpoint exact counting now has a distinct 64 GiB search-work budget,
+  equivalent to 32 complete fixed-pattern passes over the 2 GiB endpoint
+  envelope. Generic workspace scanning retains the existing 16 GiB bound.
 - Changed-location scanning remains separately capped at 512 MiB. A location
   failure cannot erase an exact-value growth violation proved by the complete
   endpoint count.
@@ -76,16 +82,47 @@ superseded_by:
   `982b02b6d29ad6b26b2e8aa0fbb306e78a1f20aa..e66e22604d60b9525fa6501613a508ec4cf0bca2`
   with exit code 0, `status: clean`, `location_status: complete`,
   `temporary_cleanup_status: complete`, and `reviewer_started: false`.
+- The first installed private release attempts returned exit code 75 with
+  `failure_class: exact-value-scan-incomplete` and complete temporary cleanup
+  against both the shallow implementation worktree and the full non-shallow
+  WME source. Both endpoint trees had zero missing objects with lazy fetching
+  disabled, so this is not an object-completeness failure.
+- A direct installed-runtime diagnostic completed base/head discovery in
+  540.107/555.368 seconds, found one dynamic exact candidate, and entered the
+  count pass with 18 patterns. The base count then failed in 4.303 seconds with
+  `external review content exceeds the legacy synthetic search limit`; the
+  failing blob had 2,089,920 bytes while only 3,526,144 search bytes remained.
+  This isolates the old 16 GiB search-work budget rather than the endpoint
+  deadline, object store, or batch parser.
+- A 17-pattern regression forces the generic search budget below one scan and
+  proves direct frozen endpoint admission uses the catalog-scale budget while
+  remaining clean and reviewer-free.
+- The candidate runtime then loaded the installed private catalog and completed
+  direct admission for the real full WME range with exit code 0, `status:
+  clean`, complete location mapping and temporary cleanup, zero violations,
+  and `reviewer_started: false`.
+- Focused validation is clean on Python 3.14.6: all 113 public-pool scanner
+  tests, all 190 synthetic-token tests, and 301 workspace tests passed; the
+  workspace class retained one expected skip. The separate new frozen-budget
+  exhaustion case also passed and remained reviewer-free with complete cleanup.
+- The complete local suite passed outside the outer Codex sandbox with a PATH
+  that resolves executable Python shebangs to the supported Homebrew runtime:
+  2,927 tests passed in 627.246 seconds with seven expected skips. Three prior
+  failures were the inherited PATH selecting macOS Python 3.9 for a `>=3.10`
+  entrypoint; the fourth was the outer sandbox rejecting the suite's nested
+  `sandbox-exec`. The three corrected-PATH tests and the one unsandboxed broker
+  test also passed independently before the clean full rerun.
 - Runtime implementation:
   `skills/review-orchestration-playbook/scripts/review_runtime/workspace.py`.
 - Regression coverage:
   `skills/review-orchestration-playbook/tests/test_workspace.py`.
 
-## Downstream Deployment
+## Remaining Gates
 
-- Release the canonical change through the private overlay before relying on
-  it for WME admission.
-- Re-run required admission for WME range
+- Complete focused and full canonical tests, fresh review, exact-secret
+  admission, PR/CI, merge, and immutable public/private release publication.
+- Install the resulting private overlay and re-run required admission for WME
+  range
   `982b02b6d29ad6b26b2e8aa0fbb306e78a1f20aa..e66e22604d60b9525fa6501613a508ec4cf0bca2`
   with the installed trusted release. A clean result with complete temporary
   cleanup is the downstream acceptance gate.
