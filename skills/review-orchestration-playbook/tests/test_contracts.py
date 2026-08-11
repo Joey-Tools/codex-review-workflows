@@ -2934,7 +2934,7 @@ concurrency:
         self.assertIn(
             "Latest workstream: "
             "`docs/project_journal/2026/08/"
-            "2026-08-06-private-overlay-ci-cost-pci001.md`",
+            "2026-08-11-large-tree-secret-admission-wme002.md`",
             project_state,
         )
         ci_cost_journal = (
