@@ -34,10 +34,10 @@ from review_runtime.claude_provenance import (  # noqa: E402
 )
 from review_runtime.claude_version_policy import (  # noqa: E402
     CLAUDE_COMPATIBILITY_SPEC,
-    CLAUDE_GUARD_OWNED_SESSION_MINIMUM_VERSION,
+    CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
-    requires_guard_owned_session,
+    requires_guard_managed_session,
 )
 from review_runtime import claude_stream_contract  # noqa: E402
 
@@ -68,7 +68,7 @@ LAUNCH_PROFILES = {
 NAMED_DIRECT_SESSION_BINDING_CONTRACT = {
     "launch_profile": "named-direct",
     "minimum_inclusive": ".".join(
-        str(component) for component in CLAUDE_GUARD_OWNED_SESSION_MINIMUM_VERSION
+        str(component) for component in CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
     ),
     "field": "session_id",
     "expected_source": "validator_argument",
@@ -3510,7 +3510,7 @@ def validate_claude_stream(
     claude_code_version = runtime_binding.selected_version
     expected_session_required = (
         runtime_binding.launch_profile == "named-direct"
-        and requires_guard_owned_session(claude_code_version)
+        and requires_guard_managed_session(claude_code_version)
     )
     expected_session_valid = (
         type(expected_session_id) is str

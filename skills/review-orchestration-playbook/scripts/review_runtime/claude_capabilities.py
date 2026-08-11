@@ -10,7 +10,7 @@ from .claude_version_policy import (
     CLAUDE_VERSION_COMPONENT_MAX_DIGITS,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
-    requires_guard_owned_session,
+    requires_guard_managed_session,
 )
 
 CLAUDE_MINIMUM_VERSION = _CLAUDE_MINIMUM_VERSION
@@ -61,7 +61,7 @@ CLAUDE_REQUIRED_OPTIONS = (
 def named_direct_required_options(version: str) -> tuple[str, ...]:
     """Return the exact named-direct option contract for one release."""
 
-    if not requires_guard_owned_session(version):
+    if not requires_guard_managed_session(version):
         return CLAUDE_REQUIRED_OPTIONS
     insertion = CLAUDE_REQUIRED_OPTIONS.index("--safe-mode")
     return (

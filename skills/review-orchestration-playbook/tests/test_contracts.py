@@ -46376,6 +46376,14 @@ printf '%s\n' "$trusted_uv"
             claude_version_policy.CLAUDE_MAXIMUM_VERSION,
             (3, 0, 0),
         )
+        self.assertEqual(
+            claude_version_policy.CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
+            (2, 1, 226),
+        )
+        self.assertFalse(
+            claude_version_policy.requires_guard_managed_session("2.1.225")
+        )
+        self.assertTrue(claude_version_policy.requires_guard_managed_session("2.1.226"))
         policy_path = SCRIPTS / "review_runtime/claude_version_policy.py"
         self.assertTrue(policy_path.is_file())
         self.assertTrue(

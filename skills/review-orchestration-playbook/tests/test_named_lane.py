@@ -9090,20 +9090,31 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertNotIn("GIT_ALLOW_PROTOCOL", child)
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
-    def test_claude_2_1_226_receives_a_precreated_guard_owned_session(self) -> None:
+    def test_claude_2_1_226_receives_a_prepared_guard_managed_session(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
         home = self.make_claude_home()
         executable = self.make_executable(
-            "import json, os, pathlib, sys\n"
+            "import fcntl, json, os, pathlib, sys\n"
             "arguments = sys.argv[1:]\n"
             "index = arguments.index('--session-id')\n"
             "session_id = arguments[index + 1]\n"
             "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
             "'session-env' / session_id\n"
             "leaf.mkdir(exist_ok=True)\n"
+            "anchor_fd = os.open(leaf.parents[1], os.O_RDONLY)\n"
+            "try:\n"
+            "    fcntl.flock(anchor_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except BlockingIOError:\n"
+            "    namespace_lock_blocked = True\n"
+            "else:\n"
+            "    namespace_lock_blocked = False\n"
+            "    fcntl.flock(anchor_fd, fcntl.LOCK_UN)\n"
+            "finally:\n"
+            "    os.close(anchor_fd)\n"
             "json.dump({'session_id': session_id, 'mode': "
-            "leaf.stat().st_mode & 0o777}, sys.stdout)\n",
+            "leaf.stat().st_mode & 0o777, 'namespace_lock_blocked': "
+            "namespace_lock_blocked}, sys.stdout)\n",
             version="2.1.226",
         )
         stdout = self.root / "session-env.json"
@@ -9126,7 +9137,34 @@ class NamedLaneGuardTest(unittest.TestCase):
             observed["session_id"],
         )
         session_binding = result["launch_binding"]["session_env"]
-        self.assertEqual(session_binding["cleanup_status"], "removed")
+        self.assertEqual(
+            session_binding["identity_binding"],
+            "first-no-follow-open-after-exclusive-mkdir",
+        )
+        self.assertFalse(session_binding["creation_origin_proven"])
+        self.assertEqual(
+            session_binding["creation_origin_guarantee"],
+            "best-effort-122-bit-uuidv4-leaf-immediate-nofollow-open-"
+            "cooperative-claude-control-directory-flock-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["namespace_exclusivity_guarantee"],
+            "exclusive-advisory-claude-control-directory-flock-"
+            "cooperative-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["cleanup_guarantee"],
+            "descriptor-custody-emptiness-revalidation-nonrecursive-rmdir-"
+            "cooperative-claude-control-directory-flock-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["cleanup_observation"],
+            "selected-name-absent-after-rmdir",
+        )
+        self.assertEqual(
+            session_binding["namespace_identity"]["file_type"],
+            stat.S_IFDIR,
+        )
         self.assertEqual(session_binding["parent_identity"]["file_type"], stat.S_IFDIR)
         self.assertEqual(session_binding["leaf_identity"]["file_type"], stat.S_IFDIR)
         self.assertEqual(session_binding["leaf_identity"]["uid"], os.geteuid())
@@ -9136,7 +9174,462 @@ class NamedLaneGuardTest(unittest.TestCase):
             r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
         )
         self.assertEqual(observed["mode"], 0o700)
+        self.assertTrue(observed["namespace_lock_blocked"])
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_namespace_lease_failure_blocks_launch(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        marker = self.root / "namespace-lease-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime.fcntl,
+                "flock",
+                side_effect=BlockingIOError("synthetic busy namespace lease"),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "namespace lease is already held",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "namespace-lease.out",
+                stderr_path=self.root / "namespace-lease.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "namespace-lease.out").exists())
+        self.assertFalse((self.root / "namespace-lease.err").exists())
+        self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+        self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_receipt_does_not_claim_mkdir_origin(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        session_id = "00000000-0000-4000-8000-000000000226"
+        displaced = parent / f"{session_id}-mkdir-created"
+        replacement_identity: tuple[int, int] | None = None
+        mkdir_created_identity: tuple[int, int] | None = None
+        real_mkdir = named_lane_runtime.os.mkdir
+        replaced = False
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "leaf.mkdir(exist_ok=True)\n",
+            version="2.1.226",
+        )
+
+        def replace_after_leaf_mkdir(
+            path: object,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal mkdir_created_identity, replaced, replacement_identity
+            real_mkdir(path, mode=mode, dir_fd=dir_fd)
+            if replaced or path != session_id or dir_fd is None:
+                return
+            replaced = True
+            created = parent / session_id
+            created_metadata = created.stat()
+            mkdir_created_identity = (
+                created_metadata.st_dev,
+                created_metadata.st_ino,
+            )
+            created.rename(displaced)
+            real_mkdir(session_id, mode=0o700, dir_fd=dir_fd)
+            replacement_metadata = (parent / session_id).stat()
+            replacement_identity = (
+                replacement_metadata.st_dev,
+                replacement_metadata.st_ino,
+            )
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_new_claude_session_id",
+                    return_value=session_id,
+                ),
+                mock.patch.object(
+                    named_lane_runtime.os,
+                    "mkdir",
+                    side_effect=replace_after_leaf_mkdir,
+                ),
+            ):
+                result = run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "mkdir-origin.out",
+                    stderr_path=self.root / "mkdir-origin.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertTrue(replaced)
+            self.assertIsNotNone(mkdir_created_identity)
+            self.assertIsNotNone(replacement_identity)
+            self.assertNotEqual(mkdir_created_identity, replacement_identity)
+            session_binding = result["launch_binding"]["session_env"]
+            self.assertFalse(session_binding["creation_origin_proven"])
+            self.assertEqual(
+                (
+                    session_binding["leaf_identity"]["device"],
+                    session_binding["leaf_identity"]["inode"],
+                ),
+                replacement_identity,
+            )
+            self.assertTrue(displaced.is_dir())
+            self.assertFalse((parent / session_id).exists())
+        finally:
+            if (parent / session_id).exists():
+                (parent / session_id).rmdir()
+            if displaced.exists():
+                displaced.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_replacement_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-replacement-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+        displaced: pathlib.Path | None = None
+        replacement: pathlib.Path | None = None
+        original_identity: tuple[int, int] | None = None
+
+        def create_snapshot_then_replace(*args: object, **kwargs: object) -> object:
+            nonlocal displaced, original_identity, replacement
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            leaf = leaves[0]
+            metadata = leaf.stat()
+            original_identity = (metadata.st_dev, metadata.st_ino)
+            displaced = parent / f"{leaf.name}-snapshot-bound"
+            leaf.rename(displaced)
+            leaf.mkdir(mode=0o700)
+            leaf.chmod(0o700)
+            replacement = leaf
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError(
+                    "Claude launch must not follow session replacement"
+                )
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_replace,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-replacement.out",
+                    stderr_path=self.root / "snapshot-replacement.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertIsNone(error.retained_path)
+            self.assertEqual(error.retained_leaf_identity, original_identity)
+            self.assertIsNotNone(displaced)
+            self.assertIsNotNone(replacement)
+            assert displaced is not None
+            assert replacement is not None
+            self.assertTrue(displaced.is_dir())
+            self.assertTrue(replacement.is_dir())
+            self.assertFalse((self.root / "snapshot-replacement.out").exists())
+            self.assertFalse((self.root / "snapshot-replacement.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if replacement is not None and replacement.exists():
+                replacement.rmdir()
+            if displaced is not None and displaced.exists():
+                displaced.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_mode_tightening_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-mode-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+
+        def create_snapshot_then_tighten(*args: object, **kwargs: object) -> object:
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            leaves[0].chmod(0o600)
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow mode drift")
+            return real_capture(argv, **kwargs)
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+                side_effect=create_snapshot_then_tighten,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=record_launch,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "leaf handoff mode changed",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "snapshot-mode.out",
+                stderr_path=self.root / "snapshot-mode.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertEqual(launch_commands, [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(parent.iterdir()), [])
+        self.assertFalse((self.root / "snapshot-mode.out").exists())
+        self.assertFalse((self.root / "snapshot-mode.err").exists())
+        self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_content_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-content-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+        retained_leaf: pathlib.Path | None = None
+
+        def create_snapshot_then_add_content(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained_leaf
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            retained_leaf = leaves[0]
+            (retained_leaf / "unexpected").write_text(
+                "retained",
+                encoding="utf-8",
+            )
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow content drift")
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_add_content,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-content.out",
+                    stderr_path=self.root / "snapshot-content.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertEqual(context.exception.retained_path, retained_leaf)
+            assert retained_leaf is not None
+            self.assertEqual(
+                (retained_leaf / "unexpected").read_text(encoding="utf-8"),
+                "retained",
+            )
+            self.assertFalse((self.root / "snapshot-content.out").exists())
+            self.assertFalse((self.root / "snapshot-content.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if retained_leaf is not None and retained_leaf.exists():
+                unexpected = retained_leaf / "unexpected"
+                if unexpected.exists():
+                    unexpected.unlink()
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_parent_replacement_during_snapshot_blocks_handoff(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        displaced = home / ".claude" / "session-env-snapshot-bound"
+        marker = self.root / "snapshot-parent-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+
+        def create_snapshot_then_replace_parent(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            snapshot = real_create_snapshot(*args, **kwargs)
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o700)
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow parent drift")
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_replace_parent,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCustodyError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-parent.out",
+                    stderr_path=self.root / "snapshot-parent.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertEqual(context.exception.cleanup_status, "removed")
+            self.assertEqual(list(displaced.iterdir()), [])
+            self.assertEqual(list(parent.iterdir()), [])
+            self.assertFalse((self.root / "snapshot-parent.out").exists())
+            self.assertFalse((self.root / "snapshot-parent.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if parent.exists():
+                parent.rmdir()
+            if displaced.exists():
+                displaced.rmdir()
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
@@ -9794,7 +10287,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 )
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
-    def test_claude_2_1_225_does_not_receive_a_guard_owned_session(self) -> None:
+    def test_claude_2_1_225_does_not_receive_a_guard_managed_session(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
         home = self.make_claude_home()
