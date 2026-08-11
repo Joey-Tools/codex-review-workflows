@@ -2357,6 +2357,20 @@ class ChildEnvironmentTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.limit_kind, "stream")
 
+    def test_bounded_capture_forwards_process_quiescence_callback(self) -> None:
+        callback = mock.Mock()
+
+        completed = common.run_bounded_capture(
+            (sys.executable, "-c", "pass"),
+            timeout_seconds=5,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+            on_process_quiescent=callback,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        callback.assert_called_once_with()
+
     def test_process_spawn_callback_validation_happens_before_launch(self) -> None:
         prepare = mock.Mock(return_value=mock.sentinel.binding)
         callback = mock.Mock()

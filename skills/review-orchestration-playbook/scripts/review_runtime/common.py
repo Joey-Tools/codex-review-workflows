@@ -1278,6 +1278,7 @@ def run_bounded_capture(
     stderr_limit_bytes: int,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
+    on_process_quiescent: Callable[[], None] | None = None,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
     if not command:
@@ -1325,6 +1326,7 @@ def run_bounded_capture(
             stderr_file_limit_bytes=stderr_limit_bytes,
             regular_file_limit_bytes=regular_file_limit_bytes,
             regular_file_limit_path=regular_file_limit_path,
+            on_process_quiescent=on_process_quiescent,
         )
         if deadline is not None and deadline - time.monotonic() <= 0:
             raise subprocess.TimeoutExpired(command, 0.0)
