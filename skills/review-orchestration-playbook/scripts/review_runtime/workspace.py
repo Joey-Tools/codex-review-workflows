@@ -314,12 +314,13 @@ MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 # each cat-file subprocess output small enough to supervise and discard eagerly.
 MAX_FROZEN_TREE_SECRET_SCAN_BYTES = 2 * 1024 * 1024 * 1024
 # Exact occurrence counting uses one native bytes search per pattern. Permit
-# 32 complete passes over the frozen endpoint envelope so production catalogs
-# can retain multiple historical exact values without weakening the smaller
-# generic-workspace search bound below.
+# 32 complete passes over both bounded frozen endpoint surfaces: blob bytes and
+# raw paths. MAX_TREE_METADATA_BYTES conservatively bounds aggregate raw paths
+# because every path is contained in that already bounded metadata stream.
 MAX_FROZEN_TREE_EXACT_SEARCH_PASSES = 32
 MAX_FROZEN_TREE_EXACT_SEARCH_BYTES = (
-    MAX_FROZEN_TREE_EXACT_SEARCH_PASSES * MAX_FROZEN_TREE_SECRET_SCAN_BYTES
+    MAX_FROZEN_TREE_EXACT_SEARCH_PASSES
+    * (MAX_FROZEN_TREE_SECRET_SCAN_BYTES + MAX_TREE_METADATA_BYTES)
 )
 MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
 MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES = 8_192

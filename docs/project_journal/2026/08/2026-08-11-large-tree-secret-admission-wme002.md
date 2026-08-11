@@ -1,7 +1,7 @@
 ---
 id: 20260811-wme002
 title: Large-Tree Secret Admission Streaming
-status: in_progress
+status: active
 created: 2026-08-11
 updated: 2026-08-11
 branch: wip/private-catalog-exact-scan-budget
@@ -47,9 +47,10 @@ superseded_by:
   container budgets persist across batches. Per-blob streaming state resets at
   each object boundary, and path-sensitive reduction identities are derived
   before offsets are discarded.
-- Frozen endpoint exact counting now has a distinct 64 GiB search-work budget,
-  equivalent to 32 complete fixed-pattern passes over the 2 GiB endpoint
-  envelope. Generic workspace scanning retains the existing 16 GiB bound.
+- Frozen endpoint exact counting now has a distinct 68 GiB search-work budget,
+  equivalent to 32 complete fixed-pattern passes over both the 2 GiB blob
+  envelope and the conservatively bounded 128 MiB path-metadata envelope.
+  Generic workspace scanning retains the existing 16 GiB bound.
 - Changed-location scanning remains separately capped at 512 MiB. A location
   failure cannot erase an exact-value growth violation proved by the complete
   endpoint count.
@@ -101,17 +102,25 @@ superseded_by:
   direct admission for the real full WME range with exit code 0, `status:
   clean`, complete location mapping and temporary cleanup, zero violations,
   and `reviewer_started: false`.
+- Fresh Codex review found that the initial 64 GiB derivation covered 32 full
+  blob passes but omitted raw-path search work charged to the same monotonic
+  budget. The corrected derivation adds one bounded tree-metadata envelope per
+  pass, and the unit test consumes all 32 maximum blob and path surfaces without
+  allocating endpoint-sized fixtures before proving the next byte fails closed.
 - Focused validation is clean on Python 3.14.6: all 113 public-pool scanner
-  tests, all 190 synthetic-token tests, and 301 workspace tests passed; the
-  workspace class retained one expected skip. The separate new frozen-budget
+  tests, all 190 synthetic-token tests, and 302 workspace tests passed; the
+  workspace class retained one expected skip. The separate frozen-budget
   exhaustion case also passed and remained reviewer-free with complete cleanup.
-- The complete local suite passed outside the outer Codex sandbox with a PATH
-  that resolves executable Python shebangs to the supported Homebrew runtime:
-  2,927 tests passed in 627.246 seconds with seven expected skips. Three prior
-  failures were the inherited PATH selecting macOS Python 3.9 for a `>=3.10`
-  entrypoint; the fourth was the outer sandbox rejecting the suite's nested
-  `sandbox-exec`. The three corrected-PATH tests and the one unsandboxed broker
-  test also passed independently before the clean full rerun.
+- After the review fix, the complete local suite passed outside the outer Codex
+  sandbox with a PATH that resolves executable Python shebangs to the supported
+  Homebrew runtime: 2,927 tests passed in 631.777 seconds with seven expected
+  skips. Three earlier inherited-PATH failures had selected macOS Python 3.9 for
+  a `>=3.10` entrypoint; the fourth was the outer sandbox rejecting the suite's
+  nested `sandbox-exec`.
+- The corrected candidate runtime re-ran real WME admission against the installed
+  private catalog and completed with exit code 0, `status: clean`, complete
+  location mapping and temporary cleanup, zero violations, and
+  `reviewer_started: false`.
 - Runtime implementation:
   `skills/review-orchestration-playbook/scripts/review_runtime/workspace.py`.
 - Regression coverage:
