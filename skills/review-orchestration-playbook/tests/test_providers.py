@@ -191,6 +191,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
     callback_started = threading.Event()
     block_callback = threading.Event()
     retained_payload: bytes | None = None
+    previous_signal_mask: set[signal.Signals] | None = None
     identity_root = tempfile.TemporaryDirectory()
     identity_socket = (
         pathlib.Path(identity_root.name)
@@ -251,7 +252,17 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
         raise providers.ForwardedSignal(signum)
 
     if mode == "signal":
+        if os.name == "posix" and hasattr(signal, "pthread_sigmask"):
+            previous_signal_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGTERM},
+            )
         signal.signal(signal.SIGTERM, forward_signal)
+        if previous_signal_mask is not None:
+            signal.pthread_sigmask(
+                signal.SIG_UNBLOCK,
+                {signal.SIGTERM},
+            )
 
     try:
         with (
@@ -330,8 +341,12 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
             )
         )
     finally:
-        identity_root.cleanup()
-        close()
+        try:
+            if previous_signal_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        finally:
+            identity_root.cleanup()
+            close()
 
 
 class ProviderImportTest(unittest.TestCase):

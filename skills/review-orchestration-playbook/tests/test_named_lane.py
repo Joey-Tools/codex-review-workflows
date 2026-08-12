@@ -10159,7 +10159,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             if retained_leaf is not None:
                 retained_leaf.rmdir()
 
-    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "deferred signal cleanup requires POSIX pthread_sigmask",
+    )
     def test_unquiescent_session_env_preserves_output_drain_after_deferred_signal(
         self,
     ) -> None:
@@ -10170,6 +10173,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         real_capture = named_lane_runtime.run_bounded_capture
         process_error = ReviewOutputDrainError("synthetic output drain failure")
         retained_leaf: pathlib.Path | None = None
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_restore = named_lane_runtime.restore_signal_mask
 
         def fail_without_quiescence(
             argv: object,
@@ -10186,6 +10191,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             self.assertTrue(callable(kwargs["on_process_quiescent"]))
             raise process_error
 
+        def restore_with_deferred_signal(
+            previous_mask: set[signal.Signals],
+        ) -> signal.Signals:
+            real_restore(previous_mask)
+            return signal.SIGTERM
+
         try:
             with (
                 mock.patch(
@@ -10200,7 +10211,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 mock.patch.object(
                     named_lane_runtime,
                     "_restore_claude_snapshot_signal_mask",
-                    return_value=signal.SIGTERM,
+                    side_effect=restore_with_deferred_signal,
                 ),
                 self.assertRaises(
                     named_lane_runtime._ClaudeSessionEnvCleanupError
@@ -10224,9 +10235,14 @@ class NamedLaneGuardTest(unittest.TestCase):
             self.assertEqual(error.__cause__.signum, signal.SIGTERM)
             assert retained_leaf is not None
             self.assertTrue(retained_leaf.is_dir())
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                initial_mask,
+            )
             self.assertFalse((self.root / "unquiescent-deferred-signal.out").exists())
             self.assertFalse((self.root / "unquiescent-deferred-signal.err").exists())
         finally:
+            real_restore(initial_mask)
             if retained_leaf is not None:
                 retained_leaf.rmdir()
 
