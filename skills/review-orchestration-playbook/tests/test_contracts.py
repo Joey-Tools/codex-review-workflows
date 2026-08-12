@@ -5873,7 +5873,7 @@ printf '%s\n' "$trusted_uv"
             "parsed and dispatched by the manifest-bound `review_runtime.named_lane`",
             " ".join(contracts.split()),
         )
-        self.assertIn("default exact three-source closure", contracts)
+        self.assertIn("default exact four-source closure", contracts)
         self.assertIn("does not create another profile", contracts)
 
         normalized_public_producer_contracts = " ".join(contracts.split())
@@ -46322,7 +46322,9 @@ printf '%s\n' "$trusted_uv"
             "def _verified_source_matches_signed_artifact(",
             "version_probe(snapshot.executable)",
             "help_probe(snapshot.executable)",
-            "_validate_help_probe(verified.help_probe_result)",
+            "_validate_help_probe(",
+            "version=verified.artifact.version",
+            "named_direct_required_options",
             "load_stream_contract()",
             '"compatible-version-selected"',
             '"ctime_ns"',
@@ -46374,6 +46376,14 @@ printf '%s\n' "$trusted_uv"
             claude_version_policy.CLAUDE_MAXIMUM_VERSION,
             (3, 0, 0),
         )
+        self.assertEqual(
+            claude_version_policy.CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
+            (2, 1, 226),
+        )
+        self.assertFalse(
+            claude_version_policy.requires_guard_managed_session("2.1.225")
+        )
+        self.assertTrue(claude_version_policy.requires_guard_managed_session("2.1.226"))
         policy_path = SCRIPTS / "review_runtime/claude_version_policy.py"
         self.assertTrue(policy_path.is_file())
         self.assertTrue(
@@ -46666,6 +46676,8 @@ printf '%s\n' "$trusted_uv"
             "EXTENDED_INIT_REQUIRED_FIELDS",
             "runtime_binding_from_preflight_result",
             '"--authentication-source"',
+            '"--expected-session-id"',
+            "NAMED_DIRECT_SESSION_BINDING_CONTRACT",
         ):
             self.assertIn(anchor, validator)
         self.assertEqual(
@@ -46768,6 +46780,7 @@ printf '%s\n' "$trusted_uv"
                     "init_field_values",
                     "intermediate_event_field_sets",
                     "intermediate_session_binding",
+                    "named_direct_expected_session_binding",
                     "terminal_field_set",
                     "terminal_variants",
                     "model_identity",
@@ -47039,6 +47052,19 @@ printf '%s\n' "$trusted_uv"
                     "runtime_cwd": "host-workspace",
                     "tools": ["Glob", "Grep", "Read"],
                 },
+            },
+        )
+        self.assertEqual(
+            schema["named_direct_session_binding"],
+            {
+                "launch_profile": "named-direct",
+                "minimum_inclusive": "2.1.226",
+                "field": "session_id",
+                "expected_source": "validator_argument",
+                "required_event": "init",
+                "propagated_events": ["intermediate", "terminal"],
+                "rule": "exact_expected_lowercase_uuid_v4",
+                "failure": "inconclusive",
             },
         )
         self.assertEqual(
@@ -47420,7 +47446,12 @@ printf '%s\n' "$trusted_uv"
 
         self.assertEqual(
             loaded_bound_modules(),
-            ["review_runtime", "review_runtime.common", "review_runtime.named_lane"],
+            [
+                "review_runtime",
+                "review_runtime.claude_version_policy",
+                "review_runtime.common",
+                "review_runtime.named_lane",
+            ],
         )
         self.assertEqual(
             loaded_bound_modules("preflight-claude"),
@@ -47659,7 +47690,13 @@ printf '%s\n' "$trusted_uv"
             "skills/review-orchestration-playbook/references/github-codex-evidence-authority.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
+            "skills/review-orchestration-playbook/references/claude-stream-schema.json",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+            "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
         )
 
         def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
@@ -47726,7 +47763,7 @@ printf '%s\n' "$trusted_uv"
             "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",
             "exact bytes must match the manifest entry",
-            "exact three-source bound-source raw loader",
+            "exact four-source bound-source raw loader",
             "default guard code-origin/import boundary",
             "exact nine-source closure",
             "Both Linux support modules are mandatory",
@@ -47764,7 +47801,7 @@ printf '%s\n' "$trusted_uv"
         ):
             self.assertIn(f"{formal_prefix} {profile}", contracts)
         for anchor in (
-            "exact three-source bound-source raw loader",
+            "exact four-source bound-source raw loader",
             "default eager runtime closure",
             "exact two-source closure",
             "review_runtime.review_result",
@@ -48161,10 +48198,8 @@ printf '%s\n' "$trusted_uv"
         self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
         self.assertIn('"GIT_GRAFT_FILE": os.devnull', runtime)
         self.assertIn("pwd.getpwuid(os.getuid())", runtime)
-        self.assertIn(
-            "env=_claude_environment(root, inherit_node_extra_ca_certs)",
-            runtime,
-        )
+        self.assertIn("child_environment = _claude_environment(", runtime)
+        self.assertIn("env=child_environment", runtime)
         self.assertNotIn("env=dict(os.environ)", runtime)
         for key in (
             "LANG",

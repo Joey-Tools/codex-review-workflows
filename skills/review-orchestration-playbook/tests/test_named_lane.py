@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
+    BoundedCapture,
     ForwardedSignal,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
@@ -138,7 +139,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             guidance_paths,
         )
 
-    def make_executable(self, source: str) -> pathlib.Path:
+    def make_executable(
+        self,
+        source: str,
+        *,
+        version: str = "2.1.212",
+    ) -> pathlib.Path:
         executable = self.root / f"command-{time.monotonic_ns()}.py"
         executable.write_text(
             f"#!{sys.executable}\n{source}",
@@ -146,15 +152,35 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         executable.chmod(0o755)
         resolved = executable.resolve()
-        self.write_preflight_result(resolved)
+        self.write_preflight_result(resolved, version=version)
         return resolved
+
+    def make_claude_home(self) -> pathlib.Path:
+        home = self.root / f"claude-home-{time.monotonic_ns()}"
+        session_env = home / ".claude" / "session-env"
+        session_env.mkdir(parents=True, mode=0o755)
+        home.chmod(0o700)
+        (home / ".claude").chmod(0o700)
+        session_env.chmod(0o755)
+        return home
+
+    def claude_account(self, home: pathlib.Path) -> mock.Mock:
+        return mock.Mock(
+            pw_dir=str(home),
+            pw_name="named-lane-test",
+            pw_shell="/bin/sh",
+        )
 
     def preflight_result_path(self, executable: pathlib.Path) -> pathlib.Path:
         return executable.with_name(f"{executable.name}.preflight.json")
 
-    def write_preflight_result(self, executable: pathlib.Path) -> pathlib.Path:
+    def write_preflight_result(
+        self,
+        executable: pathlib.Path,
+        *,
+        version: str = "2.1.212",
+    ) -> pathlib.Path:
         metadata = executable.lstat()
-        version = "2.1.212"
         checksum = hashlib.sha256(executable.read_bytes()).hexdigest()
         evidence = {
             "capability_contract": {
@@ -530,6 +556,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         expected_origins = {
             "review_runtime": str(runtime / "__init__.py"),
             "review_runtime.common": str(runtime / "common.py"),
+            "review_runtime.claude_version_policy": str(
+                runtime / "claude_version_policy.py"
+            ),
             "review_runtime.named_lane": str(runtime / "named_lane.py"),
         }
         expected_fd_exec = str(runtime / "fd_exec.py")
@@ -9060,6 +9089,1493 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["PAGER"], "cat")
         self.assertNotIn("GIT_ALLOW_PROTOCOL", child)
 
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_2_1_226_receives_a_prepared_guard_managed_session(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import fcntl, json, os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "index = arguments.index('--session-id')\n"
+            "session_id = arguments[index + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "leaf.mkdir(exist_ok=True)\n"
+            "anchor_fd = os.open(leaf.parents[1], os.O_RDONLY)\n"
+            "try:\n"
+            "    fcntl.flock(anchor_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except BlockingIOError:\n"
+            "    namespace_lock_blocked = True\n"
+            "else:\n"
+            "    namespace_lock_blocked = False\n"
+            "    fcntl.flock(anchor_fd, fcntl.LOCK_UN)\n"
+            "finally:\n"
+            "    os.close(anchor_fd)\n"
+            "json.dump({'session_id': session_id, 'mode': "
+            "leaf.stat().st_mode & 0o777, 'namespace_lock_blocked': "
+            "namespace_lock_blocked}, sys.stdout)\n",
+            version="2.1.226",
+        )
+        stdout = self.root / "session-env.json"
+        stderr = self.root / "session-env.err"
+        with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(executable), "--print"),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        observed = json.loads(stdout.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(
+            result["launch_binding"]["session_id"],
+            observed["session_id"],
+        )
+        session_binding = result["launch_binding"]["session_env"]
+        self.assertEqual(
+            session_binding["identity_binding"],
+            "first-no-follow-open-after-exclusive-mkdir",
+        )
+        self.assertFalse(session_binding["creation_origin_proven"])
+        self.assertEqual(
+            session_binding["creation_origin_guarantee"],
+            "best-effort-122-bit-uuidv4-leaf-immediate-nofollow-open-"
+            "cooperative-claude-control-directory-flock-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["namespace_exclusivity_guarantee"],
+            "exclusive-advisory-claude-control-directory-flock-"
+            "cooperative-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["cleanup_guarantee"],
+            "descriptor-custody-emptiness-revalidation-nonrecursive-rmdir-"
+            "cooperative-claude-control-directory-flock-same-uid-host-tcb",
+        )
+        self.assertEqual(
+            session_binding["cleanup_observation"],
+            "selected-name-absent-after-rmdir",
+        )
+        self.assertEqual(
+            session_binding["namespace_identity"]["file_type"],
+            stat.S_IFDIR,
+        )
+        self.assertEqual(session_binding["parent_identity"]["file_type"], stat.S_IFDIR)
+        self.assertEqual(session_binding["leaf_identity"]["file_type"], stat.S_IFDIR)
+        self.assertEqual(session_binding["leaf_identity"]["uid"], os.geteuid())
+        self.assertRegex(
+            observed["session_id"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(observed["mode"], 0o700)
+        self.assertTrue(observed["namespace_lock_blocked"])
+        self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_namespace_lease_failure_blocks_launch(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        marker = self.root / "namespace-lease-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime.fcntl,
+                "flock",
+                side_effect=BlockingIOError("synthetic busy namespace lease"),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "namespace lease is already held",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "namespace-lease.out",
+                stderr_path=self.root / "namespace-lease.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "namespace-lease.out").exists())
+        self.assertFalse((self.root / "namespace-lease.err").exists())
+        self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+        self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_receipt_does_not_claim_mkdir_origin(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        session_id = "00000000-0000-4000-8000-000000000226"
+        displaced = parent / f"{session_id}-mkdir-created"
+        replacement_identity: tuple[int, int] | None = None
+        mkdir_created_identity: tuple[int, int] | None = None
+        real_mkdir = named_lane_runtime.os.mkdir
+        replaced = False
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "leaf.mkdir(exist_ok=True)\n",
+            version="2.1.226",
+        )
+
+        def replace_after_leaf_mkdir(
+            path: object,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal mkdir_created_identity, replaced, replacement_identity
+            real_mkdir(path, mode=mode, dir_fd=dir_fd)
+            if replaced or path != session_id or dir_fd is None:
+                return
+            replaced = True
+            created = parent / session_id
+            created_metadata = created.stat()
+            mkdir_created_identity = (
+                created_metadata.st_dev,
+                created_metadata.st_ino,
+            )
+            created.rename(displaced)
+            real_mkdir(session_id, mode=0o700, dir_fd=dir_fd)
+            replacement_metadata = (parent / session_id).stat()
+            replacement_identity = (
+                replacement_metadata.st_dev,
+                replacement_metadata.st_ino,
+            )
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_new_claude_session_id",
+                    return_value=session_id,
+                ),
+                mock.patch.object(
+                    named_lane_runtime.os,
+                    "mkdir",
+                    side_effect=replace_after_leaf_mkdir,
+                ),
+            ):
+                result = run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "mkdir-origin.out",
+                    stderr_path=self.root / "mkdir-origin.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertTrue(replaced)
+            self.assertIsNotNone(mkdir_created_identity)
+            self.assertIsNotNone(replacement_identity)
+            self.assertNotEqual(mkdir_created_identity, replacement_identity)
+            session_binding = result["launch_binding"]["session_env"]
+            self.assertFalse(session_binding["creation_origin_proven"])
+            self.assertEqual(
+                (
+                    session_binding["leaf_identity"]["device"],
+                    session_binding["leaf_identity"]["inode"],
+                ),
+                replacement_identity,
+            )
+            self.assertTrue(displaced.is_dir())
+            self.assertFalse((parent / session_id).exists())
+        finally:
+            if (parent / session_id).exists():
+                (parent / session_id).rmdir()
+            if displaced.exists():
+                displaced.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_replacement_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-replacement-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+        displaced: pathlib.Path | None = None
+        replacement: pathlib.Path | None = None
+        original_identity: tuple[int, int] | None = None
+
+        def create_snapshot_then_replace(*args: object, **kwargs: object) -> object:
+            nonlocal displaced, original_identity, replacement
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            leaf = leaves[0]
+            metadata = leaf.stat()
+            original_identity = (metadata.st_dev, metadata.st_ino)
+            displaced = parent / f"{leaf.name}-snapshot-bound"
+            leaf.rename(displaced)
+            leaf.mkdir(mode=0o700)
+            leaf.chmod(0o700)
+            replacement = leaf
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError(
+                    "Claude launch must not follow session replacement"
+                )
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_replace,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-replacement.out",
+                    stderr_path=self.root / "snapshot-replacement.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertIsNone(error.retained_path)
+            self.assertEqual(error.retained_leaf_identity, original_identity)
+            self.assertIsNotNone(displaced)
+            self.assertIsNotNone(replacement)
+            assert displaced is not None
+            assert replacement is not None
+            self.assertTrue(displaced.is_dir())
+            self.assertTrue(replacement.is_dir())
+            self.assertFalse((self.root / "snapshot-replacement.out").exists())
+            self.assertFalse((self.root / "snapshot-replacement.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if replacement is not None and replacement.exists():
+                replacement.rmdir()
+            if displaced is not None and displaced.exists():
+                displaced.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_mode_tightening_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-mode-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+
+        def create_snapshot_then_tighten(*args: object, **kwargs: object) -> object:
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            leaves[0].chmod(0o600)
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow mode drift")
+            return real_capture(argv, **kwargs)
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+                side_effect=create_snapshot_then_tighten,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=record_launch,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "leaf handoff mode changed",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "snapshot-mode.out",
+                stderr_path=self.root / "snapshot-mode.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertEqual(launch_commands, [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(parent.iterdir()), [])
+        self.assertFalse((self.root / "snapshot-mode.out").exists())
+        self.assertFalse((self.root / "snapshot-mode.err").exists())
+        self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_content_during_snapshot_blocks_handoff(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        marker = self.root / "snapshot-content-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+        retained_leaf: pathlib.Path | None = None
+
+        def create_snapshot_then_add_content(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained_leaf
+            snapshot = real_create_snapshot(*args, **kwargs)
+            leaves = tuple(parent.iterdir())
+            self.assertEqual(len(leaves), 1)
+            retained_leaf = leaves[0]
+            (retained_leaf / "unexpected").write_text(
+                "retained",
+                encoding="utf-8",
+            )
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow content drift")
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_add_content,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-content.out",
+                    stderr_path=self.root / "snapshot-content.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertEqual(context.exception.retained_path, retained_leaf)
+            assert retained_leaf is not None
+            self.assertEqual(
+                (retained_leaf / "unexpected").read_text(encoding="utf-8"),
+                "retained",
+            )
+            self.assertFalse((self.root / "snapshot-content.out").exists())
+            self.assertFalse((self.root / "snapshot-content.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if retained_leaf is not None and retained_leaf.exists():
+                unexpected = retained_leaf / "unexpected"
+                if unexpected.exists():
+                    unexpected.unlink()
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_parent_replacement_during_snapshot_blocks_handoff(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        parent = home / ".claude" / "session-env"
+        displaced = home / ".claude" / "session-env-snapshot-bound"
+        marker = self.root / "snapshot-parent-launch-marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
+            version="2.1.226",
+        )
+        real_create_snapshot = named_lane_runtime._create_claude_launch_snapshot
+        real_capture = named_lane_runtime.run_bounded_capture
+        launch_commands: list[tuple[object, ...]] = []
+
+        def create_snapshot_then_replace_parent(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            snapshot = real_create_snapshot(*args, **kwargs)
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o700)
+            return snapshot
+
+        def record_launch(argv: object, **kwargs: object) -> object:
+            arguments = tuple(argv)
+            if str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                launch_commands.append(arguments)
+                raise AssertionError("Claude launch must not follow parent drift")
+            return real_capture(argv, **kwargs)
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=create_snapshot_then_replace_parent,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=record_launch,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCustodyError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "snapshot-parent.out",
+                    stderr_path=self.root / "snapshot-parent.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            self.assertEqual(launch_commands, [])
+            self.assertFalse(marker.exists())
+            self.assertEqual(context.exception.cleanup_status, "removed")
+            self.assertEqual(list(displaced.iterdir()), [])
+            self.assertEqual(list(parent.iterdir()), [])
+            self.assertFalse((self.root / "snapshot-parent.out").exists())
+            self.assertFalse((self.root / "snapshot-parent.err").exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            if parent.exists():
+                parent.rmdir()
+            if displaced.exists():
+                displaced.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "prelaunch session cleanup requires POSIX pthread_sigmask",
+    )
+    def test_prelaunch_session_cleanup_precedes_signal_restore_failures(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        session_parent = home / ".claude" / "session-env"
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_restore = named_lane_runtime.restore_signal_mask
+
+        for label in ("mask-restore", "deferred-signal"):
+            with self.subTest(label=label):
+                leaf = session_parent / (
+                    "00000000-0000-4000-8000-"
+                    f"{1 if label == 'mask-restore' else 2:012d}"
+                )
+                prepare_error: (
+                    named_lane_runtime._ClaudeSessionEnvCleanupError | None
+                ) = None
+                prepare_cause = OSError("synthetic prelaunch validation failure")
+                mask_restore_error = NamedLaneGuardError(
+                    "synthetic signal mask restoration failure"
+                )
+
+                def fail_after_leaf_creation(
+                    candidate_home: pathlib.Path,
+                ) -> object:
+                    nonlocal prepare_error
+                    self.assertEqual(candidate_home, home)
+                    leaf.mkdir(mode=0o700)
+                    leaf.chmod(0o700)
+                    parent_metadata = session_parent.stat()
+                    leaf_metadata = leaf.stat()
+                    prepare_error = named_lane_runtime._ClaudeSessionEnvCleanupError(
+                        None,
+                        "prelaunch",
+                        retained_parent_identity=(
+                            parent_metadata.st_dev,
+                            parent_metadata.st_ino,
+                        ),
+                        retained_leaf=leaf.name,
+                        retained_leaf_identity=(
+                            leaf_metadata.st_dev,
+                            leaf_metadata.st_ino,
+                        ),
+                    )
+                    if label == "mask-restore":
+                        try:
+                            raise prepare_cause
+                        except OSError:
+                            raise prepare_error
+                    raise prepare_error from prepare_cause
+
+                def restore_with_secondary(
+                    previous_mask: set[signal.Signals],
+                ) -> signal.Signals | None:
+                    real_restore(previous_mask)
+                    if label == "deferred-signal":
+                        return signal.SIGTERM
+                    raise mask_restore_error
+
+                try:
+                    with (
+                        mock.patch(
+                            "pwd.getpwuid",
+                            return_value=self.claude_account(home),
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "_prepare_claude_session_env",
+                            side_effect=fail_after_leaf_creation,
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "_restore_claude_snapshot_signal_mask",
+                            side_effect=restore_with_secondary,
+                        ),
+                        self.assertRaises(
+                            named_lane_runtime._ClaudeSessionEnvCleanupError
+                        ) as context,
+                    ):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"prelaunch-{label}.out",
+                            stderr_path=self.root / f"prelaunch-{label}.err",
+                            command=(str(executable),),
+                            prompt=b"",
+                            timeout_seconds=2.0,
+                            stream_limit_bytes=16 * 1024,
+                        )
+
+                    error = context.exception
+                    self.assertIs(error, prepare_error)
+                    self.assertEqual(error.process_reason, "prelaunch")
+                    self.assertIsNone(error.retained_path)
+                    parent_metadata = session_parent.stat()
+                    leaf_metadata = leaf.stat()
+                    self.assertEqual(
+                        error.retained_parent_identity,
+                        (parent_metadata.st_dev, parent_metadata.st_ino),
+                    )
+                    self.assertEqual(error.retained_leaf, leaf.name)
+                    self.assertEqual(
+                        error.retained_leaf_identity,
+                        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+                    )
+                    self.assertTrue(leaf.is_dir())
+                    if label == "mask-restore":
+                        self.assertIs(error.__cause__, mask_restore_error)
+                    else:
+                        self.assertIsInstance(error.__cause__, ForwardedSignal)
+                        self.assertEqual(error.__cause__.signum, signal.SIGTERM)
+                    self.assertIs(error.__cause__.__context__, prepare_cause)
+                    self.assertIsNot(error.__cause__.__context__, error)
+                    self.assertEqual(
+                        signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                        initial_mask,
+                    )
+                    self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+                    self.assertFalse((self.root / f"prelaunch-{label}.out").exists())
+                    self.assertFalse((self.root / f"prelaunch-{label}.err").exists())
+                finally:
+                    real_restore(initial_mask)
+                    if leaf.exists():
+                        leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_is_retained_without_quiescence_proof(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        for label, process_error, process_reason in (
+            ("process-leak", ReviewProcessLeakError("synthetic leak"), "process-leak"),
+            (
+                "output-drain",
+                ReviewOutputDrainError("synthetic drain failure"),
+                "output-drain",
+            ),
+        ):
+            with self.subTest(label=label):
+
+                def fail_without_quiescence(
+                    argv: object,
+                    **kwargs: object,
+                ) -> object:
+                    if str(tuple(argv)[0]).startswith(
+                        str(self.root / ".named-lane-launch-")
+                    ):
+                        self.assertTrue(callable(kwargs["on_process_quiescent"]))
+                        raise process_error
+                    return real_capture(argv, **kwargs)
+
+                retained: pathlib.Path | None = None
+                try:
+                    with (
+                        mock.patch(
+                            "pwd.getpwuid",
+                            return_value=self.claude_account(home),
+                        ),
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "run_bounded_capture",
+                            side_effect=fail_without_quiescence,
+                        ),
+                        self.assertRaises(
+                            named_lane_runtime._ClaudeSessionEnvCleanupError
+                        ) as context,
+                    ):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"unquiescent-{label}.out",
+                            stderr_path=self.root / f"unquiescent-{label}.err",
+                            command=(str(executable),),
+                            prompt=b"",
+                            timeout_seconds=2.0,
+                            stream_limit_bytes=16 * 1024,
+                        )
+
+                    error = context.exception
+                    retained = error.retained_path
+                    self.assertEqual(error.process_reason, process_reason)
+                    self.assertTrue(error.retained_for_quiescence)
+                    self.assertIsNotNone(retained)
+                    assert retained is not None
+                    parent_metadata = retained.parent.stat()
+                    leaf_metadata = retained.stat()
+                    self.assertEqual(
+                        error.retained_parent_identity,
+                        (parent_metadata.st_dev, parent_metadata.st_ino),
+                    )
+                    self.assertEqual(error.retained_leaf, retained.name)
+                    self.assertEqual(
+                        error.retained_leaf_identity,
+                        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+                    )
+                    self.assertEqual(list(retained.iterdir()), [])
+                    self.assertFalse((self.root / f"unquiescent-{label}.out").exists())
+                    self.assertFalse((self.root / f"unquiescent-{label}.err").exists())
+                finally:
+                    if retained is not None:
+                        retained.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_session_env_is_retained_when_capture_returns_without_proof(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        retained: pathlib.Path | None = None
+
+        def complete_without_quiescence(
+            argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained
+            arguments = tuple(str(argument) for argument in argv)
+            if not arguments[0].startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(argv, **kwargs)
+            session_index = arguments.index("--session-id")
+            retained = home / ".claude" / "session-env" / arguments[session_index + 1]
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            return BoundedCapture(arguments, 0, bytearray(), bytearray())
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=complete_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "capture-without-proof.out",
+                    stderr_path=self.root / "capture-without-proof.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(error.process_reason, "process-leak")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained)
+            self.assertIsInstance(error.__cause__, ReviewProcessLeakError)
+            assert retained is not None
+            self.assertTrue(retained.is_dir())
+            self.assertEqual(list(retained.iterdir()), [])
+            self.assertFalse((self.root / "capture-without-proof.out").exists())
+            self.assertFalse((self.root / "capture-without-proof.err").exists())
+        finally:
+            if retained is not None:
+                retained.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_unquiescent_session_env_survives_cleanup_mask_acquisition_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_block = named_lane_runtime.block_forwarded_signals
+        real_capture = named_lane_runtime.run_bounded_capture
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        block_calls = 0
+        capture_entered = False
+        process_error = ReviewProcessLeakError("synthetic process leak")
+        retained_leaf: pathlib.Path | None = None
+        retained_snapshot: pathlib.Path | None = None
+
+        def fail_cleanup_mask() -> set[signal.Signals] | None:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 2:
+                return None
+            return real_block()
+
+        def fail_without_quiescence(
+            _argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal capture_entered, retained_leaf, retained_snapshot
+            arguments = tuple(_argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(_argv, **kwargs)
+            capture_entered = True
+            retained_snapshot = pathlib.Path(str(arguments[0]))
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "block_forwarded_signals",
+                    side_effect=fail_cleanup_mask,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeControlCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-mask-acquire.out",
+                    stderr_path=self.root / "unquiescent-mask-acquire.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            session_error = context.exception.session_env
+            self.assertTrue(capture_entered)
+            self.assertEqual(block_calls, 2)
+            self.assertEqual(session_error.process_reason, "process-leak")
+            self.assertTrue(session_error.retained_for_quiescence)
+            self.assertIs(session_error.__cause__, process_error)
+            self.assertEqual(session_error.retained_path, retained_leaf)
+            self.assertEqual(
+                context.exception.snapshot.retained_path, retained_snapshot
+            )
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertEqual(list(retained_leaf.iterdir()), [])
+            self.assertFalse((self.root / "unquiescent-mask-acquire.out").exists())
+            self.assertFalse((self.root / "unquiescent-mask-acquire.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+            if retained_snapshot is not None:
+                retained_snapshot.unlink()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_quiescent_session_env_survives_cleanup_mask_acquisition_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_block = named_lane_runtime.block_forwarded_signals
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        block_calls = 0
+        retained_leaf: pathlib.Path | None = None
+        retained_snapshot: pathlib.Path | None = None
+
+        def fail_cleanup_mask() -> set[signal.Signals] | None:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 2:
+                return None
+            return real_block()
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "block_forwarded_signals",
+                    side_effect=fail_cleanup_mask,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeControlCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "quiescent-mask-acquire.out",
+                    stderr_path=self.root / "quiescent-mask-acquire.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            session_error = context.exception.session_env
+            self.assertEqual(block_calls, 2)
+            self.assertEqual(session_error.process_reason, "signal-mask-unavailable")
+            self.assertFalse(session_error.retained_for_quiescence)
+            retained_leaf = session_error.retained_path
+            retained_snapshot = context.exception.snapshot.retained_path
+            self.assertIsNotNone(retained_leaf)
+            self.assertIsNotNone(retained_snapshot)
+            assert retained_leaf is not None
+            assert retained_snapshot is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertTrue(retained_snapshot.is_file())
+            self.assertFalse((self.root / "quiescent-mask-acquire.out").exists())
+            self.assertFalse((self.root / "quiescent-mask-acquire.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+            if retained_snapshot is not None:
+                retained_snapshot.unlink()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "session cleanup mask requires POSIX pthread_sigmask",
+    )
+    def test_unquiescent_session_env_preserves_output_drain_after_mask_restore_failure(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        real_restore = named_lane_runtime.restore_signal_mask
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        restore_calls = 0
+        capture_entered = False
+        process_error = ReviewOutputDrainError("synthetic output drain failure")
+        retained_leaf: pathlib.Path | None = None
+
+        def fail_cleanup_mask_restores(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 1:
+                real_restore(previous)
+                return
+            raise OSError("synthetic cleanup mask restore failure")
+
+        def fail_without_quiescence(
+            _argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal capture_entered, retained_leaf
+            arguments = tuple(_argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(_argv, **kwargs)
+            capture_entered = True
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "restore_signal_mask",
+                    side_effect=fail_cleanup_mask_restores,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-mask-restore.out",
+                    stderr_path=self.root / "unquiescent-mask-restore.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertTrue(capture_entered)
+            self.assertEqual(restore_calls, 3)
+            self.assertEqual(error.process_reason, "output-drain")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained_leaf)
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertEqual(list(retained_leaf.iterdir()), [])
+            self.assertFalse((self.root / "unquiescent-mask-restore.out").exists())
+            self.assertFalse((self.root / "unquiescent-mask-restore.err").exists())
+        finally:
+            real_restore(initial_mask)
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_unquiescent_session_env_preserves_output_drain_after_deferred_signal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+        process_error = ReviewOutputDrainError("synthetic output drain failure")
+        retained_leaf: pathlib.Path | None = None
+
+        def fail_without_quiescence(
+            argv: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal retained_leaf
+            arguments = tuple(argv)
+            if not str(arguments[0]).startswith(str(self.root / ".named-lane-launch-")):
+                return real_capture(argv, **kwargs)
+            session_index = arguments.index("--session-id")
+            retained_leaf = (
+                home / ".claude" / "session-env" / str(arguments[session_index + 1])
+            )
+            self.assertTrue(callable(kwargs["on_process_quiescent"]))
+            raise process_error
+
+        try:
+            with (
+                mock.patch(
+                    "pwd.getpwuid",
+                    return_value=self.claude_account(home),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=fail_without_quiescence,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_restore_claude_snapshot_signal_mask",
+                    return_value=signal.SIGTERM,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeSessionEnvCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "unquiescent-deferred-signal.out",
+                    stderr_path=self.root / "unquiescent-deferred-signal.err",
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
+            error = context.exception
+            self.assertEqual(error.process_reason, "output-drain")
+            self.assertTrue(error.retained_for_quiescence)
+            self.assertEqual(error.retained_path, retained_leaf)
+            self.assertIsInstance(error.__cause__, ForwardedSignal)
+            self.assertEqual(error.__cause__.signum, signal.SIGTERM)
+            assert retained_leaf is not None
+            self.assertTrue(retained_leaf.is_dir())
+            self.assertFalse((self.root / "unquiescent-deferred-signal.out").exists())
+            self.assertFalse((self.root / "unquiescent-deferred-signal.err").exists())
+        finally:
+            if retained_leaf is not None:
+                retained_leaf.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_is_removed_after_proven_quiescence(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.226")
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        for label, process_error in (
+            ("deadline", ReviewTimeoutError("synthetic deadline")),
+            ("output-limit", ReviewOutputLimitError("synthetic output limit")),
+            ("process-leak", ReviewProcessLeakError("conservative synthetic leak")),
+        ):
+            with self.subTest(label=label):
+
+                def fail_after_quiescence(
+                    argv: object,
+                    **kwargs: object,
+                ) -> object:
+                    if str(tuple(argv)[0]).startswith(
+                        str(self.root / ".named-lane-launch-")
+                    ):
+                        callback = kwargs["on_process_quiescent"]
+                        assert callable(callback)
+                        callback()
+                        raise process_error
+                    return real_capture(argv, **kwargs)
+
+                with (
+                    mock.patch(
+                        "pwd.getpwuid",
+                        return_value=self.claude_account(home),
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "run_bounded_capture",
+                        side_effect=fail_after_quiescence,
+                    ),
+                    self.assertRaises(type(process_error)) as context,
+                ):
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"quiescent-{label}.out",
+                        stderr_path=self.root / f"quiescent-{label}.err",
+                        command=(str(executable),),
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+
+                self.assertIs(context.exception, process_error)
+                self.assertEqual(
+                    list((home / ".claude" / "session-env").iterdir()),
+                    [],
+                )
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_2_1_225_does_not_receive_a_guard_managed_session(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import json, sys\njson.dump({'arguments': sys.argv[1:]}, sys.stdout)\n",
+            version="2.1.225",
+        )
+        stdout = self.root / "pre-session-env.json"
+        stderr = self.root / "pre-session-env.err"
+        with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(executable), "--print"),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        observed = json.loads(stdout.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "complete")
+        self.assertNotIn("--session-id", observed["arguments"])
+        self.assertNotIn("session_id", result["launch_binding"])
+        self.assertNotIn("session_env", result["launch_binding"])
+        self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
+    def test_claude_environment_rejects_mismatched_real_and_effective_users(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(named_lane_runtime.os, "getuid", return_value=501),
+            mock.patch.object(named_lane_runtime.os, "geteuid", return_value=0),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "matching real and effective users",
+            ),
+        ):
+            named_lane_runtime._claude_environment(self.repo.resolve())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_parent_is_created_descriptor_relatively(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        (home / ".claude" / "session-env").rmdir()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "leaf.mkdir(exist_ok=True)\n",
+            version="2.1.226",
+        )
+        with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-parent.out",
+                stderr_path=self.root / "session-env-parent.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        parent = home / ".claude" / "session-env"
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o700)
+        self.assertEqual(list(parent.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_cleanup_preserves_nonempty_leaf(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "(leaf / 'unexpected').write_text('retained', encoding='utf-8')\n",
+            version="2.1.226",
+        )
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            self.assertRaises(
+                named_lane_runtime._ClaudeSessionEnvCleanupError
+            ) as context,
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-nonempty.out",
+                stderr_path=self.root / "session-env-nonempty.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        retained = context.exception.retained_path
+        self.assertEqual(context.exception.process_reason, "complete")
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertEqual((retained / "unexpected").read_text(), "retained")
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_cleanup_preserves_replacement(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "parent = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env'\n"
+            "leaf = parent / session_id\n"
+            "leaf.rename(parent / f'{session_id}-original')\n"
+            "leaf.mkdir(mode=0o700)\n",
+            version="2.1.226",
+        )
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            self.assertRaises(
+                named_lane_runtime._ClaudeSessionEnvCleanupError
+            ) as context,
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-replaced.out",
+                stderr_path=self.root / "session-env-replaced.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        locator = context.exception.retained_leaf
+        self.assertIsNone(context.exception.retained_path)
+        self.assertIsNotNone(locator)
+        assert locator is not None
+        parent = home / ".claude" / "session-env"
+        self.assertTrue((parent / locator).is_dir())
+        self.assertTrue((parent / f"{locator}-original").is_dir())
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_cleanup_preserves_unsafe_mode_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "leaf = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env' / session_id\n"
+            "leaf.chmod(0o750)\n",
+            version="2.1.226",
+        )
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            self.assertRaises(
+                named_lane_runtime._ClaudeSessionEnvCleanupError
+            ) as context,
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-mode.out",
+                stderr_path=self.root / "session-env-mode.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        retained = context.exception.retained_path
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o750)
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_allows_safe_mode_tightening(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "session_id = arguments[arguments.index('--session-id') + 1]\n"
+            "parent = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env'\n"
+            "(parent / session_id).chmod(0o600)\n"
+            "parent.chmod(0o700)\n",
+            version="2.1.226",
+        )
+        with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-tightening.out",
+                stderr_path=self.root / "session-env-tightening.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
+    def test_claude_session_env_parent_drift_is_inconclusive_after_cleanup(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        displaced = home / ".claude" / "session-env-displaced"
+        executable = self.make_executable(
+            "import os, pathlib\n"
+            "parent = pathlib.Path(os.environ['HOME']) / '.claude' / "
+            "'session-env'\n"
+            f"parent.rename(pathlib.Path({str(displaced)!r}))\n"
+            "parent.mkdir(mode=0o755)\n",
+            version="2.1.226",
+        )
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            self.assertRaises(
+                named_lane_runtime._ClaudeSessionEnvCustodyError
+            ) as context,
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "session-env-parent-drift.out",
+                stderr_path=self.root / "session-env-parent-drift.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertEqual(context.exception.cleanup_status, "removed")
+        self.assertFalse((displaced / context.exception.session_id).exists())
+        self.assertTrue(displaced.is_dir())
+
+    def test_claude_session_selection_is_guard_owned(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("raise SystemExit(97)\n", version="2.1.226")
+        for selector in (
+            ("--session-id", "00000000-0000-4000-8000-000000000000"),
+            ("--session-id=00000000-0000-4000-8000-000000000000",),
+            ("--resume", "fixture"),
+            ("-rfixture",),
+            ("--continue",),
+            ("-cfixture",),
+            ("--fork-session",),
+            ("--fork-session=true",),
+            ("--from-pr=123",),
+            ("--teleport", "fixture"),
+            ("--cloud=fixture",),
+            ("--environment", "fixture"),
+            ("--remote-control",),
+            ("--background",),
+            ("--worktree=fixture",),
+            ("-wfixture",),
+            ("--tmux=classic",),
+        ):
+            with (
+                self.subTest(selector=selector),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "session selection is owned",
+                ),
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / f"selector-{selector[0][2:]}.out",
+                    stderr_path=self.root / f"selector-{selector[0][2:]}.err",
+                    command=(str(executable), *selector),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+
     @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
     def test_opted_in_node_extra_ca_rejects_relative_and_symlink_paths(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -10647,6 +12163,280 @@ class NamedLaneGuardTest(unittest.TestCase):
                 },
             },
         )
+
+    def test_cli_reports_descriptor_bound_session_env_cleanup_locator(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeSessionEnvCleanupError(
+            None,
+            "complete",
+            retained_parent_identity=(29, 53),
+            retained_leaf="00000000-0000-4000-8000-000000000000",
+            retained_leaf_identity=(31, 59),
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-session-cleanup-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-session-cleanup.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-session-cleanup.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "inconclusive",
+                "reason": "session-env-cleanup",
+                "process_reason": "complete",
+                "retained_locator": {
+                    "parent_device": 29,
+                    "parent_inode": 53,
+                    "leaf": "00000000-0000-4000-8000-000000000000",
+                    "leaf_device": 31,
+                    "leaf_inode": 59,
+                },
+            },
+        )
+
+    def test_cli_preserves_unquiescent_supervision_reason_with_session_locator(
+        self,
+    ) -> None:
+        for process_reason in ("process-leak", "output-drain"):
+            with self.subTest(process_reason=process_reason):
+                stderr = io.StringIO()
+                retained = self.root / "retained-unquiescent-session"
+                error = named_lane_runtime._ClaudeSessionEnvCleanupError(
+                    retained,
+                    process_reason,
+                    retained_parent_identity=(29, 53),
+                    retained_leaf="00000000-0000-4000-8000-000000000000",
+                    retained_leaf_identity=(31, 59),
+                    retained_for_quiescence=True,
+                )
+                argv = (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.root / "unused-unquiescent-preflight.json"),
+                    "--stdout-path",
+                    str(self.root / "unused-unquiescent.stdout"),
+                    "--stderr-path",
+                    str(self.root / "unused-unquiescent.stderr"),
+                    "--",
+                    "/usr/bin/false",
+                )
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_read_control_prompt",
+                        return_value=b"",
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "run_claude",
+                        side_effect=error,
+                    ),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {
+                        "status": "inconclusive",
+                        "reason": "process-leak",
+                        "process_reason": process_reason,
+                        "retained_path": str(retained),
+                        "retained_locator": {
+                            "parent_device": 29,
+                            "parent_inode": 53,
+                            "leaf": "00000000-0000-4000-8000-000000000000",
+                            "leaf_device": 31,
+                            "leaf_inode": 59,
+                        },
+                    },
+                )
+
+    def test_cli_reports_removed_session_env_with_parent_custody_drift(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeSessionEnvCustodyError(
+            "00000000-0000-4000-8000-000000000000",
+            "parent-custody",
+            parent_identity=(37, 61),
+            leaf_identity=(41, 67),
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-session-custody-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-session-custody.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-session-custody.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "inconclusive",
+                "reason": "session-env-custody",
+                "process_reason": "parent-custody",
+                "session_id": "00000000-0000-4000-8000-000000000000",
+                "cleanup_status": "removed",
+                "parent_identity": {"device": 37, "inode": 61},
+                "leaf_identity": {"device": 41, "inode": 67},
+            },
+        )
+
+    def test_cli_reports_both_control_cleanup_recovery_identities(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeControlCleanupError(
+            named_lane_runtime._ClaudeLaunchSnapshotCleanupError(
+                None,
+                "deadline",
+                retained_parent_identity=(43, 71),
+                retained_leaf=".named-lane-launch-retained",
+            ),
+            named_lane_runtime._ClaudeSessionEnvCleanupError(
+                None,
+                "deadline",
+                retained_parent_identity=(47, 73),
+                retained_leaf="00000000-0000-4000-8000-000000000000",
+                retained_leaf_identity=(53, 79),
+            ),
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-control-cleanup-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-control-cleanup.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-control-cleanup.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["reason"], "control-cleanup")
+        self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
+        self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
+
+    def test_cli_process_leak_precedes_combined_control_cleanup(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeControlCleanupError(
+            named_lane_runtime._ClaudeLaunchSnapshotCleanupError(
+                None,
+                "output-drain",
+                retained_parent_identity=(43, 71),
+                retained_leaf=".named-lane-launch-retained",
+            ),
+            named_lane_runtime._ClaudeSessionEnvCleanupError(
+                None,
+                "output-drain",
+                retained_parent_identity=(47, 73),
+                retained_leaf="00000000-0000-4000-8000-000000000000",
+                retained_leaf_identity=(53, 79),
+                retained_for_quiescence=True,
+            ),
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-process-leak-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-process-leak.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-process-leak.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["reason"], "process-leak")
+        self.assertEqual(payload["session_env"]["process_reason"], "output-drain")
+        self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
+        self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
 
     def test_control_object_reason_is_stable_across_safety_commands(self) -> None:
         reason = "materialized-git-config-content-mismatch"

@@ -21,6 +21,7 @@ sys.dont_write_bytecode = True
 from review_runtime.claude_capabilities import (  # noqa: E402
     CLAUDE_REQUIRED_OPTIONS,
     ClaudeCapabilities,
+    named_direct_required_options,
 )
 from review_runtime.claude_linux import (  # noqa: E402
     SANDBOX_WORKSPACE as CLAUDE_LINUX_SANDBOX_WORKSPACE,
@@ -33,8 +34,10 @@ from review_runtime.claude_provenance import (  # noqa: E402
 )
 from review_runtime.claude_version_policy import (  # noqa: E402
     CLAUDE_COMPATIBILITY_SPEC,
+    CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
+    requires_guard_managed_session,
 )
 from review_runtime import claude_stream_contract  # noqa: E402
 
@@ -62,6 +65,22 @@ LAUNCH_PROFILES = {
         "runtime_cwd": HOST_WORKSPACE_RUNTIME_CWD,
     },
 }
+NAMED_DIRECT_SESSION_BINDING_CONTRACT = {
+    "launch_profile": "named-direct",
+    "minimum_inclusive": ".".join(
+        str(component) for component in CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
+    ),
+    "field": "session_id",
+    "expected_source": "validator_argument",
+    "required_event": "init",
+    "propagated_events": ["intermediate", "terminal"],
+    "rule": "exact_expected_lowercase_uuid_v4",
+    "failure": "inconclusive",
+}
+LOWERCASE_UUID_V4 = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
 TRUST_SOURCE_LAUNCH_PROFILES = {
     "named-parent-private-preflight": frozenset(("named-direct",)),
     "low-level-helper": frozenset(("helper-linux", "helper-darwin")),
@@ -886,6 +905,7 @@ def _load_bound_stream_contract(
             "init_field_values",
             "intermediate_event_field_sets",
             "intermediate_session_binding",
+            "named_direct_expected_session_binding",
             "terminal_field_set",
             "terminal_variants",
             "model_identity",
@@ -976,6 +996,7 @@ def _load_contract_with_binding() -> tuple[
         "process_returncode",
         "stream_contract",
         "launch_profiles",
+        "named_direct_session_binding",
         "init_event",
         "intermediate_events",
         "model_identity",
@@ -1002,6 +1023,13 @@ def _load_contract_with_binding() -> tuple[
     }
     if contract.get("launch_profiles") != expected_launch_profiles:
         raise _ContractError("launch profiles do not match the validator")
+    if (
+        contract.get("named_direct_session_binding")
+        != NAMED_DIRECT_SESSION_BINDING_CONTRACT
+    ):
+        raise _ContractError(
+            "named-direct session binding does not match the validator"
+        )
 
     stream_contract = contract.get("stream_contract")
     if type(stream_contract) is not dict:
@@ -1362,7 +1390,7 @@ def _validate_preflight_evidence(
 
     capability = evidence.get("capability_contract")
     if capability != {
-        "required_options": list(CLAUDE_REQUIRED_OPTIONS),
+        "required_options": list(named_direct_required_options(selected_version)),
         "status": "accepted",
     }:
         raise _ContractError("preflight capability contract does not match")
@@ -1509,6 +1537,11 @@ def _runtime_binding_is_valid(
         parse_compatible_release_version(runtime_binding.selected_version)
     except ClaudeVersionPolicyError:
         return False
+    required_options = (
+        named_direct_required_options(runtime_binding.selected_version)
+        if runtime_binding.launch_profile == "named-direct"
+        else CLAUDE_REQUIRED_OPTIONS
+    )
     return (
         runtime_binding.api_key_source in {"none", "ANTHROPIC_API_KEY"}
         and runtime_binding.launch_profile in LAUNCH_PROFILES
@@ -1527,7 +1560,7 @@ def _runtime_binding_is_valid(
         and runtime_binding.runtime_identity[2] == stat.S_IFREG
         and bool(runtime_binding.runtime_identity[3] & 0o111)
         and runtime_binding.runtime_identity[7] == runtime_binding.artifact_size
-        and runtime_binding.required_options == CLAUDE_REQUIRED_OPTIONS
+        and runtime_binding.required_options == required_options
         and runtime_binding.stream_contract == contract_binding
     )
 
@@ -1578,7 +1611,7 @@ def runtime_binding_from_preflight_result(
         publisher_checksum=publisher["checksum"],
         artifact_size=publisher["artifact_size"],
         runtime_identity=_preflight_identity_tuple(identity),
-        required_options=tuple(CLAUDE_REQUIRED_OPTIONS),
+        required_options=named_direct_required_options(selected_version),
         stream_contract=contract_binding,
     )
     if not _runtime_binding_is_valid(
@@ -3425,6 +3458,7 @@ def validate_claude_stream(
     expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: ClaudeRuntimeBinding,
+    expected_session_id: str | None = None,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -3474,6 +3508,24 @@ def validate_claude_stream(
             process_returncode,
         )
     claude_code_version = runtime_binding.selected_version
+    expected_session_required = (
+        runtime_binding.launch_profile == "named-direct"
+        and requires_guard_managed_session(claude_code_version)
+    )
+    expected_session_valid = (
+        type(expected_session_id) is str
+        and LOWERCASE_UUID_V4.fullmatch(expected_session_id) is not None
+    )
+    if (expected_session_required and not expected_session_valid) or (
+        not expected_session_required and expected_session_id is not None
+    ):
+        return _apply_process_returncode_precedence(
+            _failure(
+                "inconclusive",
+                {"validator.expected-session-id-invalid"},
+            ),
+            process_returncode,
+        )
 
     selected_limits = limits or DEFAULT_STREAM_LIMITS
     if type(selected_limits) is not StreamLimits:
@@ -3551,6 +3603,21 @@ def validate_claude_stream(
             launch_profile=runtime_binding.launch_profile,
             evidence=evidence,
         )
+        if expected_session_required:
+            assert expected_session_id is not None
+            if "session_id" not in envelope.first:
+                evidence.inconclusive.add("init.session_id.missing")
+            else:
+                init_expected_value = envelope.first["session_id"]
+                if type(init_expected_value) is str and (
+                    LOWERCASE_UUID_V4.fullmatch(init_expected_value) is None
+                ):
+                    evidence.inconclusive.add("init.session_id.malformed")
+                elif (
+                    type(init_expected_value) is str
+                    and init_expected_value != expected_session_id
+                ):
+                    evidence.inconclusive.add("stream.session_id.mismatch")
         raw_init_session_id = envelope.first.get("session_id")
         init_session_id = (
             raw_init_session_id
@@ -3598,6 +3665,7 @@ def validate_claude_stream_bytes(
     expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: ClaudeRuntimeBinding,
+    expected_session_id: str | None = None,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -3611,6 +3679,7 @@ def validate_claude_stream_bytes(
         expected_runtime_cwd=expected_runtime_cwd,
         requested_model=requested_model,
         runtime_binding=runtime_binding,
+        expected_session_id=expected_session_id,
         process_returncode=process_returncode,
         limits=limits,
     )
@@ -3651,6 +3720,13 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         help="Return code from the captured Claude Code child process",
+    )
+    parser.add_argument(
+        "--expected-session-id",
+        help=(
+            "Guard-owned run-claude session ID required by compatible "
+            "named-direct releases"
+        ),
     )
     parser.add_argument(
         "--input",
@@ -3698,6 +3774,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_runtime_cwd=args.cwd,
             requested_model=args.model,
             runtime_binding=runtime_binding,
+            expected_session_id=args.expected_session_id,
             process_returncode=args.process_returncode,
         )
     finally:

@@ -41,7 +41,11 @@ mandatory `--preflight-result`, and let
 `run-claude` copy the matching source from an opened no-follow descriptor into a
 private mode-`0500` snapshot after the relevant identity/policy plus signed
 size/SHA-256 checks. Launch identity intentionally excludes `mtime`, `ctime`,
-and `nlink`, so benign churn in those fields is accepted. The snapshot bytes,
+and `nlink`, so benign churn in those fields is accepted. For a `named-direct`
+release selected at the canonical `>=2.1.226` feature gate, the same guard also
+owns the session ID and manages the descriptor-bound
+`$HOME/.claude/session-env/<uuid>` lifecycle described below; this does not
+change the global compatibility floor. The snapshot bytes,
 not the mutable raw source path, are executed; replacement of that raw path
 after binding cannot change the launched bytes, and no parent before/after
 raw-path check is required. The process receipt records this as
@@ -60,8 +64,10 @@ commit transaction: a pre-receipt signal or receipt write/flush failure removes
 the output pair, while a post-receipt signal cannot create a false failure.
 Before stream validation, the parent
 compares that receipt's preflight SHA-256, source identity/path, and signed
-artifact size/SHA-256 with the accepted launch binding. The validator separately
-rereads the preflight result and does not consume `launch_binding`. Sections below
+artifact size/SHA-256 with the accepted launch binding. For guarded
+`named-direct >=2.1.226`, it also exact-checks the canonical session ID and the
+closed session-environment guarantee descriptor defined below. The validator
+separately rereads the preflight result and does not consume `launch_binding`. Sections below
 that describe executable snapshots or dependency closures, `.git`-free
 materialization, supplied-diff prompts, helper-private credential carriers, or
 helper-owned outer sandboxes remain helper-only: the canonical launch snapshot
@@ -75,7 +81,8 @@ then `named_lane_guard run-claude` for launch/process supervision, only after
 successful cleanup invoke `named_lane_guard validate-claude-stream` for terminal
 artifact classification, and only after validator acceptance invoke the
 manifest-bound `named_lane_guard classify-review-result` profile for semantic
-disposition. The default guard profile retains its exact three-module raw closure;
+disposition. The default guard profile retains its exact four-module raw closure,
+including `review_runtime.claude_version_policy`;
 the three additional subcommands select only their declared manifest-bound
 raw-source and companion profiles, including the version-policy, capability,
 stream-compatibility, audited-baseline, closed-profile-schema, and result-classifier
@@ -143,16 +150,65 @@ OAuth-token credentials are available, the lane also reports
 credential persistence is inconclusive, and neither condition authorizes another
 provider.
 
+For a preflight-selected `named-direct >=2.1.226` release, the canonical UUIDv4
+session ID remains a guard-owned control-plane input, while its filesystem
+namespace is only guard-managed and descriptor-bound. The guard rejects caller
+session/resume/cloud, background, and worktree selectors. Before creating or
+opening `$HOME/.claude/session-env`, it takes an exclusive advisory BSD `flock`
+on the stable no-follow descriptor for real `$HOME/.claude` and retains that
+lease through snapshot creation, handoff, supervision, positive quiescence, and
+cleanup or recovery-evidence construction. This lease serializes only cooperative
+controls that take the same lock. The signed Claude CLI's expected idempotent
+`mkdir` for the selected leaf and every non-cooperative same-euid host process
+remain host-TCB assumptions; the lock does not prevent their namespace writes.
+
+The guard generates a best-effort 122-bit-random lowercase canonical UUIDv4,
+retries rather than deliberately adopting `EEXIST`, creates the parent/leaf as
+needed, and records the objects seen by the first successful no-follow opens.
+Those parent/leaf device-inode-directory-type/uid identities are observed
+bindings, not proof of `mkdir` origin or continuous custody. After the verified
+launch snapshot is ready, handoff revalidates device/inode/type, current-account
+uid/access/ACL policy, exact leaf mode `0700`, and emptiness before process start.
+Directory `mtime`, `ctime`, `nlink`, and benign parent child-entry churn are not
+mutation evidence. Missing, replaced, nonempty, and unreadable or otherwise
+unprovable state remain distinct fail-closed conditions. Hostile same-euid gaps
+between parent/leaf `mkdir` and first open, handoff or runtime ABA, and final
+`stat` to `rmdir` are excluded from the guarantee.
+
+The bounded supervisor's callback supplies only positive proof of process
+quiescence; it neither performs nor triggers descriptor cleanup. After that
+proof, the outer cleanup path separately acquires a forwarded-signal mask before
+descriptor-relative, nonrecursive removal and never deletes unexpected children.
+If that callback does not run, the guard retains the possibly active fence and
+namespace lease through recovery-evidence construction, emits `process-leak`,
+preserves the original supervision failure in `process_reason`, and reports the
+first-bound parent/leaf identities together with any revalidated path. Successful
+cleanup observes only that the selected name is absent after `rmdir`; it does not
+prove creation origin or eliminate the final-window same-euid ABA.
+
+The successful receipt keeps these limits machine-readable. The parent must
+require `launch_binding.session_env.identity_binding` to equal
+`first-no-follow-open-after-exclusive-mkdir`, require
+`creation_origin_proven` to be exact boolean `false`, and exact-check
+`creation_origin_guarantee` as
+`best-effort-122-bit-uuidv4-leaf-immediate-nofollow-open-cooperative-claude-control-directory-flock-same-uid-host-tcb`,
+`namespace_exclusivity_guarantee` as
+`exclusive-advisory-claude-control-directory-flock-cooperative-same-uid-host-tcb`,
+`cleanup_guarantee` as
+`descriptor-custody-emptiness-revalidation-nonrecursive-rmdir-cooperative-claude-control-directory-flock-same-uid-host-tcb`,
+and `cleanup_observation` as `selected-name-absent-after-rmdir`. A missing,
+differently typed, or differently valued field fails the parent comparison.
+
 ### Native Selected-Deny Read Boundary
 
 For the accepted real-`HOME` native-sandbox review design, keep these layers distinct:
 
 - For the canonical direct lane, real `HOME` is the trusted ordinary Claude CLI control plane and its clean detached Git worktree is the review scope. The low-level helper instead uses its supplied-diff/private-Git workspace and, for local login, its broker/carrier/catalog transaction; those helper guarantees do not transfer to the direct lane.
 - The model may receive `Read`, `Grep`, `Glob`, and sandboxed `Bash`, with read-only behavior required by the prompt and permission contract.
-- Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
+- Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. Keep global `denyWrite` intact and add no `allowWrite` exception for the guard-managed, descriptor-bound session-environment path: precreation and cleanup are outer control-plane actions and do not authorize sandboxed Bash to write there. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
 - Capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation; that limitation applies even to Claude Code 2.1.212 baseline output. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
-- For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
+- For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. For guarded `named-direct >=2.1.226`, the parent must require a canonical receipt `launch_binding.session_id` and pass it unchanged as `--expected-session-id`; init `session_id` is mandatory and must equal that canonical UUIDv4. Every admitted intermediate event retains its existing required match-to-init binding, and terminal `session_id`, when present, must match init. Absence, malformed syntax, or a valid mismatch of the frozen init value is inconclusive. The CLI input stays optional for older named-direct and helper/provider profiles. Missing, duplicate, malformed, misordered, or mismatched observable evidence must otherwise fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
 - Select the closed `legacy-base` stream profile for `>=2.1.211,<2.1.216` and the closed `extended-2x` profile for `>=2.1.216,<3.0.0`. Both profiles validate every admitted intermediate event against a closed, session-bound contract; unknown init, intermediate, terminal, or nested fields fail closed. In `extended-2x`, optional assistant `diagnostics` accepts only `null` or the exact closed object `{"cache_miss_reason":{"type":"unavailable"}}`; `legacy-base` forbids the field. Both the direct lane and low-level helper pass captured Claude output through this canonical validator after their distinct workspace, sandbox, and authentication preparation.
 - Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
 

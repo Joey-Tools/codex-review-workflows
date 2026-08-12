@@ -6,6 +6,7 @@ import re
 CLAUDE_COMPATIBILITY_SPEC = ">=2.1.211,<3.0.0"
 CLAUDE_MINIMUM_VERSION = (2, 1, 211)
 CLAUDE_MAXIMUM_VERSION = (3, 0, 0)
+CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION = (2, 1, 226)
 CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
 _VERSION_COMPONENT = rf"(?:0|[1-9][0-9]{{0,{CLAUDE_VERSION_COMPONENT_MAX_DIGITS - 1}}})"
 CLAUDE_RELEASE_VERSION = re.compile(
@@ -53,3 +54,12 @@ def is_compatible_release_version(version: str) -> bool:
     except ClaudeVersionPolicyError:
         return False
     return True
+
+
+def requires_guard_managed_session(version: str) -> bool:
+    """Return whether the named-direct lane must bind a guard-managed session."""
+
+    return (
+        parse_compatible_release_version(version)
+        >= CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
+    )

@@ -31,6 +31,8 @@ NEW_CAPABILITIES = [
 ]
 KNOWN_CAPABILITY_SEQUENCES = [OLD_CAPABILITIES, NEW_CAPABILITIES]
 FAST_MODE_DISABLED_REASON = "sdk_opt_in_required"
+GUARD_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+_DEFAULT_EXPECTED_SESSION_ID = object()
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_claude_stream as validator  # noqa: E402
@@ -144,7 +146,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         artifact_size = 128
         return {
             "capability_contract": {
-                "required_options": list(claude_capabilities.CLAUDE_REQUIRED_OPTIONS),
+                "required_options": list(
+                    claude_capabilities.named_direct_required_options(version)
+                ),
                 "status": "accepted",
             },
             "classification": "accepted",
@@ -373,8 +377,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 if launch_profile == "named-direct"
                 else "low-level-helper"
             )
+        effective_version = selected_version or self.claude_code_version
+        try:
+            required_options = (
+                claude_capabilities.named_direct_required_options(effective_version)
+                if launch_profile == "named-direct"
+                else claude_capabilities.CLAUDE_REQUIRED_OPTIONS
+            )
+        except claude_version_policy.ClaudeVersionPolicyError:
+            # Invalid-version cases must reach the validator's version gate.
+            required_options = claude_capabilities.CLAUDE_REQUIRED_OPTIONS
         return {
-            "selected_version": selected_version or self.claude_code_version,
+            "selected_version": effective_version,
             "api_key_source": api_key_source,
             "launch_profile": launch_profile,
             "trust_source": trust_source,
@@ -392,7 +406,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 3,
                 4,
             ),
-            "required_options": claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            "required_options": required_options,
             "stream_contract": self.stream_contract_binding,
         }
 
@@ -407,16 +421,37 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         launch_profile: str = "named-direct",
         trust_source: str | None = None,
         expected_runtime_cwd: str | None = None,
+        expected_session_id: object = _DEFAULT_EXPECTED_SESSION_ID,
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
-        if raw is None:
-            raw = self._raw(events if events is not None else self._full_events())
         selected_version = (
             self.claude_code_version
             if claude_code_version is None
             else claude_code_version
         )
+        guard_session_required = False
+        try:
+            guard_session_required = (
+                launch_profile == "named-direct"
+                and claude_version_policy.requires_guard_managed_session(
+                    selected_version
+                )
+            )
+        except claude_version_policy.ClaudeVersionPolicyError:
+            pass
+        if expected_session_id is _DEFAULT_EXPECTED_SESSION_ID:
+            expected_session_id = GUARD_SESSION_ID if guard_session_required else None
+            if guard_session_required and raw is None:
+                effective_events = copy.deepcopy(
+                    events if events is not None else self._full_events()
+                )
+                for event in effective_events:
+                    if isinstance(event, dict) and "session_id" in event:
+                        event["session_id"] = GUARD_SESSION_ID
+                events = effective_events
+        if raw is None:
+            raw = self._raw(events if events is not None else self._full_events())
         api_key_source = validator.AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE.get(
             authentication_source,
             "__invalid__",
@@ -444,6 +479,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             expected_runtime_cwd=expected_runtime_cwd,
             requested_model=requested_model,
             runtime_binding=runtime_binding,
+            expected_session_id=expected_session_id,  # type: ignore[arg-type]
             process_returncode=process_returncode,
             limits=limits,
         )
@@ -2360,6 +2396,193 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assertEqual(self._validate(events)["classification"], "accepted")
 
+    def test_guard_owned_session_binding_activates_at_2_1_226(self) -> None:
+        expected_session_id = "11111111-1111-4111-8111-111111111111"
+
+        legacy_events = self._known_compatible_extension_events("2.1.225")
+        del legacy_events[0]["session_id"]
+        del legacy_events[1]
+        del legacy_events[-1]["session_id"]
+        self.assertEqual(
+            self._validate(
+                legacy_events,
+                claude_code_version="2.1.225",
+            )["classification"],
+            "accepted",
+        )
+
+        bound_events = self._known_compatible_extension_events("2.1.226")
+        for event in bound_events:
+            event["session_id"] = expected_session_id
+        self.assertEqual(
+            self._validate(
+                bound_events,
+                claude_code_version="2.1.226",
+                expected_session_id=expected_session_id,
+            )["classification"],
+            "accepted",
+        )
+
+    def test_guard_owned_session_binding_does_not_apply_to_helpers(self) -> None:
+        expected_session_id = GUARD_SESSION_ID
+        for launch_profile in ("helper-linux", "helper-darwin"):
+            with self.subTest(launch_profile=launch_profile):
+                events = self._known_compatible_extension_events("2.1.226")
+                if launch_profile == "helper-linux":
+                    events[0]["cwd"] = "/workspace"
+                    events[0]["permissionMode"] = "dontAsk"
+                    events[0]["tools"] = ["Read"]
+                else:
+                    events[0]["permissionMode"] = "default"
+                    events[0]["tools"] = ["Read", "Grep", "Glob"]
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        claude_code_version="2.1.226",
+                        launch_profile=launch_profile,
+                        expected_session_id=None,
+                    )["classification"],
+                    "accepted",
+                )
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        claude_code_version="2.1.226",
+                        launch_profile=launch_profile,
+                        expected_session_id=expected_session_id,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.expected-session-id-invalid"],
+                    },
+                )
+
+    def test_guard_owned_session_binding_rejects_invalid_validator_argument(
+        self,
+    ) -> None:
+        expected_session_id = "11111111-1111-4111-8111-111111111111"
+        events = self._known_compatible_extension_events("2.1.226")
+        for event in events:
+            event["session_id"] = expected_session_id
+        for label, supplied in (
+            ("missing", None),
+            ("malformed", "INIT-SESSION"),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        claude_code_version="2.1.226",
+                        expected_session_id=supplied,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.expected-session-id-invalid"],
+                    },
+                )
+
+        older_events = self._known_compatible_extension_events("2.1.225")
+        for supplied in (expected_session_id, "", False):
+            with self.subTest(older_supplied=supplied):
+                self.assertEqual(
+                    self._validate(
+                        older_events,
+                        claude_code_version="2.1.225",
+                        expected_session_id=supplied,  # type: ignore[arg-type]
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.expected-session-id-invalid"],
+                    },
+                )
+
+    def test_guard_owned_session_binding_requires_only_frozen_init_id(
+        self,
+    ) -> None:
+        expected_session_id = "11111111-1111-4111-8111-111111111111"
+        events = self._known_compatible_extension_events("2.1.226")
+        for event in events:
+            event["session_id"] = expected_session_id
+        del events[0]["session_id"]
+        outcome = self._validate(
+            events,
+            claude_code_version="2.1.226",
+            expected_session_id=expected_session_id,
+        )
+        self.assertEqual(outcome["classification"], "inconclusive")
+        self.assertIn("init.session_id.missing", outcome["reasons"])
+
+        for malformed in ("INIT-SESSION", False):
+            with self.subTest(malformed_init=malformed):
+                malformed_events = self._known_compatible_extension_events("2.1.226")
+                for event in malformed_events:
+                    event["session_id"] = expected_session_id
+                malformed_events[0]["session_id"] = malformed
+                malformed_outcome = self._validate(
+                    malformed_events,
+                    claude_code_version="2.1.226",
+                    expected_session_id=expected_session_id,
+                )
+                self.assertEqual(
+                    malformed_outcome["classification"],
+                    "inconclusive",
+                )
+                self.assertIn(
+                    "init.session_id.malformed",
+                    malformed_outcome["reasons"],
+                )
+
+        terminal_optional = self._known_compatible_extension_events("2.1.226")
+        for event in terminal_optional:
+            event["session_id"] = expected_session_id
+        del terminal_optional[-1]["session_id"]
+        self.assertEqual(
+            self._validate(
+                terminal_optional,
+                claude_code_version="2.1.226",
+                expected_session_id=expected_session_id,
+            )["classification"],
+            "accepted",
+        )
+
+    def test_guard_owned_session_binding_rejects_each_event_family_mismatch(
+        self,
+    ) -> None:
+        expected_session_id = "11111111-1111-4111-8111-111111111111"
+        different_session_id = "22222222-2222-4222-8222-222222222222"
+        base_events = self._known_compatible_extension_events("2.1.226")
+        reviewed_intermediates = self._reviewed_intermediate_events()
+        labels = [
+            "init",
+            *(f"intermediate-{index}" for index in range(len(reviewed_intermediates))),
+            "terminal",
+        ]
+        for label in labels:
+            with self.subTest(label=label):
+                events = [copy.deepcopy(base_events[0])]
+                events.extend(copy.deepcopy(reviewed_intermediates))
+                events.append(copy.deepcopy(base_events[-1]))
+                for event in events:
+                    event["session_id"] = expected_session_id
+                if label == "init":
+                    events[0]["session_id"] = different_session_id
+                elif label == "terminal":
+                    events[-1]["session_id"] = different_session_id
+                else:
+                    intermediate_index = int(label.rsplit("-", 1)[1])
+                    events[intermediate_index + 1]["session_id"] = different_session_id
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        claude_code_version="2.1.226",
+                        expected_session_id=expected_session_id,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["stream.session_id.mismatch"],
+                    },
+                )
+
     def test_rejects_conflicting_init_and_terminal_session_ids(self) -> None:
         events = self._full_events()
         events[-1]["session_id"] = "different-session"
@@ -3646,6 +3869,62 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
         self.assertEqual(completed.stderr, b"")
+
+    def test_cli_binds_guard_owned_session_for_2_1_226(self) -> None:
+        expected_session_id = "11111111-1111-4111-8111-111111111111"
+        preflight_path = self.parent_state / "named-claude-preflight-2.1.226.json"
+        self._write_preflight_evidence(preflight_path, version="2.1.226")
+        events = self._known_compatible_extension_events("2.1.226")
+        for event in events:
+            event["session_id"] = expected_session_id
+        input_path = self.cwd / "claude-stream-2.1.226.jsonl"
+        input_path.write_bytes(self._raw(events))
+        base_arguments = [
+            sys.executable,
+            str(VALIDATOR),
+            "--cwd",
+            str(self.cwd),
+            "--model",
+            "claude-opus-4-8",
+            "--preflight-result",
+            str(preflight_path),
+            "--authentication-source",
+            "local-login",
+            "--process-returncode",
+            "0",
+            "--input",
+            str(input_path),
+        ]
+
+        missing = subprocess.run(
+            base_arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(missing.returncode, 3)
+        self.assertEqual(
+            json.loads(missing.stdout),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.expected-session-id-invalid"],
+            },
+        )
+
+        accepted = subprocess.run(
+            [
+                *base_arguments,
+                "--expected-session-id",
+                expected_session_id,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr.decode())
+        self.assertEqual(json.loads(accepted.stdout)["classification"], "accepted")
 
     def test_named_direct_cli_rejects_nonlocal_authentication_sources(self) -> None:
         for authentication_source in ("api-key", "oauth-token"):

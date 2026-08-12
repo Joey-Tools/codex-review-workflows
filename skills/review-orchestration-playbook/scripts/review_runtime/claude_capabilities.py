@@ -10,6 +10,7 @@ from .claude_version_policy import (
     CLAUDE_VERSION_COMPONENT_MAX_DIGITS,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
+    requires_guard_managed_session,
 )
 
 CLAUDE_MINIMUM_VERSION = _CLAUDE_MINIMUM_VERSION
@@ -55,6 +56,20 @@ CLAUDE_REQUIRED_OPTIONS = (
     "--allowedTools",
     "--disallowedTools",
 )
+
+
+def named_direct_required_options(version: str) -> tuple[str, ...]:
+    """Return the exact named-direct option contract for one release."""
+
+    if not requires_guard_managed_session(version):
+        return CLAUDE_REQUIRED_OPTIONS
+    insertion = CLAUDE_REQUIRED_OPTIONS.index("--safe-mode")
+    return (
+        *CLAUDE_REQUIRED_OPTIONS[:insertion],
+        "--session-id",
+        *CLAUDE_REQUIRED_OPTIONS[insertion:],
+    )
+
 
 CLAUDE_SAFE_MODE_CUSTOMIZATION_CLAIM = (
     ("all customizations",),
@@ -719,13 +734,15 @@ def _has_unsafe_safe_mode_continuation(sentences: tuple[str, ...]) -> bool:
     return False
 
 
-def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
+def validate_claude_help(
+    help_text: str,
+    *,
+    required_options: tuple[str, ...] = CLAUDE_REQUIRED_OPTIONS,
+) -> tuple[tuple[str, ...], str]:
     declared = _declared_options(help_text)
-    missing = tuple(
-        option for option in CLAUDE_REQUIRED_OPTIONS if option not in declared
-    )
+    missing = tuple(option for option in required_options if option not in declared)
     duplicates = tuple(
-        option for option in CLAUDE_REQUIRED_OPTIONS if declared.count(option) != 1
+        option for option in required_options if declared.count(option) != 1
     )
     if missing:
         raise ClaudeCapabilityUnavailable(
@@ -816,7 +833,7 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
             "Claude Code --safe-mode semantics do not satisfy the review contract"
             + (f": {detail}" if detail else "")
         )
-    return CLAUDE_REQUIRED_OPTIONS, block
+    return required_options, block
 
 
 def validate_claude_capabilities(

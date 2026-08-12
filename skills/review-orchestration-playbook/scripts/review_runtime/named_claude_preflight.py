@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence, TextIO
 
 from .claude_capabilities import (
-    CLAUDE_REQUIRED_OPTIONS,
     CLAUDE_VERSION_LINE,
     ClaudeCapabilityError,
     ClaudeSafetyContractInvalid,
+    named_direct_required_options,
     validate_claude_help,
 )
 from .claude_provenance import (
@@ -175,7 +175,9 @@ def _result(
         }
         value["identity"] = dict(verified.identity)
         value["capability_contract"] = {
-            "required_options": list(CLAUDE_REQUIRED_OPTIONS),
+            "required_options": list(
+                named_direct_required_options(verified.artifact.version)
+            ),
             "status": "accepted" if classification == "accepted" else "unaccepted",
         }
         if classification == "accepted":
@@ -1390,7 +1392,7 @@ def _parse_version(stdout: bytes, stderr: bytes) -> str:
     return ".".join(str(component) for component in parsed)
 
 
-def _validate_help_probe(completed: ProbeResult) -> None:
+def _validate_help_probe(completed: ProbeResult, *, version: str) -> None:
     if completed.returncode != 0 or completed.stderr.strip():
         raise _CapabilityProbeInconclusive("capability probe did not complete cleanly")
     try:
@@ -1399,7 +1401,10 @@ def _validate_help_probe(completed: ProbeResult) -> None:
         raise _CapabilityProbeInconclusive(
             "capability probe output is not UTF-8"
         ) from error
-    validate_claude_help(help_text)
+    validate_claude_help(
+        help_text,
+        required_options=named_direct_required_options(version),
+    )
 
 
 def preflight(
@@ -1603,7 +1608,10 @@ def preflight(
             verified=verified,
         )
     try:
-        _validate_help_probe(verified.help_probe_result)
+        _validate_help_probe(
+            verified.help_probe_result,
+            version=verified.artifact.version,
+        )
     except _CapabilityProbeInconclusive:
         return _result(
             "inconclusive",
