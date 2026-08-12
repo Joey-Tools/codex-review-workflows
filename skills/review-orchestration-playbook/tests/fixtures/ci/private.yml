@@ -105,6 +105,34 @@ jobs:
         run: |
           python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
 
+  giant_contracts:
+    name: giant-contracts (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: epoch
+            selector: test_contracts.RepositoryContractTest.test_github_codex_epoch_retries_are_serial_fenced_and_bounded
+          - name: audit-liveness
+            selector: test_contracts.RepositoryContractTest.test_thumbs_up_clean_audit_and_liveness_reference_matrix
+    # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input 'tomli==2.2.1; python_version < "3.11"'
+      - name: Run giant contract
+        working-directory: personal_codex/skills/review-orchestration-playbook/tests
+        env:
+          CODEX_REVIEW_RUN_GIANT_CONTRACTS: "1"
+        run: |
+          python3 -B -m unittest -v "${{ matrix.selector }}"
+
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
     runs-on: macos-26
@@ -1824,6 +1852,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - platform_tests
+      - giant_contracts
       - python-39-compatibility
       - independent_supervisor_tests
       - readonly_install_supervisor_tests
@@ -1834,11 +1863,13 @@ jobs:
       - name: Require every platform test to pass
         env:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          GIANT_CONTRACTS_RESULT: ${{ needs.giant_contracts.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
           INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
           READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$GIANT_CONTRACTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
           test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"

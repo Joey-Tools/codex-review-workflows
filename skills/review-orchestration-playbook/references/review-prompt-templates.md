@@ -1,188 +1,206 @@
 # Review Prompt Templates
 
-Use these templates for bounded findings-only review. Named review shapes have one fixed composition:
+This reference owns prompt skeletons, resource load order, and reviewer output shape. It deliberately omits machine fields and provider wire details. Load [review-lane-contracts.md](review-lane-contracts.md) for eligibility and budgets.
 
-A legacy unreceipted artifact never becomes the selected completion basis.
-
-- Single is exactly one clear/fresh-context Codex `reviewer` agent in a separate clean, read-only Git workspace produced by the trusted pre-status materializer.
-- Double is single plus actual Claude Code in another independent read-only workspace over the same frozen `base_sha..head_sha`.
-- Triple is double plus exact `@codex review` on an exact-host `github.com` PR and complete authenticated current-scope GitHub Codex evidence accepted under [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
-
-A separately requested Copilot diagnostic never counts toward named double. The third lane supports only exact host `github.com`; every other host, including `sqbu-github.cisco.com` and every GitHub Enterprise host, is unsupported. If there is no PR, or the host or operating identity in `{hoteng, hoteng_cisco}` is unsupported, the completed shape is `effective double`. The fixed authority baseline has no accepted no-start body grammar and an empty accepted structured capability/installation schema set, so integration/service state cannot supply this fallback. The legacy `isolated_review` Codex helper and any pre-materialized-diff review do not count toward single, double, or triple.
-
-## Prompt Construction Rules
+## Construction Rules
 
 - Before constructing either local prompt, require parent-owned evidence that the trusted guard's `materialize-worktree` accepted only a full non-shallow, non-promisor, alternate-free source; proved `base_sha` is the sole merge base and an ancestor of `head_sha`; derived source commit scope `{base_sha} ∪ (base_sha..head_sha)`; and initialized a lane-private repository with exactly one materializer-owned shallow boundary at `base_sha`. It must import the complete recursive commit/tree/blob snapshot closure for every scoped commit, reject a graph that the single boundary cannot represent and any arbitrary destination shallow state, enforce the unchanged object/logical/checkout/path ceilings, the separate 250,000 parent-edge-occurrence ceiling, and the 768 MiB exact-range pack ceiling, and prove exact imported commits and total object inventory before `fsck`, completeness checks, and checkout. The formal destination has no `.git/config.worktree`; the guards bind its local config identity/content/access policy, bind owner-private `.git/info`, reject and revalidate `info/grafts`, and use `GIT_GRAFT_FILE=/dev/null` plus the fixed stat-safe configuration. Invoke candidate `validate-worktree` with that same mandatory frozen `--base` and `--head`; before its first status query it must revalidate both lane refs, exact `BASE+LF` shallow content, endpoint commits, the unique merge base, exact range topology, local config, and graft-free info state. Require both guard receipts to bind type-preserving identical `base`, `head`, `worktree`, `commit_count`, `parent_edge_count`, `parent_graph_sha256`, and `local_config_sha256`; the canonical graph digest byte-sorts commit rows and preserves parent-token order and duplicates. Never use `git worktree add`, clone/fetch/upload-pack, a copied source config/hooks directory, or any pre-validator status query. During this self-policy migration, the independently trusted prior bundle reviews the candidate through its prior interface; do not claim the candidate-only mandatory-`--base` gate active before merge and release.
 - Give a named Codex reviewer only review-control metadata: the clean worktree path, exact `base_sha`, exact `head_sha`, the parent-accepted materialization/validation receipt pair binding all seven shared fields above, the independently trusted control-plane bundle's absolute source/version/SHA-256 digest, the authoritative review skill's exact absolute path within that bundle and version/digest, the exact sanitized Git argv prefix, instruction-loading order, read-only/evidence limits, focus/non-goals, and output contract. Never prebuild, paste, attach, or otherwise inject the full diff, changed-file content, suspected finding, or another reviewer's output into its prompt.
 - Supply the sanitized Git prefix as an exact token sequence beginning with `/usr/bin/env -i`, followed only by the recorded trusted `PATH`, fixed `LANG`/`LC_*`, `PAGER`, and `GIT_*` allowlist, the resolved trusted Git executable, the fixed safe `-c` flags, and `-C <absolute-clean-worktree>`. Require every Git call to copy that prefix exactly; forbid bare `git`, another executable or wrapper, a reconstructed prefix, extra environment keys, changed `-c` values, and a different worktree. Require explicit `--no-ext-diff --no-textconv` on every diff-producing command.
 - The parent-supplied token sequence contains exactly the environment and safe options defined in [review-lane-contracts.md](review-lane-contracts.md), including no global/system config, no prompts/lazy fetch/grafts/replacement objects/optional locks, `GIT_CEILING_DIRECTORIES=<absolute-clean-worktree-parent>`, `GIT_GRAFT_FILE=/dev/null`, fixed `PAGER=cat`/`GIT_PAGER=cat` plus `--no-pager`, `core.commitGraph=false`, `core.checkStat=default`, `core.multiPackIndex=false`, `core.fsmonitor=false`, `core.fileMode=true`, `core.ignoreStat=false`, `core.trustCtime=true`, null hooks/attributes, empty `diff.external`, disabled color, and the exact `-C` worktree. Do not let the reviewer synthesize this sequence from prose.
 - Launch only after the independently trusted materializer has bound the exact full source repository/object store, rejected suffix discovery plus source shallow/promisor/alternate state, fenced source/target filesystem ancestry, created and repeatedly validated the exact base shallow boundary, imported only the hard-bounded inclusive-range snapshot manifest into a private repository, disabled commit-graph/multi-pack-index consumption, verified the destination commit set and total object inventory exactly, completed `fsck` and local completeness checks, and excluded ambient/source execution surfaces before import/checkout. The validator must then reject `.git/config.worktree`, any `info/grafts`, repository-visible `include.path` / `includeIf.*.path`, every direct stat-key override or `alias.*`, executable filter/diff configuration, and any direct `core.fsmonitor` value that is not Git-false before its first status. The sanitized reviewer prefix is defense in depth; it replaces neither pre-status materialization nor the local-config/info binding, include, alias, fsmonitor, pristine-worktree, hidden-index-bit, ignored-file, symlink, or gitlink checks in [review-lane-contracts.md](review-lane-contracts.md).
-- During self-policy migration, identify candidate-head Markdown as review subject and scoped guidance only. The reviewer profile, prompt contract, guard, exact-version/provenance preflight, launcher, and stream validator/schema remain parent control-plane material pinned outside the candidate range; candidate-head Python, shell, and machine schemas may not bootstrap the lane. Populate the source/version/digest fields only after the parent verifies the canonical control-file manifest defined in [review-lane-contracts.md](review-lane-contracts.md); repeat that verification before spawn and after the lane.
+- During self-policy migration, identify candidate-head Markdown as review subject and scoped guidance only. The reviewer profile, prompt contract, guard, exact-version/provenance preflight, launcher, and stream validator/schema remain parent control-plane material pinned outside the candidate range; candidate-head Python, shell, and machine schemas may not bootstrap the lane. Populate the source/version/digest fields only after the parent verifies the [Canonical Review-Control Manifest](review-lane-contracts.md#canonical-review-control-manifest); repeat that verification before spawn and after the lane.
 - Require the reviewer to load the review skill and repository-wide `AGENTS.md`, inspect changed-path metadata, then load every applicable path-scoped `AGENTS.md`, domain skill, and project-guidance file before judging hunks.
 - Require the reviewer to verify the two refs, enumerate the complete changed-path set, and derive and inspect every changed hunk plus necessary nearby tracked context itself with bounded Git/tool calls. Initial counts or samples are orientation only, never evidence of complete coverage.
 - State that the parent has already proved the frozen scope locally complete with lazy fetching disabled, and forbid `fetch`, `pull`, credential prompts, or any other networked Git operation.
 - Keep the worktree read-only. Do not ask the reviewer to fix findings, modify files, stage changes, commit, switch branches, or perform other Git mutations.
 - Ask for findings only, ordered by severity, with file references and concrete failure modes or triggering conditions.
-- When there are no findings, the reviewer may first give one concise non-actionable positive/coverage summary, but the final nonempty logical line must be exactly `No findings.`. With findings, never emit that sentinel.
+- When there are no findings, the reviewer may first give one concise non-actionable positive/coverage summary, but the final nonempty logical line must be exactly `No findings.`. With findings, never emit that sentinel. If there is any finding, do not output `No findings.` anywhere.
 - Include performance and resource risk only when the change plausibly affects hot paths, complexity, allocation, I/O, contention, startup, fan-out, query shape, repeated work, or build cost.
 - Tell the reviewer to avoid style-only nits, speculative micro-optimizations, and unrelated rewrites.
 - Prefer direct argv tool calls. Avoid `bash -lc`, `zsh -lc`, here-docs, and similar wrapper probes unless shell syntax is essential.
 - For Claude, if the CLI reports that output was persisted or spilled outside the detached worktree, never follow the reported path with `Read`, `Grep`, or `Glob`. Rerun a narrower bounded command over exact worktree paths; if an outside-workspace tool read already occurred, the lane is blocked and its findings cannot be accepted.
 - For Claude structured file tools, pass an absolute worktree path in `Read.file_path` and in every present `Grep.path` or `Glob.path`. `Glob.path` may be omitted only to use the exact review cwd. Every `Glob` call must include a bounded relative `Glob.pattern`; ordinary `**`, wildcard directory components, character classes, and simple brace alternatives are allowed, including `**/*.py`, `src/**/*.{py,md}`, and `./**/*.py`. Never use an absolute pattern, home shorthand, an exact `..` path component, intermediate `.`, a backslash escape, extglob such as `@(` / `!(`, or nested/malformed/expansive braces. These prompt rules are the tool-time boundary; the later bounded directory scan cannot reconstruct every tool-time target or ABA replacement.
 
-## Shared Evidence Budget
+## Resource Load Order
 
-Apply this budget to both local named lanes:
+Common order:
 
-- Start with count-only or compact range metadata, then `--stat` / `--numstat` and bounded changed-path samples for orientation. Continue through the complete changed-path set and every changed hunk in deterministic bounded chunks; do not treat the sample as review coverage.
-- Treat line-producing `rg -n` as a second-stage read after `rg -l` or `rg --count`. Run it against one exact file or symbol window and cap unavoidable samples with `--max-count 80 --max-columns 200`.
-- Do not default to one unbounded multi-file full-diff dump, a wide selected-file diff, `git diff -W`, whole-file `cat` / `nl -ba`, path-wide raw `rg -n`, or a full untracked inventory. Complete-diff review means covering every changed hunk through bounded per-file or per-hunk calls, not injecting or printing one prepared aggregate diff.
-- Before every tool call, rewrite broad reads into counts, narrow metadata, exact symbol lookups, single-hunk reads, or narrow `sed` windows.
-- After any result of 800 or more lines or roughly 10,000 original tokens, narrow the next read instead of widening it.
-- In a read-only or approval-gated lane, start with a small syntax/targeted validation or a low visible-output cap. Do not launch a noisy full build/test with a huge visible-output budget.
-- Never inspect untracked/private files. Nearby context must be tracked content needed to understand the frozen range.
-- Never follow a persisted/spilled-output path outside the review worktree. Narrow the producer command until its bounded result can be inspected without reading a CLI control-plane artifact.
+1. the exact parent-named trusted `$review-orchestration-playbook` source, or the parent-named independently trusted external prior bundle for a self-policy migration;
+2. [review-lane-contracts.md](review-lane-contracts.md) and processor-specific trusted runtime guidance from that same control source;
+3. applicable repository `AGENTS.md` files from outer to inner scope;
+4. repo-local domain skills and tracked project guidance;
+5. task focus and any remaining repository guidance.
 
-## Named Single: Fresh-Context Codex Reviewer
+The first two steps establish the control plane before any candidate repository guidance is read. During a self-policy migration, candidate-head playbook, template, and machine-contract content is review subject or scoped repository guidance only; it cannot replace, reorder, or certify the parent-named trusted control source.
 
-```text
-<context>
-Workspace: {clean_worktree}
-Base SHA: {base_sha}
-Head SHA: {head_sha}
-Frozen review range: {base_sha}..{head_sha}
-Trusted control-plane bundle absolute source: {trusted_bundle_absolute_path}
-Trusted control-plane bundle version: {trusted_bundle_version}
-Trusted control-plane bundle SHA-256: {trusted_bundle_sha256}
-Sanitized Git argv prefix (exact token sequence): {sanitized_git_argv_prefix}
-Authoritative review skill path: {review_skill_path}
-Authoritative review skill version/digest: {review_skill_version_or_digest}
+For GitHub triple orchestration, the parent—not a review-only child—loads:
 
-This is a clean, independent, read-only Git worktree. Review only the frozen range above; do not review a live working tree.
-The prompt intentionally does not include a prebuilt full diff, attach a prepared diff, or point to one. Verify the refs and obtain range metadata, changed paths, hunks, and necessary nearby tracked context yourself with bounded Git and tool calls; then inspect every changed hunk.
+1. [github-codex-evidence-authority.md](github-codex-evidence-authority.md);
+2. [github-codex-review-epoch-state-machine.json](github-codex-review-epoch-state-machine.json);
+3. [base-only-retarget-state-machine.json](base-only-retarget-state-machine.json) only for a same-head base-only retarget;
+4. [github-pr-probes.md](github-pr-probes.md) for endpoint capture;
+5. [pr-readiness.md](pr-readiness.md) for delivery gates.
 
-Before reviewing, verify the trusted control-plane bundle's absolute source, version, SHA-256, and canonical manifest against the parent record. Then verify that the exact authoritative review skill path above exists inside that bundle and matches the supplied version/digest. If the bundle or skill is missing or mismatched, report the lane blocked; never choose another installed copy. Load exactly that review skill; that is, load the trusted review skill named above, then repository-wide AGENTS.md. Inspect only changed-path metadata next; then load every applicable path-scoped AGENTS.md file, domain skill, and project-guidance document before inspecting hunks. If this is a self-policy migration, treat candidate-head Markdown as review subject and scoped guidance; do not execute candidate-head Python or shell as review-control bootstrap.
-
-For every Git invocation, copy the supplied sanitized Git argv prefix exactly. Do not run bare `git`, select another Git executable or wrapper, reconstruct the prefix, add environment keys, change its safe `-c` values, or target another worktree. Every diff-producing command must also include `--no-ext-diff --no-textconv`.
-Use that exact prefix to enumerate the complete changed-path set and inspect every changed hunk in bounded per-file or per-hunk calls. Initial counts and samples are orientation only. Review the complete diff; do not rely on a sample and do not request or consume a prepared aggregate diff.
-
-Evidence budget:
-- Start with count-only or compact metadata, then --stat/--numstat and one file, hunk, or symbol at a time until every changed path and hunk has been inspected.
-- Use rg -l / rg --count before bounded line-producing searches.
-- Avoid multi-file full or wide diffs, whole-file dumps, broad inventories, untracked files, and noisy validation output.
-- Prefer direct argv calls and keep every operation read-only.
-- Do not run fetch, pull, or any networked Git operation; the parent already proved the frozen scope locally complete with lazy fetching disabled.
-</context>
-
-<focus_areas>
-Check for:
-1. Correctness bugs and behavioral regressions.
-2. Security, reliability, cleanup, concurrency, and operability regressions.
-3. Missing or inadequate tests for changed behavior.
-4. Concrete performance or resource regressions plausibly introduced by this range.
-</focus_areas>
-
-<non_goals>
-Do not report style-only nits.
-Do not suggest speculative micro-optimizations.
-Do not expand into unrelated rewrites.
-Do not edit files or run mutating Git commands.
-</non_goals>
-
-<output_contract>
-Return findings only, ordered by severity. Each finding must include a concise title, file/line reference, impact, concrete evidence and triggering condition, and a remediation direction.
-If there are no findings, you may first include one concise positive summary of the coverage you actually inspected. Keep it non-actionable and free of concerns, remediation, residual risk, contradictions, or uncertainty. The final nonempty logical line must be exactly: No findings.
-If there is any finding, do not output `No findings.` anywhere.
-</output_contract>
-```
-
-Launch this prompt only through the configured clear/fresh-context `reviewer` agent with `fork_turns="none"`, or the platform-equivalent zero inherited turns. Do not use a default coding agent, inherited-context child, parent-thread continuation, or legacy helper as a substitute.
-
-## Named Double: Actual Claude Code Lane
-
-Run this after freezing the same range used by the named single lane. The Claude Code workspace must be independent from the Codex reviewer worktree and read-only.
+## Named Single Skeleton
 
 ```text
-<context>
-Workspace: {claude_readonly_workspace}
-Base SHA: {base_sha}
-Head SHA: {head_sha}
-Frozen review range: {base_sha}..{head_sha}
-Canonical Claude lane contract version: {review_contract_version}
+You are the sole fresh-context Codex reviewer for this lane.
 
-Review exactly this frozen range from this independent read-only workspace. The parent bound this path/head through trusted `materialize-worktree` followed by `validate-worktree`, whose forced status was the first status query; do not checkout, switch, reset, repair, or rematerialize it. Explicitly read repository-wide AGENTS.md, inspect only changed-path metadata, then read applicable path-scoped AGENTS.md, repo-local domain skills, and project guidance before inspecting hunks. Obtain bounded range evidence and necessary nearby tracked context yourself; no prepared diff or other reviewer's output is supplied. The parent already proved the frozen scope locally complete with lazy fetching disabled; do not run `fetch`, `pull`, credential prompts, or another networked Git operation. Do not directly read any path outside this detached workspace, including its parent, the source checkout, other reviews, real-HOME content, installed skills, or unrelated repositories. Use an absolute worktree path for `Read.file_path` and every present `Grep.path` or `Glob.path`; an omitted `Glob.path` means this exact cwd. Supply every `Glob` call with a bounded relative pattern. Ordinary `**`, wildcard directory components, character classes, and simple brace alternatives are allowed, including `**/*.py`, `src/**/*.{py,md}`, and `./**/*.py`; never use an absolute pattern, home shorthand, an exact `..` component, intermediate `.`, a backslash escape, extglob, or nested/malformed/expansive braces. If Claude Code reports that output was persisted or spilled to any outside path, do not use Read, Grep, Glob, or Bash to inspect it; rerun a narrower bounded command over exact worktree paths. If you already directly read an outside-workspace path, stop: the lane is blocked and no findings result from this run is valid. Read-only Git may internally use only this worktree's registered Git metadata/object paths for the frozen refs. Do not inspect untracked/private files or mutate the workspace. This outside-workspace exclusion is a model/prompt scope rule supplemented by a bounded validation-time scan over observable structured tool paths; that gate assumes no concurrent workspace mutation and cannot prove the earlier tool-time target or every ABA replacement. Do not assume native-sandbox `allowRead` or that gate is a global host-read whitelist; the prompt, parent-controlled workspace, and requested native sandbox remain the execution boundary.
-</context>
+Repository: <absolute clean workspace>
+Frozen range: <base_sha>..<head_sha>
+Trusted control-plane bundle: <absolute path + version + canonical manifest SHA-256>
+Authoritative review skill: <absolute path + version + SHA-256 digest>
+Trusted guard receipt: <identity>
+Materialize receipt: <exact accepted receipt>
+Validate receipt: <exact accepted receipt>
+Receipt equality: <type-preserving exact base, head, worktree, commit_count,
+parent_edge_count, parent_graph_sha256, and local_config_sha256 equality>
+Sanitized Git argv prefix: <exact supplied token sequence>
+Instruction order: <ordered paths>
+Focus: <bounded review focus>
+Non-goals: <explicit exclusions>
 
-<task>
-Review for correctness, security, behavioral regressions, missing tests, and concrete performance, reliability, or operability risks introduced by the range.
-Return findings only, ordered by severity. Each finding must include a concise title, file/line reference, impact, concrete evidence and triggering condition, and a remediation direction. Do not report style-only nits or unrelated rewrites.
-</task>
+Load the applicable instructions. Inspect the frozen diff and necessary tracked
+context yourself with bounded read-only Git/tools. Do not fetch, edit, commit,
+post, or start another reviewer.
 
-<output_contract>
-If there are findings, output only the findings.
-If there are no findings, you may first include one concise positive summary of the coverage you actually inspected. Keep it non-actionable and free of concerns, remediation, residual risk, contradictions, or uncertainty. The final nonempty logical line must be exactly: No findings.
-If there is any finding, do not output `No findings.` anywhere.
-</output_contract>
+Return actionable findings first, ordered by severity. Each finding must include
+the affected file/line, the violated property, and why the candidate causes it.
+If no actionable finding remains, return the accepted clean form required by
+the trusted reviewer profile. Report any evidence or runtime blocker exactly.
 ```
 
-Only a terminal result from actual Anthropic Claude Code satisfies this lane. A separately requested supplemental Copilot diagnostic can be reported on its own, but it does not complete named double.
-
-## Named Triple: GitHub Cloud Codex Trigger
-
-In this prompt, terminal findings remain blocking negative evidence; terminal clean remains artifact-level classification only.
-
-For this lane, inspect the complete authenticated current-scope provider snapshot and bounded audit record before posting or accepting evidence. Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md), preserve its atomic pinned source/action/common-tree/complete-15-path/result-present-rationale anti-drift receipt, and keep producer behavior separate from provider-evidence consumption. For one unchanged current head, post at most one exact `@codex review` request and never post a second or third; reuse the recorded provider evidence when a request already exists. Record `early-request-observed` for an early request and `duplicate-observed` when more than one same-scope request exists, including an overlapping or pending extra request. Those warnings are outcome-neutral and never authorize a repair request. A lone compliant pending request is not a warning; positive completion remains pending unless a complete `thumbs-up-clean` reaction basis is accepted.
-
-For each request admitted by the request or reaction plane, require one parent-owned `parent-recorded-request-scope-v1` sidecar with closed raw pre/post PR-detail and compare receipts plus the exact `201` POST response. Both scope projections equal the enclosing `(repository, PR, merge base, head)`, and the POST response projects type-preservingly to the request's eight top-level fields, including closed `user: {login, type}` actor identity. Keep `request_scope_receipts` beside the unchanged raw transcript-v4 envelope; never add a fetch kind. A missing, malformed, extra, or unmatched sidecar makes `request_policy` `unknown`, forbids another POST while same-scope history is unproved, and disables the affected reaction evidence without invalidating an independently trustworthy terminal payload. A valid old-head receipt remains old-epoch audit evidence and does not count as a current-head request; an old-epoch-only request/reaction seeded scope produces no current result entry and remains audit-only. A valid same-head/different-merge-base receipt is not this audit-only exception: it instead takes `base-changed-same-head` and forbids a replacement request. The sidecar proves neither request/run lineage nor continuous scope stability, and equal pre/post observations do not exclude an intermediate ABA transition.
-
-Wrap every terminal-looking exact-provider artifact in the receipt-bound normalized decision member in one closed `parent-recorded-terminal-artifact-scope-v1` receipt containing pre pull/compare, exact artifact GET, and post pull/compare responses. Strictly parse and digest the complete raw GitHub bodies, but compare their closed authority projections rather than rejecting legitimate extra REST fields. Require the exact current repository/PR/merge-base/head tuple for clean or malformed evidence; a finding may use its proved-ancestor artifact commit only while repository/PR/merge base remain current and normalized `scope.head` remains current. Enforce `pre Date < artifact semantic time <= artifact GET Date <= post Date`; whole-second equality at the pre edge is inconclusive. For a raw lowercase 10-hex clean issue carrier, keep semantic/role `clean-pending-resolution` and no clean authority until an exact `parent-recorded-reviewed-commit-resolution-v1` companion joins the artifact ID, scope, ref, and full current head. Its two independent raw `200` exact-repository resolution receipts must additionally prove `artifact GET Date <= initial resolution Date <= every post-scope Date <= final resolution Date`, with same-second equality allowed; a prose assertion about invocation order is not evidence. Apply this same companion join in current, complete-history, and sidecar-blind historical paths. Sidecar-blind may ignore request-scope sidecars but never this companion. Action parity is limited to the 10/40 carrier lengths and fail-closed short-ref REST outcome; lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank boundary, closed lead/tagline/disclosure/native grammar, and independent parent-recorded initial/final receipt evidence remain stricter playbook rules. A truly absent pre-v1 receipt is the narrow audit-only exception: keep the strictly older artifact raw only when one of the two raw-internal migration classifiers recognizes it, then admit it only through the authority's closed `legacy_unreceipted_audit` partition. Ordinary unreceipted current-grammar clean or finding artifacts remain ineligible. It never supplies positive authority or becomes the selected completion basis. A later accepted receipt-bound result may still have a non-null `evidence_basis` that carries the item in `legacy_unreceipted_artifacts`; the legacy item does not by itself veto that result when every migration gate closes. A malformed or unstable receipt is not this exception. The frozen reaction-history as-of bounds historical artifact semantic time, not when the bounded decision/final reread collects GET/post receipts. Validate every associated exact-provider inline child and target-thread join; any unresolved applicable child blocks, while all must be resolved before a later strong clean can supersede that review. A proved non-ancestor stays raw audit-only and must not appear in normalized active or unresolved finding lists.
-
-Attach one parent-owned `resource_budget` sibling beside each independent historical discovery or current raw endpoint transcript, never inside transcript v4. Require the exact closed profile `{profile: github-codex-evidence-resource-budget-v1, schema_version: 1, max_seeded_pull_requests: 512, max_controlled_requests: 512, max_fetch_attempts: 8192, max_retained_pages: 4096, max_records: 20000, max_page_body_bytes: 8388608, max_retained_utf8_bytes: 67108864, deadline_seconds: 900}`. Historical discovery combines an updated-desc pull boundary, a fully paginated since-cutoff repository issue-comment feed, and exact current/declaration anchors; fully traverse every PR in that union. The 512 cap counts only union/detail scopes, never cumulative repository history or old boundary witnesses. Apply the profile to three non-borrowing endpoint, request-scope-sidecar, and terminal-artifact-scope-receipt ledgers with the same inventory start/deadline. Pre-count each sidecar or artifact wrapper: an ordinary artifact wrapper plus five raw scope/artifact responses costs six records, while a lowercase 10-hex clean wrapper adds two independent resolution responses, for seven raw responses and eight records. Create the artifact ledger once per inventory decision pass, validate each immutable wrapper once, and thread its memoized result through candidate ordering, audit, profile, outcome, and report projection; never reset it per candidate/scope/recomputation or recharge the same wrapper. Sidecar overflow makes request policy unknown and disables reaction authority without erasing stable terminal evidence. Aggregate artifact-ledger overflow invalidates the complete terminal projection and selects `unknown`, never a validated prefix. Charge known attempts/pages/records before cloning or serialization, bytes before hashing/decoding/accumulation, and recheck time before success. Parse a current raw inventory's one real detail fetch set exactly once—no synthetic seed, duplicate pull parse, second deadline, or post-budget mutation. Endpoint overflow or an unverifiable bound selects `unknown` and discards the traversal, never a truncated candidate set. The 20,000-record, 8-MiB response, and 64-MiB run magnitudes align with the pinned `codex-review-gate-action`; the remaining caps are playbook extensions.
-
-Record `request_policy`, `provider_profile`, and `evidence_basis`, and classify the final snapshot under `terminal-payload`, `mixed`, `thumbs-up-clean`, or `unknown` unless a proved pre-provider blocker requires null profile/basis. Provider-evidence artifact classification does not require request/run attribution. A terminal payload supplies artifact-level clean/findings classification only. Every selected terminal basis records `scope_assurance: artifact-publication-only`, which identifies artifact-publication scope but does not attest the provider's internal input merge base or establish request/run/artifact lineage; it cannot complete triple or make the PR merge-ready. Terminal findings remain blocking negative evidence, while terminal clean is immediately `triple-inconclusive`, classification-only, and audit-only for readiness. Only a complete `thumbs-up-clean` reaction basis can complete the GitHub Codex lane. Future positive completion requires a predeclared provider-authenticated input-base or request/run/artifact binding; the current accepted provider-input-binding schema set is empty. An independently trustworthy current terminal clean/findings artifact defaults to `terminal-payload` when the declaration is missing or historical traversal, pagination, endpoint/artifact budget, or sidecar validation fails; those failures prevent only `mixed` and weak reaction authority. Run optional history before the final current reread and allocate fresh current trackers afterward, so elapsed historical work cannot expire current classification authority. Current endpoint/artifact receipt, identity, scope, lifecycle, thread, ancestry, grammar, selection, or final-stability failure still blocks. In `mixed`, a trustworthy current-scope terminal payload controls artifact classification precedence regardless of reaction ordering; a later `+1`, `eyes`, or other reaction never overturns it, but `mixed` never accepts reaction-only clean and the payload supplies no positive completion authority. `eyes` is liveness-only and affects only reaction-only fallback, where an `eyes` at or after the selected `+1` prevents weak clean.
-
-Only `thumbs-up-clean` can reach the complete weak `+1` fallback. Build the complete bounded history candidate universe from the schema-version-4 dual-source discovery union before profile selection and never skip an incomplete, conflicting, or unfavourable candidate. Its 3–10 historical samples come from distinct non-current scopes; validate the exact current scope separately and never count it toward that minimum. Each historical sample and the separate current snapshot binds one selected exact `@codex review` parent's eight fields and exact request-time scope sidecar to its individual child exact-bot `+1`, with strict `reaction.created_at > request.request_server_time`. Each scope also records every accepted same-scope request parent, repeats each sidecar, and fully paginates every individual reaction so a newer request, old-epoch reattachment, or cross-parent conflict cannot be hidden. The selected `+1` parent must be the unique latest request by semantic time, and the evidence basis binds the authoritative provider declaration identity/digest.
-
-Apply the frozen as-of cutoff only after complete schema, native-ID, canonical-URL/parent-join, timestamp, and actor validation. A confirmed-different non-request issue comment created wholly after the cutoff, confirmed-different submitted review after the cutoff, or confirmed-different reaction after the cutoff remains raw-only and may be excluded from the semantic projection. A controlled `@codex review` request, exact-provider or ambiguous/provider-like record, exact/ambiguous child, or cross-cutoff issue-comment edit remains fail-closed. Transcript v4 has no inline-child timestamp with which to infer that a later reply on an in-cutoff provider review is removable suffix noise.
-
-The as-of bound applies to historical samples and the separate current reaction-only basis for `thumbs-up-clean`. It does not cap the semantic time of a strong current `terminal-payload` or `mixed` result that arrives during the bounded provider wait after declaration discovery, and it does not cap artifact-receipt GET/post collection time.
-
-Accept the declaration only as the canonical GitHub REST issue-comment resource that the parent reads directly and re-fetches unchanged during final revalidation, with exact `user.login == "chatgpt-codex-connector[bot]"`, `user.type == "Bot"`, `performed_via_github_app.slug == "chatgpt-codex-connector"`, exact repository/PR/API-URL/HTML-URL bindings, and the exact `If Codex has suggestions, it will comment; otherwise it will react with 👍.` line. Both bounded dual-source discovery passes include its bound PR as an explicit anchor, fully traverse it, and find that exact record once. Declaration authority and terminal classification are orthogonal: the same artifact may prove the declaration and independently classify as clean, findings, or malformed. Only an independently nonterminal declaration record and the closed progress-only grammar are audit-only; a declaration-only nonterminal PR is a confirmed non-candidate. Other exact-provider free-form prose fails closed, and in-window terminal-looking malformed prose remains a candidate. A fully parsed malformed record at or before the exclusive lower boundary remains audit-only confirmed-non-candidate evidence. Generic issuer/source fields, caller-supplied records, and self-hashed paraphrases are invalid.
-
-Use only `compliant`, `warning`, `unknown`, or `not-applicable` for `request_policy.status`. A proved no-PR or unsupported-host/identity path uses `not-applicable`; unprovable early-request timing uses `unknown` without an early-warning code. A proved pre-provider blocker reports `provider_profile: null` and `evidence_basis: null`. An eligible wait uses the computed profile or `unknown` with `evidence_basis: null`. Classified terminal clean/findings uses `terminal-payload` or `mixed` plus its selected artifact-publication-only basis without completing the lane; accepted weak reaction clean uses `thumbs-up-clean` plus its complete reaction basis and is the only positive completion path. An inconclusive result uses its computed profile or `unknown` and a stable blocking basis when one exists, otherwise null.
-
-Fetch the selected exact-bot review body plus every fully paginated associated inline review comment, or the complete terminal issue-comment body, and include relevant thread state in the final re-read. Admit terminal comments/reviews only under the authority's fixed clean/finding/inline-parent grammar; every other terminal-looking exact-provider artifact is malformed. A terminal clean classification requires stable current-head artifact-publication scope and no newer trustworthy finding, authority-invalidating malformed or unknown provider evidence, active top-level finding on the current or an ancestor head, or unresolved thread finding; it still supplies no positive whole-PR completion. When no complete `thumbs-up-clean` reaction fallback is accepted, missing terminal evidence, an unestablished reaction-only profile, or retryable incomplete pagination remains pending while bounded waiting is meaningful; after that wait is exhausted it is `triple-inconclusive`. Malformed or stale evidence, ambiguous identity/scope or terminal payload, non-retryable failure, permanently incomplete enumeration, or an unstable lifecycle/scope/provider-artifact/thread/selected-terminal final re-read is immediately `triple-inconclusive`. Complete duplicate/pending request and reaction pages remain audit inputs, but stable or changing records affect only request/reaction authority and never overturn an independently stable terminal classification. Sidecar-only instability likewise makes request policy unknown and disables reaction completion while preserving that classification. An exact-App current-head check/run is service-start evidence only; it never completes triple or proves clean/no-findings, even when `completed` / `success`.
-
-Before counting either local lane for a selected PR, independently require exact authenticated lifecycle `state == "open"`, `merged == false`, and `merged_at == null`; read `baseRefName`, `baseRefOid`, and `headRefOid`; require locally complete base/head commits with lazy fetching disabled; and require `git merge-base --all pr_base_oid pr_head_oid` to produce exactly one full `pr_merge_base`. Missing/contradictory lifecycle evidence is `pr-lifecycle-unverified`; closed-unmerged is `selected-pr-closed`, and merged is terminal `already-merged` / `selected-pr-merged`. Revalidate lifecycle before posting, before result acceptance, and before readiness/merge; an observed non-open lifecycle at any mandated snapshot after request/service start invalidates evidence and remains triple-inconclusive. These point-in-time snapshots do not prove that no intermediate close-and-reopen occurred between them. At the first selected-PR range freeze, persist immutable parent-owned `range_origin.kind`, `range_origin.base_sha`, and `range_origin.head_sha`; use only `caller-supplied` or `pr-derived`, never infer origin from a later parent-provided range, and never overwrite original caller endpoints. A selected PR's explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`. A same-head/different-base range is `blocked-input` (`scope-mismatch`): preserve the caller's range, do not silently rewrite it, and never describe its local review results as whole-PR coverage. Explicit-range-only standalone single/double with no selected PR is unaffected.
-
-Before applying the generic same-head/different-base `scope-mismatch` branch, if a valid sidecar proves that the request-time merge base changed after the accepted request while the head stayed unchanged, invalidate the old whole-PR artifacts and apply [base-only-retarget-state-machine.json](base-only-retarget-state-machine.json), but do not post a replacement same-head request or reattach the old-epoch reaction. A missing/malformed sidecar does not prove the retarget event and closes only request/reaction authority. Missing origin, an inherited stale range, or a parent rewrite of caller-owned endpoints stops before local lanes. An exact current range newly supplied by the caller recovers local lanes for caller-origin state; normal exact-current rederivation recovers them for PR-derived state. Either recovery runs only the local lanes and does not unblock the GitHub lane. Report readiness `blocked-input` (`base-changed-same-head`) and `requested: triple`, `effective: triple-inconclusive`; do not create an empty or anchor commit to manufacture a new head epoch.
-
-After both local lanes are terminal on that exact whole-PR frozen range, post the exact comment below only when the complete authenticated snapshot shows that no exact request exists for the unchanged head of the exact-host `github.com` PR corresponding to `{head_sha}`. Otherwise consume the existing provider snapshot and do not post another request:
+## Named Double Claude Skeleton
 
 ```text
-@codex review
+Review the exact frozen range <base_sha>..<head_sha> in the supplied independent
+read-only workspace. Load the listed instructions in order and inspect the diff
+yourself. Do not read outside the scoped workspace, mutate files, fetch, commit,
+post, or contact another processor.
+
+Focus: <bounded focus>
+Non-goals: <explicit exclusions>
+
+Return findings with severity and precise file/line evidence. If clean, use the
+trusted stream/result profile's accepted clean presentation. Do not claim that
+runtime or sandbox validation succeeded; the parent validates raw output.
 ```
 
-For that one parent-owned write, capture raw PR-detail and bound compare
-responses immediately before it, the exact raw `201` POST response, and new
-PR-detail/compare responses immediately afterward. Project the two identical
-scope tuples and the POST's eight request fields independently, store their
-closed six-field response receipts in the one-to-one sidecar, and preserve
-their individual server Date ordering. Do not create the comment first and try
-to synthesize this sidecar later.
+The parent supplies this prompt only after trusted runtime preflight and validates the captured stream independently. Do not paste authentication values, preflight payloads, or the full diff into the prompt.
 
-Persist a parent-owned control-order record showing whether both required local
-lanes had terminal artifacts before the request write. The orchestrator itself
-must wait for those terminal artifacts before sending a new request. If a
-request is proved earlier than either local terminal, record
-`early-request-observed` under `request_policy` as warning-only and
-outcome-neutral. If the order cannot be proved, record
-`request_policy.status: unknown` without an early-warning code. In either case,
-evaluate independently complete current-head provider evidence normally and do
-not send another request to repair or clarify the order.
+## Named Triple Parent Skeleton
 
-Posting the comment requests the third lane but does not complete it. Record the PR URL, triggered head, request-policy report, provider profile, evidence basis, and complete terminal provider-authored current-head findings payload when present. Accept terminal review/comment payloads only from exact REST `user.login == "chatgpt-codex-connector[bot]"` with exact `user.type == "Bot"` and only under the authority's fixed terminal-payload grammar; they classify the artifact only and cannot complete triple or make the PR merge-ready. Terminal findings remain blocking negative evidence, and only a complete `thumbs-up-clean` reaction basis supplies positive completion. Exact `app.slug == "chatgpt-codex-connector"` check/run evidence can prove only current-head post-request service start. Unknown or lookalike identities are `triple-inconclusive` and prove neither rejection, start, nor completion. When a still-eligible PR's current `headRefOid` does not equal the frozen `head_sha`, that mismatch is not an availability fallback. Publish/freeze the intended head and rerun affected lanes only when the parent separately authorized PR mutation; otherwise leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`. For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue. If there is no existing PR, or the host/operating identity is directly unsupported—including host `sqbu-github.cisco.com`, any other non-`github.com` host, and identity in `{hoteng, hoteng_cisco}`—do not create or mutate a PR to manufacture the lane. Report `requested: triple`, `effective: double`, `request_policy.status: not-applicable`, `provider_profile: null`, and `evidence_basis: null`, with the exact reason. The fixed authority baseline has an empty accepted structured capability/installation schema set and no accepted no-start body grammar, so integration/service uncertainty and free-form provider prose cannot currently prove that fallback. A missing response, otherwise valid nonterminal/check-only evidence, or a retryable transport/read failure remains pending while bounded waiting is meaningful; after exhaustion it is `triple-inconclusive`. Unknown provider identity, malformed/stale evidence, non-retryable failure, permanently incomplete enumeration, or an unstable lifecycle/scope/provider-artifact/thread/selected-terminal final read is immediately `triple-inconclusive`. Sidecar-only instability instead makes request policy unknown and disables reaction completion while preserving an independently stable terminal classification.
+```text
+Requested shape: triple
+Frozen local range: <base_sha>..<head_sha>
+Selected PR: <owner/repo#number>
+
+Preserve the caller range independently. Classify selected-PR lifecycle first;
+only then derive base/head/merge-base scope and apply conditional retarget policy.
+Run the two local lanes on the same frozen range. For the GitHub lane, load the
+canonical authority and machine resources in their documented order, reconcile
+complete current-scope evidence, and create only a machine-authorized request.
+Never blind-retry uncertain transport or create an anchor commit.
+
+Treat attempts as one logical lane and provider evidence artifact-first. Report
+exactly six independent GitHub planes: request_policy; provider, with
+evidence_basis nested only inside provider; required_action_status;
+named_github_lane; reaction_audit; and readiness. Before evidence acquisition,
+load the epoch machine's exact configuration into one parent-owned
+composed-operation budget ledger for the complete provider/required-Action evidence
+graph. Counters, retained UTF-8 bytes, and deadline are cumulative;
+only the body ceiling is per body. No initial/final capture, candidate/sibling
+evaluation, caller, release, or test input may reset, split, refund, borrow,
+override, or reseal the ledger.
+Register complete component evidence, then reduce only through one parent-owned
+sealed composite coordinate binding required-status membership, final provider
+validation, immutable epoch-origin clock, and current marker/attempt state; the
+six planes are outputs, not separate reducer authorities. For the per-PR sole-job caller to
+JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1,
+floating @v1 is pre-execution trust, and dynamic post-run validation binds producer
+receipt v1 and run/called-workflow identity. Bind receipt job.workflow_sha,
+receipt action.ref, and unique exact-attempt referenced_workflows[].sha to W;
+require its ref to be exact refs/tags/v1. Bind controlled exact-pinned checkout,
+receipt action.commit_sha, provenance action.commit_oid, and
+provenance tags.v1.peeled_commit_oid to selected candidate C. For every release
+candidate, independently fetch and locally OpenPGP-verify its provenance-bound
+release-R, derived-v1.minor, and historical-v1-T tag objects, each directly
+targeting that candidate's C. Count W matches against only candidate T and C:
+zero is proved-incompatible with otherwise complete valid proof, one is eligible,
+and more than one is malformed ERROR. Independently authenticate and final-stably
+reread current alias T_current->C_current; it is live audit/stability evidence and
+never supplies W or validates historical candidate proof. Classify the complete
+release-candidate vector as valid, proved-incompatible, or
+malformed-or-incomplete-error; a valid signature by a different signer or zero
+W matches may be proved-incompatible only with otherwise complete proof, while
+missing/invalid/ambiguous/unverifiable tag proof, multiple matches, or any
+integrity/cross-binding contradiction makes the whole admission ERROR. Exclude
+only proved-incompatible candidates and require exactly one valid release with
+all three tag proofs and one valid provenance-v2 asset. Never admit v1.5.0 or an
+erratum path; v1.5.1 is first admitted. Independently authenticate the source commit and prove its
+packages/action subtree equals the Action-C root tree as admission evidence.
+The consumer pins neither selected called-workflow bytes/digest nor the selected
+release's external Action SHA set; never substitute a Skill-pinned patch SHA,
+tag object, commit, or workflow blob.
+Treat any independent repository-owned scheduled dispatcher as bounded per-PR
+transport into this caller only. It is not producer evidence, PASS, or an
+alternate producer caller; its exact trigger, cadence, and permissions remain
+repository policy rather than generic protocol or epoch-machine inputs.
+A noncanonical repository-side compatibility status cannot satisfy PASS. Finish
+with readiness gates and exact blockers. A +1 supplies neither PASS nor ACK. Record that the accepted
+producer proof is run-level consistency rather than cryptographic job provenance
+and that the contract has no post-publication revocation guarantee.
+At or after 7,200 seconds, reduce any still-budgeted or other incomplete
+acquisition to FAILURE before considering the narrow complete late-clean plus
+canonical-success PASS arm.
+```
+
+The actual controlled request body is generated and validated by the canonical machine contract; prompt prose does not define its envelope.
+
+## Review-Only Child Output
+
+```text
+[P0-P3] Short finding title
+
+File: <path>:<line>
+Property: <what must remain true>
+Evidence: <bounded decisive facts>
+Impact: <why this matters>
+Repair direction: <minimal bounded direction, when useful>
+```
+
+Return no delivery plan, PR mutation, CI wait, merge action, or reviewer orchestration. If clean, use the lane's accepted clean form only.
+
+## Parent Report Skeleton
+
+```text
+Requested/effective shape: <shape>
+Repository/range: <repo> <base_sha>..<head_sha>
+Selected PR/lifecycle/scope: <value or not-applicable>
+Codex lane: <status/evidence>
+Claude lane: <status/evidence>
+request_policy: <status/warnings/evidence>
+provider:
+  classification: <status>
+  evidence_basis: <selected provider basis or null>
+required_action_status:
+  decision: <PASS|FAILURE|PENDING|ERROR>
+  reduction_authority: <one parent-owned sealed composite coordinate + required-status membership + final provider validation + immutable epoch-origin clock + current marker/attempt state>
+  producer_binding: <caller @v1 + called-job repo/path + unique exact-attempt referenced ref refs/tags/v1 + receipt job.workflow_sha/action.ref/referenced_workflows.sha W + per-candidate provenance-bound and locally OpenPGP-verified release-R/derived-v1.minor/historical-v1-T direct-to-C proofs + candidate-local workflow_sha_resolution W-match count 0=proved-incompatible|1=eligible|>1=malformed-error + separate final-stable current alias T_current/C_current live proof that never substitutes for historical proof + complete ordered valid|proved-incompatible|malformed-or-incomplete-error release-candidate vector with missing/invalid/cross-binding global ERROR + GitHub-Releases-only immutable v1.x.y release/provenance-v2 asset/compatibility + v1.5.1 first-admitted and v1.5.0 never-admitted boundary + independently authenticated distinct source.commit_oid/packages-action-subtree-equals-Action-C-root admission proof + no consumer called-workflow-bytes/digest or external-Action-SHA-set pin + receipt/protocol/decision-schema/policy-major/policy-version evidence>
+  evidence_resource_budget: <machine-owned exact-config equality + one composed-operation ledger + cumulative counters/retained-UTF-8/deadline + per-body body ceiling + no initial/final/candidate/sibling/caller/release/test reset/split/refund/borrow/override/reseal + exhaustion evidence>
+named_github_lane: <disposition/evidence>
+reaction_audit: <present/audit-only/PASS=false/ACK=false>
+readiness: <merge-ready|pending|blocked|inconclusive + exact gates>
+Findings: <summary>
+Local gates: <actual commands/results>
+Secret admission: <status>
+CI/conversations/branch-base: <status>
+Remaining risks/non-goals: <bounded list>
+```
+
+Never claim a test, reviewer, provider result, or readiness gate that was not actually completed.
 
 ## Low-Level Helper Results
 
-A legacy `isolated_review` Codex helper result or any review driven by a supplied/pre-materialized diff is compatibility or diagnostic evidence only. It never satisfies or increments single, double, or triple, and PR readiness adds no retired extra Codex gates.
+Low-level `isolated_review` output remains diagnostic or compatibility evidence with `named_lane_eligible: false`. Report its backend, authentication source class, validation status, result, and recovery artifact metadata when applicable, but never present it as named single, double, or triple completion.

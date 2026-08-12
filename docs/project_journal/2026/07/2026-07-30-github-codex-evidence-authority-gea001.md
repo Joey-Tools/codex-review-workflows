@@ -3,11 +3,11 @@ id: 20260730-gea001
 title: GitHub Codex Provider-Evidence Authority
 status: completed
 created: 2026-07-30
-updated: 2026-08-06
+updated: 2026-08-07
 branch: wip/github-codex-evidence-authority
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/87
 supersedes: []
-superseded_by:
+superseded_by: 20260805-wpe001
 ---
 
 # GitHub Codex Provider-Evidence Authority
@@ -28,6 +28,20 @@ superseded_by:
   complete audit-only history; this prevents old transport limitations from
   defeating the recorded result-present decision without accepting arbitrary
   legacy prose.
+
+## Supersession Boundary (PR #93)
+
+This journal preserves the historical PR #87 and PR #91 evidence and the
+then-current “result present” artifact-classification decisions. PR #93 and
+`docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`
+supersede every statement below that a terminal clean/result by itself can
+pass, complete triple, or make the PR merge-ready. A terminal payload now
+supplies only clean/findings classification with
+`scope_assurance: artifact-publication-only`: terminal findings still block,
+but terminal clean does not attest the provider's whole-PR input base. Positive
+completion currently requires a complete `thumbs-up-clean` reaction basis.
+The live REST Compare and legacy-provider observations remain valid provenance
+and migration evidence; this boundary does not rewrite those observations.
 
 ## Current State
 
@@ -89,14 +103,22 @@ superseded_by:
   Neither receipt supplies request/run/artifact lineage, and their point reads
   do not exclude an intermediate ABA transition.
 - The v1 receipt is intentionally an **artifact-publication scope** contract.
-  A complete pre/artifact/post envelope authorizes the whole-PR tuple observed
-  around publication even if request history is unbound or a caller reports
-  that provider work began under an earlier merge base. It does not attest the
-  provider's internal input merge base. Only a valid
-  same-head/different-merge-base request sidecar proves
-  `base-changed-same-head`; a missing or malformed sidecar is `not-proved`,
-  makes request policy unknown, and cannot veto an independently trustworthy
-  terminal result. Requiring unavailable launch-time scope would restore the
+  Outside a same-head retarget branch, a complete pre/artifact/post envelope
+  binds the whole-PR tuple observed around publication even when request history
+  is unbound. It does not attest the provider's internal input merge base. A
+  valid same-head/different-merge-base
+  request sidecar is one definitive `observed` shortcut, not the only retarget
+  signal. The closed prior-epoch `none` / `observed` / `unknown` classifier also
+  consumes origin, attempt, control, liveness, artifact, and complete provider
+  reconciliation evidence. Missing or malformed sidecar evidence contributes
+  `unknown` rather than absence unless other unambiguous old-epoch activity
+  proves `observed`. An `observed` or `unknown` same-head retarget terminally
+  blocks prior-epoch retirement, every same-head POST, and every same-head
+  artifact admission; later publication cannot relabel an artifact into the
+  putative current-base epoch. Only a substantive change that creates a real
+  new head may resume the GitHub lane. Outside the retarget branch, missing or
+  malformed sidecar evidence cannot veto an independently trustworthy terminal
+  result. Requiring unavailable launch-time scope would restore the
   rejected request/run/artifact binding. A future provider-authenticated
   input-base marker governed by a predeclared provider profile may change this
   policy explicitly; caller narrative and inferred timing may not.
@@ -107,18 +129,25 @@ superseded_by:
   attested. `Result present` does not make an unreceipted historical artifact
   current-scope evidence.
 - Legacy receipt migration never adopts an old artifact retroactively and
-  never lets the agent POST a replacement same-scope request. Recovery is
-  limited to an ordinary substantive change that creates a new head, or one
-  explicitly caller-owned manual exact `@codex review` trigger on the unchanged
-  head after the parent persisted the standard pre-artifact pull/compare scope
-  pair. The agent neither performs nor repeats that POST and creates no request
-  sidecar for it; request policy remains `unknown`, and reaction-only evidence
-  is unavailable. Only a later terminal artifact that strictly follows the pre
-  boundary and completes the normal version-1 artifact receipt/final-stability
-  contract can decide without request/run attribution. Otherwise the lane
-  remains `triple-inconclusive`. A proved `base-changed-same-head` event cannot
-  use the manual path and requires a real new head; empty or anchor commits are
-  not recovery mechanisms.
+  never lets the agent use an agent-owned replacement POST to repair the old
+  receipt. The original manual-recovery discussion was historical; the current
+  epoch contract does not let a manual comment bypass admission receipts or an
+  agent-controlled comment bypass transport-fence rules. A caller-owned manual
+  formal-broad comment is admission input only with its canonical authenticated
+  comment GET, raw pre- and post-comment pull-detail and compare receipts, exact
+  raw-body digest, actor, canonical URL, and time bindings, an immutable
+  preliminary record, append-only finalization, and a
+  post-finalization authenticated GitHub `Date` fence for the exact current
+  epoch. The agent neither performs nor repeats that manual POST, and a missing
+  pre-comment bracket cannot be reconstructed later. Any agent-controlled
+  marker instead remains subject to the parent-owned write-ahead, one-active
+  attempt ledger, dispatch claim, and ambiguous-transport fence; it is never a
+  receipt-repair mechanism. Only a later terminal artifact with its own
+  singular version-1 artifact receipt and final-stability proof can decide
+  without request/run attribution. Otherwise the lane remains
+  `triple-inconclusive`. A proved `base-changed-same-head` event cannot use the
+  manual path and requires a real new head; empty or anchor commits are not
+  recovery mechanisms.
 - The tolerated legacy member is now closed to exactly two raw-internal
   migration-only carriers; an ordinary unreceipted current-grammar clean or
   finding cannot enter. `legacy-finding-native-review-v1` reports role
@@ -336,6 +365,10 @@ superseded_by:
   decision and commit scope; a request comment carries only intent to start.
   Provider evidence is therefore the verdict authority, while requests remain
   producer controls and audit records.
+- PR #93 fixes that authority at artifact-level clean/findings classification:
+  without provider-authenticated input-base or request/run/artifact binding, a
+  terminal clean cannot complete triple or make the PR merge-ready. Terminal
+  findings remain blocking negative evidence.
 - The controlled request projection has exactly eight top-level fields:
   `id`, `url`, `created_at`, `updated_at`, `request_server_time`,
   `request_server_time_field`, `normalized_body`, and closed
@@ -415,8 +448,11 @@ superseded_by:
   `JoeyTeng/codex-review-gate@16366aa81270ad2c875d2ceb8ce194f5b2308af6`
   and released Action
   `JoeyTeng/codex-review-gate-action@2a7f9d8cd98f90cb56dc1540bf54d9dc7484afc6`.
-  Provider-result authority, duplicate-result consumption, and early-result
-  consumption are inherited. Short-marker parity is limited to 10/40 carrier
+  Provider-result classification, duplicate-result consumption, and early-result
+  consumption are inherited. PR #93 supersedes the older positive-completion
+  reading of that inheritance: terminal findings remain blocking, while a
+  terminal clean has artifact-publication scope only and does not complete the
+  lane without whole-PR evidence. Short-marker parity is limited to 10/40 carrier
   lengths and the short carrier's fail-closed exact-repository REST resolution
   outcome. Lowercase-only refs, exact marker spacing, the exact-two-LF/nonblank
   boundary, closed lead/tagline/disclosure/native grammar, and independent
@@ -430,10 +466,14 @@ superseded_by:
   proved its fail-closed REST resolution outcome; finding URLs and native
   review/inline commit IDs remain full-SHA-only. Future edits must preserve that
   split instead of mechanically copying either implementation into the other.
-  The machine-readable base-only-retarget
-  contract is now version 2;
-  version 1 request-sidecar event semantics are unchanged, and version 2 adds
-  only the independent terminal-artifact scope plane.
+  The candidate epoch workstream subsequently expanded the versioned
+  base-only-retarget contract to bind immutable origin, prior/current review
+  epochs, sentinel/attempt/formal/focused control, liveness and artifact
+  inventories, complete reconciliation, and the closed
+  `none` / `observed` / `unknown` disposition while retaining the independent
+  terminal-artifact publication-scope plane. The machine contract and active
+  epoch journal, rather than this historical version snapshot, own the exact
+  current schema version.
 - Future provider behaviour may change, but adaptation must select one of the
   predeclared profiles from complete bounded evidence. It must not invent a new
   reaction meaning, declaration authority source, or time-window definition, or
@@ -575,26 +615,29 @@ superseded_by:
   reviewed the current whole-PR range. Changing that boundary requires a new
   predeclared provider-authenticated input-base profile, not inferred timing.
 - The legacy-receipt finding first exposed an operability/documentation gap,
-  then a later evaluator audit proved that the documented manual recovery path
-  was not executable: a pre-receipt artifact could neither enter the normalized
-  record nor be omitted from the raw projection. The evaluator now proves the
-  closed partition `raw = receipt-bound ⊎ legacy-unreceipted-audit` by native
-  identity. Only old clean and non-unresolved finding roles that are strictly
-  earlier than both selected-artifact pre-scope boundaries enter the audit-only
-  member; unresolved, malformed, unknown, equal-boundary, later, overlapping,
-  or omitted evidence fails closed. A selected completion remains independently
-  receipt-bound, and reports expose the stable audit list without adding a
-  fourth top-level key. This makes the two recovery paths executable while
-  preserving the rule that the agent never POSTs a replacement request, old
-  artifacts are never scoped retroactively, and the base-retarget state machine
-  is unchanged.
-  A follow-up regression now constructs the raw legacy member with its
-  `artifact_scope_receipt` truly absent, proves that copying that wrapper into
-  the normalized receipt-bound member remains `unknown`, and covers later v1
-  clean/findings recovery plus only-legacy, newer-finding, and unresolved-thread
-  fail-closed cases. Operational summaries now state the same partition
-  exception explicitly so the ordinary raw/normalized equality rule cannot be
-  misread as a permanent lane-wide veto.
+  then a later evaluator audit proved that raw-minus-normalized is not receipt-
+  absence authority. The evaluator now requires a parent-owned disposition
+  ledger in `artifact_scope_receipt_dispositions` and proves the closed
+  partition `raw = receipt-bound ⊎ legacy-unreceipted-audit` by native identity
+  and source digest. `receipt-record-present-v1` must bind the unique valid
+  receipt; only a durable pre-cutover `legacy-pre-v1-absent-v1` entry with a
+  null digest may enter audit-only handling. The separate parent-private
+  binding covers the canonical ledger payload and exact raw endpoint base
+  payload, so a self-hash, malformed present receipt, omission, duplicate,
+  wrong scope, late insertion, revision rollback, or initial/final drift fails
+  closed. Old clean and non-unresolved finding roles must also remain strictly
+  earlier than both selected-artifact pre-scope boundaries; unresolved,
+  malformed, unknown, equal-boundary, later, or overlapping evidence fails
+  closed. A selected completion remains independently receipt-bound, and
+  reports expose the stable audit list without adding a fourth top-level key.
+  Legacy receipt migration never adopts an old artifact retroactively and the
+  agent does not perform a receipt-repair POST. Completion stays artifact-first:
+  any late same-epoch receipt-bound artifact from an automatic, manual, or
+  controlled producer may count under the common evidence consumer, including
+  after `max_wait`. Each path still requires two-phase formal-scope admission;
+  a serial retry is liveness only and cannot repair the old artifact. Receipt
+  migration does not weaken or bypass the version-6 base-retarget blocker, and
+  empty or anchor commits are not recovery mechanisms.
 - The large reference matrix remains exhaustive, but its report-only negative
   variants no longer recompute the full evidence oracle. A pure matcher reuses
   an already independently generated and positively round-tripped expected
@@ -1068,10 +1111,13 @@ versus consumer-verdict split below.
 
 The paired base-retarget regression fixes that evidence boundary rather than
 trusting a launch narrative. With the same current-scope artifact receipt, a
-valid same-head/different-base request sidecar blocks; removing that sidecar
-makes the retarget `not-proved`, leaves request policy unknown, and allows the
-artifact-publication scope result to decide. This preserves result-present
-authority and records why unavailable provider input scope is not inferred.
+valid same-head/different-base request sidecar is one definitive `observed`
+shortcut and blocks. Removing or invalidating that sidecar contributes
+`unknown`, not `not-proved`; other unambiguous prior-epoch activity may still
+prove `observed`. Either `observed` or `unknown` blocks same-head artifact
+admission, and publication scope cannot repair the retarget. This preserves
+result-present authority outside the retarget branch without inferring
+unavailable provider input scope.
 
 The decision itself is unchanged and is recorded here explicitly to prevent
 future drift: **a trustworthy result being present is sufficient verdict
@@ -1649,9 +1695,9 @@ The fourth formal named-single review of commit
 issue-comment endpoint also returns comments on ordinary issues. Treating every
 exact-body `@codex review` record as a PR request made one canonical ordinary
 issue comment invalidate the entire adaptive history and could consume the
-seeded-PR budget. Canonical ordinary-issue `@codex review` comments are
-validated, retained, and budget-charged as raw-only non-seeds; mismatched or
-ambiguous PR-like routing fails closed. The classifier jointly binds the
+seeded-PR budget. Canonical ordinary-issue formal-broad comments, including
+trusted controlled markers, are validated, retained, and budget-charged as
+raw-only non-seeds; mismatched or ambiguous PR-like routing fails closed. The classifier jointly binds the
 canonical issue API URL, comment API URL, ordinary-issue or PR HTML route,
 shared issue number, and comment ID; controlled-comment IDs remain unique
 across both routes. A future ordinary-issue comment remains irrelevant to PR

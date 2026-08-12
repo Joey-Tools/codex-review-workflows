@@ -7,7 +7,7 @@ updated: 2026-08-05
 branch: wip/whole-pr-evidence-binding-master
 pr:
 supersedes: [20260730-gea001]
-superseded_by:
+superseded_by: 20260804-gce001
 ---
 
 # Whole-PR Completion Evidence Binding
