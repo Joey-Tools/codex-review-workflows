@@ -86305,7 +86305,9 @@ printf '%s\n' "$trusted_uv"
             )
 
         candidate_epoch = ("owner/repo", 87, "b" * 40, "c" * 40)
-        artifact_time = datetime.datetime(2026, 8, 4, 13, 0, tzinfo=datetime.UTC)
+        artifact_time = datetime.datetime(
+            2026, 8, 4, 13, 0, tzinfo=datetime.timezone.utc
+        )
 
         def scope_eligible(
             record_epoch: tuple[str, int, str, str],
