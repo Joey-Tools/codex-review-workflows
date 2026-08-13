@@ -10896,6 +10896,7 @@ _SourcePermissionMarkerRecordStatus = Literal[
 def _source_permission_marker_record_status(
     value: bytes,
     *,
+    assignment_start: int,
     assignment_end: int,
     assignment_line_start: int,
     proof_end: int,
@@ -10905,12 +10906,18 @@ def _source_permission_marker_record_status(
     """Classify one bounded source record that may contain the permission marker."""
 
     if not (
-        0 <= assignment_line_start <= assignment_end <= proof_end <= len(value)
+        0
+        <= assignment_line_start
+        <= assignment_start
+        <= assignment_end
+        <= proof_end
+        <= len(value)
     ):
         raise ReviewError(
             "sensitive scanner produced an invalid permission marker proof range"
         )
     maximum_record_bytes = 128
+    marker_key = b"id-" + b"to" + b"ken" + b":"
     record_limit = min(proof_end, assignment_line_start + maximum_record_bytes + 1)
     line_boundaries = tuple(
         boundary
@@ -10935,39 +10942,25 @@ def _source_permission_marker_record_status(
     if line_end - assignment_line_start > maximum_record_bytes:
         return "near-miss", line_end
 
+    # The assignment matcher can see a marker beyond this record classifier's
+    # smaller proof window.  Such a marker is not proven unrelated merely
+    # because its opening literal or indentation is outside the window.
+    if assignment_end > line_end:
+        if value.startswith(marker_key, assignment_start, assignment_end):
+            return "near-miss", assignment_end
+        return "not-applicable", assignment_end
+
     record = value[assignment_line_start:line_end]
     if diff_surface:
         if not record or record[0] not in (0x20, 0x2B, 0x2D):
             return "not-applicable", assignment_end
         record = record[1:]
     record = record.lstrip(b" \t")
-    marker_key = b"id-" + b"to" + b"ken" + b":"
     marker_start = record.find(marker_key)
     if marker_start < 0:
         return "not-applicable", assignment_end
     literal_prefix = record[:marker_start]
-    if literal_prefix.lower() not in {
-        b"'",
-        b'"',
-        b"'''",
-        b'"""',
-        b"b'",
-        b'b"',
-        b"r'",
-        b'r"',
-        b"br'",
-        b'br"',
-        b"rb'",
-        b'rb"',
-        b"u'",
-        b'u"',
-        b"f'",
-        b'f"',
-        b"fr'",
-        b'fr"',
-        b"rf'",
-        b'rf"',
-    }:
+    if not _starts_quoted_literal(record):
         return "not-applicable", assignment_end
     if not record_complete:
         if line_end - assignment_line_start >= maximum_record_bytes:
@@ -11146,6 +11139,7 @@ def _secret_assignment_rhs_is_closed(
     source_marker_status, source_marker_end = (
         _source_permission_marker_record_status(
             value,
+            assignment_start=assignment_start,
             assignment_end=assignment_end,
             assignment_line_start=assignment_line_start,
             proof_end=proof_end,

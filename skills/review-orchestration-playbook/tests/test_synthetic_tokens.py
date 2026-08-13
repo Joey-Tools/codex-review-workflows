@@ -6016,6 +6016,14 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "not-applicable",
             ),
             (
+                "long-leading-context",
+                b" " * 129 + b'"' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            ("c-u8-prefix", b'u8"' + marker + b'"\n', True, "near-miss"),
+            ("c-wide-prefix", b'L"' + marker + b'"\n', True, "near-miss"),
+            (
                 "c-adjacent-literal",
                 b'"' + marker + b'"\n"' + credential + b'"\n',
                 True,
@@ -6038,6 +6046,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 status, record_end = (
                     workspace._source_permission_marker_record_status(
                         payload,
+                        assignment_start=assignment.start(),
                         assignment_end=assignment.end(),
                         assignment_line_start=0,
                         proof_end=len(payload),
@@ -6053,6 +6062,9 @@ class PublicPoolScannerTest(unittest.TestCase):
     def test_source_string_permission_marker_exception_is_exact(self) -> None:
         marker = source_permission_marker()
         credential = reduction_secret("generic-secret-assignment", b"X")
+        credential_fragments = (credential[:11], credential[11:22], credential[22:])
+        self.assertEqual(b"".join(credential_fragments), credential)
+        self.assertTrue(all(len(fragment) < 16 for fragment in credential_fragments))
         escaped_marker = b"id-" + b"token: wr\\x69te"
         accepted = (
             b'"' + marker + b'"\n',
@@ -6092,6 +6104,34 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b'"\n    + "'
             + credential
             + b'",\n)\n',
+            b" " * 129
+            + b'"'
+            + marker
+            + b'"\n"'
+            + credential_fragments[0]
+            + b'"\n"'
+            + credential_fragments[1]
+            + b'"\n"'
+            + credential_fragments[2]
+            + b'"\n',
+            b'u8"'
+            + marker
+            + b'"\nu8"'
+            + credential_fragments[0]
+            + b'"\nu8"'
+            + credential_fragments[1]
+            + b'"\nu8"'
+            + credential_fragments[2]
+            + b'"\n',
+            b'L"'
+            + marker
+            + b'"\nL"'
+            + credential_fragments[0]
+            + b'"\nL"'
+            + credential_fragments[1]
+            + b'"\nL"'
+            + credential_fragments[2]
+            + b'"\n',
             b'(\n    "'
             + marker
             + b'"'

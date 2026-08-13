@@ -358,6 +358,9 @@ class WorkspaceTest(unittest.TestCase):
     ) -> None:
         marker = source_permission_marker()
         credential = unregistered_generic_credential()
+        credential_fragments = (credential[:13], credential[13:])
+        self.assertEqual(b"".join(credential_fragments), credential)
+        self.assertTrue(all(len(fragment) < 16 for fragment in credential_fragments))
         escaped_marker = b"id-" + b"token: wr\\x69te"
         python_prefix = b"for marker in (\n    "
         python_suffix = b"):\n    pass\n"
@@ -416,6 +419,40 @@ class WorkspaceTest(unittest.TestCase):
                 + credential
                 + b'",\n'
                 + python_suffix,
+            ),
+            (
+                "long-leading-context",
+                ".c",
+                b" " * 129
+                + b'"'
+                + marker
+                + b'"\n"'
+                + credential_fragments[0]
+                + b'"\n"'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-u8-adjacent-literals",
+                ".c",
+                b'u8"'
+                + marker
+                + b'"\nu8"'
+                + credential_fragments[0]
+                + b'"\nu8"'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-wide-adjacent-literals",
+                ".c",
+                b'L"'
+                + marker
+                + b'"\nL"'
+                + credential_fragments[0]
+                + b'"\nL"'
+                + credential_fragments[1]
+                + b'";\n',
             ),
         ):
             with self.subTest(case=label):

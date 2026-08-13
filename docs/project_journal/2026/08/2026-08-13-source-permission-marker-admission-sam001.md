@@ -32,6 +32,9 @@ superseded_by:
 - An exact marker without a trailing comma is accepted only at a proved final
   line ending. Later source bytes fail closed, preventing C adjacent literals,
   Python implicit concatenation, and next-line operators from extending it.
+- Marker candidates outside the bounded record window or inside recognized
+  non-plain source literals remain opaque and fail closed instead of falling
+  through as unrelated text.
 
 ## Evidence
 
@@ -42,3 +45,5 @@ superseded_by:
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
   regressions cover C and Python forms plus a logical stream-read boundary.
+- Whole-range re-review identified long-leading-context and C/C++ literal-prefix
+  gaps; direct, streamed, and repository admission regressions cover both.
