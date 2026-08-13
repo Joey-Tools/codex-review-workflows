@@ -79,6 +79,29 @@ def without_repository_guards(source: str) -> str:
     return source.replace(REPOSITORY_GUARD + "\n", "")
 
 
+def top_level_permissions(source: str) -> object:
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("permissions:"):
+            continue
+        scalar = line.removeprefix("permissions:").strip()
+        if scalar:
+            return scalar
+
+        permissions: dict[str, str] = {}
+        for entry in lines[index + 1 :]:
+            if not entry.strip():
+                continue
+            if not entry.startswith("  "):
+                break
+            key, separator, value = entry.strip().partition(":")
+            if not separator or not key or not value.strip() or key in permissions:
+                return None
+            permissions[key] = value.strip()
+        return permissions
+    return None
+
+
 class RequiredCIWorkflowTests(unittest.TestCase):
     def test_reusable_entry_preserves_the_complete_required_test_graph(self) -> None:
         source = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
@@ -94,12 +117,31 @@ class RequiredCIWorkflowTests(unittest.TestCase):
         header, _separator, _body = reusable.partition("permissions:\n")
 
         self.assertEqual(header, REUSABLE_HEADER)
-        self.assertIn("permissions:\n  contents: read\n", reusable)
-        self.assertNotIn("contents: write", reusable)
-        self.assertNotIn("statuses: write", reusable)
+        self.assertEqual(top_level_permissions(reusable), {"contents": "read"})
         self.assertNotIn("${{ secrets.", reusable)
         self.assertNotIn("inputs.repository", reusable)
         self.assertNotIn("inputs.ref", reusable)
+
+        near_misses = {
+            "issues write": reusable.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\n  issues: write\n",
+                1,
+            ),
+            "pull requests write": reusable.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: read\n  pull-requests: write\n",
+                1,
+            ),
+            "write all": reusable.replace(
+                "permissions:\n  contents: read\n", "permissions: write-all\n", 1
+            ),
+        }
+        for label, near_miss in near_misses.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(
+                    top_level_permissions(near_miss), {"contents": "read"}
+                )
 
     def test_every_checkout_is_guarded_and_bound_to_the_exact_repository(self) -> None:
         reusable = (WORKFLOW_DIR / "required-ci.yml").read_text(encoding="utf-8")

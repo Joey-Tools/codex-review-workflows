@@ -16,20 +16,26 @@ superseded_by:
 
 - Add a caller-only, read-only reusable workflow for the central Required CI
   rollout without changing the existing CI workflow.
-- Require the caller to provide the repository and exact ref validated by every
-  checkout in the reusable graph.
+- Bind every checkout to the fixed target repository and the caller event's
+  `github.sha`, guarded by the exact target repository identity.
 - Preserve the complete dependency graph behind the required `test` job.
 
 ## Current State
 
-- `.github/workflows/required-ci.yml` exposes only `workflow_call` with the
-  required string inputs `repository` and `ref`, plus `contents: read`.
+- `.github/workflows/required-ci.yml` exposes only input-free `workflow_call`
+  with the exact top-level permission mapping `contents: read`; callers must
+  not pass `repository` or `ref` inputs.
 - Its environment and jobs are byte-for-byte derived from
   `.github/workflows/ci.yml`, including all four prerequisite jobs and the
-  `test` aggregator, except for the closed checkout-input bindings.
-- All four `actions/checkout` steps bind `repository` and `ref` to those exact
-  caller inputs while preserving their existing fetch-depth and credential
-  settings.
+  `test` aggregator, except for the closed repository guards and checkout
+  bindings.
+- Before each checkout, the workflow fails closed unless `github.repository`
+  is exactly `Joey-Tools/codex-review-workflows`. All four `actions/checkout`
+  steps use that same literal repository, `ref: ${{ github.sha }}`, and
+  `persist-credentials: false` while preserving the existing fetch depth.
+- This entry supports only caller event contexts where `github.repository` is
+  that exact target repository and the caller event's `github.sha` is the
+  commit being validated.
 - The contract test lives under
   `skills/review-orchestration-playbook/tests/test_required_ci_workflow.py`,
   so the existing test discovery in both CI workflows executes it without a
