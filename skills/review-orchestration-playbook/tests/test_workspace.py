@@ -328,32 +328,68 @@ class WorkspaceTest(unittest.TestCase):
         self,
     ) -> None:
         marker = source_permission_marker()
-        payload = (
-            b"values = (\n"
-            b'    "'
-            + marker
-            + b'",\n'
-            b'    "requires '
-            + marker
-            + b' permission",\n'
-            b")\n"
-        )
-        prose_head = self.commit_bytes(
-            "permission_help.py",
-            payload,
-            "Add permission help text regression",
-        )
+        for label, suffix, payload in (
+            (
+                "source-string-prose",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",\n'
+                b'    "requires '
+                + marker
+                + b' permission",\n'
+                b")\n",
+            ),
+            (
+                "markdown-sentence-prose",
+                ".md",
+                b'Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "markdown-list-prose",
+                ".md",
+                b'- Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "html-text-prose",
+                ".html",
+                b'<p>Use "' + marker + b'" permission.</p>\n',
+            ),
+            (
+                "html-comment-prose",
+                ".html",
+                b'<!-- Use "' + marker + b'" permission. -->\n',
+            ),
+        ):
+            with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
+                relative = f"{label}{suffix}"
+                prose_head = self.commit_bytes(
+                    relative,
+                    payload,
+                    f"Add {label} permission prose regression",
+                )
 
-        exit_code, summary = workspace_runtime.secret_admission(
-            repo=self.repo,
-            base_ref=self.head,
-            head_ref=prose_head,
-        )
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=prose_head,
+                )
 
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(summary["status"], "clean")
-        self.assertEqual(summary["secret_delta"]["status"], "clean")
-        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["status"], "clean")
+                self.assertEqual(summary["secret_delta"]["status"], "clean")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                clean_head = self.remove_and_commit(
+                    relative,
+                    f"Remove {label} permission prose regression",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
+                )
 
     def test_secret_admission_accepts_permission_marker_with_inline_comment(
         self,
@@ -732,6 +768,59 @@ class WorkspaceTest(unittest.TestCase):
                 + b'";\n',
             ),
             (
+                "rust-raw-nine-hashes",
+                ".rs",
+                b"r"
+                + b"#" * 9
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 9
+                + b"\n",
+            ),
+            (
+                "rust-raw-c-nine-hashes",
+                ".rs",
+                b"cr"
+                + b"#" * 9
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 9
+                + b"\n",
+            ),
+            (
+                "rust-raw-maximum-hashes",
+                ".rs",
+                b"br"
+                + b"#" * 255
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 255
+                + b"\n",
+            ),
+            (
+                "rust-raw-over-maximum-incomplete",
+                ".rs",
+                b"r" + b"#" * 256 + b'"' + marker,
+            ),
+            (
+                "html-attribute-marker",
+                ".html",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+            ),
+            (
+                "markdown-inline-code-marker",
+                ".md",
+                b'Use `"' + marker + b'"` permission.\n',
+            ),
+            (
+                "markdown-fenced-code-marker",
+                ".md",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
+            ),
+            (
                 "python-multiline-triple",
                 ".py",
                 b'value = """\n' + marker + b'\n"""\n',
@@ -759,6 +848,7 @@ class WorkspaceTest(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
                 malformed_head = self.commit_bytes(
                     f"{label}{suffix}",
                     payload,
@@ -782,9 +872,13 @@ class WorkspaceTest(unittest.TestCase):
                     "exact-value-scan-incomplete",
                 )
                 self.assertEqual(summary["temporary_cleanup_status"], "complete")
-                self.remove_and_commit(
+                clean_head = self.remove_and_commit(
                     f"{label}{suffix}",
                     f"Remove {label} permission marker fixture",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
                 )
 
     def test_secret_admission_reports_growth_and_scan_uncertainty(self) -> None:

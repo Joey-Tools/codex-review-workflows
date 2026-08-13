@@ -10778,6 +10778,41 @@ def _file_secret_rule(
     return _file_secret_scan(path, event_budget=event_budget).blocking_rule
 
 
+_RUST_RAW_LITERAL_PREFIXES = (b"br", b"cr", b"r")
+_RUST_RAW_LITERAL_MAX_HASHES = 255
+_RUST_RAW_LITERAL_MAX_OPENER_BYTES = (
+    max(len(prefix) for prefix in _RUST_RAW_LITERAL_PREFIXES)
+    + _RUST_RAW_LITERAL_MAX_HASHES
+    + 1
+)
+
+
+def _rust_raw_literal_content_start(value: bytes) -> tuple[bool, int | None]:
+    """Return whether a Rust raw prefix matched and its bounded opener end."""
+
+    prefix = next(
+        (
+            candidate
+            for candidate in _RUST_RAW_LITERAL_PREFIXES
+            if value.startswith(candidate)
+        ),
+        None,
+    )
+    if prefix is None:
+        return False, None
+    hash_start = len(prefix)
+    cursor = hash_start
+    while cursor < len(value) and value[cursor] == 0x23:
+        cursor += 1
+    if cursor == hash_start:
+        return False, None
+    if cursor >= len(value) or value[cursor] != 0x22:
+        return True, None
+    # The Rust grammar admits at most 255 hashes.  Return the quote boundary
+    # for an over-limit opener too so callers keep the malformed form opaque.
+    return True, cursor + 1
+
+
 def _starts_quoted_literal(value: bytes) -> bool:
     prefixes = (
         b"",
@@ -10802,22 +10837,24 @@ def _starts_quoted_literal(value: bytes) -> bool:
         b"@$",
     )
     lowered = value[:5].lower()
+    rust_raw_prefix, rust_raw_content_start = _rust_raw_literal_content_start(value)
     return (
         any(
             lowered.startswith(prefix + quote)
             for prefix in prefixes
             for quote in (b"'", b'"', b"`")
         )
-        or re.match(rb"(?i)(?:br|r)#{1,8}['\"]", value) is not None
+        or (rust_raw_prefix and rust_raw_content_start is not None)
     )
 
 
 _CPP_RAW_LITERAL_PREFIXES = (b"u8R\"", b"uR\"", b"UR\"", b"LR\"", b"R\"")
 _CPP_RAW_LITERAL_MAX_DELIMITER_BYTES = 16
-_SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES = (
+_SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES = max(
+    _RUST_RAW_LITERAL_MAX_OPENER_BYTES,
     max(len(prefix) for prefix in _CPP_RAW_LITERAL_PREFIXES)
     + _CPP_RAW_LITERAL_MAX_DELIMITER_BYTES
-    + 1
+    + 1,
 )
 
 
@@ -10853,6 +10890,9 @@ def _cpp_raw_literal_content_start(value: bytes) -> tuple[bool, int | None]:
 def _quoted_literal_content_start(value: bytes) -> int | None:
     """Return the bounded opening-delimiter end for a recognized literal."""
 
+    rust_raw_prefix, rust_raw_content_start = _rust_raw_literal_content_start(value)
+    if rust_raw_prefix:
+        return rust_raw_content_start
     cpp_raw_prefix, cpp_raw_content_start = _cpp_raw_literal_content_start(value)
     if cpp_raw_prefix:
         if cpp_raw_content_start is not None:
@@ -11092,6 +11132,79 @@ def _source_permission_line_comment_is_closed(value: bytes) -> bool:
     return True
 
 
+_SOURCE_PERMISSION_PROSE_PREFIX = re.compile(
+    rb"(?:[-*+] |[1-9][0-9]{0,8}[.)] )?Use "
+)
+_SOURCE_PERMISSION_PROSE_SUFFIX = b" permission."
+_SOURCE_PERMISSION_MARKDOWN_FENCE = re.compile(
+    rb"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})(?P<tail>[^\r\n]*)"
+)
+
+
+def _source_permission_inside_markdown_fence(
+    value: bytes,
+    *,
+    record_start: int,
+    prefix_context_complete: bool,
+) -> bool:
+    """Conservatively identify a Markdown fence before one physical record."""
+
+    if not prefix_context_complete:
+        return True
+    fence: tuple[int, int] | None = None
+    for match in _SOURCE_PERMISSION_MARKDOWN_FENCE.finditer(
+        value,
+        0,
+        record_start,
+    ):
+        delimiter = match.group("fence")
+        marker = delimiter[0]
+        tail = match.group("tail")
+        if fence is None:
+            if marker == 0x60 and b"`" in tail:
+                continue
+            fence = marker, len(delimiter)
+        elif (
+            marker == fence[0]
+            and len(delimiter) >= fence[1]
+            and not tail.strip(b" \t")
+        ):
+            fence = None
+    return fence is not None
+
+
+def _source_permission_marker_is_proven_prose(
+    value: bytes,
+    *,
+    record: bytes,
+    record_start: int,
+    literal_start: int,
+    literal_end: int,
+    diff_surface: bool,
+    prefix_context_complete: bool,
+) -> bool:
+    """Accept a closed subset of prose around one exact quoted marker."""
+
+    if diff_surface or _source_permission_inside_markdown_fence(
+        value,
+        record_start=record_start,
+        prefix_context_complete=prefix_context_complete,
+    ):
+        return False
+    prefix = record[:literal_start]
+    suffix = record[literal_end:]
+    if prefix.startswith(b"<!-- ") and suffix.endswith(b" -->"):
+        prefix = prefix[len(b"<!-- ") :]
+        suffix = suffix[: -len(b" -->")]
+    elif prefix.startswith(b"<p>") and suffix.endswith(b"</p>"):
+        prefix = prefix[len(b"<p>") :]
+        suffix = suffix[: -len(b"</p>")]
+    return (
+        _SOURCE_PERMISSION_PROSE_PREFIX.fullmatch(prefix) is not None
+        and suffix == _SOURCE_PERMISSION_PROSE_SUFFIX
+    )
+
+
 def _bounded_diff_hunk_context_before(
     value: bytes,
     before: int,
@@ -11181,6 +11294,7 @@ def _source_permission_marker_record_status(
     assignment_line_start: int,
     proof_end: int,
     diff_surface: bool,
+    prefix_context_complete: bool,
     suffix_context_complete: bool,
 ) -> tuple[_SourcePermissionMarkerRecordStatus, int]:
     """Classify one bounded source record that may contain the permission marker."""
@@ -11284,6 +11398,18 @@ def _source_permission_marker_record_status(
         else b""
     )
     if record.startswith(exact_literal, literal_start):
+        if literal_start != 0 and _source_permission_marker_is_proven_prose(
+            value,
+            record=record,
+            record_start=record_start,
+            literal_start=literal_start,
+            literal_end=exact_literal_end,
+            diff_surface=diff_surface,
+            prefix_context_complete=prefix_context_complete,
+        ):
+            # Preserve the public not-applicable classification while carrying
+            # the complete proved-prose record boundary to the event reducer.
+            return "not-applicable", line_end
         tail = tail.lstrip(b" \t")
         comma_present = False
         if tail.startswith(b","):
@@ -11952,7 +12078,14 @@ def _quoted_assignment_may_accept(
         return logical_startswith((b"\r", b"\n", b"#", b"/*"), cursor)
 
     def starts_literal() -> bool:
-        return _starts_quoted_literal(value[cursor : min(cursor + 16, logical_end)])
+        return _starts_quoted_literal(
+            value[
+                cursor : min(
+                    cursor + _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES,
+                    logical_end,
+                )
+            ]
+        )
 
     def skip_opposite_diff_records() -> tuple[bool, bool]:
         nonlocal crossed_line_boundary, cursor, skipped_diff_bytes
@@ -13684,9 +13817,23 @@ def _iter_secret_events(
                 assignment_line_start=assignment_line_start,
                 proof_end=proof_end,
                 diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=proof_suffix_context_complete,
             )
         )
+        source_marker_proved_nonsecret = (
+            source_marker_status == "not-applicable"
+            and source_marker_end > assignment_match.end()
+        )
+        if source_marker_proved_nonsecret:
+            if not prefix_proof_tracker.consume(
+                assignment_line_start,
+                source_marker_end,
+            ):
+                raise ReviewError(
+                    "sensitive scanner exceeded one permission marker proof window"
+                )
+            continue
         if source_marker_status in {"exact", "near-miss"}:
             if not prefix_proof_tracker.consume(
                 assignment_line_start,

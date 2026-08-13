@@ -6049,6 +6049,30 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "not-applicable",
             ),
             (
+                "plain-prose-with-quoted-marker",
+                b'Use "' + marker + b'" permission.\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "markdown-list-prose-with-quoted-marker",
+                b'- Use "' + marker + b'" permission.\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "html-prose-with-quoted-marker",
+                b'<p>Use "' + marker + b'" permission.</p>\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "html-comment-with-quoted-marker",
+                b'<!-- Use "' + marker + b'" permission. -->\n',
+                True,
+                "not-applicable",
+            ),
+            (
                 "long-quoted-prose",
                 b'"' + b"x" * 129 + b" " + marker + b' permission"\n',
                 True,
@@ -6105,6 +6129,36 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "rust-raw-hash-prefix",
                 b'r#"' + marker + b'"#,\n',
                 True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-nine-hash-prefix",
+                b"r" + b"#" * 9 + b'"' + marker + b'"' + b"#" * 9 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-c-nine-hash-prefix",
+                b"cr" + b"#" * 9 + b'"' + marker + b'"' + b"#" * 9 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-maximum-hash-prefix",
+                b"br"
+                + b"#" * 255
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 255
+                + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-over-maximum-incomplete-prefix",
+                b"r" + b"#" * 256 + b'"' + marker,
+                False,
                 "near-miss",
             ),
             ("cpp-raw-prefix", b'R"(' + marker + b')"\n', True, "near-miss"),
@@ -6222,6 +6276,36 @@ class PublicPoolScannerTest(unittest.TestCase):
             (
                 "javascript-regex-quote-before-literal",
                 b'const r = /"/; const p = "' + marker + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "prose-shaped-function-call",
+                b'Use("' + marker + b'");\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "prose-shaped-adjacent-literal",
+                b'Use "' + marker + b'" "permission".\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "html-attribute",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-inline-code",
+                b'Use `"' + marker + b'"` permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-fenced-code",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
                 True,
                 "near-miss",
             ),
@@ -6370,6 +6454,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                         assignment_line_start=assignment_line_start,
                         proof_end=len(payload),
                         diff_surface=label == "diff-line",
+                        prefix_context_complete=True,
                         suffix_context_complete=suffix_context_complete,
                     )
                 )
@@ -6394,6 +6479,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 assignment_line_start=0,
                 proof_end=len(assignment_bound_payload),
                 diff_surface=False,
+                prefix_context_complete=True,
                 suffix_context_complete=True,
             )
         )
@@ -6403,6 +6489,10 @@ class PublicPoolScannerTest(unittest.TestCase):
         marker = source_permission_marker()
         credential = reduction_secret("generic-secret-assignment", b"V")
         ordinary = b'    "requires ' + marker + b' permission",\n'
+        plain_prose = b'Use "' + marker + b'" permission.\n'
+        markdown_list_prose = b'- Use "' + marker + b'" permission.\n'
+        html_prose = b'<p>Use "' + marker + b'" permission.</p>\n'
+        html_comment = b'<!-- Use "' + marker + b'" permission. -->\n'
         inner_quoted = b"    \"requires '" + marker + b"' permission\",\n"
         escaped_quoted = (
             b'    "requires \\"' + marker + b'\\" permission",\n'
@@ -6419,6 +6509,10 @@ class PublicPoolScannerTest(unittest.TestCase):
 
         for label, payload, should_block in (
             ("ordinary-prose", ordinary, False),
+            ("plain-prose", plain_prose, False),
+            ("markdown-list-prose", markdown_list_prose, False),
+            ("html-prose", html_prose, False),
+            ("html-comment", html_comment, False),
             ("inner-quoted-prose", inner_quoted, False),
             ("escaped-quoted-prose", escaped_quoted, False),
             ("assigned-inner-quoted-prose", assigned_inner_quoted, False),
@@ -6426,6 +6520,27 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("marker-near-miss", near_miss, True),
             ("long-credential", credential_payload, True),
             ("comment-assignment", comment_assignment, True),
+            ("prose-shaped-call", b'Use("' + marker + b'");\n', True),
+            (
+                "prose-shaped-adjacent-literal",
+                b'Use "' + marker + b'" "permission".\n',
+                True,
+            ),
+            (
+                "html-attribute",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+                True,
+            ),
+            (
+                "markdown-inline-code",
+                b'Use `"' + marker + b'"` permission.\n',
+                True,
+            ),
+            (
+                "markdown-fenced-code",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
+                True,
+            ),
         ):
             with self.subTest(case=label):
                 direct = workspace._scan_secret_value(
@@ -6483,6 +6598,28 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'(\n    B"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    r"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    r#"' + marker + b'"#,\n    "statuses: write",\n)\n',
+            b'(\n    r'
+            + b"#" * 9
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 9
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    cr'
+            + b"#" * 9
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 9
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    br'
+            + b"#" * 255
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 255
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    r' + b"#" * 256 + b'"' + marker,
             b'(\n    "' + marker + b'";\n    "statuses: write",\n)\n',
             b'const char *p = "'
             + marker
@@ -6684,6 +6821,54 @@ class PublicPoolScannerTest(unittest.TestCase):
             direct,
         )
         self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 512)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 320)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256)
+    def test_rust_raw_permission_marker_maximum_opener_split_fails_closed(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        for label, opener, suffix in (
+            (
+                "maximum",
+                b"br" + b"#" * 255 + b'"',
+                b'"' + b"#" * 255 + b"\n",
+            ),
+            (
+                "over-maximum-incomplete",
+                b"br" + b"#" * 256 + b'"',
+                b"",
+            ),
+        ):
+            with self.subTest(case=label):
+                record = opener + marker + suffix
+                padding_size = first_read_size - len(opener)
+                padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+                payload = padding + record
+                self.assertEqual(len(padding + opener), first_read_size)
+
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
 
     @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
     @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 16)

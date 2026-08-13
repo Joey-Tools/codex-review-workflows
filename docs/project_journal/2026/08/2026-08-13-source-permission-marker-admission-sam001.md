@@ -55,6 +55,13 @@ superseded_by:
   non-plain literal boundaries. A marker whose opener is not proved on its
   physical record, including multiline raw, triple-quoted, and template forms,
   remains a near-miss rather than entering the plain-literal exception.
+- Rust raw-string openers use the language grammar's `1..=255` hash bound,
+  including byte and C-string prefixes. The maximum legal opener remains in
+  the bounded lookbehind window; over-limit or incomplete openers fail closed.
+- A nonzero plain quote is excluded only for a closed ASCII prose subset:
+  `Use "<marker>" permission.` as a sentence or Markdown list item, the same
+  text inside one `<p>` element, or an exact HTML comment. Assignments, calls,
+  attributes, adjacent literals, templates, and Markdown code remain opaque.
 - The bounded `#` tail check skips only horizontal whitespace and one or more
   closed non-nested ASCII block comments while looking for Rust attribute
   tokens. Nested, unclosed, and non-ASCII forms remain near-misses; this is a
@@ -64,7 +71,7 @@ superseded_by:
 
 - Focused classifier, direct/stream, and Git-tree admission regressions passed
   on Python 3.13.0.
-- `PublicPoolScannerTest`: 120 tests passed.
+- `PublicPoolScannerTest`: 121 tests passed.
 - `WorkspaceTest`: 308 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
@@ -91,3 +98,7 @@ superseded_by:
   boundaries plus Rust attributes separated by block comments. The bounded
   classifier now admits the marker exception only from a proved plain-literal
   content start and keeps those ambiguous forms fail closed.
+- The next whole-range review identified Rust raw delimiters above eight hashes
+  and quoted prose outside source literals. Direct, streamed, and Git-tree
+  regressions cover 9, 255, and over-limit hash counts plus the closed prose and
+  code-context matrices.
