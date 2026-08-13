@@ -22,7 +22,7 @@ from collections import Counter, deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Literal, Mapping
 
 from .common import (
     TRUSTED_PATH,
@@ -10885,6 +10885,124 @@ def _assignment_proof_retention_start(
     return lower_bound
 
 
+_SourcePermissionMarkerRecordStatus = Literal[
+    "not-applicable",
+    "incomplete",
+    "exact",
+    "near-miss",
+]
+
+
+def _source_permission_marker_record_status(
+    value: bytes,
+    *,
+    assignment_end: int,
+    assignment_line_start: int,
+    proof_end: int,
+    diff_surface: bool,
+    suffix_context_complete: bool,
+) -> tuple[_SourcePermissionMarkerRecordStatus, int]:
+    """Classify one bounded source record that may contain the permission marker."""
+
+    if not (
+        0 <= assignment_line_start <= assignment_end <= proof_end <= len(value)
+    ):
+        raise ReviewError(
+            "sensitive scanner produced an invalid permission marker proof range"
+        )
+    maximum_record_bytes = 128
+    record_limit = min(proof_end, assignment_line_start + maximum_record_bytes + 1)
+    line_boundaries = tuple(
+        boundary
+        for boundary in (
+            value.find(b"\n", assignment_end, record_limit),
+            value.find(b"\r", assignment_end, record_limit),
+        )
+        if boundary >= 0
+    )
+    if line_boundaries:
+        line_end = min(line_boundaries)
+        record_complete = True
+    elif (
+        suffix_context_complete
+        and proof_end - assignment_line_start <= maximum_record_bytes
+    ):
+        line_end = proof_end
+        record_complete = True
+    else:
+        line_end = min(proof_end, assignment_line_start + maximum_record_bytes)
+        record_complete = False
+    if line_end - assignment_line_start > maximum_record_bytes:
+        return "near-miss", line_end
+
+    record = value[assignment_line_start:line_end]
+    if diff_surface:
+        if not record or record[0] not in (0x20, 0x2B, 0x2D):
+            return "not-applicable", assignment_end
+        record = record[1:]
+    record = record.lstrip(b" \t")
+    marker_key = b"id-" + b"to" + b"ken" + b":"
+    marker_start = record.find(marker_key)
+    if marker_start < 0:
+        return "not-applicable", assignment_end
+    literal_prefix = record[:marker_start]
+    if literal_prefix.lower() not in {
+        b"'",
+        b'"',
+        b"'''",
+        b'"""',
+        b"b'",
+        b'b"',
+        b"r'",
+        b'r"',
+        b"br'",
+        b'br"',
+        b"rb'",
+        b'rb"',
+        b"u'",
+        b'u"',
+        b"f'",
+        b'f"',
+        b"fr'",
+        b'fr"',
+        b"rf'",
+        b'rf"',
+    }:
+        return "not-applicable", assignment_end
+    if not record_complete:
+        if line_end - assignment_line_start >= maximum_record_bytes:
+            return "near-miss", line_end
+        return "incomplete", assignment_end
+
+    if literal_prefix not in (b"'", b'"'):
+        return "near-miss", line_end
+    quote = literal_prefix
+    marker = marker_key + b" " + b"write"
+    exact_literal = quote + marker + quote
+    tail = record[len(exact_literal) :] if record.startswith(exact_literal) else b""
+    if record.startswith(exact_literal):
+        tail = tail.lstrip(b" \t")
+        if tail.startswith(b","):
+            tail = tail[1:].lstrip(b" \t")
+        if not tail:
+            return "exact", line_end
+
+    closing_start = record.find(quote, marker_start)
+    if closing_start >= 0:
+        raw_payload = record[marker_start:closing_start]
+        raw_rhs = raw_payload[len(marker_key) :].lstrip(b" \t")
+        closed_tail = record[closing_start + 1 :].lstrip(b" \t")
+        if closed_tail.startswith(b","):
+            closed_tail = closed_tail[1:].lstrip(b" \t")
+        if (
+            not closed_tail
+            and b"\\" not in raw_payload
+            and len(raw_rhs) >= 16
+        ):
+            return "not-applicable", assignment_end
+    return "near-miss", line_end
+
+
 def _secret_assignment_rhs_is_closed(
     value: bytes,
     *,
@@ -10899,6 +11017,9 @@ def _secret_assignment_rhs_is_closed(
     event_budget: SecretScanBudget,
     prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     closure_recorder: Callable[[int], None] | None = None,
+    source_permission_marker_recorder: (
+        Callable[[_SourcePermissionMarkerRecordStatus, int], None] | None
+    ) = None,
     literal_rhs_recorder: (
         Callable[[int, int | None, bytes, bytes, int | None], None] | None
     ) = None,
@@ -11012,6 +11133,30 @@ def _secret_assignment_rhs_is_closed(
             )
         except _IncompleteSecretScanSuffix:
             return False
+
+    source_marker_status, source_marker_end = (
+        _source_permission_marker_record_status(
+            value,
+            assignment_end=assignment_end,
+            assignment_line_start=assignment_line_start,
+            proof_end=proof_end,
+            diff_surface=diff_surface,
+            suffix_context_complete=proof_suffix_context_complete,
+        )
+    )
+    if source_marker_status in {"exact", "near-miss"}:
+        if not proof_range_tracker.consume(
+            assignment_line_start,
+            source_marker_end,
+        ):
+            return finish(False)
+        record_inspected(source_marker_end)
+        if (
+            source_marker_status == "near-miss"
+            and source_permission_marker_recorder is not None
+        ):
+            source_permission_marker_recorder(source_marker_status, source_marker_end)
+        return finish(source_marker_status == "exact")
 
     direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
         value,
@@ -13262,6 +13407,9 @@ def _iter_secret_events(
                 tuple[int, int | None, bytes, bytes, int | None]
             ] = []
             recorded_unquoted_rhs: list[tuple[int, int | None]] = []
+            recorded_source_permission_markers: list[
+                tuple[_SourcePermissionMarkerRecordStatus, int]
+            ] = []
             assignment_closed = _secret_assignment_rhs_is_closed(
                 value,
                 prefix_proof_start=prefix_proof_start,
@@ -13275,6 +13423,9 @@ def _iter_secret_events(
                 event_budget=event_budget,
                 prefix_proof_tracker=prefix_proof_tracker,
                 closure_recorder=recorded_closure_frontiers.append,
+                source_permission_marker_recorder=lambda status, end: (
+                    recorded_source_permission_markers.append((status, end))
+                ),
                 literal_rhs_recorder=lambda start, end, delimiter, prefix, diff_side: (
                     recorded_literal_rhs.append(
                         (start, end, delimiter, prefix, diff_side)
@@ -13284,6 +13435,44 @@ def _iter_secret_events(
                     recorded_unquoted_rhs.append((start, end))
                 ),
             )
+            if recorded_source_permission_markers:
+                source_marker_status, source_marker_end = (
+                    recorded_source_permission_markers[-1]
+                )
+                if source_marker_status != "near-miss":
+                    raise ReviewError(
+                        "sensitive scanner recorded an invalid permission marker status"
+                    )
+                if end_is_committable(source_marker_end):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        source_marker_end,
+                        False,
+                        assignment_match.start(),
+                        _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+                    )
+                elif (
+                    maximum_end is not None
+                    and source_marker_end > maximum_end
+                    and maximum_end > minimum_end
+                ):
+                    event_budget.consume()
+                    yield (
+                        _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                        None,
+                        maximum_end,
+                        False,
+                        assignment_match.start(),
+                        _assignment_proof_retention_start(
+                            value,
+                            assignment_start=assignment_match.start(),
+                            diff_surface=diff_surface,
+                            prefix_context_complete=prefix_context_complete,
+                        ),
+                    )
+                continue
             if assignment_closed:
                 if (
                     closed_assignment_proof_frontier is not None

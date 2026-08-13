@@ -92,6 +92,10 @@ def unregistered_generic_credential() -> bytes:
     return b"".join((b"Critical", b"Credential", b"Alpha", b"9!"))
 
 
+def source_permission_marker() -> bytes:
+    return b"id-" + b"token: write"
+
+
 def second_unregistered_generic_credential() -> bytes:
     return b"".join((b"Critical", b"Credential", b"Bravo", b"8!"))
 
@@ -286,6 +290,104 @@ class WorkspaceTest(unittest.TestCase):
             tuple(sorted(path.name for path in self.repo.iterdir())),
             repository_entries,
         )
+
+    def test_secret_admission_accepts_complete_source_string_permission_marker(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        payload = (
+            b"from pathlib import Path\n"
+            b"\n"
+            b"for forbidden in (\n"
+            b'    "contents: write",\n'
+            b'    "'
+            + marker
+            + b'",\n'
+            b'    "statuses: write",\n'
+            b"):\n"
+            b"    assert forbidden not in Path(__file__).read_text()\n"
+        )
+        permission_marker_head = self.commit_bytes(
+            "test_required_ci_workflow.py",
+            payload,
+            "Add workflow permission regression",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=permission_marker_head,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_secret_admission_rejects_permission_marker_secret_suffixes(self) -> None:
+        marker = source_permission_marker()
+        credential = unregistered_generic_credential()
+        for label, literal in (
+            ("value", b"id-" + b"token: " + credential + b"\n"),
+            ("suffix", marker + credential + b"\n"),
+        ):
+            with self.subTest(case=label):
+                credential_head = self.commit_bytes(
+                    f"{label}.txt",
+                    literal,
+                    f"Add {label} credential fixture",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=self.head,
+                    head_ref=credential_head,
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["status"], "violations")
+                self.assertEqual(summary["secret_delta"]["status"], "violations")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.assertNotIn(
+                    literal.decode("ascii").strip(),
+                    json.dumps(summary, sort_keys=True),
+                )
+
+    def test_secret_admission_fails_closed_for_malformed_permission_markers(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        for label, literal in (
+            ("bytes-prefix", b'b"' + marker + b'",\n'),
+            ("concatenation", b'"' + marker + b'" + "suffix",\n'),
+            ("escaped", b'"' + escaped_marker + b'",\n'),
+            ("unclosed", b'"' + marker + b"\n"),
+        ):
+            with self.subTest(case=label):
+                malformed_head = self.commit_bytes(
+                    f"{label}.py",
+                    b"for marker in (\n    " + literal + b"):\n    pass\n",
+                    f"Add {label} permission marker fixture",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=self.head,
+                    head_ref=malformed_head,
+                )
+
+                self.assertEqual(exit_code, 75)
+                self.assertEqual(summary["status"], "inconclusive")
+                self.assertEqual(
+                    summary["failure_class"],
+                    "exact-value-scan-incomplete",
+                )
+                self.assertEqual(
+                    summary["secret_delta"]["failure_class"],
+                    "exact-value-scan-incomplete",
+                )
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
 
     def test_secret_admission_reports_growth_and_scan_uncertainty(self) -> None:
         added_secret_head = self.commit_bytes(

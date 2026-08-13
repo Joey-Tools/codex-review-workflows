@@ -50,6 +50,10 @@ JWT_LEGACY = "eyJ" + "A" * 12 + "." + "B" * 12 + "." + "C" * 12
 HIGH_ENTROPY = b"Aa9!" + b"Bb8@" + b"Cc7#" + b"Dd6$" + b"Ee5%"
 
 
+def source_permission_marker() -> bytes:
+    return b"id-" + b"token: write"
+
+
 def reduction_secret(rule: str, marker: bytes = b"A") -> bytes:
     if len(marker) != 1 or not marker.isalpha():
         raise ValueError("marker must be one ASCII letter")
@@ -5921,6 +5925,195 @@ class PublicPoolScannerTest(unittest.TestCase):
             scan.blocking_candidates,
             {candidate: {"github-token"}},
         )
+
+    def test_complete_source_string_permission_marker_is_not_opaque(self) -> None:
+        marker = source_permission_marker()
+        payload = (
+            b"        for forbidden in (\n"
+            b'            "contents: write",\n'
+            b'            "'
+            + marker
+            + b'",\n'
+            b'            "statuses: write",\n'
+            b"        ):\n"
+            b"            self.assertNotIn(forbidden, workflow)\n"
+            b"\n"
+            b'if __name__ == "__main__":\n'
+            b"    unittest.main()\n"
+        )
+        direct = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.blocking_candidates, {})
+        self.assertEqual(streamed, direct)
+
+        candidate = reduction_secret("generic-secret-assignment", b"Z")
+        secret_payload = b'            "password: ' + candidate + b'",\n'
+        secret_scan = workspace._scan_secret_value(
+            secret_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(
+            secret_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertIsNone(secret_scan.unextractable_rule)
+        self.assertEqual(secret_scan.blocking_candidates, {})
+
+    def test_source_permission_marker_record_classifier_is_closed(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"Y")
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        cases = (
+            ("double-quoted", b'"' + marker + b'"\n', True, "exact"),
+            ("single-quoted-comma", b"'" + marker + b"',\n", True, "exact"),
+            ("eof", b'"' + marker + b'"', True, "exact"),
+            ("diff-line", b'+    "' + marker + b'",\n', True, "exact"),
+            ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
+            ("uppercase-prefix", b'B"' + marker + b'",\n', True, "near-miss"),
+            ("raw-prefix", b'r"' + marker + b'",\n', True, "near-miss"),
+            ("format-prefix", b'f"' + marker + b'",\n', True, "near-miss"),
+            ("semicolon", b'"' + marker + b'";\n', True, "near-miss"),
+            (
+                "concatenation",
+                b'"' + marker + b'" + "suffix"\n',
+                True,
+                "near-miss",
+            ),
+            ("escape", b'"' + escaped_marker + b'"\n', True, "near-miss"),
+            ("triple", b'"""' + marker + b'"""\n', True, "near-miss"),
+            ("embedded-newline", b'"' + marker + b'\n"\n', True, "near-miss"),
+            ("unclosed", b'"' + marker + b'\n', True, "near-miss"),
+            (
+                "long-record",
+                b'"' + marker + b'"' + b" " * 129 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "credential-value",
+                b'"id-' + b"token: " + credential + b'"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "credential-suffix",
+                b'"' + marker + credential + b'"\n',
+                True,
+                "not-applicable",
+            ),
+            ("partial", b'"' + marker + b'"', False, "incomplete"),
+        )
+
+        for label, payload, suffix_context_complete, expected in cases:
+            with self.subTest(case=label):
+                assignment = workspace.SECRET_ASSIGNMENT_PREFIX.search(payload)
+                self.assertIsNotNone(assignment)
+                assert assignment is not None
+                status, record_end = (
+                    workspace._source_permission_marker_record_status(
+                        payload,
+                        assignment_end=assignment.end(),
+                        assignment_line_start=0,
+                        proof_end=len(payload),
+                        diff_surface=label == "diff-line",
+                        suffix_context_complete=suffix_context_complete,
+                    )
+                )
+
+                self.assertEqual(status, expected)
+                self.assertGreaterEqual(record_end, assignment.end())
+                self.assertLessEqual(record_end, len(payload))
+
+    def test_source_string_permission_marker_exception_is_exact(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"X")
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        accepted = (
+            b'"' + marker + b'"\n',
+            b'"' + marker + b'"',
+            b"'" + marker + b"',\n",
+            b'(\n    "contents: write",\n    "'
+            + marker
+            + b'",\n    "statuses: write",\n)\n',
+        )
+        rejected = (
+            b'(\n    b"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    B"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    r"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    "' + marker + b'";\n    "statuses: write",\n)\n',
+            b'(\n    "'
+            + marker
+            + b'" + "suffix",\n    "statuses: write",\n)\n',
+            b'(\n    "'
+            + marker
+            + credential
+            + b'",\n    "statuses: write",\n)\n',
+            b'(\n    "id-'
+            + b"token: "
+            + credential
+            + b'",\n    "statuses: write",\n)\n',
+            b'(\n    "' + escaped_marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    """' + marker + b'""",\n    "statuses: write",\n)\n',
+            b'(\n    "' + marker + b'\n",\n    "statuses: write",\n)\n',
+            b'(\n    "' + marker + b',\n    "statuses: write",\n)\n',
+            b'(\n    "'
+            + marker
+            + b'"'
+            + b" " * 129
+            + b',\n    "statuses: write",\n)\n',
+        )
+
+        for payload in accepted:
+            with self.subTest(kind="accepted", payload=payload):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertIsNone(direct.blocking_rule)
+                self.assertIsNone(direct.unextractable_rule)
+                self.assertEqual(direct.blocking_candidates, {})
+                self.assertEqual(streamed, direct)
+
+        for payload in rejected:
+            with self.subTest(kind="rejected", payload=payload):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule
+                    == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
 
     def test_safe_short_provider_candidate_is_counted_once(self) -> None:
         candidate = b"ghp_" + b"A" * 36
