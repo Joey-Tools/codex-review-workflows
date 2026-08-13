@@ -23,6 +23,7 @@ on:
 """
 REPOSITORY_BINDING = "repository: ${{ inputs.repository }}"
 REF_BINDING = "ref: ${{ inputs.ref }}"
+PERSIST_CREDENTIALS_BINDING = "persist-credentials: false"
 
 
 def bind_checkout_inputs(source: str) -> str:
@@ -51,8 +52,9 @@ def bind_checkout_inputs(source: str) -> str:
                     index += 1
                     field = lines[index]
                     key = field[len(field_indent) :].split(":", 1)[0]
-                    if key not in {"repository", "ref"}:
+                    if key not in {"repository", "ref", "persist-credentials"}:
                         bound.append(field)
+            bound.append(f"{field_indent}{PERSIST_CREDENTIALS_BINDING}\n")
         index += 1
     return "".join(bound)
 
@@ -106,6 +108,7 @@ class RequiredCIWorkflowTests(unittest.TestCase):
         for block in blocks:
             self.assertEqual(block.count(REPOSITORY_BINDING), 1)
             self.assertEqual(block.count(REF_BINDING), 1)
+            self.assertEqual(block.count(PERSIST_CREDENTIALS_BINDING), 1)
 
 
 if __name__ == "__main__":
