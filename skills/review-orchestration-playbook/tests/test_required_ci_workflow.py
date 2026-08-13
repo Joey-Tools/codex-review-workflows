@@ -10,19 +10,10 @@ REUSABLE_HEADER = """name: Required CI
 
 on:
   workflow_call:
-    inputs:
-      repository:
-        description: Repository whose exact ref Required CI validates.
-        required: true
-        type: string
-      ref:
-        description: Exact commit or ref Required CI validates.
-        required: true
-        type: string
 
 """
-REPOSITORY_BINDING = "repository: ${{ inputs.repository }}"
-REF_BINDING = "ref: ${{ inputs.ref }}"
+REPOSITORY_BINDING = "repository: ${{ github.repository }}"
+REF_BINDING = "ref: ${{ github.sha }}"
 PERSIST_CREDENTIALS_BINDING = "persist-credentials: false"
 
 
@@ -97,8 +88,10 @@ class RequiredCIWorkflowTests(unittest.TestCase):
         self.assertNotIn("contents: write", reusable)
         self.assertNotIn("statuses: write", reusable)
         self.assertNotIn("${{ secrets.", reusable)
+        self.assertNotIn("inputs.repository", reusable)
+        self.assertNotIn("inputs.ref", reusable)
 
-    def test_every_checkout_is_bound_to_the_closed_caller_inputs(self) -> None:
+    def test_every_checkout_is_bound_to_the_triggering_context(self) -> None:
         reusable = (WORKFLOW_DIR / "required-ci.yml").read_text(encoding="utf-8")
         header, _separator, _body = reusable.partition("permissions:\n")
         blocks = checkout_step_blocks(reusable)
