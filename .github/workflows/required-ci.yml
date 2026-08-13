@@ -20,9 +20,12 @@ jobs:
           - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-review-workflows' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-review-workflows
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -72,9 +75,12 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 15
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-review-workflows' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-review-workflows
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Require hosted-runner byte reproduction
@@ -90,9 +96,12 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 15
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-review-workflows' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-review-workflows
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -140,9 +149,12 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-review-workflows' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-review-workflows
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false

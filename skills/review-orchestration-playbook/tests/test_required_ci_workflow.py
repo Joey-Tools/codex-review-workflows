@@ -12,9 +12,15 @@ on:
   workflow_call:
 
 """
-REPOSITORY_BINDING = "repository: ${{ github.repository }}"
+EXPECTED_REPOSITORY = "Joey-Tools/codex-review-workflows"
+REPOSITORY_BINDING = f"repository: {EXPECTED_REPOSITORY}"
 REF_BINDING = "ref: ${{ github.sha }}"
 PERSIST_CREDENTIALS_BINDING = "persist-credentials: false"
+REPOSITORY_GUARD = (
+    "      - name: Reject unexpected repository\n"
+    f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
+    "        run: exit 1"
+)
 
 
 def bind_checkout_inputs(source: str) -> str:
@@ -69,6 +75,10 @@ def checkout_step_blocks(source: str) -> list[str]:
     return blocks
 
 
+def without_repository_guards(source: str) -> str:
+    return source.replace(REPOSITORY_GUARD + "\n", "")
+
+
 class RequiredCIWorkflowTests(unittest.TestCase):
     def test_reusable_entry_preserves_the_complete_required_test_graph(self) -> None:
         source = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
@@ -77,7 +87,7 @@ class RequiredCIWorkflowTests(unittest.TestCase):
         permissions = source.index("permissions:\n")
         expected = REUSABLE_HEADER + bind_checkout_inputs(source[permissions:])
 
-        self.assertEqual(reusable, expected)
+        self.assertEqual(without_repository_guards(reusable), expected)
 
     def test_reusable_entry_is_read_only_and_caller_only(self) -> None:
         reusable = (WORKFLOW_DIR / "required-ci.yml").read_text(encoding="utf-8")
@@ -91,17 +101,25 @@ class RequiredCIWorkflowTests(unittest.TestCase):
         self.assertNotIn("inputs.repository", reusable)
         self.assertNotIn("inputs.ref", reusable)
 
-    def test_every_checkout_is_bound_to_the_triggering_context(self) -> None:
+    def test_every_checkout_is_guarded_and_bound_to_the_exact_repository(self) -> None:
         reusable = (WORKFLOW_DIR / "required-ci.yml").read_text(encoding="utf-8")
         header, _separator, _body = reusable.partition("permissions:\n")
         blocks = checkout_step_blocks(reusable)
 
         self.assertEqual(header, REUSABLE_HEADER)
         self.assertEqual(len(blocks), 4)
+        self.assertEqual(reusable.count(REPOSITORY_GUARD), len(blocks))
+        self.assertEqual(
+            reusable.count(
+                REPOSITORY_GUARD + "\n      - uses: actions/checkout@"
+            ),
+            len(blocks),
+        )
         for block in blocks:
             self.assertEqual(block.count(REPOSITORY_BINDING), 1)
             self.assertEqual(block.count(REF_BINDING), 1)
             self.assertEqual(block.count(PERSIST_CREDENTIALS_BINDING), 1)
+        self.assertNotIn("repository: ${{ github.repository }}", reusable)
 
 
 if __name__ == "__main__":
