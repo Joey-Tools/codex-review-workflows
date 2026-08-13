@@ -6027,6 +6027,12 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
             ("uppercase-prefix", b'B"' + marker + b'",\n', True, "near-miss"),
             ("raw-prefix", b'r"' + marker + b'",\n', True, "near-miss"),
+            (
+                "rust-raw-hash-prefix",
+                b'r#"' + marker + b'"#,\n',
+                True,
+                "near-miss",
+            ),
             ("format-prefix", b'f"' + marker + b'",\n', True, "near-miss"),
             ("semicolon", b'"' + marker + b'";\n', True, "near-miss"),
             (
@@ -6162,6 +6168,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'(\n    b"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    B"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    r"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    r#"' + marker + b'"#,\n    "statuses: write",\n)\n',
             b'(\n    "' + marker + b'";\n    "statuses: write",\n)\n',
             b'(\n    "'
             + marker

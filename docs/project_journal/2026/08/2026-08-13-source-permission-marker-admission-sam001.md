@@ -41,6 +41,8 @@ superseded_by:
 - The marker exception now requires the marker to begin at the recognized
   quoted literal's content boundary. Ordinary prose that mentions the marker
   later in the same literal remains ordinary source text.
+- Rust raw hash-delimited literals remain marker near-misses and fail closed;
+  the exception stays limited to plain single- or double-quoted literals.
 
 ## Evidence
 
