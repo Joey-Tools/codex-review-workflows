@@ -52,9 +52,9 @@ superseded_by:
 
 ## Evidence
 
-- Ten focused parser/admission regressions passed on Python 3.13.0.
+- Twelve focused parser/admission regressions passed on Python 3.13.0.
 - `PublicPoolScannerTest`: 119 tests passed.
-- `WorkspaceTest`: 307 tests passed with one expected skip.
+- `WorkspaceTest`: 308 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
   regressions cover C and Python forms plus a logical stream-read boundary.
@@ -69,3 +69,7 @@ superseded_by:
   cumulative malformed-fixture, and inline-comment gaps. Each malformed
   Git-tree case now compares one fixture against its own immediate clean base;
   direct, streamed, and admission regressions cover the repaired boundaries.
+- Formal whole-range review identified a second cumulative Git-tree fixture in
+  the permission-suffix matrix. Every suffix case now compares against its own
+  immediate clean base, binds all reported additions to that case's path, and
+  commits fixture removal before the next case.

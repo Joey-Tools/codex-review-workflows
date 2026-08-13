@@ -441,15 +441,18 @@ class WorkspaceTest(unittest.TestCase):
             ("suffix", marker + credential + b"\n"),
         ):
             with self.subTest(case=label):
+                relative = f"{label}.txt"
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
                 credential_head = self.commit_bytes(
-                    f"{label}.txt",
+                    relative,
                     literal,
                     f"Add {label} credential fixture",
                 )
 
                 exit_code, summary = workspace_runtime.secret_admission(
                     repo=self.repo,
-                    base_ref=self.head,
+                    base_ref=clean_base,
                     head_ref=credential_head,
                 )
 
@@ -460,6 +463,20 @@ class WorkspaceTest(unittest.TestCase):
                 self.assertNotIn(
                     literal.decode("ascii").strip(),
                     json.dumps(summary, sort_keys=True),
+                )
+                addition_paths = {
+                    addition["path"]
+                    for violation in summary["secret_delta"]["violations"]
+                    for addition in violation["additions"]
+                }
+                self.assertEqual(addition_paths, {relative})
+                clean_head = self.remove_and_commit(
+                    relative,
+                    f"Remove {label} credential fixture",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
                 )
 
     def test_secret_admission_fails_closed_for_malformed_permission_markers(
