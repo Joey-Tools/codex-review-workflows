@@ -355,6 +355,54 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(summary["secret_delta"]["status"], "clean")
         self.assertEqual(summary["temporary_cleanup_status"], "complete")
 
+    def test_secret_admission_accepts_permission_marker_with_inline_comment(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        for label, suffix, payload in (
+            (
+                "python-hash-comment",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",  # required for OIDC\n'
+                b")\n",
+            ),
+            (
+                "c-slash-comment",
+                ".c",
+                b"const char *values[] = {\n"
+                b'    "'
+                + marker
+                + b'",  // required for OIDC\n'
+                b"};\n",
+            ),
+        ):
+            with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                relative = f"{label}{suffix}"
+                comment_head = self.commit_bytes(
+                    relative,
+                    payload,
+                    f"Add {label} permission marker regression",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=comment_head,
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["status"], "clean")
+                self.assertEqual(summary["secret_delta"]["status"], "clean")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.remove_and_commit(
+                    relative,
+                    f"Remove {label} permission marker regression",
+                )
+
     def test_secret_admission_accepts_marker_before_unchanged_provider(self) -> None:
         marker = source_permission_marker()
         provider = b"ghp_" + b"A" * 36
@@ -432,6 +480,50 @@ class WorkspaceTest(unittest.TestCase):
                 python_prefix + b'b"' + marker + b'",\n' + python_suffix,
             ),
             (
+                "assignment-bytes-prefix",
+                ".py",
+                b'permission = b"' + marker + b'"\n',
+            ),
+            (
+                "assignment-plain-literal",
+                ".py",
+                b'permission = "' + marker + b'"\n',
+            ),
+            (
+                "comment-without-comma",
+                ".py",
+                b'values = ("' + marker + b'" # required\n)\n',
+            ),
+            (
+                "block-comment-after-comma",
+                ".c",
+                b'const char *values[] = {"'
+                + marker
+                + b'", /* required */};\n',
+            ),
+            (
+                "comment-lookalike-after-comma",
+                ".py",
+                b'values = ("' + marker + b'", / required\n)\n',
+            ),
+            (
+                "hash-directive-after-comma",
+                ".rs",
+                b'values = [\n    "' + marker + b'", #[cfg(test)]\n];\n',
+            ),
+            (
+                "slash-comment-unicode-line-separator",
+                ".js",
+                b'values = [\n    "'
+                + marker
+                + b'", // required\xe2\x80\xa8"suffix"\n];\n',
+            ),
+            (
+                "same-line-list-comment",
+                ".py",
+                b'values = ("' + marker + b'", # required\n)\n',
+            ),
+            (
                 "concatenation",
                 ".py",
                 python_prefix
@@ -457,6 +549,28 @@ class WorkspaceTest(unittest.TestCase):
                 + marker
                 + b'"\n    "'
                 + credential
+                + b'";\n',
+            ),
+            (
+                "c-same-line-adjacent-literal",
+                ".c",
+                b'const char *marker = "'
+                + marker
+                + b'" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-comment-before-adjacent-literal",
+                ".c",
+                b'/* " */ const char *marker = "'
+                + marker
+                + b'" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
                 + b'";\n',
             ),
             (
@@ -517,6 +631,7 @@ class WorkspaceTest(unittest.TestCase):
             ),
         ):
             with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
                 malformed_head = self.commit_bytes(
                     f"{label}{suffix}",
                     payload,
@@ -525,7 +640,7 @@ class WorkspaceTest(unittest.TestCase):
 
                 exit_code, summary = workspace_runtime.secret_admission(
                     repo=self.repo,
-                    base_ref=self.head,
+                    base_ref=clean_base,
                     head_ref=malformed_head,
                 )
 
@@ -540,6 +655,10 @@ class WorkspaceTest(unittest.TestCase):
                     "exact-value-scan-incomplete",
                 )
                 self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.remove_and_commit(
+                    f"{label}{suffix}",
+                    f"Remove {label} permission marker fixture",
+                )
 
     def test_secret_admission_reports_growth_and_scan_uncertainty(self) -> None:
         added_secret_head = self.commit_bytes(

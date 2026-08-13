@@ -6010,6 +6010,30 @@ class PublicPoolScannerTest(unittest.TestCase):
         cases = (
             ("double-quoted", b'"' + marker + b'"\n', True, "exact"),
             ("single-quoted-comma", b"'" + marker + b"',\n", True, "exact"),
+            (
+                "hash-comment-after-comma",
+                b'    "' + marker + b'",  # required\n',
+                True,
+                "exact",
+            ),
+            (
+                "slash-comment-after-comma",
+                b'    "' + marker + b'",  // required\n',
+                True,
+                "exact",
+            ),
+            (
+                "hash-comment-at-proven-eof",
+                b'"' + marker + b'", # required',
+                True,
+                "exact",
+            ),
+            (
+                "hash-comment-incomplete",
+                b'"' + marker + b'", # required',
+                False,
+                "incomplete",
+            ),
             ("eof", b'"' + marker + b'"', True, "exact"),
             ("diff-line", b'+    "' + marker + b'",\n', True, "exact"),
             (
@@ -6024,7 +6048,39 @@ class PublicPoolScannerTest(unittest.TestCase):
                 True,
                 "not-applicable",
             ),
+            (
+                "inner-single-quoted-prose",
+                b"\"requires '" + marker + b"' permission\"\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "escaped-double-quoted-prose",
+                b'"requires \\"' + marker + b'\\" permission"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "assigned-inner-quoted-prose",
+                b"message = \"requires '"
+                + marker
+                + b"' permission\"\n",
+                True,
+                "not-applicable",
+            ),
             ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
+            (
+                "assignment-bytes-prefix",
+                b'permission = b"' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "assignment-plain-literal",
+                b'permission = "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
             ("uppercase-prefix", b'B"' + marker + b'",\n', True, "near-miss"),
             ("raw-prefix", b'r"' + marker + b'",\n', True, "near-miss"),
             (
@@ -6078,6 +6134,96 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "near-miss",
             ),
             (
+                "c-assignment-adjacent-literal",
+                b'const char *p = "'
+                + marker
+                + b'" "'
+                + credential
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "c-block-comment-before-adjacent-literal",
+                b'/* " */ const char *p = "'
+                + marker
+                + b'" "'
+                + credential
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-before-literal",
+                b'r"prefix\\"; let p = "'
+                + marker
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-label-before-literal",
+                b'\'label: let p = "' + marker + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-lifetime-before-literal",
+                b'let _: &\'a str = "' + marker + b'"; let _: &\'b str = "";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "javascript-regex-quote-before-literal",
+                b'const r = /"/; const p = "' + marker + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "comment-without-comma",
+                b'"' + marker + b'" # required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "same-line-list-comment",
+                b'values = ("' + marker + b'", # required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "block-comment-after-comma",
+                b'"' + marker + b'", /* required */\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "comment-lookalike-after-comma",
+                b'"' + marker + b'", / required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-directive-after-comma",
+                b'"' + marker + b'", #[cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-comment-without-separator",
+                b'"' + marker + b'", #required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "slash-comment-unicode-line-separator",
+                b'"'
+                + marker
+                + b'", // required\xe2\x80\xa8"suffix"\n',
+                True,
+                "near-miss",
+            ),
+            (
                 "python-next-line-operator",
                 b'"' + marker + b'"\n+ "' + credential + b'"\n',
                 True,
@@ -6107,19 +6253,54 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertGreaterEqual(record_end, assignment.end())
                 self.assertLessEqual(record_end, len(payload))
 
+        assignment_bound_payload = (
+            b'"' + marker + b'", # password = "' + credential + b'"\n'
+        )
+        assignment_matches = tuple(
+            workspace.SECRET_ASSIGNMENT_PREFIX.finditer(assignment_bound_payload)
+        )
+        self.assertEqual(len(assignment_matches), 2)
+        later_assignment = assignment_matches[1]
+        later_status, _later_end = (
+            workspace._source_permission_marker_record_status(
+                assignment_bound_payload,
+                assignment_start=later_assignment.start(),
+                assignment_end=later_assignment.end(),
+                assignment_line_start=0,
+                proof_end=len(assignment_bound_payload),
+                diff_surface=False,
+                suffix_context_complete=True,
+            )
+        )
+        self.assertEqual(later_status, "not-applicable")
+
     def test_permission_marker_inside_quoted_prose_is_ordinary(self) -> None:
         marker = source_permission_marker()
         credential = reduction_secret("generic-secret-assignment", b"V")
         ordinary = b'    "requires ' + marker + b' permission",\n'
+        inner_quoted = b"    \"requires '" + marker + b"' permission\",\n"
+        escaped_quoted = (
+            b'    "requires \\"' + marker + b'\\" permission",\n'
+        )
+        assigned_inner_quoted = (
+            b"message = \"requires '" + marker + b"' permission\"\n"
+        )
         exact = b'"' + marker + b'"\n'
         near_miss = b'b"' + marker + b'"\n'
         credential_payload = b'password = "' + credential + b'"\n'
+        comment_assignment = (
+            b'"' + marker + b'", # password = "' + credential + b'"\n'
+        )
 
         for label, payload, should_block in (
             ("ordinary-prose", ordinary, False),
+            ("inner-quoted-prose", inner_quoted, False),
+            ("escaped-quoted-prose", escaped_quoted, False),
+            ("assigned-inner-quoted-prose", assigned_inner_quoted, False),
             ("exact-marker", exact, False),
             ("marker-near-miss", near_miss, True),
             ("long-credential", credential_payload, True),
+            ("comment-assignment", comment_assignment, True),
         ):
             with self.subTest(case=label):
                 direct = workspace._scan_secret_value(
@@ -6160,16 +6341,45 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'"' + marker + b'"\n',
             b'"' + marker + b'"',
             b"'" + marker + b"',\n",
+            b'values = (\n    "' + marker + b'",  # required for OIDC\n)\n',
+            b'values = {\n    "' + marker + b'",  // required for OIDC\n}\n',
             b'(\n    "contents: write",\n    "'
             + marker
             + b'",\n    "statuses: write",\n)\n',
         )
         rejected = (
             b'(\n    b"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'permission = b"' + marker + b'"\n',
+            b'permission = "' + marker + b'"\n',
             b'(\n    B"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    r"' + marker + b'",\n    "statuses: write",\n)\n',
             b'(\n    r#"' + marker + b'"#,\n    "statuses: write",\n)\n',
             b'(\n    "' + marker + b'";\n    "statuses: write",\n)\n',
+            b'const char *p = "'
+            + marker
+            + b'" "'
+            + credential
+            + b'";\n',
+            b'/* " */ const char *p = "'
+            + marker
+            + b'" "'
+            + credential
+            + b'";\n',
+            b'r"prefix\\"; let p = "' + marker + b'";\n',
+            b'\'label: let p = "' + marker + b'";\n',
+            b'let _: &\'a str = "'
+            + marker
+            + b'"; let _: &\'b str = "";\n',
+            b'const r = /"/; const p = "' + marker + b'";\n',
+            b'values = ("' + marker + b'", # required\n)\n',
+            b'values = ("' + marker + b'" # required\n)\n',
+            b'values = ("' + marker + b'", /* required */\n)\n',
+            b'values = ("' + marker + b'", / required\n)\n',
+            b'values = (\n    "' + marker + b'", #[cfg(test)]\n)\n',
+            b'values = (\n    "' + marker + b'", #required\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", // required\xe2\x80\xa8"suffix"\n)\n',
             b'(\n    "'
             + marker
             + b'" + "suffix",\n    "statuses: write",\n)\n',

@@ -10836,6 +10836,170 @@ def _quoted_literal_content_start(value: bytes) -> int | None:
     return delimiter_start + delimiter_size
 
 
+def _source_literal_candidate_start(
+    value: bytes,
+    content_start: int,
+    *,
+    scan_start: int = 0,
+) -> int | None:
+    """Return the earliest recognized local opener ending at ``content_start``."""
+
+    if not 0 <= scan_start <= content_start <= len(value):
+        raise ReviewError("sensitive scanner produced an invalid literal boundary")
+    candidates = []
+    for literal_start in range(max(scan_start, content_start - 12), content_start):
+        relative_content_start = _quoted_literal_content_start(
+            value[literal_start:content_start]
+        )
+        if (
+            relative_content_start is not None
+            and literal_start + relative_content_start == content_start
+        ):
+            candidates.append(literal_start)
+    return min(candidates, default=None)
+
+
+def _source_plain_literal_closing_end(
+    value: bytes,
+    *,
+    literal_content_start: int,
+    quote: bytes,
+    scan_end: int,
+) -> int | None:
+    """Return one unescaped plain-literal closing boundary."""
+
+    cursor = literal_content_start
+    while True:
+        closing_start = value.find(quote, cursor, scan_end)
+        if closing_start < 0:
+            return None
+        backslash_count = 0
+        previous = closing_start - 1
+        while previous >= literal_content_start and value[previous] == 0x5C:
+            backslash_count += 1
+            previous -= 1
+        if backslash_count % 2 == 0:
+            return closing_start + 1
+        cursor = closing_start + 1
+
+
+_SourceLiteralBoundaryStatus = Literal[
+    "candidate",
+    "proven-not-opener",
+    "ambiguous",
+]
+
+
+@dataclass(frozen=True)
+class _SourceLiteralBoundary:
+    status: _SourceLiteralBoundaryStatus
+    literal_start: int | None = None
+
+
+def _source_literal_boundary(
+    value: bytes,
+    content_start: int,
+    *,
+    scan_start: int = 0,
+    scan_end: int | None = None,
+) -> _SourceLiteralBoundary:
+    """Classify a bounded local opener without guessing cross-language syntax."""
+
+    if scan_end is None:
+        scan_end = len(value)
+    if not 0 <= scan_start <= content_start <= scan_end <= len(value):
+        raise ReviewError("sensitive scanner produced an invalid literal boundary")
+    literal_start = _source_literal_candidate_start(
+        value,
+        content_start,
+        scan_start=scan_start,
+    )
+    if literal_start is None:
+        return _SourceLiteralBoundary("proven-not-opener")
+    local_opener = value[literal_start:content_start]
+    if local_opener not in (b"'", b'"'):
+        return _SourceLiteralBoundary("ambiguous")
+
+    cursor = scan_start
+    while cursor < literal_start:
+        if value.startswith(b"/*", cursor, literal_start):
+            comment_end = value.find(b"*/", cursor + 2, literal_start)
+            if comment_end < 0:
+                return _SourceLiteralBoundary("ambiguous")
+            cursor = comment_end + 2
+            continue
+        if value.startswith(b"//", cursor, literal_start) or value[cursor] == 0x23:
+            return _SourceLiteralBoundary("ambiguous")
+        relative_content_start = _quoted_literal_content_start(
+            value[cursor : min(scan_end, cursor + 16)]
+        )
+        if relative_content_start is None:
+            cursor += 1
+            continue
+        literal_content_start = cursor + relative_content_start
+        opener = value[cursor:literal_content_start]
+        if opener not in (b"'", b'"'):
+            return _SourceLiteralBoundary("ambiguous")
+        previous_significant = cursor - 1
+        while (
+            previous_significant >= scan_start
+            and value[previous_significant] in (0x09, 0x20)
+        ):
+            previous_significant -= 1
+        if opener == b"'" and previous_significant >= scan_start:
+            previous_byte = value[previous_significant]
+            if (
+                previous_byte in b"&+<:"
+                or 0x30 <= previous_byte <= 0x39
+                or 0x41 <= previous_byte <= 0x5A
+                or previous_byte == 0x5F
+                or 0x61 <= previous_byte <= 0x7A
+            ):
+                return _SourceLiteralBoundary("ambiguous")
+        if opener == b"'" and re.match(
+            rb"'[A-Za-z_][A-Za-z0-9_]*:",
+            value[cursor:literal_start],
+        ):
+            return _SourceLiteralBoundary("ambiguous")
+        closing_end = _source_plain_literal_closing_end(
+            value,
+            literal_content_start=literal_content_start,
+            quote=opener,
+            scan_end=scan_end,
+        )
+        if closing_end is None:
+            return _SourceLiteralBoundary("ambiguous")
+        if closing_end == content_start:
+            return _SourceLiteralBoundary("ambiguous")
+        if closing_end > content_start:
+            return _SourceLiteralBoundary("proven-not-opener")
+        cursor = closing_end
+    backslash_count = 0
+    previous = literal_start - 1
+    while previous >= scan_start and value[previous] == 0x5C:
+        backslash_count += 1
+        previous -= 1
+    if backslash_count % 2:
+        return _SourceLiteralBoundary("ambiguous")
+    return _SourceLiteralBoundary("candidate", literal_start)
+
+
+def _source_permission_line_comment_is_closed(value: bytes) -> bool:
+    """Accept one conservative ASCII line-comment grammar."""
+
+    introducer_size = 0
+    for introducer in (b"#", b"//"):
+        if value.startswith(introducer):
+            introducer_size = len(introducer)
+            break
+    if introducer_size == 0:
+        return False
+    body = value[introducer_size:]
+    if body and body[0] not in (0x09, 0x20):
+        return False
+    return all(byte == 0x09 or 0x20 <= byte <= 0x7E for byte in body)
+
+
 def _bounded_diff_hunk_context_before(
     value: bytes,
     before: int,
@@ -10972,24 +11136,42 @@ def _source_permission_marker_record_status(
     if assignment_end > line_end:
         if (
             value.startswith(marker_key, assignment_start, assignment_end)
-            and assignment_start > assignment_line_start
-            and value[assignment_start - 1] in (0x22, 0x27, 0x60)
+            and _source_literal_candidate_start(
+                value,
+                assignment_start,
+                scan_start=max(assignment_line_start, assignment_start - 12),
+            )
+            is not None
         ):
             return "near-miss", assignment_end
         return "not-applicable", assignment_end
 
     record = value[assignment_line_start:line_end]
+    record_start = assignment_line_start
     if diff_surface:
         if not record or record[0] not in (0x20, 0x2B, 0x2D):
             return "not-applicable", assignment_end
         record = record[1:]
-    record = record.lstrip(b" \t")
-    marker_start = record.find(marker_key)
-    if marker_start < 0:
+        record_start += 1
+    stripped_record = record.lstrip(b" \t")
+    record_start += len(record) - len(stripped_record)
+    record = stripped_record
+    marker_start = assignment_start - record_start
+    if marker_start < 0 or not record.startswith(marker_key, marker_start):
         return "not-applicable", assignment_end
-    if marker_start != _quoted_literal_content_start(record):
+    literal_boundary = _source_literal_boundary(
+        record,
+        marker_start,
+        scan_end=len(record),
+    )
+    if literal_boundary.status == "proven-not-opener":
         return "not-applicable", assignment_end
-    literal_prefix = record[:marker_start]
+    if literal_boundary.status == "ambiguous":
+        return "near-miss", line_end
+    literal_start = literal_boundary.literal_start
+    if literal_start is None:
+        raise ReviewError("sensitive scanner lost a permission literal boundary")
+    literal_prefix = record[literal_start:marker_start]
     if not record_complete:
         if line_end - assignment_line_start >= maximum_record_bytes:
             return "near-miss", line_end
@@ -11000,14 +11182,22 @@ def _source_permission_marker_record_status(
     quote = literal_prefix
     marker = marker_key + b" " + b"write"
     exact_literal = quote + marker + quote
-    tail = record[len(exact_literal) :] if record.startswith(exact_literal) else b""
-    if record.startswith(exact_literal):
+    exact_literal_end = literal_start + len(exact_literal)
+    tail = (
+        record[exact_literal_end:]
+        if record.startswith(exact_literal, literal_start)
+        else b""
+    )
+    if record.startswith(exact_literal, literal_start):
         tail = tail.lstrip(b" \t")
         comma_present = False
         if tail.startswith(b","):
             comma_present = True
             tail = tail[1:].lstrip(b" \t")
-        if not tail:
+        line_comment_present = _source_permission_line_comment_is_closed(tail)
+        if not tail or (comma_present and line_comment_present):
+            if literal_start != 0:
+                return "near-miss", line_end
             if comma_present:
                 return "exact", line_end
             terminal_line_ending_size = proof_end - line_end

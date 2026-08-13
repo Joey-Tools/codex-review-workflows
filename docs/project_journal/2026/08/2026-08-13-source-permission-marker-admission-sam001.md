@@ -43,6 +43,12 @@ superseded_by:
   later in the same literal remains ordinary source text.
 - Rust raw hash-delimited literals remain marker near-misses and fail closed;
   the exception stays limited to plain single- or double-quoted literals.
+- Same-line assignments, adjacent literals, language-ambiguous quote contexts,
+  and unproved literal boundaries remain near-misses; ordinary containing
+  prose is excluded only after a bounded plain-literal proof.
+- Exact standalone list entries may carry a conservative ASCII `#` or `//`
+  line comment after their comma. Directives, block comments, lookalikes,
+  alternate line separators, and incomplete records remain near-misses.
 
 ## Evidence
 
@@ -59,3 +65,7 @@ superseded_by:
 - GitHub Codex identified an ordinary-prose false positive; direct, streamed,
   classifier, and Git-tree admission regressions now cover the exact literal
   start boundary without weakening the existing fail-closed cases.
+- A current-head GitHub Codex pass identified same-line literal-boundary,
+  cumulative malformed-fixture, and inline-comment gaps. Each malformed
+  Git-tree case now compares one fixture against its own immediate clean base;
+  direct, streamed, and admission regressions cover the repaired boundaries.
