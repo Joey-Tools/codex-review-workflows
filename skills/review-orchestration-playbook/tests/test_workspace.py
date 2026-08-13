@@ -357,17 +357,71 @@ class WorkspaceTest(unittest.TestCase):
         self,
     ) -> None:
         marker = source_permission_marker()
+        credential = unregistered_generic_credential()
         escaped_marker = b"id-" + b"token: wr\\x69te"
-        for label, literal in (
-            ("bytes-prefix", b'b"' + marker + b'",\n'),
-            ("concatenation", b'"' + marker + b'" + "suffix",\n'),
-            ("escaped", b'"' + escaped_marker + b'",\n'),
-            ("unclosed", b'"' + marker + b"\n"),
+        python_prefix = b"for marker in (\n    "
+        python_suffix = b"):\n    pass\n"
+        for label, suffix, payload in (
+            (
+                "bytes-prefix",
+                ".py",
+                python_prefix + b'b"' + marker + b'",\n' + python_suffix,
+            ),
+            (
+                "concatenation",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'" + "suffix",\n'
+                + python_suffix,
+            ),
+            (
+                "escaped",
+                ".py",
+                python_prefix + b'"' + escaped_marker + b'",\n' + python_suffix,
+            ),
+            (
+                "unclosed",
+                ".py",
+                python_prefix + b'"' + marker + b"\n" + python_suffix,
+            ),
+            (
+                "c-adjacent-literal",
+                ".c",
+                b"const char *marker =\n    \""
+                + marker
+                + b'"\n    "'
+                + credential
+                + b'";\n',
+            ),
+            (
+                "python-implicit-concatenation",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'"\n    "'
+                + credential
+                + b'",\n'
+                + python_suffix,
+            ),
+            (
+                "python-next-line-operator",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'"\n    + "'
+                + credential
+                + b'",\n'
+                + python_suffix,
+            ),
         ):
             with self.subTest(case=label):
                 malformed_head = self.commit_bytes(
-                    f"{label}.py",
-                    b"for marker in (\n    " + literal + b"):\n    pass\n",
+                    f"{label}{suffix}",
+                    payload,
                     f"Add {label} permission marker fixture",
                 )
 

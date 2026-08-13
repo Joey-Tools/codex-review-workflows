@@ -5974,6 +5974,7 @@ class PublicPoolScannerTest(unittest.TestCase):
 
     def test_source_permission_marker_record_classifier_is_closed(self) -> None:
         marker = source_permission_marker()
+        self.assertEqual(marker, b"id-" + b"token:" + b" " + b"write")
         credential = reduction_secret("generic-secret-assignment", b"Y")
         escaped_marker = b"id-" + b"token: wr\\x69te"
         cases = (
@@ -6013,6 +6014,18 @@ class PublicPoolScannerTest(unittest.TestCase):
                 b'"' + marker + credential + b'"\n',
                 True,
                 "not-applicable",
+            ),
+            (
+                "c-adjacent-literal",
+                b'"' + marker + b'"\n"' + credential + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "python-next-line-operator",
+                b'"' + marker + b'"\n+ "' + credential + b'"\n',
+                True,
+                "near-miss",
             ),
             ("partial", b'"' + marker + b'"', False, "incomplete"),
         )
@@ -6071,6 +6084,16 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'(\n    "' + marker + b',\n    "statuses: write",\n)\n',
             b'(\n    "'
             + marker
+            + b'"\n    "'
+            + credential
+            + b'",\n)\n',
+            b'(\n    "'
+            + marker
+            + b'"\n    + "'
+            + credential
+            + b'",\n)\n',
+            b'(\n    "'
+            + marker
             + b'"'
             + b" " * 129
             + b',\n    "statuses: write",\n)\n',
@@ -6114,6 +6137,34 @@ class PublicPoolScannerTest(unittest.TestCase):
                     direct,
                 )
                 self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 16)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32)
+    def test_permission_marker_continuation_survives_stream_boundary(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"W")
+        marker_record = b'"' + marker + b'"\n'
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        padding_size = first_read_size - len(marker_record)
+        padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+        payload = padding + marker_record + b'"' + credential + b'"\n'
+        self.assertEqual(len(padding + marker_record), first_read_size)
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertTrue(
+            scan.blocking_rule == "generic-secret-assignment"
+            or scan.unextractable_rule == "generic-secret-assignment",
+            scan,
+        )
 
     def test_safe_short_provider_candidate_is_counted_once(self) -> None:
         candidate = b"ghp_" + b"A" * 36

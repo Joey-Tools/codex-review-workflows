@@ -29,10 +29,16 @@ superseded_by:
   parser change without encountering the marker as a tracked raw literal.
 - Direct and streamed scanner paths share the same record classification and
   proof-budget accounting.
+- An exact marker without a trailing comma is accepted only at a proved final
+  line ending. Later source bytes fail closed, preventing C adjacent literals,
+  Python implicit concatenation, and next-line operators from extending it.
 
 ## Evidence
 
-- Seven focused parser and admission regressions passed on Python 3.13.0.
-- `PublicPoolScannerTest`: 116 tests passed.
+- The original seven and six follow-up focused parser/admission regressions
+  passed on Python 3.13.0.
+- `PublicPoolScannerTest`: 117 tests passed.
 - `WorkspaceTest`: 305 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
+- Fresh review identified the cross-line continuation boundary; the follow-up
+  regressions cover C and Python forms plus a logical stream-read boundary.

@@ -10982,10 +10982,19 @@ def _source_permission_marker_record_status(
     tail = record[len(exact_literal) :] if record.startswith(exact_literal) else b""
     if record.startswith(exact_literal):
         tail = tail.lstrip(b" \t")
+        comma_present = False
         if tail.startswith(b","):
+            comma_present = True
             tail = tail[1:].lstrip(b" \t")
         if not tail:
-            return "exact", line_end
+            if comma_present:
+                return "exact", line_end
+            terminal_line_ending_size = proof_end - line_end
+            if suffix_context_complete and terminal_line_ending_size <= 2:
+                terminal_line_ending = value[line_end:proof_end]
+                if terminal_line_ending in {b"", b"\n", b"\r", b"\r\n"}:
+                    return "exact", line_end
+            return "near-miss", line_end
 
     closing_start = record.find(quote, marker_start)
     if closing_start >= 0:
