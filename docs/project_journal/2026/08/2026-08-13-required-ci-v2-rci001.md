@@ -16,20 +16,25 @@ superseded_by:
 
 - Add a caller-only, read-only reusable workflow for the central Required CI
   rollout without changing the existing CI workflow.
+- Require the caller to provide the repository and exact ref validated by every
+  checkout in the reusable graph.
 - Preserve the complete dependency graph behind the required `test` job.
 
 ## Current State
 
-- `.github/workflows/required-ci.yml` exposes only `workflow_call` with
-  `contents: read`.
+- `.github/workflows/required-ci.yml` exposes only `workflow_call` with the
+  required string inputs `repository` and `ref`, plus `contents: read`.
 - Its environment and jobs are byte-for-byte derived from
   `.github/workflows/ci.yml`, including all four prerequisite jobs and the
-  `test` aggregator.
+  `test` aggregator, except for the closed checkout-input bindings.
+- All four `actions/checkout` steps bind `repository` and `ref` to those exact
+  caller inputs while preserving their existing fetch-depth and credential
+  settings.
 - The contract test lives under
   `skills/review-orchestration-playbook/tests/test_required_ci_workflow.py`,
   so the existing test discovery in both CI workflows executes it without a
-  new job. It rejects trigger, permission, secret, or job-graph drift during
-  the canary rollout.
+  new job. It rejects input, checkout, trigger, permission, secret, or job-graph
+  drift during the canary rollout.
 
 ## Next Steps
 
@@ -40,9 +45,9 @@ superseded_by:
 
 - Direct execution of
   `skills/review-orchestration-playbook/tests/test_required_ci_workflow.py`
-  passes both focused contract tests under Python 3.13.0.
+  passes all three focused contract tests under Python 3.13.0.
 - The existing `python3 -B -m unittest discover` path with test root
   `skills/review-orchestration-playbook/tests` and pattern
-  `test_required_ci_workflow.py` also selects and passes both tests.
+  `test_required_ci_workflow.py` also selects and passes all three tests.
 - `actionlint -shellcheck= .github/workflows/required-ci.yml` validates the
   reusable workflow structure and expressions.
