@@ -6012,6 +6012,18 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("single-quoted-comma", b"'" + marker + b"',\n", True, "exact"),
             ("eof", b'"' + marker + b'"', True, "exact"),
             ("diff-line", b'+    "' + marker + b'",\n', True, "exact"),
+            (
+                "quoted-prose",
+                b'"requires ' + marker + b' permission"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "long-quoted-prose",
+                b'"' + b"x" * 129 + b" " + marker + b' permission"\n',
+                True,
+                "not-applicable",
+            ),
             ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
             ("uppercase-prefix", b'B"' + marker + b'",\n', True, "near-miss"),
             ("raw-prefix", b'r"' + marker + b'",\n', True, "near-miss"),
@@ -6088,6 +6100,48 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertEqual(status, expected)
                 self.assertGreaterEqual(record_end, assignment.end())
                 self.assertLessEqual(record_end, len(payload))
+
+    def test_permission_marker_inside_quoted_prose_is_ordinary(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"V")
+        ordinary = b'    "requires ' + marker + b' permission",\n'
+        exact = b'"' + marker + b'"\n'
+        near_miss = b'b"' + marker + b'"\n'
+        credential_payload = b'password = "' + credential + b'"\n'
+
+        for label, payload, should_block in (
+            ("ordinary-prose", ordinary, False),
+            ("exact-marker", exact, False),
+            ("marker-near-miss", near_miss, True),
+            ("long-credential", credential_payload, True),
+        ):
+            with self.subTest(case=label):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(streamed, direct)
+                if should_block:
+                    self.assertTrue(
+                        direct.blocking_rule == "generic-secret-assignment"
+                        or direct.unextractable_rule
+                        == "generic-secret-assignment"
+                        or direct.blocking_candidates
+                        == {credential: {"generic-secret-assignment"}},
+                        direct,
+                    )
+                else:
+                    self.assertIsNone(direct.blocking_rule)
+                    self.assertIsNone(direct.unextractable_rule)
+                    self.assertEqual(direct.blocking_candidates, {})
 
     def test_source_string_permission_marker_exception_is_exact(self) -> None:
         marker = source_permission_marker()

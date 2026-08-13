@@ -10812,6 +10812,30 @@ def _starts_quoted_literal(value: bytes) -> bool:
     )
 
 
+def _quoted_literal_content_start(value: bytes) -> int | None:
+    """Return the bounded opening-delimiter end for a recognized literal."""
+
+    if not _starts_quoted_literal(value):
+        return None
+    delimiter_start = min(
+        (
+            position
+            for delimiter in (b"'", b'"', b"`")
+            if (position := value.find(delimiter, 0, 12)) >= 0
+        ),
+        default=-1,
+    )
+    if delimiter_start < 0:
+        return None
+    delimiter = value[delimiter_start : delimiter_start + 1]
+    delimiter_size = (
+        3
+        if delimiter != b"`" and value.startswith(delimiter * 3, delimiter_start)
+        else 1
+    )
+    return delimiter_start + delimiter_size
+
+
 def _bounded_diff_hunk_context_before(
     value: bytes,
     before: int,
@@ -10946,7 +10970,11 @@ def _source_permission_marker_record_status(
     # smaller proof window.  Such a marker is not proven unrelated merely
     # because its opening literal or indentation is outside the window.
     if assignment_end > line_end:
-        if value.startswith(marker_key, assignment_start, assignment_end):
+        if (
+            value.startswith(marker_key, assignment_start, assignment_end)
+            and assignment_start > assignment_line_start
+            and value[assignment_start - 1] in (0x22, 0x27, 0x60)
+        ):
             return "near-miss", assignment_end
         return "not-applicable", assignment_end
 
@@ -10959,9 +10987,9 @@ def _source_permission_marker_record_status(
     marker_start = record.find(marker_key)
     if marker_start < 0:
         return "not-applicable", assignment_end
-    literal_prefix = record[:marker_start]
-    if not _starts_quoted_literal(record):
+    if marker_start != _quoted_literal_content_start(record):
         return "not-applicable", assignment_end
+    literal_prefix = record[:marker_start]
     if not record_complete:
         if line_end - assignment_line_start >= maximum_record_bytes:
             return "near-miss", line_end

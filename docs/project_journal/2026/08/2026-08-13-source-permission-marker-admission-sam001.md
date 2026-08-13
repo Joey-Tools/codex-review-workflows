@@ -38,12 +38,15 @@ superseded_by:
 - Marker classification runs before the provider-specific fast path, so a
   later unchanged provider candidate remains counted without reclassifying the
   exact marker as a generic secret.
+- The marker exception now requires the marker to begin at the recognized
+  quoted literal's content boundary. Ordinary prose that mentions the marker
+  later in the same literal remains ordinary source text.
 
 ## Evidence
 
-- Nine focused parser/admission regressions passed on Python 3.13.0.
-- `PublicPoolScannerTest`: 118 tests passed.
-- `WorkspaceTest`: 306 tests passed with one expected skip.
+- Ten focused parser/admission regressions passed on Python 3.13.0.
+- `PublicPoolScannerTest`: 119 tests passed.
+- `WorkspaceTest`: 307 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
   regressions cover C and Python forms plus a logical stream-read boundary.
@@ -51,3 +54,6 @@ superseded_by:
   gaps; direct, streamed, and repository admission regressions cover both.
 - The next whole-range review identified a later-provider fast-path gap;
   direct/stream parity and an unchanged-provider admission range cover it.
+- GitHub Codex identified an ordinary-prose false positive; direct, streamed,
+  classifier, and Git-tree admission regressions now cover the exact literal
+  start boundary without weakening the existing fail-closed cases.

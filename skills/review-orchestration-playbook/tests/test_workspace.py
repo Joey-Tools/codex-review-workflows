@@ -324,6 +324,37 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(summary["secret_delta"]["status"], "clean")
         self.assertEqual(summary["temporary_cleanup_status"], "complete")
 
+    def test_secret_admission_accepts_permission_marker_inside_quoted_prose(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        payload = (
+            b"values = (\n"
+            b'    "'
+            + marker
+            + b'",\n'
+            b'    "requires '
+            + marker
+            + b' permission",\n'
+            b")\n"
+        )
+        prose_head = self.commit_bytes(
+            "permission_help.py",
+            payload,
+            "Add permission help text regression",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=prose_head,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
     def test_secret_admission_accepts_marker_before_unchanged_provider(self) -> None:
         marker = source_permission_marker()
         provider = b"ghp_" + b"A" * 36
