@@ -529,6 +529,18 @@ class WorkspaceTest(unittest.TestCase):
                 b'values = [\n    "' + marker + b'", #[cfg(test)]\n];\n',
             ),
             (
+                "hash-spaced-outer-attribute-after-comma",
+                ".rs",
+                b'values = [\n    "' + marker + b'", # [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-spaced-inner-attribute-after-comma",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # ! [allow(dead_code)]\n];\n',
+            ),
+            (
                 "slash-comment-unicode-line-separator",
                 ".js",
                 b'values = [\n    "'

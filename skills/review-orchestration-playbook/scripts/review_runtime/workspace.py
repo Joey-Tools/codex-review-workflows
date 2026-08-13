@@ -10988,15 +10988,23 @@ def _source_permission_line_comment_is_closed(value: bytes) -> bool:
     """Accept one conservative ASCII line-comment grammar."""
 
     introducer_size = 0
+    hash_comment = False
     for introducer in (b"#", b"//"):
         if value.startswith(introducer):
             introducer_size = len(introducer)
+            hash_comment = introducer == b"#"
             break
     if introducer_size == 0:
         return False
     body = value[introducer_size:]
     if body and body[0] not in (0x09, 0x20):
         return False
+    if hash_comment:
+        token = body.lstrip(b" \t")
+        if token.startswith(b"["):
+            return False
+        if token.startswith(b"!") and token[1:].lstrip(b" \t").startswith(b"["):
+            return False
     return all(byte == 0x09 or 0x20 <= byte <= 0x7E for byte in body)
 
 

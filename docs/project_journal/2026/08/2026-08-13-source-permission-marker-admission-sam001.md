@@ -49,6 +49,8 @@ superseded_by:
 - Exact standalone list entries may carry a conservative ASCII `#` or `//`
   line comment after their comma. Directives, block comments, lookalikes,
   alternate line separators, and incomplete records remain near-misses.
+- Whitespace-separated Rust outer and inner attribute tokens after `#` remain
+  directives rather than comments and therefore fail closed.
 
 ## Evidence
 
@@ -73,3 +75,6 @@ superseded_by:
   the permission-suffix matrix. Every suffix case now compares against its own
   immediate clean base, binds all reported additions to that case's path, and
   commits fixture removal before the next case.
+- The next formal review identified whitespace-separated Rust attributes that
+  the generic `#` comment grammar still admitted. Classifier, direct/stream,
+  and Git-tree regressions now reject both outer and inner attribute forms.

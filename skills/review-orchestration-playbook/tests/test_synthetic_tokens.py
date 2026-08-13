@@ -6210,6 +6210,18 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "near-miss",
             ),
             (
+                "hash-spaced-outer-attribute-after-comma",
+                b'"' + marker + b'", # [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-spaced-inner-attribute-after-comma",
+                b'"' + marker + b'", # ! [allow(dead_code)]\n',
+                True,
+                "near-miss",
+            ),
+            (
                 "hash-comment-without-separator",
                 b'"' + marker + b'", #required\n',
                 True,
@@ -6342,6 +6354,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'"' + marker + b'"',
             b"'" + marker + b"',\n",
             b'values = (\n    "' + marker + b'",  # required for OIDC\n)\n',
+            b'values = (\n    "' + marker + b'",  # ! ordinary note\n)\n',
             b'values = {\n    "' + marker + b'",  // required for OIDC\n}\n',
             b'(\n    "contents: write",\n    "'
             + marker
@@ -6376,6 +6389,10 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'values = ("' + marker + b'", /* required */\n)\n',
             b'values = ("' + marker + b'", / required\n)\n',
             b'values = (\n    "' + marker + b'", #[cfg(test)]\n)\n',
+            b'values = (\n    "' + marker + b'", # [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # ! [allow(dead_code)]\n)\n',
             b'values = (\n    "' + marker + b'", #required\n)\n',
             b'values = (\n    "'
             + marker
