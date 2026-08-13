@@ -1,0 +1,1763 @@
+name: Required CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  platform_tests:
+    name: platform-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input 'tomli==2.2.1; python_version < "3.11"'
+      - name: Install Linux isolation dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap gcc ripgrep socat
+      - name: Enable unprivileged user namespaces for Linux isolation test
+        if: runner.os == 'Linux'
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Check Python helper syntax without bytecode
+        run: |
+          python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(path).read_bytes(), path, "exec") for path in sys.argv[1:]]' \
+            skills/review-orchestration-playbook/scripts/isolated_review \
+            skills/review-orchestration-playbook/scripts/named_claude_preflight \
+            skills/review-orchestration-playbook/scripts/named_lane_guard \
+            skills/review-orchestration-playbook/scripts/validate_claude_stream.py \
+            skills/review-orchestration-playbook/scripts/review_runtime/*.py
+      - name: Check Linux launcher C syntax
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only skills/review-orchestration-playbook/scripts/review_runtime/claude_linux_launcher.c
+      - name: Run tests
+        run: |
+          python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v
+      - name: Run real Linux isolation integration test
+        if: runner.os == 'Linux'
+        env:
+          CODEX_REVIEW_RUN_LINUX_ISOLATION_INTEGRATION: "1"
+        run: |
+          python3 -m unittest -v skills/review-orchestration-playbook/tests/test_claude_linux.py
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
+
+  broker_reproducibility:
+    name: broker-reproducibility (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require hosted-runner byte reproduction
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          /bin/bash \
+            skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+            --check
+
+  independent_supervisor_tests:
+    name: independent-supervisor (python-3.13)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check independent review supervisor syntax without bytecode
+        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        run: |
+          python3 -B -c 'import pathlib; paths = [pathlib.Path("independent-codex-pr-review"), *sorted(pathlib.Path("review_supervisor").rglob("*.py"))]; [compile(path.read_bytes(), str(path), "exec") for path in paths]'
+      - name: Report hosted no-child runtime fingerprint
+        run: |
+          /usr/bin/sw_vers -productVersion
+          /usr/bin/sw_vers -buildVersion
+          /usr/bin/uname -r
+          /usr/bin/uname -m
+          /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
+      - name: Match hosted no-child blocker signature
+        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          python3 -m tests.run_hosted_no_child_fail_closed
+      - name: Run deterministic independent supervisor tests
+        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{ runner.temp }}
+        run: |
+          python3 -m tests.run_required_deterministic_supervisor
+      - name: Verify installed release tree remains immutable
+        working-directory: skills/review-orchestration-playbook/tests
+        run: |
+          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
+      - name: Verify independent review supervisor CLI
+        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        run: |
+          python3 independent-codex-pr-review --help
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          python3 -B -c 'import pathlib, sys; artifacts = [str(path) for path in pathlib.Path(".").rglob("*") if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}][:20]; sys.exit("bytecode artifacts: " + ", ".join(artifacts)) if artifacts else None'
+
+  readonly_install_supervisor_tests:
+    name: read-only-install-supervisor (python-3.13)
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Install pinned uv
+        id: setup-uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.18"
+          enable-cache: false
+      - name: Run deterministic supervisor from read-only install
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+          REVIEW_SOURCE_RELATIVE: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+          UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
+        run: |
+          isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/codex-review-readonly.XXXXXX)"
+          echo "Read-only isolation recovery root: $isolated_root"
+          if [[ ! "$isolated_root" =~ ^/private/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
+            echo "::error::Refusing an unexpected isolation root; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /bin/chmod -N "$isolated_root"
+          /usr/bin/sudo /bin/test -d "$isolated_root"
+          /usr/bin/sudo /bin/test ! -L "$isolated_root"
+          isolated_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$isolated_root")" = "700"
+          uv_root_home="$isolated_root/uv-home"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_home"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$uv_root_home")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$uv_root_home")" = "700"
+          uv_root_tmp="$uv_root_home/tmp"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_root_tmp"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$uv_root_tmp")" = "0"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$uv_root_tmp")" = "700"
+          trusted_uv_candidate="$UV_EXECUTABLE"
+          trusted_uv=""
+          if [[ "$trusted_uv_candidate" == /* ]] \
+            && ! /bin/test -L "$trusted_uv_candidate"; then
+            trusted_uv="$(cd "$(/usr/bin/dirname "$trusted_uv_candidate")" && pwd -P)/$(/usr/bin/basename "$trusted_uv_candidate")" \
+              || trusted_uv=""
+          fi
+          run_trusted_uv() {
+            /usr/bin/sudo /usr/bin/env -i \
+              HOME="$uv_root_home" \
+              LANG=C \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              TMPDIR="$uv_root_tmp" \
+              "$trusted_uv" "$@"
+          }
+          if [[ -z "$trusted_uv" ]] \
+            || ! /bin/test -f "$trusted_uv" \
+            || /bin/test -L "$trusted_uv" \
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
+            echo "::error::Pinned setup-uv executable is not the expected physical uv 0.11.18; retained at $isolated_root"
+            exit 1
+          fi
+          trusted_uv_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$trusted_uv")"
+          trusted_uv_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"
+          trusted_uv_digest="${trusted_uv_digest%% *}"
+          if [[ ! "$trusted_uv_digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+            echo "::error::Pinned setup-uv executable digest is invalid; retained at $isolated_root"
+            exit 1
+          fi
+          uv_staging_dir="$isolated_root/uv-managed-staging"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$uv_staging_dir"
+          run_trusted_uv python install 3.13.13 \
+            --managed-python \
+            --install-dir "$uv_staging_dir" \
+            --no-bin \
+            --no-cache \
+            --no-progress \
+            --no-config
+          trusted_uv_postinstall_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$trusted_uv")"
+          trusted_uv_postinstall_digest="$(/usr/bin/shasum -a 256 "$trusted_uv")"
+          trusted_uv_postinstall_digest="${trusted_uv_postinstall_digest%% *}"
+          if [[ "$trusted_uv_postinstall_binding" != "$trusted_uv_binding" ]] \
+            || [[ "$trusted_uv_postinstall_digest" != "$trusted_uv_digest" ]] \
+            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
+            echo "::error::Pinned setup-uv executable changed while installing Python; retained at $isolated_root"
+            exit 1
+          fi
+          staged_runtime_root=""
+          staged_runtime_count=0
+          for runtime_candidate in \
+            "$uv_staging_dir/cpython-3.13.13-macos-aarch64-none" \
+            "$uv_staging_dir/cpython-3.13.13-macos-x86_64-none"; do
+            if /usr/bin/sudo /bin/test -e "$runtime_candidate" \
+              || /usr/bin/sudo /bin/test -L "$runtime_candidate"; then
+              staged_runtime_root="$runtime_candidate"
+              (( staged_runtime_count += 1 ))
+            fi
+          done
+          staged_runtime_alias=""
+          staged_runtime_alias_count=0
+          for runtime_alias_candidate in \
+            "$uv_staging_dir/cpython-3.13-macos-aarch64-none" \
+            "$uv_staging_dir/cpython-3.13-macos-x86_64-none"; do
+            if /usr/bin/sudo /bin/test -e "$runtime_alias_candidate" \
+              || /usr/bin/sudo /bin/test -L "$runtime_alias_candidate"; then
+              staged_runtime_alias="$runtime_alias_candidate"
+              (( staged_runtime_alias_count += 1 ))
+            fi
+          done
+          staged_runtime_alias_target=""
+          if (( staged_runtime_alias_count == 1 )) \
+            && /usr/bin/sudo /bin/test -L "$staged_runtime_alias"; then
+            staged_runtime_alias_target="$(/usr/bin/sudo /usr/bin/readlink "$staged_runtime_alias")" \
+              || staged_runtime_alias_target="<unreadable>"
+          fi
+          staging_unexpected_entry=""
+          staging_unexpected_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir" \
+            -mindepth 1 -maxdepth 1 \
+            ! -name '.lock' \
+            ! -name '.temp' \
+            ! -name '.gitignore' \
+            ! -name 'cpython-3.13-macos-aarch64-none' \
+            ! -name 'cpython-3.13-macos-x86_64-none' \
+            ! -name 'cpython-3.13.13-macos-aarch64-none' \
+            ! -name 'cpython-3.13.13-macos-x86_64-none' \
+            -print -quit)" || staging_unexpected_entry="<unreadable>"
+          staging_temp_entry=""
+          staging_temp_entry="$(/usr/bin/sudo /usr/bin/find "$uv_staging_dir/.temp" \
+            -mindepth 1 -print -quit)" || staging_temp_entry="<unreadable>"
+          if (( staged_runtime_count != 1 )) \
+            || (( staged_runtime_alias_count != 1 )) \
+            || ! /usr/bin/sudo /bin/test -L "$staged_runtime_alias" \
+            || [[ "$staged_runtime_alias_target" != "$staged_runtime_root" ]] \
+            || [[ -n "$staging_unexpected_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -f "$uv_staging_dir/.lock" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.lock" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%z' "$uv_staging_dir/.lock")" != "0" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$uv_staging_dir/.temp" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.temp" \
+            || [[ -n "$staging_temp_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -f "$uv_staging_dir/.gitignore" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.gitignore" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%z' "$uv_staging_dir/.gitignore")" != "1" ]] \
+            || [[ "$(/usr/bin/sudo /bin/cat "$uv_staging_dir/.gitignore")" != "*" ]]; then
+            echo "::error::uv staging inventory is not the exact v0.11.18 managed-Python layout; retained at $isolated_root"
+            exit 1
+          fi
+          staged_runtime_root_physical="$(/usr/bin/sudo /bin/sh -c 'cd "$1" && pwd -P' sh "$staged_runtime_root")"
+          staged_runtime_root_name="$(/usr/bin/basename "$staged_runtime_root")"
+          if [[ "$staged_runtime_root_physical" != "$staged_runtime_root" ]] \
+            || [[ ! "$staged_runtime_root_name" =~ ^cpython-3\.13\.13-macos-(aarch64|x86_64)-none$ ]] \
+            || ! /usr/bin/sudo /bin/test -d "$staged_runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$staged_runtime_root"; then
+            echo "::error::uv staged Python root has an unexpected identity; retained at $isolated_root"
+            exit 1
+          fi
+          managed_python_dir="$isolated_root/managed-python"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$managed_python_dir"
+          runtime_root="$managed_python_dir/$staged_runtime_root_name"
+          /usr/bin/sudo /bin/mv "$staged_runtime_root" "$runtime_root"
+          /usr/bin/sudo /bin/rm "$staged_runtime_alias" \
+            "$uv_staging_dir/.lock" "$uv_staging_dir/.gitignore"
+          /usr/bin/sudo /bin/rmdir "$uv_staging_dir/.temp" "$uv_staging_dir"
+          if /usr/bin/sudo /bin/test -e "$uv_staging_dir" \
+            || /usr/bin/sudo /bin/test -L "$uv_staging_dir"; then
+            echo "::error::uv staging cleanup is incomplete; retained at $isolated_root"
+            exit 1
+          fi
+          managed_python_unexpected_entry=""
+          managed_python_unexpected_entry="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \
+            -mindepth 1 -maxdepth 1 \
+            ! -name "$staged_runtime_root_name" -print -quit)" \
+            || managed_python_unexpected_entry="<unreadable>"
+          if [[ -n "$managed_python_unexpected_entry" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$runtime_root"; then
+            echo "::error::Final managed-Python parent does not contain exactly one versioned physical root; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_root_physical="$(/usr/bin/sudo /bin/sh -c 'cd "$1" && pwd -P' sh "$runtime_root")"
+          runtime_root_parent="$(/usr/bin/sudo /bin/sh -c 'cd "$1/.." && pwd -P' sh "$runtime_root")"
+          runtime_root_name="$(/usr/bin/basename "$runtime_root")"
+          if [[ "$runtime_root_physical" != "$runtime_root" ]] \
+            || [[ "$runtime_root_parent" != "$managed_python_dir" ]] \
+            || [[ ! "$runtime_root_name" =~ ^cpython-3\.13\.13-macos-(aarch64|x86_64)-none$ ]] \
+            || ! /usr/bin/sudo /bin/test -d "$runtime_root" \
+            || /usr/bin/sudo /bin/test -L "$runtime_root"; then
+            echo "::error::uv managed Python root has an unexpected identity or layout; retained at $isolated_root"
+            exit 1
+          fi
+          isolated_python="$runtime_root/bin/python3.13"
+          if ! /usr/bin/sudo /bin/test -f "$isolated_python" \
+            || /usr/bin/sudo /bin/test -L "$isolated_python" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%HT:%l' "$isolated_python")" != "Regular File:1" ]]; then
+            echo "::error::uv managed Python interpreter is not a singly linked regular file; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_special="$(/usr/bin/sudo /usr/bin/find "$runtime_root" ! -type d ! -type f ! -type l -print -quit)"
+          runtime_hardlink="$(/usr/bin/sudo /usr/bin/find "$runtime_root" -type f -links +1 -print -quit)"
+          if [[ -n "$runtime_special" ]] \
+            || [[ -n "$runtime_hardlink" ]]; then
+            echo "::error::uv managed Python contains a special file or external hardlink alias; retained at $isolated_root"
+            exit 1
+          fi
+          runtime_libraries="$(/usr/bin/sudo /usr/bin/otool -L "$isolated_python" | /usr/bin/sed -n '2,$p')"
+          runtime_library_violation="$(/usr/bin/printf '%s\n' "$runtime_libraries" | /usr/bin/awk '{print $1}' | /usr/bin/awk '$0 !~ "^/System/" && $0 !~ "^/usr/lib/" && !found {print; found = 1}')"
+          runtime_rpaths="$(/usr/bin/sudo /usr/bin/otool -l "$isolated_python" | /usr/bin/awk '$1 == "cmd" && $2 == "LC_RPATH" {want = 1; next} want && $1 == "path" {print $2; want = 0}')"
+          if [[ -z "$runtime_libraries" ]] \
+            || [[ -n "$runtime_library_violation" ]] \
+            || [[ "$runtime_rpaths" != "@executable_path/../lib" ]]; then
+            echo "::error::uv managed Python has an external non-system Mach-O dependency; retained at $isolated_root"
+            exit 1
+          fi
+          compute_runtime_loader_binding() {
+            {
+              /usr/bin/sudo /usr/bin/otool -L "$isolated_python"
+              /usr/bin/sudo /usr/bin/otool -l "$isolated_python"
+            } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+          }
+          compute_runtime_symlink_binding() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import hashlib, os, pathlib, sys; root = pathlib.Path(sys.argv[1]).resolve(strict=True); links = sorted((path for path in root.rglob("*") if path.is_symlink()), key=lambda path: os.fsencode(str(path.relative_to(root)))); resolved = [(path, path.resolve(strict=True)) for path in links]; escaped = [(path, target) for path, target in resolved if target != root and root not in target.parents]; records = [os.fsencode(str(path.relative_to(root))) + b"\0" + os.fsencode(os.readlink(path)) + b"\0" for path in links]; sys.exit("runtime symlink escapes versioned root: " + ", ".join(str(path) for path, _ in escaped[:10])) if escaped else print(f"{len(links)}:{hashlib.sha256(b"".join(records)).hexdigest()}")' \
+              "$runtime_root"
+          }
+          compute_runtime_tree_binding() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import hashlib, os, pathlib, stat, sys; root = pathlib.Path(sys.argv[1]).resolve(strict=True); entries = sorted(((path, path.lstat()) for path in [root, *root.rglob("*")]), key=lambda item: os.fsencode(str(item[0].relative_to(root)))); special = [path for path, metadata in entries if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode))]; content = [os.fsencode(str(path.relative_to(root))) + b"\0" + (b"D" if stat.S_ISDIR(metadata.st_mode) else b"L" + os.fsencode(os.readlink(path)) if stat.S_ISLNK(metadata.st_mode) else b"F" + hashlib.sha256(path.read_bytes()).digest()) + b"\0" for path, metadata in entries]; identity = [os.fsencode(str(path.relative_to(root))) + b"\0" + f"{metadata.st_dev}:{metadata.st_ino}:{stat.S_IFMT(metadata.st_mode)}:{metadata.st_uid}:{metadata.st_gid}:{stat.S_IMODE(metadata.st_mode)}:{getattr(metadata, "st_flags", 0)}:{metadata.st_nlink}".encode() + b"\0" for path, metadata in entries]; sys.exit("special runtime entry: " + ", ".join(str(path) for path in special[:10])) if special else print(hashlib.sha256(b"".join(content)).hexdigest() + ":" + hashlib.sha256(b"".join(identity)).hexdigest())' \
+              "$runtime_root"
+          }
+          probe_runtime_identity() {
+            /usr/bin/sudo /usr/bin/env -i PYTHONDONTWRITEBYTECODE=1 \
+              "$isolated_python" -I -B -S -c 'import os, sys; print("|".join((f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", os.path.realpath(sys.executable), os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix))))'
+          }
+          runtime_symlink_binding="$(compute_runtime_symlink_binding)"
+          runtime_identity="$(probe_runtime_identity)"
+          if [[ "$runtime_identity" != "3.13.13|$isolated_python|$runtime_root|$runtime_root" ]]; then
+            echo "::error::uv managed Python did not self-identify as the isolated exact runtime; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/sbin/chown -R root:wheel "$managed_python_dir"
+          /usr/bin/sudo /bin/chmod -RN "$managed_python_dir"
+          /usr/bin/sudo /usr/bin/xattr -cr "$managed_python_dir"
+          /usr/bin/sudo /bin/chmod -R a+rX,a-w "$managed_python_dir"
+          runtime_root_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$runtime_root")"
+          isolated_python_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$isolated_python")"
+          isolated_python_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_python")"
+          isolated_python_digest="${isolated_python_digest%% *}"
+          runtime_loader_binding="$(compute_runtime_loader_binding)"
+          runtime_tree_binding="$(compute_runtime_tree_binding)"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$managed_python_dir")" = "0:0:555"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$runtime_root")" = "0:0:555"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp:%l' "$isolated_python")" = "0:0:555:1"
+          verify_runtime_custody() {
+            local phase="$1"
+            local current_runtime_root_binding=""
+            local current_isolated_python_binding=""
+            local current_isolated_python_digest=""
+            local current_runtime_loader_binding=""
+            local current_runtime_symlink_binding=""
+            local current_runtime_tree_binding=""
+            local current_runtime_identity=""
+            local current_runtime_special=""
+            local current_runtime_hardlink=""
+            local current_runtime_owner_violation=""
+            local current_runtime_write_violation=""
+            local current_runtime_read_violation=""
+            local current_runtime_traverse_violation=""
+            local current_runtime_xattr_violation=""
+            local current_runtime_acl_violation=""
+            local current_codesign_status=0
+            current_runtime_root_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$runtime_root")" \
+              || current_runtime_root_binding="<unreadable>"
+            current_isolated_python_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$isolated_python")" \
+              || current_isolated_python_binding="<unreadable>"
+            current_isolated_python_digest="$(/usr/bin/sudo /usr/bin/shasum -a 256 "$isolated_python")" \
+              || current_isolated_python_digest="<unreadable>"
+            current_isolated_python_digest="${current_isolated_python_digest%% *}"
+            current_runtime_loader_binding="$(compute_runtime_loader_binding)" \
+              || current_runtime_loader_binding="<unreadable>"
+            current_runtime_symlink_binding="$(compute_runtime_symlink_binding)" \
+              || current_runtime_symlink_binding="<unsafe>"
+            current_runtime_tree_binding="$(compute_runtime_tree_binding)" \
+              || current_runtime_tree_binding="<unreadable>"
+            current_runtime_identity="$(probe_runtime_identity)" \
+              || current_runtime_identity="<invalid>"
+            current_runtime_special="$(/usr/bin/sudo /usr/bin/find "$runtime_root" ! -type d ! -type f ! -type l -print -quit)" \
+              || current_runtime_special="<unreadable>"
+            current_runtime_hardlink="$(/usr/bin/sudo /usr/bin/find "$runtime_root" -type f -links +1 -print -quit)" \
+              || current_runtime_hardlink="<unreadable>"
+            current_runtime_owner_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \( ! -user root -o ! -group wheel \) -print -quit)" \
+              || current_runtime_owner_violation="<unreadable>"
+            current_runtime_write_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" \( -perm -0200 -o -perm -0020 -o -perm -0002 \) -print -quit)" \
+              || current_runtime_write_violation="<unreadable>"
+            current_runtime_read_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" -type f ! -perm -0444 -print -quit)" \
+              || current_runtime_read_violation="<unreadable>"
+            current_runtime_traverse_violation="$(/usr/bin/sudo /usr/bin/find "$managed_python_dir" -type d ! -perm -0555 -print -quit)" \
+              || current_runtime_traverse_violation="<unreadable>"
+            current_runtime_xattr_violation="$(/usr/bin/sudo /usr/bin/xattr -lr "$managed_python_dir" | /usr/bin/sed -n '1p')" \
+              || current_runtime_xattr_violation="<unreadable>"
+            current_runtime_acl_violation="$(/usr/bin/sudo /usr/bin/find -s "$managed_python_dir" -exec /bin/ls -lde {} \; | /usr/bin/awk 'substr($1, 11, 1) == "+" && !found {print; found = 1}')" \
+              || current_runtime_acl_violation="<unreadable>"
+            /usr/bin/sudo /usr/bin/codesign --verify --strict "$isolated_python" \
+              || current_codesign_status=$?
+            if [[ "$current_runtime_root_binding" != "$runtime_root_binding" ]] \
+              || [[ "$current_isolated_python_binding" != "$isolated_python_binding" ]] \
+              || [[ "$current_isolated_python_digest" != "$isolated_python_digest" ]] \
+              || [[ "$current_runtime_loader_binding" != "$runtime_loader_binding" ]] \
+              || [[ "$current_runtime_symlink_binding" != "$runtime_symlink_binding" ]] \
+              || [[ "$current_runtime_tree_binding" != "$runtime_tree_binding" ]] \
+              || [[ "$current_runtime_identity" != "$runtime_identity" ]] \
+              || [[ -n "$current_runtime_special" ]] \
+              || [[ -n "$current_runtime_hardlink" ]] \
+              || [[ -n "$current_runtime_owner_violation" ]] \
+              || [[ -n "$current_runtime_write_violation" ]] \
+              || [[ -n "$current_runtime_read_violation" ]] \
+              || [[ -n "$current_runtime_traverse_violation" ]] \
+              || [[ -n "$current_runtime_xattr_violation" ]] \
+              || [[ -n "$current_runtime_acl_violation" ]] \
+              || (( current_codesign_status != 0 )); then
+              echo "::error::Isolated uv-managed Python failed $phase custody validation; retained at $isolated_root"
+              return 1
+            fi
+          }
+          verify_runtime_custody post-install
+          developer_dir_physical="$(cd "$DEVELOPER_DIR" && pwd -P)"
+          direct_git="$DEVELOPER_DIR/usr/bin/git"
+          direct_git_physical="$(cd "$(/usr/bin/dirname "$direct_git")" && pwd -P)/$(/usr/bin/basename "$direct_git")"
+          direct_git_exec_path="$DEVELOPER_DIR/usr/libexec/git-core"
+          direct_git_exec_path_physical="$(cd "$direct_git_exec_path" && pwd -P)"
+          direct_git_shim_identifier="$(/usr/bin/codesign -dvvv /usr/bin/git 2>&1 \
+            | /usr/bin/awk -F= '$1 == "Identifier" {print $2}')"
+          direct_git_codesign="$(/usr/bin/codesign -dvvv "$direct_git" 2>&1)"
+          direct_git_identifier="$(/usr/bin/printf '%s\n' "$direct_git_codesign" \
+            | /usr/bin/awk -F= '$1 == "Identifier" {print $2}')"
+          direct_git_team="$(/usr/bin/printf '%s\n' "$direct_git_codesign" \
+            | /usr/bin/awk -F= '$1 == "TeamIdentifier" {print $2}')"
+          if [[ "$developer_dir_physical" != "$DEVELOPER_DIR" ]] \
+            || [[ "$direct_git" != "$DEVELOPER_DIR/usr/bin/git" ]] \
+            || [[ "$direct_git_physical" != "$direct_git" ]] \
+            || [[ "$direct_git_exec_path" != "$DEVELOPER_DIR/usr/libexec/git-core" ]] \
+            || [[ "$direct_git_exec_path_physical" != "$direct_git_exec_path" ]] \
+            || [[ "$direct_git_shim_identifier" != "com.apple.dt.xcode_select.tool-shim-public" ]] \
+            || [[ "$direct_git_identifier" != "com.apple.git" ]] \
+            || [[ "$direct_git_team" != "59GAB85EFG" ]] \
+            || ! /bin/test -f "$direct_git" \
+            || /bin/test -L "$direct_git" \
+            || ! /bin/test -x "$direct_git" \
+            || ! /bin/test -d "$direct_git_exec_path" \
+            || /bin/test -L "$direct_git_exec_path" \
+            || ! /usr/bin/codesign --verify --strict "$direct_git"; then
+            /usr/bin/printf '%s\n' "::error::Pinned Xcode Git trust root is unavailable"
+            exit 1
+          fi
+          direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")"
+          direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")"
+          direct_git_digest="${direct_git_digest%% *}"
+          direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")"
+          direct_git_loader_binding="$({
+            /usr/bin/otool -L "$direct_git"
+            /usr/bin/otool -l "$direct_git"
+          } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+          direct_git_codesign_binding="$(/usr/bin/printf '%s\n' "$direct_git_codesign" \
+            | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+          if [[ ! "$direct_git_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || [[ ! "$direct_git_loader_binding" =~ ^[[:xdigit:]]{64}$ ]] \
+            || [[ ! "$direct_git_codesign_binding" =~ ^[[:xdigit:]]{64}$ ]]; then
+            /usr/bin/printf '%s\n' "::error::Pinned Xcode Git receipt is malformed"
+            exit 1
+          fi
+          /usr/bin/printf '%s\n' \
+            "Pinned Xcode Git: developer_dir=$DEVELOPER_DIR executable=$direct_git exec_path=$direct_git_exec_path sha256=$direct_git_digest loader_receipt=$direct_git_loader_binding codesign_receipt=$direct_git_codesign_binding"
+          checkout_root="$(pwd -P)"
+          bootstrap_uid="$(/usr/bin/id -u)"
+          bootstrap_gid="$(/usr/bin/id -g)"
+          checkout_git_dir="$checkout_root/.git"
+          checkout_git_objects="$checkout_git_dir/objects"
+          checkout_head_file="$checkout_git_dir/HEAD"
+          probe_checkout_git_source_acl() {
+            {
+              /bin/ls -lde "$checkout_git_dir"
+              /bin/ls -lde "$checkout_head_file"
+              /usr/bin/find -s "$checkout_git_objects" -exec /bin/ls -lde {} \;
+            } | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          }
+          probe_checkout_git_escape_metadata() {
+            local promisor_marker=""
+            if [[ -L "$checkout_git_objects/info" ]] \
+              || [[ -L "$checkout_git_objects/pack" ]] \
+              || [[ -e "$checkout_git_objects/info/alternates" ]] \
+              || [[ -L "$checkout_git_objects/info/alternates" ]] \
+              || [[ -e "$checkout_git_objects/info/http-alternates" ]] \
+              || [[ -L "$checkout_git_objects/info/http-alternates" ]]; then
+              /usr/bin/printf '%s\n' alternate-metadata
+              return 0
+            fi
+            for promisor_marker in "$checkout_git_objects/pack/"*.promisor; do
+              if [[ -e "$promisor_marker" || -L "$promisor_marker" ]]; then
+                /usr/bin/printf '%s\n' promisor-marker
+                return 0
+              fi
+            done
+          }
+          if [[ ! "$bootstrap_uid" =~ ^[[:digit:]]+$ ]] \
+            || [[ ! "$bootstrap_gid" =~ ^[[:digit:]]+$ ]] \
+            || ! /bin/test -d "$checkout_git_dir" \
+            || /bin/test -L "$checkout_git_dir" \
+            || ! /bin/test -d "$checkout_git_objects" \
+            || /bin/test -L "$checkout_git_objects" \
+            || ! /bin/test -f "$checkout_head_file" \
+            || /bin/test -L "$checkout_head_file"; then
+            /usr/bin/printf '%s\n' "::error::Checkout Git metadata is not safely bindable"
+            exit 1
+          fi
+          checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || checkout_git_source_acl_violation="<unreadable>"
+          checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || checkout_git_escape_metadata="<unreadable>"
+          checkout_git_dir_physical="$(cd "$checkout_git_dir" && pwd -P)"
+          checkout_git_objects_physical="$(cd "$checkout_git_objects" && pwd -P)"
+          checkout_head_file_physical="$(cd "$checkout_git_dir" && pwd -P)/HEAD"
+          checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          checkout_git_dir_mode="$(/usr/bin/stat -f '%Lp' "$checkout_git_dir")"
+          checkout_git_objects_mode="$(/usr/bin/stat -f '%Lp' "$checkout_git_objects")"
+          checkout_head_mode="$(/usr/bin/stat -f '%Lp' "$checkout_head_file")"
+          checkout_head_size="$(/usr/bin/stat -f '%z' "$checkout_head_file")"
+          checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          if [[ "$checkout_git_dir_physical" != "$checkout_git_dir" ]] \
+            || [[ "$checkout_git_objects_physical" != "$checkout_git_objects" ]] \
+            || [[ "$checkout_head_file_physical" != "$checkout_head_file" ]] \
+            || [[ "$checkout_git_objects" == *:* ]] \
+            || [[ ! "$checkout_git_dir_mode" =~ ^[0-7]{3,4}$ ]] \
+            || [[ ! "$checkout_git_objects_mode" =~ ^[0-7]{3,4}$ ]] \
+            || [[ ! "$checkout_head_mode" =~ ^[0-7]{3,4}$ ]] \
+            || (( (8#$checkout_git_dir_mode & 0022) != 0 )) \
+            || (( (8#$checkout_git_objects_mode & 0022) != 0 )) \
+            || (( (8#$checkout_head_mode & 0022) != 0 )) \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_git_dir")" != "$bootstrap_uid" ]] \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_git_objects")" != "$bootstrap_uid" ]] \
+            || [[ "$(/usr/bin/stat -f '%u' "$checkout_head_file")" != "$bootstrap_uid" ]] \
+            || [[ -n "$checkout_git_source_acl_violation" ]] \
+            || [[ -n "$checkout_git_escape_metadata" ]] \
+            || [[ ! "$checkout_head_size" =~ ^[[:digit:]]+$ ]] \
+            || (( checkout_head_size != 41 )) \
+            || [[ ! "$checkout_head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            /usr/bin/printf '%s\n' "::error::Checkout Git object root or detached HEAD is not safely bindable"
+            exit 1
+          fi
+          checkout_bootstrap_root="$isolated_root/git-bootstrap"
+          checkout_git_control="$checkout_bootstrap_root/repository.git"
+          checkout_git_home="$checkout_bootstrap_root/home"
+          checkout_git_hooks="$checkout_bootstrap_root/hooks"
+          checkout_git_template="$checkout_bootstrap_root/template"
+          checkout_git_tmp="$checkout_bootstrap_root/tmp"
+          bootstrap_checkout_git() {
+            /usr/bin/env -i \
+              DEVELOPER_DIR="$DEVELOPER_DIR" \
+              GIT_ASKPASS=/usr/bin/false \
+              GIT_ATTR_NOSYSTEM=1 \
+              GIT_CEILING_DIRECTORIES="$isolated_root" \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              GIT_EXEC_PATH="$direct_git_exec_path" \
+              GIT_NO_LAZY_FETCH=1 \
+              GIT_NO_REPLACE_OBJECTS=1 \
+              GIT_OPTIONAL_LOCKS=0 \
+              GIT_PAGER=cat \
+              GIT_PROTOCOL_FROM_USER=0 \
+              GIT_TERMINAL_PROMPT=0 \
+              HOME="$checkout_git_home" \
+              LANG=C \
+              LC_ALL=C \
+              PAGER=cat \
+              PATH=/usr/bin:/bin \
+              TMPDIR="$checkout_git_tmp" \
+              "$direct_git" --no-pager --no-replace-objects \
+                -C "$checkout_bootstrap_root" "$@"
+          }
+          trusted_checkout_git() {
+            /usr/bin/env -i \
+              DEVELOPER_DIR="$DEVELOPER_DIR" \
+              GIT_ALTERNATE_OBJECT_DIRECTORIES="$checkout_git_objects" \
+              GIT_ASKPASS=/usr/bin/false \
+              GIT_ATTR_NOSYSTEM=1 \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              GIT_DIR="$checkout_git_control" \
+              GIT_EXEC_PATH="$direct_git_exec_path" \
+              GIT_NO_LAZY_FETCH=1 \
+              GIT_NO_REPLACE_OBJECTS=1 \
+              GIT_OPTIONAL_LOCKS=0 \
+              GIT_PAGER=cat \
+              GIT_PROTOCOL_FROM_USER=0 \
+              GIT_TERMINAL_PROMPT=0 \
+              HOME="$checkout_git_home" \
+              LANG=C \
+              LC_ALL=C \
+              PAGER=cat \
+              PATH=/usr/bin:/bin \
+              TMPDIR="$checkout_git_tmp" \
+              "$direct_git" --no-pager --no-replace-objects \
+                -c core.commitGraph=false \
+                -c core.multiPackIndex=false \
+                -c core.fsmonitor=false \
+                -c core.hooksPath="$checkout_git_hooks" \
+                -c core.attributesFile=/dev/null \
+                -c maintenance.auto=false \
+                -c credential.helper= \
+                -c protocol.ext.allow=never \
+                -c protocol.file.allow=never \
+                -c protocol.git.allow=never \
+                -c protocol.http.allow=never \
+                -c protocol.https.allow=never \
+                -c protocol.ssh.allow=never "$@"
+          }
+          source_review_root="$checkout_root/$REVIEW_SOURCE_RELATIVE"
+          source_review_root_physical="$(cd "$source_review_root" && pwd -P)"
+          if [[ "$source_review_root_physical" != "$source_review_root" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root"; then
+            echo "::error::Checkout review source is not the expected physical directory; retained at $isolated_root"
+            exit 1
+          fi
+          # Bind source object identity/access policy separately from copied content.
+          source_root_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_tree_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)"
+          if [[ -n "$source_tree_symlink" ]]; then
+            echo "::error::Checkout review source contains a symlink; retained at $isolated_root"
+            exit 1
+          fi
+          source_review_profile="$source_review_root/tests/readonly_child_isolation.sb"
+          /bin/test -f "$source_review_profile"
+          /bin/test ! -L "$source_review_profile"
+          source_profile_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          isolated_source="$isolated_root/source"
+          /usr/bin/sudo /bin/test ! -e "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          /usr/bin/sudo /usr/bin/ditto "$source_review_root" "$isolated_source"
+          /usr/bin/sudo /bin/test -d "$isolated_source"
+          /usr/bin/sudo /bin/test ! -L "$isolated_source"
+          source_tree_postcopy_symlink=""
+          source_tree_postcopy_symlink="$(/usr/bin/find "$source_review_root" -type l -print -quit)" \
+            || source_tree_postcopy_symlink="<unreadable>"
+          isolated_tree_postcopy_symlink=""
+          isolated_tree_postcopy_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postcopy_symlink="<unreadable>"
+          source_root_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")"
+          source_review_root_postcopy_physical=""
+          source_review_root_postcopy_physical="$(cd "$source_review_root" && pwd -P)" \
+            || source_review_root_postcopy_physical="<unreadable>"
+          if [[ "$source_root_postcopy_binding" != "$source_root_binding" ]] \
+            || [[ "$source_review_root_postcopy_physical" != "$source_review_root" ]] \
+            || [[ -n "$source_tree_postcopy_symlink" ]] \
+            || [[ -n "$isolated_tree_postcopy_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null; then
+            echo "::error::Checkout review source changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/sbin/chown -R root:wheel "$isolated_source"
+          /usr/bin/sudo /bin/chmod -RN "$isolated_source"
+          /usr/bin/sudo /bin/chmod -R a+rX,a-w "$isolated_source"
+          isolated_source_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$isolated_source")" = "0:0:555"
+          /usr/bin/sudo /bin/chmod 0755 "$isolated_root"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" = "0:755"
+          /usr/bin/sudo /bin/test ! -e "$checkout_bootstrap_root"
+          /usr/bin/sudo /bin/test ! -L "$checkout_bootstrap_root"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$checkout_bootstrap_root"
+          /usr/bin/sudo /usr/sbin/chown "$bootstrap_uid:$bootstrap_gid" "$checkout_bootstrap_root"
+          test "$(/usr/bin/stat -f '%u:%g:%Lp' "$checkout_bootstrap_root")" = \
+            "$bootstrap_uid:$bootstrap_gid:700"
+          checkout_bootstrap_root_physical="$(cd "$checkout_bootstrap_root" && pwd -P)"
+          checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          if [[ "$checkout_bootstrap_root_physical" != "$checkout_bootstrap_root" ]]; then
+            /usr/bin/printf '%s\n' "::error::Git bootstrap control root is not physical"
+            exit 1
+          fi
+          /bin/mkdir -m 0700 \
+            "$checkout_git_home" "$checkout_git_hooks" \
+            "$checkout_git_template" "$checkout_git_tmp"
+          bootstrap_checkout_git init --bare -q \
+            --template="$checkout_git_template" "$checkout_git_control"
+          /bin/chmod -RN "$checkout_bootstrap_root"
+          /bin/chmod -R go-rwx "$checkout_bootstrap_root"
+          /bin/chmod 0600 "$checkout_git_control/config"
+          checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          checkout_git_config_digest="${checkout_git_config_digest%% *}"
+          checkout_git_control_symlink="$(/usr/bin/find "$checkout_bootstrap_root" -type l -print -quit)"
+          checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || checkout_git_control_acl_violation="<unreadable>"
+          if [[ -n "$checkout_git_control_symlink" ]] \
+            || [[ -n "$checkout_git_control_acl_violation" ]] \
+            || [[ ! "$checkout_git_config_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || trusted_checkout_git config --local --name-only \
+              --get-regexp '^(remote|credential|protocol)\.' >/dev/null 2>&1; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap control is unsafe"
+            exit 1
+          fi
+          /usr/bin/printf '%s\n' \
+            "Isolated Git bootstrap: control=$checkout_git_control_binding config=$checkout_git_config_binding config_sha256=$checkout_git_config_digest objects=$checkout_git_objects head=$checkout_head_sha"
+          review_user_guid="$(/usr/bin/uuidgen)"
+          review_group_guid="$(/usr/bin/uuidgen)"
+          review_account_suffix="$(/usr/bin/printf '%s' "$review_user_guid" \
+            | /usr/bin/tr -d '-' \
+            | /usr/bin/tr '[:upper:]' '[:lower:]' \
+            | /usr/bin/cut -c 1-12)"
+          if [[ ! "$review_user_guid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+            || [[ ! "$review_group_guid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+            || [[ ! "$review_account_suffix" =~ ^[[:xdigit:]]{12}$ ]]; then
+            echo "::error::Ephemeral review account identity generation failed; retained at $isolated_root"
+            exit 1
+          fi
+          review_user="codexreview${review_account_suffix}"
+          review_group="$review_user"
+          review_user_path="/Users/$review_user"
+          review_group_path="/Groups/$review_group"
+          review_user_created=false
+          review_user_origin_bound=false
+          review_group_created=false
+          review_group_origin_bound=false
+          review_account_custody_active=false
+          review_process_diagnostics="$isolated_root/review-process-diagnostics.log"
+          /usr/bin/sudo /bin/test ! -e "$review_process_diagnostics"
+          /usr/bin/sudo /usr/bin/touch "$review_process_diagnostics"
+          /usr/bin/sudo /usr/sbin/chown root:wheel "$review_process_diagnostics"
+          /usr/bin/sudo /bin/chmod -N "$review_process_diagnostics"
+          /usr/bin/sudo /bin/chmod 0600 "$review_process_diagnostics"
+          review_process_diagnostics_binding="$(/usr/bin/sudo /usr/bin/stat \
+            -f '%d:%i:%u:%g:%Lp' "$review_process_diagnostics")"
+          test "$review_process_diagnostics_binding" = \
+            "$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:0:0:600' "$review_process_diagnostics")"
+          review_uid=""
+          review_gid=""
+          review_admin_gid="$(/usr/bin/dscl . -read /Groups/admin PrimaryGroupID \
+            | /usr/bin/awk '$1 == "PrimaryGroupID:" {print $2}')"
+          review_account_validation_reason="not-run"
+          review_account_validation_expected="<unset>"
+          review_account_validation_observed="<unset>"
+          set_review_account_validation_failure() {
+            review_account_validation_reason="$1"
+            printf -v review_account_validation_expected '%q' "$2"
+            printf -v review_account_validation_observed '%q' "$3"
+          }
+          report_review_account_validation_failure() {
+            /usr/bin/printf '%s\n' \
+              "::error::Ephemeral review account validation failed"
+            /usr/bin/printf '%s\n' \
+              "Ephemeral review account validation diagnostics: reason=$review_account_validation_reason expected=$review_account_validation_expected observed=$review_account_validation_observed"
+          }
+          verify_review_scalar_record() {
+            local record_kind="$1"
+            local attribute="$2"
+            local expected_value="$3"
+            local observed_record="$4"
+            local expected_record="$attribute: $expected_value"
+            if [[ "$observed_record" != "$expected_record" ]]; then
+              set_review_account_validation_failure \
+                "$record_kind.$attribute.mismatch" "$expected_record" "$observed_record"
+              return 1
+            fi
+          }
+          verify_review_record_attribute() {
+            local record_kind="$1"
+            local record_path="$2"
+            local attribute="$3"
+            local expected_value="$4"
+            local expected_record="$attribute: $expected_value"
+            local observed_record=""
+            if ! observed_record="$(/usr/bin/sudo /usr/bin/dscl . -read "$record_path" "$attribute" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "$record_kind.$attribute.unavailable" "$expected_record" "<unavailable>"
+              return 1
+            fi
+            verify_review_scalar_record \
+              "$record_kind" "$attribute" "$expected_value" "$observed_record"
+          }
+          review_account_processes() {
+            local process_table=""
+            if ! process_table="$(/bin/ps -axo ruid=,uid=,pid=)"; then
+              return 1
+            fi
+            (( ${#process_table} <= 1048576 )) || return 1
+            /usr/bin/awk -v target_uid="$review_uid" \
+              '$1 == target_uid || $2 == target_uid {print $3}' \
+              <<< "$process_table"
+          }
+          report_review_account_processes() {
+            local current_binding=""
+            local current_bytes=0
+            local diagnostic=""
+            local escaped=""
+            local pid=""
+            local pids="$1"
+            local record=""
+            local record_bytes=0
+            local record_count=0
+            while IFS= read -r pid; do
+              [[ "$pid" =~ ^[[:digit:]]+$ ]] || continue
+              (( record_count += 1 ))
+              (( record_count <= 128 )) || return 1
+              if ! diagnostic="$(/bin/ps -p "$pid" \
+                -o pid= -o ppid= -o pgid= -o sess= -o state= \
+                -o lstart= -o comm= -o command= 2>&1)"; then
+                diagnostic="<unavailable>"
+              elif (( ${#diagnostic} > 4096 )); then
+                diagnostic="${diagnostic:0:4096}"
+              fi
+              printf -v escaped '%q' "$diagnostic"
+              record="Ephemeral review process diagnostic: uid=$review_uid record=$escaped"
+              current_binding="$(/usr/bin/sudo /usr/bin/stat \
+                -f '%d:%i:%u:%g:%Lp' "$review_process_diagnostics")" \
+                || return 1
+              [[ "$current_binding" == "$review_process_diagnostics_binding" ]] \
+                || return 1
+              current_bytes="$(/usr/bin/sudo /usr/bin/stat \
+                -f '%z' "$review_process_diagnostics")" \
+                || return 1
+              record_bytes="$(/usr/bin/printf '%s\n' "$record" \
+                | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+              [[ "$current_bytes" =~ ^[[:digit:]]+$ ]] \
+                && [[ "$record_bytes" =~ ^[[:digit:]]+$ ]] \
+                && (( current_bytes + record_bytes <= 1048576 )) \
+                || return 1
+              /usr/bin/printf '%s\n' "$record" \
+                | /usr/bin/sudo /usr/bin/tee -a "$review_process_diagnostics" \
+                  >/dev/null \
+                || return 1
+              current_binding="$(/usr/bin/sudo /usr/bin/stat \
+                -f '%d:%i:%u:%g:%Lp' "$review_process_diagnostics")" \
+                || return 1
+              current_bytes="$(/usr/bin/sudo /usr/bin/stat \
+                -f '%z' "$review_process_diagnostics")" \
+                || return 1
+              [[ "$current_binding" == "$review_process_diagnostics_binding" ]] \
+                && [[ "$current_bytes" =~ ^[[:digit:]]+$ ]] \
+                && (( current_bytes <= 1048576 )) \
+                || return 1
+            done <<< "$pids"
+          }
+          terminate_custodied_review_processes() {
+            local absent_confirmations=0
+            local deadline=$((SECONDS + 5))
+            local pid=""
+            local pids=""
+            local signal_status=0
+            if [[ "$review_account_custody_active" != "true" ]] \
+              || ! verify_review_account; then
+              return 1
+            fi
+            while (( SECONDS < deadline )); do
+              verify_review_account || return 1
+              pids="$(review_account_processes)" || return 1
+              if [[ -z "$pids" ]]; then
+                (( absent_confirmations += 1 ))
+                if (( absent_confirmations >= 2 )); then
+                  verify_review_account
+                  return
+                fi
+                /bin/sleep 0.1
+                continue
+              fi
+              absent_confirmations=0
+              report_review_account_processes "$pids" || return 1
+              signal_status=0
+              while IFS= read -r pid; do
+                [[ "$pid" =~ ^[[:digit:]]+$ ]] || return 1
+                run_review_user /bin/kill -TERM "$pid" 2>/dev/null \
+                  || signal_status=1
+              done <<< "$pids"
+              /bin/sleep 0.2
+              verify_review_account || return 1
+              pids="$(review_account_processes)" || return 1
+              if [[ -n "$pids" ]]; then
+                report_review_account_processes "$pids" || return 1
+                while IFS= read -r pid; do
+                  [[ "$pid" =~ ^[[:digit:]]+$ ]] || return 1
+                  run_review_user /bin/kill -KILL "$pid" 2>/dev/null \
+                    || signal_status=1
+                done <<< "$pids"
+              fi
+              if (( signal_status != 0 )); then
+                pids="$(review_account_processes)" || return 1
+                [[ -z "$pids" ]] || return 1
+              fi
+              /bin/sleep 0.1
+            done
+            return 1
+          }
+          verify_review_group() {
+            if [[ "$review_group_origin_bound" != "true" ]]; then
+              set_review_account_validation_failure \
+                "group.origin.unbound" "true" "$review_group_origin_bound"
+              return 1
+            fi
+            verify_review_record_attribute \
+              group "$review_group_path" GeneratedUID "$review_group_guid" \
+              && verify_review_record_attribute \
+                group "$review_group_path" PrimaryGroupID "$review_gid"
+          }
+          run_review_user() {
+            /usr/bin/sudo -u "$review_user" -g "$review_group" "$@"
+          }
+          verify_review_cached_identity() {
+            local cached_user_records=""
+            local cached_group_records=""
+            local cached_user_names=""
+            local cached_group_names=""
+            cached_user_records="$(/usr/bin/dscacheutil -q user -a uid "$review_uid")" \
+              || {
+                set_review_account_validation_failure \
+                  "cache.user.unavailable" "$review_user" "<unavailable>"
+                return 1
+              }
+            cached_group_records="$(/usr/bin/dscacheutil -q group -a gid "$review_gid")" \
+              || {
+                set_review_account_validation_failure \
+                  "cache.group.unavailable" "$review_group" "<unavailable>"
+                return 1
+              }
+            cached_user_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_user_records")" \
+              || {
+                set_review_account_validation_failure \
+                  "cache.user.parse-failed" "$review_user" "<unavailable>"
+                return 1
+              }
+            cached_group_names="$(/usr/bin/awk '$1 == "name:" {print $2}' <<< "$cached_group_records")" \
+              || {
+                set_review_account_validation_failure \
+                  "cache.group.parse-failed" "$review_group" "<unavailable>"
+                return 1
+              }
+            if [[ "$cached_user_names" != "$review_user" ]]; then
+              set_review_account_validation_failure \
+                "cache.user.name-mismatch" "$review_user" "$cached_user_names"
+              return 1
+            fi
+            if [[ "$cached_group_names" != "$review_group" ]]; then
+              set_review_account_validation_failure \
+                "cache.group.name-mismatch" "$review_group" "$cached_group_names"
+              return 1
+            fi
+          }
+          verify_review_account() {
+            local account_groups=""
+            local observed_identity=""
+            verify_review_group || return 1
+            verify_review_cached_identity || return 1
+            if [[ "$review_user_origin_bound" != "true" ]]; then
+              set_review_account_validation_failure \
+                "user.origin.unbound" "true" "$review_user_origin_bound"
+              return 1
+            fi
+            verify_review_record_attribute \
+              user "$review_user_path" GeneratedUID "$review_user_guid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" UniqueID "$review_uid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" PrimaryGroupID "$review_gid" \
+              && verify_review_record_attribute \
+                user "$review_user_path" NFSHomeDirectory /var/empty \
+              && verify_review_record_attribute \
+                user "$review_user_path" UserShell /usr/bin/false \
+              && verify_review_record_attribute \
+                user "$review_user_path" dsAttrTypeNative:IsHidden 1 \
+              || return 1
+            if ! observed_identity="$(/usr/bin/id -u "$review_user" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.user.uid-unavailable" "$review_uid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_uid" ]]; then
+              set_review_account_validation_failure \
+                "identity.user.uid-mismatch" "$review_uid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(/usr/bin/id -g "$review_user" 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.user.gid-unavailable" "$review_gid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_gid" ]]; then
+              set_review_account_validation_failure \
+                "identity.user.gid-mismatch" "$review_gid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(run_review_user /usr/bin/id -u 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.uid-unavailable" "$review_uid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_uid" ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.uid-mismatch" "$review_uid" "$observed_identity"
+              return 1
+            fi
+            if ! observed_identity="$(run_review_user /usr/bin/id -g 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.gid-unavailable" "$review_gid" "<unavailable>"
+              return 1
+            fi
+            if [[ "$observed_identity" != "$review_gid" ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.gid-mismatch" "$review_gid" "$observed_identity"
+              return 1
+            fi
+            if ! account_groups="$(run_review_user /usr/bin/id -G 2>/dev/null)"; then
+              set_review_account_validation_failure \
+                "identity.runtime.groups-unavailable" "numeric group list" "<unavailable>"
+              return 1
+            fi
+            if [[ ! "$account_groups" =~ ^[[:digit:]]+([[:space:]][[:digit:]]+)*$ ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.groups-malformed" "numeric group list" "$account_groups"
+              return 1
+            fi
+            if [[ " $account_groups " != *" $review_gid "* ]]; then
+              set_review_account_validation_failure \
+                "identity.runtime.primary-group-missing" "$review_gid" "$account_groups"
+              return 1
+            fi
+            if [[ " $account_groups " == *" $review_admin_gid "* ]]; then
+              set_review_account_validation_failure \
+                "policy.admin-group-present" "admin group absent" "$account_groups"
+              return 1
+            fi
+            review_account_validation_reason="ok"
+            review_account_validation_expected="<none>"
+            review_account_validation_observed="<none>"
+          }
+          cleanup_review_account() {
+            local primary_status=$?
+            local cleanup_status=0
+            local process_cleanup_proven=false
+            local process_status=0
+            local review_processes=""
+            trap - EXIT
+            set +e
+            if [[ "$review_user_created" == "true" ]]; then
+              if ! verify_review_account; then
+                report_review_account_validation_failure
+                echo "::error::Ephemeral review user identity or policy is unproven; retained until runner disposal: name=$review_user uid=$review_uid"
+                cleanup_status=1
+              else
+                review_processes="$(review_account_processes)"
+                process_status=$?
+                if (( process_status != 0 )); then
+                  /usr/bin/printf '%s\n' "::error::Ephemeral review account process census failed"
+                  /usr/bin/printf '%s\n' \
+                    "Ephemeral review account retention: name=$review_user uid=$review_uid"
+                  cleanup_status=1
+                elif [[ -z "$review_processes" ]]; then
+                  process_cleanup_proven=true
+                else
+                  report_review_account_processes "$review_processes" \
+                    || cleanup_status=1
+                  if terminate_custodied_review_processes; then
+                    process_status=0
+                    review_processes="$(review_account_processes)" \
+                      || process_status=$?
+                    if (( process_status == 0 )) \
+                      && [[ -z "$review_processes" ]]; then
+                      process_cleanup_proven=true
+                    else
+                      cleanup_status=1
+                    fi
+                  else
+                    cleanup_status=1
+                  fi
+                  if [[ -n "$review_processes" ]]; then
+                    /usr/bin/printf '%s\n' "::error::Ephemeral review account process cleanup failed"
+                    /usr/bin/printf '%s\n' \
+                      "Ephemeral review account retention: name=$review_user uid=$review_uid"
+                    cleanup_status=1
+                  fi
+                fi
+                if [[ "$process_cleanup_proven" == "true" ]]; then
+                  if ! /usr/bin/sudo /usr/bin/dscl . -delete "$review_user_path" \
+                    || /usr/bin/sudo /usr/bin/dscl . -read "$review_user_path" >/dev/null 2>&1; then
+                    echo "::error::Ephemeral review user cleanup failed; retained until runner disposal: name=$review_user uid=$review_uid"
+                    cleanup_status=1
+                  else
+                    review_user_created=false
+                  fi
+                fi
+              fi
+            fi
+            if [[ "$review_group_created" == "true" ]]; then
+              if [[ "$review_user_created" == "true" ]]; then
+                echo "::error::Ephemeral review group retained with its user until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              elif ! verify_review_group; then
+                report_review_account_validation_failure
+                echo "::error::Ephemeral review group identity or policy is unproven; retained until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              elif ! /usr/bin/sudo /usr/bin/dscl . -delete "$review_group_path" \
+                || /usr/bin/sudo /usr/bin/dscl . -read "$review_group_path" >/dev/null 2>&1; then
+                echo "::error::Ephemeral review group cleanup failed; retained until runner disposal: name=$review_group gid=$review_gid"
+                cleanup_status=1
+              else
+                review_group_created=false
+              fi
+            fi
+            if (( primary_status != 0 )); then
+              exit "$primary_status"
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_review_account EXIT
+          review_local_user_names=""
+          review_local_group_names=""
+          review_local_user_ids=""
+          review_local_group_ids=""
+          review_cached_user_name=""
+          review_cached_group_name=""
+          if ! review_local_user_names="$(/usr/bin/sudo /usr/bin/dscl . -list /Users)" \
+            || ! review_local_group_names="$(/usr/bin/sudo /usr/bin/dscl . -list /Groups)" \
+            || ! review_local_user_ids="$(/usr/bin/sudo /usr/bin/dscl . -list /Users UniqueID)" \
+            || ! review_local_group_ids="$(/usr/bin/sudo /usr/bin/dscl . -list /Groups PrimaryGroupID)" \
+            || ! review_cached_user_name="$(/usr/bin/dscacheutil -q user -a name "$review_user")" \
+            || ! review_cached_group_name="$(/usr/bin/dscacheutil -q group -a name "$review_group")"; then
+            echo "::error::Ephemeral review account directory inventory is unavailable; retained at $isolated_root"
+            exit 1
+          fi
+          review_local_user_name_match="$(/usr/bin/awk -v target="$review_user" '$1 == target {print $1}' <<< "$review_local_user_names")"
+          review_local_group_name_match="$(/usr/bin/awk -v target="$review_group" '$1 == target {print $1}' <<< "$review_local_group_names")"
+          if [[ -n "$review_cached_user_name" ]] \
+            || [[ -n "$review_cached_group_name" ]] \
+            || [[ -n "$review_local_user_name_match" ]] \
+            || [[ -n "$review_local_group_name_match" ]] \
+            || [[ ! "$review_admin_gid" =~ ^[[:digit:]]+$ ]]; then
+            echo "::error::Ephemeral review account name or admin-group evidence is unavailable; retained at $isolated_root"
+            exit 1
+          fi
+          review_id_prefix="${review_account_suffix:0:4}"
+          review_id_start=$((50000 + (16#$review_id_prefix % 10000)))
+          for (( review_id_offset = 0; review_id_offset < 10000; review_id_offset++ )); do
+            review_id_candidate=$((50000 + ((review_id_start - 50000 + review_id_offset) % 10000)))
+            review_cached_user_uid=""
+            review_cached_group_gid=""
+            if ! review_cached_user_uid="$(/usr/bin/dscacheutil -q user -a uid "$review_id_candidate")" \
+              || ! review_cached_group_gid="$(/usr/bin/dscacheutil -q group -a gid "$review_id_candidate")"; then
+              echo "::error::Ephemeral review account UID/GID lookup failed; retained at $isolated_root"
+              exit 1
+            fi
+            review_local_user_uid_match="$(/usr/bin/awk -v target="$review_id_candidate" '$NF == target {print $1}' <<< "$review_local_user_ids")"
+            review_local_group_gid_match="$(/usr/bin/awk -v target="$review_id_candidate" '$NF == target {print $1}' <<< "$review_local_group_ids")"
+            if [[ -z "$review_cached_user_uid" ]] \
+              && [[ -z "$review_cached_group_gid" ]] \
+              && [[ -z "$review_local_user_uid_match" ]] \
+              && [[ -z "$review_local_group_gid_match" ]]; then
+              review_uid="$review_id_candidate"
+              review_gid="$review_id_candidate"
+              break
+            fi
+          done
+          if [[ ! "$review_uid" =~ ^[[:digit:]]+$ ]] \
+            || (( review_uid < 50000 || review_uid > 59999 )); then
+            echo "::error::No unused ephemeral review account UID/GID is available; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path"
+          review_group_created=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" GeneratedUID "$review_group_guid"
+          if ! verify_review_record_attribute \
+            group "$review_group_path" GeneratedUID "$review_group_guid"; then
+            report_review_account_validation_failure
+            echo "::error::Ephemeral review group origin binding failed; retained until runner disposal"
+            exit 1
+          fi
+          review_group_origin_bound=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" PrimaryGroupID "$review_gid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_group_path" RealName "Codex Review CI"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path"
+          review_user_created=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" GeneratedUID "$review_user_guid"
+          if ! verify_review_record_attribute \
+            user "$review_user_path" GeneratedUID "$review_user_guid"; then
+            report_review_account_validation_failure
+            echo "::error::Ephemeral review user origin binding failed; retained until runner disposal"
+            exit 1
+          fi
+          review_user_origin_bound=true
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" UniqueID "$review_uid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" PrimaryGroupID "$review_gid"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" NFSHomeDirectory /var/empty
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" UserShell /usr/bin/false
+          /usr/bin/sudo /usr/bin/dscl . -create \
+            "$review_user_path" dsAttrTypeNative:IsHidden 1
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" AuthenticationAuthority ";DisabledUser;"
+          /usr/bin/sudo /usr/bin/dscl . -create "$review_user_path" Password '*'
+          /usr/bin/sudo /usr/bin/dscacheutil -flushcache
+          if ! verify_review_account; then
+            report_review_account_validation_failure
+            echo "::error::Ephemeral review account failed identity or non-admin validation; retained until runner disposal"
+            exit 1
+          fi
+          review_account_receipt="$(/usr/bin/printf '%s\0' \
+            hosted-review-account-v1 \
+            "$review_user" "$review_uid" "$review_gid" \
+            "$review_user_guid" "$review_group_guid" \
+            | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+          if [[ ! "$review_account_receipt" =~ ^[[:xdigit:]]{64}$ ]]; then
+            /usr/bin/printf '%s\n' "::error::Ephemeral review account receipt is malformed"
+            exit 1
+          fi
+          review_processes_preuse="$(review_account_processes)"
+          if [[ -n "$review_processes_preuse" ]]; then
+            echo "::error::Ephemeral review account is already in use; retained until runner disposal: pids=${review_processes_preuse//$'\n'/,}"
+            exit 1
+          fi
+          review_account_custody_active=true
+          echo "Ephemeral review account: name=$review_user uid=$review_uid gid=$review_gid user_guid=$review_user_guid group_guid=$review_group_guid"
+          /usr/bin/sudo /bin/mkdir -m 0700 "$isolated_root/payload"
+          /usr/bin/sudo /usr/sbin/chown "$review_user:$review_group" "$isolated_root/payload"
+          run_review_user /bin/test ! -w /private
+          run_review_user /bin/test ! -w "$isolated_root"
+          run_review_user /bin/test -x "$isolated_python"
+          run_review_user /bin/test ! -w "$managed_python_dir"
+          run_review_user /bin/test ! -w "$runtime_root"
+          run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py"
+          run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py"
+          run_review_user /bin/test ! -w "$isolated_source"
+          prequery_developer_dir_physical="$(cd "$DEVELOPER_DIR" && pwd -P)"
+          prequery_direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")"
+          prequery_direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")"
+          prequery_direct_git_digest="${prequery_direct_git_digest%% *}"
+          prequery_direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")"
+          prequery_checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          prequery_checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          prequery_checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          prequery_checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          prequery_checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          prequery_checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          prequery_checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          prequery_checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          prequery_checkout_git_config_digest="${prequery_checkout_git_config_digest%% *}"
+          prequery_checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || prequery_checkout_git_source_acl_violation="<unreadable>"
+          prequery_checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || prequery_checkout_git_control_acl_violation="<unreadable>"
+          prequery_checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || prequery_checkout_git_escape_metadata="<unreadable>"
+          if [[ "$prequery_developer_dir_physical" != "$DEVELOPER_DIR" ]] \
+            || [[ "$prequery_direct_git_binding" != "$direct_git_binding" ]] \
+            || [[ "$prequery_direct_git_digest" != "$direct_git_digest" ]] \
+            || [[ "$prequery_direct_git_exec_path_binding" != "$direct_git_exec_path_binding" ]] \
+            || [[ "$prequery_checkout_git_dir_binding" != "$checkout_git_dir_binding" ]] \
+            || [[ "$prequery_checkout_git_objects_binding" != "$checkout_git_objects_binding" ]] \
+            || [[ "$prequery_checkout_head_binding" != "$checkout_head_binding" ]] \
+            || [[ "$prequery_checkout_head_sha" != "$checkout_head_sha" ]] \
+            || [[ "$prequery_checkout_bootstrap_root_binding" != "$checkout_bootstrap_root_binding" ]] \
+            || [[ "$prequery_checkout_git_control_binding" != "$checkout_git_control_binding" ]] \
+            || [[ "$prequery_checkout_git_config_binding" != "$checkout_git_config_binding" ]] \
+            || [[ "$prequery_checkout_git_config_digest" != "$checkout_git_config_digest" ]] \
+            || [[ -n "$prequery_checkout_git_source_acl_violation" ]] \
+            || [[ -n "$prequery_checkout_git_control_acl_violation" ]] \
+            || [[ -n "$prequery_checkout_git_escape_metadata" ]]; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap custody changed before object reads"
+            exit 1
+          fi
+          gate_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/tests/trusted_mac_gate.py"
+          gate_size="$(trusted_checkout_git cat-file -s "$gate_spec")"
+          gate_digest="$(trusted_checkout_git cat-file blob "$gate_spec" | /usr/bin/shasum -a 256)"
+          gate_digest="${gate_digest%% *}"
+          if [[ ! "$gate_size" =~ ^[[:digit:]]+$ ]] \
+            || (( gate_size < 1 || gate_size > 131072 )) \
+            || [[ ! "$gate_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || ! trusted_checkout_git cat-file blob "$gate_spec" \
+              | /usr/bin/sudo /usr/bin/cmp -s - "$isolated_source/tests/trusted_mac_gate.py"; then
+            echo "::error::Trusted gate bootstrap source is not bounded; retained at $isolated_root"
+            exit 1
+          fi
+          echo "Trusted gate bootstrap: bytes=$gate_size sha256=$gate_digest"
+          gate_manifest="$isolated_source/trusted_mac_gate_sources.index"
+          gate_manifest_spec="$checkout_head_sha:$REVIEW_SOURCE_RELATIVE/trusted_mac_gate_sources.index"
+          gate_manifest_size="$(trusted_checkout_git cat-file -s "$gate_manifest_spec")"
+          gate_manifest_digest="$(trusted_checkout_git cat-file blob "$gate_manifest_spec" | /usr/bin/shasum -a 256)"
+          gate_manifest_digest="${gate_manifest_digest%% *}"
+          if [[ ! "$gate_manifest_size" =~ ^[[:digit:]]+$ ]] \
+            || (( gate_manifest_size < 1 || gate_manifest_size > 1048576 )) \
+            || [[ ! "$gate_manifest_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
+            || ! trusted_checkout_git cat-file blob "$gate_manifest_spec" \
+              | /usr/bin/sudo /usr/bin/cmp -s - "$gate_manifest"; then
+            echo "::error::Trusted gate source manifest is not exact HEAD; retained at $isolated_root"
+            exit 1
+          fi
+          echo "Trusted gate source manifest: bytes=$gate_manifest_size sha256=$gate_manifest_digest"
+          current_checkout_git_objects_physical="$(cd "$checkout_git_objects" && pwd -P)"
+          current_checkout_git_dir_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_dir")"
+          current_checkout_git_objects_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_objects")"
+          current_checkout_head_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_head_file")"
+          current_checkout_head_sha="$(/bin/cat "$checkout_head_file")"
+          current_checkout_bootstrap_root_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_bootstrap_root")"
+          current_checkout_git_control_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$checkout_git_control")"
+          current_checkout_git_config_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z' "$checkout_git_control/config")"
+          current_checkout_git_config_digest="$(/usr/bin/shasum -a 256 "$checkout_git_control/config")"
+          current_checkout_git_config_digest="${current_checkout_git_config_digest%% *}"
+          current_direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")"
+          current_direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")"
+          current_direct_git_digest="${current_direct_git_digest%% *}"
+          current_direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")"
+          current_checkout_git_source_acl_violation="$(probe_checkout_git_source_acl)" \
+            || current_checkout_git_source_acl_violation="<unreadable>"
+          current_checkout_git_control_acl_violation="$(
+            /usr/bin/find -s "$checkout_bootstrap_root" -exec /bin/ls -lde {} \; \
+              | /usr/bin/awk 'substr($1, 11, 1) == "+" {print "acl"; exit}'
+          )" || current_checkout_git_control_acl_violation="<unreadable>"
+          current_checkout_git_escape_metadata="$(probe_checkout_git_escape_metadata)" \
+            || current_checkout_git_escape_metadata="<unreadable>"
+          if [[ "$current_checkout_git_objects_physical" != "$checkout_git_objects" ]] \
+            || [[ "$current_checkout_git_dir_binding" != "$checkout_git_dir_binding" ]] \
+            || [[ "$current_checkout_git_objects_binding" != "$checkout_git_objects_binding" ]] \
+            || [[ "$current_checkout_head_binding" != "$checkout_head_binding" ]] \
+            || [[ "$current_checkout_head_sha" != "$checkout_head_sha" ]] \
+            || [[ "$current_checkout_bootstrap_root_binding" != "$checkout_bootstrap_root_binding" ]] \
+            || [[ "$current_checkout_git_control_binding" != "$checkout_git_control_binding" ]] \
+            || [[ "$current_checkout_git_config_binding" != "$checkout_git_config_binding" ]] \
+            || [[ "$current_checkout_git_config_digest" != "$checkout_git_config_digest" ]] \
+            || [[ "$current_direct_git_binding" != "$direct_git_binding" ]] \
+            || [[ "$current_direct_git_digest" != "$direct_git_digest" ]] \
+            || [[ "$current_direct_git_exec_path_binding" != "$direct_git_exec_path_binding" ]] \
+            || [[ -n "$current_checkout_git_source_acl_violation" ]] \
+            || [[ -n "$current_checkout_git_control_acl_violation" ]] \
+            || [[ -n "$current_checkout_git_escape_metadata" ]]; then
+            /usr/bin/printf '%s\n' "::error::Isolated Git bootstrap custody changed during object reads"
+            exit 1
+          fi
+          run_review_user /bin/mkdir -m 0700 "$isolated_root/payload/runtime"
+          isolated_source_profile="$isolated_source/tests/readonly_child_isolation.sb"
+          review_profile="$isolated_root/readonly_child_isolation.sb"
+          /usr/bin/sudo /bin/test ! -e "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /bin/cp "$isolated_source_profile" "$review_profile"
+          /usr/bin/sudo /usr/sbin/chown root:wheel "$review_profile"
+          /usr/bin/sudo /bin/chmod -N "$review_profile"
+          /usr/bin/sudo /bin/chmod 0444 "$review_profile"
+          /usr/bin/sudo /bin/test -f "$review_profile"
+          /usr/bin/sudo /bin/test ! -L "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"
+          /usr/bin/sudo /usr/bin/cmp -s "$isolated_source_profile" "$review_profile"
+          profile_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")"
+          test "$(/usr/bin/sudo /usr/bin/stat -f '%u:%g:%Lp' "$review_profile")" = "0:0:444"
+          /bin/test ! -w "$review_profile"
+          run_review_user /bin/test -r "$review_profile"
+          run_review_user /bin/test ! -w "$review_profile"
+          source_profile_postcopy_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")"
+          if [[ "$source_profile_postcopy_binding" != "$source_profile_binding" ]] \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile"; then
+            echo "::error::Checkout child profile changed while copying; retained at $isolated_root"
+            exit 1
+          fi
+          measure_git_toolchain_for_review_account() {
+            /bin/cat "$isolated_source/tests/trusted_mac_gate.py" \
+              | run_review_user /usr/bin/env -i \
+                  HOME=/var/empty \
+                  LANG=C \
+                  LC_ALL=C \
+                  PATH=/usr/bin:/bin \
+                  PYTHONDONTWRITEBYTECODE=1 \
+                  TMPDIR="$isolated_root/payload/runtime" \
+                  "$isolated_python" -I -B -S - \
+                    --hosted-git-receipt \
+                    "$DEVELOPER_DIR" "$direct_git" "$direct_git_digest" \
+                    "$direct_git_exec_path"
+          }
+          git_toolchain_measurement=""
+          git_toolchain_measurement_status=0
+          git_toolchain_measurement="$(measure_git_toolchain_for_review_account)" \
+            || git_toolchain_measurement_status=$?
+          git_toolchain_measurement_bytes="$(/usr/bin/printf '%s\n' "$git_toolchain_measurement" \
+            | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+          git_toolchain_measurement_ascii_status=0
+          /usr/bin/printf '%s' "$git_toolchain_measurement" \
+            | LANG=C LC_ALL=C /usr/bin/grep -Eq '^[ -~]+$' \
+            || git_toolchain_measurement_ascii_status=$?
+          if (( git_toolchain_measurement_status != 0 )) \
+            || (( git_toolchain_measurement_ascii_status != 0 )) \
+            || [[ ! "$git_toolchain_measurement_bytes" =~ ^[[:digit:]]+$ ]] \
+            || (( git_toolchain_measurement_bytes < 2 \
+              || git_toolchain_measurement_bytes > 4096 )) \
+            || [[ "$git_toolchain_measurement" == *$'\n'* ]] \
+            || [[ "$git_toolchain_measurement" != \
+              *'"schema":"hosted-git-toolchain-receipt-v2"'* ]]; then
+            /usr/bin/printf '%s\n' "::error::Pinned Xcode Git review-account receipt is malformed"
+            exit 1
+          fi
+          direct_git_toolchain_receipt="$(/usr/bin/printf '%s\n' "$git_toolchain_measurement" \
+            | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+          if [[ ! "$direct_git_toolchain_receipt" =~ ^[[:xdigit:]]{64}$ ]]; then
+            /usr/bin/printf '%s\n' "::error::Pinned Xcode Git review-account receipt digest is malformed"
+            exit 1
+          fi
+          verify_git_toolchain_custody() {
+            local phase="$1"
+            local current_developer_dir_physical=""
+            local current_direct_git_binding=""
+            local current_direct_git_codesign=""
+            local current_direct_git_codesign_binding=""
+            local current_direct_git_digest=""
+            local current_direct_git_exec_path_binding=""
+            local current_direct_git_exec_path_physical=""
+            local current_direct_git_loader_binding=""
+            local current_direct_git_physical=""
+            local current_measurement=""
+            local current_shim_identifier=""
+            local current_status=0
+            current_developer_dir_physical="$(cd "$DEVELOPER_DIR" && pwd -P)" \
+              || current_status=1
+            current_direct_git_physical="$(cd "$(/usr/bin/dirname "$direct_git")" \
+              && pwd -P)/$(/usr/bin/basename "$direct_git")" \
+              || current_status=1
+            current_direct_git_exec_path_physical="$(cd "$direct_git_exec_path" \
+              && pwd -P)" \
+              || current_status=1
+            current_direct_git_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%l' "$direct_git")" \
+              || current_status=1
+            current_direct_git_digest="$(/usr/bin/shasum -a 256 "$direct_git")" \
+              || current_status=1
+            current_direct_git_digest="${current_direct_git_digest%% *}"
+            current_direct_git_exec_path_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$direct_git_exec_path")" \
+              || current_status=1
+            current_direct_git_codesign="$(/usr/bin/codesign -dvvv "$direct_git" 2>&1)" \
+              || current_status=1
+            current_direct_git_codesign_binding="$(/usr/bin/printf '%s\n' "$current_direct_git_codesign" \
+              | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+            current_shim_identifier="$(/usr/bin/codesign -dvvv /usr/bin/git 2>&1 \
+              | /usr/bin/awk -F= '$1 == "Identifier" {print $2}')"
+            current_direct_git_loader_binding="$({
+              /usr/bin/otool -L "$direct_git"
+              /usr/bin/otool -l "$direct_git"
+            } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')" \
+              || current_status=1
+            current_measurement="$(measure_git_toolchain_for_review_account)" \
+              || current_status=1
+            /usr/bin/codesign --verify --strict "$direct_git" \
+              || current_status=1
+            if (( current_status != 0 )) \
+              || [[ "$current_developer_dir_physical" != "$DEVELOPER_DIR" ]] \
+              || [[ "$current_direct_git_physical" != "$direct_git" ]] \
+              || [[ "$current_direct_git_exec_path_physical" != "$direct_git_exec_path" ]] \
+              || [[ "$current_direct_git_binding" != "$direct_git_binding" ]] \
+              || [[ "$current_direct_git_digest" != "$direct_git_digest" ]] \
+              || [[ "$current_direct_git_exec_path_binding" != "$direct_git_exec_path_binding" ]] \
+              || [[ "$current_direct_git_codesign_binding" != "$direct_git_codesign_binding" ]] \
+              || [[ "$current_direct_git_loader_binding" != "$direct_git_loader_binding" ]] \
+              || [[ "$current_shim_identifier" != "com.apple.dt.xcode_select.tool-shim-public" ]] \
+              || [[ "$current_measurement" != "$git_toolchain_measurement" ]]; then
+              /usr/bin/printf '%s\n' "::error::Pinned Xcode Git failed $phase custody validation"
+              return 1
+            fi
+          }
+          /usr/bin/printf '%s\n' \
+            "Pinned Xcode Git review receipt: receipt_sha256=$direct_git_toolchain_receipt account_sha256=$review_account_receipt"
+          /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root"
+          isolated_flags="$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")"
+          (( (isolated_flags & 2) == 2 ))
+          test -n "${RUNNER_TEMP:-}"
+          run_review_user /bin/test ! -w "$RUNNER_TEMP"
+          summary_file="$(/usr/bin/mktemp "$RUNNER_TEMP/codex-review-readonly-summary.XXXXXX")"
+          echo "Read-only supervisor summary file (retained on failure): $summary_file"
+          /bin/test -f "$summary_file"
+          /bin/test ! -L "$summary_file"
+          summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")"
+          set -o pipefail
+          literal_profile_status=0
+          /usr/bin/grep -Fq '(literal ' "$review_profile" \
+            || literal_profile_status=$?
+          if ! /usr/bin/grep -Fqx '(deny job-creation)' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '(deny process-exec*' "$review_profile" \
+            || ! /usr/bin/grep -Fqx '  (file-mode #o4000 #o2000))' "$review_profile" \
+            || (( literal_profile_status != 1 )); then
+            echo "::error::Read-only child profile lacks required denials; retained at $isolated_root"
+            exit 1
+          fi
+          source_profile_prelaunch_binding=""
+          source_profile_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_prelaunch_binding="<unreadable>"
+          source_root_prelaunch_binding=""
+          source_root_prelaunch_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_prelaunch_binding="<unreadable>"
+          isolated_source_prelaunch_binding=""
+          isolated_source_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_prelaunch_binding="<unreadable>"
+          isolated_tree_prelaunch_symlink=""
+          isolated_tree_prelaunch_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_prelaunch_symlink="<unreadable>"
+          profile_prelaunch_binding=""
+          profile_prelaunch_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_prelaunch_binding="<unreadable>"
+          if [[ "$source_profile_prelaunch_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_prelaunch_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_prelaunch_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_prelaunch_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || run_review_user /bin/test -w "$isolated_source" \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_prelaunch_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! run_review_user /bin/test -r "$review_profile" \
+            || run_review_user /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed before launch; retained at $isolated_root"
+            exit 1
+          fi
+          verify_runtime_custody prelaunch
+          verify_git_toolchain_custody prelaunch
+          if ! verify_review_account; then
+            report_review_account_validation_failure
+            echo "::error::Ephemeral review account changed before launch; retained until runner disposal"
+            exit 1
+          fi
+          if ! review_processes_prelaunch="$(review_account_processes)"; then
+            /usr/bin/printf '%s\n' \
+              "::error::Ephemeral review account process census failed before launch"
+            exit 1
+          fi
+          if [[ -n "$review_processes_prelaunch" ]]; then
+            report_review_account_processes "$review_processes_prelaunch" || true
+            /usr/bin/printf '%s\n' \
+              "::error::Ephemeral review account is not process-isolated before launch"
+            /usr/bin/printf '%s\n' \
+              "Ephemeral review account retention: name=$review_user uid=$review_uid pids=${review_processes_prelaunch//$'\n'/,} diagnostics=$review_process_diagnostics"
+            exit 1
+          fi
+          runner_status=0
+          /bin/cat "$isolated_source/tests/trusted_mac_gate.py" \
+            | run_review_user /usr/bin/sandbox-exec -f "$review_profile" /usr/bin/env -i \
+              LANG=C \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              "$isolated_python" -I -B -S - "$isolated_source" \
+              "$gate_manifest" "$gate_manifest_digest" hosted-readonly \
+              "$isolated_root/payload/runtime" "$isolated_root/payload" \
+              "$DEVELOPER_DIR" "$direct_git" "$direct_git_digest" \
+              "$direct_git_exec_path" "$git_toolchain_measurement" \
+              "$review_user" "$review_uid" "$review_gid" \
+              "$review_account_receipt" \
+            | /usr/bin/tee "$summary_file" >/dev/null || runner_status=$?
+          verify_runtime_custody postrun
+          verify_git_toolchain_custody postrun
+          review_account_postrun_status=0
+          review_processes_postrun=""
+          if ! verify_review_account; then
+            report_review_account_validation_failure
+            review_account_postrun_status=1
+          fi
+          review_processes_postrun="$(review_account_processes)" \
+            || review_account_postrun_status=1
+          if [[ -n "$review_processes_postrun" ]]; then
+            report_review_account_processes "$review_processes_postrun" \
+              || review_account_postrun_status=1
+            review_account_postrun_status=1
+          fi
+          source_profile_postrun_binding=""
+          source_profile_postrun_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$source_review_profile")" \
+            || source_profile_postrun_binding="<unreadable>"
+          source_root_postrun_binding=""
+          source_root_postrun_binding="$(/usr/bin/stat -f '%d:%i:%p:%u:%g' "$source_review_root")" \
+            || source_root_postrun_binding="<unreadable>"
+          isolated_source_postrun_binding=""
+          isolated_source_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$isolated_source")" \
+            || isolated_source_postrun_binding="<unreadable>"
+          isolated_tree_postrun_symlink=""
+          isolated_tree_postrun_symlink="$(/usr/bin/sudo /usr/bin/find "$isolated_source" -type l -print -quit)" \
+            || isolated_tree_postrun_symlink="<unreadable>"
+          profile_postrun_binding=""
+          profile_postrun_binding="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i:%u:%g:%Lp' "$review_profile")" \
+            || profile_postrun_binding="<unreadable>"
+          if [[ "$source_profile_postrun_binding" != "$source_profile_binding" ]] \
+            || [[ "$source_root_postrun_binding" != "$source_root_binding" ]] \
+            || [[ "$isolated_source_postrun_binding" != "$isolated_source_binding" ]] \
+            || [[ -n "$isolated_tree_postrun_symlink" ]] \
+            || ! /bin/test -d "$source_review_root" \
+            || /bin/test -L "$source_review_root" \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_source" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_source" \
+            || ! /usr/bin/sudo /usr/bin/diff -qr "$source_review_root" "$isolated_source" >/dev/null \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/trusted_mac_gate.py" \
+            || ! run_review_user /bin/test -r "$gate_manifest" \
+            || run_review_user /bin/test -w "$gate_manifest" \
+            || ! run_review_user /bin/test -r "$isolated_source/tests/run_readonly_install_deterministic_supervisor.py" \
+            || run_review_user /bin/test -w "$isolated_source" \
+            || ! /bin/test -f "$source_review_profile" \
+            || /bin/test -L "$source_review_profile" \
+            || ! /usr/bin/sudo /usr/bin/cmp -s "$source_review_profile" "$review_profile" \
+            || [[ "$profile_postrun_binding" != "$profile_binding" ]] \
+            || ! /bin/test -f "$review_profile" \
+            || /bin/test -L "$review_profile" \
+            || /bin/test -w "$review_profile" \
+            || ! run_review_user /bin/test -r "$review_profile" \
+            || run_review_user /bin/test -w "$review_profile"; then
+            echo "::error::Read-only child profile changed during launch; retained at $isolated_root"
+            exit 1
+          fi
+          current_summary_object_id=""
+          current_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || current_summary_object_id="<unreadable>"
+          if [[ "$current_summary_object_id" != "$summary_object_id" ]]; then
+            echo "::error::Supervisor summary identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          if (( runner_status != 0 )); then
+            echo "::error::Read-only supervisor exited $runner_status; retained at $isolated_root"
+            exit "$runner_status"
+          fi
+          if (( review_account_postrun_status != 0 )); then
+            /usr/bin/printf '%s\n' \
+              "::error::Ephemeral review account changed or retained processes during launch"
+            /usr/bin/printf '%s\n' \
+              "Ephemeral review account retention: name=$review_user uid=$review_uid pids=${review_processes_postrun//$'\n'/,} diagnostics=$review_process_diagnostics"
+            exit 1
+          fi
+          summary_status=0
+          "$isolated_python" -I -B -S -c 'import json, pathlib, sys; raw = pathlib.Path(sys.argv[1]).read_bytes(); valid_line = raw.endswith(b"\n") and b"\n" not in raw[:-1] and b"\r" not in raw; reject_duplicates = lambda pairs: dict(pairs) if len(dict(pairs)) == len(pairs) else (_ for _ in ()).throw(ValueError("duplicate JSON key")); payload = json.loads(raw, object_pairs_hook=reject_duplicates) if valid_line else {}; expected = {"child_process_closure": "proven", "cleanup_failures": [], "cleanup_guarantee": "custodied-manifest-quarantine-descriptor-revalidation-same-uid-final-rename-unlink-host-tcb", "cleanup_status": "complete", "creation_origin_guarantee": "best-effort-128-bit-leaf-immediate-nofollow-open-same-uid-host-tcb", "creation_origin_proven": False, "install_parent_is_sticky_world_writable": True, "no_child_runtime_profile": None, "primary_failure": None, "primary_status": "complete", "release_tree_immutable": True, "release_tree_property": "object-identity-content-access-policy", "retained_paths": [], "returncode": 0, "runtime_residue": [], "secondary_failures": [], "signal_number": None, "source_head_bound": False, "source_head_sha": None, "source_head_subtree_manifest_sha256": None, "source_manifest_sha256": None, "timed_out": False}; source_manifest = payload.get("source_manifest_sha256") if isinstance(payload, dict) else None; source_manifest_valid = type(source_manifest) is str and len(source_manifest) == 64 and all(character in "0123456789abcdef" for character in source_manifest); expected["source_manifest_sha256"] = source_manifest; keys_exact = isinstance(payload, dict) and set(payload) == set(expected); invalid_values = {key: payload.get(key) for key, value in expected.items() if key not in payload or type(payload[key]) is not type(value) or payload[key] != value} if isinstance(payload, dict) else {"payload_type": type(payload).__name__}; invalid_values.update({} if source_manifest_valid else {"source_manifest_sha256_contract": {"length": len(source_manifest) if type(source_manifest) is str else None, "type": type(source_manifest).__name__}}); sys.exit("invalid terminal supervisor summary: " + json.dumps({"invalid_values": invalid_values, "keys_exact": keys_exact}, sort_keys=True, separators=(",", ":"))) if not valid_line or not keys_exact or invalid_values else print(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))' \
+            "$summary_file" || summary_status=$?
+          if (( summary_status != 0 )); then
+            echo "::error::Terminal supervisor evidence was not cleanup-safe; retained at $isolated_root"
+            exit "$summary_status"
+          fi
+          current_object_id=""
+          current_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || current_object_id="<unreadable>"
+          if [[ "$current_object_id" != "$isolated_object_id" ]] \
+            || ! /usr/bin/sudo /bin/test -d "$isolated_root" \
+            || ! /usr/bin/sudo /bin/test ! -L "$isolated_root" \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u' "$isolated_root")" != "0" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%Lp' "$isolated_root")" != "755" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%f' "$isolated_root")" != "$isolated_flags" ]]; then
+            echo "::error::Isolation root identity changed; retained at $isolated_root"
+            exit 1
+          fi
+          /usr/bin/sudo /usr/bin/chflags nouchg "$isolated_root"
+          post_clear_object_id=""
+          post_clear_object_id="$(/usr/bin/sudo /usr/bin/stat -f '%d:%i' "$isolated_root")" \
+            || post_clear_object_id="<unreadable>"
+          if [[ "$post_clear_object_id" != "$isolated_object_id" ]] \
+            || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%u:%Lp' "$isolated_root")" != "0:755" ]]; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root changed while opening cleanup; retained at $isolated_root"
+            exit 1
+          fi
+          root_cleanup_status=0
+          /usr/bin/sudo /bin/rm -rf "$isolated_root" || root_cleanup_status=$?
+          if (( root_cleanup_status != 0 )) \
+            || /usr/bin/sudo /bin/test -e "$isolated_root" \
+            || /usr/bin/sudo /bin/test -L "$isolated_root"; then
+            if /usr/bin/sudo /bin/test -d "$isolated_root" \
+              && /usr/bin/sudo /bin/test ! -L "$isolated_root"; then
+              /usr/bin/sudo /usr/bin/chflags uchg "$isolated_root" || true
+            fi
+            echo "::error::Isolation root cleanup incomplete at $isolated_root"
+            exit 1
+          fi
+          final_summary_object_id=""
+          final_summary_object_id="$(/usr/bin/stat -f '%d:%i' "$summary_file")" \
+            || final_summary_object_id="<unreadable>"
+          if [[ "$final_summary_object_id" != "$summary_object_id" ]] \
+            || ! /bin/test -f "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup identity changed; retained at $summary_file"
+            exit 1
+          fi
+          summary_cleanup_status=0
+          /bin/rm "$summary_file" || summary_cleanup_status=$?
+          if (( summary_cleanup_status != 0 )) \
+            || /bin/test -e "$summary_file" \
+            || /bin/test -L "$summary_file"; then
+            echo "::error::Summary cleanup incomplete at $summary_file"
+            exit 1
+          fi
+      - name: Require source-only Python tree
+        if: always()
+        run: |
+          bytecode_artifact=""
+          if ! bytecode_artifact="$(/usr/bin/find . \
+            \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) \
+            -print -quit)"; then
+            echo "::error::Unable to inspect the checkout for Python bytecode artifacts"
+            exit 1
+          fi
+          if [[ -n "$bytecode_artifact" ]]; then
+            echo "::error::Python bytecode artifact: $bytecode_artifact"
+            exit 1
+          fi
+
+  test:
+    name: test
+    if: ${{ always() }}
+    needs:
+      - platform_tests
+      - broker_reproducibility
+      - independent_supervisor_tests
+      - readonly_install_supervisor_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test to pass
+        env:
+          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
+          READONLY_INSTALL_SUPERVISOR_RESULT: ${{ needs.readonly_install_supervisor_tests.result }}
+        run: |
+          test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
+          test "$READONLY_INSTALL_SUPERVISOR_RESULT" = "success"
