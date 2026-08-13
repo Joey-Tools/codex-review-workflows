@@ -5972,6 +5972,36 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(secret_scan.unextractable_rule)
         self.assertEqual(secret_scan.blocking_candidates, {})
 
+    def test_permission_marker_keeps_later_provider_candidate(self) -> None:
+        marker = source_permission_marker()
+        provider = b"ghp_" + b"A" * 36
+        accepted = accepted_legacy_value(
+            provider.decode("ascii"),
+            rule="github-token",
+        )
+        payload = (
+            b"for forbidden in (\n    \""
+            + marker
+            + b'",\n    "'
+            + provider
+            + b'",\n):\n    pass\n'
+        )
+
+        direct = workspace._scan_secret_value(
+            payload,
+            accepted_values=(accepted,),
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=(accepted,),
+        )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.accepted_counts, {accepted: 1})
+        self.assertEqual(streamed, direct)
+
     def test_source_permission_marker_record_classifier_is_closed(self) -> None:
         marker = source_permission_marker()
         self.assertEqual(marker, b"id-" + b"token:" + b" " + b"write")

@@ -35,15 +35,19 @@ superseded_by:
 - Marker candidates outside the bounded record window or inside recognized
   non-plain source literals remain opaque and fail closed instead of falling
   through as unrelated text.
+- Marker classification runs before the provider-specific fast path, so a
+  later unchanged provider candidate remains counted without reclassifying the
+  exact marker as a generic secret.
 
 ## Evidence
 
-- The original seven and six follow-up focused parser/admission regressions
-  passed on Python 3.13.0.
-- `PublicPoolScannerTest`: 117 tests passed.
-- `WorkspaceTest`: 305 tests passed with one expected skip.
+- Nine focused parser/admission regressions passed on Python 3.13.0.
+- `PublicPoolScannerTest`: 118 tests passed.
+- `WorkspaceTest`: 306 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
   regressions cover C and Python forms plus a logical stream-read boundary.
 - Whole-range re-review identified long-leading-context and C/C++ literal-prefix
   gaps; direct, streamed, and repository admission regressions cover both.
+- The next whole-range review identified a later-provider fast-path gap;
+  direct/stream parity and an unchanged-provider admission range cover it.

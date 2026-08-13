@@ -324,6 +324,36 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(summary["secret_delta"]["status"], "clean")
         self.assertEqual(summary["temporary_cleanup_status"], "complete")
 
+    def test_secret_admission_accepts_marker_before_unchanged_provider(self) -> None:
+        marker = source_permission_marker()
+        provider = b"ghp_" + b"A" * 36
+        provider_payload = b'values = (\n    "' + provider + b'",\n)\n'
+        provider_base = self.commit_bytes(
+            "retained-provider.py",
+            provider_payload,
+            "Add retained provider fixture",
+        )
+        marker_head = self.commit_bytes(
+            "retained-provider.py",
+            b'values = (\n    "'
+            + marker
+            + b'",\n    "'
+            + provider
+            + b'",\n)\n',
+            "Add workflow permission marker",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=provider_base,
+            head_ref=marker_head,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
     def test_secret_admission_rejects_permission_marker_secret_suffixes(self) -> None:
         marker = source_permission_marker()
         credential = unregistered_generic_credential()

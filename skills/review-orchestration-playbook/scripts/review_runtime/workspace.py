@@ -11019,9 +11019,6 @@ def _secret_assignment_rhs_is_closed(
     event_budget: SecretScanBudget,
     prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     closure_recorder: Callable[[int], None] | None = None,
-    source_permission_marker_recorder: (
-        Callable[[_SourcePermissionMarkerRecordStatus, int], None] | None
-    ) = None,
     literal_rhs_recorder: (
         Callable[[int, int | None, bytes, bytes, int | None], None] | None
     ) = None,
@@ -11135,31 +11132,6 @@ def _secret_assignment_rhs_is_closed(
             )
         except _IncompleteSecretScanSuffix:
             return False
-
-    source_marker_status, source_marker_end = (
-        _source_permission_marker_record_status(
-            value,
-            assignment_start=assignment_start,
-            assignment_end=assignment_end,
-            assignment_line_start=assignment_line_start,
-            proof_end=proof_end,
-            diff_surface=diff_surface,
-            suffix_context_complete=proof_suffix_context_complete,
-        )
-    )
-    if source_marker_status in {"exact", "near-miss"}:
-        if not proof_range_tracker.consume(
-            assignment_line_start,
-            source_marker_end,
-        ):
-            return finish(False)
-        record_inspected(source_marker_end)
-        if (
-            source_marker_status == "near-miss"
-            and source_permission_marker_recorder is not None
-        ):
-            source_permission_marker_recorder(source_marker_status, source_marker_end)
-        return finish(source_marker_status == "exact")
 
     direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
         value,
@@ -13391,61 +13363,26 @@ def _iter_secret_events(
         proof_suffix_context_complete = suffix_context_complete and proof_end == len(
             value
         )
-        pending_specific_within_proof = (
-            pending_specific_cursor < len(pending_specific_ranges)
-            and pending_specific_ranges[pending_specific_cursor][0] < proof_end
-            and pending_specific_ranges[pending_specific_cursor][1] <= proof_end
-        )
-        if not pending_specific_within_proof:
-            prefix_proof_start = 0
-            if (
-                closed_assignment_proof_frontier is not None
-                and closed_assignment_proof_frontier > 0
-                and closed_assignment_proof_frontier <= assignment_match.start()
-                and assignment_match.start() <= MAX_SECRET_PREFIX_PROOF_BYTES
-            ):
-                prefix_proof_start = closed_assignment_proof_frontier
-            recorded_closure_frontiers: list[int] = []
-            recorded_literal_rhs: list[
-                tuple[int, int | None, bytes, bytes, int | None]
-            ] = []
-            recorded_unquoted_rhs: list[tuple[int, int | None]] = []
-            recorded_source_permission_markers: list[
-                tuple[_SourcePermissionMarkerRecordStatus, int]
-            ] = []
-            assignment_closed = _secret_assignment_rhs_is_closed(
+        source_marker_status, source_marker_end = (
+            _source_permission_marker_record_status(
                 value,
-                prefix_proof_start=prefix_proof_start,
                 assignment_start=assignment_match.start(),
                 assignment_end=assignment_match.end(),
                 assignment_line_start=assignment_line_start,
                 proof_end=proof_end,
                 diff_surface=diff_surface,
-                prefix_context_complete=prefix_context_complete,
-                suffix_context_complete=suffix_context_complete,
-                event_budget=event_budget,
-                prefix_proof_tracker=prefix_proof_tracker,
-                closure_recorder=recorded_closure_frontiers.append,
-                source_permission_marker_recorder=lambda status, end: (
-                    recorded_source_permission_markers.append((status, end))
-                ),
-                literal_rhs_recorder=lambda start, end, delimiter, prefix, diff_side: (
-                    recorded_literal_rhs.append(
-                        (start, end, delimiter, prefix, diff_side)
-                    )
-                ),
-                unquoted_rhs_recorder=lambda start, end: (
-                    recorded_unquoted_rhs.append((start, end))
-                ),
+                suffix_context_complete=proof_suffix_context_complete,
             )
-            if recorded_source_permission_markers:
-                source_marker_status, source_marker_end = (
-                    recorded_source_permission_markers[-1]
+        )
+        if source_marker_status in {"exact", "near-miss"}:
+            if not prefix_proof_tracker.consume(
+                assignment_line_start,
+                source_marker_end,
+            ):
+                raise ReviewError(
+                    "sensitive scanner exceeded one permission marker proof window"
                 )
-                if source_marker_status != "near-miss":
-                    raise ReviewError(
-                        "sensitive scanner recorded an invalid permission marker status"
-                    )
+            if source_marker_status == "near-miss":
                 if end_is_committable(source_marker_end):
                     event_budget.consume()
                     yield (
@@ -13475,7 +13412,48 @@ def _iter_secret_events(
                             prefix_context_complete=prefix_context_complete,
                         ),
                     )
-                continue
+            continue
+        pending_specific_within_proof = (
+            pending_specific_cursor < len(pending_specific_ranges)
+            and pending_specific_ranges[pending_specific_cursor][0] < proof_end
+            and pending_specific_ranges[pending_specific_cursor][1] <= proof_end
+        )
+        if not pending_specific_within_proof:
+            prefix_proof_start = 0
+            if (
+                closed_assignment_proof_frontier is not None
+                and closed_assignment_proof_frontier > 0
+                and closed_assignment_proof_frontier <= assignment_match.start()
+                and assignment_match.start() <= MAX_SECRET_PREFIX_PROOF_BYTES
+            ):
+                prefix_proof_start = closed_assignment_proof_frontier
+            recorded_closure_frontiers: list[int] = []
+            recorded_literal_rhs: list[
+                tuple[int, int | None, bytes, bytes, int | None]
+            ] = []
+            recorded_unquoted_rhs: list[tuple[int, int | None]] = []
+            assignment_closed = _secret_assignment_rhs_is_closed(
+                value,
+                prefix_proof_start=prefix_proof_start,
+                assignment_start=assignment_match.start(),
+                assignment_end=assignment_match.end(),
+                assignment_line_start=assignment_line_start,
+                proof_end=proof_end,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=suffix_context_complete,
+                event_budget=event_budget,
+                prefix_proof_tracker=prefix_proof_tracker,
+                closure_recorder=recorded_closure_frontiers.append,
+                literal_rhs_recorder=lambda start, end, delimiter, prefix, diff_side: (
+                    recorded_literal_rhs.append(
+                        (start, end, delimiter, prefix, diff_side)
+                    )
+                ),
+                unquoted_rhs_recorder=lambda start, end: (
+                    recorded_unquoted_rhs.append((start, end))
+                ),
+            )
             if assignment_closed:
                 if (
                     closed_assignment_proof_frontier is not None
