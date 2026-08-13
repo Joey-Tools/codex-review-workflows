@@ -10812,9 +10812,54 @@ def _starts_quoted_literal(value: bytes) -> bool:
     )
 
 
+_CPP_RAW_LITERAL_PREFIXES = (b"u8R\"", b"uR\"", b"UR\"", b"LR\"", b"R\"")
+_CPP_RAW_LITERAL_MAX_DELIMITER_BYTES = 16
+_SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES = (
+    max(len(prefix) for prefix in _CPP_RAW_LITERAL_PREFIXES)
+    + _CPP_RAW_LITERAL_MAX_DELIMITER_BYTES
+    + 1
+)
+
+
+def _cpp_raw_literal_content_start(value: bytes) -> tuple[bool, int | None]:
+    """Return whether a C++ raw prefix matched and its bounded opener end."""
+
+    prefix = next(
+        (candidate for candidate in _CPP_RAW_LITERAL_PREFIXES if value.startswith(candidate)),
+        None,
+    )
+    if prefix is None:
+        return False, None
+    delimiter_start = len(prefix)
+    opener_end = value.find(
+        b"(",
+        delimiter_start,
+        min(
+            len(value),
+            delimiter_start + _CPP_RAW_LITERAL_MAX_DELIMITER_BYTES + 1,
+        ),
+    )
+    if opener_end < 0:
+        return True, None
+    delimiter = value[delimiter_start:opener_end]
+    if any(
+        byte < 0x21 or byte > 0x7E or byte in b"()\\"
+        for byte in delimiter
+    ):
+        return True, None
+    return True, opener_end + 1
+
+
 def _quoted_literal_content_start(value: bytes) -> int | None:
     """Return the bounded opening-delimiter end for a recognized literal."""
 
+    cpp_raw_prefix, cpp_raw_content_start = _cpp_raw_literal_content_start(value)
+    if cpp_raw_prefix:
+        if cpp_raw_content_start is not None:
+            return cpp_raw_content_start
+        # Keep malformed or incomplete raw openers visible to the conservative
+        # boundary walker instead of interpreting the marker as ordinary prose.
+        return value.find(b'"') + 1
     if not _starts_quoted_literal(value):
         return None
     delimiter_start = min(
@@ -10847,7 +10892,10 @@ def _source_literal_candidate_start(
     if not 0 <= scan_start <= content_start <= len(value):
         raise ReviewError("sensitive scanner produced an invalid literal boundary")
     candidates = []
-    for literal_start in range(max(scan_start, content_start - 12), content_start):
+    for literal_start in range(
+        max(scan_start, content_start - _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES),
+        content_start,
+    ):
         relative_content_start = _quoted_literal_content_start(
             value[literal_start:content_start]
         )
@@ -10914,24 +10962,31 @@ def _source_literal_boundary(
         content_start,
         scan_start=scan_start,
     )
-    if literal_start is None:
-        return _SourceLiteralBoundary("proven-not-opener")
-    local_opener = value[literal_start:content_start]
-    if local_opener not in (b"'", b'"'):
-        return _SourceLiteralBoundary("ambiguous")
+    if literal_start is not None:
+        local_opener = value[literal_start:content_start]
+        if local_opener not in (b"'", b'"'):
+            return _SourceLiteralBoundary("ambiguous")
+    local_boundary = content_start if literal_start is None else literal_start
 
     cursor = scan_start
-    while cursor < literal_start:
-        if value.startswith(b"/*", cursor, literal_start):
-            comment_end = value.find(b"*/", cursor + 2, literal_start)
+    while cursor < local_boundary:
+        if value.startswith(b"/*", cursor, local_boundary):
+            comment_end = value.find(b"*/", cursor + 2, scan_end)
             if comment_end < 0:
                 return _SourceLiteralBoundary("ambiguous")
+            if comment_end + 2 > content_start:
+                return _SourceLiteralBoundary("proven-not-opener")
             cursor = comment_end + 2
             continue
-        if value.startswith(b"//", cursor, literal_start) or value[cursor] == 0x23:
-            return _SourceLiteralBoundary("ambiguous")
+        if value.startswith(b"//", cursor, local_boundary) or value[cursor] == 0x23:
+            return _SourceLiteralBoundary("proven-not-opener")
         relative_content_start = _quoted_literal_content_start(
-            value[cursor : min(scan_end, cursor + 16)]
+            value[
+                cursor : min(
+                    scan_end,
+                    cursor + _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES,
+                )
+            ]
         )
         if relative_content_start is None:
             cursor += 1
@@ -10974,6 +11029,11 @@ def _source_literal_boundary(
         if closing_end > content_start:
             return _SourceLiteralBoundary("proven-not-opener")
         cursor = closing_end
+    if literal_start is None:
+        prefix = value[scan_start:content_start]
+        if content_start == scan_start or b"=" in prefix or b":" in prefix:
+            return _SourceLiteralBoundary("ambiguous")
+        return _SourceLiteralBoundary("proven-not-opener")
     backslash_count = 0
     previous = literal_start - 1
     while previous >= scan_start and value[previous] == 0x5C:
@@ -10982,6 +11042,21 @@ def _source_literal_boundary(
     if backslash_count % 2:
         return _SourceLiteralBoundary("ambiguous")
     return _SourceLiteralBoundary("candidate", literal_start)
+
+
+def _source_permission_rust_trivia_end(value: bytes, start: int) -> int | None:
+    """Skip bounded horizontal trivia without guessing nested block comments."""
+
+    cursor = start
+    while True:
+        while cursor < len(value) and value[cursor] in (0x09, 0x20):
+            cursor += 1
+        if not value.startswith(b"/*", cursor):
+            return cursor
+        comment_end = value.find(b"*/", cursor + 2)
+        if comment_end < 0 or value.find(b"/*", cursor + 2, comment_end) >= 0:
+            return None
+        cursor = comment_end + 2
 
 
 def _source_permission_line_comment_is_closed(value: bytes) -> bool:
@@ -10999,13 +11074,22 @@ def _source_permission_line_comment_is_closed(value: bytes) -> bool:
     body = value[introducer_size:]
     if body and body[0] not in (0x09, 0x20):
         return False
+    if not all(byte == 0x09 or 0x20 <= byte <= 0x7E for byte in body):
+        return False
     if hash_comment:
-        token = body.lstrip(b" \t")
-        if token.startswith(b"["):
+        token_start = _source_permission_rust_trivia_end(body, 0)
+        if token_start is None:
             return False
-        if token.startswith(b"!") and token[1:].lstrip(b" \t").startswith(b"["):
+        if body.startswith(b"[", token_start):
             return False
-    return all(byte == 0x09 or 0x20 <= byte <= 0x7E for byte in body)
+        if body.startswith(b"!", token_start):
+            attribute_start = _source_permission_rust_trivia_end(
+                body,
+                token_start + 1,
+            )
+            if attribute_start is None or body.startswith(b"[", attribute_start):
+                return False
+    return True
 
 
 def _bounded_diff_hunk_context_before(
@@ -11147,7 +11231,10 @@ def _source_permission_marker_record_status(
             and _source_literal_candidate_start(
                 value,
                 assignment_start,
-                scan_start=max(assignment_line_start, assignment_start - 12),
+                scan_start=max(
+                    assignment_line_start,
+                    assignment_start - _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES,
+                ),
             )
             is not None
         ):

@@ -6023,6 +6023,12 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "exact",
             ),
             (
+                "hash-comment-after-closed-block",
+                b'    "' + marker + b'",  # /* note */ required\n',
+                True,
+                "exact",
+            ),
+            (
                 "hash-comment-at-proven-eof",
                 b'"' + marker + b'", # required',
                 True,
@@ -6068,6 +6074,18 @@ class PublicPoolScannerTest(unittest.TestCase):
                 True,
                 "not-applicable",
             ),
+            (
+                "unquoted-prose",
+                b"documentation requires " + marker + b" permission\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "hash-comment-prose",
+                b"# documentation requires " + marker + b" permission\n",
+                True,
+                "not-applicable",
+            ),
             ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
             (
                 "assignment-bytes-prefix",
@@ -6089,6 +6107,34 @@ class PublicPoolScannerTest(unittest.TestCase):
                 True,
                 "near-miss",
             ),
+            ("cpp-raw-prefix", b'R"(' + marker + b')"\n', True, "near-miss"),
+            (
+                "cpp-u8-raw-prefix",
+                b'u8R"tag(' + marker + b')tag"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-maximum-delimiter",
+                b'u8R"'
+                + b"d" * 16
+                + b"("
+                + marker
+                + b")"
+                + b"d" * 16
+                + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-incomplete-overlong-delimiter",
+                b'u8R"' + b"d" * 17 + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            ("cpp-u-raw-prefix", b'uR"(' + marker + b')"\n', True, "near-miss"),
+            ("cpp-U-raw-prefix", b'UR"(' + marker + b')"\n', True, "near-miss"),
+            ("cpp-L-raw-prefix", b'LR"(' + marker + b')"\n', True, "near-miss"),
             ("format-prefix", b'f"' + marker + b'",\n', True, "near-miss"),
             ("semicolon", b'"' + marker + b'";\n', True, "near-miss"),
             (
@@ -6222,6 +6268,36 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "near-miss",
             ),
             (
+                "hash-comment-separated-outer-attribute",
+                b'"' + marker + b'", # /* gap */ [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-comment-separated-inner-attribute",
+                b'"' + marker + b'", # ! /* gap */ [allow(dead_code)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-nested-comment-before-attribute",
+                b'"' + marker + b'", # /* outer /* nested */ [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-unclosed-comment-before-attribute",
+                b'"' + marker + b'", # /* gap [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-nonascii-comment",
+                b'"' + marker + b'", # required \xe2\x80\xa8[cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
                 "hash-comment-without-separator",
                 b'"' + marker + b'", #required\n',
                 True,
@@ -6242,6 +6318,36 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "near-miss",
             ),
             ("partial", b'"' + marker + b'"', False, "incomplete"),
+            (
+                "multiline-triple",
+                b'value = """\n' + marker + b'\n"""\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-raw-triple",
+                b'value = r"""\n' + marker + b'\n"""\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-cpp-raw",
+                b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-rust-raw",
+                b'let p = r#"\n' + marker + b'\n"#;\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-template",
+                b'const p = `\n' + marker + b'\n`;\n',
+                True,
+                "near-miss",
+            ),
         )
 
         for label, payload, suffix_context_complete, expected in cases:
@@ -6249,12 +6355,19 @@ class PublicPoolScannerTest(unittest.TestCase):
                 assignment = workspace.SECRET_ASSIGNMENT_PREFIX.search(payload)
                 self.assertIsNotNone(assignment)
                 assert assignment is not None
+                assignment_line_start = (
+                    max(
+                        payload.rfind(b"\n", 0, assignment.start()),
+                        payload.rfind(b"\r", 0, assignment.start()),
+                    )
+                    + 1
+                )
                 status, record_end = (
                     workspace._source_permission_marker_record_status(
                         payload,
                         assignment_start=assignment.start(),
                         assignment_end=assignment.end(),
-                        assignment_line_start=0,
+                        assignment_line_start=assignment_line_start,
                         proof_end=len(payload),
                         diff_surface=label == "diff-line",
                         suffix_context_complete=suffix_context_complete,
@@ -6355,6 +6468,9 @@ class PublicPoolScannerTest(unittest.TestCase):
             b"'" + marker + b"',\n",
             b'values = (\n    "' + marker + b'",  # required for OIDC\n)\n',
             b'values = (\n    "' + marker + b'",  # ! ordinary note\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'",  # /* note */ required for OIDC\n)\n',
             b'values = {\n    "' + marker + b'",  // required for OIDC\n}\n',
             b'(\n    "contents: write",\n    "'
             + marker
@@ -6393,6 +6509,18 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'values = (\n    "'
             + marker
             + b'", # ! [allow(dead_code)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* gap */ [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # ! /* gap */ [allow(dead_code)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* outer /* nested */ [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* gap [cfg(test)]\n)\n',
             b'values = (\n    "' + marker + b'", #required\n)\n',
             b'values = (\n    "'
             + marker
@@ -6455,6 +6583,33 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b'"'
             + b" " * 129
             + b',\n    "statuses: write",\n)\n',
+            b'R"(' + marker + b')"\n',
+            b'u8R"tag(' + marker + b')tag"\n',
+            b'u8R"'
+            + b"d" * 16
+            + b"("
+            + marker
+            + b")"
+            + b"d" * 16
+            + b'"\n',
+            b'u8R"' + b"d" * 17 + marker + b"\n",
+            b'uR"(' + marker + b')"\n',
+            b'UR"(' + marker + b')"\n',
+            b'LR"(' + marker + b')"\n',
+            b'R"('
+            + marker
+            + b')" "'
+            + credential_fragments[0]
+            + b'" "'
+            + credential_fragments[1]
+            + b'" "'
+            + credential_fragments[2]
+            + b'";\n',
+            b'value = """\n' + marker + b'\n"""\n',
+            b'value = r"""\n' + marker + b'\n"""\n',
+            b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+            b'let p = r#"\n' + marker + b'\n"#;\n',
+            b'const p = `\n' + marker + b'\n`;\n',
         )
 
         for payload in accepted:
@@ -6495,6 +6650,40 @@ class PublicPoolScannerTest(unittest.TestCase):
                     direct,
                 )
                 self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32)
+    def test_cpp_raw_permission_marker_opener_split_fails_closed(self) -> None:
+        marker = source_permission_marker()
+        opener = b'u8R"' + b"d" * 16 + b"("
+        record = opener + marker + b")" + b"d" * 16 + b'"\n'
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        padding_size = first_read_size - len(opener)
+        padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+        payload = padding + record
+        self.assertEqual(len(padding + opener), first_read_size)
+
+        direct = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertTrue(
+            direct.blocking_rule == "generic-secret-assignment"
+            or direct.unextractable_rule == "generic-secret-assignment",
+            direct,
+        )
+        self.assertEqual(streamed, direct)
 
     @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
     @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 16)

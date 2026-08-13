@@ -378,6 +378,15 @@ class WorkspaceTest(unittest.TestCase):
                 + b'",  // required for OIDC\n'
                 b"};\n",
             ),
+            (
+                "python-hash-comment-after-block-note",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",  # /* note */ required for OIDC\n'
+                b")\n",
+            ),
         ):
             with self.subTest(case=label):
                 clean_base = git(self.repo, "rev-parse", "HEAD")
@@ -541,6 +550,34 @@ class WorkspaceTest(unittest.TestCase):
                 + b'", # ! [allow(dead_code)]\n];\n',
             ),
             (
+                "hash-comment-separated-outer-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* gap */ [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-comment-separated-inner-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # ! /* gap */ [allow(dead_code)]\n];\n',
+            ),
+            (
+                "hash-nested-comment-before-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* outer /* nested */ [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-unclosed-comment-before-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* gap [cfg(test)]\n];\n',
+            ),
+            (
                 "slash-comment-unicode-line-separator",
                 ".js",
                 b'values = [\n    "'
@@ -657,6 +694,67 @@ class WorkspaceTest(unittest.TestCase):
                 + b'"\nL"'
                 + credential_fragments[1]
                 + b'";\n',
+            ),
+            ("cpp-raw-r", ".cc", b'R"(' + marker + b')"\n'),
+            (
+                "cpp-raw-u8r-custom-delimiter",
+                ".cc",
+                b'u8R"tag(' + marker + b')tag"\n',
+            ),
+            (
+                "cpp-raw-u8r-maximum-delimiter",
+                ".cc",
+                b'u8R"'
+                + b"d" * 16
+                + b"("
+                + marker
+                + b")"
+                + b"d" * 16
+                + b'"\n',
+            ),
+            (
+                "cpp-raw-u8r-incomplete-overlong-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 17 + marker + b"\n",
+            ),
+            ("cpp-raw-ur", ".cc", b'uR"(' + marker + b')"\n'),
+            ("cpp-raw-uppercase-u-r", ".cc", b'UR"(' + marker + b')"\n'),
+            ("cpp-raw-lr", ".cc", b'LR"(' + marker + b')"\n'),
+            (
+                "cpp-raw-adjacent-literals",
+                ".cc",
+                b'R"('
+                + marker
+                + b')" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "python-multiline-triple",
+                ".py",
+                b'value = """\n' + marker + b'\n"""\n',
+            ),
+            (
+                "python-multiline-raw-triple",
+                ".py",
+                b'value = r"""\n' + marker + b'\n"""\n',
+            ),
+            (
+                "cpp-multiline-raw",
+                ".cc",
+                b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+            ),
+            (
+                "rust-multiline-raw",
+                ".rs",
+                b'let p = r#"\n' + marker + b'\n"#;\n',
+            ),
+            (
+                "javascript-multiline-template",
+                ".js",
+                b'const p = `\n' + marker + b'\n`;\n',
             ),
         ):
             with self.subTest(case=label):

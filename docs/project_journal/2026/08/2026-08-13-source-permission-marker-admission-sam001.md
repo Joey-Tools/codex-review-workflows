@@ -51,11 +51,20 @@ superseded_by:
   alternate line separators, and incomplete records remain near-misses.
 - Whitespace-separated Rust outer and inner attribute tokens after `#` remain
   directives rather than comments and therefore fail closed.
+- C++ raw-string prefixes and bounded custom delimiters are recognized as
+  non-plain literal boundaries. A marker whose opener is not proved on its
+  physical record, including multiline raw, triple-quoted, and template forms,
+  remains a near-miss rather than entering the plain-literal exception.
+- The bounded `#` tail check skips only horizontal whitespace and one or more
+  closed non-nested ASCII block comments while looking for Rust attribute
+  tokens. Nested, unclosed, and non-ASCII forms remain near-misses; this is a
+  conservative token check, not a general-purpose source-language parser.
 
 ## Evidence
 
-- Twelve focused parser/admission regressions passed on Python 3.13.0.
-- `PublicPoolScannerTest`: 119 tests passed.
+- Focused classifier, direct/stream, and Git-tree admission regressions passed
+  on Python 3.13.0.
+- `PublicPoolScannerTest`: 120 tests passed.
 - `WorkspaceTest`: 308 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
@@ -78,3 +87,7 @@ superseded_by:
 - The next formal review identified whitespace-separated Rust attributes that
   the generic `#` comment grammar still admitted. Classifier, direct/stream,
   and Git-tree regressions now reject both outer and inner attribute forms.
+- Formal review then identified unproved multiline and C++ raw-literal
+  boundaries plus Rust attributes separated by block comments. The bounded
+  classifier now admits the marker exception only from a proved plain-literal
+  content start and keeps those ambiguous forms fail closed.
