@@ -3,7 +3,7 @@ id: 20260813-sam001
 title: Source Permission Marker Admission
 status: completed
 created: 2026-08-13
-updated: 2026-08-13
+updated: 2026-08-14
 branch: wip/secret-admission-marker-fix
 pr:
 supersedes: []
@@ -66,12 +66,22 @@ superseded_by:
   closed non-nested ASCII block comments while looking for Rust attribute
   tokens. Nested, unclosed, and non-ASCII forms remain near-misses; this is a
   conservative token check, not a general-purpose source-language parser.
+- A `#` before the candidate is treated as an ordinary comment only when the
+  same closed grammar proves it. C/C++ preprocessor directives and Rust
+  attributes remain ambiguous and fail closed.
+- Markdown fence state advances monotonically once per scanner value instead
+  of rescanning from byte zero for each marker. The prose proof also retains
+  physical indentation, so four-space and tab-indented code remain opaque.
+- A bounded `R"` occurrence before a marker outside the 128-byte record keeps
+  malformed, overlong, and incomplete C++ raw openers ambiguous. The accepted
+  delimiter bound remains 16 bytes; this is a conservative opener proof, not a
+  general C++ parser.
 
 ## Evidence
 
 - Focused classifier, direct/stream, and Git-tree admission regressions passed
   on Python 3.13.0.
-- `PublicPoolScannerTest`: 121 tests passed.
+- `PublicPoolScannerTest`: 123 tests passed.
 - `WorkspaceTest`: 308 tests passed with one expected skip.
 - Ruff checks passed for the runtime and both changed test modules.
 - Fresh review identified the cross-line continuation boundary; the follow-up
@@ -102,3 +112,8 @@ superseded_by:
   and quoted prose outside source literals. Direct, streamed, and Git-tree
   regressions cover 9, 255, and over-limit hash counts plus the closed prose and
   code-context matrices.
+- Formal whole-range review then identified ambiguous `#` prefixes, repeated
+  Markdown fence scans, over-window C++ raw openers, and lost Markdown
+  indentation. Classifier, direct/stream, dense-input, and isolated Git-tree
+  regressions cover all four boundaries without widening the plain-marker
+  exception.

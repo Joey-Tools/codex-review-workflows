@@ -352,6 +352,11 @@ class WorkspaceTest(unittest.TestCase):
                 b'- Use "' + marker + b'" permission.\n',
             ),
             (
+                "python-hash-comment-prose",
+                ".py",
+                b'# documentation requires "' + marker + b'" permission\n',
+            ),
+            (
                 "html-text-prose",
                 ".html",
                 b'<p>Use "' + marker + b'" permission.</p>\n',
@@ -753,6 +758,11 @@ class WorkspaceTest(unittest.TestCase):
                 ".cc",
                 b'u8R"' + b"d" * 17 + marker + b"\n",
             ),
+            (
+                "cpp-raw-u8r-overlong-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 17 + b"(" + marker + b"\n",
+            ),
             ("cpp-raw-ur", ".cc", b'uR"(' + marker + b')"\n'),
             ("cpp-raw-uppercase-u-r", ".cc", b'UR"(' + marker + b')"\n'),
             ("cpp-raw-lr", ".cc", b'LR"(' + marker + b')"\n'),
@@ -819,6 +829,41 @@ class WorkspaceTest(unittest.TestCase):
                 "markdown-fenced-code-marker",
                 ".md",
                 b'```text\nUse "' + marker + b'" permission.\n```\n',
+            ),
+            (
+                "markdown-four-space-indented-code-marker",
+                ".md",
+                b'    Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "markdown-tab-indented-code-marker",
+                ".md",
+                b'\tUse "' + marker + b'" permission.\n',
+            ),
+            (
+                "cpp-raw-u8r-over-window-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+            ),
+            (
+                "cpp-raw-u8r-over-window-incomplete-opener",
+                ".cc",
+                b'u8R"' + b"d" * 129 + marker + b"\n",
+            ),
+            (
+                "c-preprocessor-define-marker",
+                ".h",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+            ),
+            (
+                "c-preprocessor-spaced-define-marker",
+                ".h",
+                b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+            ),
+            (
+                "rust-doc-attribute-marker",
+                ".rs",
+                b'#[doc = "' + marker + b'"]\n',
             ),
             (
                 "python-multiline-triple",

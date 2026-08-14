@@ -11018,8 +11018,12 @@ def _source_literal_boundary(
                 return _SourceLiteralBoundary("proven-not-opener")
             cursor = comment_end + 2
             continue
-        if value.startswith(b"//", cursor, local_boundary) or value[cursor] == 0x23:
+        if value.startswith(b"//", cursor, local_boundary):
             return _SourceLiteralBoundary("proven-not-opener")
+        if value[cursor] == 0x23:
+            if _source_permission_line_comment_is_closed(value[cursor:scan_end]):
+                return _SourceLiteralBoundary("proven-not-opener")
+            return _SourceLiteralBoundary("ambiguous")
         relative_content_start = _quoted_literal_content_start(
             value[
                 cursor : min(
@@ -11129,6 +11133,37 @@ def _source_permission_line_comment_is_closed(value: bytes) -> bool:
             )
             if attribute_start is None or body.startswith(b"[", attribute_start):
                 return False
+        token_end = token_start
+        while token_end < len(body) and (
+            body[token_end] == 0x5F
+            or 0x30 <= body[token_end] <= 0x39
+            or 0x41 <= body[token_end] <= 0x5A
+            or 0x61 <= body[token_end] <= 0x7A
+        ):
+            token_end += 1
+        if body[token_start:token_end].lower() in {
+            b"define",
+            b"elif",
+            b"elifdef",
+            b"elifndef",
+            b"else",
+            b"embed",
+            b"endif",
+            b"error",
+            b"if",
+            b"ifdef",
+            b"ifndef",
+            b"import",
+            b"include",
+            b"include_next",
+            b"line",
+            b"pragma",
+            b"region",
+            b"undef",
+            b"using",
+            b"warning",
+        }:
+            return False
     return True
 
 
@@ -11141,36 +11176,74 @@ _SOURCE_PERMISSION_MARKDOWN_FENCE = re.compile(
 )
 
 
+@dataclass
+class _SourcePermissionMarkdownFenceTracker:
+    """Advance Markdown fence state once across ordered source records."""
+
+    value: bytes
+    prefix_context_complete: bool
+    _matches: Iterator[re.Match[bytes]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _pending: re.Match[bytes] | None = field(default=None, init=False, repr=False)
+    _fence: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _last_record_start: int = field(default=-1, init=False, repr=False)
+
+    def _advance_match(self) -> None:
+        if self._matches is None:
+            self._matches = iter(_SOURCE_PERMISSION_MARKDOWN_FENCE.finditer(self.value))
+        self._pending = next(self._matches, None)
+
+    def inside(self, record_start: int) -> bool:
+        if not 0 <= record_start <= len(self.value):
+            raise ReviewError(
+                "sensitive scanner produced an invalid Markdown record boundary"
+            )
+        if not self.prefix_context_complete:
+            return True
+        if record_start < self._last_record_start:
+            return True
+        if self._matches is None:
+            self._advance_match()
+        while self._pending is not None and self._pending.start() < record_start:
+            delimiter = self._pending.group("fence")
+            marker = delimiter[0]
+            tail = self._pending.group("tail")
+            if self._fence is None:
+                if marker != 0x60 or b"`" not in tail:
+                    self._fence = marker, len(delimiter)
+            elif (
+                marker == self._fence[0]
+                and len(delimiter) >= self._fence[1]
+                and not tail.strip(b" \t")
+            ):
+                self._fence = None
+            self._advance_match()
+        self._last_record_start = record_start
+        return self._fence is not None
+
+
 def _source_permission_inside_markdown_fence(
     value: bytes,
     *,
     record_start: int,
     prefix_context_complete: bool,
+    tracker: _SourcePermissionMarkdownFenceTracker | None = None,
 ) -> bool:
     """Conservatively identify a Markdown fence before one physical record."""
 
-    if not prefix_context_complete:
-        return True
-    fence: tuple[int, int] | None = None
-    for match in _SOURCE_PERMISSION_MARKDOWN_FENCE.finditer(
-        value,
-        0,
-        record_start,
+    if tracker is None:
+        tracker = _SourcePermissionMarkdownFenceTracker(
+            value,
+            prefix_context_complete,
+        )
+    elif tracker.value is not value or (
+        tracker.prefix_context_complete != prefix_context_complete
     ):
-        delimiter = match.group("fence")
-        marker = delimiter[0]
-        tail = match.group("tail")
-        if fence is None:
-            if marker == 0x60 and b"`" in tail:
-                continue
-            fence = marker, len(delimiter)
-        elif (
-            marker == fence[0]
-            and len(delimiter) >= fence[1]
-            and not tail.strip(b" \t")
-        ):
-            fence = None
-    return fence is not None
+        raise ReviewError("sensitive scanner reused the wrong Markdown fence tracker")
+    return tracker.inside(record_start)
 
 
 def _source_permission_marker_is_proven_prose(
@@ -11180,15 +11253,23 @@ def _source_permission_marker_is_proven_prose(
     record_start: int,
     literal_start: int,
     literal_end: int,
+    leading_indent: bytes,
     diff_surface: bool,
     prefix_context_complete: bool,
+    markdown_fence_tracker: _SourcePermissionMarkdownFenceTracker | None = None,
 ) -> bool:
     """Accept a closed subset of prose around one exact quoted marker."""
 
-    if diff_surface or _source_permission_inside_markdown_fence(
-        value,
-        record_start=record_start,
-        prefix_context_complete=prefix_context_complete,
+    if (
+        diff_surface
+        or b"\t" in leading_indent
+        or len(leading_indent) >= 4
+        or _source_permission_inside_markdown_fence(
+            value,
+            record_start=record_start,
+            prefix_context_complete=prefix_context_complete,
+            tracker=markdown_fence_tracker,
+        )
     ):
         return False
     prefix = record[:literal_start]
@@ -11286,6 +11367,22 @@ _SourcePermissionMarkerRecordStatus = Literal[
 ]
 
 
+def _source_permission_has_unproved_cpp_raw_opener(
+    value: bytes,
+    *,
+    record_start: int,
+    marker_start: int,
+) -> bool:
+    """Return whether bounded line proof cannot exclude a C++ raw opener."""
+
+    if not 0 <= record_start <= marker_start <= len(value):
+        raise ReviewError("sensitive scanner produced an invalid raw opener range")
+    proof_start = max(record_start, marker_start - MAX_SECRET_PREFIX_PROOF_BYTES)
+    if proof_start > record_start:
+        return True
+    return value.rfind(b'R"', proof_start, marker_start) >= 0
+
+
 def _source_permission_marker_record_status(
     value: bytes,
     *,
@@ -11296,6 +11393,7 @@ def _source_permission_marker_record_status(
     diff_surface: bool,
     prefix_context_complete: bool,
     suffix_context_complete: bool,
+    markdown_fence_tracker: _SourcePermissionMarkdownFenceTracker | None = None,
 ) -> tuple[_SourcePermissionMarkerRecordStatus, int]:
     """Classify one bounded source record that may contain the permission marker."""
 
@@ -11342,15 +11440,22 @@ def _source_permission_marker_record_status(
     if assignment_end > line_end:
         if (
             value.startswith(marker_key, assignment_start, assignment_end)
-            and _source_literal_candidate_start(
-                value,
-                assignment_start,
-                scan_start=max(
-                    assignment_line_start,
-                    assignment_start - _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES,
-                ),
+            and (
+                _source_literal_candidate_start(
+                    value,
+                    assignment_start,
+                    scan_start=max(
+                        assignment_line_start,
+                        assignment_start - _SOURCE_LITERAL_MAX_LOCAL_OPENER_BYTES,
+                    ),
+                )
+                is not None
+                or _source_permission_has_unproved_cpp_raw_opener(
+                    value,
+                    record_start=assignment_line_start,
+                    marker_start=assignment_start,
+                )
             )
-            is not None
         ):
             return "near-miss", assignment_end
         return "not-applicable", assignment_end
@@ -11362,8 +11467,10 @@ def _source_permission_marker_record_status(
             return "not-applicable", assignment_end
         record = record[1:]
         record_start += 1
+    physical_record_start = record_start
     stripped_record = record.lstrip(b" \t")
-    record_start += len(record) - len(stripped_record)
+    leading_indent = record[: len(record) - len(stripped_record)]
+    record_start += len(leading_indent)
     record = stripped_record
     marker_start = assignment_start - record_start
     if marker_start < 0 or not record.startswith(marker_key, marker_start):
@@ -11401,11 +11508,13 @@ def _source_permission_marker_record_status(
         if literal_start != 0 and _source_permission_marker_is_proven_prose(
             value,
             record=record,
-            record_start=record_start,
+            record_start=physical_record_start,
             literal_start=literal_start,
             literal_end=exact_literal_end,
+            leading_indent=leading_indent,
             diff_surface=diff_surface,
             prefix_context_complete=prefix_context_complete,
+            markdown_fence_tracker=markdown_fence_tracker,
         ):
             # Preserve the public not-applicable classification while carrying
             # the complete proved-prose record boundary to the event reducer.
@@ -13760,6 +13869,10 @@ def _iter_secret_events(
     )
     assignment_line_search_start = 0
     assignment_line_start = 0
+    markdown_fence_tracker = _SourcePermissionMarkdownFenceTracker(
+        value,
+        prefix_context_complete,
+    )
     pending_specific_cursor = 0
     closed_assignment_proof_frontier: int | None = (
         0 if prefix_context_complete and not diff_surface else None
@@ -13819,6 +13932,7 @@ def _iter_secret_events(
                 diff_surface=diff_surface,
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=proof_suffix_context_complete,
+                markdown_fence_tracker=markdown_fence_tracker,
             )
         )
         source_marker_proved_nonsecret = (

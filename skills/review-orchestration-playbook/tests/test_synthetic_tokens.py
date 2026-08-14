@@ -6061,6 +6061,18 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "not-applicable",
             ),
             (
+                "markdown-four-space-indented-code",
+                b'    Use "' + marker + b'" permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-tab-indented-code",
+                b'\tUse "' + marker + b'" permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
                 "html-prose-with-quoted-marker",
                 b'<p>Use "' + marker + b'" permission.</p>\n',
                 True,
@@ -6109,6 +6121,30 @@ class PublicPoolScannerTest(unittest.TestCase):
                 b"# documentation requires " + marker + b" permission\n",
                 True,
                 "not-applicable",
+            ),
+            (
+                "hash-comment-quoted-prose",
+                b'# documentation requires "' + marker + b'" permission\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "hash-define-literal",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-spaced-define-literal",
+                b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-doc-attribute-literal",
+                b'#[doc = "' + marker + b'"]\n',
+                True,
+                "near-miss",
             ),
             ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
             (
@@ -6183,6 +6219,18 @@ class PublicPoolScannerTest(unittest.TestCase):
             (
                 "cpp-u8-raw-incomplete-overlong-delimiter",
                 b'u8R"' + b"d" * 17 + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-over-window-delimiter",
+                b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-over-window-incomplete-opener",
+                b'u8R"' + b"d" * 129 + marker + b"\n",
                 True,
                 "near-miss",
             ),
@@ -6511,6 +6559,11 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("ordinary-prose", ordinary, False),
             ("plain-prose", plain_prose, False),
             ("markdown-list-prose", markdown_list_prose, False),
+            (
+                "hash-comment-prose",
+                b'# documentation requires "' + marker + b'" permission\n',
+                False,
+            ),
             ("html-prose", html_prose, False),
             ("html-comment", html_comment, False),
             ("inner-quoted-prose", inner_quoted, False),
@@ -6539,6 +6592,26 @@ class PublicPoolScannerTest(unittest.TestCase):
             (
                 "markdown-fenced-code",
                 b'```text\nUse "' + marker + b'" permission.\n```\n',
+                True,
+            ),
+            (
+                "markdown-four-space-indented-code",
+                b'    Use "' + marker + b'" permission.\n',
+                True,
+            ),
+            (
+                "markdown-tab-indented-code",
+                b'\tUse "' + marker + b'" permission.\n',
+                True,
+            ),
+            (
+                "hash-define-literal",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+            ),
+            (
+                "rust-doc-attribute-literal",
+                b'#[doc = "' + marker + b'"]\n',
                 True,
             ),
         ):
@@ -6730,6 +6803,8 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b"d" * 16
             + b'"\n',
             b'u8R"' + b"d" * 17 + marker + b"\n",
+            b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+            b'u8R"' + b"d" * 129 + marker + b"\n",
             b'uR"(' + marker + b')"\n',
             b'UR"(' + marker + b')"\n',
             b'LR"(' + marker + b')"\n',
@@ -6747,6 +6822,11 @@ class PublicPoolScannerTest(unittest.TestCase):
             b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
             b'let p = r#"\n' + marker + b'\n"#;\n',
             b'const p = `\n' + marker + b'\n`;\n',
+            b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+            b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+            b'#[doc = "' + marker + b'"]\n',
+            b'    Use "' + marker + b'" permission.\n',
+            b'\tUse "' + marker + b'" permission.\n',
         )
 
         for payload in accepted:
@@ -6788,6 +6868,36 @@ class PublicPoolScannerTest(unittest.TestCase):
                 )
                 self.assertEqual(streamed, direct)
 
+    def test_dense_permission_marker_prose_scans_markdown_fences_once(self) -> None:
+        marker = source_permission_marker()
+        payload = (b'Use "' + marker + b'" permission.\n') * 256
+        original_pattern = workspace._SOURCE_PERMISSION_MARKDOWN_FENCE
+
+        class CountingPattern:
+            def __init__(self) -> None:
+                self.finditer_calls = 0
+
+            def finditer(self, *args: object, **kwargs: object):
+                self.finditer_calls += 1
+                return original_pattern.finditer(*args, **kwargs)
+
+        counting_pattern = CountingPattern()
+        with mock.patch.object(
+            workspace,
+            "_SOURCE_PERMISSION_MARKDOWN_FENCE",
+            counting_pattern,
+        ):
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.blocking_candidates, {})
+        self.assertEqual(counting_pattern.finditer_calls, 1)
+
     @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
     @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32)
     @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32)
@@ -6821,6 +6931,44 @@ class PublicPoolScannerTest(unittest.TestCase):
             direct,
         )
         self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 512)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 320)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256)
+    def test_cpp_raw_overlong_opener_split_fails_closed(self) -> None:
+        marker = source_permission_marker()
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        for label, opener in (
+            ("overlong-delimiter", b'u8R"' + b"d" * 17 + b"("),
+            ("over-window-delimiter", b'u8R"' + b"d" * 129 + b"("),
+            ("over-window-incomplete", b'u8R"' + b"d" * 129),
+        ):
+            with self.subTest(case=label):
+                padding_size = first_read_size - len(opener)
+                padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+                payload = padding + opener + marker + b"\n"
+                self.assertEqual(len(padding + opener), first_read_size)
+
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
 
     @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 512)
     @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 320)
