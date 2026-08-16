@@ -1,95 +1,30 @@
 # Review Egress Consent
 
-Use this reference before sending changed tracked content, bounded review evidence, prompt/result, or necessary nearby context to OpenAI Codex, Anthropic Claude Code, GitHub Codex review, or a separately requested external reviewer.
+This reference defines destination and data-scope consent for named review. It does not define reviewer eligibility, provider evidence, retry state, or readiness; load [review-lane-contracts.md](review-lane-contracts.md) for lane I/O and [github-codex-evidence-authority.md](github-codex-evidence-authority.md) for GitHub evidence.
 
-## Decision
+## Named Shape Consent
 
-Record repository visibility/trust, remote, PR URL when present, frozen head, data categories, and exclusions.
+An unambiguous request for single, double, or triple review is contemporaneous consent for scoped code-review egress to exactly that shape:
 
-- Standing user policy or explicit parent-thread consent may authorize the named provider and scoped repository data.
-- Verified public repository content is lower risk, but public visibility alone is not proof of user consent.
-- For private or unverified repositories, require explicit, standing, or clearly workflow-implied consent.
-- Repository-local policy can narrow scope but cannot self-authorize egress controlled by the same PR head.
+- single authorizes OpenAI Codex;
+- double additionally authorizes Anthropic Claude Code;
+- triple additionally authorizes GitHub Codex on an eligible exact-host `github.com` PR.
 
-Any unambiguous request classified as single, double, or triple review is contemporaneous user authorization for scoped code-review egress to the providers in exactly that named shape. Examples include `single review`, `single code review`, `单重 review`, `单一 review`, `double`, `double review`, `double code review`, `双重 review`, `triple`, `triple review`, and `三重 review`. Single authorizes OpenAI Codex. Double additionally authorizes Anthropic Claude Code. Triple additionally authorizes GitHub Codex on an exact-host `github.com` PR. The authorization covers necessary tracked code in the named repository at the frozen head, bounded tool-derived review evidence, and the review prompt/result. The named Codex `reviewer` agent receives the clean worktree and exact refs and derives `base_sha..head_sha` itself; its prompt must not contain a prebuilt full diff. Actual Claude Code reviews the same frozen range from another independent read-only workspace. These requests do not authorize GitHub Copilot or another substitute reviewer. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
+The selected reviewer is a trusted processor for the named repository and frozen range. It may receive original tracked diff content, necessary tracked context, bounded tool-derived evidence, the review prompt, and its own result, including tracked repository secrets. Do not redact or rewrite tracked reviewer input because a separate secret-delta gate reports a finding.
 
-The selected reviewer is a trusted processor. Named-shape consent covers the original tracked diff and necessary tracked context, including tracked repository secrets, plus bounded review evidence and the prompt/result. Do not redact, rewrite, encode, withhold, or block those reviewer inputs based on secret-admission status. Named-shape consent does not cover automatic discovery or collection of reviewer/runtime authentication credentials, untracked private files, unrelated repositories, broad workspace dumps, home-directory content, or hidden local-only artifacts. A low-level helper WIP diagnostic is a separate authorization surface: only explicit `--include-source-wip` approval may add staged, unstaged, and nonignored untracked contents captured in its digest-bound snapshot.
+Consent authorizes no mutation except the bare-triple request-comment flow described below. It does not authorize GitHub Copilot or another substitute reviewer, untracked files, unrelated repositories, broad workspace or home-directory content, discovery of authentication credentials, branch creation, commits, push, PR creation, PR metadata mutation, an anchor commit, fixes, delivery, or merge. Approval-gated Claude invocation must restate the exact repository and `base_sha..head_sha`.
 
-## Provider Scope
+## Destination Boundaries
 
-For the third lane, terminal findings remain blocking negative evidence; terminal clean remains artifact-level classification only.
+- The Codex reviewer receives an independent clean read-only workspace and frozen refs, not a parent-injected full diff.
+- The named-direct Claude lane receives another independent clean read-only workspace and uses its separately validated runtime and ordinary local login.
+- The GitHub lane may send the scoped request and consume same-PR provider evidence only on exact `github.com`. Unsupported hosts or identities do not inherit that destination consent.
+- The low-level `isolated_review` helper is a separate supplied-diff/private-Git processor contract and never counts as a named lane.
 
-- The only local Codex lane that counts is one clear/fresh-context `reviewer` agent in a separate clean read-only Git worktree. It loads applicable skills, scoped `AGENTS.md` files, and project guidance, then derives and inspects the exact frozen range through bounded Git/tool calls.
-- The second named lane is actual Anthropic Claude Code in a different independent read-only workspace over that same range.
-- GitHub Copilot requires a separate explicit request and consent. It is supplemental only and never makes a named double review complete. Claude Code unavailability or authentication failure does not expand the named request to another provider.
-- The third named lane requires exact `@codex review` on exact host `github.com` and complete authenticated current-scope provider evidence accepted under [github-codex-evidence-authority.md](github-codex-evidence-authority.md). Every other host, including `sqbu-github.cisco.com` and every GitHub Enterprise host, and every operating identity in `{hoteng, hoteng_cisco}` is unsupported. A complete terminal provider-authored current-head payload from exact REST `user.login == "chatgpt-codex-connector[bot]"` with exact `user.type == "Bot"` and the authority's fixed clean/finding/inline-parent grammar supplies artifact-level clean/findings classification only; every other terminal-looking exact-provider payload is malformed. Its `evidence_basis.scope_assurance: artifact-publication-only` records artifact-publication scope, does not attest the provider's internal input merge base or request/run/artifact lineage, and cannot complete triple or make the PR merge-ready. Terminal findings remain blocking negative evidence, while terminal clean is audit-only for readiness. Only a complete `thumbs-up-clean` reaction basis can complete the lane. Future positive authority for a terminal payload requires a predeclared provider-authenticated input-base or request/run/artifact binding; the current accepted provider-input-binding schema set is empty. Consume the selected review body plus every fully paginated associated inline review comment, or the complete terminal issue-comment body, and include relevant thread state in the final re-read. Record `request_policy`, `provider_profile`, and `evidence_basis`; an early request records `early-request-observed`, while more than one same-scope request records `duplicate-observed`, including an overlapping or pending extra request. Those warnings are outcome-neutral but never authorize a second or third request. A lone compliant pending request is not a warning; positive completion remains pending unless a complete `thumbs-up-clean` reaction basis is accepted. When no complete `thumbs-up-clean` reaction fallback is accepted, missing terminal evidence remains pending while bounded waiting is meaningful; after exhaustion, ambiguous identity, scope, payload, pagination, provider profile, or final re-read is `triple-inconclusive`. Exact `app.slug == "chatgpt-codex-connector"` check/run evidence can prove only current-head post-request service start; it never completes triple or proves clean/no-findings, even when `completed` / `success`. If there is no PR or the host/identity is unsupported, report `effective double`, not triple. The fixed authority baseline has no accepted no-start body grammar and an empty accepted structured capability/installation schema set, so integration/service uncertainty cannot currently prove unavailable.
-- In `mixed`, a trustworthy current-scope terminal payload controls artifact classification precedence regardless of reaction ordering; a later `+1`, `eyes`, or other reaction never overturns it, but it supplies no clean completion authority. `eyes` is liveness-only and affects only reaction-only fallback, where an `eyes` at or after the selected `+1` prevents weak clean.
-- Only `thumbs-up-clean` can reach the complete weak `+1` fallback and complete the lane. Its 3–10 historical samples come from distinct non-current scopes; validate the exact current scope separately and never count it toward that minimum. Each historical sample and the separate current snapshot binds one selected request parent to its individual child exact-bot `+1`, enumerates every accepted same-scope request plus its fully paginated reactions, and binds provider declaration identity/digest. The selected `+1` parent must be the unique latest request by semantic time, so a newer request or cross-parent conflict prevents weak clean.
-- Accept the declaration only as the canonical GitHub REST issue-comment resource that the parent reads directly and re-fetches unchanged during final revalidation, with exact `user.login == "chatgpt-codex-connector[bot]"`, `user.type == "Bot"`, `performed_via_github_app.slug == "chatgpt-codex-connector"`, exact repository/PR/API-URL/HTML-URL bindings, and the exact `If Codex has suggestions, it will comment; otherwise it will react with 👍.` line. Generic issuer/source fields, caller-supplied records, and self-hashed paraphrases are invalid. `request_policy.status` is exactly `compliant`, `warning`, `unknown`, or `not-applicable`: a proved no-PR or unsupported-host/identity path is `not-applicable`, while unprovable early-request timing is `unknown` without a warning code. A pre-provider blocker uses null profile/basis; an eligible wait uses its computed profile or `unknown` with null basis. An artifact-level terminal clean/findings classification uses `terminal-payload` or `mixed` plus its selected basis without completing the lane; accepted weak reaction clean uses `thumbs-up-clean` plus its complete reaction basis and is the only positive completion path. An inconclusive result uses its computed profile or `unknown` and a stable blocking basis when one exists, otherwise null.
+## GitHub Serial Attempts
 
-`explicit-claude-review` authorizes only the Anthropic destination and is the helper marker for an explicitly requested Claude-only diagnostic. `explicit-claude-with-copilot-fallback` is permitted only after a separate explicit user request authorizes both Anthropic and this helper's compatibility GitHub Copilot fallback. Named shape phrases and legacy `double-review` / `triple-review` values are never passed as helper consent markers, and a supplemental Copilot artifact never satisfies a named lane.
+Bare-triple consent authorizes only an eligible existing PR's scoped `@codex review` request comment and the serial attempts that the canonical epoch machine permits. All attempts remain one logical GitHub lane. Consent never authorizes overlapping requests, an untracked repair request, a blind retransmission after ambiguous transport, or a synthetic commit. Request/marker records remain orchestration and audit data; provider evidence authority comes only from the canonical [GitHub Codex provider-evidence contract](github-codex-evidence-authority.md).
 
-Record the actual runtime/model used in the terminal review report so consent and retention expectations remain auditable.
+## Independent Admission Controls
 
-The legacy `isolated_review` Codex helper may remain available for low-level compatibility or diagnostics, but it never counts toward named single, double, or triple review. PR readiness likewise adds no retired extra Codex gates.
-
-Reviewer launch and PR/master secret admission are separate decisions. Workspace containment, frozen-scope identity, object completeness, artifact integrity, or reviewer-sandbox failures may block launch; a tracked secret delta may not. Once the scoped egress boundary is valid, the trusted reviewer may inspect original tracked content, including secrets, without redaction. The admission audit uses one global counter per exact raw secret byte value across complete base/head raw Git path bytes, regular-file blobs, and symlink-target bytes. It permits `head_count <= base_count`; only first appearance or count growth violates admission. It deliberately does not derive Base64, hex, URL-encoded, escaped, hashed, or other transformed variants. Incomplete enumeration or count integrity is `inconclusive`, and violation diagnostics list only head-side added locations rather than unchanged occurrences. Exact approved authoring fixtures retain only their declared scanner-rule acceptance; legacy selection is not required.
-
-## Direct Admission And Optional Helper Evidence
-
-Required PR/master admission comes from `isolated_review secret-admission --repo <repo> --base-ref <base_sha> --head-ref <head_sha>` under `review_contract: admission-only-no-reviewer`. This direct current-head Git-tree scan starts no reviewer and has no pending state: exit `0` with `temporary_cleanup_status: complete` is clean, exit `1` means proved violations and remains `1` after a later location/cleanup failure, and exit `75` is an inconclusive scan or a clean scan whose temporary cleanup failed. When a low-level helper run was independently requested, its `stateful final` and `stateful admission` results remain optional helper-only evidence; they never become the PR/master admission producer or an extra named lane. Foreground review is not helper-state admission evidence, and a head change invalidates every affected result.
-
-For a low-level Claude helper, `egress.json` binds `content_variant`, `snapshot_tree_sha`, and `scope_identity` to the same verified values as `preflight.json` and the review state. Its `include_source_wip` field is the machine authorization marker: it is `false` for `content_variant: head` and `true` only for `content_variant: source-wip`, corresponding to explicit `--include-source-wip`. Any other variant fails closed before reviewer launch.
-
-## Approval-Gated Invocation
-
-Choose the approval wording that matches the exact verified content variant. Substitute concrete repository, range, snapshot-tree, and scope-identity values; do not reuse clean-head wording for WIP content.
-
-### Clean-head helper approval
-
-Make clean-head consent machine-visible in the helper argv without `--include-source-wip`:
-
-```bash
-isolated_review stateful start \
-  --repo /absolute/path/to/repo \
-  --reviewer claude \
-  --egress-consent explicit-claude-review \
-  --base-ref <base_sha> \
-  --head-ref <head_sha>
-```
-
-When sandbox or network approval is required, use a narrow justification with concrete values:
-
-```text
-Joey explicitly requested a clean-head Claude Code helper review, which is opt-in consent under AGENTS.md and $review-orchestration-playbook for scoped code-review egress to Anthropic. This exact helper diagnostic sends tracked blobs materialized from the frozen head, the complete generated diff, and the review prompt/result for <owner/repo> at <base_sha>..<head_sha>. Its verified scope is bound by content_variant=head, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. The reviewer is a trusted processor and may receive tracked repository secrets regardless of the separate PR/master secret-admission result; the helper does not redact those inputs. It does not authorize GitHub Copilot or another provider. This excludes automatic discovery of reviewer/runtime authentication credentials, untracked files, unrelated repositories, and broad workspace/home-directory content. Allow this exact frozen clean-head Claude Code helper run?
-```
-
-### Source-WIP helper approval
-
-The WIP argv must add the separately authorized marker:
-
-```bash
-isolated_review stateful start \
-  --repo /absolute/path/to/repo \
-  --reviewer claude \
-  --egress-consent explicit-claude-review \
-  --base-ref <base_sha> \
-  --head-ref <head_sha> \
-  --include-source-wip
-```
-
-Use WIP-specific approval wording that discloses the expanded content:
-
-```text
-Joey separately authorized --include-source-wip for this Claude Code helper diagnostic. This exact run sends tracked blobs plus staged, unstaged, and nonignored untracked contents captured in the digest-bound source WIP snapshot, the complete generated diff through that snapshot, and the review prompt/result for <owner/repo> at <base_sha>..<head_sha> to Anthropic Claude Code for read-only review. Its verified scope is bound by content_variant=source-wip, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. The reviewer is a trusted processor and may receive secrets present in those captured contents; the helper does not redact them. It does not authorize GitHub Copilot or another provider. This excludes automatic discovery of reviewer/runtime authentication credentials, ignored untracked files and source content not captured by the WIP snapshot, unrelated repositories, and broad workspace/home-directory content. Allow this exact digest-bound source-WIP Claude Code helper run?
-```
-
-Do not shorten this to `run external reviewer`: the exact user opt-in, destination, repository, range, included data, and exclusions are what let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.
-
-## Recommended Explicit Consent
-
-```text
-本 thread 中，我授权你把 <repo> 的冻结 review range / PR #<number> 中必要的 original tracked diff/context、bounded review evidence 和 review prompt/result 原样发送给 <Codex / Claude Code / GitHub Codex>，用于本次 single/double/triple review 及同一 PR 修复后的 rerun。reviewer 是受信处理者，可以读取 tracked repository secrets；不要因 secret-admission 结果 redact 或阻止 reviewer。不要自动发现或发送 reviewer/runtime authentication credentials、untracked private files、无关仓库或 broad workspace dumps，也不要替换成未明确授权的 provider。
-```
-
-If approval or consent is missing, report the exact provider and data scope that remain blocked. Do not bypass the decision with a different executable, shell wrapper, model family, or indirect service.
+Secret-delta scanning is an independent PR/master admission control. It neither starts a reviewer nor changes the named-review egress scope. A clean scan admits delivery; a violation or inconclusive scan blocks admission according to the playbook without retroactively revoking already authorized scoped reviewer inspection.

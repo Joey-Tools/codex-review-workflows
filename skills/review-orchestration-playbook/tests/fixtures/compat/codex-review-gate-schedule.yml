@@ -1,0 +1,225 @@
+name: Codex Review Gate Scheduled Reconciliation
+
+on:
+  schedule:
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  pull-requests: read
+
+concurrency:
+  group: codex-review-gate-scheduled-reconciliation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch-open-pull-requests:
+    if: vars.CODEX_REVIEW_GATE_AUTO_RETRY == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch per-PR reconciliation runs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const PAGE_SIZE = 100;
+            const MAX_DISPATCHES_PER_RUN = 25;
+
+            const runNumberText = process.env.GITHUB_RUN_NUMBER;
+            if (
+              typeof runNumberText !== "string" ||
+              !/^[1-9][0-9]*$/.test(runNumberText)
+            ) {
+              throw new Error("GITHUB_RUN_NUMBER is not a canonical positive decimal");
+            }
+            const runNumber = Number(runNumberText);
+            if (
+              !Number.isSafeInteger(runNumber) ||
+              runNumber <= 0 ||
+              String(runNumber) !== runNumberText
+            ) {
+              throw new Error("GITHUB_RUN_NUMBER is not a positive safe integer");
+            }
+
+            const result = await github.graphql(
+              `query ScheduledReviewGateTargets($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  defaultBranchRef {
+                    name
+                  }
+                  pullRequests(first: 1, states: OPEN) {
+                    totalCount
+                  }
+                }
+              }`,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              },
+            );
+
+            const repository = result?.repository;
+            if (repository === null || typeof repository !== "object") {
+              throw new Error("Repository query returned an invalid response");
+            }
+
+            const defaultBranchRef = repository.defaultBranchRef;
+            if (
+              defaultBranchRef === null ||
+              typeof defaultBranchRef !== "object" ||
+              typeof defaultBranchRef.name !== "string" ||
+              defaultBranchRef.name.length === 0
+            ) {
+              throw new Error("Repository query returned an invalid default branch");
+            }
+
+            const pullRequests = repository.pullRequests;
+            if (pullRequests === null || typeof pullRequests !== "object") {
+              throw new Error("Repository query returned an invalid pull request connection");
+            }
+            if (
+              !Number.isSafeInteger(pullRequests.totalCount) ||
+              pullRequests.totalCount < 0
+            ) {
+              throw new Error("Repository query returned an invalid open pull request count");
+            }
+            if (pullRequests.totalCount === 0) {
+              return;
+            }
+
+            const totalCountBigInt = BigInt(pullRequests.totalCount);
+            const startOffset = Number(
+              ((BigInt(runNumber) - 1n) * BigInt(MAX_DISPATCHES_PER_RUN)) %
+                totalCountBigInt,
+            );
+            const dispatchCount = Math.min(
+              MAX_DISPATCHES_PER_RUN,
+              pullRequests.totalCount,
+            );
+            const remainingToEnd = pullRequests.totalCount - startOffset;
+            const selectedOffsets = Array.from(
+              { length: dispatchCount },
+              (_, index) =>
+                index < remainingToEnd
+                  ? startOffset + index
+                  : index - remainingToEnd,
+            );
+
+            const selectedPageNumbers = [];
+            const seenSelectedPageNumbers = new Set();
+            for (const offset of selectedOffsets) {
+              const pageNumber = Math.floor(offset / PAGE_SIZE) + 1;
+              if (!seenSelectedPageNumbers.has(pageNumber)) {
+                seenSelectedPageNumbers.add(pageNumber);
+                selectedPageNumbers.push(pageNumber);
+              }
+            }
+            if (
+              selectedPageNumbers.length < 1 ||
+              selectedPageNumbers.length > 3
+            ) {
+              throw new Error("Selected pull request offsets require an invalid page count");
+            }
+
+            const pagePullRequestNumbers = new Map();
+            for (const pageNumber of selectedPageNumbers) {
+              const pageResult = await github.request(
+                "GET /repos/{owner}/{repo}/pulls",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: "open",
+                  sort: "created",
+                  direction: "asc",
+                  per_page: PAGE_SIZE,
+                  page: pageNumber,
+                },
+              );
+              const firstPageOffset = (pageNumber - 1) * PAGE_SIZE;
+              const expectedPageLength = Math.min(
+                PAGE_SIZE,
+                pullRequests.totalCount - firstPageOffset,
+              );
+              if (
+                !Number.isSafeInteger(expectedPageLength) ||
+                expectedPageLength < 1 ||
+                expectedPageLength > PAGE_SIZE ||
+                pageResult === null ||
+                typeof pageResult !== "object" ||
+                !Array.isArray(pageResult.data) ||
+                pageResult.data.length !== expectedPageLength
+              ) {
+                throw new Error("REST returned an inconsistent pull request page");
+              }
+
+              const numbers = [];
+              const seenPagePullRequestNumbers = new Set();
+              for (const pullRequest of pageResult.data) {
+                if (
+                  pullRequest === null ||
+                  typeof pullRequest !== "object" ||
+                  Array.isArray(pullRequest) ||
+                  !Number.isSafeInteger(pullRequest.number) ||
+                  pullRequest.number <= 0
+                ) {
+                  throw new Error("REST returned an invalid pull request number");
+                }
+                if (seenPagePullRequestNumbers.has(pullRequest.number)) {
+                  throw new Error("REST returned a duplicate pull request number in one page");
+                }
+                seenPagePullRequestNumbers.add(pullRequest.number);
+                numbers.push(pullRequest.number);
+              }
+              pagePullRequestNumbers.set(pageNumber, numbers);
+            }
+
+            const selectedPullRequestNumbers = [];
+            const seenSelectedPullRequestNumbers = new Set();
+            for (const offset of selectedOffsets) {
+              const pageNumber = Math.floor(offset / PAGE_SIZE) + 1;
+              const pageIndex = offset % PAGE_SIZE;
+              const pullRequestNumber = pagePullRequestNumbers.get(pageNumber)?.[
+                pageIndex
+              ];
+              if (
+                !Number.isSafeInteger(pullRequestNumber) ||
+                pullRequestNumber <= 0
+              ) {
+                throw new Error("Selected pull request offset is unavailable");
+              }
+              if (seenSelectedPullRequestNumbers.has(pullRequestNumber)) {
+                throw new Error("Selected pull request numbers are not unique");
+              }
+              seenSelectedPullRequestNumbers.add(pullRequestNumber);
+              selectedPullRequestNumbers.push(pullRequestNumber);
+            }
+
+            const dispatchFailures = [];
+            for (const pullRequestNumber of selectedPullRequestNumbers) {
+              try {
+                await github.request(
+                  "POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: "codex-review-gate.yml",
+                    ref: defaultBranchRef.name,
+                    inputs: {
+                      pull_request: String(pullRequestNumber),
+                      codex_review_gate_trigger: "scheduled-target-v1",
+                    },
+                  },
+                );
+              } catch {
+                dispatchFailures.push(pullRequestNumber);
+              }
+            }
+            if (dispatchFailures.length > 0) {
+              throw new Error(
+                `Failed to dispatch ${dispatchFailures.length} pull request(s): ` +
+                  dispatchFailures.join(", "),
+              );
+            }

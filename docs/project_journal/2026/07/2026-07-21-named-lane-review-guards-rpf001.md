@@ -3,7 +3,7 @@ id: 20260721-rpf001
 title: Named Lane Review Guards
 status: completed
 created: 2026-07-21
-updated: 2026-07-22
+updated: 2026-08-04
 branch: codex/daily-skill-friction-20260721-codex-review-workflows-review-policy-final-review-fixes
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/72
 supersedes: []
@@ -11,6 +11,8 @@ superseded_by:
 ---
 
 # Named Lane Review Guards
+
+> Superseded for GitHub Codex third-lane retry, trigger, and evidence semantics by `20260804-gce001`; the implementation record below remains historical audit evidence.
 
 ## Summary
 

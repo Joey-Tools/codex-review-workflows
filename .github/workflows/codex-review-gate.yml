@@ -1,138 +1,36 @@
-name: Codex Review Gate Compatibility Status
+name: Codex Review Gate
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
   workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to gate
+        required: true
+        type: number
+      codex_review_gate_trigger:
+        description: Internal scheduled reconciliation mode
+        required: false
+        type: string
 
-permissions: {}
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: codex-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pull_request }}
+  cancel-in-progress: false
 
 jobs:
-  compatibility-status:
-    if: github.event_name == 'pull_request_target'
-    name: codex/review-gate compatibility publisher
-    permissions:
-      statuses: write
-    runs-on: ubuntu-slim
-    timeout-minutes: 1
-    env:
-      GH_TOKEN: ${{ github.token }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      REPOSITORY: ${{ github.repository }}
-    steps:
-      - name: Emit legacy required context
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::The pull request head SHA is missing or malformed."
-            exit 1
-          fi
-
-          gh api --method POST "repos/${REPOSITORY}/statuses/${HEAD_SHA}" \
-            --silent \
-            -f state=success \
-            -f context=codex/review-gate \
-            -f description="Compatibility only; no reviewer or review lane."
-
-  backfill-open-pull-requests:
-    if: github.event_name == 'workflow_dispatch'
-    name: Backfill codex/review-gate for open pull requests
-    permissions:
-      pull-requests: read
-      statuses: write
-    runs-on: ubuntu-slim
-    timeout-minutes: 5
-    env:
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      GH_TOKEN: ${{ github.token }}
-      REPOSITORY: ${{ github.repository }}
-    steps:
-      - name: Backfill exact current pull request heads
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${DEFAULT_BRANCH}" || "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
-            echo "::error::The compatibility backfill must run from the repository default branch."
-            exit 1
-          fi
-
-          readonly MAX_ENUMERATION_PASSES=6
-          previous_snapshot=""
-          have_previous=false
-
-          for ((pass = 1; pass <= MAX_ENUMERATION_PASSES; pass++)); do
-            # shellcheck disable=SC2016 # jq owns $pulls and string interpolation.
-            api_targets="$(
-              gh api --paginate --slurp \
-                -H "Accept: application/vnd.github+json" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "repos/${REPOSITORY}/pulls?state=all&sort=created&direction=asc&per_page=100" \
-                --jq '
-                  if type == "array"
-                    and length > 0
-                    and all(.[]; type == "array")
-                    and all(.[][];
-                      type == "object"
-                      and (.state == "open" or .state == "closed")
-                      and (.number | type == "number" and . > 0 and floor == .)
-                      and (.head.sha | type == "string" and test("^[0-9a-f]{40}$"))
-                    )
-                  then
-                    ([.[][]] | sort_by(.number)) as $pulls
-                    | if ($pulls | map(.number) | unique | length) == ($pulls | length)
-                      then ["API_EVIDENCE"] + ($pulls | map(select(.state == "open") | "\(.number)\t\(.head.sha)")) | .[]
-                      else "RETRY_PAGINATION"
-                      end
-                  else
-                    error("malformed or incomplete pull request API evidence")
-                  end
-                '
-            )"
-            mapfile -t targets <<<"${api_targets}"
-
-            if [[ "${targets[0]:-}" == "RETRY_PAGINATION" && "${#targets[@]}" -eq 1 ]]; then
-              echo "::notice::Open pull requests moved across API pages during pass ${pass}; retrying."
-              previous_snapshot=""
-              have_previous=false
-              continue
-            fi
-            if [[ "${targets[0]:-}" != "API_EVIDENCE" ]]; then
-              echo "::error::The authenticated pull request API returned no evidence."
-              exit 1
-            fi
-
-            current_snapshot=""
-            if (( ${#targets[@]} > 1 )); then
-              printf -v current_snapshot '%s\n' "${targets[@]:1}"
-            fi
-
-            validated_head_shas=()
-            for target in "${targets[@]:1}"; do
-              IFS=$'\t' read -r pull_number head_sha extra <<<"${target}"
-              if [[ ! "${pull_number}" =~ ^[1-9][0-9]*$ || ! "${head_sha}" =~ ^[0-9a-f]{40}$ || -n "${extra}" ]]; then
-                echo "::error::A pull request target derived from authenticated API evidence is malformed."
-                exit 1
-              fi
-              validated_head_shas+=("${head_sha}")
-            done
-
-            if [[ "${have_previous}" == "true" && "${current_snapshot}" == "${previous_snapshot}" ]]; then
-              for head_sha in "${validated_head_shas[@]}"; do
-                gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
-                  --silent \
-                  -f state=success \
-                  -f context=codex/review-gate \
-                  -f description="Compatibility only; no reviewer or review lane."
-              done
-              echo "::notice::Authenticated open pull request snapshots stabilized after ${pass} passes."
-              exit 0
-            fi
-            previous_snapshot="${current_snapshot}"
-            have_previous=true
-          done
-
-          echo "::error::Open pull requests did not stabilize after ${MAX_ENUMERATION_PASSES} authenticated enumeration passes."
-          exit 1
+  codex-review-gate:
+    name: codex/review-gate runner
+    uses: JoeyTeng/codex-review-gate-action/.github/workflows/codex-review-gate.yml@v1

@@ -1,8 +1,85 @@
 {
-  "version": 3,
-  "event": "request-time-merge-base-changed-with-same-head",
+  "version": 23,
+  "version_contract": {
+    "role": "closed-schema-discriminator",
+    "compatible_consumer_versions": [
+      23
+    ],
+    "version_1_consumer_may_accept_this_shape": false,
+    "version_2_consumer_may_accept_this_shape": false,
+    "version_3_consumer_may_accept_this_shape": false,
+    "version_4_consumer_may_accept_this_shape": false,
+    "version_5_consumer_may_accept_this_shape": false,
+    "version_6_consumer_may_accept_this_shape": false,
+    "version_7_consumer_may_accept_this_shape": false,
+    "version_8_consumer_may_accept_this_shape": false,
+    "version_9_consumer_may_accept_this_shape": false,
+    "version_10_consumer_may_accept_this_shape": false,
+    "version_11_consumer_may_accept_this_shape": false,
+    "version_12_consumer_may_accept_this_shape": false,
+    "version_13_consumer_may_accept_this_shape": false,
+    "version_14_consumer_may_accept_this_shape": false,
+    "version_15_consumer_may_accept_this_shape": false,
+    "version_16_consumer_may_accept_this_shape": false,
+    "version_17_consumer_may_accept_this_shape": false,
+    "version_18_consumer_may_accept_this_shape": false,
+    "version_19_consumer_may_accept_this_shape": false,
+    "version_20_consumer_may_accept_this_shape": false,
+    "version_21_consumer_may_accept_this_shape": false,
+    "version_22_consumer_may_accept_this_shape": false,
+    "breaking_closed-schema-change_requires-version-increment": true,
+    "root_closed_required_fields": [
+      "version",
+      "version_contract",
+      "event",
+      "request_scope_receipt_sidecar",
+      "terminal_artifact_scope_receipt",
+      "range_origin",
+      "prior_epoch_github_lane_activity",
+      "unused_epoch_supersession",
+      "activity_transitions",
+      "github_lane",
+      "unknown_github_lane",
+      "late_old_epoch_evidence",
+      "transitions"
+    ],
+    "root_additional_fields_allowed": false,
+    "closed_required_fields": [
+      "role",
+      "compatible_consumer_versions",
+      "version_1_consumer_may_accept_this_shape",
+      "version_2_consumer_may_accept_this_shape",
+      "version_3_consumer_may_accept_this_shape",
+      "version_4_consumer_may_accept_this_shape",
+      "version_5_consumer_may_accept_this_shape",
+      "version_6_consumer_may_accept_this_shape",
+      "version_7_consumer_may_accept_this_shape",
+      "version_8_consumer_may_accept_this_shape",
+      "version_9_consumer_may_accept_this_shape",
+      "version_10_consumer_may_accept_this_shape",
+      "version_11_consumer_may_accept_this_shape",
+      "version_12_consumer_may_accept_this_shape",
+      "version_13_consumer_may_accept_this_shape",
+      "version_14_consumer_may_accept_this_shape",
+      "version_15_consumer_may_accept_this_shape",
+      "version_16_consumer_may_accept_this_shape",
+      "version_17_consumer_may_accept_this_shape",
+      "version_18_consumer_may_accept_this_shape",
+      "version_19_consumer_may_accept_this_shape",
+      "version_20_consumer_may_accept_this_shape",
+      "version_21_consumer_may_accept_this_shape",
+      "version_22_consumer_may_accept_this_shape",
+      "breaking_closed-schema-change_requires-version-increment",
+      "root_closed_required_fields",
+      "root_additional_fields_allowed",
+      "closed_required_fields",
+      "additional_fields_allowed"
+    ],
+    "additional_fields_allowed": false
+  },
+  "event": "review-epoch-merge-base-changed-with-same-head",
   "request_scope_receipt_sidecar": {
-    "required_kind_for_event": "parent-recorded-request-scope-v1",
+    "required_kind_for_request_event": "parent-recorded-request-scope-v1",
     "required_fields": [
       "kind",
       "request_id",
@@ -39,6 +116,8 @@
     "required_scope_fields": [
       "repository",
       "pr",
+      "base_ref_name",
+      "base_ref_oid",
       "pr_merge_base",
       "head"
     ],
@@ -72,6 +151,11 @@
         "reaction_action": "audit-only"
       }
     },
+    "activity_classification_mapping": {
+      "valid_same_head_different_merge_base": "observed",
+      "missing_malformed_or_unattributable_old_epoch_receipt": "unknown",
+      "no_request_event": "continue-closed-inventory-classification"
+    },
     "old_epoch_reattachment": "forbidden",
     "proves_request_run_lineage": false,
     "proves_continuous_scope_stability": false,
@@ -79,13 +163,79 @@
   },
   "terminal_artifact_scope_receipt": {
     "wrapper_field": "artifact_scope_receipt",
-    "kind": "parent-recorded-terminal-artifact-scope-v1",
-    "closed_fields": [
-      "kind",
-      "pre_artifact_scope_receipts",
-      "artifact_get_receipt",
-      "post_artifact_scope_receipts"
-    ],
+    "default_new_kind_exact": "parent-recorded-terminal-artifact-scope-v2",
+    "kind_discriminated_exact_schemas": {
+      "parent-recorded-terminal-artifact-scope-v2": {
+        "closed_required_fields": [
+          "kind",
+          "repository_git_object_identity_sha256",
+          "publication_scope",
+          "pre_artifact_scope_receipts",
+          "artifact_get_receipt",
+          "post_artifact_scope_receipts"
+        ],
+        "repository_git_object_identity_required": true,
+        "new_receipts_must_use_this_kind": true
+      },
+      "parent-recorded-terminal-artifact-scope-v1": {
+        "closed_fields": [
+          "kind",
+          "pre_artifact_scope_receipts",
+          "artifact_get_receipt",
+          "post_artifact_scope_receipts"
+        ],
+        "repository_git_object_identity_field_allowed": false,
+        "acceptance_requires_parent_proved_legacy_migration_authority": true,
+        "new_receipts_may_use_this_kind": false
+      }
+    },
+    "publication_scope_contract": {
+      "closed_required_fields": [
+        "repository",
+        "pr",
+        "base_ref_name",
+        "base_ref_oid",
+        "pr_merge_base",
+        "head"
+      ],
+      "additional_fields_allowed": false,
+      "type_sensitive_exact_projection_contract": "repository-pr-pr_merge_base-and-head-map-type-sensitively-to-the-existing-four-field-immutable-scope-key-repository-pull_request-pr_merge_base-and-head-and-the-exact-review_epoch-while-base_ref_name-and-base_ref_oid-equal-the-authenticated-pre-and-post-pull-detail-and-compare-observations",
+      "current_head_contract": "head-is-always-the-exact-current-review_epoch.head_sha-even-when-the-artifact-GET-commit-is-a-parent-proved-ancestor",
+      "base_metadata_contract": "base_ref_name-and-base_ref_oid-are-authenticated-point-in-time-publication-metadata-and-neither-enters-or-rekeys-the-four-field-immutable-scope-key-nor-substitutes-for-pr_merge_base"
+    },
+    "repository_git_object_identity_sha256_contract": "required-lowercase-64-hex-SHA-256-parent-frozen-identity-of-the-exact-local-repository-Git-object-database-for-v2;v1-does-not-contain-or-silently-acquire-this-field-and-is-current-head-only;legacy-migration-authority-never-proves-repository-bound-ancestry",
+    "receipt_cross_binding_contract": {
+      "enclosing_normalized_immutable_scope_key_fields_exact": [
+        "repository",
+        "pull_request",
+        "pr_merge_base",
+        "head"
+      ],
+      "enclosing_normalized_immutable_scope_key_must_equal_exact_review_epoch": true,
+      "candidate_artifact_snapshot_publication_scope_field_exact": "publication_scope",
+      "candidate_artifact_snapshot_publication_scope_required": true,
+      "candidate_artifact_snapshot_publication_scope_closed_and_type-sensitive": true,
+      "candidate_artifact_snapshot_publication_scope_must_equal_authenticated_current-six-field-projection": true,
+      "candidate_artifact_snapshot_publication_scope_must_equal-receipt-publication_scope": true,
+      "publication_scope_must_type-sensitively-equal-the-six-field-authenticated-pre-and-post-scope-projection": true,
+      "artifact_receipt_repository_pr_base-ref-name-base-ref-OID-merge-base-and-head-must-equal_publication_scope": true,
+      "clean_or_malformed_artifact_receipt_head_must_equal_epoch_head_sha": true,
+      "missing_extra_wrong-type_swapped-base-or-stale-head_action": "triple-inconclusive"
+    },
+    "legacy_v1_migration_authority_contract": {
+      "kind_exact": "parent-proved-terminal-artifact-scope-v1-migration-v1",
+      "closed_required_fields": [
+        "kind",
+        "review_epoch",
+        "artifact_scope_receipt_sha256",
+        "migration_registry_revision",
+        "migration_readback_identity_sha256"
+      ],
+      "additional_fields_allowed": false,
+      "parent_owned_preexisting_and_independently_read_back_required": true,
+      "missing_malformed_resealed_wrong_epoch_or_wrong_digest_action": "blocked-input"
+    },
+    "kind_and_field_set_may_not_be_mixed": true,
     "scope_receipt_fields": [
       "pull",
       "compare"
@@ -98,16 +248,81 @@
       "body_utf8",
       "body_sha256"
     ],
+    "nested_closed_schema": {
+      "pre_artifact_scope_receipts": {
+        "closed_fields": [
+          "pull",
+          "compare"
+        ],
+        "each_value_must_match": "response_receipt_fields"
+      },
+      "artifact_get_receipt": {
+        "closed_fields": "response_receipt_fields",
+        "method": "GET",
+        "status": 200,
+        "request_url": "canonical-exact-artifact-REST-resource"
+      },
+      "post_artifact_scope_receipts": {
+        "closed_fields": [
+          "pull",
+          "compare"
+        ],
+        "each_value_must_match": "response_receipt_fields"
+      }
+    },
     "storage_relation": "independent-parent-owned-artifact-wrapper",
     "artifact_get_binding": "exact-repository-pr-channel-native-id-provider-projection",
-    "pre_post_scope_binding": "type-preserving-equal-base-head-merge-base",
-    "lifecycle_binding": "independent-mandatory-snapshots",
+    "artifact_get_authority_projection_fields": [
+      "repository",
+      "pr",
+      "channel",
+      "native_id",
+      "canonical_api_url",
+      "canonical_html_url",
+      "provider_user_login",
+      "provider_user_type",
+      "provider_app_slug_if-applicable",
+      "raw_body",
+      "body_sha256",
+      "grammar_classification",
+      "state",
+      "semantic_server_time",
+      "artifact_commit"
+    ],
+    "artifact_get_projection_must_type-preservingly-equal": "same-terminal-looking-candidate-in-the-persisted-artifact-GET-both-complete-raw-inventories-and-the-independent-fresh-final-canonical-exact-artifact-GET",
+    "pre_post_scope_binding": "type-preserving-equal-repository-pr-base_ref_name-base_ref_oid-head-merge-base-with-base_ref_oid-independent-from-pr_merge_base",
+    "scope_authority_projection_fields": [
+      "repository",
+      "pr",
+      "base_ref_name",
+      "base_ref_oid",
+      "head_oid",
+      "pr_merge_base"
+    ],
+    "lifecycle_binding": "independent-mandatory-final-scope-lifecycle-inventory-and-canonical-exact-artifact-GET-rereads",
     "time_envelope": "pre-date-strictly-before-artifact-semantic-time-at-or-before-artifact-get-date-at-or-before-post-date",
     "may_reuse_prior_persisted_receipt": true,
+    "prior_persisted_receipt_reuse_constraints": {
+      "same_wrapper_kind": true,
+      "same_repository_pr_channel_and_native_id": true,
+      "same_artifact_body_digest_provider_identity_semantic_time_and_commit": true,
+      "same_exact_review_epoch_or-permitted-proved-ancestor-finding-scope": true,
+      "same_complete-receipt-bytes": true,
+      "fresh_authenticated-final-artifact-get-required": true,
+      "fresh-final-get-must-project-type-preservingly-identical-artifact": true,
+      "fresh-final-scope-lifecycle-and-inventory-reread-required": true,
+      "reuse_may_replace_missing-earlier-pre-boundary": false
+    },
+    "retarget_cutover_override": "old-epoch-receipt-never-reattaches-and-new-epoch-artifact-must-be-strictly-after-new-origin",
     "artifact_not_strictly_after_every_trustworthy_pre_observation": "triple-inconclusive",
     "missing_or_malformed": {
       "terminal_payload_action": "exclude-from-current-scope-precedence",
       "status": "triple-inconclusive"
+    },
+    "activity_classification_mapping": {
+      "valid_old_epoch_receipt_or_associated_artifact": "observed",
+      "missing_malformed_or_epoch-ambiguous_receipt": "unknown",
+      "no_terminal_artifact_event": "continue-closed-inventory-classification"
     },
     "independent_of_request_scope_sidecar": true,
     "scope_assurance": "artifact-publication-only",
@@ -133,9 +348,677 @@
     ],
     "original_caller_endpoints_are_immutable": true
   },
+  "prior_epoch_github_lane_activity": {
+    "classification_is_free_caller_input": false,
+    "classification_record": {
+      "owner": "parent-orchestrator",
+      "closed_schema_required": true,
+      "kind_exact": "github-codex-base-only-retarget-activity-classification-v4",
+      "version_exact": 4,
+      "required_fields": [
+        "kind",
+        "version",
+        "classification_id",
+        "classification_sequence",
+        "previous_classification_entry_sha256",
+        "prior_review_epoch",
+        "prior_origin_revision",
+        "prior_origin_sha256",
+        "current_base_ref_name",
+        "current_base_ref_oid",
+        "current_pr_merge_base",
+        "current_head_sha",
+        "origin_orchestration_started",
+        "sentinel_attempt_inventory",
+        "scope_control_event_inventory",
+        "provider_reconciliation",
+        "provider_no_inflight_attestation",
+        "provider_no_inflight_attestation_authority",
+        "classification",
+        "recorded_at",
+        "evidence_sha256"
+      ],
+      "evidence_digest_preimage_fields": [
+        "kind",
+        "version",
+        "classification_id",
+        "classification_sequence",
+        "previous_classification_entry_sha256",
+        "prior_review_epoch",
+        "prior_origin_revision",
+        "prior_origin_sha256",
+        "current_base_ref_name",
+        "current_base_ref_oid",
+        "current_pr_merge_base",
+        "current_head_sha",
+        "origin_orchestration_started",
+        "sentinel_attempt_inventory",
+        "scope_control_event_inventory",
+        "provider_reconciliation",
+        "provider_no_inflight_attestation",
+        "provider_no_inflight_attestation_authority",
+        "classification",
+        "recorded_at"
+      ],
+      "additional_fields_allowed": false,
+      "prior_review_epoch_must_equal_superseded_epoch": true,
+      "current_base_ref_name_base_ref_oid_pr_merge_base_and_head_must_equal_authenticated-current-PR": true,
+      "base_ref_oid_and_pr_merge_base_are_independent": true,
+      "prior_origin_revision_and_sha256_must_bind-immutable-origin-bytes": true,
+      "recorded_at": "strict-rfc3339-utc-Z",
+      "evidence_sha256": "sha256-of-exact-closed-classification-evidence-bytes"
+    },
+    "classification_membership_contract": {
+      "kind_exact": "github-codex-base-only-retarget-activity-classification-membership-v2",
+      "closed_required_fields": [
+        "kind",
+        "classification_id",
+        "store_id",
+        "store_revision",
+        "store_entry_index",
+        "entry_sha256",
+        "registry_readback_identity_sha256"
+      ],
+      "additional_fields_allowed": false
+    },
+    "classification_registry_readback_contract": {
+      "kind_exact": "github-codex-base-only-retarget-activity-classification-registry-readback-v2",
+      "closed_required_fields": [
+        "kind",
+        "store_id",
+        "revision",
+        "records"
+      ],
+      "additional_fields_allowed": false,
+      "store_id_exact": "github-codex-base-only-retarget-activity-classification-store",
+      "authority_contract": "one-preexisting-parent-owned-append-only-current-head-readback-selected-by-membership-store-positive-revision-final-index-entry-digest-and-readback-identity;the-membership-must-select-the-final-record-at-store_entry_index-equal-to-revision-minus-1;the-consumer-strictly-validates-every-record-in-the-complete-zero-through-final-index-prefix-before-semantic-classification",
+      "full_prefix_chain_contract": "classification_sequence-is-a-type-sensitive-positive-safe-integer-exactly-equal-to-global-store-index-plus-1;previous_classification_entry_sha256-is-exact-null-at-index-0-and-the-sha256-of-the-complete-canonical-immediately-preceding-record-at-every-later-index;duplicate-classification_id-sequence-gap-reorder-truncation-malformed-row-or-resealed-prefix-not-selected-by-the-parent-owned-current-head-readback-fails-closed",
+      "full_prefix_row_closed_validation_contract": "every-row-in-the-complete-zero-through-selected-index-prefix-must-pass-the-entire-closed-classification-record-schema-including-the-exact-review-epoch-scalar-object-prior-origin-coordinate-current-scope-OIDs-inventory-status-authority-classification-time-and-evidence-digest-contracts-before-it-can-contribute-to-aggregation",
+      "current_scope_aggregation_contract": {
+        "group_key_exact": [
+          "prior_review_epoch.repository_id",
+          "prior_review_epoch.repository_full_name",
+          "prior_review_epoch.pull_request_number",
+          "prior_review_epoch.pr_merge_base",
+          "prior_review_epoch.head_sha",
+          "prior_origin_revision",
+          "prior_origin_sha256",
+          "current_pr_merge_base",
+          "current_head_sha"
+        ],
+        "range_origin_scope_binding": "prior_review_epoch-repository-PR-base-and-head-plus-prior_origin_revision-and-prior_origin_sha256-bind-the-exact-immutable-range-origin-authority;current_pr_merge_base-and-current_head_sha-complete-the-immutable-aggregation-key",
+        "current_base_metadata_validation_contract": "current_base_ref_name-and-current_base_ref_oid-are-validated-type-sensitively-on-every-row-against-that-row's-independently-authenticated-current-PR-scope-but-neither-field-keys-or-resets-the-aggregation;rows-with-a-base-tip-or-base-name-change-and-the-same-immutable-group-still-aggregate-together",
+        "complete_matching_prefix_required": true,
+        "aggregation_precedence": [
+          "observed",
+          "unknown",
+          "none"
+        ],
+        "selected_current_record_classification_must_equal_aggregate": true,
+        "supersession_requires_exact_aggregate": "none",
+        "malformed-duplicate-gap-stale-head-or-cross-scope-splice_action": "derive-unknown-and-fail-closed"
+      },
+      "consumer-registration-or-self-consistent-unregistered-record-is-authority": false,
+      "missing-unregistered-stale-replaced-duplicate-or-concurrent_action": "classify-unknown-and-fail-closed"
+    },
+    "allowed_values": [
+      "none",
+      "observed",
+      "unknown"
+    ],
+    "origin_registration_alone_is_activity": false,
+    "inventory_status_values": {
+      "sentinel_attempt_inventory": [
+        "complete-empty",
+        "definitive-activity-present",
+        "incomplete",
+        "unreadable",
+        "conflicting"
+      ],
+      "scope_control_event_inventory": [
+        "gap-free-append-only-complete-empty",
+        "definitive-activity-present",
+        "history-gap-or-mutable-snapshot-only",
+        "unreadable",
+        "conflicting"
+      ],
+      "provider_reconciliation": [
+        "complete-current-snapshot-empty",
+        "definitive-activity-present",
+        "incomplete-pagination",
+        "unreadable",
+        "association-or-ordering-ambiguous",
+        "conflicting"
+      ],
+      "provider_no_inflight_attestation": [
+        "provider-native-append-only-complete-none",
+        "definitive-activity-present",
+        "unsupported-by-current-baseline",
+        "incomplete",
+        "unreadable",
+        "conflicting"
+      ]
+    },
+    "provider_no_inflight_attestation_contract": {
+      "must-cover-control-classes": [
+        "automatic",
+        "controlled",
+        "manual"
+      ],
+      "must-exclude-triggered-but-not-yet-visible-provider-work": true,
+      "must-be-provider-native-and-append-only": true,
+      "accepted-current-baseline-schema-registry": [],
+      "current_consumer_registry_is_machine_owned_and_may_not_be_overridden": true,
+      "current_consumer_or_caller_may_register_or_self_project_attestation_authority": false,
+      "status-string-alone-is-attestation-authority": false,
+      "attestation_authority_membership_contract": {
+        "closed_required_fields": [
+          "schema_id",
+          "schema_version",
+          "attestation_id",
+          "store_id",
+          "store_revision",
+          "store_entry_index",
+          "entry_sha256",
+          "registry_readback_identity_sha256"
+        ],
+        "additional_fields_allowed": false,
+        "authority_contract": "the-consumer-must-independently-load-one-preexisting-parent-owned-provider-native-append-only-attestation-record-through-an-exact-schema-id-version-store-revision-index-entry-digest-and-fresh-registry-readback-identity-and-the-schema-id-version-pair-must-occur-exactly-once-in-the-machine-owned-accepted-current-baseline-schema-registry",
+        "null_contract": "exact-null-when-no-accepted-registered-attestation-authority-exists"
+      },
+      "current-GitHub-issue-review-APIs-can-supply": false,
+      "complete-current-provider-snapshot-empty-is-sufficient": false,
+      "current-baseline-none-classification-reachable": false,
+      "missing-or-unsupported-action": "classify-unknown-and-block-same-head-cutover"
+    },
+    "classification_algorithm": {
+      "predicate_semantics": {
+        "none_requires_all": "all_of",
+        "observed_requires-definitive-old-epoch-activity": "any_of",
+        "unknown_includes_any": "any_of"
+      },
+      "deterministic_precedence": [
+        "unknown-conflicting-or-unattributable-activity",
+        "observed-unambiguous-definitive-activity",
+        "none-complete-empty",
+        "unknown-incomplete-without-definitive-activity"
+      ],
+      "consumer_derivation_contract": {
+        "inputs_exact": [
+          "origin_orchestration_started",
+          "sentinel_attempt_inventory",
+          "scope_control_event_inventory",
+        "provider_reconciliation",
+          "provider_no_inflight_attestation",
+          "provider_no_inflight_attestation_authority"
+        ],
+        "input_status_values_reference": "prior_epoch_github_lane_activity.inventory_status_values",
+        "unknown_conflicting_or_unattributable_statuses": {
+          "sentinel_attempt_inventory": [
+            "conflicting"
+          ],
+          "scope_control_event_inventory": [
+            "history-gap-or-mutable-snapshot-only",
+            "conflicting"
+          ],
+          "provider_reconciliation": [
+            "association-or-ordering-ambiguous",
+            "conflicting"
+          ],
+          "provider_no_inflight_attestation": [
+            "conflicting"
+          ]
+        },
+        "observed_if_exact_true_origin_or_any_inventory_exact_definitive_activity_present": true,
+        "none_exact_input": {
+          "origin_orchestration_started": false,
+          "sentinel_attempt_inventory": "complete-empty",
+          "scope_control_event_inventory": "gap-free-append-only-complete-empty",
+          "provider_reconciliation": "complete-current-snapshot-empty",
+          "provider_no_inflight_attestation": "provider-native-append-only-complete-none"
+        },
+        "none_attestation_authority_gate": {
+          "status_string_alone_is_authority": false,
+          "accepted_schema_registry_reference": "prior_epoch_github_lane_activity.provider_no_inflight_attestation_contract.accepted-current-baseline-schema-registry",
+          "requires_exactly_one_fresh_registered_attestation_authority": true,
+          "empty-registry-no-unique-schema-match-missing-null-stale-or-self-projected_action": "derive-unknown",
+          "current_baseline_derived_value_for-none_exact_input": "unknown",
+          "future-registry-or-attestation-shape-change-requires-machine-version-increment": true
+        },
+        "otherwise_exact": "unknown",
+        "persisted_classification_must_type_sensitive_equal_derived_value": true,
+        "consumer_must_recompute_evidence_sha256_before_derivation": true
+      },
+      "precedence_rules": {
+        "unknown-conflicting-or-unattributable-activity": "any-origin-binding-conflict-or-any-definitive-looking-event-whose-old-epoch-association-is-ambiguous",
+        "observed-unambiguous-definitive-activity": "at-least-one-authenticated-and-old-epoch-bound-definitive-activity-event-even-if-an-unrelated-inventory-is-incomplete",
+        "none-complete-empty": "all-none_requires_all-predicates-hold",
+        "unknown-incomplete-without-definitive-activity": "no-unambiguous-definitive-activity-and-any-required-inventory-is-incomplete-unreadable-or-mutable-snapshot-only"
+      },
+      "none_requires_all": [
+        "valid-prior-origin-with-orchestration_started-false",
+        "sentinel_attempt_inventory-complete-empty",
+        "scope_control_event_inventory-gap-free-append-only-complete-empty",
+        "provider_reconciliation-complete-current-snapshot-empty",
+        "provider_no_inflight_attestation-provider-native-append-only-complete-none"
+      ],
+      "observed_requires-definitive-old-epoch-activity": [
+        "coherent-started-origin-with-sentinel-or-attempt",
+        "authenticated-manual-controlled-or-automatic-formal-scope-event",
+        "authenticated-focused-provider-review-request-event",
+        "exact-provider-ack-eye-check-or-run-liveness",
+        "exact-provider-review-inline-or-terminal-comment-artifact"
+      ],
+      "unknown_includes_any": [
+        "started-origin-with-missing-unreadable-or-inconsistent-sentinel-or-attempt-state",
+        "missing-unreadable-partial-conflicting-or-mutable-snapshot-only-scope-history",
+        "incomplete-unreadable-conflicting-or-ambiguously-associated-provider-reconciliation",
+        "missing-unsupported-incomplete-unreadable-or-conflicting-provider-no-inflight-attestation",
+        "missing-malformed-or-mismatched-origin-revision-or-digest",
+        "equal-timestamp-or-old-new-epoch-association-ambiguity"
+      ],
+      "missing-partial-or-unreadable-is-never-absence": true,
+      "issue-comment-current-snapshot-absence-alone-cannot-prove-no-prior-request": true,
+      "complete-current-provider-snapshot-empty-alone-cannot-prove-no-inflight-provider-work": true,
+      "unrelated-inventory-incompleteness-may-demote-unambiguous-observed-activity": false
+    },
+    "unknown_or_incomplete_evidence_is_fail_closed": true
+  },
+  "unused_epoch_supersession": {
+    "old-origin-is-deleted-or-rewritten": false,
+    "requires-authorized-current-range-transition": [
+      "caller-supplied-current-recovery",
+      "pr-derived-current-recovery"
+    ],
+    "parent-may-silently-rederive-caller-supplied-current-range": false,
+    "requires-provider-native-append-only-no-inflight-attestation": true,
+    "reachable-under-current-baseline": false,
+    "parent_readback_decoding_contract": "every-classification-semantic-authority-supersession-cutover-transaction-and-cutover-image-parent-readback-is-complete-strict-UTF-8-JSON;duplicate-object-names-nonstandard-constants-and-nonfinite-numbers-at-any-depth-fail-closed-before-field-or-digest-validation",
+  "append_only_supersession_record_required_fields": [
+      "kind",
+      "version",
+      "supersession_id",
+      "prior_review_epoch",
+    "prior_origin_sha256",
+    "classification_id",
+    "classification_registry_readback_identity_sha256",
+    "classification_evidence_sha256",
+    "classification_aggregate",
+    "classification_head_readback_identity_sha256",
+    "authenticated_current_pr_scope_sha256",
+    "authorized_range_transition_sha256",
+    "new_origin_reservation_sha256",
+    "new_origin_sha256",
+    "new_review_epoch",
+      "superseded_at",
+      "reason"
+    ],
+    "supersession_record_kind_exact": "github-codex-unused-review-epoch-supersession-v4",
+    "supersession_record_version_exact": 4,
+    "supersession_membership_contract": {
+      "kind_exact": "github-codex-unused-review-epoch-supersession-membership-v1",
+      "closed_required_fields": [
+        "kind",
+        "supersession_id",
+        "store_id",
+        "store_revision",
+        "store_entry_index",
+        "entry_sha256",
+        "registry_readback_identity_sha256"
+      ],
+      "additional_fields_allowed": false
+    },
+    "supersession_registry_readback_contract": {
+      "kind_exact": "github-codex-unused-review-epoch-supersession-registry-readback-v1",
+      "closed_required_fields": [
+        "kind",
+        "store_id",
+        "revision",
+        "records"
+      ],
+      "additional_fields_allowed": false,
+      "store_id_exact": "github-codex-unused-review-epoch-supersession-store",
+      "authority_contract": "one-preexisting-parent-owned-append-only-readback-selected-by-membership-store-positive-revision-nonnegative-index-entry-digest-and-readback-identity;the-selected-exact-v4-record-supersession_id-and-every-byte-must-match-before-cutover;byte-membership-validity-is-necessary-but-not-sufficient-and-the-consumer-must-apply-supersession_semantic_cross_binding_contract-to-independently-loaded-authorities",
+      "semantic_validation_required_before_authority": true,
+      "consumer-registration-or-self-consistent-unregistered-record-is-authority": false,
+      "missing-unregistered-stale-replaced-duplicate-or-concurrent_action": "classify-unknown-state_lost-no-post-no-artifact-admission"
+    },
+  "supersession_semantic_cross_binding_contract": {
+      "independently_loaded_authorities_exact": [
+        "derived-prior-epoch-activity-classification-record-and-membership-readback",
+        "immutable-prior-range-origin-raw-bytes-revision-and-sha256",
+      "authenticated-current-PR-scope-membership-and-registry-readback",
+      "authorized-exact-current-range-transition-membership-and-registry-readback",
+      "immutable-prior-range-origin-membership plus new-origin-reservation predecessor-membership-and-readback plus authorized-transition successor-membership-and-readback",
+      "parent-owned-single-CAS-cutover-append-transaction-membership-before-and-after-readbacks-and-finalized-new-origin-bytes"
+    ],
+      "prior_epoch_binding": "supersession.prior_review_epoch-type-sensitively-equals-the-derived-classification.prior_review_epoch-and-the-immutable-prior-origin.review_epoch;repository_id-repository_full_name-pull_request_number-and-head_sha-type-sensitively-equal-the-current-PR-scope-new-origin-and-new-review-epoch",
+      "prior_origin_binding": "supersession.prior_origin_sha256-equals-the-classification.prior_origin_sha256-and-the-consumer-recomputed-sha256-of-the-exact-immutable-prior-origin-raw-bytes-at-classification.prior_origin_revision;prior-origin.range_origin-is-the-exact-closed-kind-base_sha-head_sha-object-bound-to-prior-review-epoch-pr_merge_base-and-head_sha",
+      "classification_binding": "the-consumer-loads-the-parent-owned-current-classification-head-and-complete-closed-hash-linked-prefix;groups-by-the-exact-immutable-prior-review-epoch-repository-PR-merge-base-head-prior-origin-revision-and-sha256-plus-current-merge-base-and-head;validates-each-row's-current-base-ref-name-and-base-ref-OID-separately-without-keying;aggregates-observed-before-unknown-before-none;and-requires-the-selected-final-record-supersession.classification_id-classification_evidence_sha256-and-both-classification-readback-identities-to-bind-the-exact-current-head-with-supersession.classification_aggregate-exact-none",
+      "authorized_current_range_binding": "supersession.new_review_epoch-type-sensitively-equals-the canonical five-field repository-ID-full-name-PR-pr_merge_base-and-unchanged-head projection of the independently loaded authenticated current-PR scope and the independently loaded actual authorized caller-supplied-current-recovery or pr-derived-current-recovery authority;current base_ref_name and base_ref_oid remain separately bound scope metadata and are not review-epoch members;that authority.recovery_range_origin is the exact closed kind-base_sha-head_sha object equal to the preexisting new-origin-reservation.reserved_range_origin and the later finalized new-origin.range_origin and bound to new-review-epoch pr_merge_base and head_sha;the current-PR lifecycle is exact open-false-null and the unique-merge-base authority is fresh and proves exactly one merge-base equal to pr_merge_base;supersession.authenticated_current_pr_scope_sha256-authorized_range_transition_sha256-and-new_origin_reservation_sha256 bind those exact authorities",
+      "new_origin_binding": "one-preexisting-parent-owned-reservation-with-no-orchestration authority is bound before the CAS;the finalized canonical new-origin is the second logical append after the supersession append and its review_epoch-type-sensitively-equals-supersession.new_review_epoch-with-revision-exact-1-orchestration_started-exact-false-one-fresh-registered_at-and-the-exact-reserved-range_origin;supersession.new_origin_sha256-binds-its exact canonical bytes",
+      "reason_exact": "unused-origin-only-epoch-retarget",
+      "ordering_contract": "unique_merge_base_authority.captured_at-is-before-or-equal-to-authenticated-current-PR-scope.captured_at-which-is-before-or-equal-to-new-origin-reservation.reserved_at;reservation.reserved_at-is-strictly-before-authorized-range-transition.authorized_at-which-is-strictly-before-supersession.superseded_at-which-is-strictly-before-finalized-new-origin.registered_at;classification.recorded_at-is-strictly-before-supersession.superseded_at;all-times-use-strict-rfc3339-utc-Z-semantics",
+      "causal_order_authorities_must_be_independently_loaded_before_supersession": true,
+    "self_declared_transition_scope_origin_or_merge_base_dictionary_is_authority": false,
+    "mismatch-equality-ambiguous-time-stale-readback-or-cross-record-splice_action": "classify-unknown-state_lost-no-post-no-artifact-admission"
+  },
+  "semantic_authority_registry_contract": {
+    "membership_kind_exact": "github-codex-retarget-semantic-authority-membership-v1",
+    "membership_closed_required_fields": [
+      "kind",
+      "authority_id",
+      "store_id",
+      "store_revision",
+      "store_entry_index",
+      "entry_sha256",
+      "registry_readback_identity_sha256"
+    ],
+    "registry_readback_kind_exact": "github-codex-retarget-semantic-authority-registry-readback-v1",
+    "registry_readback_closed_required_fields": [
+      "kind",
+      "store_id",
+      "revision",
+      "records"
+    ],
+    "store_id_exact": "github-codex-retarget-semantic-authority-store",
+    "record_kind_closed_required_fields": {
+      "github-codex-retarget-range-origin-authority-v2": [
+        "kind",
+        "authority_id",
+        "origin_role",
+        "range_origin",
+        "review_epoch",
+        "revision",
+        "orchestration_started",
+        "registered_at"
+      ],
+      "github-codex-retarget-new-origin-reservation-v2": [
+        "kind",
+        "authority_id",
+        "reserved_range_origin",
+        "reserved_review_epoch",
+        "reserved_revision",
+        "orchestration_started",
+        "reserved_at"
+      ],
+      "github-codex-retarget-current-pr-scope-authority-v1": [
+        "kind",
+        "authority_id",
+        "repository_id",
+        "repository_full_name",
+        "pull_request_number",
+        "base_ref_name",
+        "base_ref_oid",
+        "pr_merge_base",
+        "head_sha",
+        "lifecycle",
+        "unique_merge_base_authority",
+        "captured_at"
+      ],
+      "github-codex-retarget-authorized-range-transition-v2": [
+        "kind",
+        "authority_id",
+        "transition_kind",
+        "prior_origin_authority_id",
+        "new_origin_reservation_authority_id",
+        "current_pr_scope_authority_id",
+        "recovery_range_origin",
+        "review_epoch",
+        "authorized_at"
+      ]
+    },
+    "range_origin_contract": {
+      "closed_required_fields": [
+        "kind",
+        "base_sha",
+        "head_sha"
+      ],
+      "allowed_kinds": [
+        "caller-supplied",
+        "pr-derived"
+      ],
+      "additional_fields_allowed": false
+    },
+    "recovery_range_origin_kind_by_transition_kind": {
+      "caller-supplied-current-recovery": "caller-supplied",
+      "pr-derived-current-recovery": "pr-derived"
+    },
+    "current_pr_lifecycle_exact": {
+      "state": "open",
+      "merged": false,
+      "merged_at": null
+    },
+    "unique_merge_base_authority_contract": "closed-parent-readback-with-nonempty-readback-identity-base_oid-head_oid-exactly-one-full-40-hex-merge-base-equal-to-the-current-scope-pr_merge_base-and-captured_at-no-later-than-the-current-scope-captured_at",
+    "new_origin_reservation_contract": "one preexisting parent-owned closed reservation with reserved_revision exact 1 orchestration_started exact false and reserved_range_origin and canonical five-field reserved_review_epoch exactly equal to the later authorized current range transition and current-PR epoch projection;its immutable membership selects the complete predecessor registry readback and the authorization membership selects a distinct complete successor readback whose revision is exactly predecessor revision plus one and whose exact byte prefix is the predecessor plus only the authorization row;reserved_at is strictly before authorized_at;the reservation is not a canonical review-epoch origin and cannot admit posting artifacts or readiness",
+    "additional_fields_allowed": false,
+    "consumer-registration-or-caller-dictionary-is-authority": false
+  },
+    "parent_append_transaction_contract": {
+      "kind_exact": "github-codex-retarget-cutover-append-transaction-v1",
+      "closed_required_fields": [
+        "kind",
+        "transaction_id",
+        "store_id",
+        "expected_before_revision",
+        "expected_before_readback_identity_sha256",
+        "before_readback_raw_utf8",
+        "before_readback_sha256",
+        "supersession_global_revision",
+        "supersession_store_entry_index",
+        "supersession_record_raw_utf8",
+        "supersession_entry_sha256",
+        "supersession_membership_raw_utf8",
+        "supersession_membership_sha256",
+        "supersession_registry_readback_raw_utf8",
+        "supersession_registry_readback_sha256",
+        "supersession_registry_readback_identity_sha256",
+        "finalized_origin_global_revision",
+        "finalized_origin_store_entry_index",
+        "finalized_origin_record_raw_utf8",
+        "finalized_origin_entry_sha256",
+        "committed_after_revision",
+        "after_readback_raw_utf8",
+        "after_readback_sha256",
+        "committed_at",
+        "transaction_sha256"
+      ],
+      "digest_preimage_fields": [
+        "kind",
+        "transaction_id",
+        "store_id",
+        "expected_before_revision",
+        "expected_before_readback_identity_sha256",
+        "before_readback_raw_utf8",
+        "before_readback_sha256",
+        "supersession_global_revision",
+        "supersession_store_entry_index",
+        "supersession_record_raw_utf8",
+        "supersession_entry_sha256",
+        "supersession_membership_raw_utf8",
+        "supersession_membership_sha256",
+        "supersession_registry_readback_raw_utf8",
+        "supersession_registry_readback_sha256",
+        "supersession_registry_readback_identity_sha256",
+        "finalized_origin_global_revision",
+        "finalized_origin_store_entry_index",
+        "finalized_origin_record_raw_utf8",
+        "finalized_origin_entry_sha256",
+        "committed_after_revision",
+        "after_readback_raw_utf8",
+        "after_readback_sha256",
+        "committed_at"
+      ],
+      "additional_fields_allowed": false,
+      "store_id_exact": "github-codex-retarget-cutover-append-store",
+      "selected_supersession_registry_binding_contract": "the-transaction-binds-the-exact-strictly-decoded-closed-supersession-membership-bytes-and-sha256-plus-the-complete-strictly-decoded-parent-supersession-registry-readback-bytes-sha256-and-readback-identity;the-membership-must-select-the-exact-supersession_id-record-by-store-revision-index-entry-digest-and-readback-identity-and-that-selected-record-must-be-byte-identical-to-supersession_record_raw_utf8-before-the-single-CAS-after-image-is-authority",
+      "transaction_membership_contract": {
+        "kind_exact": "github-codex-retarget-cutover-append-transaction-membership-v1",
+        "closed_required_fields": [
+          "kind",
+          "transaction_id",
+          "store_id",
+          "store_revision",
+          "store_entry_index",
+          "entry_sha256",
+          "registry_readback_identity_sha256"
+        ],
+        "additional_fields_allowed": false
+      },
+      "transaction_registry_readback_contract": {
+        "kind_exact": "github-codex-retarget-cutover-append-transaction-registry-readback-v1",
+        "store_id_exact": "github-codex-retarget-cutover-append-transaction-store",
+        "closed_required_fields": [
+          "kind",
+          "store_id",
+          "revision",
+          "records"
+        ],
+        "additional_fields_allowed": false
+      },
+      "cutover_readback_contract": {
+        "kind_exact": "github-codex-retarget-cutover-append-readback-v1",
+        "closed_required_fields": [
+          "kind",
+          "store_id",
+          "revision",
+          "records"
+        ],
+        "record_envelope_closed_required_fields": [
+          "global_revision",
+          "store_entry_index",
+          "record_kind",
+          "record_raw_utf8",
+          "record_sha256"
+        ],
+        "additional_fields_allowed": false,
+        "record_envelope_additional_fields_allowed": false,
+        "complete_prefix_contract": "revision-type-sensitively-equals-record-count;each-global_revision-is-the-positive-safe-index-plus-1;each-store_entry_index-is-the-nonnegative-safe-exact-index;every-record_raw_utf8-is-strict-JSON-whose-kind-equals-record_kind-and-whose-exact-UTF-8-sha256-equals-record_sha256;duplicate-index-revision-logical-record-ID-or-record-digest-and-any-gap-reorder-or-malformed-row-fails-closed",
+        "logical_record_id_field_by_kind": {
+          "github-codex-retarget-range-origin-authority-v2": "authority_id",
+          "github-codex-retarget-current-pr-scope-authority-v1": "authority_id",
+          "github-codex-retarget-authorized-range-transition-v2": "authority_id",
+          "github-codex-retarget-new-origin-reservation-v2": "authority_id",
+          "github-codex-unused-review-epoch-supersession-v4": "supersession_id"
+        },
+        "logical_record_id_uniqueness_contract": "the-complete-prefix-is-strictly-decoded-first;each-admitted-record-kind-has-exactly-one-nonempty-string-logical-ID-at-the-machine-selected-field-and-no-logical-ID-may-repeat-anywhere-in-the-complete-before-or-after-prefix-even-across-different-record-kinds"
+      },
+      "before_image_contract": {
+        "complete_historical_prefix_contract": "the-before-image-is-an-arbitrary-nonempty-complete-byte-identical-append-only-prefix-of-the-single-parent-store;all-earlier-cutovers-and-their-supersession-and-finalized-origin-pairs-remain-present-in-original-global-revision-and-index-order;no-whole-store-exact-four-record-assumption-is-allowed",
+        "selected_predecessor_authority_kind_order": [
+          "github-codex-retarget-range-origin-authority-v2",
+          "github-codex-retarget-current-pr-scope-authority-v1",
+          "github-codex-retarget-new-origin-reservation-v2",
+          "github-codex-retarget-authorized-range-transition-v2"
+        ],
+        "selected_predecessor_membership_contract": "each-of-the-four-authorities-is-selected-by-its-exact-parent-membership-store-id-revision-entry-index-entry-sha256-and-registry-readback-identity;the-membership-resolves-one-byte-identical-record-envelope-at-its-arbitrary-historical-prefix-index;the-four-selected-records-bind-one-range-and-this-cutover-without-requiring-adjacency-to-genesis-or-to-one-another",
+        "predecessor_successor_load_contract": "prior-origin current-PR-scope and new-origin-reservation are independently loaded by exact membership-and-index from the immutable complete predecessor readback;the authorized transition is independently loaded by exact membership-and-index from the exact complete plus-one successor readback whose full earlier byte prefix equals that predecessor",
+        "serial_cutover_contract": "a-later-cutover-selects-the-prior-cutover-finalized-origin-and-its-own-current-scope-reservation-and-transition-from-the-complete-history;two-or-more-consecutive-valid-cutovers-append-without-rewriting-dropping-or-reclassifying-any-earlier-row",
+        "reservation_is_not-finalized-origin": true
+      },
+      "after_image_contract": {
+        "before_prefix_must_be_exact-byte-for-byte-and-index-for-index": true,
+        "exact_logical_append_kind_order": [
+          "github-codex-unused-review-epoch-supersession-v4",
+          "github-codex-retarget-range-origin-authority-v2"
+        ],
+        "supersession_append_index_exact": "expected_before_revision",
+        "finalized_origin_append_index_exact": "expected_before_revision-plus-1",
+        "committed_after_revision_exact": "expected_before_revision-plus-2",
+        "finalized_origin_must_bind_preexisting_reservation_and-supersession": true
+      },
+      "single_cas_publish_contract": "the-parent-compares-the-type-sensitive-current-global-store-revision-and-current-readback-identity-to-expected_before_revision-and-expected_before_readback_identity_sha256-exactly-once-and-atomically-publishes-the-complete-after-image-plus-the-content-addressed-transaction;there-is-no-consumer-reseal-registration-or-partial-success-path",
+      "validation_order_exact": [
+        "load-and-closed-validate-current-classification-head-and-complete-prefix",
+        "load-and-closed-validate-arbitrary-complete-historical-prefix-with-all-prior-cutovers-byte-identical",
+        "resolve-prior-origin-current-scope-and-new-origin-reservation-by-their-exact-parent-memberships-and-arbitrary-prefix-indices",
+        "resolve-the-authorized-transition-by-its-exact-parent-membership-and-index-from-the-exact-plus-one-successor-readback-and-prove-the-complete-predecessor-byte-prefix",
+        "load-parent-owned-transaction-membership-and-registry-readback",
+        "strict-validate-complete-before-image-and-match-the-current-pre-CAS-readback",
+        "verify-type-sensitive-single-CAS-revision-identity-and-exact-byte-prefix",
+        "strict-validate-logical-supersession-append-at-next-global-revision-and-index",
+        "strict-load-and-cross-bind-the-parent-selected-supersession-membership-and-complete-registry-readback-to-the-logical-supersession-append",
+        "strict-validate-finalized-origin-append-at-the-following-global-revision-and-index",
+        "load-and-compare-the-parent-owned-complete-after-readback",
+        "recompute-transaction-sha256-and-final-cross-bindings"
+      ],
+      "zero-duplicate-out-of-order-partial-visible-stale-before-resealed-prefix-cross-store-splice-or-missing-finalization_action": "classify-unknown-state_lost-no-post-no-artifact-admission"
+    },
+    "new_origin_contract": {
+      "review_epoch": "exact-current-pr_merge_base-and-same-head",
+      "phase": "finalized-only-after-the-logical-supersession-append-in-the-parent-owned-single-CAS-after-image",
+      "reservation_required": true,
+      "registered_at": "fresh-strict-rfc3339-utc-Z-after-supersession-fence-and-after-the-preexisting-reservation",
+      "revision": 1,
+      "orchestration_started": false
+    },
+    "atomic_commit_required": "one-parent-owned-single-CAS-publishes-the-complete-before-bound-after-image-with-logical-supersession-then-finalized-origin-appends",
+    "two_phase_fallback_allowed": false,
+    "partial-missing-or-restarted-cutover_action": "classify-unknown-state_lost-no-post-no-artifact-admission",
+    "new_epoch_scope_and-artifact-must-be-strictly-after-new-origin": true,
+    "equal-or-ambiguous-order_action": "triple-inconclusive",
+    "invalidate_old-base-bound-evidence": [
+      "local-lanes",
+      "secret-admission",
+      "readiness"
+    ],
+    "empty-or-anchor-commit-allowed": false
+  },
+  "activity_transitions": [
+    {
+      "name": "unused-origin-only-epoch",
+      "prior_epoch_github_lane_activity": "none",
+      "github_action": "after-authorized-current-range-append-supersession-and-register-current-merge-base-epoch",
+      "github_lane_status": "eligible-only-after-complete-cutover-and-fresh-evidence",
+      "local_action": "apply-range-origin-recovery-transitions",
+      "reason": "unused-origin-only-epoch-retarget",
+      "reachable_under_current_baseline": false,
+      "unreachable_reason": "no-accepted-provider-native-append-only-no-inflight-attestation-schema"
+    },
+    {
+      "name": "started-or-observed-third-lane",
+      "prior_epoch_github_lane_activity": "observed",
+      "github_action": "block-provider-coverage-for-retargeted-merge-base",
+      "github_lane_status": "triple-inconclusive",
+      "local_action": "apply-range-origin-recovery-transitions",
+      "reason": "base-changed-same-head"
+    },
+    {
+      "name": "third-lane-activity-unverified",
+      "prior_epoch_github_lane_activity": "unknown",
+      "github_action": "fail-closed",
+      "github_lane_status": "triple-inconclusive",
+      "local_action": "apply-range-origin-recovery-transitions-without-epoch-retirement-provider-post-or-artifact-admission",
+      "reason": "prior-epoch-third-lane-activity-unverified"
+    }
+  ],
   "github_lane": {
-    "action": "never-post-replacement-same-head",
-    "status": "triple-inconclusive"
+    "action": "block-provider-coverage-for-retargeted-merge-base",
+    "status": "triple-inconclusive",
+    "reason": "provider-native-artifact-binds-head-only-and-independent-scope-receipt-does-not-prove-provider-coverage-of-retargeted-pr_merge_base",
+    "applies_when_prior_epoch_github_lane_activity": [
+      "observed"
+    ],
+    "same_head_second_marker_prohibition_is_reason": false,
+    "new_marker_without_merge_base_bound_artifact_is_sufficient": false,
+    "requires_preexisting_epoch_origin_for_artifact_acceptance": true,
+    "missing_or_backfilled_epoch_origin_status": "triple-inconclusive"
+  },
+  "unknown_github_lane": {
+    "applies_when_prior_epoch_github_lane_activity": "unknown",
+    "action": "fail-closed-without-retire-register-post-or-artifact-admission",
+    "status": "triple-inconclusive",
+    "reason": "prior-epoch-third-lane-activity-unverified",
+    "authorized-exact-current-local-lanes-may-run": true
+  },
+  "late_old_epoch_evidence": {
+    "reconciliation_is_point_in_time": true,
+    "strictly-before-cutover-definitive-old-epoch-activity": "invalidate-replacement-eligibility-and-apply-observed-blocker",
+    "equal-ambiguous-or-unattributable-time": "classify-unknown-and-fail-closed",
+    "strictly-after-cutover-provider-artifact": "never-relabel-by-publication-time-require-provider-native-new-merge-base-or-trigger-identity-binding-otherwise-invalidate-cutover-and-classify-unknown",
+    "same-head-publication-time-alone-may-assign-new-epoch": false,
+    "old-epoch-artifact-may-be-relabelled-to-new-same-head-epoch": false,
+    "future-unobserved-output-exclusion-claimed": false
   },
   "transitions": [
     {
@@ -152,7 +1035,7 @@
       "recovery_source": "inherited-stale",
       "current_range_equals_current_pr": false,
       "local_action": "stop-before-local-lanes",
-      "reason": "base-changed-same-head"
+      "reason": "caller-current-range-required"
     },
     {
       "name": "forbidden-parent-rewrite-of-caller-range",
@@ -176,7 +1059,7 @@
       "recovery_source": "inherited-stale",
       "current_range_equals_current_pr": false,
       "local_action": "stop-before-local-lanes",
-      "reason": "base-changed-same-head"
+      "reason": "pr-derived-current-range-required"
     },
     {
       "name": "pr-derived-current-recovery",
