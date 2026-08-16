@@ -56,13 +56,22 @@ def _expected_hosted_fail_closed_blockers(
             item is not None
             and item.detail == profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
         ):
-            blockers.update(
-                {
-                    f"{prefix}-post-exec-leader-binding-invalid",
-                    f"{prefix}-start-identity-is-missing",
-                    f"{prefix}-post-exec-rlimit-is-invalid",
-                }
+            child_identity = (
+                item.child_pid,
+                item.child_process_group,
+                item.child_session,
             )
+            pre_exec_identity = (
+                item.pre_exec_pid,
+                item.pre_exec_process_group,
+                item.pre_exec_session,
+            )
+            if child_identity != pre_exec_identity:
+                blockers.add(f"{prefix}-post-exec-leader-binding-invalid")
+            if not item.child_start_identity:
+                blockers.add(f"{prefix}-start-identity-is-missing")
+            if (item.nproc_soft, item.nproc_hard) != (0, 0):
+                blockers.add(f"{prefix}-post-exec-rlimit-is-invalid")
     for layer in ("seatbelt", "combined"):
         for action in PROBE_ACTIONS:
             blockers.add(f"ambiguous-{layer}-{action}")
@@ -111,10 +120,17 @@ def _matches_hosted_fail_closed_observations(
         ):
             return False
         if layer == "rlimit":
+            sampled_numeric_identity = (
+                item.child_process_group,
+                item.child_session,
+            )
             unbound = (
                 item.detail == profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
-                and item.child_process_group is None
-                and item.child_session is None
+                and sampled_numeric_identity in (
+                    (None, None),
+                    (item.pre_exec_pid, None),
+                    (item.pre_exec_pid, item.pre_exec_pid),
+                )
                 and item.child_start_identity is None
                 and item.nproc_soft is None
                 and item.nproc_hard is None
@@ -248,7 +264,9 @@ def main() -> int:
     )
     observation_signature_matches = _matches_hosted_fail_closed_observations(evidence)
     signature_matches = (
-        runtime_matches
+        not evidence.compatible
+        and not evidence.production_capable
+        and runtime_matches
         and observation_signature_matches
         and blockers == expected_blockers
         and len(blockers) == len(evidence.blockers)
