@@ -3,7 +3,7 @@ id: 20260730-hbp001
 title: Hosted Broker Codesign Pin
 status: completed
 created: 2026-07-30
-updated: 2026-08-01
+updated: 2026-08-16
 branch: wip/broker-codesign-pin-refresh
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/85
 supersedes: []
@@ -33,6 +33,12 @@ superseded_by:
 - Hosted no-child fail-closed probing accepts only the exact reviewed
   macOS 26.4 build `25E246` or macOS 26.5.2 build `25F84` runtime fingerprint;
   an unknown runtime fails before the probe.
+- A leader-exited rlimit observation accepts only the ordered numeric sampling
+  prefixes `(None, None)`, `(pid, None)`, or `(pid, pid)`, with every sampled
+  value equal to the pre-exec PID. Numeric process topology, start identity,
+  and post-exec RLIMIT remain separate protected properties: the latter two
+  must still be absent, so the hosted profile remains incompatible and not
+  production-capable.
 - Source, artifact, Xcode, SDK, clang, linker, lipo, vtool, and
   `codesign_allocate` pins are unchanged.
 - Hosted read-only execution enters the source-only gate through bounded stdin
@@ -161,3 +167,15 @@ superseded_by:
   After synchronizing the exact Trusted Mac source manifest, the final
   host-level Python 3.13.12 deterministic gate passed 840/840 in 269.450
   seconds. The earlier manifest-mismatch run is non-counting.
+- Private overlay CI job
+  [`95207345825`](https://github.com/Joey-Tools/codex-private-workflows/actions/runs/31964454116/job/95207345825)
+  failed the hosted signature on macOS 26.5.2 after the rlimit `fork` probe
+  sampled PID, process group, and session as the same pre-exec PID, then lost
+  the leader before start identity or post-exec RLIMIT could be read.
+  Production therefore emitted the correct 71 blockers without
+  `rlimit-fork-post-exec-leader-binding-invalid`; the stale hosted expectation
+  required 72 and also rejected that valid numeric sampling prefix.
+- The exact hosted-signature selector and its 59-test module, four focused
+  Trusted Mac bootstrap/manifest tests, and the HBP001 repository contract pass
+  locally. This correction still records no post-fix hosted-runner result; a
+  later hosted execution must stand on its own evidence.

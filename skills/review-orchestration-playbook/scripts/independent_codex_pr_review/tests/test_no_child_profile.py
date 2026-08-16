@@ -599,7 +599,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
 
         def build_evidence(
             bound_rlimit_actions: set[str],
+            *,
+            leader_exited_prefix_lengths: dict[str, int] | None = None,
         ) -> profile.CompatibilityEvidence:
+            prefix_lengths = leader_exited_prefix_lengths or {}
             observations: list[profile.ProbeObservation] = []
             for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
                 expected_limit = parent_limit if layer == "seatbelt" else (0, 0)
@@ -607,6 +610,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 for action_index, action in enumerate(PROBE_ACTIONS):
                     pid = 4000 + layer_index * 100 + action_index
                     bound = layer != "rlimit" or action in bound_rlimit_actions
+                    numeric_prefix_length = 2 if bound else prefix_lengths.get(action, 0)
                     post_exec_limit = expected_limit if bound else (None, None)
                     observations.append(
                         profile.ProbeObservation(
@@ -619,8 +623,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
                                 else profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
                             ),
                             child_pid=pid,
-                            child_process_group=pid if bound else None,
-                            child_session=pid if bound else None,
+                            child_process_group=(
+                                pid if numeric_prefix_length >= 1 else None
+                            ),
+                            child_session=pid if numeric_prefix_length >= 2 else None,
                             child_start_identity=(
                                 f"darwin-proc-start:{pid}:1" if bound else None
                             ),
@@ -663,15 +669,43 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 blockers=tuple(blockers),
             )
 
+        def replace_observation(
+            evidence: profile.CompatibilityEvidence,
+            index: int,
+            **changes: object,
+        ) -> profile.CompatibilityEvidence:
+            observations = list(evidence.observations)
+            observations[index] = replace(observations[index], **changes)
+            blockers = profile._probe_blockers(
+                observations,
+                parent_nproc=parent_limit,
+                profile_sha256=profile_sha256,
+            )
+            return replace(
+                evidence,
+                observations=tuple(observations),
+                blockers=tuple(blockers),
+            )
+
         cases = (
-            ("all-unbound", set(), 72),
-            ("baseline-bound", {"baseline"}, 69),
-            ("all-bound", set(PROBE_ACTIONS), 48),
+            ("all-unbound", set(), {}, 72),
+            ("pr174-full-numeric-prefix", set(), {"fork": 2}, 71),
+            ("pgid-only-numeric-prefix", set(), {"fork": 1}, 72),
+            ("baseline-bound", {"baseline"}, {}, 69),
+            ("all-bound", set(PROBE_ACTIONS), {}, 48),
         )
         evidence_by_case: dict[str, profile.CompatibilityEvidence] = {}
-        for name, bound_rlimit_actions, expected_blocker_count in cases:
+        for (
+            name,
+            bound_rlimit_actions,
+            leader_exited_prefix_lengths,
+            expected_blocker_count,
+        ) in cases:
             with self.subTest(name=name):
-                evidence = build_evidence(bound_rlimit_actions)
+                evidence = build_evidence(
+                    bound_rlimit_actions,
+                    leader_exited_prefix_lengths=leader_exited_prefix_lengths,
+                )
                 evidence_by_case[name] = evidence
                 expected_blockers = _expected_hosted_fail_closed_blockers(evidence)
 
@@ -697,26 +731,88 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 )
                 self.assertEqual(len(diagnostics["observations"]), 24)
 
+        pr174_evidence = evidence_by_case["pr174-full-numeric-prefix"]
+        rlimit_fork_index = next(
+            index
+            for index, item in enumerate(pr174_evidence.observations)
+            if (item.layer, item.action) == ("rlimit", "fork")
+        )
+        pr174_fork = pr174_evidence.observations[rlimit_fork_index]
+        self.assertEqual(
+            (pr174_fork.child_process_group, pr174_fork.child_session),
+            (pr174_fork.pre_exec_pid, pr174_fork.pre_exec_pid),
+        )
+        self.assertNotIn(
+            "rlimit-fork-post-exec-leader-binding-invalid",
+            pr174_evidence.blockers,
+        )
+        self.assertIn("rlimit-fork-start-identity-is-missing", pr174_evidence.blockers)
+        self.assertIn("rlimit-fork-post-exec-rlimit-is-invalid", pr174_evidence.blockers)
+
+        pgid_only_evidence = evidence_by_case["pgid-only-numeric-prefix"]
+        pgid_only_fork = pgid_only_evidence.observations[rlimit_fork_index]
+        self.assertEqual(
+            (pgid_only_fork.child_process_group, pgid_only_fork.child_session),
+            (pgid_only_fork.pre_exec_pid, None),
+        )
+        self.assertIn(
+            "rlimit-fork-post-exec-leader-binding-invalid",
+            pgid_only_evidence.blockers,
+        )
+
+        negative_prefix_cases = (
+            (
+                "reverse-numeric-sample",
+                {
+                    "child_process_group": None,
+                    "child_session": pr174_fork.pre_exec_pid,
+                },
+            ),
+            (
+                "wrong-numeric-sample",
+                {
+                    "child_process_group": pr174_fork.pre_exec_pid + 1,
+                    "child_session": pr174_fork.pre_exec_pid + 1,
+                },
+            ),
+            (
+                "start-identity-present",
+                {"child_start_identity": "darwin-proc-start:synthetic"},
+            ),
+            (
+                "post-exec-nproc-present",
+                {"nproc_soft": 0, "nproc_hard": 0},
+            ),
+        )
+        for name, changes in negative_prefix_cases:
+            with self.subTest(name=name):
+                drifted = replace_observation(
+                    pr174_evidence,
+                    rlimit_fork_index,
+                    **changes,
+                )
+                self.assertFalse(_matches_hosted_fail_closed_observations(drifted))
+                self.assertEqual(
+                    set(drifted.blockers),
+                    _expected_hosted_fail_closed_blockers(drifted),
+                )
+
         evidence = evidence_by_case["baseline-bound"]
         rlimit_index = next(
             index
             for index, item in enumerate(evidence.observations)
             if (item.layer, item.action) == ("rlimit", "baseline")
         )
-        malformed_observations = list(evidence.observations)
-        malformed_observations[rlimit_index] = replace(
-            malformed_observations[rlimit_index],
-            detail=profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING,
-        )
-        malformed_evidence = replace(
+        malformed_evidence = replace_observation(
             evidence,
-            observations=tuple(malformed_observations),
+            rlimit_index,
+            detail=profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING,
         )
         with self.subTest(name="malformed-mixed-shape"):
             self.assertFalse(
                 _matches_hosted_fail_closed_observations(malformed_evidence)
             )
-            self.assertNotEqual(
+            self.assertEqual(
                 set(malformed_evidence.blockers),
                 _expected_hosted_fail_closed_blockers(malformed_evidence),
             )
