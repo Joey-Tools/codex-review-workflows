@@ -723,6 +723,66 @@ superseded_by:
   an error: all 3,053 tests passed, with six conditional skips, in 980.329
   seconds.
 
+### Final whole-range review and accepted boundaries
+
+- A new fresh Codex CLI reviewer inspected the frozen range
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..ff7bc22ba6358843dbcda4939c2dfcaeab12d633`
+  from an independently materialized workspace. Pre- and post-review receipts
+  agreed on six scoped commits, five parent edges, parent-graph SHA-256
+  `81552a554eb8c0b5ba073e82d600eee15a9860811a4a6772c8ad3fdb1fbe0e5d`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+- The parent-owned prompt was 9,466 bytes with SHA-256
+  `0b303bc1137c69ee00ec9c844b12f4180137d27e18df3471021ed2e337023be8`.
+  The complete event stream SHA-256 was
+  `9bb61e848a3dfe34ec68130e718e2fea297809836434b4bdcf4b6861b3b426af`;
+  the terminal findings artifact SHA-256 was
+  `3c1afcd9c4f99275ffb5fc4f16b989bef6e85dd828ec68103ca7a8e54c4d0ee5`;
+  stderr was empty. The auth-only review home and empty probe home were removed,
+  and the ordinary authentication object remained unchanged.
+- Two reviewer requests for stronger guarantees were intentionally not
+  adopted because they contradict explicit product decisions rather than
+  reveal internal inconsistency:
+  - GitHub Codex completion is deliberately head-only. It proves the exact
+    current head, not the PR base or merge base. A base change reruns local and
+    readiness gates, and no report may claim that the provider reviewed the
+    base.
+  - After read-before-repeat remains ambiguous, one recovery owner may retry
+    the exact GitHub review request with backoff. Duplicate delivery remains a
+    one-lane audit warning; concurrent or uncontrolled posting is still
+    forbidden.
+- Five actionable findings were accepted and remediated:
+  - a preferred merge/status basis now requires independent parent scope,
+    exact current-head commit, stable check-run identity and URL, verified App
+    and check-name contract, `completed` plus `success`, and an association to
+    accepted same-head provider-clean evidence;
+  - every squash, amend, base-refresh merge, or other head-changing landing
+    transformation must precede final frozen review, while any later commit
+    invalidates the prior exact-head result and reruns validation and review;
+  - the legacy public-command test harness was removed and replaced by an
+    internal-worker-only fixture that cannot forward `run` or another public
+    supervisor command;
+  - the exact range and parent-support object union is now counted against the
+    logical-byte ceiling before pack generation, with bounded error mapping
+    and post-pack integrity checks retained; and
+  - an absent gitlink is accepted only through its exact NUL-framed,
+    path-and-OID-bound status record, while every other deletion or dirty state
+    remains blocking and materialized submodule content is rechecked.
+- Two bounded combined-patch audits then found and closed five integration
+  gaps without changing the selected product behavior: merge-status contracts
+  are now independently parent-bound rather than report-self-authenticating;
+  nested clean channel/grammar pairs are closed; in-process legacy tests
+  restore `SIGPIPE` in `finally`; staged index data is read once and shared
+  between link and clean validation; and every pre-pack error mapping preserves
+  process-quiescence uncertainty from its complete exception graph.
+- The first complete combined-tree test run executed 3,063 tests with six
+  conditional skips in 947.905 seconds. Its sole failure was environmental:
+  the outer execution sandbox rejected the nested Claude broker
+  `sandbox-exec` with return code 71 before the code assertion could run. The
+  authoritative rerun outside that outer restriction used the same tree,
+  command, and `ResourceWarning`-as-error policy; all 3,063 tests passed with
+  the same six skips in 984.620 seconds.
+
 ## Next Steps
 
 - Use the final signed squash candidate head for secret admission and obtain a

@@ -282,7 +282,19 @@ Lowercase `h` (`assume-unchanged`) and lowercase or uppercase `s`/`S`
 (`skip-worktree`) are blocking hidden-index state; every malformed record or
 unknown tag is a validation failure rather than clean evidence.
 
-An absent, uninitialized gitlink is acceptable. The reviewer loads guidance only after validation.
+An absent, uninitialized gitlink is acceptable. The protected property is that
+ordinary tracked content has no worktree or index drift and that a gitlink has no
+materialized submodule content; it does not require an identity distinction
+between an absent gitlink and an empty placeholder directory. The validator
+therefore filters only an exact NUL-framed porcelain-v2
+`.D S... 160000 160000 000000` record whose path and equal head/index object ID
+match the bound index and whose path was proved absent immediately before the
+status call. Every other deletion or status record remains dirty, and gitlink
+paths are checked again after status/index-flags inspection. Child-entry metadata
+churn alone is not mutation evidence, while any materialized entry is a true
+change to the protected property. Each validation reads and parses the staged
+index once; clean-status validation consumes that same bound gitlink set and its
+pre-status absence proof. The reviewer loads guidance only after validation.
 
 Symlink validation uses one bounded batch lookup rather than one Git process per
 link. It admits at most 4,096 tracked symlinks, at most 16 KiB per target and

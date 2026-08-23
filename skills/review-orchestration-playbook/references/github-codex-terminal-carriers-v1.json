@@ -288,6 +288,46 @@
         "head_binding",
         "request_id"
       ],
+      "merge_status_evidence": [
+        "kind",
+        "id",
+        "url",
+        "channel",
+        "check_name",
+        "status",
+        "conclusion",
+        "artifact_commit",
+        "app",
+        "server_time",
+        "server_time_field",
+        "head_binding",
+        "association"
+      ],
+      "merge_status_app": [
+        "id",
+        "slug"
+      ],
+      "merge_status_association": [
+        "kind",
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "check_run_id",
+        "check_run_url",
+        "check_name",
+        "app_id",
+        "app_slug",
+        "contract",
+        "provider_clean_evidence"
+      ],
+      "merge_status_contract": [
+        "source_repository",
+        "source_commit",
+        "source_path",
+        "source_sha256"
+      ],
       "request_policy": [
         "status",
         "warnings"
@@ -371,6 +411,7 @@
           "clean-issue-v1",
           "clean-review-v1"
         ],
+        "channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
         "artifact_commit": "required-full-sha-equals-report-head",
         "head_binding": "explicit-commit"
       },
@@ -383,8 +424,18 @@
       "merge-status": {
         "status": "pass",
         "evidence_kind": "merge-status",
-        "artifact_commit": null,
-        "head_binding": "current-head-status"
+        "evidence_profile": "merge_status_evidence",
+        "channel": "check-run",
+        "check_status": "completed",
+        "conclusion": "success",
+        "artifact_commit": "required-full-sha-equals-report-head",
+        "head_binding": "explicit-commit",
+        "parent_scope_binding": "report repository, pull request, and head equal independently supplied parent scope inputs",
+        "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
+        "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
+        "parent_contract_input": "separate closed parent-owned record whose contract-descriptor UTF-8 bytes, trusted App ID and slug, exact check name, check-run ID and URL, and provider-clean evidence ID and URL equal the report association",
+        "provider_clean_channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
+        "association": "complete parent-owned binding of this exact check run to one accepted current-head provider clean result and independently verified producer-contract bytes"
       },
       "null": {
         "null_evidence_statuses": [
@@ -501,15 +552,51 @@
         "kind": "merge-status",
         "id": 701,
         "url": "https://github.com/octo/review-fixture/runs/701",
-        "channel": "merge-status",
-        "grammar": null,
-        "grammar_branch": null,
-        "grammar_status": null,
-        "artifact_commit": null,
+        "channel": "check-run",
+        "check_name": "Codex Review Merge Gate",
+        "status": "completed",
+        "conclusion": "success",
+        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
         "server_time": "2026-08-23T09:07:00Z",
-        "server_time_field": "status-time",
-        "head_binding": "current-head-status",
-        "request_id": null
+        "server_time_field": "completed_at",
+        "head_binding": "explicit-commit",
+        "association": {
+          "kind": "parent-verified-repository-contract",
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "check_run_id": 701,
+          "check_run_url": "https://github.com/octo/review-fixture/runs/701",
+          "check_name": "Codex Review Merge Gate",
+          "app_id": 15368,
+          "app_slug": "github-actions",
+          "contract": {
+            "source_repository": "octo/review-gate",
+            "source_commit": "2222222222222222222222222222222222222222",
+            "source_path": "contracts/github-codex-merge-status-v1.json",
+            "source_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "provider_clean_evidence": {
+            "kind": "terminal-artifact",
+            "id": 101,
+            "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+            "channel": "issue-comment",
+            "grammar": "github-codex-terminal-carriers-v1",
+            "grammar_branch": "clean-issue-v1",
+            "grammar_status": "accepted",
+            "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+            "server_time": "2026-08-23T09:00:00Z",
+            "server_time_field": "created_at",
+            "head_binding": "explicit-commit",
+            "request_id": 91
+          }
+        }
       },
       "request_policy": {
         "status": "not-applicable",
@@ -702,6 +789,348 @@
       "base": "merge_status",
       "patch": {},
       "valid": true
+    },
+    {
+      "id": "merge-status-null-artifact-commit",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "artifact_commit": null
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-old-head",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-not-completed",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "status": "in_progress"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-unsuccessful-conclusion",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "conclusion": "neutral"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-untrusted-app-id",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "id": 99999
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-untrusted-app-slug",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "slug": "chatgpt-codex-connector"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-app-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "id": 99999,
+            "slug": "other-actions"
+          },
+          "association": {
+            "app_id": 99999,
+            "app_slug": "other-actions"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-check-run-id-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "check_run_id": 702
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-run-url-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/runs/702"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-run-identity-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "id": 702,
+          "url": "https://github.com/octo/review-fixture/runs/702",
+          "association": {
+            "check_run_id": 702,
+            "check_run_url": "https://github.com/octo/review-fixture/runs/702"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-check-name-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_name": "Unrelated Successful Check"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-name-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_name": "Other Review Gate",
+          "association": {
+            "check_name": "Other Review Gate"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-missing-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": null
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-incomplete-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "status": "incomplete"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-head-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "head_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-repository-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "repository": "octo/other"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-pr-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "pull_request": 8
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-service-start-not-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "kind": "provider-service-start"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-cross-pr",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-101"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-provider-clean-identity-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "id": 102,
+              "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-missing-provider-clean-result",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": null
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-stale-provider-clean-result",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "artifact_commit": "1111111111111111111111111111111111111111"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-after-check",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "server_time": "2026-08-23T09:08:00Z"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-issue-review-branch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "grammar_branch": "clean-review-v1"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-review-issue-branch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_evidence": {
+              "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-101",
+              "channel": "review",
+              "grammar_branch": "clean-issue-v1",
+              "server_time_field": "submitted_at"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-invalid-contract-digest",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "contract": {
+              "source_sha256": "not-a-digest"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-contract-descriptor-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "contract": {
+              "source_repository": "octo/other-gate",
+              "source_commit": "4444444444444444444444444444444444444444",
+              "source_path": "contracts/other-status-v1.json",
+              "source_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+            }
+          }
+        }
+      },
+      "valid": false
     },
     {
       "id": "finding-report-positive",

@@ -404,6 +404,38 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(rerun_gate, normalized_freshness)
 
+    def test_change_delivery_reviews_the_exact_final_landing_head(self) -> None:
+        delivery_path = POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
+        delivery = delivery_path.read_text(encoding="utf-8")
+        normalized = _normalize(delivery)
+        landing_step = normalized.split(
+            "5. form the landing shape, freeze, and hand off review.", 1
+        )[1].split("6. accept the reviewed landing head.", 1)[0]
+        acceptance_step = normalized.split("6. accept the reviewed landing head.", 1)[1]
+
+        self.assertIn(
+            "complete every intended squash, amend, or other landing transformation before the final frozen review",
+            landing_step,
+        )
+        self.assertIn(
+            "the exact head intended for the next push or pr handoff",
+            landing_step,
+        )
+        self.assertIn("only accept the exact `head_sha`", acceptance_step)
+        self.assertIn("invalidates the prior exact-head result", acceptance_step)
+        self.assertIn(
+            "rerun the full local validation and documentation checks",
+            acceptance_step,
+        )
+        self.assertIn(
+            "repeat every requested local review lane",
+            acceptance_step,
+        )
+        self.assertNotIn(
+            "review checkpoint commits may be squashed into the final landing shape",
+            normalized,
+        )
+
     def test_secret_admission_never_redacts_or_blocks_reviewer_input(self) -> None:
         consent = _normalize(_read("references/egress-consent.md"))
         contracts = _normalize(_read("references/review-lane-contracts.md"))

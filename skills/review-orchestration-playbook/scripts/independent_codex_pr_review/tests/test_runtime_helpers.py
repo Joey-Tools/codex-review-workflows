@@ -76,13 +76,13 @@ from review_supervisor.secureio import (
 from review_supervisor.wire import receive_record, send_blob, send_record, socket_pair
 
 from tests.support import (
-    LEGACY_SUPERVISOR_HARNESS,
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     bind_attempt_state,
     owned_temporary_directory,
 )
 
 
-ENTRYPOINT = LEGACY_SUPERVISOR_HARNESS
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 
 
 def _fake_attempt(path: pathlib.Path = pathlib.Path("/attempt")) -> SimpleNamespace:

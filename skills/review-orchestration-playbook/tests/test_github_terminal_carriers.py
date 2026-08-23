@@ -9,7 +9,6 @@ import re
 import unittest
 import urllib.parse
 
-
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GRAMMAR_PATH = SKILL_ROOT / "references/github-codex-terminal-carriers-v1.json"
 AUTHORITY_PATH = SKILL_ROOT / "references/github-codex-evidence-authority.md"
@@ -17,6 +16,8 @@ FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 MARKER = re.compile(r"\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`\Z")
 FINDING = re.compile(r"- \[P[0-3]\] (.{1,240}) — (https://[^\s]+)\Z")
 RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+APP_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?\Z")
 
 
 def _merge_patch(target: object, patch: object) -> object:
@@ -512,13 +513,20 @@ class _ReferenceClassifier:
 class _ReportValidator:
     """Closed test-only validator for the required report projection."""
 
-    def __init__(self, grammar: dict[str, object]) -> None:
+    def __init__(
+        self,
+        grammar: dict[str, object],
+        merge_status_parent_scope: dict[str, object],
+        merge_status_parent_contract: dict[str, object],
+    ) -> None:
         self.grammar_name = grammar["schema"]
         self.schema = grammar["required_report_schema"]
         self.fields = self.schema["closed_fields"]
         self.scope_rules = self.schema["scope_rules"]
         self.rules = self.schema["basis_rules"]
         self.finding_rules = self.schema["unresolved_provider_findings_rules"]
+        self.merge_status_parent_scope = copy.deepcopy(merge_status_parent_scope)
+        self.merge_status_parent_contract = copy.deepcopy(merge_status_parent_contract)
 
     def _closed(self, value: object, profile: str) -> bool:
         return isinstance(value, dict) and set(value) == set(self.fields[profile])
@@ -565,6 +573,192 @@ class _ReportValidator:
             and evidence["grammar_status"] == "accepted"
             and self._full_sha(evidence["artifact_commit"])
             and evidence["head_binding"] == "explicit-commit"
+        )
+
+    def _clean_terminal_evidence(
+        self, report: dict[str, object], evidence: object
+    ) -> bool:
+        if not self._terminal_evidence(report, evidence):
+            return False
+        branch_by_channel = {
+            "issue-comment": "clean-issue-v1",
+            "review": "clean-review-v1",
+        }
+        return evidence["grammar_branch"] == branch_by_channel.get(evidence["channel"])
+
+    @staticmethod
+    def _safe_contract_path(value: object) -> bool:
+        if not isinstance(value, str) or not value or "\\" in value:
+            return False
+        path = pathlib.PurePosixPath(value)
+        return (
+            not path.is_absolute()
+            and path.as_posix() == value
+            and all(part not in {"", ".", ".."} for part in path.parts)
+        )
+
+    def _merge_status_evidence(
+        self, report: dict[str, object], evidence: object
+    ) -> bool:
+        parent_scope = self.merge_status_parent_scope
+        parent_contract = self.merge_status_parent_contract
+        if (
+            not isinstance(parent_scope, dict)
+            or not isinstance(parent_contract, dict)
+            or set(parent_scope) != {"repository", "pull_request", "head_sha"}
+            or report["repository"] != parent_scope["repository"]
+            or report["pull_request"] != parent_scope["pull_request"]
+            or report["head_sha"] != parent_scope["head_sha"]
+            or set(parent_contract)
+            != {
+                "contract_descriptor",
+                "app_id",
+                "app_slug",
+                "check_name",
+                "check_run_id",
+                "check_run_url",
+                "provider_clean_evidence_id",
+                "provider_clean_evidence_url",
+            }
+        ):
+            return False
+        if not self._closed(evidence, "merge_status_evidence"):
+            return False
+        try:
+            completed_at = _time(evidence["server_time"])
+        except (TypeError, ValueError):
+            return False
+        check_name = evidence["check_name"]
+        if (
+            evidence["kind"] != "merge-status"
+            or evidence["channel"] != "check-run"
+            or not self._positive_int(evidence["id"])
+            or not isinstance(check_name, str)
+            or not 1 <= len(check_name) <= 100
+            or check_name.strip() != check_name
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in check_name
+            )
+            or evidence["status"] != "completed"
+            or evidence["conclusion"] != "success"
+            or not self._full_sha(evidence["artifact_commit"])
+            or evidence["artifact_commit"] != report["head_sha"]
+            or evidence["server_time_field"] != "completed_at"
+            or evidence["head_binding"] != "explicit-commit"
+            or evidence["id"] != parent_contract["check_run_id"]
+            or evidence["url"] != parent_contract["check_run_url"]
+        ):
+            return False
+
+        parsed_url = urllib.parse.urlsplit(evidence["url"])
+        repository_parts = report["repository"].split("/")
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.netloc != "github.com"
+            or parsed_url.query
+            or parsed_url.fragment
+            or parsed_url.path.removeprefix("/").split("/")
+            != [*repository_parts, "runs", str(evidence["id"])]
+        ):
+            return False
+
+        app = evidence["app"]
+        if (
+            not self._closed(app, "merge_status_app")
+            or not self._positive_int(app["id"])
+            or not isinstance(app["slug"], str)
+            or APP_SLUG.fullmatch(app["slug"]) is None
+        ):
+            return False
+
+        association = evidence["association"]
+        if not self._closed(association, "merge_status_association"):
+            return False
+        contract = association["contract"]
+        if not self._closed(contract, "merge_status_contract"):
+            return False
+        expected_descriptor = parent_contract["contract_descriptor"]
+        if not self._closed(expected_descriptor, "merge_status_contract"):
+            return False
+        source_repository = contract["source_repository"]
+        if (
+            not isinstance(source_repository, str)
+            or source_repository.count("/") != 1
+            or any(not part for part in source_repository.split("/"))
+            or not self._full_sha(contract["source_commit"])
+            or not self._safe_contract_path(contract["source_path"])
+            or not isinstance(contract["source_sha256"], str)
+            or SHA256.fullmatch(contract["source_sha256"]) is None
+        ):
+            return False
+        descriptor_fields = tuple(self.fields["merge_status_contract"])
+        try:
+            descriptor_identity = tuple(
+                contract[field].encode("utf-8") for field in descriptor_fields
+            )
+            expected_descriptor_identity = tuple(
+                expected_descriptor[field].encode("utf-8")
+                for field in descriptor_fields
+            )
+            app_slug_identity = app["slug"].encode("utf-8")
+            expected_app_slug_identity = parent_contract["app_slug"].encode("utf-8")
+            check_name_identity = check_name.encode("utf-8")
+            expected_check_name_identity = parent_contract["check_name"].encode("utf-8")
+        except (AttributeError, UnicodeEncodeError):
+            return False
+        if (
+            descriptor_identity != expected_descriptor_identity
+            or app["id"] != parent_contract["app_id"]
+            or app_slug_identity != expected_app_slug_identity
+            or check_name_identity != expected_check_name_identity
+        ):
+            return False
+
+        provider_clean = association["provider_clean_evidence"]
+        if (
+            association["kind"] != "parent-verified-repository-contract"
+            or association["owner"] != "parent-orchestrator"
+            or association["status"] != "complete"
+            or association["repository"] != report["repository"]
+            or association["pull_request"] != report["pull_request"]
+            or association["head_sha"] != report["head_sha"]
+            or association["check_run_id"] != evidence["id"]
+            or association["check_run_url"] != evidence["url"]
+            or association["check_name"] != check_name
+            or association["app_id"] != app["id"]
+            or association["app_slug"] != app["slug"]
+            or not self._clean_terminal_evidence(report, provider_clean)
+            or provider_clean["artifact_commit"] != report["head_sha"]
+            or not self._clean_evidence_url_matches_scope(report, provider_clean)
+            or provider_clean["id"] != parent_contract["provider_clean_evidence_id"]
+            or provider_clean["url"] != parent_contract["provider_clean_evidence_url"]
+        ):
+            return False
+        try:
+            provider_clean_time = _time(provider_clean["server_time"])
+        except (TypeError, ValueError):
+            return False
+        return provider_clean_time <= completed_at
+
+    @staticmethod
+    def _clean_evidence_url_matches_scope(
+        report: dict[str, object], evidence: dict[str, object]
+    ) -> bool:
+        parsed = urllib.parse.urlsplit(evidence["url"])
+        repository_parts = report["repository"].split("/")
+        fragment_prefix = {
+            "issue-comment": "issuecomment-",
+            "review": "pullrequestreview-",
+        }.get(evidence["channel"])
+        return (
+            fragment_prefix is not None
+            and parsed.scheme == "https"
+            and parsed.netloc == "github.com"
+            and not parsed.query
+            and parsed.path.removeprefix("/").split("/")
+            == [*repository_parts, "pull", str(report["pull_request"])]
+            and parsed.fragment == f"{fragment_prefix}{evidence['id']}"
         )
 
     @staticmethod
@@ -712,7 +906,7 @@ class _ReportValidator:
             return (
                 report["status"] == rule["status"]
                 and not report["unresolved_provider_findings"]
-                and self._terminal_evidence(report, evidence)
+                and self._clean_terminal_evidence(report, evidence)
                 and evidence["kind"] == rule["evidence_kind"]
                 and evidence["grammar_branch"] in rule["branches"]
                 and evidence["artifact_commit"] == report["head_sha"]
@@ -739,16 +933,13 @@ class _ReportValidator:
             return (
                 report["status"] == rule["status"]
                 and not report["unresolved_provider_findings"]
-                and self._common_evidence(report, evidence)
+                and self._merge_status_evidence(report, evidence)
                 and evidence["kind"] == rule["evidence_kind"]
-                and evidence["channel"] == "merge-status"
-                and evidence["grammar"] is None
-                and evidence["grammar_branch"] is None
-                and evidence["grammar_status"] is None
-                and evidence["artifact_commit"] is None
-                and evidence["server_time_field"] == "status-time"
+                and evidence["channel"] == rule["channel"]
+                and evidence["status"] == rule["check_status"]
+                and evidence["conclusion"] == rule["conclusion"]
+                and evidence["artifact_commit"] == report["head_sha"]
                 and evidence["head_binding"] == rule["head_binding"]
-                and evidence["request_id"] is None
             )
         null_rule = self.rules["null"]
         if basis is not None:
@@ -769,7 +960,31 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.grammar = json.loads(GRAMMAR_PATH.read_text(encoding="utf-8"))
         cls.classifier = _ReferenceClassifier(cls.grammar)
-        cls.report_validator = _ReportValidator(cls.grammar)
+        cls.merge_status_parent_scope = {
+            "repository": "octo/review-fixture",
+            "pull_request": 7,
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        }
+        cls.merge_status_parent_contract = {
+            "contract_descriptor": {
+                "source_repository": "octo/review-gate",
+                "source_commit": "2222222222222222222222222222222222222222",
+                "source_path": "contracts/github-codex-merge-status-v1.json",
+                "source_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            },
+            "app_id": 15368,
+            "app_slug": "github-actions",
+            "check_name": "Codex Review Merge Gate",
+            "check_run_id": 701,
+            "check_run_url": "https://github.com/octo/review-fixture/runs/701",
+            "provider_clean_evidence_id": 101,
+            "provider_clean_evidence_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+        }
+        cls.report_validator = _ReportValidator(
+            cls.grammar,
+            cls.merge_status_parent_scope,
+            cls.merge_status_parent_contract,
+        )
 
     def test_resource_is_versioned_closed_and_consumer_only(self) -> None:
         self.assertEqual(self.grammar["schema"], "github-codex-terminal-carriers-v1")
@@ -837,6 +1052,64 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "stable-request-epoch",
         )
         self.assertEqual(
+            report_schema["basis_rules"]["merge-status"]["artifact_commit"],
+            "required-full-sha-equals-report-head",
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["merge-status"]["head_binding"],
+            "explicit-commit",
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["merge-status"]["conclusion"],
+            "success",
+        )
+        self.assertIn(
+            "separate closed parent-owned record",
+            report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["merge-status"][
+                "provider_clean_channel_branch_binding"
+            ],
+            "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
+        )
+        self.assertEqual(
+            set(report_schema["closed_fields"]["merge_status_evidence"]),
+            {
+                "kind",
+                "id",
+                "url",
+                "channel",
+                "check_name",
+                "status",
+                "conclusion",
+                "artifact_commit",
+                "app",
+                "server_time",
+                "server_time_field",
+                "head_binding",
+                "association",
+            },
+        )
+        self.assertEqual(
+            set(report_schema["closed_fields"]["merge_status_association"]),
+            {
+                "kind",
+                "owner",
+                "status",
+                "repository",
+                "pull_request",
+                "head_sha",
+                "check_run_id",
+                "check_run_url",
+                "check_name",
+                "app_id",
+                "app_slug",
+                "contract",
+                "provider_clean_evidence",
+            },
+        )
+        self.assertEqual(
             report_schema["scope_rules"]["selected-pr"]["status_values"],
             ["pass", "findings", "pending", "inconclusive"],
         )
@@ -900,6 +1173,16 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "`artifact_commit` is required, non-null, and equal",
             "`head_binding` is exactly `explicit-commit`",
             "`stable-request-epoch` is valid only in that `basis: reaction-clean`",
+            "parent-verified-repository-contract",
+            "status: completed",
+            "conclusion: success",
+            "provider_clean_evidence: exact-terminal-clean-evidence-object",
+            "independently supplied frozen scope inputs",
+            "successful service-start check cannot become a merge-status pass",
+            "separate closed\nparent-owned `merge_status_parent_contract` record",
+            "exact UTF-8 byte identity",
+            "`issue-comment` requires `clean-issue-v1`",
+            "`review`\nrequires `clean-review-v1`",
         ):
             self.assertIn(anchor, authority)
         self.assertNotIn("artifact_commit: 40-lowercase-hex-or-null", authority)
@@ -966,6 +1249,33 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "reaction-clean-report-positive",
             "reaction-clean-explicit-commit",
             "merge-status-report-positive",
+            "merge-status-null-artifact-commit",
+            "merge-status-old-head",
+            "merge-status-not-completed",
+            "merge-status-unsuccessful-conclusion",
+            "merge-status-untrusted-app-id",
+            "merge-status-untrusted-app-slug",
+            "merge-status-coupled-app-mutation",
+            "merge-status-check-run-id-mismatch",
+            "merge-status-run-url-mismatch",
+            "merge-status-coupled-check-run-identity-mutation",
+            "merge-status-check-name-mismatch",
+            "merge-status-coupled-check-name-mutation",
+            "merge-status-missing-association",
+            "merge-status-incomplete-association",
+            "merge-status-association-head-mismatch",
+            "merge-status-association-repository-mismatch",
+            "merge-status-association-pr-mismatch",
+            "merge-status-service-start-not-association",
+            "merge-status-provider-clean-cross-pr",
+            "merge-status-coupled-provider-clean-identity-mutation",
+            "merge-status-missing-provider-clean-result",
+            "merge-status-stale-provider-clean-result",
+            "merge-status-provider-clean-after-check",
+            "merge-status-provider-clean-issue-review-branch",
+            "merge-status-provider-clean-review-issue-branch",
+            "merge-status-invalid-contract-digest",
+            "merge-status-coupled-contract-descriptor-mutation",
             "finding-report-positive",
             "inline-finding-report-positive",
             "finding-report-empty-unresolved-list",
@@ -1002,6 +1312,88 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 self.assertEqual(
                     self.report_validator.validate(report), fixture["valid"]
                 )
+
+    def test_merge_status_uses_independent_parent_scope_inputs(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        self.assertTrue(self.report_validator.validate(report))
+        replacements = {
+            "repository": "octo/other",
+            "pull_request": 8,
+            "head_sha": "1111111111111111111111111111111111111111",
+        }
+        for field, replacement in replacements.items():
+            with self.subTest(field=field):
+                parent_scope = copy.deepcopy(self.merge_status_parent_scope)
+                parent_scope[field] = replacement
+                validator = _ReportValidator(
+                    self.grammar,
+                    parent_scope,
+                    self.merge_status_parent_contract,
+                )
+                self.assertFalse(validator.validate(report))
+
+    def test_merge_status_uses_independent_parent_contract_input(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        self.assertTrue(self.report_validator.validate(report))
+        replacements = {
+            "contract_descriptor": {
+                "source_repository": "octo/other-gate",
+                "source_commit": "4444444444444444444444444444444444444444",
+                "source_path": "contracts/other-status-v1.json",
+                "source_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            },
+            "app_id": 99999,
+            "app_slug": "other-actions",
+            "check_name": "Other Review Gate",
+            "check_run_id": 702,
+            "check_run_url": "https://github.com/octo/review-fixture/runs/702",
+            "provider_clean_evidence_id": 102,
+            "provider_clean_evidence_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102",
+        }
+        for field, replacement in replacements.items():
+            with self.subTest(field=field):
+                parent_contract = copy.deepcopy(self.merge_status_parent_contract)
+                parent_contract[field] = replacement
+                validator = _ReportValidator(
+                    self.grammar,
+                    self.merge_status_parent_scope,
+                    parent_contract,
+                )
+                self.assertFalse(validator.validate(report))
+
+    def test_merge_status_provider_clean_channel_branch_pairs_are_closed(
+        self,
+    ) -> None:
+        issue_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        issue_clean = issue_report["evidence"]["association"]["provider_clean_evidence"]
+        issue_clean["grammar_branch"] = "clean-review-v1"
+        self.assertFalse(self.report_validator.validate(issue_report))
+
+        review_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        review_clean = review_report["evidence"]["association"][
+            "provider_clean_evidence"
+        ]
+        review_url = (
+            "https://github.com/octo/review-fixture/pull/7#pullrequestreview-101"
+        )
+        review_clean.update(
+            {
+                "url": review_url,
+                "channel": "review",
+                "grammar_branch": "clean-review-v1",
+                "server_time_field": "submitted_at",
+            }
+        )
+        review_parent_contract = copy.deepcopy(self.merge_status_parent_contract)
+        review_parent_contract["provider_clean_evidence_url"] = review_url
+        review_validator = _ReportValidator(
+            self.grammar,
+            self.merge_status_parent_scope,
+            review_parent_contract,
+        )
+        self.assertTrue(review_validator.validate(review_report))
+        review_clean["grammar_branch"] = "clean-issue-v1"
+        self.assertFalse(review_validator.validate(review_report))
 
     def test_selected_pr_report_variants_reject_present_null_scope(self) -> None:
         selected_reports = [

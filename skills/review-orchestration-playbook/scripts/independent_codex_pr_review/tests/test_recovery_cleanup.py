@@ -67,7 +67,7 @@ from review_supervisor.signal_relay import (
 )
 
 from tests.support import (
-    LEGACY_SUPERVISOR_HARNESS,
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     _remove_exact_test_entry,
     _test_entry_object_identity,
     bind_attempt_state,
@@ -75,7 +75,7 @@ from tests.support import (
 )
 from tests.test_git_checkout import GIT, _build_repository
 
-ENTRYPOINT = LEGACY_SUPERVISOR_HARNESS
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 
 
 class _DeferredLeafSignal(BaseException):

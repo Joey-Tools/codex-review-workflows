@@ -136,10 +136,14 @@ Evaluate the following bases in order:
    request.
 
 The first basis is preferred when it exists because repositories commonly
-aggregate the review into a merge-oriented check. Association must be derived
-from current-head check/run metadata or an explicitly documented repository
-contract; never guess a workflow or check name. A generic successful check,
-an App start marker, or a status from another head does not qualify.
+aggregate the review into a merge-oriented check. Association requires both
+current-head check-run metadata and an independently parent-verified repository
+contract; never guess a workflow, check name, or App identity. The raw check
+run must bind its stable ID and exact repository `/runs/<ID>` URL, exact App ID
+and slug, `completed` status, `success` conclusion, and full head SHA to that
+contract. The same association must name one accepted current-head provider
+terminal-clean result. A generic successful check, an App start marker, or a
+status from another head does not qualify.
 
 Preference does not silently enlarge what the check proves. Unless its
 documented contract explicitly binds the PR base, the related merge/status
@@ -384,7 +388,9 @@ evidence:
 For `basis: terminal-clean`, `artifact_commit` is required, non-null, and equal
 to the envelope `head_sha`; `head_binding` is exactly `explicit-commit`.
 `artifact_commit: null` and `head_binding: stable-request-epoch` are
-structurally invalid for terminal clean.
+structurally invalid for terminal clean. The clean channel and grammar branch
+are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
+requires `clean-review-v1`; crossing those pairs is malformed evidence.
 
 Reaction fallback uses a separate closed shape:
 
@@ -405,14 +411,74 @@ evidence:
 ```
 
 `stable-request-epoch` is valid only in that `basis: reaction-clean` reaction
-variant. A `basis: merge-status` report instead uses a closed merge-status
-variant with `head_binding: current-head-status`; a findings report backed by
-an accepted terminal carrier uses `kind: terminal-artifact`, a non-null full
-`artifact_commit`, `head_binding: explicit-commit`, and its finding grammar
-branch. Pending and inconclusive PR-bound reports may use `evidence: null`
-when no stable diagnostic artifact is selected. The no-PR `not-applicable`
-variant always uses null evidence together with its required null PR/head
-fields.
+variant. A `basis: merge-status` report uses this distinct closed check-run
+shape; `provider_clean_evidence` is the complete terminal-clean evidence shape
+shown above, not an ID-only assertion:
+
+```yaml
+evidence:
+  kind: merge-status
+  id: stable-check-run-id
+  url: https://github.com/owner/name/runs/<same-id>
+  channel: check-run
+  check_name: exact-name-from-verified-contract
+  status: completed
+  conclusion: success
+  artifact_commit: 40-lowercase-hex-equal-to-report-head
+  app:
+    id: exact-positive-app-id-from-verified-contract
+    slug: exact-app-slug-from-verified-contract
+  server_time: RFC3339
+  server_time_field: completed_at
+  head_binding: explicit-commit
+  association:
+    kind: parent-verified-repository-contract
+    owner: parent-orchestrator
+    status: complete
+    repository: owner/name
+    pull_request: 123
+    head_sha: 40-lowercase-hex-equal-to-report-head
+    check_run_id: stable-check-run-id
+    check_run_url: https://github.com/owner/name/runs/<same-id>
+    check_name: exact-name-from-verified-contract
+    app_id: exact-positive-app-id-from-verified-contract
+    app_slug: exact-app-slug-from-verified-contract
+    contract:
+      source_repository: owner/name
+      source_commit: 40-lowercase-hex
+      source_path: safe/repository-relative/path
+      source_sha256: 64-lowercase-hex
+    provider_clean_evidence: exact-terminal-clean-evidence-object
+```
+
+Before accepting this shape, the consumer receives a separate closed
+parent-owned `merge_status_parent_contract` record; it must not derive that
+record from the report being validated. The record carries the four contract
+descriptor strings (`source_repository`, `source_commit`, `source_path`, and
+`source_sha256`), trusted App ID and slug, exact check name, stable check-run ID
+and URL, and stable provider-clean evidence ID and URL. Compare every descriptor
+string by exact UTF-8 byte identity with the independently verified record and
+compare every remaining field exactly. Coupled edits to the report's contract,
+App, check, or stable association identities therefore fail even when the
+edited report remains internally self-consistent.
+
+The parent independently verifies the exact contract bytes and digest and
+confirms that the contract binds this App identity, check name, check identity,
+current-head scope, and provider-clean association. The association fields must
+equal the outer raw check-run fields, while the report and association
+repository, PR, and head must separately equal the parent's
+independently supplied frozen scope inputs. Its accepted clean artifact must
+use the closed channel/branch pair above, bind the same head, and have semantic
+time no later than `completed_at`.
+Thus a successful service-start check cannot become a merge-status pass merely
+by copying the App identity or current head.
+
+A findings report backed by an accepted terminal carrier uses
+`kind: terminal-artifact`, a non-null full `artifact_commit`,
+`head_binding: explicit-commit`, and its finding grammar branch. Pending and
+inconclusive PR-bound reports may use `evidence: null` when no stable diagnostic
+artifact is selected. The no-PR `not-applicable` variant always uses null
+evidence together with its required null PR/head fields.
 
 Use `warning` for observed early or duplicate requests. Warnings do not change
 the provider verdict and never authorize another concurrent request. Use

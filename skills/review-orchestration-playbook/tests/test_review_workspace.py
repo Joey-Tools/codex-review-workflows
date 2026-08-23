@@ -844,6 +844,108 @@ class ReviewWorkspaceTest(unittest.TestCase):
             git(prepared.root, "checkout-index", "--all", "--force")
             self.cleanup(prepared)
 
+    def test_absent_gitlink_is_the_only_permitted_status_deletion(self) -> None:
+        gitlink_oid = self.commits[1]
+        raw_path = b"vendor/module"
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{gitlink_oid},{os.fsdecode(raw_path)}",
+        )
+        git(self.repo, "commit", "-m", "add uninitialized gitlink")
+        head = git(self.repo, "rev-parse", "HEAD")
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "absent-gitlink-workspace",
+            self.commits[2],
+            head,
+        )
+        try:
+            placeholder = prepared.root / os.fsdecode(raw_path)
+            self.assertTrue(placeholder.is_dir())
+            self.assertEqual(tuple(placeholder.iterdir()), ())
+            placeholder.rmdir()
+            self.assertFalse(placeholder.exists())
+            status = workspace_runtime._run_git(
+                prepared.root,
+                (
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ),
+            )
+            self.assertTrue(
+                workspace_runtime._status_contains_only_permitted_absent_gitlinks(
+                    status,
+                    {raw_path: gitlink_oid.encode("ascii")},
+                    frozenset({raw_path}),
+                )
+            )
+            with mock.patch.object(
+                workspace_runtime,
+                "_run_git",
+                wraps=workspace_runtime._run_git,
+            ) as run_git:
+                validate_workspace(prepared.root, self.commits[2], head)
+            index_calls = [
+                call
+                for call in run_git.call_args_list
+                if call.args[1] == ("ls-files", "--stage", "-z")
+            ]
+            self.assertEqual(len(index_calls), 1)
+
+            (prepared.root / "tracked.txt").unlink()
+            with self.assertRaises(ReviewWorkspaceError) as caught:
+                validate_workspace(prepared.root, self.commits[2], head)
+            self.assertEqual(caught.exception.reason, "workspace-not-clean")
+        finally:
+            self.cleanup(prepared)
+
+    def test_absent_gitlink_status_filter_requires_exact_bound_record(self) -> None:
+        raw_path = b"vendor/module"
+        oid = self.commits[1].encode("ascii")
+        expected = {raw_path: oid}
+        absent = frozenset({raw_path})
+        accepted = (
+            b"1 .D S... 160000 160000 000000 "
+            + oid
+            + b" "
+            + oid
+            + b" "
+            + raw_path
+            + b"\0"
+        )
+        self.assertTrue(
+            workspace_runtime._status_contains_only_permitted_absent_gitlinks(
+                accepted,
+                expected,
+                absent,
+            )
+        )
+
+        rejected = (
+            accepted[:-1],
+            accepted + accepted,
+            accepted + b"? unrelated.txt\0",
+            accepted.replace(b".D", b"D.", 1),
+            accepted.replace(b"160000", b"100644", 1),
+            accepted.replace(oid, b"f" * len(oid), 1),
+            accepted.replace(raw_path, b"vendor/other", 1),
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload[:48]):
+                self.assertFalse(
+                    workspace_runtime._status_contains_only_permitted_absent_gitlinks(
+                        payload,
+                        expected,
+                        absent,
+                    )
+                )
+
     def test_range_incomplete_is_offline_and_gives_narrow_fetch_guidance(self) -> None:
         shallow = self.root / "incomplete-source"
         subprocess.run(
@@ -916,6 +1018,236 @@ class ReviewWorkspaceTest(unittest.TestCase):
             self.assert_independent_git_layout(prepared.root)
         finally:
             self.cleanup(prepared)
+
+    def test_prepack_logical_budget_blocks_before_pack_generation(self) -> None:
+        destination = self.root / "prepack-logical-limit-workspace"
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "RANGE_OBJECT_LOGICAL_BYTES_LIMIT",
+                0,
+            ),
+            mock.patch.object(workspace_runtime, "run_process") as pack_process,
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            prepare_workspace(
+                self.repo,
+                destination,
+                self.commits[1],
+                self.commits[2],
+            )
+        self.assertEqual(caught.exception.reason, "range-object-logical-byte-limit")
+        self.assertGreater(caught.exception.details["observed"], 0)
+        self.assertEqual(caught.exception.details["limit"], 0)
+        pack_process.assert_not_called()
+        self.assertFalse(destination.exists())
+
+    def test_prepack_object_size_failure_is_classified_before_pack(self) -> None:
+        destination = self.root / "prepack-size-failure-workspace"
+        original_run_git_raw = workspace_runtime._run_git_raw
+        size_command = (
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        )
+
+        def fail_size_probe(
+            root: pathlib.Path,
+            arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> tuple[int, bytes, bytes]:
+            if arguments == size_command:
+                return 23, b"", b"fixture object-size failure\n"
+            return original_run_git_raw(root, arguments, **kwargs)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_git_raw",
+                side_effect=fail_size_probe,
+            ),
+            mock.patch.object(workspace_runtime, "run_process") as pack_process,
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            prepare_workspace(
+                self.repo,
+                destination,
+                self.commits[1],
+                self.commits[2],
+            )
+        self.assertEqual(caught.exception.reason, "range-object-size-check-failed")
+        self.assertEqual(caught.exception.details["returncode"], 23)
+        self.assertEqual(
+            caught.exception.details["stderr_preview"],
+            "fixture object-size failure\n",
+        )
+        pack_process.assert_not_called()
+        self.assertFalse(destination.exists())
+
+    def test_prepack_object_size_process_errors_are_stably_classified(self) -> None:
+        size_command = (
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        )
+        leak_error = workspace_runtime.ReviewProcessLeakError("fixture process leak")
+        workspace_runtime.mark_process_quiescence_unproven(leak_error)
+        marked_timeout = workspace_runtime.ReviewTimeoutError("fixture marked timeout")
+        workspace_runtime.mark_process_quiescence_unproven(marked_timeout)
+        caused_output_limit = workspace_runtime.ReviewOutputLimitError(
+            "fixture caused output limit",
+            limit_kind="stream",
+        )
+        caused_output_limit.__cause__ = workspace_runtime.ReviewProcessLeakError(
+            "fixture output-limit child leak"
+        )
+        contextual_generic = workspace_runtime.ReviewError(
+            "fixture contextual generic failure"
+        )
+        contextual_generic.__context__ = workspace_runtime.ReviewProcessLeakError(
+            "fixture generic child leak"
+        )
+        nested_workspace_error = ReviewWorkspaceError(
+            "fixture-object-size-workspace-error",
+            "fixture workspace failure with an unquiesced child",
+        )
+        nested_workspace_error.__cause__ = workspace_runtime.ReviewProcessLeakError(
+            "fixture workspace child leak"
+        )
+        cases = (
+            (
+                workspace_runtime.ReviewTimeoutError("fixture timeout"),
+                "range-object-size-timeout",
+                "inconclusive",
+                False,
+            ),
+            (
+                marked_timeout,
+                "range-object-size-timeout",
+                "inconclusive",
+                True,
+            ),
+            (
+                workspace_runtime.ReviewOutputLimitError(
+                    "fixture output limit",
+                    limit_kind="stream",
+                ),
+                "range-object-size-output-limit",
+                "blocked-safety",
+                False,
+            ),
+            (
+                caused_output_limit,
+                "range-object-size-output-limit",
+                "inconclusive",
+                True,
+            ),
+            (
+                workspace_runtime.ReviewOutputDrainError("fixture drain failure"),
+                "range-object-size-output-drain",
+                "inconclusive",
+                False,
+            ),
+            (
+                leak_error,
+                "range-object-size-process-leak",
+                "inconclusive",
+                True,
+            ),
+            (
+                contextual_generic,
+                "range-object-size-check-failed",
+                "inconclusive",
+                True,
+            ),
+            (
+                nested_workspace_error,
+                "fixture-object-size-workspace-error",
+                "inconclusive",
+                True,
+            ),
+        )
+        original_run_git_raw = workspace_runtime._run_git_raw
+
+        for index, (error, reason, status, quiescence_unproven) in enumerate(cases):
+            with self.subTest(reason=reason):
+                destination = self.root / f"prepack-process-error-{index}"
+
+                def fail_size_probe(
+                    root: pathlib.Path,
+                    arguments: tuple[str, ...],
+                    _error: BaseException = error,
+                    **kwargs: object,
+                ) -> tuple[int, bytes, bytes]:
+                    if arguments == size_command:
+                        raise _error
+                    return original_run_git_raw(root, arguments, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_run_git_raw",
+                        side_effect=fail_size_probe,
+                    ),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "run_process",
+                    ) as pack_process,
+                    self.assertRaises(ReviewWorkspaceError) as caught,
+                ):
+                    prepare_workspace(
+                        self.repo,
+                        destination,
+                        self.commits[1],
+                        self.commits[2],
+                    )
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(
+                    workspace_runtime.process_quiescence_unproven(caught.exception),
+                    quiescence_unproven,
+                )
+                pack_process.assert_not_called()
+                self.assertFalse(destination.exists())
+
+    def test_prepack_object_size_metadata_binds_the_exact_union(self) -> None:
+        destination = self.root / "prepack-size-binding-workspace"
+        original_run_git_raw = workspace_runtime._run_git_raw
+        size_command = (
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        )
+
+        def replace_first_object(
+            root: pathlib.Path,
+            arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> tuple[int, bytes, bytes]:
+            result = original_run_git_raw(root, arguments, **kwargs)
+            if arguments != size_command:
+                return result
+            returncode, stdout, stderr = result
+            _first, separator, remainder = stdout.partition(b"\n")
+            forged = b"f" * 40 + b" blob 1\n"
+            return returncode, forged + (remainder if separator else b""), stderr
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_git_raw",
+                side_effect=replace_first_object,
+            ),
+            mock.patch.object(workspace_runtime, "run_process") as pack_process,
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            prepare_workspace(
+                self.repo,
+                destination,
+                self.commits[1],
+                self.commits[2],
+            )
+        self.assertEqual(caught.exception.reason, "range-object-size-output-invalid")
+        self.assertEqual(caught.exception.details["record_index"], 0)
+        pack_process.assert_not_called()
+        self.assertFalse(destination.exists())
 
     def test_raw_object_store_copy_is_hard_deprecated(self) -> None:
         with self.assertRaises(ReviewWorkspaceError) as caught:
@@ -2604,7 +2936,12 @@ class ReviewWorkspaceTest(unittest.TestCase):
             )
             self.assertTrue(raw_flags.startswith(b"S tracked.txt\0"))
             with self.assertRaises(ReviewWorkspaceError) as skip:
-                workspace_runtime._validate_clean(prepared.root, binding)
+                workspace_runtime._validate_clean(
+                    prepared.root,
+                    binding,
+                    gitlinks=(),
+                    absent_gitlinks=frozenset(),
+                )
             self.assertEqual(skip.exception.reason, "workspace-index-flags")
 
             git(prepared.root, "update-index", "--no-skip-worktree", "tracked.txt")
@@ -2623,7 +2960,12 @@ class ReviewWorkspaceTest(unittest.TestCase):
             )
             self.assertTrue(raw_flags.startswith(b"h tracked.txt\0"))
             with self.assertRaises(ReviewWorkspaceError) as assume_unchanged:
-                workspace_runtime._validate_clean(prepared.root, binding)
+                workspace_runtime._validate_clean(
+                    prepared.root,
+                    binding,
+                    gitlinks=(),
+                    absent_gitlinks=frozenset(),
+                )
             self.assertEqual(
                 assume_unchanged.exception.reason,
                 "workspace-index-flags",
@@ -2655,7 +2997,12 @@ class ReviewWorkspaceTest(unittest.TestCase):
                 ),
                 self.assertRaises(ReviewWorkspaceError) as malformed,
             ):
-                workspace_runtime._validate_clean(prepared.root, binding)
+                workspace_runtime._validate_clean(
+                    prepared.root,
+                    binding,
+                    gitlinks=(),
+                    absent_gitlinks=frozenset(),
+                )
             self.assertEqual(
                 malformed.exception.reason,
                 "index-flags-output-invalid",

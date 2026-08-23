@@ -2064,6 +2064,182 @@ def _select_raw_commit_scope(
     )
 
 
+def _source_object_budget_quiescence_unproven(error: BaseException) -> bool:
+    """Inspect the complete cause/context graph before normalizing a failure."""
+
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if process_quiescence_unproven(current):
+            return True
+        for related in (current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return False
+
+
+def _map_source_object_budget_error(
+    reason: str,
+    message: str,
+    source: BaseException,
+    *,
+    status: str = "blocked-safety",
+    details: Mapping[str, object] | None = None,
+) -> ReviewWorkspaceError:
+    quiescence_unproven = _source_object_budget_quiescence_unproven(source)
+    mapped = ReviewWorkspaceError(
+        reason,
+        message,
+        status="inconclusive" if quiescence_unproven else status,
+        details=details,
+    )
+    if quiescence_unproven:
+        mark_process_quiescence_unproven(mapped)
+    return mapped
+
+
+def _validate_source_object_logical_budget(
+    root: pathlib.Path,
+    object_format: str,
+    object_ids: Sequence[str],
+    *,
+    deadline: float,
+) -> None:
+    """Bind and budget the exact source object union before pack generation."""
+
+    _check_object_store_deadline(deadline)
+    expected_ids = tuple(sorted(set(object_ids)))
+    expected_length = 40 if object_format == "sha1" else 64
+    if (
+        not expected_ids
+        or len(expected_ids) > RANGE_OBJECT_COUNT_LIMIT
+        or tuple(object_ids) != expected_ids
+        or any(
+            len(oid) != expected_length or FULL_OBJECT_ID.fullmatch(oid) is None
+            for oid in expected_ids
+        )
+    ):
+        raise ReviewWorkspaceError(
+            "range-object-size-input-invalid",
+            "source object-size budgeting did not receive the exact bounded object union",
+        )
+    command = (
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+    )
+    query = b"".join(f"{oid}\n".encode("ascii") for oid in expected_ids)
+    output_limit = len(expected_ids) * (expected_length + 64) + 1024
+    try:
+        returncode, output, stderr = _run_git_raw(
+            root,
+            command,
+            stdin=query,
+            output_limit_bytes=output_limit,
+            absolute_deadline=deadline,
+        )
+    except ReviewWorkspaceError as error:
+        if _source_object_budget_quiescence_unproven(error):
+            mark_process_quiescence_unproven(error)
+            error.status = "inconclusive"
+        raise
+    except ReviewTimeoutError as error:
+        raise _map_source_object_budget_error(
+            "range-object-size-timeout",
+            "source object-size budgeting exceeded its bounded process deadline",
+            error,
+            status="inconclusive",
+            details={"retryable": True},
+        ) from error
+    except ReviewOutputLimitError as error:
+        raise _map_source_object_budget_error(
+            "range-object-size-output-limit",
+            "source object-size budgeting exceeded its derived output bound",
+            error,
+            details={
+                "limit": output_limit,
+                "limit_kind": error.limit_kind,
+            },
+        ) from error
+    except (ReviewOutputDrainError, ReviewProcessLeakError) as error:
+        reason = (
+            "range-object-size-output-drain"
+            if isinstance(error, ReviewOutputDrainError)
+            else "range-object-size-process-leak"
+        )
+        mapped = _map_source_object_budget_error(
+            reason,
+            "source object-size budgeting did not prove complete process settlement",
+            error,
+            status="inconclusive",
+        )
+        raise mapped from error
+    except (ReviewError, OSError) as error:
+        raise _map_source_object_budget_error(
+            "range-object-size-check-failed",
+            "source object-size budgeting failed operationally",
+            error,
+        ) from error
+    if returncode != 0:
+        raise ReviewWorkspaceError(
+            "range-object-size-check-failed",
+            "source object-size budgeting failed operationally",
+            details={
+                "returncode": returncode,
+                "stderr_preview": stderr.decode("utf-8", "backslashreplace")[:4096],
+            },
+        )
+    if not output.endswith(b"\n"):
+        raise ReviewWorkspaceError(
+            "range-object-size-output-invalid",
+            "source object-size budgeting returned an unterminated object record",
+        )
+    records = output[:-1].split(b"\n")
+    if len(records) != len(expected_ids):
+        raise ReviewWorkspaceError(
+            "range-object-size-output-invalid",
+            "source object-size budgeting returned the wrong record count",
+            details={
+                "expected_object_count": len(expected_ids),
+                "observed_record_count": len(records),
+            },
+        )
+    logical_bytes = 0
+    accepted_types = {b"blob", b"commit", b"tree"}
+    for index, (expected_oid, record) in enumerate(zip(expected_ids, records)):
+        if index % 4096 == 0:
+            _check_object_store_deadline(deadline)
+        fields = record.split(b" ")
+        if (
+            len(fields) != 3
+            or fields[0] != expected_oid.encode("ascii")
+            or fields[1] not in accepted_types
+            or not fields[2].isdigit()
+        ):
+            raise ReviewWorkspaceError(
+                "range-object-size-output-invalid",
+                "source object-size budgeting did not bind the exact object union",
+                details={"record_index": index},
+            )
+        size = int(fields[2])
+        logical_bytes += size
+    _check_object_store_deadline(deadline)
+    if logical_bytes > RANGE_OBJECT_LOGICAL_BYTES_LIMIT:
+        raise ReviewWorkspaceError(
+            "range-object-logical-byte-limit",
+            "frozen range plus parent support exceeds the logical-byte limit",
+            details={
+                "object_count": len(expected_ids),
+                "observed": logical_bytes,
+                "limit": RANGE_OBJECT_LOGICAL_BYTES_LIMIT,
+            },
+        )
+
+
 def _freeze_range(
     root: pathlib.Path,
     object_format: str,
@@ -2300,6 +2476,12 @@ def _freeze_range(
                 "limit": RANGE_OBJECT_COUNT_LIMIT,
             },
         )
+    _validate_source_object_logical_budget(
+        root,
+        object_format,
+        tuple(sorted(total_objects)),
+        deadline=deadline,
+    )
     return (
         base,
         head,
@@ -5124,7 +5306,7 @@ def _run_symlink_git(
 
 def _parse_staged_index_for_symlinks(
     payload: bytes,
-) -> tuple[tuple[bytes, ...], tuple[tuple[bytes, bytes], ...]]:
+) -> tuple[tuple[tuple[bytes, bytes], ...], tuple[tuple[bytes, bytes], ...]]:
     if not payload:
         return (), ()
     if not payload.endswith(b"\0"):
@@ -5138,7 +5320,7 @@ def _parse_staged_index_for_symlinks(
             "index-output-invalid",
             "Git staged-index output contains an empty record",
         )
-    gitlinks: list[bytes] = []
+    gitlinks: list[tuple[bytes, bytes]] = []
     symlinks: list[tuple[bytes, bytes]] = []
     for record in records:
         header, separator, raw_path = record.partition(b"\t")
@@ -5157,23 +5339,23 @@ def _parse_staged_index_for_symlinks(
             raise ReviewWorkspaceError(
                 "index-stage-invalid", "workspace index contains an unmerged entry"
             )
-        if mode == b"160000":
-            gitlinks.append(raw_path)
-            continue
-        if mode != b"120000":
+        if mode not in {b"120000", b"160000"}:
             continue
         try:
             oid_text = oid.decode("ascii")
         except UnicodeDecodeError as error:
             raise ReviewWorkspaceError(
                 "index-output-invalid",
-                "Git staged-index symlink object ID is not ASCII",
+                "Git staged-index link object ID is not ASCII",
             ) from error
         if not FULL_OBJECT_ID.fullmatch(oid_text):
             raise ReviewWorkspaceError(
                 "index-output-invalid",
-                "Git staged-index symlink object ID is malformed",
+                "Git staged-index link object ID is malformed",
             )
+        if mode == b"160000":
+            gitlinks.append((raw_path, oid))
+            continue
         symlinks.append((raw_path, oid))
         if len(symlinks) > SYMLINK_COUNT_LIMIT:
             raise ReviewWorkspaceError(
@@ -5271,15 +5453,17 @@ def _parse_symlink_batch(
 
 def _validate_gitlink_placeholders(
     root: pathlib.Path,
-    raw_paths: Sequence[bytes],
+    entries: Sequence[tuple[bytes, bytes]],
     deadline: float,
-) -> None:
-    for raw_path in raw_paths:
+) -> frozenset[bytes]:
+    absent: set[bytes] = set()
+    for raw_path, _expected_oid in entries:
         _remaining_symlink_validation_seconds(deadline)
         gitlink = root / pathlib.Path(os.fsdecode(raw_path))
         try:
             metadata = gitlink.stat(follow_symlinks=False)
         except FileNotFoundError:
+            absent.add(raw_path)
             continue
         if not stat.S_ISDIR(metadata.st_mode):
             raise ReviewWorkspaceError(
@@ -5298,12 +5482,20 @@ def _validate_gitlink_placeholders(
                 "gitlink-materialized",
                 "review workspace submodule placeholder cannot be inspected",
             ) from error
+    return frozenset(absent)
 
 
-def _validate_symlinks(
+@dataclass(frozen=True)
+class _ValidatedLinks:
+    gitlinks: tuple[tuple[bytes, bytes], ...]
+    absent_gitlinks: frozenset[bytes]
+    symlink_count: int
+
+
+def _validate_links(
     root: pathlib.Path,
     control_binding: _WorkspaceControlBinding,
-) -> int:
+) -> _ValidatedLinks:
     deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
     index = _run_symlink_git(
         root,
@@ -5315,9 +5507,13 @@ def _validate_symlinks(
         control_binding=control_binding,
     )
     gitlinks, symlinks = _parse_staged_index_for_symlinks(index)
-    _validate_gitlink_placeholders(root, gitlinks, deadline)
     if not symlinks:
-        return 0
+        absent_gitlinks = _validate_gitlink_placeholders(root, gitlinks, deadline)
+        return _ValidatedLinks(
+            gitlinks=gitlinks,
+            absent_gitlinks=absent_gitlinks,
+            symlink_count=0,
+        )
     batch = _run_symlink_git(
         root,
         ("cat-file", "--batch"),
@@ -5418,7 +5614,21 @@ def _validate_symlinks(
             _remaining_symlink_validation_seconds(deadline)
     finally:
         os.close(root_descriptor)
-    return len(symlinks)
+    absent_gitlinks = _validate_gitlink_placeholders(root, gitlinks, deadline)
+    return _ValidatedLinks(
+        gitlinks=gitlinks,
+        absent_gitlinks=absent_gitlinks,
+        symlink_count=len(symlinks),
+    )
+
+
+def _validate_symlinks(
+    root: pathlib.Path,
+    control_binding: _WorkspaceControlBinding,
+) -> int:
+    """Retain the standalone symlink-validation API used by focused probes."""
+
+    return _validate_links(root, control_binding).symlink_count
 
 
 def _validate_no_object_dependencies(root: pathlib.Path) -> None:
@@ -6886,22 +7096,84 @@ def _validate_fixed_state(
     )
 
 
+def _permitted_absent_gitlink_status_path(
+    record: bytes,
+    expected_gitlinks: Mapping[bytes, bytes],
+) -> bytes | None:
+    fields = record.split(b" ", 8)
+    if len(fields) != 9:
+        return None
+    (
+        kind,
+        xy,
+        submodule,
+        head_mode,
+        index_mode,
+        worktree_mode,
+        head_oid,
+        index_oid,
+        raw_path,
+    ) = fields
+    expected_oid = expected_gitlinks.get(raw_path)
+    if expected_oid is None:
+        return None
+    if (
+        kind != b"1"
+        or xy != b".D"
+        or submodule != b"S..."
+        or head_mode != b"160000"
+        or index_mode != b"160000"
+        or worktree_mode != b"0" * 6
+        or head_oid != expected_oid
+        or index_oid != expected_oid
+    ):
+        return None
+    return raw_path
+
+
+def _status_contains_only_permitted_absent_gitlinks(
+    payload: bytes,
+    expected_gitlinks: Mapping[bytes, bytes],
+    absent_gitlinks: frozenset[bytes],
+) -> bool:
+    if not payload:
+        return True
+    if not payload.endswith(b"\0") or b"\0\0" in payload:
+        return False
+    observed: set[bytes] = set()
+    for record in payload[:-1].split(b"\0"):
+        raw_path = _permitted_absent_gitlink_status_path(record, expected_gitlinks)
+        if raw_path is None or raw_path not in absent_gitlinks or raw_path in observed:
+            return False
+        observed.add(raw_path)
+    return True
+
+
 def _validate_clean(
     root: pathlib.Path,
     control_binding: _WorkspaceControlBinding,
+    *,
+    gitlinks: Sequence[tuple[bytes, bytes]],
+    absent_gitlinks: frozenset[bytes],
 ) -> None:
+    expected_gitlinks = dict(gitlinks)
     status = _run_git(
         root,
         (
             "status",
             "--porcelain=v2",
+            "-z",
             "--untracked-files=all",
             "--ignored=matching",
         ),
         reason="workspace-status-failed",
         control_binding=control_binding,
     )
-    if status:
+    if not _status_contains_only_permitted_absent_gitlinks(
+        status,
+        expected_gitlinks,
+        absent_gitlinks,
+    ):
         raise ReviewWorkspaceError(
             "workspace-not-clean",
             "workspace contains staged, dirty, untracked, or ignored state",
@@ -6936,6 +7208,11 @@ def _validate_clean(
                 "index-flags-output-invalid",
                 "Git returned an unexpected ls-files -v status tag",
             )
+    _validate_gitlink_placeholders(
+        root,
+        gitlinks,
+        time.monotonic() + GIT_TIMEOUT_SECONDS,
+    )
 
 
 def _index_contains_split_link_extension(payload: bytes, oid_width: int) -> bool:
@@ -7054,8 +7331,14 @@ def validate_workspace(
         shallow_bytes,
         shallow_sha256,
     ) = _validate_fixed_state(root, marker, base, head, control_binding)
-    symlink_count = _validate_symlinks(root, control_binding)
-    _validate_clean(root, control_binding)
+    links = _validate_links(root, control_binding)
+    symlink_count = links.symlink_count
+    _validate_clean(
+        root,
+        control_binding,
+        gitlinks=links.gitlinks,
+        absent_gitlinks=links.absent_gitlinks,
+    )
     control_binding.revalidate()
     _validate_no_object_dependencies(root)
     control_binding.revalidate()

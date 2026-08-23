@@ -12,7 +12,7 @@ from review_supervisor.errors import SupervisorError
 from review_supervisor.supervisor import _acquire_source_custody_via_helper
 
 from tests.support import (
-    LEGACY_SUPERVISOR_HARNESS,
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     build_helper_fixture,
     owned_temporary_directory,
 )
@@ -35,7 +35,7 @@ class HelperCustodyTests(unittest.TestCase):
                 repository=SimpleNamespace(repo=fixture["repo"]),
                 attempt_dir=attempt,
             )
-            entrypoint = LEGACY_SUPERVISOR_HARNESS
+            entrypoint = SUPERVISOR_INTERNAL_CHILD_FIXTURE
             transient = fixture["state_dir"] / "benign-transient-child"
             transient.mkdir(mode=0o700)
             handles = None

@@ -80,14 +80,14 @@ from review_supervisor.supervisor import (
 )
 
 from tests.support import (
-    LEGACY_SUPERVISOR_HARNESS,
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     bind_attempt_state,
     owned_temporary_directory,
 )
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
-ENTRYPOINT = LEGACY_SUPERVISOR_HARNESS
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 
 
 class ReviewContractEnvelopeTests(unittest.TestCase):
