@@ -2622,9 +2622,9 @@ class StatefulLifecycleTest(unittest.TestCase):
                     str(self.review.container_dir),
                 ]
             )
-        self.assertEqual(cli_exit, 75)
-        self.assertEqual(json.loads(stdout.getvalue()), summary)
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(cli_exit, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("stateful review entrypoints were retired", stderr.getvalue())
 
         lock_path = self.review.container_dir / state.LOCK_FILE
         with state.open_private_lock_file(

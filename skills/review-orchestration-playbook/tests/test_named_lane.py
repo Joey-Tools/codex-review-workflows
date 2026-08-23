@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import hashlib
 import io
 import importlib.machinery
@@ -28,6 +29,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
+from review_runtime import review_workspace as review_workspace_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
     BoundedCapture,
     ForwardedSignal,
@@ -85,6 +87,26 @@ def run_claude(**kwargs: object) -> dict[str, object]:
     return _run_claude(**kwargs)
 
 
+def retired_public_commands(*commands: str) -> object:
+    """Convert a legacy CLI test into an assertion that its route is absent."""
+
+    def decorate(legacy_test: object) -> object:
+        @functools.wraps(legacy_test)
+        def assert_retired(self: unittest.TestCase) -> None:
+            for command in commands:
+                with (
+                    self.subTest(command=command),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    named_lane_main((command,))
+                self.assertEqual(caught.exception.code, 2)
+
+        return assert_retired
+
+    return decorate
+
+
 class NamedLaneGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         temp_root = pathlib.Path(tempfile.gettempdir()).resolve()
@@ -107,6 +129,1188 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", message)
         return git(self.repo, "rev-parse", "HEAD")
+
+    def workspace_range(self) -> tuple[str, str]:
+        (self.repo / "AGENTS.md").write_text("base guidance\n", encoding="utf-8")
+        base = self.commit("workspace base")
+        (self.repo / "tracked.txt").write_text("workspace head\n", encoding="utf-8")
+        head = self.commit("workspace head")
+        return base, head
+
+    def prepare_workspace_argv(
+        self,
+        destination: pathlib.Path,
+        base: str,
+        head: str,
+    ) -> tuple[str, ...]:
+        return (
+            "prepare-workspace",
+            "--source",
+            str(self.repo.resolve()),
+            "--worktree",
+            str(destination),
+            "--base",
+            base,
+            "--head",
+            head,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_flushes_receipt_before_transferring_cleanup(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "flushed-workspace"
+
+        class CountingStdout(io.StringIO):
+            flush_calls = 0
+
+            def flush(inner_self) -> None:
+                super().flush()
+                inner_self.flush_calls += 1
+
+        stdout = CountingStdout()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stdout.flush_calls, 1)
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(receipt["command"], "prepare-workspace")
+        self.assertEqual(receipt["worktree"], str(destination))
+        self.assertGreater(receipt["range_object_count"], 0)
+        self.assertRegex(receipt["range_object_sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertGreaterEqual(receipt["parent_support_object_count"], 0)
+        self.assertRegex(
+            receipt["parent_support_object_sha256"],
+            r"\A[0-9a-f]{64}\Z",
+        )
+        self.assertEqual(receipt["shallow_bytes"], "")
+        self.assertFalse((destination / ".git/shallow").exists())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_publication_failures_roll_back_workspace(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        real_emit = named_lane_runtime._emit
+
+        class PartialBrokenPipe(io.StringIO):
+            committed = False
+            failed = False
+
+            def write(inner_self, payload: str) -> int:
+                if not inner_self.failed:
+                    inner_self.failed = True
+                    super().write(payload[: max(1, len(payload) // 2)])
+                    raise BrokenPipeError("simulated partial receipt write")
+                return super().write(payload)
+
+        class FlushBrokenPipe(io.StringIO):
+            committed = False
+
+            def flush(inner_self) -> None:
+                raise BrokenPipeError("simulated receipt flush failure")
+
+        cases: tuple[tuple[str, io.StringIO, str], ...] = (
+            ("before-write", io.StringIO(), "simulated receipt write failure"),
+            ("partial-write", PartialBrokenPipe(), "simulated partial receipt write"),
+            ("flush", FlushBrokenPipe(), "simulated receipt flush failure"),
+        )
+        for label, stdout, expected_reason in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"{label}-workspace"
+                stderr = io.StringIO()
+
+                def fail_before_write(
+                    payload: dict[str, object],
+                    *,
+                    stream: object | None = None,
+                ) -> None:
+                    if (
+                        label == "before-write"
+                        and stream is None
+                        and payload.get("command") == "prepare-workspace"
+                    ):
+                        raise BrokenPipeError("simulated receipt write failure")
+                    real_emit(payload, stream=stream)
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_emit",
+                        side_effect=fail_before_write,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(
+                        self.prepare_workspace_argv(destination, base, head)
+                    )
+
+                self.assertEqual(returncode, 2)
+                failure = json.loads(stderr.getvalue())
+                self.assertEqual(failure["status"], "blocked-safety")
+                self.assertEqual(
+                    failure["reason"], "workspace-receipt-publication-failed"
+                )
+                self.assertIn(expected_reason, failure["publication_reason"])
+                self.assertEqual(failure["rollback_status"], "complete")
+                self.assertFalse(destination.exists())
+                if hasattr(stdout, "committed"):
+                    self.assertFalse(stdout.committed)
+                if label == "before-write":
+                    self.assertEqual(stdout.getvalue(), "")
+                elif label == "partial-write":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(stdout.getvalue())
+                else:
+                    self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
+                    self.assertNotEqual(returncode, 0)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_pending_return_signal_rolls_back_before_receipt(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "return-signal-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def prepare_then_signal(*args: object, **kwargs: object) -> object:
+            result = real_prepare(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=prepare_then_signal,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(destination.exists())
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_unquiesced_pack_signal_reports_retained_partial(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "unquiesced-pack-signal-workspace"
+
+        def interrupt_after_process_start(
+            *_args: object,
+            **kwargs: object,
+        ) -> object:
+            for callback_name in ("on_process_starting", "on_process_started"):
+                callback = kwargs[callback_name]
+                assert callable(callback)
+                callback()
+            raise ForwardedSignal(signal.SIGTERM)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                review_workspace_runtime,
+                "run_process",
+                side_effect=interrupt_after_process_start,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        payload_text = stderr.getvalue()
+        payload = json.loads(payload_text)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertEqual(payload["reason"], "forwarded-signal")
+        self.assertIs(payload["cleanup_unavailable_until_quiescent"], True)
+        self.assertEqual(payload["retained_path"], str(destination))
+        parent_metadata = destination.parent.stat()
+        workspace_metadata = destination.stat(follow_symlinks=False)
+        self.assertEqual(
+            payload["parent_identity"],
+            {
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+            },
+        )
+        self.assertEqual(
+            payload["workspace_identity"],
+            {
+                "device": workspace_metadata.st_dev,
+                "inode": workspace_metadata.st_ino,
+                "uid": workspace_metadata.st_uid,
+            },
+        )
+        self.assertEqual(
+            payload["recovery"],
+            {
+                "command": None,
+                "argv": None,
+                "argv_ready": False,
+                "requires_quiescence_proof": True,
+                "ordinary_cleanup_available": False,
+                "instruction": payload["recovery"]["instruction"],
+                "unavailable_reason": ("partial-recovery-process-identity-unavailable"),
+            },
+        )
+        self.assertIn("do not invoke cleanup-workspace", payload_text.lower())
+        self.assertNotIn("cleanup_token", payload_text)
+        self.assertNotIn("--token", payload_text)
+        self.assertFalse(
+            (destination / ".git" / review_workspace_runtime.WORKSPACE_MARKER).exists()
+        )
+        self.assertEqual(
+            len(tuple((destination / ".git/objects/pack").glob(".review-*.pack"))),
+            1,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_signal_after_flush_keeps_delivered_workspace(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "post-flush-signal-workspace"
+
+        class SignalAfterFlush(io.StringIO):
+            injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                if not inner_self.injected:
+                    inner_self.injected = True
+                    signal.raise_signal(signal.SIGTERM)
+
+        stdout = SignalAfterFlush()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertTrue(stdout.injected)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(destination.is_dir())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_transient_restore_failure_keeps_success(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "transient-restore-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        restore_attempts: list[int] = []
+        captured_owner: list[object] = []
+
+        def prepare_with_flaky_restore(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            owner = result._handoff_signal_mask
+            assert owner is not None
+            real_restore = owner.restore
+
+            def flaky_restore(restore: object | None = None) -> None:
+                restore_attempts.append(1)
+                if len(restore_attempts) == 1:
+                    raise OSError("simulated transient signal-mask restore failure")
+                real_restore(restore)  # type: ignore[arg-type]
+
+            owner.restore = flaky_restore  # type: ignore[method-assign]
+            captured_owner.append(owner)
+            return result
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=prepare_with_flaky_restore,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(restore_attempts), 2)
+        owner = captured_owner[0]
+        self.assertFalse(owner.active)  # type: ignore[attr-defined]
+        receipt = json.loads(stdout.getvalue())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_post_flush_drain_failure_exits_success_only(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "post-flush-drain-failure-workspace"
+        consume_calls = 0
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        def consume_with_post_flush_failure() -> signal.Signals | None:
+            nonlocal consume_calls
+            consume_calls += 1
+            if consume_calls == 3:
+                raise OSError("simulated post-flush pending-signal drain failure")
+            return None
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "consume_pending_forwarded_signal",
+                side_effect=consume_with_post_flush_failure,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_terminal_process_exit",
+                side_effect=terminal_exit,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(TerminalExit) as caught,
+        ):
+            named_lane_main(self.prepare_workspace_argv(destination, base, head))
+
+        self.assertEqual(caught.exception.returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(destination.is_dir())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_cleanup_failure_reports_bound_recovery(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "retained-publication-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        real_emit = named_lane_runtime._emit
+        prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+        restore_attempts: list[int] = []
+
+        def capture_prepare(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            owner = result._handoff_signal_mask
+            assert owner is not None
+
+            def fail_restore(_restore: object | None = None) -> None:
+                restore_attempts.append(1)
+                raise OSError("simulated signal-mask restore failure")
+
+            owner.restore = fail_restore  # type: ignore[method-assign]
+            prepared_results.append(result)
+            return result
+
+        def fail_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            if stream is None and payload.get("command") == "prepare-workspace":
+                raise BrokenPipeError("simulated publication failure")
+            real_emit(payload, stream=stream)
+
+        def fail_cleanup(*_args: object, **_kwargs: object) -> object:
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "synthetic-cleanup-failure",
+                "simulated identity-bound cleanup failure",
+            )
+
+        class CountingStderr(io.StringIO):
+            flush_calls = 0
+            signal_injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                inner_self.flush_calls += 1
+                if not inner_self.signal_injected:
+                    inner_self.signal_injected = True
+                    signal.raise_signal(signal.SIGTERM)
+
+        stdout = io.StringIO()
+        stderr = CountingStderr()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=capture_prepare,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "cleanup_workspace",
+                side_effect=fail_cleanup,
+            ),
+            mock.patch.object(named_lane_runtime, "_emit", side_effect=fail_receipt),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.flush_calls, 1)
+        self.assertTrue(stderr.signal_injected)
+        self.assertEqual(len(restore_attempts), 2)
+        failure = json.loads(stderr.getvalue())
+        prepared = prepared_results[0]
+        assert prepared._handoff_signal_mask is not None
+        self.assertFalse(prepared._handoff_signal_mask.active)
+        self.assertEqual(
+            set(failure),
+            {
+                "status",
+                "reason",
+                "primary_reason",
+                "cleanup_reason",
+                "cleanup_token_sha256",
+                "parent_identity",
+                "workspace_identity",
+                "partial_recovery_control",
+                "workspace_state",
+                "owner_process",
+                "active_process",
+                "cleanup_unavailable_until_quiescent",
+                "recovery",
+                "retained_path",
+            },
+        )
+        self.assertEqual(failure["reason"], "workspace-publication-rollback-incomplete")
+        self.assertEqual(failure["primary_reason"], "simulated publication failure")
+        self.assertEqual(failure["cleanup_reason"], "synthetic-cleanup-failure")
+        self.assertEqual(failure["retained_path"], str(destination))
+        self.assertEqual(
+            failure["cleanup_token_sha256"],
+            prepared.cleanup_token_sha256,
+        )
+        self.assertNotIn(prepared.cleanup_token, stderr.getvalue())
+        self.assertEqual(
+            failure["recovery"]["argv"],
+            [
+                "recover-partial-workspace",
+                "--control-file",
+                failure["partial_recovery_control"]["path"],
+                "--control-sha256",
+                failure["partial_recovery_control"]["sha256"],
+            ],
+        )
+        self.assertTrue(failure["recovery"]["argv_ready"])
+        self.assertNotIn("<", " ".join(failure["recovery"]["argv"]))
+        with mock.patch.object(
+            review_workspace_runtime,
+            "_process_start_identity",
+            side_effect=ProcessLookupError,
+        ):
+            recovered = review_workspace_runtime.recover_partial_workspace(
+                pathlib.Path(failure["partial_recovery_control"]["path"]),
+                failure["partial_recovery_control"]["sha256"],
+            )
+        self.assertEqual(recovered.cleanup_status, "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_publication_rollback_recovery_roundtrips_from_serialized_child_result(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "serialized-publication-recovery"
+        child_script = self.root / "publication_failure_child.py"
+        child_script.write_text(
+            "\n".join(
+                (
+                    "import pathlib",
+                    "import sys",
+                    f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                    "from review_runtime import named_lane as runtime",
+                    "from review_runtime.review_workspace import ReviewWorkspaceError",
+                    "real_emit = runtime._emit",
+                    "def fail_emit(payload, *, stream=None):",
+                    "    if stream is None and payload.get('command') == 'prepare-workspace':",
+                    "        raise BrokenPipeError('fixture serialized publication failure')",
+                    "    return real_emit(payload, stream=stream)",
+                    "def fail_cleanup(*args, **kwargs):",
+                    "    raise ReviewWorkspaceError('fixture-rollback-failure', 'fixture rollback failure')",
+                    "runtime._emit = fail_emit",
+                    "runtime.cleanup_workspace = fail_cleanup",
+                    "raise SystemExit(runtime.main((",
+                    "    'prepare-workspace',",
+                    f"    '--source', {str(self.repo)!r},",
+                    f"    '--worktree', {str(destination)!r},",
+                    f"    '--base', {base!r},",
+                    f"    '--head', {head!r},",
+                    ")))",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        child = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(child_script),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(child.returncode, 2, child.stderr)
+        self.assertEqual(child.stdout, "")
+        failure = json.loads(child.stderr)
+        self.assertEqual(
+            failure["reason"],
+            "workspace-publication-rollback-incomplete",
+        )
+        recovery = failure["recovery"]
+        self.assertTrue(recovery["argv_ready"])
+        self.assertNotIn("<cleanup-token", child.stderr)
+        control_path = pathlib.Path(failure["partial_recovery_control"]["path"])
+        control_metadata = control_path.stat(follow_symlinks=False)
+        self.assertEqual(stat.S_IMODE(control_metadata.st_mode), 0o600)
+        self.assertEqual(control_metadata.st_nlink, 1)
+
+        guard = SCRIPTS / "named_lane_guard"
+        recovered = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(guard),
+                *recovery["argv"],
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        receipt = json.loads(recovered.stdout)
+        self.assertEqual(receipt["command"], "recover-partial-workspace")
+        self.assertEqual(receipt["cleanup_status"], "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_cleanup_failure_does_not_claim_replaced_path(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "replaced-publication-workspace"
+        retained = self.root / "identity-bound-original-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        real_emit = named_lane_runtime._emit
+        prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+
+        def capture_prepare(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            prepared_results.append(result)
+            return result
+
+        def fail_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            if stream is None and payload.get("command") == "prepare-workspace":
+                raise BrokenPipeError("simulated publication failure")
+            real_emit(payload, stream=stream)
+
+        def replace_before_cleanup(*_args: object, **_kwargs: object) -> object:
+            destination.rename(retained)
+            destination.mkdir(mode=0o700)
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-identity-mismatch",
+                "simulated replacement before cleanup",
+            )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=capture_prepare,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "cleanup_workspace",
+                side_effect=replace_before_cleanup,
+            ),
+            mock.patch.object(named_lane_runtime, "_emit", side_effect=fail_receipt),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 2)
+        failure = json.loads(stderr.getvalue())
+        self.assertEqual(failure["retained_path"], str(retained))
+        self.assertEqual(
+            failure["workspace_identity"]["inode"],
+            prepared_results[0].workspace_identity[1],
+        )
+        self.assertTrue(failure["recovery"]["argv_ready"])
+        self.assertEqual(
+            failure["recovery"]["argv"][0],
+            "recover-partial-workspace",
+        )
+        with mock.patch.object(
+            review_workspace_runtime,
+            "_process_start_identity",
+            side_effect=ProcessLookupError,
+        ):
+            recovered = review_workspace_runtime.recover_partial_workspace(
+                pathlib.Path(failure["partial_recovery_control"]["path"]),
+                failure["partial_recovery_control"]["sha256"],
+            )
+        self.assertEqual(recovered.root, retained)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_failure_envelope_write_failures_exit_without_mask_leak(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        real_prepare = review_workspace_runtime.prepare_workspace
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        class ReceiptBrokenPipe(io.StringIO):
+            def write(inner_self, _payload: str) -> int:
+                raise BrokenPipeError("simulated stdout receipt failure")
+
+        class PartialStderr(io.StringIO):
+            failed = False
+
+            def write(inner_self, payload: str) -> int:
+                if not inner_self.failed:
+                    inner_self.failed = True
+                    super().write(payload[: max(1, len(payload) // 2)])
+                    raise BrokenPipeError("simulated partial stderr write failure")
+                return super().write(payload)
+
+        class FlushStderr(io.StringIO):
+            def flush(inner_self) -> None:
+                raise BrokenPipeError("simulated stderr flush failure")
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        def fail_cleanup(*_args: object, **_kwargs: object) -> object:
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "synthetic-cleanup-failure",
+                "simulated retained rollback target",
+            )
+
+        for label, stderr in (
+            ("partial", PartialStderr()),
+            ("flush", FlushStderr()),
+        ):
+            with self.subTest(label=label):
+                destination = self.root / f"stderr-{label}-workspace"
+                stdout = ReceiptBrokenPipe()
+                prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+
+                def capture_prepare(
+                    *args: object,
+                    **kwargs: object,
+                ) -> review_workspace_runtime.PreparedWorkspace:
+                    result = real_prepare(*args, **kwargs)
+                    prepared_results.append(result)
+                    return result
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "prepare_workspace",
+                        side_effect=capture_prepare,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "cleanup_workspace",
+                        side_effect=fail_cleanup,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_terminal_process_exit",
+                        side_effect=terminal_exit,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(TerminalExit) as caught,
+                ):
+                    named_lane_main(
+                        self.prepare_workspace_argv(destination, base, head)
+                    )
+
+                self.assertEqual(caught.exception.returncode, 2)
+                self.assertTrue(destination.is_dir())
+                if label == "partial":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(stderr.getvalue())
+                    self.assertEqual(stderr.getvalue().count("\n"), 0)
+                else:
+                    self.assertEqual(
+                        json.loads(stderr.getvalue())["reason"],
+                        "workspace-publication-rollback-incomplete",
+                    )
+                    self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                for forwarded, previous in previous_handlers.items():
+                    self.assertEqual(signal.getsignal(forwarded), previous)
+                self.assertEqual(
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                    previous_mask,
+                )
+                matching_controls = []
+                for candidate in destination.parent.glob(
+                    f"{review_workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                ):
+                    payload = json.loads(candidate.read_bytes())
+                    if payload.get("worktree") == str(destination):
+                        matching_controls.append(candidate)
+                self.assertEqual(len(matching_controls), 1)
+                control_path = matching_controls[0]
+                control_digest = hashlib.sha256(control_path.read_bytes()).hexdigest()
+                with mock.patch.object(
+                    review_workspace_runtime,
+                    "_process_start_identity",
+                    side_effect=ProcessLookupError,
+                ):
+                    recovered = review_workspace_runtime.recover_partial_workspace(
+                        control_path,
+                        control_digest,
+                    )
+                self.assertEqual(recovered.cleanup_status, "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_terminal_persistent_restore_failure_exits_with_published_rc(
+        self,
+    ) -> None:
+        probe = """
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from review_runtime import named_lane
+from review_runtime.common import ForwardedSignalMaskOwner
+
+previous = signal.pthread_sigmask(
+    signal.SIG_BLOCK,
+    set(named_lane.forwarded_signals()),
+)
+owner = ForwardedSignalMaskOwner(previous_mask=previous, active=True)
+
+def fail_restore(_restore=None):
+    raise OSError("persistent owner restore failure")
+
+def fail_direct(_previous_mask):
+    raise OSError("persistent direct restore failure")
+
+owner.restore = fail_restore
+named_lane._direct_restore_workspace_signal_mask = fail_direct
+state = named_lane._StructuredSignalState()
+if sys.argv[2] == "success":
+    named_lane._emit_workspace_terminal_receipt(
+        {"status": "ok", "command": "fixture", "cleanup_token": "fixture-token"},
+        state,
+        handoff_owner=owner,
+    )
+else:
+    named_lane._emit_structured_terminal_failure(
+        {"status": "blocked-safety", "reason": "fixture"},
+        state,
+        returncode=7,
+        handoff_owner=owner,
+    )
+raise AssertionError("terminal publisher returned with an active mask owner")
+"""
+        for mode, expected_returncode in (("success", 0), ("failure", 7)):
+            with self.subTest(mode=mode):
+                completed = subprocess.run(
+                    (
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        probe,
+                        str(SCRIPTS),
+                        mode,
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, expected_returncode)
+                if mode == "success":
+                    self.assertEqual(completed.stderr, "")
+                    self.assertEqual(
+                        json.loads(completed.stdout),
+                        {
+                            "status": "ok",
+                            "command": "fixture",
+                            "cleanup_token": "fixture-token",
+                        },
+                    )
+                else:
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(
+                        json.loads(completed.stderr),
+                        {"status": "blocked-safety", "reason": "fixture"},
+                    )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_failure_handler_install_failure_restores_before_exit(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "stderr-handler-install-workspace"
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_install = named_lane_runtime._install_post_terminal_signal_handlers
+        install_calls = 0
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        class ReceiptBrokenPipe(io.StringIO):
+            def write(inner_self, _payload: str) -> int:
+                raise BrokenPipeError("simulated stdout receipt failure")
+
+        def install_then_fail() -> list[signal.Signals]:
+            nonlocal install_calls
+            install_calls += 1
+            if install_calls == 2:
+                raise OSError("simulated terminal handler installation failure")
+            return real_install()
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        stdout = ReceiptBrokenPipe()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_install_post_terminal_signal_handlers",
+                side_effect=install_then_fail,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_terminal_process_exit",
+                side_effect=terminal_exit,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(TerminalExit) as caught,
+        ):
+            named_lane_main(self.prepare_workspace_argv(destination, base, head))
+
+        self.assertEqual(caught.exception.returncode, 2)
+        self.assertEqual(install_calls, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(destination.exists())
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    def test_workspace_publication_recovery_accepts_only_identity_bound_quarantine(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        recovery_parent = self.root / "recovery-parent"
+        recovery_parent.mkdir(mode=0o700)
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            recovery_parent / "quarantine-recovery-workspace",
+            base,
+            head,
+        )
+        quarantine = recovery_parent / ".quarantine-recovery-workspace.cleanup-fixture"
+        prepared.root.rename(quarantine)
+        try:
+            cleanup_error = review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-cleanup-incomplete",
+                "fixture retained quarantine",
+                details={"retained_path": str(quarantine)},
+            )
+            self.assertEqual(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                ),
+                str(quarantine),
+            )
+
+            replacement = prepared.root
+            replacement.mkdir(mode=0o700)
+            replaced_error = review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-cleanup-incomplete",
+                "fixture unverified replacement",
+                details={"retained_path": str(replacement)},
+            )
+            self.assertEqual(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    replaced_error,
+                ),
+                str(quarantine),
+            )
+            replacement.rmdir()
+
+            quarantine.chmod(0o755)
+            self.assertIsNone(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                )
+            )
+            quarantine.chmod(0o700)
+
+            recovery_parent.chmod(0o755)
+            self.assertIsNone(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                )
+            )
+            recovery_parent.chmod(0o700)
+
+            original_parent = recovery_parent.with_name("recovery-parent-original")
+            recovery_parent.rename(original_parent)
+            recovery_parent.mkdir(mode=0o700)
+            moved_quarantine = recovery_parent / quarantine.name
+            (original_parent / quarantine.name).rename(moved_quarantine)
+            try:
+                parent_swap_error = review_workspace_runtime.ReviewWorkspaceError(
+                    "workspace-cleanup-incomplete",
+                    "fixture parent replacement",
+                    details={"retained_path": str(moved_quarantine)},
+                )
+                self.assertIsNone(
+                    named_lane_runtime._prepared_workspace_retained_path(
+                        prepared,
+                        parent_swap_error,
+                    )
+                )
+            finally:
+                moved_quarantine.rename(original_parent / quarantine.name)
+                recovery_parent.rmdir()
+                original_parent.rename(recovery_parent)
+        finally:
+            quarantine.rename(prepared.root)
+            review_workspace_runtime.cleanup_workspace(
+                prepared.root,
+                prepared.cleanup_token,
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_validate_and_cleanup_cli_keep_flushed_terminal_receipts(self) -> None:
+        base, head = self.workspace_range()
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / "terminal-receipt-workspace",
+            base,
+            head,
+        )
+        real_cleanup = review_workspace_runtime.cleanup_workspace
+
+        def cleanup_then_signal(*args: object, **kwargs: object) -> object:
+            result = real_cleanup(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        class SignalAfterFlush(io.StringIO):
+            injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                if not inner_self.injected:
+                    inner_self.injected = True
+                    signal.raise_signal(signal.SIGINT)
+
+        commands = (
+            (
+                "validate-workspace",
+                (
+                    "validate-workspace",
+                    "--worktree",
+                    str(prepared.root),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                ),
+            ),
+            (
+                "cleanup-workspace",
+                (
+                    "cleanup-workspace",
+                    "--worktree",
+                    str(prepared.root),
+                    "--token",
+                    prepared.cleanup_token,
+                ),
+            ),
+        )
+        for command, argv in commands:
+            with self.subTest(command=command):
+                stdout = SignalAfterFlush()
+                stderr = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    if command == "cleanup-workspace":
+                        stack.enter_context(
+                            mock.patch.object(
+                                named_lane_runtime,
+                                "cleanup_workspace",
+                                side_effect=cleanup_then_signal,
+                            )
+                        )
+                    stack.enter_context(contextlib.redirect_stdout(stdout))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    returncode = named_lane_main(argv)
+                self.assertTrue(stdout.injected)
+                self.assertEqual(returncode, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(json.loads(stdout.getvalue())["command"], command)
+        self.assertFalse(prepared.root.exists())
 
     def bind_formal_validator_range(self, base: str, head: str) -> None:
         info = self.repo / ".git" / "info"
@@ -559,6 +1763,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "review_runtime.claude_version_policy": str(
                 runtime / "claude_version_policy.py"
             ),
+            "review_runtime.review_workspace": str(runtime / "review_workspace.py"),
             "review_runtime.named_lane": str(runtime / "named_lane.py"),
         }
         expected_fd_exec = str(runtime / "fd_exec.py")
@@ -1811,26 +3016,19 @@ class NamedLaneGuardTest(unittest.TestCase):
         prefixes: tuple[str, ...] = (),
         phase: str = "initial",
     ) -> tuple[int, str, str]:
-        argv = [
-            "legacy-short-prefix-receipts",
-            "--source",
-            str(source),
-            "--temporary-path",
-            str(temporary_path),
-            "--head",
-            head,
-            "--phase",
-            phase,
-        ]
-        for prefix in prefixes:
-            argv.extend(("--prefix", prefix))
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(tuple(argv))
+            returncode = named_lane_runtime.legacy_short_prefix_compatibility_main(
+                source,
+                temporary_path,
+                head,
+                phase,
+                prefixes,
+            )
         return returncode, stdout.getvalue(), stderr.getvalue()
 
     def test_legacy_short_prefix_receipts_emit_sorted_closed_schema_and_fixed_git_queries(
@@ -2044,51 +3242,17 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(receipt["object_type"], "commit")
         self.assertFalse(temporary_path.exists())
 
-    def test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime(
-        self,
-    ) -> None:
-        base, _middle, head = self.legacy_prefix_history()
-        scripts, guard = self.copy_guard_bundle()
-        workspace_marker = self.root / "workspace-module-loaded.marker"
-        (scripts / "review_runtime/workspace.py").write_text(
-            "import pathlib\n"
-            f"pathlib.Path({str(workspace_marker)!r}).write_text('loaded')\n",
-            encoding="utf-8",
-        )
-        temporary_path = self.root / "guard-legacy-prefix-view"
-
+    def test_guard_help_omits_legacy_short_prefix_receipt_route(self) -> None:
+        _scripts, guard = self.copy_guard_bundle()
         completed = subprocess.run(
-            self.isolated_guard_command(
-                guard,
-                "legacy-short-prefix-receipts",
-                "--source",
-                str(self.repo.resolve()),
-                "--temporary-path",
-                str(temporary_path),
-                "--head",
-                head,
-                "--phase",
-                "initial",
-                "--prefix",
-                base[:10],
-            ),
-            check=False,
+            self.isolated_guard_command(guard, "--help"),
+            check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stderr, "")
-        payload = json.loads(completed.stdout)
-        self.assertEqual(
-            payload["schema_version"],
-            LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
-        )
-        self.assertEqual(payload["receipts"][0]["raw_prefix"], base[:10])
-        self.assertFalse(workspace_marker.exists())
-        self.assertFalse(temporary_path.exists())
-        self.assertEqual(list(scripts.rglob("__pycache__")), [])
+        self.assertNotIn("legacy-short-prefix-receipts", completed.stdout)
 
     def test_legacy_short_prefix_receipts_reject_current_head_prefix_without_receipts(
         self,
@@ -5001,6 +6165,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             validate_worktree(self.repo.resolve(), base, head)
 
+    @retired_public_commands("validate-worktree")
     def test_validate_worktree_cli_requires_base_and_receipts_frozen_range(
         self,
     ) -> None:
@@ -5404,6 +6569,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertTrue(replaced)
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_distinct_local_config_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5491,6 +6657,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     {"status": "blocked-safety", "reason": expected_reason},
                 )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_config_input_inspection_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5537,6 +6704,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     },
                 )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_config_record_inspection_failure(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5576,6 +6744,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             },
         )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_distinct_git_info_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -6644,6 +7813,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                             expected_identity,
                         )
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_structures_signal_during_python_cleanup_window(
         self,
     ) -> None:
@@ -6698,6 +7868,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_preserves_retained_control_path_at_terminal_restore(
         self,
     ) -> None:
@@ -6784,6 +7955,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertNotEqual(payload["reason"], "forwarded-signal")
         self.assertFalse(destination.exists())
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_defers_signal_during_control_cleanup(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6842,6 +8014,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_retries_signal_block_before_cleanup(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6893,6 +8066,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_a_signal_during_emit(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6956,6 +8130,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_signal_while_unblocking(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -7020,6 +8195,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_signal_during_outer_teardown(
         self,
     ) -> None:
@@ -7087,6 +8263,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_retains_terminal_failure_when_signal_arrives_during_receipt_rollback(
         self,
     ) -> None:
@@ -7650,6 +8827,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             self.validate_repo(head)
 
+    @retired_public_commands("validate-worktree")
     def test_valueless_frozen_submodule_path_is_structured_blocked_safety(
         self,
     ) -> None:
@@ -7870,6 +9048,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertFalse(marker.exists())
                 git(self.repo, "config", "--unset-all", key)
 
+    @retired_public_commands("validate-worktree")
     def test_git_alias_is_blocked_before_reviewer_launch(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit()
@@ -12454,6 +13633,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
         self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_control_object_reason_is_stable_across_safety_commands(self) -> None:
         reason = "materialized-git-config-content-mismatch"
         error = named_lane_runtime._ControlObjectGuardError(
@@ -12504,6 +13684,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     {"status": "blocked-safety", "reason": reason},
                 )
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (
             ("deadline", lambda: ReviewTimeoutError("deadline"), 2),
@@ -12608,6 +13789,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                         {"status": expected_status, "reason": reason},
                     )
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_cli_wraps_thread_start_failure_by_subcommand(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit()

@@ -795,6 +795,21 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertTrue(owner.may_have_started())
         self.assertTrue(owner.started())
 
+    def test_process_leak_secondary_marks_selected_signal_structurally(
+        self,
+    ) -> None:
+        selected = common.ForwardedSignal(signal.SIGTERM)
+        leak = common.ReviewProcessLeakError("fixture process group did not quiesce")
+
+        common._attach_process_secondary_failure(
+            selected,
+            leak,
+            context="fixture cleanup",
+        )
+
+        self.assertTrue(common.process_quiescence_unproven(selected))
+        self.assertTrue(common.process_quiescence_unproven(leak))
+
     def test_logged_process_owned_spawn_result_interruption_is_reaped(
         self,
     ) -> None:

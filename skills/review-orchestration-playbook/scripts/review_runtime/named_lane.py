@@ -19,10 +19,11 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import BinaryIO, Callable, Iterable, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterable, Mapping, NoReturn, Sequence
 
 from .common import (
     ForwardedSignal,
+    ForwardedSignalMaskOwner,
     ReviewError,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
@@ -41,6 +42,18 @@ from .claude_version_policy import (
     CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
+)
+from .review_workspace import (
+    PreparedWorkspace,
+    RangeIncomplete,
+    ReviewWorkspaceError,
+    _finish_forwarded_signal_mask,
+    _partial_workspace_recovery_payload,
+    cleanup_workspace,
+    prepare_workspace,
+    recover_partial_workspace,
+    retain_workspace_for_owner_exit_recovery,
+    validate_workspace,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 1_800.0
@@ -111,6 +124,64 @@ CLAUDE_ENV_PASSTHROUGH_KEYS = (
 
 class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
+
+
+@dataclass(frozen=True)
+class _SignalMaskRestoreOutcome:
+    """Result of bounded terminal signal-mask restoration."""
+
+    restored: bool
+    failure_types: tuple[str, ...]
+    direct_exact_mask_fallback: str
+
+
+class _WorkspacePublicationRollbackError(ReviewWorkspaceError):
+    """An unpublished workspace could not be removed after receipt failure."""
+
+    def __init__(
+        self,
+        prepared: PreparedWorkspace,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+        recovery_payload: Mapping[str, object],
+    ) -> None:
+        expected_parent = {
+            "device": prepared.parent_identity[0],
+            "inode": prepared.parent_identity[1],
+            "uid": prepared.parent_identity[2],
+        }
+        expected_workspace = {
+            "device": prepared.workspace_identity[0],
+            "inode": prepared.workspace_identity[1],
+            "uid": prepared.workspace_identity[2],
+        }
+        details: dict[str, object] = {
+            "primary_reason": _workspace_publication_failure_reason(primary_error),
+            "cleanup_reason": _workspace_publication_failure_reason(cleanup_error),
+            "cleanup_token_sha256": prepared.cleanup_token_sha256,
+            "parent_identity": expected_parent,
+            "workspace_identity": expected_workspace,
+            **dict(recovery_payload),
+        }
+        retained_path = _prepared_workspace_retained_path(
+            prepared,
+            cleanup_error,
+        )
+        if retained_path is not None:
+            details["retained_path"] = retained_path
+        else:
+            details["expected_locator"] = {
+                "parent": str(prepared.root.parent),
+                "parent_identity": expected_parent,
+                "leaf": prepared.root.name,
+                "workspace_identity": expected_workspace,
+            }
+        super().__init__(
+            "workspace-publication-rollback-incomplete",
+            "workspace receipt publication failed and identity-bound cleanup did "
+            "not complete",
+            details=details,
+        )
 
 
 class _ControlObjectGuardError(NamedLaneGuardError):
@@ -8880,41 +8951,39 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
-    materialize = subparsers.add_parser(
-        "materialize-worktree",
-        help="Create a private repository from a bounded frozen object closure.",
+    prepare = subparsers.add_parser(
+        "prepare-workspace",
+        help="Create an independent clean workspace for a frozen committed range.",
     )
-    materialize.add_argument("--source", required=True)
-    materialize.add_argument("--worktree", required=True)
-    materialize.add_argument("--base", required=True)
-    materialize.add_argument("--head", required=True)
+    prepare.add_argument("--source", required=True)
+    prepare.add_argument("--worktree", required=True)
+    prepare.add_argument("--base", required=True)
+    prepare.add_argument("--head", required=True)
 
     validate = subparsers.add_parser(
-        "validate-worktree",
-        help="Validate tracked symlink containment for a frozen named-lane worktree.",
+        "validate-workspace",
+        help="Revalidate an independent clean review workspace.",
     )
     validate.add_argument("--worktree", required=True)
     validate.add_argument("--base", required=True)
     validate.add_argument("--head", required=True)
-    validate.add_argument("--guidance", action="append", default=[])
 
-    legacy_prefixes = subparsers.add_parser(
-        "legacy-short-prefix-receipts",
-        help="Resolve legacy short commit prefixes in a private sanitized Git view.",
+    cleanup = subparsers.add_parser(
+        "cleanup-workspace",
+        help="Remove the exact identity-bound review workspace.",
     )
-    legacy_prefixes.add_argument("--source", required=True)
-    legacy_prefixes.add_argument("--temporary-path", required=True)
-    legacy_prefixes.add_argument("--head", required=True)
-    legacy_prefixes.add_argument(
-        "--phase",
-        required=True,
-        choices=("initial", "final"),
+    cleanup.add_argument("--worktree", required=True)
+    cleanup.add_argument("--token", required=True)
+
+    recover = subparsers.add_parser(
+        "recover-partial-workspace",
+        help=(
+            "Remove an identity-bound retained workspace after its exact process "
+            "identity is absent."
+        ),
     )
-    legacy_prefixes.add_argument(
-        "--prefix",
-        action="append",
-        default=[],
-    )
+    recover.add_argument("--control-file", required=True)
+    recover.add_argument("--control-sha256", required=True)
 
     claude = subparsers.add_parser(
         "run-claude",
@@ -8948,6 +9017,407 @@ def _emit(payload: dict[str, object], *, stream: object | None = None) -> None:
     print(json.dumps(payload, sort_keys=True), file=stream)
 
 
+def _workspace_publication_failure_reason(error: BaseException) -> str:
+    if isinstance(error, ForwardedSignal):
+        return "forwarded-signal"
+    if isinstance(error, ReviewWorkspaceError):
+        return error.reason
+    reason = str(error)
+    return reason if reason else type(error).__name__
+
+
+def _prepared_workspace_retained_path(
+    prepared: PreparedWorkspace,
+    cleanup_error: BaseException,
+) -> str | None:
+    candidates = [prepared.root]
+    if isinstance(cleanup_error, ReviewWorkspaceError):
+        retained = cleanup_error.details.get("retained_path")
+        if isinstance(retained, str):
+            candidate = pathlib.Path(retained)
+            if candidate.is_absolute() and candidate.parent == prepared.root.parent:
+                candidates.append(candidate)
+    try:
+        with os.scandir(prepared.root.parent) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 4096:
+                    break
+                candidate = prepared.root.parent / entry.name
+                if candidate not in candidates:
+                    candidates.append(candidate)
+    except OSError:
+        pass
+    for candidate in candidates:
+        parent_descriptor: int | None = None
+        workspace_descriptor: int | None = None
+        try:
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            parent_descriptor = os.open(candidate.parent, directory_flags)
+            parent = os.fstat(parent_descriptor)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or stat.S_IMODE(parent.st_mode) != 0o700
+                or (parent.st_dev, parent.st_ino, parent.st_uid)
+                != prepared.parent_identity
+            ):
+                continue
+            workspace_descriptor = os.open(
+                candidate.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            workspace = os.fstat(workspace_descriptor)
+            workspace_path = os.stat(
+                candidate.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            parent_path = candidate.parent.stat(follow_symlinks=False)
+            parent_final = os.fstat(parent_descriptor)
+            workspace_final = os.fstat(workspace_descriptor)
+            workspace_path_final = os.stat(
+                candidate.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            parent_path_final = candidate.parent.stat(follow_symlinks=False)
+            if (
+                stat.S_ISDIR(workspace.st_mode)
+                and stat.S_IMODE(workspace.st_mode) == 0o700
+                and (workspace.st_dev, workspace.st_ino, workspace.st_uid)
+                == prepared.workspace_identity
+                and (workspace_path.st_dev, workspace_path.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and stat.S_IMODE(workspace_path.st_mode) == 0o700
+                and (parent_path.st_dev, parent_path.st_ino, parent_path.st_uid)
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_path.st_mode) == 0o700
+                and (parent_final.st_dev, parent_final.st_ino, parent_final.st_uid)
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_final.st_mode) == 0o700
+                and (workspace_final.st_dev, workspace_final.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and (workspace_path_final.st_dev, workspace_path_final.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and workspace_path_final.st_uid == prepared.workspace_identity[2]
+                and stat.S_IMODE(workspace_path_final.st_mode) == 0o700
+                and (
+                    parent_path_final.st_dev,
+                    parent_path_final.st_ino,
+                    parent_path_final.st_uid,
+                )
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_path_final.st_mode) == 0o700
+            ):
+                return str(candidate)
+        except (OSError, ValueError):
+            continue
+        finally:
+            if workspace_descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(workspace_descriptor)
+            if parent_descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(parent_descriptor)
+    return None
+
+
+def _rollback_unpublished_workspace(
+    prepared: PreparedWorkspace,
+    primary_error: BaseException,
+    handoff_owner: ForwardedSignalMaskOwner | None,
+) -> None:
+    try:
+        cleaned = cleanup_workspace(
+            prepared.root,
+            prepared.cleanup_token,
+            defer_signal_handoff=True,
+        )
+        nested_owner = cleaned._handoff_signal_mask
+        if nested_owner is None or not nested_owner.active:
+            raise NamedLaneGuardError(
+                "workspace rollback cleanup did not retain signal-mask custody"
+            )
+        _finish_forwarded_signal_mask(
+            nested_owner,
+            primary_error=primary_error,
+        )
+    except BaseException as cleanup_error:
+        retained_path = _prepared_workspace_retained_path(
+            prepared,
+            cleanup_error,
+        )
+        if retained_path is None:
+            raise ReviewWorkspaceError(
+                "workspace-publication-rollback-state-unavailable",
+                "workspace receipt publication failed and rollback state could not be bound",
+                details={
+                    "primary_reason": _workspace_publication_failure_reason(
+                        primary_error
+                    ),
+                    "cleanup_reason": _workspace_publication_failure_reason(
+                        cleanup_error
+                    ),
+                    "parent_identity": {
+                        "device": prepared.parent_identity[0],
+                        "inode": prepared.parent_identity[1],
+                        "uid": prepared.parent_identity[2],
+                    },
+                    "workspace_identity": {
+                        "device": prepared.workspace_identity[0],
+                        "inode": prepared.workspace_identity[1],
+                        "uid": prepared.workspace_identity[2],
+                    },
+                },
+            ) from cleanup_error
+        try:
+            recovery_payload = retain_workspace_for_owner_exit_recovery(
+                pathlib.Path(retained_path),
+                prepared.parent_identity,
+                prepared.workspace_identity,
+            )
+        except BaseException as recovery_error:
+            terminal_error = ReviewWorkspaceError(
+                "workspace-publication-recovery-capability-unavailable",
+                "workspace rollback failed and an executable recovery capability could not be sealed",
+                details={
+                    "primary_reason": _workspace_publication_failure_reason(
+                        primary_error
+                    ),
+                    "cleanup_reason": _workspace_publication_failure_reason(
+                        cleanup_error
+                    ),
+                    "recovery_reason": _workspace_publication_failure_reason(
+                        recovery_error
+                    ),
+                    "retained_path": retained_path,
+                    "parent_identity": {
+                        "device": prepared.parent_identity[0],
+                        "inode": prepared.parent_identity[1],
+                        "uid": prepared.parent_identity[2],
+                    },
+                    "workspace_identity": {
+                        "device": prepared.workspace_identity[0],
+                        "inode": prepared.workspace_identity[1],
+                        "uid": prepared.workspace_identity[2],
+                    },
+                },
+            )
+            _attach_workspace_publication_owner(terminal_error, handoff_owner)
+            raise terminal_error from recovery_error
+        terminal_error = _WorkspacePublicationRollbackError(
+            prepared,
+            primary_error,
+            cleanup_error,
+            recovery_payload,
+        )
+        _attach_workspace_publication_owner(terminal_error, handoff_owner)
+        raise terminal_error from cleanup_error
+    if isinstance(primary_error, ForwardedSignal):
+        terminal_error = primary_error
+    else:
+        terminal_error = ReviewWorkspaceError(
+            "workspace-receipt-publication-failed",
+            "workspace receipt publication failed after rollback completed",
+            details={
+                "publication_reason": _workspace_publication_failure_reason(
+                    primary_error
+                ),
+                "rollback_status": "complete",
+            },
+        )
+        terminal_error.__cause__ = primary_error
+    _attach_workspace_publication_owner(terminal_error, handoff_owner)
+    raise terminal_error
+
+
+def _attach_workspace_publication_owner(
+    error: BaseException,
+    owner: ForwardedSignalMaskOwner | None,
+) -> None:
+    if owner is not None and owner.active:
+        setattr(error, "_workspace_publication_signal_owner", owner)
+
+
+def _workspace_publication_owner(
+    error: BaseException,
+) -> ForwardedSignalMaskOwner | None:
+    owner = getattr(error, "_workspace_publication_signal_owner", None)
+    if isinstance(owner, ForwardedSignalMaskOwner) and owner.active:
+        return owner
+    return None
+
+
+def _acquire_workspace_publication_owner() -> tuple[
+    ForwardedSignalMaskOwner,
+    ForwardedSignal | None,
+]:
+    owner = ForwardedSignalMaskOwner()
+    deferred: ForwardedSignal | None = None
+    while True:
+        try:
+            block_forwarded_signals(signal_mask_owner=owner)
+            return owner, deferred
+        except ForwardedSignal as error:
+            if deferred is None:
+                deferred = error
+
+
+def _direct_restore_workspace_signal_mask(
+    previous_mask: set[signal.Signals] | None,
+) -> None:
+    if previous_mask is None:
+        raise NamedLaneGuardError(
+            "active workspace signal-mask owner has no exact previous mask"
+        )
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _restore_workspace_publication_owner(
+    owner: ForwardedSignalMaskOwner,
+) -> _SignalMaskRestoreOutcome:
+    failures: list[BaseException] = []
+    for _attempt in range(2):
+        if not owner.active:
+            break
+        try:
+            owner.restore()
+        except BaseException as error:
+            failures.append(error)
+    direct_fallback = "not-needed"
+    if owner.active:
+        try:
+            _direct_restore_workspace_signal_mask(owner.previous_mask)
+        except BaseException as error:
+            failures.append(error)
+            direct_fallback = "failed"
+        else:
+            owner.restore_attempted = True
+            owner.active = False
+            direct_fallback = "succeeded"
+    return _SignalMaskRestoreOutcome(
+        restored=not owner.active,
+        failure_types=tuple(type(error).__name__ for error in failures),
+        direct_exact_mask_fallback=direct_fallback,
+    )
+
+
+def _terminal_process_exit(returncode: int) -> NoReturn:
+    os._exit(returncode)
+
+
+def _finish_workspace_terminal_publication(
+    owner: ForwardedSignalMaskOwner,
+    signal_state: _StructuredSignalState,
+    *,
+    returncode: int,
+) -> None:
+    terminal_failure = False
+    try:
+        consume_pending_forwarded_signal()
+        signal_state.commit()
+    except BaseException:
+        terminal_failure = True
+    try:
+        outcome = _restore_workspace_publication_owner(owner)
+    except BaseException:
+        terminal_failure = True
+        outcome = _SignalMaskRestoreOutcome(
+            restored=False,
+            failure_types=("terminal-restore-internal-failure",),
+            direct_exact_mask_fallback="failed",
+        )
+    if terminal_failure or not outcome.restored:
+        _terminal_process_exit(returncode)
+
+
+def _emit_prepared_workspace_receipt(
+    prepared: PreparedWorkspace,
+    signal_state: _StructuredSignalState,
+) -> None:
+    handoff_owner = prepared._handoff_signal_mask
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, acquisition_signal = _acquire_workspace_publication_owner()
+        primary_error: BaseException
+        if acquisition_signal is not None:
+            primary_error = acquisition_signal
+        else:
+            primary_error = NamedLaneGuardError(
+                "workspace receipt handoff does not own a signal mask"
+            )
+        _rollback_unpublished_workspace(
+            prepared,
+            primary_error,
+            handoff_owner,
+        )
+    pending_before_receipt = consume_pending_forwarded_signal()
+    if pending_before_receipt is not None:
+        _rollback_unpublished_workspace(
+            prepared,
+            ForwardedSignal(pending_before_receipt),
+            handoff_owner,
+        )
+    try:
+        _install_post_terminal_signal_handlers()
+        _emit(prepared.receipt())
+        sys.stdout.flush()
+    except BaseException as publication_error:
+        _rollback_unpublished_workspace(
+            prepared,
+            publication_error,
+            handoff_owner,
+        )
+    # A complete flush transfers cleanup-token custody to the caller. Signals
+    # that arrived during publication are post-terminal and must not turn the
+    # delivered success receipt into a false failure.
+    _finish_workspace_terminal_publication(
+        handoff_owner,
+        signal_state,
+        returncode=0,
+    )
+
+
+def _emit_workspace_terminal_receipt(
+    payload: dict[str, object],
+    signal_state: _StructuredSignalState,
+    *,
+    handoff_owner: ForwardedSignalMaskOwner | None = None,
+) -> None:
+    acquisition_signal: ForwardedSignal | None = None
+    acquired_for_publication = False
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, acquisition_signal = _acquire_workspace_publication_owner()
+        acquired_for_publication = True
+        if not handoff_owner.active:
+            raise NamedLaneGuardError(
+                "workspace receipt publication requires main-thread signal masking"
+            )
+        if acquisition_signal is not None:
+            _attach_workspace_publication_owner(acquisition_signal, handoff_owner)
+            raise acquisition_signal
+    try:
+        if acquired_for_publication:
+            pending_before_receipt = consume_pending_forwarded_signal()
+            if pending_before_receipt is not None:
+                raise ForwardedSignal(pending_before_receipt)
+        _install_post_terminal_signal_handlers()
+        _emit(payload)
+        sys.stdout.flush()
+    except BaseException as publication_error:
+        _attach_workspace_publication_owner(publication_error, handoff_owner)
+        raise
+    _finish_workspace_terminal_publication(
+        handoff_owner,
+        signal_state,
+        returncode=0,
+    )
+
+
 def _emit_claude_receipt(payload: dict[str, object]) -> None:
     _emit(payload)
     sys.stdout.flush()
@@ -8967,18 +9437,146 @@ def _install_post_terminal_signal_handlers() -> list[signal.Signals]:
 def _emit_structured_terminal_failure(
     payload: dict[str, object],
     signal_state: _StructuredSignalState,
+    *,
+    returncode: int,
+    handoff_owner: ForwardedSignalMaskOwner | None = None,
 ) -> None:
-    terminal_mask, _deferred_signal = _block_materializer_cleanup_signals()
-    if terminal_mask is None:
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, _deferred_signal = _acquire_workspace_publication_owner()
+    if not handoff_owner.active:
         raise NamedLaneGuardError(
             "terminal failure publication requires main-thread signal masking"
         )
-    _emit(payload, stream=sys.stderr)
-    sys.stderr.flush()
-    _install_post_terminal_signal_handlers()
-    consume_pending_forwarded_signal()
-    signal_state.commit()
-    restore_signal_mask(terminal_mask)
+    publication_error: BaseException | None = None
+    try:
+        _install_post_terminal_signal_handlers()
+        _emit(payload, stream=sys.stderr)
+        sys.stderr.flush()
+        consume_pending_forwarded_signal()
+        signal_state.commit()
+    except BaseException as error:
+        publication_error = error
+    finally:
+        outcome = _restore_workspace_publication_owner(handoff_owner)
+        if not outcome.restored:
+            _terminal_process_exit(returncode)
+    if publication_error is not None:
+        _terminal_process_exit(returncode)
+
+
+def _workspace_command_failure(
+    error: BaseException,
+) -> tuple[int, dict[str, object]]:
+    partial_recovery = _partial_workspace_recovery_payload(error) or {}
+    if isinstance(error, RangeIncomplete):
+        return 75, {**error.payload(), **partial_recovery}
+    if isinstance(error, ReviewWorkspaceError):
+        return 2, {**error.payload(), **partial_recovery}
+    if isinstance(error, ForwardedSignal):
+        return (
+            128 + int(error.signum),
+            {
+                "status": "blocked-safety",
+                "reason": "forwarded-signal",
+                **partial_recovery,
+            },
+        )
+    if isinstance(error, ReviewTimeoutError):
+        reason = "deadline"
+    elif isinstance(error, ReviewOutputLimitError):
+        reason = "output-limit"
+    elif isinstance(error, ReviewOutputDrainError):
+        reason = "output-drain"
+    elif isinstance(error, ReviewProcessLeakError):
+        reason = "process-leak"
+    else:
+        reason = _machine_reason(error)
+    return 2, {
+        "status": "blocked-safety",
+        "reason": reason,
+        **partial_recovery,
+    }
+
+
+def _workspace_command_main(args: argparse.Namespace) -> int:
+    with _structured_forwarded_signals() as signal_state:
+        try:
+            if args.command_name == "prepare-workspace":
+                prepared = prepare_workspace(
+                    pathlib.Path(args.source),
+                    pathlib.Path(args.worktree),
+                    args.base,
+                    args.head,
+                    defer_signal_handoff=True,
+                )
+                _emit_prepared_workspace_receipt(prepared, signal_state)
+                return 0
+            if args.command_name == "validate-workspace":
+                validated = validate_workspace(
+                    pathlib.Path(args.worktree),
+                    args.base,
+                    args.head,
+                )
+                _emit_workspace_terminal_receipt(
+                    validated.receipt(),
+                    signal_state,
+                )
+                return 0
+            if args.command_name == "cleanup-workspace":
+                cleaned = cleanup_workspace(
+                    pathlib.Path(args.worktree),
+                    args.token,
+                    defer_signal_handoff=True,
+                )
+                if (
+                    cleaned._handoff_signal_mask is None
+                    or not cleaned._handoff_signal_mask.active
+                ):
+                    raise NamedLaneGuardError(
+                        "cleanup workspace receipt handoff does not own a signal mask"
+                    )
+                _emit_workspace_terminal_receipt(
+                    cleaned.receipt(),
+                    signal_state,
+                    handoff_owner=cleaned._handoff_signal_mask,
+                )
+                return 0
+            if args.command_name == "recover-partial-workspace":
+                cleaned = recover_partial_workspace(
+                    pathlib.Path(args.control_file),
+                    args.control_sha256,
+                    defer_signal_handoff=True,
+                )
+                if (
+                    cleaned._handoff_signal_mask is None
+                    or not cleaned._handoff_signal_mask.active
+                ):
+                    raise NamedLaneGuardError(
+                        "partial recovery receipt handoff does not own a signal mask"
+                    )
+                _emit_workspace_terminal_receipt(
+                    cleaned.receipt(),
+                    signal_state,
+                    handoff_owner=cleaned._handoff_signal_mask,
+                )
+                return 0
+            raise NamedLaneGuardError("unknown workspace command")
+        except (
+            ForwardedSignal,
+            NamedLaneGuardError,
+            RangeIncomplete,
+            ReviewError,
+            OSError,
+            ValueError,
+        ) as error:
+            returncode, payload = _workspace_command_failure(error)
+            _emit_structured_terminal_failure(
+                payload,
+                signal_state,
+                returncode=returncode,
+                handoff_owner=_workspace_publication_owner(error),
+            )
+            return returncode
 
 
 def _machine_reason(error: BaseException) -> str:
@@ -9088,81 +9686,68 @@ def _emit_legacy_prefix_receipt(result: LegacyPrefixReceiptResult) -> None:
     restore_signal_mask(handoff_mask)
 
 
+def legacy_short_prefix_compatibility_main(
+    source: pathlib.Path,
+    temporary_path: pathlib.Path,
+    head: str,
+    phase: str,
+    prefixes: Sequence[str],
+) -> int:
+    """Exercise the retained low-level receipt implementation without a CLI route."""
+    try:
+        with _structured_forwarded_signals() as signal_state:
+            result = legacy_short_prefix_receipts(
+                source,
+                temporary_path,
+                head,
+                phase,
+                prefixes,
+                defer_signal_handoff=True,
+            )
+            _emit_legacy_prefix_receipt(result)
+            signal_state.commit()
+        return 0
+    except LegacyPrefixReceiptInconclusive as error:
+        _emit(
+            {"status": "inconclusive", "reason": error.reason},
+            stream=sys.stderr,
+        )
+        return 75
+    except ForwardedSignal as error:
+        _emit(
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+            stream=sys.stderr,
+        )
+        return 128 + int(error.signum)
+    except ReviewTimeoutError:
+        reason = "deadline"
+    except ReviewOutputLimitError:
+        reason = "output-limit"
+    except ReviewOutputDrainError:
+        reason = "output-drain"
+    except ReviewProcessLeakError:
+        reason = "process-leak"
+    except (NamedLaneGuardError, ReviewError, OSError, ValueError) as error:
+        reason = _machine_reason(error)
+    _emit(
+        {"status": "blocked-safety", "reason": reason},
+        stream=sys.stderr,
+    )
+    return 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     safety_command = args.command_name in {
-        "legacy-short-prefix-receipts",
-        "materialize-worktree",
-        "validate-worktree",
+        "cleanup-workspace",
+        "prepare-workspace",
+        "recover-partial-workspace",
+        "validate-workspace",
     }
+    if safety_command:
+        return _workspace_command_main(args)
     try:
-        if args.command_name == "materialize-worktree":
-            with _structured_forwarded_signals() as signal_state:
-                try:
-                    result = materialize_worktree(
-                        pathlib.Path(args.source),
-                        pathlib.Path(args.worktree),
-                        args.base,
-                        args.head,
-                        defer_signal_handoff=True,
-                    )
-                    _emit_materialized_receipt(result)
-                except (
-                    ForwardedSignal,
-                    ReviewTimeoutError,
-                    ReviewOutputLimitError,
-                    ReviewOutputDrainError,
-                    ReviewProcessLeakError,
-                    NamedLaneGuardError,
-                    ReviewError,
-                    OSError,
-                    ValueError,
-                ) as error:
-                    returncode, payload = _materializer_failure_payload(error)
-                    _emit_structured_terminal_failure(payload, signal_state)
-                    return returncode
-                signal_state.commit()
-                return 0
-
-        if args.command_name == "validate-worktree":
-            with _structured_forwarded_signals():
-                result = validate_worktree(
-                    pathlib.Path(args.worktree),
-                    args.base,
-                    args.head,
-                    args.guidance,
-                )
-                _emit(
-                    {
-                        "status": "ok",
-                        "worktree": str(result.root),
-                        "base": result.base_sha,
-                        "head": result.head_sha,
-                        "commit_count": result.commit_count,
-                        "parent_edge_count": result.parent_edge_count,
-                        "parent_graph_sha256": result.parent_graph_sha256,
-                        "local_config_sha256": result.local_config_sha256,
-                        "symlink_count": result.symlink_count,
-                        "guidance_count": result.guidance_count,
-                    }
-                )
-            return 0
-
-        if args.command_name == "legacy-short-prefix-receipts":
-            with _structured_forwarded_signals() as signal_state:
-                result = legacy_short_prefix_receipts(
-                    pathlib.Path(args.source),
-                    pathlib.Path(args.temporary_path),
-                    args.head,
-                    args.phase,
-                    args.prefix,
-                    defer_signal_handoff=True,
-                )
-                _emit_legacy_prefix_receipt(result)
-                signal_state.commit()
-            return 0
-
         command = list(args.claude_argv)
         if command and command[0] == "--":
             command.pop(0)
@@ -9360,6 +9945,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream=sys.stderr,
         )
         return 75
+    except RangeIncomplete as error:
+        _emit(error.payload(), stream=sys.stderr)
+        return 75
+    except ReviewWorkspaceError as error:
+        _emit(error.payload(), stream=sys.stderr)
+        return 2
     except ForwardedSignal as error:
         status = "blocked-safety" if safety_command else "inconclusive"
         _emit(

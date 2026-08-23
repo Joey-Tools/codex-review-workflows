@@ -3,14 +3,20 @@ id: 20260807-wme001
 title: Large-Repository Exact-Range Materialization
 status: completed
 created: 2026-08-07
-updated: 2026-08-07
+updated: 2026-08-23
 branch: wip/wme-range-materialization
 pr:
 supersedes: []
-superseded_by:
+superseded_by: 20260822-ros001
 ---
 
 # Large-Repository Exact-Range Materialization
+
+This entry records the historical materializer that shipped in this workstream.
+Its single-base shallow boundary and `--ancestry-path` topology restriction are
+not current review policy. They are superseded by
+`20260822-ros001`, which admits the complete merge-inclusive DAG and validates
+the reviewer-visible frozen range directly.
 
 ## Summary
 
