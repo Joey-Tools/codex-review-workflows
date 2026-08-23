@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import json
+import pathlib
+import unittest
+
+
+SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
+REFERENCES = SKILL_ROOT / "references"
+
+
+def _read(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _normalize(value: str) -> str:
+    return " ".join(value.split()).lower()
+
+
+class GitHubRecoveryContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.skill = _read(SKILL_ROOT / "SKILL.md")
+        cls.probes = _read(REFERENCES / "github-pr-probes.md")
+        cls.authority = _read(REFERENCES / "github-codex-evidence-authority.md")
+        cls.readiness = _read(REFERENCES / "pr-readiness.md")
+        cls.carriers = json.loads(
+            _read(REFERENCES / "github-codex-terminal-carriers-v1.json")
+        )
+
+    def test_actions_mutation_requires_contract_and_authorization(self) -> None:
+        recovery = self.probes.split("## Reconcile Only Recoverable States", 1)[
+            1
+        ].split("## Retry Schedule And Cost Control", 1)[0]
+        normalized = _normalize(recovery)
+
+        self.assertIn("an actions mutation has two independent gates", normalized)
+        self.assertIn(
+            "predeclares the exact rerun or dispatch operation as idempotent or reentrant",
+            normalized,
+        )
+        self.assertIn("the current task authorizes that external mutation", normalized)
+        self.assertIn("keep the recovery owner in status-only mode", normalized)
+        self.assertIn(
+            "report the missing contract or authorization instead of triggering",
+            normalized,
+        )
+        self.assertLess(
+            normalized.index("an actions mutation has two independent gates"),
+            normalized.index("illustrative commands"),
+        )
+        self.assertNotIn(
+            "repeated reruns or dispatches are semantically idempotent",
+            _normalize(self.skill + "\n" + self.probes + "\n" + self.authority),
+        )
+
+    def test_unbounded_backoff_is_limited_to_typed_retryable_reasons(self) -> None:
+        retry = self.probes.split("## Retry Schedule And Cost Control", 1)[1].split(
+            "## Active Thread And Automation", 1
+        )[0]
+        normalized = _normalize(retry)
+
+        self.assertIn(
+            "machine-decidable retryable pending or infrastructure reason",
+            normalized,
+        )
+        self.assertIn("1, 2, 4, 8, 16, 32, 60, 60, 60", normalized)
+        self.assertIn(
+            "there is no retry-count ceiling while the same reason remains machine-decidably retryable",
+            normalized,
+        )
+        self.assertIn("at 60 minutes, report", normalized)
+        self.assertIn("then retry hourly", normalized)
+        self.assertIn("stable malformed snapshot", normalized)
+        self.assertIn("non-retryable inconclusive state stops", normalized)
+
+        combined = _normalize(self.skill + "\n" + self.probes + "\n" + self.authority)
+        self.assertNotIn("inconclusive provider collection", combined)
+        self.assertIn(
+            "other non-retryable inconclusive state terminates recovery",
+            combined,
+        )
+
+    def test_long_wait_uses_same_thread_and_private_throttling(self) -> None:
+        automation = self.probes.split("## Active Thread And Automation", 1)[1]
+        retry = self.probes.split("## Retry Schedule And Cost Control", 1)[1]
+        normalized = _normalize(automation + "\n" + retry)
+
+        for anchor in (
+            "same active thread",
+            "never create a new conversation",
+            "pollable and cancellable active-thread fallback",
+            "rolling budget of four full-run equivalents per 24 hours",
+            "status-only hourly checks",
+            "public repositories do not use the private-minute budget",
+        ):
+            self.assertIn(anchor, normalized)
+
+    def test_only_applicable_unresolved_findings_block(self) -> None:
+        findings = self.authority.split("## Finding Precedence And Resolution", 1)[
+            1
+        ].split("## Reaction-Only Fallback", 1)[0]
+        normalized = _normalize(findings)
+
+        self.assertIn("typed `isresolved == true`", normalized)
+        self.assertIn(
+            "removes the finding from `unresolved_provider_findings`", normalized
+        )
+        self.assertIn(
+            "it does not require a replacement request or a new head", normalized
+        )
+        self.assertIn(
+            "trustworthy provider clean correction on the same head", normalized
+        )
+        self.assertIn("generic correction prose is not enough", normalized)
+        self.assertIn("if addressing the finding changes repository code", normalized)
+        self.assertIn("commit that change as a new head", normalized)
+
+        combined = _normalize(
+            self.skill + "\n" + self.authority + "\n" + self.readiness
+        )
+        self.assertIn("only applicable unresolved provider findings block", combined)
+        self.assertIn("requires fresh review", combined)
+        self.assertIn(
+            "a typed thread resolution or trustworthy same-head provider correction alone does not require a commit",
+            combined,
+        )
+        self.assertNotIn(
+            "provider findings block until fixed and resolved on a new reviewed head",
+            combined,
+        )
+
+    def test_no_pr_uses_a_terminal_closed_null_scope_variant(self) -> None:
+        report = self.authority.split("## Required Report", 1)[1]
+        normalized = _normalize(report)
+        scope_rule = self.carriers["required_report_schema"]["scope_rules"][
+            "no-selected-supported-pr"
+        ]
+
+        self.assertIsNone(scope_rule["pull_request"])
+        self.assertIsNone(scope_rule["head_sha"])
+        self.assertEqual(scope_rule["status"], "not-applicable")
+        for field, value in (
+            ("status", scope_rule["status"]),
+            ("pull_request", "null"),
+            ("head_sha", "null"),
+            ("scope_assurance", scope_rule["scope_assurance"]),
+            ("base_assurance", scope_rule["base_assurance"]),
+            ("basis", "null"),
+            ("evidence", "null"),
+            ("last_reason", scope_rule["last_reason"]),
+        ):
+            self.assertIn(f"{field}: {value}", report)
+        self.assertIn("this no-pr variant is terminal", normalized)
+        self.assertIn("it never enters retry recovery", normalized)
+        self.assertIn("required null pr/head fields", normalized)
+
+
+if __name__ == "__main__":
+    unittest.main()

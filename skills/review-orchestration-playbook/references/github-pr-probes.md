@@ -73,9 +73,11 @@ time.
 
 If the POST returns an ambiguous transport result, first reread comments to
 look for the request. If no result can be proved, the same exact POST may be
-repeated after backoff. Repeats are semantically idempotent. Do not run two
-POSTs concurrently, and do not treat multiple visible requests as multiple
-review lanes.
+repeated after backoff only under the named lane's authorized ambiguous-delivery
+recovery. A duplicate still counts as the same logical review lane, but the
+GitHub write is not intrinsically idempotent. Do not run two POSTs
+concurrently, and do not treat multiple visible requests as multiple review
+lanes.
 
 A base-only retarget on the same head does not authorize or require another
 request. Reuse qualifying head-bound provider evidence, rerun the base-sensitive
@@ -110,28 +112,54 @@ does so; ordinary readiness still validates base and merge base locally.
 
 ## Reconcile Only Recoverable States
 
-Automatic reconciliation is allowed for:
+Enter automatic recovery only when typed GitHub state or a documented
+repository contract supplies a stable, machine-decidable retryable reason.
+Eligible reasons are:
 
-- missing or stale provider/check evidence;
-- cancelled or skipped jobs;
-- inconclusive provider collection;
-- GitHub or runner infrastructure failure; and
-- an aggregation mismatch where child jobs are successful but the related
-  aggregate status is absent or stale.
+- missing or stale provider/check evidence whose exact producer contract
+  classifies that condition as recoverable;
+- a typed pending provider/check state whose associated metadata classifies
+  the wait as recoverable;
+- a cancelled or skipped job whose typed conclusion and associated metadata
+  distinguish retryable infrastructure from an intentional condition or
+  policy decision;
+- a typed GitHub, service, or runner infrastructure failure; and
+- an aggregation mismatch where complete child-job state proves success but
+  the documented related aggregate is absent or stale.
 
-Never reconcile an explicit review finding, test failure, lint failure, policy
-failure, or other substantive negative result. Those require a fix or an
-explicit policy decision.
+The label `inconclusive` is not itself a retry reason. A stable malformed
+snapshot, identity or scope contradiction, unsupported operation, permission
+denial, or any other non-retryable inconclusive state terminates recovery and
+must be reported immediately. Unknown free-form prose cannot supply the
+machine-decidable retryable classification.
 
-Choose the smallest operation that can recover the state:
+Never reconcile an explicit review finding that is applicable and unresolved,
+a test failure, lint failure, policy failure, or other substantive negative
+result. Those require resolution, a fix, or an explicit policy decision.
 
-1. Rerun failed jobs when the associated run exists and only jobs failed.
+An Actions mutation has two independent gates:
+
+1. The repository's documented producer contract predeclares the exact rerun
+   or dispatch operation as idempotent or reentrant for the frozen head and
+   exact inputs.
+2. The current task authorizes that external mutation.
+
+The existence of a run, workflow ID, or `gh` subcommand proves neither gate.
+When either gate is absent, keep the recovery owner in status-only mode, poll
+the scoped evidence on the schedule below, and report the missing contract or
+authorization instead of triggering the workflow.
+
+After both mutation gates pass, choose the smallest operation that can recover
+the machine-decidable retryable state:
+
+1. Retry failed jobs when the associated run exists and only jobs failed.
 2. Rerun the full associated run for a run-level infrastructure failure or a
    broken aggregate that cannot be repaired by failed-job rerun.
 3. Dispatch a new run only for missing, stale, or aggregation-only state, and
    only after dynamic discovery proves the exact workflow and required inputs.
 
-Typical operations are:
+Illustrative commands for an already authorized, repository-declared recovery
+are:
 
 ```bash
 gh run rerun <run-id> --failed --repo <owner/repo>
@@ -140,17 +168,21 @@ gh workflow run <workflow-id> --repo <owner/repo> --ref <current-head-branch>
 ```
 
 Repository-specific inputs come from the discovered workflow contract. Never
-invent input names. Repeated reruns or dispatches are semantically idempotent,
-but single-flight still applies: wait until the current attempt is terminal or
+invent input names or assume that a rerun or dispatch is idempotent. Even when
+the repository contract declares the operation idempotent or reentrant,
+single-flight still applies: wait until the current attempt is terminal or
 proved lost before starting another.
 
 ## Retry Schedule And Cost Control
 
-Persistent monitoring is an explicit product requirement for retryable states.
-It is caller-owned, single-flight, and cancellable; it is not an independent
-review lane or a detached best-effort task. Monitoring continues until the
-state becomes terminal, the expected head or PR is superseded, or the user
-cancels it.
+Persistent monitoring is an explicit product requirement for states with a
+machine-decidable retryable pending or infrastructure reason. It is
+caller-owned, single-flight, and cancellable; it is not an independent review
+lane or a detached best-effort task. Monitoring continues only while that
+classification remains true, until the expected head or PR is superseded, or
+until the user cancels it. A stable malformed snapshot, scope contradiction,
+or non-retryable inconclusive state stops the schedule immediately and is
+reported as terminal for this recovery owner.
 
 Use exponential backoff in minutes:
 
@@ -158,12 +190,13 @@ Use exponential backoff in minutes:
 1, 2, 4, 8, 16, 32, 60, 60, 60, ...
 ```
 
-There is no retry-count ceiling for a retryable state. At 60 minutes, report
-the continuing delay to the user and then retry hourly without a terminal time
-ceiling. Reset the schedule only after meaningful progress, such as a new run,
-new provider artifact, changed check conclusion, or new head. Crossing an hour
-is a reporting and cadence transition, not a reason to stop or declare the
-lane inconclusive.
+There is no retry-count ceiling while the same reason remains
+machine-decidably retryable. At 60 minutes, report the continuing delay to the
+user and then retry hourly without a terminal time ceiling. Reset the schedule
+only after meaningful progress, such as a new run, new provider artifact,
+changed check conclusion, or new head. Crossing an hour is a reporting and
+cadence transition, not a reason to stop or declare the lane inconclusive;
+losing the retryable classification is.
 
 For private repositories, default to a rolling budget of four full-run
 equivalents per 24 hours unless repository policy defines another budget.
@@ -175,7 +208,8 @@ known service degradation. This budget throttles Action-consuming mutations;
 it never terminates status-only monitoring or imposes a retry-count ceiling.
 
 Public repositories do not use the private-minute budget and may retry more
-frequently within the same backoff and single-flight rules.
+frequently within the same backoff, single-flight, repository-contract, and
+authorization rules.
 
 Keep recovery visibly pending:
 
@@ -185,17 +219,21 @@ recovery:
   phase: observe | rerun-failed | rerun-full | dispatch | status-only
   attempt: 1
   next_retry_at: RFC3339
+  reason_class: retryable-pending | retryable-infrastructure
   last_reason: stable-machine-readable-reason
+  mutation_gate: authorized-predeclared-reentrant | status-only
   rolling_full_run_equivalents: 0
 ```
 
 Do not convert a retryable recovery into `pass` or `inconclusive` merely because
 the active wait crossed an hour.
 
-Persistent monitoring does not expand authorization. A wake may reread scoped
-evidence and repeat only an already authorized, proven-recoverable idempotent
-operation. A new workflow, new inputs, branch or PR mutation, destination, or
-other materially different action still requires its ordinary authorization.
+Persistent monitoring does not expand authorization. A wake may always reread
+scoped evidence; it may repeat an Actions mutation only when the exact
+repository contract still predeclares it as idempotent or reentrant and the
+current mutation remains authorized. A new workflow, new inputs, branch or PR
+mutation, destination, or other materially different action still requires
+its ordinary authorization.
 
 ## Active Thread And Automation
 
@@ -230,7 +268,9 @@ default evidence source.
 ## Probe Failures
 
 Classify transport, authentication, and rate-limit errors separately from an
-empty result. Retry `429`, retryable `5xx`, service degradation, and transient
-network failures under the schedule above. Treat permission denial, unsupported
-host, malformed stable response, or irreconcilable scope mismatch as a crisp
-blocker with the exact failed endpoint and scope.
+empty result. Retry typed `429`, retryable `5xx`, service degradation, and
+transient network failures under the schedule above while their
+machine-decidable classification remains retryable. Permission denial,
+unsupported host, malformed stable response, irreconcilable scope mismatch,
+or another non-retryable inconclusive result terminates recovery immediately;
+report the exact failed endpoint and scope.

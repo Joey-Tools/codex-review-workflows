@@ -3189,6 +3189,52 @@ class ReviewWorkspaceTest(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "range-parent-graph-check-failed")
         self.assertFalse(destination.exists())
 
+    def test_raw_parent_graph_output_cap_includes_legal_missing_frontier(self) -> None:
+        head = self.commits[2]
+        missing_parents = tuple(f"{number:040x}" for number in range(1, 33))
+        payload = (
+            f"{head} {' '.join(missing_parents)}\n"
+            + "".join(f"?{parent}\n" for parent in missing_parents)
+        ).encode("ascii")
+
+        def bounded_raw_graph(
+            root: pathlib.Path,
+            arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> tuple[int, bytes, bytes]:
+            self.assertEqual(
+                arguments,
+                ("rev-list", "--parents", "--missing=print", head),
+            )
+            output_limit = kwargs["output_limit_bytes"]
+            self.assertIsInstance(output_limit, int)
+            assert isinstance(output_limit, int)
+            self.assertGreaterEqual(output_limit, len(payload))
+            return 0, payload, b""
+
+        with (
+            mock.patch.object(workspace_runtime, "RANGE_OBJECT_COUNT_LIMIT", 1),
+            mock.patch.object(
+                workspace_runtime,
+                "RANGE_PARENT_EDGE_COUNT_LIMIT",
+                len(missing_parents),
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_run_git_raw",
+                side_effect=bounded_raw_graph,
+            ),
+        ):
+            probe = workspace_runtime._read_raw_commit_graph(
+                self.repo,
+                head,
+                deadline=float("inf"),
+                workspace=False,
+            )
+
+        self.assertEqual(probe.parents, {head: missing_parents})
+        self.assertEqual(probe.missing, frozenset(missing_parents))
+
     def test_shallow_or_promisor_raw_graph_operational_failure_is_blocked(
         self,
     ) -> None:
@@ -6345,8 +6391,8 @@ class ReviewWorkspaceTest(unittest.TestCase):
         original_readlink = workspace_runtime.os.readlink
         observations = iter(("target.txt", "other.txt"))
 
-        def drifting_readlink(path: object, *args: object, **kwargs: object) -> str:
-            if pathlib.Path(path) == prepared.root / "link":
+        def drifting_readlink(path: object, *args: object, **kwargs: object) -> object:
+            if path in {b"link", "link"} and kwargs.get("dir_fd") is not None:
                 return next(observations)
             return original_readlink(path, *args, **kwargs)
 
@@ -6363,6 +6409,269 @@ class ReviewWorkspaceTest(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "symlink-content-drift")
         finally:
             self.cleanup(prepared)
+
+    def test_symlink_escape_is_rejected_before_filesystem_or_path_resolution(
+        self,
+    ) -> None:
+        oid = b"1" * 40
+        target = b"../../outside/sentinel"
+        index = b"120000 " + oid + b" 0\tescape\0"
+        batch = (
+            oid + b" blob " + str(len(target)).encode("ascii") + b"\n" + target + b"\n"
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_symlink_git",
+                side_effect=(index, batch),
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_read_tracked_symlink",
+            ) as filesystem_read,
+            mock.patch.object(
+                workspace_runtime.pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("Path.resolve must not be called"),
+            ),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            workspace_runtime._validate_symlinks(self.repo, mock.Mock())
+
+        self.assertEqual(caught.exception.reason, "symlink-escape")
+        filesystem_read.assert_not_called()
+
+    def test_symlink_chain_is_resolved_from_root_dirfd_without_path_resolve(
+        self,
+    ) -> None:
+        deep = self.repo / "deep"
+        deep.mkdir()
+        (deep / "link").symlink_to("..")
+        (self.repo / "outer").symlink_to("deep/link/../../outside")
+        inner_oid = b"1" * 40
+        outer_oid = b"2" * 40
+        inner_target = b".."
+        outer_target = b"deep/link/../../outside"
+        index = (
+            b"120000 "
+            + inner_oid
+            + b" 0\tdeep/link\0"
+            + b"120000 "
+            + outer_oid
+            + b" 0\touter\0"
+        )
+        batch = (
+            inner_oid
+            + b" blob 2\n"
+            + inner_target
+            + b"\n"
+            + outer_oid
+            + b" blob "
+            + str(len(outer_target)).encode("ascii")
+            + b"\n"
+            + outer_target
+            + b"\n"
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_symlink_git",
+                side_effect=(index, batch),
+            ),
+            mock.patch.object(
+                workspace_runtime.pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("Path.resolve must not be called"),
+            ),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            workspace_runtime._validate_symlinks(self.repo, mock.Mock())
+
+        self.assertEqual(caught.exception.reason, "symlink-escape")
+
+    def test_symlink_case_alias_follows_volume_semantics_without_path_resolve(
+        self,
+    ) -> None:
+        canonical_directory = "CaseDir"
+        canonical_link = "CaseLink"
+        alias_directory = "casedir"
+        alias_link = "caselink"
+        directory = self.repo / canonical_directory
+        directory.mkdir()
+        (directory / canonical_link).symlink_to("..")
+        outer_target = f"{alias_directory}/{alias_link}/../../outside"
+        (self.repo / "case-outer").symlink_to(outer_target)
+
+        canonical_metadata = (directory / canonical_link).stat(follow_symlinks=False)
+        try:
+            alias_metadata = (self.repo / alias_directory / alias_link).stat(
+                follow_symlinks=False
+            )
+        except FileNotFoundError:
+            aliases_same_object = False
+        else:
+            aliases_same_object = os.path.samestat(
+                canonical_metadata,
+                alias_metadata,
+            )
+
+        inner_oid = b"3" * 40
+        outer_oid = b"4" * 40
+        raw_inner = os.fsencode(f"{canonical_directory}/{canonical_link}")
+        raw_outer = b"case-outer"
+        encoded_outer_target = os.fsencode(outer_target)
+        index = (
+            b"120000 "
+            + inner_oid
+            + b" 0\t"
+            + raw_inner
+            + b"\0"
+            + b"120000 "
+            + outer_oid
+            + b" 0\t"
+            + raw_outer
+            + b"\0"
+        )
+        batch = (
+            inner_oid
+            + b" blob 2\n..\n"
+            + outer_oid
+            + b" blob "
+            + str(len(encoded_outer_target)).encode("ascii")
+            + b"\n"
+            + encoded_outer_target
+            + b"\n"
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_symlink_git",
+                side_effect=(index, batch),
+            ),
+            mock.patch.object(
+                workspace_runtime.pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("Path.resolve must not be called"),
+            ),
+        ):
+            if aliases_same_object:
+                with self.assertRaises(ReviewWorkspaceError) as caught:
+                    workspace_runtime._validate_symlinks(self.repo, mock.Mock())
+                self.assertEqual(caught.exception.reason, "symlink-escape")
+            else:
+                # On a case-sensitive volume this spelling is genuinely missing,
+                # so the same contained link remains a legal dangling symlink.
+                self.assertEqual(
+                    workspace_runtime._validate_symlinks(self.repo, mock.Mock()),
+                    2,
+                )
+
+    def test_symlink_chain_fails_closed_for_unbound_filesystem_symlink(self) -> None:
+        deep = self.repo / "unbound-dir"
+        deep.mkdir()
+        (deep / "unbound-link").symlink_to("..")
+        target = b"unbound-dir/unbound-link/../../outside"
+        (self.repo / "unbound-outer").symlink_to(os.fsdecode(target))
+        oid = b"7" * 40
+        index = b"120000 " + oid + b" 0\tunbound-outer\0"
+        batch = (
+            oid + b" blob " + str(len(target)).encode("ascii") + b"\n" + target + b"\n"
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_symlink_git",
+                side_effect=(index, batch),
+            ),
+            mock.patch.object(
+                workspace_runtime.pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("Path.resolve must not be called"),
+            ),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            workspace_runtime._validate_symlinks(self.repo, mock.Mock())
+
+        self.assertEqual(caught.exception.reason, "symlink-resolution-unbound")
+
+    def test_symlink_unicode_alias_follows_volume_semantics_without_path_resolve(
+        self,
+    ) -> None:
+        canonical_directory = "Caf\u00e9"
+        canonical_link = "L\u00efnk"
+        alias_directory = "Cafe\u0301"
+        alias_link = "Li\u0308nk"
+        directory = self.repo / canonical_directory
+        directory.mkdir()
+        (directory / canonical_link).symlink_to("..")
+        outer_target = f"{alias_directory}/{alias_link}/../../outside"
+        (self.repo / "unicode-outer").symlink_to(outer_target)
+
+        canonical_metadata = (directory / canonical_link).stat(follow_symlinks=False)
+        try:
+            alias_metadata = (self.repo / alias_directory / alias_link).stat(
+                follow_symlinks=False
+            )
+        except FileNotFoundError:
+            aliases_same_object = False
+        else:
+            aliases_same_object = os.path.samestat(
+                canonical_metadata,
+                alias_metadata,
+            )
+
+        inner_oid = b"5" * 40
+        outer_oid = b"6" * 40
+        raw_inner = os.fsencode(f"{canonical_directory}/{canonical_link}")
+        encoded_outer_target = os.fsencode(outer_target)
+        index = (
+            b"120000 "
+            + inner_oid
+            + b" 0\t"
+            + raw_inner
+            + b"\0"
+            + b"120000 "
+            + outer_oid
+            + b" 0\tunicode-outer\0"
+        )
+        batch = (
+            inner_oid
+            + b" blob 2\n..\n"
+            + outer_oid
+            + b" blob "
+            + str(len(encoded_outer_target)).encode("ascii")
+            + b"\n"
+            + encoded_outer_target
+            + b"\n"
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_symlink_git",
+                side_effect=(index, batch),
+            ),
+            mock.patch.object(
+                workspace_runtime.pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("Path.resolve must not be called"),
+            ),
+        ):
+            if aliases_same_object:
+                with self.assertRaises(ReviewWorkspaceError) as caught:
+                    workspace_runtime._validate_symlinks(self.repo, mock.Mock())
+                self.assertEqual(caught.exception.reason, "symlink-escape")
+            else:
+                # Case-sensitive/non-normalizing filesystems do not alias NFC and
+                # NFD spellings; preserving the dangling target is then correct.
+                self.assertEqual(
+                    workspace_runtime._validate_symlinks(self.repo, mock.Mock()),
+                    2,
+                )
 
     def test_tracked_symlink_escape_is_rejected_and_partial_workspace_removed(
         self,

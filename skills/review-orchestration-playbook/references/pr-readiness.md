@@ -19,6 +19,11 @@ authenticated open PR for the exact intended head repository and branch.
 Multiple candidates require caller selection. Other PRs are read-only
 coordination evidence.
 
+When authenticated selection proves that no supported PR exists, emit the
+GitHub lane authority's closed `not-applicable` no-PR variant with null PR/head
+fields. Do not fabricate a PR-readiness report or enter provider recovery; a
+local standalone range may still be reviewed under its own authorization.
+
 A review request alone does not authorize creating a branch, commit, push, PR,
 or changing PR metadata. Obtain the authorization required by repository and
 workspace policy before each external mutation. Named review egress is covered
@@ -256,18 +261,29 @@ When any substantive gate fails:
 
 1. Classify the failure as code, test, policy, conversation, provider finding,
    or retryable infrastructure.
-2. Fix substantive failures on the intended branch; do not rerun them as if
-   they were infrastructure.
+2. Resolve substantive failures on the intended branch; do not rerun them as
+   if they were infrastructure. An applicable inline provider finding may be
+   cleared on the same head only by the exact GraphQL thread's typed
+   `isResolved == true`; a top-level finding may be superseded by the evidence
+   authority's trustworthy same-head provider correction. Neither transition
+   alone requires a fresh review.
 3. Commit and push only when authorized.
 4. Re-read lifecycle, base/head, and merge base.
 5. Rerun every invalidated local lane and validation.
 6. Reacquire GitHub Codex, CI, and conversation evidence for the new state.
 7. Repeat until every gate is simultaneously true.
 
-Retry missing, stale, cancelled, skipped, inconclusive, infrastructure, or
-aggregation-only GitHub states through the recovery contract in
-[github-pr-probes.md](github-pr-probes.md). An explicit provider finding,
-failed test, or policy failure is never an automatic reconcile target.
+If resolving a finding changes code, that commit creates a new head and the
+full invalidation and fresh-review rules apply. Do not manufacture an empty
+commit for a resolution-only state change.
+
+Retry only GitHub states whose typed evidence or documented repository
+contract supplies a machine-decidable retryable pending or infrastructure
+reason, using [github-pr-probes.md](github-pr-probes.md). A stable malformed
+snapshot, scope contradiction, or other non-retryable inconclusive state stops
+recovery and is reported immediately. An explicit applicable unresolved
+provider finding, failed test, or policy failure is never an automatic
+reconcile target.
 
 ## Final Reread
 

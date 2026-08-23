@@ -449,6 +449,74 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=self.head,
             )
 
+    def test_secret_admission_legacy_selection_is_compatibility_only(self) -> None:
+        legacy_value = unregistered_generic_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="generic-secret-assignment",
+        )
+        added_head = self.commit_bytes(
+            "legacy-credential.txt",
+            b"password: " + legacy_value + b"\n",
+            "Add legacy credential",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            unselected_exit, unselected = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=added_head,
+            )
+            selected_exit, selected = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=added_head,
+                synthetic_secret_exemptions=("test-legacy-exemption",),
+            )
+
+        self.assertEqual((unselected_exit, selected_exit), (1, 1))
+        self.assertEqual(unselected["secret_delta"], selected["secret_delta"])
+        self.assertEqual(unselected["status"], "violations")
+
+    def test_secret_admission_rejects_unknown_or_duplicate_legacy_selection(
+        self,
+    ) -> None:
+        catalog = self.catalog_with_legacy_values(
+            (unregistered_generic_credential(),),
+            rule="generic-secret-assignment",
+        )
+        for selection, message in (
+            (("missing",), "unknown synthetic secret exemption"),
+            (
+                ("test-legacy-exemption", "test-legacy-exemption"),
+                "duplicate synthetic secret exemption",
+            ),
+        ):
+            with self.subTest(selection=selection):
+                with (
+                    mock.patch.object(
+                        workspace_runtime,
+                        "load_catalog",
+                        return_value=catalog,
+                    ),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_secret_count_manifests",
+                    ) as scan,
+                    self.assertRaisesRegex(ReviewError, message),
+                ):
+                    workspace_runtime.secret_admission(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                        synthetic_secret_exemptions=selection,
+                    )
+                scan.assert_not_called()
+
     def commit_bytes(self, relative: str, payload: bytes, message: str) -> str:
         destination = self.repo / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -5436,9 +5504,7 @@ class WorkspaceTest(unittest.TestCase):
 
     def test_frozen_endpoint_exact_search_uses_catalog_scale_budget(self) -> None:
         values = tuple(
-            b"HistoricalCatalogPattern"
-            + f"{index:02d}".encode("ascii")
-            + b"A" * 16
+            b"HistoricalCatalogPattern" + f"{index:02d}".encode("ascii") + b"A" * 16
             for index in range(17)
         )
         catalog = self.catalog_with_legacy_values(
@@ -5556,9 +5622,7 @@ class WorkspaceTest(unittest.TestCase):
             object_ids[1]: b"second\n",
         }
         metadata = b"".join(
-            f"100644 blob {object_id} {len(payload)}\t{index}.txt\0".encode(
-                "ascii"
-            )
+            f"100644 blob {object_id} {len(payload)}\t{index}.txt\0".encode("ascii")
             for index, (object_id, payload) in enumerate(payloads.items())
         )
         observed_timeouts: list[float] = []
@@ -5672,9 +5736,7 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertNotIn(secret.decode("ascii"), str(error.exception))
 
-        mismatched = io.BytesIO(
-            f"{object_id} blob 4\n".encode("ascii") + b"data\n"
-        )
+        mismatched = io.BytesIO(f"{object_id} blob 4\n".encode("ascii") + b"data\n")
         with (
             mock.patch.object(workspace_runtime, "_stream_secret_scan") as scanner,
             self.assertRaisesRegex(ReviewError, "does not match frozen tree metadata"),
@@ -5704,9 +5766,7 @@ class WorkspaceTest(unittest.TestCase):
         object_id = "a" * 40
         payload = b"complete blob context\n"
         output = io.BytesIO(
-            f"{object_id} blob {len(payload)}\n".encode("ascii")
-            + payload
-            + b"\n"
+            f"{object_id} blob {len(payload)}\n".encode("ascii") + payload + b"\n"
         )
         expected = workspace_runtime.SecretScanResult.empty()
         with (
@@ -5733,9 +5793,7 @@ class WorkspaceTest(unittest.TestCase):
         stream_scan.assert_not_called()
 
         output = io.BytesIO(
-            f"{object_id} blob {len(payload)}\n".encode("ascii")
-            + payload
-            + b"\n"
+            f"{object_id} blob {len(payload)}\n".encode("ascii") + payload + b"\n"
         )
 
         def consume_stream(stream, *, size, **_kwargs):
@@ -5981,9 +6039,7 @@ class WorkspaceTest(unittest.TestCase):
         blob_object = "a" * 40
         self.assertEqual(
             workspace_runtime._parse_sized_tree_record(
-                f"100644 blob {blob_object}      12\tpath with spaces".encode(
-                    "ascii"
-                )
+                f"100644 blob {blob_object}      12\tpath with spaces".encode("ascii")
             ),
             (
                 "100644",
@@ -9747,12 +9803,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_unextractable_container_nonincrease_is_clean_for_unchanged_move_and_delete(
         self,
     ) -> None:
-        payload = (
-            b"({accessToken:0},0);\n"
-            b"({accessToken:0});\n"
-            b'/"/;\n'
-            + b"U" * 13
-        )
+        payload = b'({accessToken:0},0);\n({accessToken:0});\n/"/;\n' + b"U" * 13
         scan = workspace_runtime._scan_secret_value(
             payload,
             capture_blocking_candidates=True,
@@ -10315,9 +10366,7 @@ class WorkspaceTest(unittest.TestCase):
             evidence = validate_external_workspace(review)
         manifest = self.public_synthetic_manifest(review)
         secret_delta = manifest["secret_delta"]
-        entries = {
-            entry["value_sha256"]: entry for entry in manifest["entries"]
-        }
+        entries = {entry["value_sha256"]: entry for entry in manifest["entries"]}
         legacy_entry = entries[hashlib.sha256(legacy_value).hexdigest()]
 
         self.assertEqual(secret_delta["status"], "clean")

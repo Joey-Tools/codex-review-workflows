@@ -74,19 +74,45 @@ The intended current policy is:
 - Use exact `@codex review` on an existing supported `github.com` PR at the frozen current head. Do not infer provider coverage of the local merge base; base and merge-base coverage remain local PR-readiness facts.
 - A trustworthy provider terminal clean comment or review on the latest head, together with no unresolved provider finding in the PR, passes the lane. Prefer a trustworthy associated merge-commit or provider status check when the repository exposes one, while still checking unresolved provider findings.
 - A complete provider `+1` reaction basis is a fallback when no stronger terminal artifact is available.
-- Provider findings block until fixed and resolved on a new reviewed head. A successful service-start check alone is not a clean review.
+- Only applicable unresolved provider findings block. On the same head, an exact
+  typed GraphQL thread resolution or a later trustworthy provider correction
+  accepted by the evidence authority can clear a finding without inventing a
+  code change. If addressing a finding actually changes code, the resulting
+  new head invalidates old-head evidence and requires fresh review.
+  A successful service-start check alone is not a clean review.
 
-For a missing, stale, cancelled, skipped, inconclusive, infrastructure-failed, or aggregation-mismatched result, reconcile the associated current workflow dynamically. Retry failed jobs first, then the existing run; create a new dispatch only when the run is missing, stale, or cannot aggregate. Never reconcile an explicit code finding, test failure, or policy failure as infrastructure.
+Only a machine-decidable retryable pending or infrastructure reason enters
+automatic recovery. A stable malformed snapshot, scope contradiction, or
+other non-retryable inconclusive result terminates recovery and is reported
+immediately. For a retryable reason, prefer the smallest associated recovery,
+but rerun or dispatch a GitHub Action automatically only when the repository
+predeclares that exact operation as idempotent or reentrant for the frozen
+scope and the current mutation is authorized. Otherwise poll read-only state
+and report the missing contract or authorization. Never reconcile an explicit
+code finding, test failure, or policy failure as infrastructure.
 
-Use one single-flight recovery schedule: 1, 2, 4, 8, 16, 32, then 60 minutes, followed by hourly retries without a fixed attempt limit. Report to the user when the delay first reaches 60 minutes and keep recovery pending. Apply the repository's private-run cost budget; when it is exhausted, poll status only until a low-frequency retry is allowed. Public repositories may retry more freely. Prefer an Automation that wakes the same active thread; when that capability is unavailable, keep a cancellable hourly wait in the active thread. Remove the wake-up when the result becomes terminal or the PR closes, merges, or is superseded.
+While that exact reason remains machine-decidably retryable, use one
+single-flight recovery schedule: 1, 2, 4, 8, 16, 32, then 60 minutes, followed
+by hourly retries without a fixed attempt limit. Report to the user when the
+delay first reaches 60 minutes and keep recovery pending. Apply the
+repository's private-run cost budget; when it is exhausted, poll status only
+until a low-frequency retry is allowed. Public repositories may retry more
+freely within the same authorization boundary. Prefer an Automation that
+wakes the same active thread; when that capability is unavailable, keep a
+cancellable hourly wait in the active thread. Remove the wake-up when the
+result becomes terminal or the PR closes, merges, or is superseded.
 
 ## Drive PR Readiness
 
 When the user authorizes implementation or PR repair, loop on the same explicit PR and current head:
 
 1. Classify all local and GitHub reviewer findings.
-2. Fix valid findings, add proportionate tests, and create a new committed head.
-3. Rerun required local lanes and obtain current-head GitHub evidence.
+2. Resolve valid findings. When resolution changes code, add proportionate
+   tests and create a new committed head; a typed thread resolution or
+   trustworthy same-head provider correction alone does not require a commit.
+3. Rerun every invalidated lane. A code-changing new head requires fresh local
+   and GitHub review; a resolution-only same-head transition requires the
+   authority's complete stable reread instead.
 4. Wait for required CI and read all review conversations with complete pagination.
 5. Confirm no unresolved blocking finding, the intended base/head relationship, open lifecycle, merge policy, and a final stable reread.
 

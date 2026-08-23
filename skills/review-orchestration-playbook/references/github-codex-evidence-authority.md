@@ -23,6 +23,11 @@ solely because the provider does not expose its internal input base. The local
 Codex lane and PR-readiness gates independently prove the current base,
 whole-PR range, CI, conversations, and merge policy before the PR can be ready.
 
+When authenticated selection proves that no supported PR exists, there is no
+PR head to freeze and no provider recovery to run. Emit the closed no-PR
+`not-applicable` report variant defined below, with null PR and head fields;
+never manufacture a selector, head, request, or pending retry state.
+
 ## Immutable Scope
 
 Freeze these fields before consuming evidence:
@@ -199,16 +204,19 @@ ancestor is still an applicable inline finding. A top-level finding review must
 likewise parse and join every associated provider child; its top-level finding
 cannot hide an unresolved inline thread.
 
-A terminal finding blocks immediately once exact identity, scope, and carrier
-are trustworthy. Missing positive evidence cannot neutralize a finding.
+A terminal finding blocks immediately only when exact identity, scope, and
+carrier are trustworthy and the finding is applicable and unresolved. Missing
+positive evidence cannot neutralize such a finding.
 
 ## Finding Precedence And Resolution
 
 Classify provider findings independently of human conversation state.
 
 - For an inline finding, only the raw GraphQL thread node's typed `isResolved`
-  value resolves that thread. `isOutdated`, a human reply, or a synthesized
-  REST field is not resolution.
+  value resolves that thread. On the same head, typed `isResolved == true`
+  removes the finding from `unresolved_provider_findings` after a complete,
+  stable reread; it does not require a replacement request or a new head.
+  `isOutdated`, a human reply, or a synthesized REST field is not resolution.
 - Join an inline REST comment to exactly one GraphQL thread comment by the
   exact child comment ID, URL, and parent review ID. URL plus parent alone is
   not an identity join. Require the URL's frozen repository and PR and its
@@ -216,11 +224,21 @@ Classify provider findings independently of human conversation state.
   join, child-ID mismatch, parent mismatch, or incomplete nested page is
   inconclusive or malformed according to the closed grammar.
 - A top-level provider finding remains active until a later trustworthy
-  provider clean artifact on the same or a locally proved descendant head
-  supersedes it.
+  provider clean correction on the same head, or a trustworthy clean artifact
+  on a locally proved descendant head, supersedes it. A same-head correction
+  must have exact provider identity, an accepted terminal-clean carrier and
+  current-head binding, later semantic time than the finding, complete pages,
+  and a stable final reread; generic correction prose is not enough.
 - A later clean never supersedes an unresolved provider thread finding.
 - A finding from a non-ancestor old head is audit context, not an applicable
   current-range finding. An inability to prove ancestry is inconclusive.
+
+A resolution-only thread transition or trustworthy same-head correction does
+not invalidate otherwise stable current-head tests or local reviews. If
+addressing the finding changes repository code, commit that change as a new
+head and reacquire every head-bound test, local review, provider result, CI
+result, and final reread required by PR readiness. Do not create an empty
+commit merely to turn a resolved finding into a fresh review.
 
 When terminal candidates share the latest semantic server time, findings win
 over clean within the same GitHub channel. Conflicting latest candidates from
@@ -254,11 +272,12 @@ Accept it only when every condition holds:
 precedence over reaction fallback even if the reaction is later.
 
 If the POST outcome was ambiguous, the producer may repeat the same exact
-request after backoff. Such repeats are semantically idempotent producer
-recovery, not additional review lanes. Keep a single in-flight recovery owner,
-prefer the latest visible request for fallback, and report duplicates as an
-audit warning. Never let duplicate request count erase trustworthy terminal
-provider evidence.
+request after backoff only under the named lane's authorized
+ambiguous-delivery recovery. A duplicate remains one logical review lane, but
+the GitHub write is not intrinsically idempotent. Keep a single in-flight
+recovery owner, prefer the latest visible request for fallback, and report
+duplicates as an audit warning. Never let duplicate request count erase
+trustworthy terminal provider evidence.
 
 ## Service And Pending Evidence
 
@@ -267,10 +286,13 @@ successful App check is not by itself a clean review because it may represent
 startup or aggregation and can coexist with findings.
 
 Absent evidence, transport failure, a timeout, a cancelled or skipped run,
-free-form provider failure prose, or unknown identity is not a pass. Keep a
-retryable state `pending`; after a non-retryable contradiction or malformed
-stable snapshot, report `inconclusive`. Recovery policy is defined in
-[github-pr-probes.md](github-pr-probes.md).
+free-form provider failure prose, or unknown identity is not a pass. Keep the
+lane `pending` only while typed GitHub state or a documented repository
+contract supplies a machine-decidable retryable pending or infrastructure
+reason. A stable malformed snapshot, scope contradiction, unknown
+free-form-only failure, or other non-retryable inconclusive state terminates
+recovery and is reported immediately as `inconclusive`. Recovery policy is
+defined in [github-pr-probes.md](github-pr-probes.md).
 
 ## Decision Table
 
@@ -282,7 +304,7 @@ stable snapshot, report `inconclusive`. Recovery policy is defined in
 | Any applicable unresolved provider finding | `findings` |
 | Work is running or failure is retryable | `pending` |
 | Pagination, identity, grammar, scope, ordering, or final stability cannot be proved | `inconclusive` |
-| No selected supported PR | `not-applicable` |
+| Authenticated selection proves no supported PR | `not-applicable` using the closed null-PR/head variant |
 
 Only the first three rows complete the GitHub lane. Other PR conversations and
 required checks can still block overall PR readiness.
@@ -291,7 +313,7 @@ required checks can still block overall PR readiness.
 
 Record compact, reproducible evidence. The normative executable shape is
 `required_report_schema` in the version-1 consumer resource above; the forms
-below are its human-readable projection. The common envelope is:
+below are its human-readable projection. The PR-bound common envelope is:
 
 ```yaml
 github_codex_lane:
@@ -309,6 +331,31 @@ github_codex_lane:
   unresolved_provider_findings: []
   last_reason: stable-machine-readable-reason
 ```
+
+When authenticated selection proves no supported PR, use the separate closed
+variant rather than inserting invented scope values into the PR-bound
+envelope:
+
+```yaml
+github_codex_lane:
+  status: not-applicable
+  repository: owner/name
+  pull_request: null
+  head_sha: null
+  scope_assurance: proved-no-selected-supported-pr
+  base_assurance: not-applicable
+  basis: null
+  evidence: null
+  request_policy:
+    status: not-applicable
+    warnings: []
+  unresolved_provider_findings: []
+  last_reason: no-selected-supported-pr
+```
+
+This no-PR variant is terminal. It never enters retry recovery, and its null
+PR/head fields cannot be mixed into a PR-bound `pass`, `findings`, `pending`,
+or `inconclusive` report.
 
 `evidence` is a closed, basis-discriminated union; do not merge fields or
 alternatives between variants. `basis: terminal-clean` requires this exact
@@ -358,8 +405,10 @@ variant. A `basis: merge-status` report instead uses a closed merge-status
 variant with `head_binding: current-head-status`; a findings report backed by
 an accepted terminal carrier uses `kind: terminal-artifact`, a non-null full
 `artifact_commit`, `head_binding: explicit-commit`, and its finding grammar
-branch. Pending, inconclusive, and not-applicable reports may use
-`evidence: null` when no stable diagnostic artifact is selected.
+branch. Pending and inconclusive PR-bound reports may use `evidence: null`
+when no stable diagnostic artifact is selected. The no-PR `not-applicable`
+variant always uses null evidence together with its required null PR/head
+fields.
 
 Use `warning` for observed early or duplicate requests. Warnings do not change
 the provider verdict and never authorize another concurrent request. Use

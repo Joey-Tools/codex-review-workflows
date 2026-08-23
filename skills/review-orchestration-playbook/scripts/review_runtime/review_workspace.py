@@ -77,6 +77,7 @@ SYMLINK_BATCH_HEADER_LIMIT_BYTES = 128
 SYMLINK_BATCH_OUTPUT_LIMIT_BYTES = SYMLINK_TARGET_AGGREGATE_LIMIT_BYTES + (
     SYMLINK_COUNT_LIMIT * (SYMLINK_BATCH_HEADER_LIMIT_BYTES + 2)
 )
+SYMLINK_RESOLUTION_COMPONENT_LIMIT = 100_000
 OBJECT_STORE_OBJECT_COUNT_LIMIT = 4_000_000
 OBJECT_STORE_FILE_COUNT_LIMIT = 1_000_000
 OBJECT_STORE_LOGICAL_BYTES_LIMIT = 32 * 1024 * 1024 * 1024
@@ -1737,11 +1738,16 @@ def _read_raw_commit_graph(
     workspace: bool,
 ) -> _RawCommitGraphProbe:
     command = ("rev-list", "--parents", "--missing=print", head)
+    oid_row_bytes = len(head) + 1
+    missing_row_bytes = len(head) + 2
     returncode, output, stderr = _run_git_raw(
         root,
         command,
         output_limit_bytes=(
-            (RANGE_OBJECT_COUNT_LIMIT + RANGE_PARENT_EDGE_COUNT_LIMIT) * (len(head) + 1)
+            (RANGE_OBJECT_COUNT_LIMIT + RANGE_PARENT_EDGE_COUNT_LIMIT) * oid_row_bytes
+            # Every distinct missing parent can add a separate ``?OID\n`` row;
+            # a missing head is the only possible extra report without an edge.
+            + (RANGE_PARENT_EDGE_COUNT_LIMIT + 1) * missing_row_bytes
             + 1024
         ),
         absolute_deadline=deadline,
@@ -4838,6 +4844,249 @@ def _remaining_symlink_validation_seconds(deadline: float) -> float:
     return remaining
 
 
+def _tracked_path_components(raw_path: bytes) -> tuple[bytes, ...]:
+    components = tuple(raw_path.split(b"/"))
+    if (
+        not raw_path
+        or raw_path.startswith(b"/")
+        or any(component in {b"", b".", b".."} for component in components)
+    ):
+        raise ReviewWorkspaceError(
+            "index-output-invalid",
+            "Git returned a non-canonical tracked symlink path",
+        )
+    return components
+
+
+def _apply_lexical_symlink_target(
+    parent: Sequence[bytes],
+    target: bytes,
+    *,
+    raw_path: bytes,
+) -> tuple[bytes, ...]:
+    if target.startswith(b"/"):
+        raise ReviewWorkspaceError(
+            "symlink-escape",
+            f"tracked symlink {os.fsdecode(raw_path)!r} is absolute",
+        )
+    resolved = list(parent)
+    for component in target.split(b"/"):
+        if component in {b"", b"."}:
+            continue
+        if component == b"..":
+            if not resolved:
+                raise ReviewWorkspaceError(
+                    "symlink-escape",
+                    f"tracked symlink {os.fsdecode(raw_path)!r} escapes workspace",
+                )
+            resolved.pop()
+            continue
+        resolved.append(component)
+    return tuple(resolved)
+
+
+def _read_tracked_symlink(
+    root_descriptor: int,
+    raw_path: bytes,
+    *,
+    deadline: float,
+) -> tuple[os.stat_result, bytes]:
+    components = _tracked_path_components(raw_path)
+    descriptor = os.dup(root_descriptor)
+    try:
+        for component in components[:-1]:
+            _remaining_symlink_validation_seconds(deadline)
+            child = os.open(
+                component,
+                _nofollow_flags(directory=True),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        _remaining_symlink_validation_seconds(deadline)
+        metadata = os.stat(
+            components[-1],
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        target = os.readlink(components[-1], dir_fd=descriptor)
+        return metadata, os.fsencode(target)
+    finally:
+        os.close(descriptor)
+
+
+def _open_tracked_directory_stack(
+    root_descriptor: int,
+    components: Sequence[bytes],
+    *,
+    deadline: float,
+) -> list[int]:
+    descriptors = [os.dup(root_descriptor)]
+    try:
+        for component in components:
+            _remaining_symlink_validation_seconds(deadline)
+            child = os.open(
+                component,
+                _nofollow_flags(directory=True),
+                dir_fd=descriptors[-1],
+            )
+            descriptors.append(child)
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _validate_tracked_symlink_chain(
+    root_descriptor: int,
+    raw_path: bytes,
+    target: bytes,
+    target_by_identity: Mapping[tuple[int, int], tuple[bytes, bytes]],
+    *,
+    deadline: float,
+) -> None:
+    link_components = _tracked_path_components(raw_path)
+    try:
+        directory_stack = _open_tracked_directory_stack(
+            root_descriptor,
+            link_components[:-1],
+            deadline=deadline,
+        )
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "symlink-validation-failed",
+            "tracked symlink parent cannot be opened without following links",
+        ) from error
+    pending = list(reversed(target.split(b"/")))
+    expansions = 0
+    component_steps = 0
+    try:
+        while pending:
+            if component_steps % 256 == 0:
+                _remaining_symlink_validation_seconds(deadline)
+            component_steps += 1
+            if component_steps > SYMLINK_RESOLUTION_COMPONENT_LIMIT:
+                raise ReviewWorkspaceError(
+                    "symlink-resolution-limit",
+                    "tracked symlink chain exceeds its component-resolution limit",
+                    details={"limit": SYMLINK_RESOLUTION_COMPONENT_LIMIT},
+                )
+            component = pending.pop()
+            if component in {b"", b"."}:
+                continue
+            if component == b"..":
+                if len(directory_stack) == 1:
+                    raise ReviewWorkspaceError(
+                        "symlink-escape",
+                        f"tracked symlink {os.fsdecode(raw_path)!r} escapes workspace",
+                    )
+                os.close(directory_stack.pop())
+                continue
+
+            try:
+                metadata = os.stat(
+                    component,
+                    dir_fd=directory_stack[-1],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                # A missing component makes the link dangling.  The prior pure
+                # lexical check already proved that this unresolved spelling is
+                # contained, and no target path has been followed.
+                return
+            except OSError as error:
+                raise ReviewWorkspaceError(
+                    "symlink-validation-failed",
+                    "tracked symlink target component cannot be inspected safely",
+                ) from error
+
+            if stat.S_ISLNK(metadata.st_mode):
+                identity = (metadata.st_dev, metadata.st_ino)
+                binding = target_by_identity.get(identity)
+                if binding is None:
+                    raise ReviewWorkspaceError(
+                        "symlink-resolution-unbound",
+                        (
+                            "tracked symlink target reached a filesystem symlink "
+                            "that is not bound to the staged Git symlink map"
+                        ),
+                    )
+                _bound_path, nested_target = binding
+                try:
+                    observed_target = os.fsencode(
+                        os.readlink(component, dir_fd=directory_stack[-1])
+                    )
+                    repeated_metadata = os.stat(
+                        component,
+                        dir_fd=directory_stack[-1],
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise ReviewWorkspaceError(
+                        "symlink-validation-failed",
+                        "tracked symlink alias cannot be revalidated safely",
+                    ) from error
+                if (
+                    not stat.S_ISLNK(repeated_metadata.st_mode)
+                    or not os.path.samestat(metadata, repeated_metadata)
+                    or observed_target != nested_target
+                ):
+                    raise ReviewWorkspaceError(
+                        "symlink-content-drift",
+                        "tracked symlink alias changed during chain validation",
+                    )
+                expansions += 1
+                if expansions > SYMLINK_COUNT_LIMIT:
+                    raise ReviewWorkspaceError(
+                        "symlink-resolution-limit",
+                        "tracked symlink chain is cyclic or exceeds its expansion limit",
+                        details={"limit": SYMLINK_COUNT_LIMIT},
+                    )
+                nested_components = nested_target.split(b"/")
+                if (
+                    len(pending) + len(nested_components)
+                    > SYMLINK_RESOLUTION_COMPONENT_LIMIT
+                ):
+                    raise ReviewWorkspaceError(
+                        "symlink-resolution-limit",
+                        "tracked symlink chain exceeds its pending-component limit",
+                        details={"limit": SYMLINK_RESOLUTION_COMPONENT_LIMIT},
+                    )
+                pending.extend(reversed(nested_components))
+                continue
+
+            if not pending or not stat.S_ISDIR(metadata.st_mode):
+                # A non-directory with unresolved suffix is an ordinary dangling
+                # path, while a terminal entry is already contained in this dirfd.
+                return
+            child = -1
+            try:
+                child = os.open(
+                    component,
+                    _nofollow_flags(directory=True),
+                    dir_fd=directory_stack[-1],
+                )
+                child_metadata = os.fstat(child)
+            except OSError as error:
+                if child >= 0:
+                    os.close(child)
+                raise ReviewWorkspaceError(
+                    "symlink-validation-failed",
+                    "tracked symlink target directory cannot be opened safely",
+                ) from error
+            if not os.path.samestat(metadata, child_metadata):
+                os.close(child)
+                raise ReviewWorkspaceError(
+                    "symlink-content-drift",
+                    "tracked symlink target directory changed during validation",
+                )
+            directory_stack.append(child)
+    finally:
+        for descriptor in reversed(directory_stack):
+            os.close(descriptor)
+
+
 def _run_symlink_git(
     root: pathlib.Path,
     arguments: tuple[str, ...],
@@ -5080,49 +5329,95 @@ def _validate_symlinks(
         control_binding=control_binding,
     )
     targets = _parse_symlink_batch(batch, tuple(oid for _path, oid in symlinks))
-    resolved_root = root.resolve(strict=True)
+    target_by_path: dict[tuple[bytes, ...], bytes] = {}
+    # Reject every overt lexical escape before opening any checkout path.  A
+    # hostile target therefore cannot select host metadata for validation.
     for (raw_path, _oid), target in zip(symlinks, targets, strict=True):
         _remaining_symlink_validation_seconds(deadline)
-        target_text = os.fsdecode(target)
-        if os.path.isabs(target_text):
+        path_components = _tracked_path_components(raw_path)
+        _apply_lexical_symlink_target(
+            path_components[:-1],
+            target,
+            raw_path=raw_path,
+        )
+        if path_components in target_by_path:
             raise ReviewWorkspaceError(
-                "symlink-escape",
-                f"tracked symlink {os.fsdecode(raw_path)!r} is absolute",
+                "index-output-invalid",
+                "Git returned duplicate tracked symlink paths",
             )
-        link = root / pathlib.Path(os.fsdecode(raw_path))
-        try:
-            first_metadata = link.stat(follow_symlinks=False)
-            first_target = os.readlink(link)
-            first_resolved = (link.parent / first_target).resolve(strict=False)
-            second_metadata = link.stat(follow_symlinks=False)
-            second_target = os.readlink(link)
-            second_resolved = (link.parent / second_target).resolve(strict=False)
-        except (OSError, RuntimeError) as error:
-            raise ReviewWorkspaceError(
-                "symlink-validation-failed", "tracked symlink cannot be validated"
-            ) from error
-        if not stat.S_ISLNK(first_metadata.st_mode) or not stat.S_ISLNK(
-            second_metadata.st_mode
-        ):
-            raise ReviewWorkspaceError(
-                "symlink-content-mismatch", "tracked symlink differs from its Git blob"
+        target_by_path[path_components] = target
+
+    target_by_identity: dict[tuple[int, int], tuple[bytes, bytes]] = {}
+    # Bind each actual link through root-relative no-follow directory handles.
+    # Object replacement is mutation evidence; timestamp-only changes are not.
+    try:
+        root_descriptor = os.open(root, _nofollow_flags(directory=True))
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "symlink-validation-failed",
+            "workspace root cannot be opened safely for symlink validation",
+        ) from error
+    try:
+        for (raw_path, _oid), target in zip(symlinks, targets, strict=True):
+            _remaining_symlink_validation_seconds(deadline)
+            try:
+                first_metadata, first_target = _read_tracked_symlink(
+                    root_descriptor,
+                    raw_path,
+                    deadline=deadline,
+                )
+                second_metadata, second_target = _read_tracked_symlink(
+                    root_descriptor,
+                    raw_path,
+                    deadline=deadline,
+                )
+            except (OSError, RuntimeError) as error:
+                raise ReviewWorkspaceError(
+                    "symlink-validation-failed",
+                    "tracked symlink cannot be validated without following ancestors",
+                ) from error
+            if not stat.S_ISLNK(first_metadata.st_mode) or not stat.S_ISLNK(
+                second_metadata.st_mode
+            ):
+                raise ReviewWorkspaceError(
+                    "symlink-content-mismatch",
+                    "tracked symlink differs from its Git blob",
+                )
+            if first_target != second_target or not os.path.samestat(
+                first_metadata, second_metadata
+            ):
+                raise ReviewWorkspaceError(
+                    "symlink-content-drift",
+                    "tracked symlink changed during validation",
+                )
+            if first_target != target:
+                raise ReviewWorkspaceError(
+                    "symlink-content-mismatch",
+                    "tracked symlink differs from its Git blob",
+                )
+            identity = (first_metadata.st_dev, first_metadata.st_ino)
+            if identity in target_by_identity:
+                raise ReviewWorkspaceError(
+                    "symlink-content-drift",
+                    "distinct tracked symlink paths unexpectedly share one object",
+                )
+            target_by_identity[identity] = (raw_path, target)
+
+        # Actual links now match their Git blobs.  Resolve each component through
+        # the root dirfd, and identify aliases by bound inode instead of guessing
+        # APFS case-folding or Unicode-normalization rules in Python.  A
+        # case-sensitive volume simply reports a differently spelled entry absent.
+        for (raw_path, _oid), target in zip(symlinks, targets, strict=True):
+            _validate_tracked_symlink_chain(
+                root_descriptor,
+                raw_path,
+                target,
+                target_by_identity,
+                deadline=deadline,
             )
-        if first_target != second_target or first_resolved != second_resolved:
-            raise ReviewWorkspaceError(
-                "symlink-content-drift", "tracked symlink changed during validation"
-            )
-        if os.fsencode(first_target) != target:
-            raise ReviewWorkspaceError(
-                "symlink-content-mismatch", "tracked symlink differs from its Git blob"
-            )
-        try:
-            first_resolved.relative_to(resolved_root)
-        except ValueError as error:
-            raise ReviewWorkspaceError(
-                "symlink-escape",
-                f"tracked symlink {os.fsdecode(raw_path)!r} escapes workspace",
-            ) from error
-        _remaining_symlink_validation_seconds(deadline)
+            _remaining_symlink_validation_seconds(deadline)
+    finally:
+        os.close(root_descriptor)
     return len(symlinks)
 
 

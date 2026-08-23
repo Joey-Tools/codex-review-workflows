@@ -516,6 +516,7 @@ class _ReportValidator:
         self.grammar_name = grammar["schema"]
         self.schema = grammar["required_report_schema"]
         self.fields = self.schema["closed_fields"]
+        self.scope_rules = self.schema["scope_rules"]
         self.rules = self.schema["basis_rules"]
 
     def _closed(self, value: object, profile: str) -> bool:
@@ -565,6 +566,32 @@ class _ReportValidator:
             and evidence["head_binding"] == "explicit-commit"
         )
 
+    def _selected_pr_scope(self, report: dict[str, object]) -> bool:
+        rule = self.scope_rules["selected-pr"]
+        return (
+            report["status"] in rule["status_values"]
+            and self._positive_int(report["pull_request"])
+            and self._full_sha(report["head_sha"])
+            and report["scope_assurance"] == rule["scope_assurance"]
+            and report["base_assurance"] == rule["base_assurance"]
+        )
+
+    def _no_selected_supported_pr_scope(self, report: dict[str, object]) -> bool:
+        rule = self.scope_rules["no-selected-supported-pr"]
+        return (
+            report["status"] == rule["status"]
+            and report["pull_request"] is rule["pull_request"]
+            and report["head_sha"] is rule["head_sha"]
+            and report["scope_assurance"] == rule["scope_assurance"]
+            and report["base_assurance"] == rule["base_assurance"]
+            and report["basis"] is rule["basis"]
+            and report["evidence"] is rule["evidence"]
+            and report["request_policy"]["status"] == rule["request_policy_status"]
+            and not report["request_policy"]["warnings"]
+            and not report["unresolved_provider_findings"]
+            and report["last_reason"] == rule["last_reason"]
+        )
+
     def validate(self, report: object) -> bool:
         if not self._closed(report, "report"):
             return False
@@ -572,10 +599,6 @@ class _ReportValidator:
             report["status"] not in self.schema["status_values"]
             or not isinstance(report["repository"], str)
             or report["repository"].count("/") != 1
-            or not self._positive_int(report["pull_request"])
-            or not self._full_sha(report["head_sha"])
-            or report["scope_assurance"] != "latest-head-only"
-            or report["base_assurance"] != "local-pr-readiness"
             or not isinstance(report["unresolved_provider_findings"], list)
             or not isinstance(report["last_reason"], str)
             or not report["last_reason"]
@@ -588,6 +611,10 @@ class _ReportValidator:
             or not isinstance(policy["warnings"], list)
             or not all(isinstance(warning, str) for warning in policy["warnings"])
         ):
+            return False
+        if self._no_selected_supported_pr_scope(report):
+            return True
+        if not self._selected_pr_scope(report):
             return False
         basis = report["basis"]
         evidence = report["evidence"]
@@ -719,6 +746,26 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             report_schema["basis_rules"]["reaction-clean"]["head_binding"],
             "stable-request-epoch",
         )
+        self.assertEqual(
+            report_schema["scope_rules"]["selected-pr"]["status_values"],
+            ["pass", "findings", "pending", "inconclusive"],
+        )
+        self.assertEqual(
+            report_schema["scope_rules"]["no-selected-supported-pr"],
+            {
+                "status": "not-applicable",
+                "pull_request": None,
+                "head_sha": None,
+                "scope_assurance": "proved-no-selected-supported-pr",
+                "base_assurance": "not-applicable",
+                "basis": None,
+                "evidence": None,
+                "request_policy_status": "not-applicable",
+                "request_policy_warnings": "required-empty",
+                "unresolved_provider_findings": "required-empty",
+                "last_reason": "no-selected-supported-pr",
+            },
+        )
 
     def test_authority_strongly_links_the_consumer_grammar(self) -> None:
         authority = AUTHORITY_PATH.read_text(encoding="utf-8")
@@ -808,6 +855,19 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "reaction-clean-explicit-commit",
             "merge-status-report-positive",
             "finding-report-positive",
+            "selected-pending-report-positive",
+            "selected-inconclusive-report-positive",
+            "no-selected-supported-pr-positive",
+            "no-pr-null-scope-cannot-pass",
+            "no-pr-null-scope-cannot-findings",
+            "no-pr-null-scope-cannot-pending",
+            "no-pr-null-scope-cannot-inconclusive",
+            "no-pr-rejects-non-null-pr",
+            "no-pr-rejects-non-null-head",
+            "no-pr-rejects-selected-scope-assurance",
+            "no-pr-rejects-basis-leak",
+            "no-pr-rejects-evidence-leak",
+            "selected-pr-rejects-not-applicable",
         }
         self.assertTrue(required.issubset(fixture_ids))
         for fixture in fixtures:
@@ -818,6 +878,28 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 self.assertEqual(
                     self.report_validator.validate(report), fixture["valid"]
                 )
+
+    def test_selected_pr_report_variants_reject_present_null_scope(self) -> None:
+        selected_reports = [
+            copy.deepcopy(self.grammar["report_bases"][base])
+            for base in (
+                "terminal_clean",
+                "reaction_clean",
+                "merge_status",
+                "finding",
+                "selected_pending",
+            )
+        ]
+        inconclusive = copy.deepcopy(self.grammar["report_bases"]["selected_pending"])
+        inconclusive["status"] = "inconclusive"
+        inconclusive["last_reason"] = "provider-evidence-inconclusive"
+        selected_reports.append(inconclusive)
+        for report in selected_reports:
+            for field in ("pull_request", "head_sha"):
+                with self.subTest(status=report["status"], field=field):
+                    null_scope = copy.deepcopy(report)
+                    null_scope[field] = None
+                    self.assertFalse(self.report_validator.validate(null_scope))
 
     def test_normalization_is_scalar_and_does_not_apply_unicode_normalization(
         self,

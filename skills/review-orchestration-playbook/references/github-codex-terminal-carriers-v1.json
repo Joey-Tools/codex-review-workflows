@@ -306,6 +306,33 @@
       "unknown",
       "not-applicable"
     ],
+    "scope_rules": {
+      "selected-pr": {
+        "status_values": [
+          "pass",
+          "findings",
+          "pending",
+          "inconclusive"
+        ],
+        "pull_request": "required-positive-integer",
+        "head_sha": "required-full-sha",
+        "scope_assurance": "latest-head-only",
+        "base_assurance": "local-pr-readiness"
+      },
+      "no-selected-supported-pr": {
+        "status": "not-applicable",
+        "pull_request": null,
+        "head_sha": null,
+        "scope_assurance": "proved-no-selected-supported-pr",
+        "base_assurance": "not-applicable",
+        "basis": null,
+        "evidence": null,
+        "request_policy_status": "not-applicable",
+        "request_policy_warnings": "required-empty",
+        "unresolved_provider_findings": "required-empty",
+        "last_reason": "no-selected-supported-pr"
+      }
+    },
     "basis_rules": {
       "terminal-clean": {
         "status": "pass",
@@ -332,8 +359,7 @@
       "null": {
         "null_evidence_statuses": [
           "pending",
-          "inconclusive",
-          "not-applicable"
+          "inconclusive"
         ],
         "finding_evidence_kind": "terminal-artifact",
         "finding_branches": [
@@ -492,6 +518,38 @@
         301
       ],
       "last_reason": "applicable-provider-finding"
+    },
+    "selected_pending": {
+      "status": "pending",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": null,
+      "request_policy": {
+        "status": "unknown",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "provider-work-retryable"
+    },
+    "no_selected_supported_pr": {
+      "status": "not-applicable",
+      "repository": "octo/review-fixture",
+      "pull_request": null,
+      "head_sha": null,
+      "scope_assurance": "proved-no-selected-supported-pr",
+      "base_assurance": "not-applicable",
+      "basis": null,
+      "evidence": null,
+      "request_policy": {
+        "status": "not-applicable",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "no-selected-supported-pr"
     }
   },
   "report_fixtures": [
@@ -573,6 +631,123 @@
       "base": "finding",
       "patch": {},
       "valid": true
+    },
+    {
+      "id": "selected-pending-report-positive",
+      "base": "selected_pending",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "selected-inconclusive-report-positive",
+      "base": "selected_pending",
+      "patch": {
+        "status": "inconclusive",
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": true
+    },
+    {
+      "id": "no-selected-supported-pr-positive",
+      "base": "no_selected_supported_pr",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "no-pr-null-scope-cannot-pass",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "pass"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-findings",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "findings"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-pending",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "pending",
+        "scope_assurance": "latest-head-only",
+        "base_assurance": "local-pr-readiness",
+        "request_policy": {
+          "status": "unknown"
+        },
+        "last_reason": "provider-work-retryable"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-inconclusive",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "inconclusive",
+        "scope_assurance": "latest-head-only",
+        "base_assurance": "local-pr-readiness",
+        "request_policy": {
+          "status": "unknown"
+        },
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-non-null-pr",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "pull_request": 7
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-non-null-head",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "head_sha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-selected-scope-assurance",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "scope_assurance": "latest-head-only"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-basis-leak",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-evidence-leak",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "evidence": {}
+      },
+      "valid": false
+    },
+    {
+      "id": "selected-pr-rejects-not-applicable",
+      "base": "selected_pending",
+      "patch": {
+        "status": "not-applicable",
+        "request_policy": {
+          "status": "not-applicable"
+        },
+        "last_reason": "no-selected-supported-pr"
+      },
+      "valid": false
     }
   ],
   "bases": {

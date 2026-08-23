@@ -211,10 +211,47 @@ class ForegroundCleanupTest(unittest.TestCase):
             repo=pathlib.Path("/tmp/repository"),
             base_ref="base",
             head_ref="head",
+            synthetic_secret_exemptions=(),
         )
         run_review.assert_not_called()
         prepare_workspace.assert_not_called()
         run_foreground.assert_not_called()
+
+    def test_secret_admission_accepts_repeatable_legacy_exemption_options(
+        self,
+    ) -> None:
+        stdout = io.StringIO()
+        summary = {"exit_code": 0, "status": "clean"}
+        with (
+            mock.patch.object(
+                cli, "secret_admission", return_value=(0, summary)
+            ) as scan,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(
+                [
+                    "secret-admission",
+                    "--repo",
+                    "/tmp/repository",
+                    "--base-ref",
+                    "base",
+                    "--head-ref",
+                    "head",
+                    "--synthetic-secret-exemption",
+                    "historical-one",
+                    "--synthetic-secret-exemption",
+                    "historical-two",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+        scan.assert_called_once_with(
+            repo=pathlib.Path("/tmp/repository"),
+            base_ref="base",
+            head_ref="head",
+            synthetic_secret_exemptions=("historical-one", "historical-two"),
+        )
 
     def test_secret_admission_preserves_terminal_exit_mapping(self) -> None:
         arguments = [

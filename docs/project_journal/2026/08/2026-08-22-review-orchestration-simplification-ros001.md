@@ -546,6 +546,85 @@ superseded_by:
   `git diff --check` passed, and all three changed skills passed quick
   validation. The full suite and WME evidence are recorded above.
 
+### Final-head formal review findings
+
+- Reviewed range:
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..90585b6a87b4ed20fb57736c6d1724e40b1474b1`.
+  The independently trusted control source remained private-overlay release
+  `f9e596f458a119fa88b89789c24c2290c37b4857`; candidate executable code was
+  not used as review control.
+- Materialization and the post-review trusted revalidation agreed on three
+  scoped commits, two parent edges, parent-graph SHA-256
+  `206e5051ebc7c8378b90d07ff0e33c2399507dbb73ad93044be48a5b463fbc14`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+- The parent-owned prompt was 8,858 bytes with SHA-256
+  `0f52df1e9d7df4fb5e1eb5ab97eb8c7d1db981808c44c087a2999fb59b3a6fa6`.
+  The findings terminal artifact SHA-256 was
+  `a93a0a3e5109c33b1a3d6b1c4190591a094b98a20ebc66ccb4862c5f42746306`;
+  the JSON event stream SHA-256 was
+  `08287469ca9efc7c9f0a215b5c9c3edcb1eb44ddab55258bb99127a808e98319`;
+  stderr SHA-256 was
+  `63aab5657be324bf8ddbcbbcb2411fa6754eb5a93d0349dfeaa98e6ae428fbad`.
+- The fresh GPT-5.6 Sol Ultra reviewer reported ten actionable findings. The
+  accepted remediation plan is to:
+  - regenerate and continuously verify the trusted Mac gate source manifest;
+  - isolate the canonical CLI adapter from automatically loaded candidate and
+    ambient guidance during self-policy migration;
+  - make effective-profile acceptance unambiguous and fail closed on an
+    unproved or mismatched runtime;
+  - replace host `Path.resolve()` symlink traversal with bounded lexical and
+    tracked-symlink-map containment;
+  - require an explicit repository idempotency/reentrancy declaration and
+    mutation authority before any workflow rerun or dispatch;
+  - retry only machine-classified transient infrastructure outcomes, never
+    stable malformed or contradictory evidence;
+  - add a closed no-selected-supported-PR report variant without weakening
+    selected-PR scope requirements;
+  - retain the validated repeatable synthetic-exemption compatibility
+    argument without weakening secret admission;
+  - include worst-case `--missing=print` frontier rows in parent-graph output
+    budgeting; and
+  - block only applicable unresolved provider findings, allowing typed
+    same-head resolution or a trustworthy same-head provider correction.
+- These findings invalidate `90585b6` as the final candidate. The next signed
+  head must rerun the affected suites, the complete local gate, exact-secret
+  admission, and a new fresh-context formal review.
+
+### Final-head remediation and integrated gate
+
+- All ten formal-review findings were fixed. Follow-up independent audits also
+  closed four cross-cutting gaps before the final gate:
+  - tracked-symlink chaining now follows the actual volume's case and Unicode
+    alias semantics through root-relative no-follow lookups, while matching
+    only double-read, inode/content-bound Git symlinks; unbound aliases fail
+    closed and case-sensitive dangling targets remain valid;
+  - every canonical Codex CLI lane now starts from an empty parent-owned
+    neutral root, so candidate project configuration cannot inject developer
+    instructions; the model-visible debug probe and exec-only capability/
+    strict-launch evidence are separate, non-overclaiming receipts;
+  - the always-read lane contract and prompt template now share the same
+    transient-only recovery, non-intrinsic-idempotency, and same-head typed
+    resolution rules as the GitHub field authority; and
+  - the trusted Mac source-manifest generator now enforces the consumer's
+    exact ASCII path grammar, no-follow ordinary-directory policy, entry,
+    depth, path-byte, per-file, double-read total-byte, and manifest-byte
+    ceilings, and its output is tested through the exact consumer parser.
+- Focused post-remediation evidence includes 133 passing workspace tests, 304
+  passing admission/workspace tests with one conditional skip, 65 passing
+  combined contract/carrier/CLI/manifest tests, 13 passing symlink tests, and
+  the deterministic 74-entry trusted Mac manifest regeneration/check.
+- The first complete host-sandbox probe ran 3,051 tests in 1,065.851 seconds:
+  3,050 passed, six were conditionally skipped, and one existing nested
+  `sandbox-exec` test was rejected by the outer sandbox with return code 71.
+  The exact test failed identically in isolation and did not expose a code
+  assertion failure.
+- The authoritative rerun outside that outer restriction used the same source,
+  command, and `ResourceWarning`-as-error policy. All 3,051 tests passed with
+  six conditional skips in 1,133.469 seconds. Ruff lint and format, 65 focused
+  contracts, three skill validators, Action workflow syntax, JSON parsing,
+  project-journal validation, and `git diff --check` also passed.
+
 ## Next Steps
 
 - Use the final signed squash candidate head for secret admission and obtain a

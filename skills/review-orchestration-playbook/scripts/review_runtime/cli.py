@@ -177,6 +177,16 @@ def _build_secret_admission_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".", help="Source Git repository.")
     parser.add_argument("--base-ref", required=True, help="Frozen base commit-ish.")
     parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
+    parser.add_argument(
+        "--synthetic-secret-exemption",
+        action="append",
+        default=[],
+        help=(
+            "Deprecated repeatable compatibility option. Every ID must name a "
+            "catalog legacy exemption, but selection does not change exact-secret "
+            "admission."
+        ),
+    )
     return parser
 
 
@@ -186,6 +196,7 @@ def _run_secret_admission(argv: list[str]) -> int:
         repo=pathlib.Path(args.repo),
         base_ref=args.base_ref,
         head_ref=args.head_ref,
+        synthetic_secret_exemptions=tuple(args.synthetic_secret_exemption),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return exit_code
