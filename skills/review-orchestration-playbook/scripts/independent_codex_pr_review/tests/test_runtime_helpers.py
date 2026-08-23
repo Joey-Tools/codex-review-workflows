@@ -75,12 +75,14 @@ from review_supervisor.secureio import (
 )
 from review_supervisor.wire import receive_record, send_blob, send_record, socket_pair
 
-from tests.support import bind_attempt_state, owned_temporary_directory
-
-
-ENTRYPOINT = (
-    pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
+from tests.support import (
+    LEGACY_SUPERVISOR_HARNESS,
+    bind_attempt_state,
+    owned_temporary_directory,
 )
+
+
+ENTRYPOINT = LEGACY_SUPERVISOR_HARNESS
 
 
 def _fake_attempt(path: pathlib.Path = pathlib.Path("/attempt")) -> SimpleNamespace:

@@ -60,6 +60,11 @@ _DARWIN_MAXPATHLEN = 1024
 _OWNED_TEMPORARY_CLEANUP_ENTRY_CAP = 8192
 _OWNED_TEMPORARY_CLEANUP_MANIFEST_BYTES = 4 * 1024 * 1024
 _OWNED_TEMPORARY_CLEANUP_SECONDS = 60.0
+LEGACY_SUPERVISOR_HARNESS = (
+    pathlib.Path(__file__)
+    .with_name("legacy_supervisor_harness.py")
+    .resolve(strict=True)
+)
 
 
 def _canonical_ascii_directory(raw_path: str | pathlib.Path) -> pathlib.Path:

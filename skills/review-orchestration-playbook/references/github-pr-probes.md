@@ -79,9 +79,11 @@ review lanes.
 
 A base-only retarget on the same head does not authorize or require another
 request. Reuse qualifying head-bound provider evidence, rerun the base-sensitive
-local/readiness gates, and reconcile a related merge/status check when its
-contract is base-sensitive. Never claim the provider inspected the retargeted
-base.
+local/readiness gates only after the parent-owned `range_origin` gate in
+[pr-readiness.md](pr-readiness.md) authorizes their exact local PR-wide range,
+and reconcile a related merge/status check when its contract is base-sensitive.
+This probe layer never selects or rewrites that range. Never claim the provider
+inspected the retargeted base.
 
 ## Discover Related Checks Dynamically
 

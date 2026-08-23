@@ -1,0 +1,1610 @@
+{
+  "schema": "github-codex-terminal-carriers-v1",
+  "schema_version": 1,
+  "role": "consumer-terminal-carrier-grammar",
+  "producer_contract": "out-of-scope",
+  "fixture_patch_semantics": "RFC7396",
+  "normalization": {
+    "input": "unicode-scalar-values",
+    "line_breaks_to_lf": [
+      "CRLF",
+      "U+000D",
+      "U+000B",
+      "U+000C",
+      "U+0085",
+      "U+2028",
+      "U+2029"
+    ],
+    "reject": "surrogates, NUL, and remaining C0/C1 controls except HT and LF",
+    "outer_trim": [
+      "U+0009",
+      "U+000A",
+      "U+0020"
+    ],
+    "other_transformations": "none"
+  },
+  "provider_identity": {
+    "login": "chatgpt-codex-connector[bot]",
+    "type": "Bot",
+    "issue_comment_app_slug": "chatgpt-codex-connector"
+  },
+  "terminal_detection": {
+    "issue_comment": {
+      "anchor": "Codex Review",
+      "first_line_max_start_scalar_index": 63,
+      "prefix_must_contain_no_ascii_alnum": true,
+      "progress_stems": [
+        "Codex Review in progress",
+        "Codex Review still in progress"
+      ],
+      "progress_detail_max_scalars": 160,
+      "progress_requires_no_later_nonempty_line": true
+    },
+    "review": {
+      "nonterminal_states": [
+        "PENDING"
+      ],
+      "admitted_states": [
+        "APPROVED",
+        "COMMENTED",
+        "CHANGES_REQUESTED"
+      ],
+      "inadmissible_terminal_states": [
+        "DISMISSED"
+      ],
+      "missing_or_unknown_state_with_body_or_child": "malformed"
+    }
+  },
+  "semantic_time": {
+    "issue_comment": "updated_at when updated_at is later than created_at; otherwise created_at",
+    "review": "submitted_at",
+    "requirements": "canonical GitHub UTC-second RFC3339 strings; updated_at must not precede created_at"
+  },
+  "terminal_commit_binding": {
+    "hashless_branches": [],
+    "clean_issue_v1": "reviewed-commit marker",
+    "clean_review_v1": "native review commit_id",
+    "top_level_finding_v1": "finding blob URL, native review commit_id when applicable, and complete ancestor projection for a non-head commit",
+    "inline_parent_v1": "native parent, child commit_id, child original_commit_id, exact child thread join, and complete ancestor projection for a non-head commit"
+  },
+  "ancestor_shas_projection": {
+    "owner": "parent-orchestrator",
+    "status_values": [
+      "complete",
+      "incomplete"
+    ],
+    "base_endpoint": "locally proved unique PR merge base",
+    "head_endpoint": "exact immutable scope head",
+    "ancestor_set": "complete lowercase full-SHA set from base_sha..head_sha excluding head_sha when status is complete",
+    "canonical_order": "ascending lowercase ASCII SHA order with no duplicates",
+    "digest": "SHA-256 of the ASCII bytes of each ordered ancestor SHA followed by LF, including LF after the final SHA",
+    "membership_rule": "only a closed, scope-bound, digest-valid projection with status complete may make ancestor membership applicable; incomplete makes non-head applicability inconclusive"
+  },
+  "disclosure_lines": [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    "- Comment \"@codex review\".",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "</details>"
+  ],
+  "branches": {
+    "clean_issue_v1": {
+      "lead": "Codex Review: Didn't find any major issues.",
+      "body_to_marker_separator": "\n\n",
+      "marker_template": "**Reviewed commit:** `<LOWERCASE_10_OR_40_HEX_SHA>`",
+      "commit_ref_lengths": [
+        10,
+        40
+      ],
+      "full_ref_binding": "equals-current-head",
+      "short_ref_binding": "stable-unique-exact-repository-resolution-to-current-head",
+      "allowed_tagline_symbols": [
+        ":rocket:",
+        ":tada:",
+        ":+1:",
+        "🚀",
+        "🎉",
+        "👍",
+        "✨",
+        "✅"
+      ],
+      "allowed_tagline_stems": [
+        "Nice work",
+        "Chef's kiss",
+        "What shall we delve into next",
+        "Already looking forward to the next diff",
+        "Keep them coming",
+        "Swish",
+        "Another round soon, please",
+        "Breezy",
+        "Can't wait for the next one",
+        "More of your lovely PRs please",
+        "Bravo",
+        "Keep it up",
+        "Delightful",
+        "Hooray",
+        "You're on a roll"
+      ],
+      "tagline_stem_terminal_punctuation": [
+        ".",
+        "!",
+        "?"
+      ],
+      "optional_disclosure": "two LF, nonblank first line, then disclosure_lines after per-line trim and blank-line removal"
+    },
+    "clean_review_v1": {
+      "state": "APPROVED",
+      "body": "No findings.",
+      "commit_binding": "native-full-sha-equals-current-head",
+      "provider_target_children": "zero",
+      "associated_pages": "complete"
+    },
+    "top_level_finding_v1": {
+      "header": "### 💡 Codex Review",
+      "line_template": "- [P<0..3>] <TITLE> — <BLOB_URL>",
+      "title_max_scalars": 240,
+      "review_states": [
+        "COMMENTED",
+        "CHANGES_REQUESTED"
+      ],
+      "blob_url": "lowercase https github.com, exact repository, full lowercase SHA, safe RFC3986 path, positive line anchor",
+      "commit_binding": "current-head-or-locally-proved-ancestor",
+      "ancestor_binding": "closed parent-owned ancestor_shas_projection",
+      "provider_target_children": "parse and join every associated child before returning the top-level finding",
+      "optional_disclosure": "exact two-LF boundary and byte-exact disclosure_lines"
+    },
+    "inline_parent_v1": {
+      "parent_forms": "COMMENTED empty/exact-container body, or APPROVED exact clean-review body whose provider target child overrides clean",
+      "commit_binding": "current-head-or-locally-proved-ancestor",
+      "empty_parent_body_allowed": true,
+      "nonempty_parent_lines": [
+        "### 💡 Codex Review",
+        "Here are some automated review suggestions for this pull request.",
+        "**Reviewed commit:** `<PARENT_FULL_SHA>`"
+      ],
+      "provider_children_minimum": 1,
+      "child_binding": "exact parent review ID and parent commit_id/original_commit_id",
+      "thread_join": "one REST child ID and exact frozen-repository/PR discussion_r<ID> URL to one GraphQL thread comment under the exact parent review with typed isResolved",
+      "incomplete_join": "inconclusive"
+    }
+  },
+  "closed_record_fields": {
+    "issue_comment": [
+      "kind",
+      "id",
+      "user",
+      "performed_via_github_app",
+      "body",
+      "created_at",
+      "updated_at",
+      "scope",
+      "commit_resolution"
+    ],
+    "review": [
+      "kind",
+      "id",
+      "user",
+      "state",
+      "commit_id",
+      "body",
+      "submitted_at",
+      "scope",
+      "children_complete",
+      "threads_complete",
+      "children"
+    ],
+    "scope": [
+      "repository",
+      "pull_request",
+      "base_sha",
+      "head_sha",
+      "ancestor_shas",
+      "ancestor_shas_projection"
+    ],
+    "ancestor_shas_projection": [
+      "owner",
+      "status",
+      "repository",
+      "pull_request",
+      "base_sha",
+      "head_sha",
+      "ancestor_count",
+      "ancestor_shas_sha256"
+    ],
+    "user": [
+      "login",
+      "type"
+    ],
+    "app": [
+      "slug"
+    ],
+    "commit_resolution": [
+      "repository",
+      "commit_ref",
+      "initial_resolved_commit",
+      "final_resolved_commit"
+    ],
+    "child": [
+      "id",
+      "url",
+      "user",
+      "pull_request_review_id",
+      "commit_id",
+      "original_commit_id",
+      "body",
+      "thread_join"
+    ],
+    "thread_join": [
+      "match_count",
+      "parent_review_id",
+      "child_comment_id",
+      "url",
+      "isResolved"
+    ]
+  },
+  "closed_world": {
+    "unknown_terminal_looking_exact_provider_carrier": "malformed",
+    "wrong_or_lookalike_actor": "irrelevant-audit-context",
+    "old_head_positive": "stale",
+    "incomplete_ancestor_projection_for_non_head": "inconclusive",
+    "invalid_or_unbound_ancestor_projection": "malformed",
+    "orphaned_or_conflicting_join": "malformed",
+    "non_unique_or_incomplete_join_or_pagination": "inconclusive",
+    "inline_resolution_source": "typed GraphQL isResolved only"
+  },
+  "required_report_schema": {
+    "schema": "github-codex-lane-report-v1",
+    "role": "consumer-report-schema",
+    "producer_contract": "out-of-scope",
+    "closed_fields": {
+      "report": [
+        "status",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "scope_assurance",
+        "base_assurance",
+        "basis",
+        "evidence",
+        "request_policy",
+        "unresolved_provider_findings",
+        "last_reason"
+      ],
+      "evidence": [
+        "kind",
+        "id",
+        "url",
+        "channel",
+        "grammar",
+        "grammar_branch",
+        "grammar_status",
+        "artifact_commit",
+        "server_time",
+        "server_time_field",
+        "head_binding",
+        "request_id"
+      ],
+      "request_policy": [
+        "status",
+        "warnings"
+      ]
+    },
+    "status_values": [
+      "pass",
+      "findings",
+      "pending",
+      "inconclusive",
+      "not-applicable"
+    ],
+    "request_policy_status_values": [
+      "compliant",
+      "warning",
+      "unknown",
+      "not-applicable"
+    ],
+    "basis_rules": {
+      "terminal-clean": {
+        "status": "pass",
+        "evidence_kind": "terminal-artifact",
+        "branches": [
+          "clean-issue-v1",
+          "clean-review-v1"
+        ],
+        "artifact_commit": "required-full-sha-equals-report-head",
+        "head_binding": "explicit-commit"
+      },
+      "reaction-clean": {
+        "status": "pass",
+        "evidence_kind": "reaction",
+        "artifact_commit": null,
+        "head_binding": "stable-request-epoch"
+      },
+      "merge-status": {
+        "status": "pass",
+        "evidence_kind": "merge-status",
+        "artifact_commit": null,
+        "head_binding": "current-head-status"
+      },
+      "null": {
+        "null_evidence_statuses": [
+          "pending",
+          "inconclusive",
+          "not-applicable"
+        ],
+        "finding_evidence_kind": "terminal-artifact",
+        "finding_branches": [
+          "top-level-finding-v1",
+          "inline-parent-v1"
+        ],
+        "finding_artifact_commit": "required-full-sha",
+        "finding_head_binding": "explicit-commit"
+      }
+    }
+  },
+  "report_bases": {
+    "terminal_clean": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "terminal-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 101,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+        "channel": "issue-comment",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "clean-issue-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "server_time": "2026-08-23T09:00:00Z",
+        "server_time_field": "created_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "terminal-clean-current-head"
+    },
+    "terminal_clean_null_commit": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "terminal-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 101,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+        "channel": "issue-comment",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "clean-issue-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": null,
+        "server_time": "2026-08-23T09:00:00Z",
+        "server_time_field": "created_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "invalid-null-terminal-commit"
+    },
+    "reaction_clean": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "reaction-clean",
+      "evidence": {
+        "kind": "reaction",
+        "id": 601,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-91",
+        "channel": "reaction",
+        "grammar": null,
+        "grammar_branch": null,
+        "grammar_status": null,
+        "artifact_commit": null,
+        "server_time": "2026-08-23T09:06:00Z",
+        "server_time_field": "reaction-time",
+        "head_binding": "stable-request-epoch",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "reaction-fallback-current-head"
+    },
+    "merge_status": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "merge-status",
+      "evidence": {
+        "kind": "merge-status",
+        "id": 701,
+        "url": "https://github.com/octo/review-fixture/runs/701",
+        "channel": "merge-status",
+        "grammar": null,
+        "grammar_branch": null,
+        "grammar_status": null,
+        "artifact_commit": null,
+        "server_time": "2026-08-23T09:07:00Z",
+        "server_time_field": "status-time",
+        "head_binding": "current-head-status",
+        "request_id": null
+      },
+      "request_policy": {
+        "status": "not-applicable",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "associated-current-head-status"
+    },
+    "finding": {
+      "status": "findings",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 301,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "top-level-finding-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "server_time": "2026-08-23T09:02:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [
+        301
+      ],
+      "last_reason": "applicable-provider-finding"
+    }
+  },
+  "report_fixtures": [
+    {
+      "id": "terminal-clean-report-positive",
+      "base": "terminal_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "terminal-clean-null-artifact-commit",
+      "base": "terminal_clean_null_commit",
+      "patch": {},
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-stable-request-epoch",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "head_binding": "stable-request-epoch"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-artifact-commit-mismatch",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-reaction-kind-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-open-evidence",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "provider_epoch": "opaque"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-report-positive",
+      "base": "reaction_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "reaction-clean-explicit-commit",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+          "head_binding": "explicit-commit"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-report-positive",
+      "base": "merge_status",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "finding-report-positive",
+      "base": "finding",
+      "patch": {},
+      "valid": true
+    }
+  ],
+  "bases": {
+    "clean_issue": {
+      "kind": "issue_comment",
+      "id": 101,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "performed_via_github_app": {
+        "slug": "chatgpt-codex-connector"
+      },
+      "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`",
+      "created_at": "2026-08-23T09:00:00Z",
+      "updated_at": "2026-08-23T09:00:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "commit_resolution": null
+    },
+    "clean_review": {
+      "kind": "review",
+      "id": 201,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "APPROVED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "No findings.",
+      "submitted_at": "2026-08-23T09:01:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": []
+    },
+    "top_level_finding": {
+      "kind": "review",
+      "id": 301,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12",
+      "submitted_at": "2026-08-23T09:02:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": []
+    },
+    "inline_finding": {
+      "kind": "review",
+      "id": 401,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "",
+      "submitted_at": "2026-08-23T09:03:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 501,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 401,
+          "commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "body": "[P1] Preserve the selected object identity",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 401,
+            "child_comment_id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "isResolved": false
+          }
+        }
+      ]
+    },
+    "top_level_with_inline": {
+      "kind": "review",
+      "id": 302,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12",
+      "submitted_at": "2026-08-23T09:04:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 502,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 302,
+          "commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "body": "[P2] Keep the thread finding visible",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 302,
+            "child_comment_id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "isResolved": false
+          }
+        }
+      ]
+    },
+    "approved_ancestor_inline": {
+      "kind": "review",
+      "id": 402,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "APPROVED",
+      "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "body": "No findings.",
+      "submitted_at": "2026-08-23T09:05:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 503,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 402,
+          "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "body": "[P1] Preserve the ancestor finding",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 402,
+            "child_comment_id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "isResolved": false
+          }
+        }
+      ]
+    }
+  },
+  "fixtures": [
+    {
+      "id": "clean-issue-positive",
+      "base": "clean_issue",
+      "patch": {},
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-crlf-normalized",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\r\n\r\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`"
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-short-sha-resolved",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789`",
+        "commit_resolution": {
+          "repository": "octo/review-fixture",
+          "commit_ref": "0123456789",
+          "initial_resolved_commit": "0123456789abcdef0123456789abcdef01234567",
+          "final_resolved_commit": "0123456789abcdef0123456789abcdef01234567"
+        }
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-positive",
+      "base": "clean_review",
+      "patch": {},
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-review-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-finding-positive",
+      "base": "top_level_finding",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "top-level-ancestor-finding-positive",
+      "base": "top_level_finding",
+      "patch": {
+        "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "top-level-multiple-findings",
+      "base": "top_level_finding",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12\n- [P2] Preserve the selected identity — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L30"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "inline-finding-unresolved",
+      "base": "inline_finding",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "inline-finding-resolved",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-with-inline-finding",
+      "base": "inline_finding",
+      "patch": {
+        "state": "APPROVED",
+        "body": "No findings."
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-finding",
+      "base": "approved_ancestor_inline",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-incomplete-projection",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "status": "incomplete"
+          }
+        }
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "approved-nonancestor-inline-finding",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "commit_id": "1111111111111111111111111111111111111111",
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "1111111111111111111111111111111111111111",
+            "original_commit_id": "1111111111111111111111111111111111111111",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 503,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-count-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "ancestor_count": 2
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-digest-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "ancestor_shas_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-head-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "head_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-base-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-unknown-status",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "status": "unknown"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-open-field",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "provider_claim": true
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-inline-child-id-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 999,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-child-url-id-mismatch",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r999",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r999",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-child-url-cross-scope",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/other/repository/pull/99#discussion_r501",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/other/repository/pull/99#discussion_r501",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-with-inline-unresolved",
+      "base": "top_level_with_inline",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "top-level-ancestor-with-inline-unresolved",
+      "base": "top_level_with_inline",
+      "patch": {
+        "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12",
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 502,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "top-level-with-inline-resolved",
+      "base": "top_level_with_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 502,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "top-level-inline-child-id-mismatch",
+      "base": "top_level_with_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 999,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-with-inline-incomplete-join",
+      "base": "top_level_with_inline",
+      "patch": {
+        "threads_complete": false
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "edited-clean-issue",
+      "base": "clean_issue",
+      "patch": {
+        "updated_at": "2026-08-23T09:05:00Z"
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "updated_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "progress-issue",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### Codex Review in progress: inspecting tests"
+      },
+      "expected": {
+        "classification": "nonterminal",
+        "branch": "progress",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "provider-failure-terminal-looking",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review failed: provider timed out"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "hashless-clean-issue-near-miss",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues."
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-near-miss",
+      "base": "clean_review",
+      "patch": {
+        "body": "No findings!"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "wrong-actor-copy",
+      "base": "clean_issue",
+      "patch": {
+        "user": {
+          "login": "octocat",
+          "type": "User"
+        }
+      },
+      "expected": {
+        "classification": "irrelevant",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "old-head-clean-review",
+      "base": "clean_review",
+      "patch": {
+        "commit_id": "1111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "clean-review-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-incomplete-join",
+      "base": "inline_finding",
+      "patch": {
+        "threads_complete": false
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "dismissed-terminal-review",
+      "base": "clean_review",
+      "patch": {
+        "state": "DISMISSED"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "missing-state-terminal-review",
+      "base": "clean_review",
+      "patch": {
+        "state": null
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "issue-nul-control",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review:\u0000 Didn't find any major issues."
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-short-sha-without-resolution",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789`"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-finding-cross-repository",
+      "base": "top_level_finding",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/other/repository/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "unknown-field-near-miss",
+      "base": "clean_issue",
+      "patch": {
+        "provider_run_id": "opaque"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    }
+  ]
+}

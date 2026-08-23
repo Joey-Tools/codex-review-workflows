@@ -60,6 +60,79 @@ An explicit caller-supplied range that differs from the selected PR range may
 still be reviewed as a standalone range, but it does not satisfy whole-PR
 readiness.
 
+For every range intended to count toward PR readiness, the parent persists one
+compact provenance lineage and its active immutable record when it first
+freezes the endpoints:
+
+```yaml
+range_origin:
+  lineage_id: stable-parent-generated-lineage-id
+  kind: caller-supplied | pr-derived
+  active_record_id: stable-parent-generated-record-id
+  record_id: same-as-active-record-id
+  predecessor_record_id: null | previous-active-record-id
+  base_sha: record-full-object-id
+  head_sha: record-full-object-id
+```
+
+The parent-owned immutable `range_origin` lineage header consists of
+`lineage_id` and `kind`; the first record fixes both for the lifetime of this
+selected-PR/head lineage. `caller-supplied` means the caller explicitly
+provided or confirmed both original endpoints. `pr-derived` means the parent
+derived the original endpoints from the authenticated PR head and its unique
+local merge base because no caller range was authoritative. The parent
+generates the opaque lineage and record identifiers, retains every immutable
+record, and owns the single current `active_record_id` binding. The candidate,
+provider, and PR metadata cannot author or replace any of them. The first
+record has `predecessor_record_id: null`.
+
+Every successor must reuse the fixed `lineage_id` and `kind`, have a new stable
+`record_id`, name the exact previously active record in
+`predecessor_record_id`, and record its own exact endpoints. Appending a record
+never activates it: only the parent may advance `active_record_id`, and only
+as the same parent-owned state transition that creates an authorized successor
+below. The active predecessor chain must be unique, gap-free, and acyclic back
+to the first record. While the selected PR and head stay fixed, do not start or
+substitute a second lineage. In particular, a `caller-supplied` lineage can
+never acquire or activate a `pr-derived` record. Only the unique record named
+by the current
+`(lineage_id, active_record_id)` binding may count as PR-wide evidence, and its
+endpoints must equal the exact `base_sha..head_sha` used by every counted local
+lane.
+
+A missing field, an unrecognized kind, a reused identifier, a broken or forked
+predecessor chain, a stale or mismatched active record, a replacement lineage,
+a kind switch, or endpoints that do not match the record or counted lane whose
+provenance they claim is `blocked-input` with reason
+`range-origin-unverified`; stop before starting or counting a local PR-wide
+lane.
+
+### Same-Head Merge-Base Change
+
+When the selected PR keeps the same head but obtains a new unique merge base,
+apply the provenance gate before selecting the local rerun range:
+
+- For `pr-derived`, the parent may automatically derive the exact new
+  `pr_merge_base..head_ref_oid` pair, append an immutable successor in the same
+  `pr-derived` lineage whose predecessor is the current active record, advance
+  the active-record binding, and rerun every invalidated local PR-wide lane.
+- For `caller-supplied`, preserve the original endpoints and do not silently
+  substitute the new merge base. Only the caller's explicit provision or
+  confirmation of the exact current `pr_merge_base..head_ref_oid` pair creates
+  an immutable successor in the same `caller-supplied` lineage, permits the
+  parent to advance the active-record binding, and authorizes that local
+  PR-wide rerun. Until then, the old range may remain standalone review
+  evidence, but PR readiness is blocked. Never append or activate a
+  `pr-derived` successor to bypass this confirmation.
+- For missing, unknown, malformed, or mismatched origin, report
+  `blocked-input` / `range-origin-unverified`. Do not guess provenance from the
+  current PR fields or from an old review artifact.
+
+This gate controls only local PR-wide range selection. A separately trustworthy
+GitHub Codex result may remain valid as latest-head-only evidence, but it never
+makes the PR ready while the local provenance gate or new-base lanes are
+blocked.
+
 ## Lifecycle Gate
 
 At every required snapshot, require:
@@ -109,20 +182,21 @@ GitHub Codex provider verdict; it blocks at the all-conversations gate.
 
 ## Branch Freshness Is Not Linear History
 
-GitHub names the strict freshness option **Require branches to be up to date
-before merging**. It is distinct from **Require linear history**. A readiness
-probe may identify the first through REST `required_status_checks.strict`,
-GraphQL branch protection `requiresStrictStatusChecks`, or ruleset input
+GitHub names the strict freshness option
+**Require branches to be up to date before merging**. It is distinct from
+**Require linear history**. A readiness probe may identify the first through
+REST `required_status_checks.strict`, GraphQL branch protection
+`requiresStrictStatusChecks`, or ruleset input
 `strictRequiredStatusChecksPolicy`; GraphQL `requiresLinearHistory` describes
 the separate linear-history rule. Never infer a rebase requirement from the
 freshness setting.
 
 When a merge queue owns freshness, follow the queue's merge-group and check
-semantics instead of updating the feature branch unnecessarily. Otherwise, if
-strict freshness blocks the authorized PR workflow, merge the current base
-branch into the feature branch with a signed merge commit. Do not rebase,
-force-push, or rewrite the branch into linear history merely to satisfy
-freshness.
+semantics instead of updating the feature branch unnecessarily. When no merge
+queue owns freshness and strict freshness blocks the authorized PR workflow,
+merge the current base branch into the feature branch with a signed merge
+commit. Do not rebase, force-push, or rewrite the branch into linear history
+merely to satisfy freshness.
 
 That merge creates a new head. Re-read the PR, require one unique merge base,
 freeze the resulting `merge_base..new_head`, and rerun the complete pre-merge
@@ -164,7 +238,8 @@ Re-read PR scope after every push, base retarget, or merge-queue transition.
 Because the GitHub provider contract proves the head rather than the base, a
 merge-base-only change does not by itself invalidate a trustworthy current-head
 terminal clean or reaction fallback. Revalidate unresolved provider findings
-and current head, rerun the local whole-PR lanes for the new merge base, and
+and current head, pass the `range_origin` provenance gate above, rerun the local
+whole-PR lanes for the authorized new merge base, and
 reconcile any base-sensitive merge/status check. Do not post another
 `@codex review` solely because the base changed unless a future provider
 contract explicitly binds base input.
@@ -202,6 +277,9 @@ following without reusing stale summaries:
 - exact PR lifecycle and draft state;
 - `baseRefOid`, `headRefOid`, intended head ownership/branch, and unique local
   merge base;
+- the parent-owned immutable `range_origin` lineage, its complete predecessor
+  chain, and its current active-record binding for every local range counted as
+  PR-wide evidence;
 - local review artifacts and validations bound to the resulting range;
 - the complete GitHub Codex decision inputs and unresolved provider findings;
 - required check rollup, related merge/status evidence, mergeability, and
@@ -227,6 +305,14 @@ pr_readiness:
   base_ref_oid: 40-lowercase-hex
   head_ref_oid: 40-lowercase-hex
   merge_base: 40-lowercase-hex
+  range_origin:
+    lineage_id: stable-parent-generated-lineage-id
+    kind: caller-supplied | pr-derived
+    active_record_id: stable-parent-generated-record-id
+    record_id: same-as-active-record-id
+    predecessor_record_id: null | previous-active-record-id
+    base_sha: record-full-object-id
+    head_sha: record-full-object-id
   local_review_shape: single | double | triple | skill-repo-codex-gate
   local_reviews: pass | blocked | pending
   github_codex_lane: pass | findings | pending | inconclusive | not-applicable

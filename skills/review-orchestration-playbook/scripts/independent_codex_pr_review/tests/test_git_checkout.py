@@ -82,6 +82,7 @@ from review_supervisor.secureio import (
 )
 
 from tests.support import (
+    LEGACY_SUPERVISOR_HARNESS,
     bind_attempt_state,
     build_helper_fixture,
     owned_temporary_directory,
@@ -2460,8 +2461,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                     with open_attempt_lease(lease, attempt) as attempt_lease:
                         state, _, digest = read_bound_attempt_state(attempt_lease)
                         state, _ = _cleanup_worktree(
-                            entrypoint=pathlib.Path(__file__).resolve().parent.parent
-                            / "independent-codex-pr-review",
+                            entrypoint=LEGACY_SUPERVISOR_HARNESS,
                             attempt=attempt_lease,
                             state=state,
                             state_digest=digest,
@@ -2494,10 +2494,7 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
+            entrypoint = LEGACY_SUPERVISOR_HARNESS
             completed = _run_fixture_process(
                 (
                     sys.executable,
@@ -2556,10 +2553,7 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
+            entrypoint = LEGACY_SUPERVISOR_HARNESS
             completed = _run_fixture_process(
                 (
                     sys.executable,
@@ -2614,10 +2608,7 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
+            entrypoint = LEGACY_SUPERVISOR_HARNESS
             completed = _run_fixture_process(
                 (
                     sys.executable,

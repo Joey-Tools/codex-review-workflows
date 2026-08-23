@@ -263,6 +263,147 @@ class RepositoryContractTest(unittest.TestCase):
             skill_raw.index("## Run Local Lanes"),
         )
 
+    def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
+        skill = _read("SKILL.md")
+        readiness = _read("references/pr-readiness.md")
+        authority = _read("references/github-codex-evidence-authority.md")
+        probes = _read("references/github-pr-probes.md")
+        normalized_skill = _normalize(skill)
+        normalized_readiness = _normalize(readiness)
+        freeze_contract = readiness.split("## Freeze The Whole-PR Range", 1)[1].split(
+            "## Lifecycle Gate", 1
+        )[0]
+        report_contract = readiness.split("## Merge-Ready Report", 1)[1]
+        normalized_freeze = _normalize(freeze_contract)
+
+        for document in (normalized_skill, normalized_readiness):
+            self.assertIn("parent-owned immutable `range_origin`", document)
+            self.assertIn("`caller-supplied`", document)
+            self.assertIn("`pr-derived`", document)
+            self.assertIn("`lineage_id`", document)
+            self.assertIn("`active_record_id`", document)
+
+        for schema_field in (
+            "range_origin:",
+            "lineage_id: stable-parent-generated-lineage-id",
+            "kind: caller-supplied | pr-derived",
+            "active_record_id: stable-parent-generated-record-id",
+            "record_id: same-as-active-record-id",
+            "predecessor_record_id: null | previous-active-record-id",
+            "base_sha: record-full-object-id",
+            "head_sha: record-full-object-id",
+        ):
+            self.assertIn(schema_field, freeze_contract)
+            self.assertIn(schema_field, report_contract)
+
+        for lineage_anchor in (
+            "the first record fixes both for the lifetime of this selected-pr/head lineage",
+            "the first record has `predecessor_record_id: null`",
+            "every successor must reuse the fixed `lineage_id` and `kind`",
+            "name the exact previously active record in `predecessor_record_id`",
+            "appending a record never activates it",
+            "do not start or substitute a second lineage",
+            "a `caller-supplied` lineage can never acquire or activate a `pr-derived` record",
+            "only the unique record named by the current `(lineage_id, active_record_id)` binding may count as pr-wide evidence",
+            "its endpoints must equal the exact `base_sha..head_sha` used by every counted local lane",
+        ):
+            self.assertIn(lineage_anchor, normalized_freeze)
+
+        self.assertIn(
+            _normalize(
+                "For `pr-derived`, the parent may automatically derive the exact new "
+                "`pr_merge_base..head_ref_oid` pair"
+            ),
+            normalized_freeze,
+        )
+        self.assertIn(
+            _normalize(
+                "For `caller-supplied`, preserve the original endpoints and do not "
+                "silently substitute the new merge base"
+            ),
+            normalized_freeze,
+        )
+        self.assertIn(
+            _normalize(
+                "Only the caller's explicit provision or confirmation of the exact "
+                "current `pr_merge_base..head_ref_oid` pair creates an immutable "
+                "successor in the same `caller-supplied` lineage"
+            ),
+            normalized_freeze,
+        )
+        self.assertIn(
+            "never append or activate a `pr-derived` successor to bypass this confirmation",
+            normalized_freeze,
+        )
+        self.assertIn("range-origin-unverified", freeze_contract)
+        self.assertIn("a stale or mismatched active record", normalized_freeze)
+        self.assertIn("a replacement lineage", normalized_freeze)
+        self.assertIn("a kind switch", normalized_freeze)
+        self.assertIn(
+            "stop before starting or counting a local pr-wide lane",
+            normalized_freeze,
+        )
+        self.assertIn(
+            "GitHub Codex result may remain valid as latest-head-only evidence",
+            readiness,
+        )
+        self.assertIn(
+            "provenance gate in [pr-readiness.md](pr-readiness.md)", authority
+        )
+        self.assertIn(
+            "neither selects nor rewrites a local range",
+            _normalize(authority),
+        )
+        self.assertIn("This probe layer never selects or rewrites that range", probes)
+
+    def test_q44_strict_freshness_requires_signed_merge_and_full_rerun(
+        self,
+    ) -> None:
+        skill = _read("SKILL.md")
+        readiness = _read("references/pr-readiness.md")
+        normalized_skill = _normalize(skill)
+        freshness_contract = readiness.split(
+            "## Branch Freshness Is Not Linear History", 1
+        )[1].split("### Head-Only Provider Responsibility Boundary", 1)[0]
+        normalized_freshness = _normalize(freshness_contract)
+
+        for exact_github_name in (
+            "Require branches to be up to date before merging",
+            "Require linear history",
+        ):
+            self.assertIn(exact_github_name, skill)
+            self.assertIn(exact_github_name, freshness_contract)
+
+        self.assertIn(
+            "when a merge queue owns freshness, follow the queue's merge-group and check semantics",
+            normalized_freshness,
+        )
+        self.assertIn(
+            "when no merge queue owns freshness and strict freshness blocks the authorized pr workflow, merge the current base branch into the feature branch with a signed merge commit",
+            normalized_freshness,
+        )
+        self.assertIn("do not rebase", normalized_freshness)
+        self.assertIn("that merge creates a new head", normalized_freshness)
+        self.assertIn(
+            "freeze the resulting `merge_base..new_head`", normalized_freshness
+        )
+        self.assertIn("invalidates all old-head evidence", normalized_skill)
+        self.assertIn(
+            "no clean evidence bound to the old head is reusable",
+            normalized_freshness,
+        )
+
+        for rerun_gate in (
+            "local validation and tests",
+            "every required local review lane",
+            "the github codex lane",
+            "ci and status checks",
+            "all conversations",
+            "lifecycle/base/head and merge-policy checks",
+            "the final stable reread",
+        ):
+            self.assertIn(rerun_gate, normalized_freshness)
+
     def test_secret_admission_never_redacts_or_blocks_reviewer_input(self) -> None:
         consent = _normalize(_read("references/egress-consent.md"))
         contracts = _normalize(_read("references/review-lane-contracts.md"))
@@ -298,6 +439,88 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, instructions)
         self.assertIn("do not orchestrate another named review", instructions.lower())
+
+    def test_codex_peer_adapters_share_sanitized_git_prefix_contract(self) -> None:
+        contracts = _read("references/review-lane-contracts.md")
+        prompts = _read("references/review-prompt-templates.md")
+        local = _read("references/local-codex-lane.md")
+        workspace = _read("references/review-workspace.md")
+        with (POLICY_SCOPE_ROOT / "agents/reviewer.toml").open("rb") as handle:
+            role = tomllib.load(handle)["developer_instructions"]
+
+        for document in (contracts, prompts, local, workspace, role):
+            self.assertIn("sanitized_git_argv_prefix", document)
+
+        for fixed_token in (
+            "/usr/bin/env",
+            "-i",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_GRAFT_FILE=/dev/null",
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_TERMINAL_PROMPT=0",
+            "--no-pager",
+            "--no-lazy-fetch",
+            "-c core.commitGraph=false",
+            "-c core.fsmonitor=false",
+            "-c core.hooksPath=/dev/null",
+            "-c core.attributesFile=/dev/null",
+            "-c diff.external=",
+            "-C <absolute-clean-workspace>",
+        ):
+            self.assertIn(fixed_token, contracts)
+
+        for metadata_field in (
+            "prefix_profile: <sanitized-git-argv-prefix-v1 | not-applicable>",
+            "sanitized_git_argv_prefix:",
+            "sanitized_git_argv_prefix_sha256:",
+            "git_executable:",
+            "git_version:",
+            "git_prefix_delivery:",
+            "git_read_only_boundary:",
+            "git_prefix_observation:",
+        ):
+            self.assertIn(metadata_field, prompts)
+
+        subagent = local.split("### Subagent adapter", 1)[1].split(
+            "### CLI adapter", 1
+        )[0]
+        cli = local.split("### CLI adapter", 1)[1].split("## Reviewer Profile", 1)[0]
+        for adapter_contract in (subagent, cli):
+            self.assertIn("sanitized_git_argv_prefix", adapter_contract)
+            self.assertIn("exact", adapter_contract.lower())
+            self.assertIn("unobservable", adapter_contract.lower())
+
+        normalized_contracts = _normalize(contracts)
+        normalized_prompts = _normalize(prompts)
+        normalized_local = _normalize(local)
+        normalized_role = _normalize(role)
+        for normalized in (
+            normalized_contracts,
+            normalized_prompts,
+            normalized_local,
+            normalized_role,
+        ):
+            self.assertIn("bare", normalized)
+            self.assertIn("alternate git", normalized)
+            self.assertIn("`-c`", normalized)
+            self.assertIn("`--git-dir`", normalized)
+            self.assertIn("`--no-ext-diff`", normalized)
+            self.assertIn("`--no-textconv`", normalized)
+            self.assertIn("inconclusive", normalized)
+            self.assertIn("unobservable", normalized)
+
+        self.assertIn("lane receipt records the prefix profile and digest", contracts)
+        self.assertIn("prompt and tool-observation boundary", contracts)
+        self.assertIn("not by itself a lane failure", normalized_contracts)
+        self.assertIn("not by itself prevent a clean result", normalized_prompts)
+        self.assertIn("telemetry limitation is not itself a deviation", role)
+        self.assertIn(
+            "not an operating-system enforcement claim", _normalize(workspace)
+        )
 
     def test_codex_profile_discovery_and_fallback_are_bounded(self) -> None:
         local = _read("references/local-codex-lane.md")
@@ -475,13 +698,9 @@ class RepositoryContractTest(unittest.TestCase):
             "scope, lifecycle, raw pages, and selected evidence remain stable on the final reread",
         ):
             self.assertIn(required_condition, normalized)
+        self.assertIn("a hashless issue comment is not a terminal carrier", normalized)
         self.assertIn(
-            _normalize(
-                "select the unique latest exact `@codex review` request, prove the same "
-                "head immediately before and after that request and at artifact/final reread, "
-                "require the artifact's server time to follow the request, and require no "
-                "newer request in the complete snapshot"
-            ),
+            "`stable-request-epoch` is reserved for the reaction-only fallback",
             normalized,
         )
         self.assertIn(

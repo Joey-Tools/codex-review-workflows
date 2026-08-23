@@ -108,11 +108,102 @@ Every local reviewer receives:
 - read-only and external-action prohibitions;
 - findings-only output contract.
 
+Every local Codex reviewer also receives the parent-owned
+`sanitized_git_argv_prefix` exact token sequence plus its identity metadata as
+defined below. The prefix is opaque to the reviewer: it is copied, not rebuilt
+from prose.
+
 The reviewer must obtain stats, changed paths, hunks, and necessary nearby tracked context itself with bounded commands. Do not inject the full diff, parent conclusions, or another lane's findings.
 
 For a process adapter, the parent serializes this metadata and the substantive prompt into exact UTF-8 bytes, delivers those bytes through a capability-proven initial-prompt channel, and records their byte length and SHA-256 digest. A runtime's default review prompt or range selector never substitutes for this control prompt. If the parent cannot prove that the selected entrypoint accepts both the complete prompt and the frozen range, use another verified entrypoint or classify the launch as inconclusive.
 
 Use [review-prompt-templates.md](review-prompt-templates.md) to construct the prompt.
+
+### Parent-Owned Reviewer Git Prefix
+
+After the final successful workspace validation, the parent materializes one
+ordered `sanitized_git_argv_prefix` for that exact Codex lane. It binds:
+
+- the fixed absolute Git executable and the exact accepted `git --version`
+  result used for the lane;
+- the canonical validated workspace and its validation-receipt identity;
+- the closed environment-key allowlist and fixed safe Git options below; and
+- `sanitized_git_argv_prefix_sha256`, the lowercase SHA-256 of the exact UTF-8
+  JSON token-array bytes placed in the control metadata.
+
+The ordered token profile is `sanitized-git-argv-prefix-v1`:
+
+```text
+/usr/bin/env
+-i
+PATH=<parent-recorded-trusted-path>
+LANG=<parent-fixed-locale>
+LC_ALL=<parent-fixed-locale>
+GIT_ASKPASS=/usr/bin/false
+GIT_ATTR_NOSYSTEM=1
+GIT_CEILING_DIRECTORIES=<absolute-clean-workspace-parent>
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_SYSTEM=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+GIT_GRAFT_FILE=/dev/null
+GIT_NO_LAZY_FETCH=1
+GIT_NO_REPLACE_OBJECTS=1
+GIT_OPTIONAL_LOCKS=0
+GIT_TERMINAL_PROMPT=0
+PAGER=cat
+GIT_PAGER=cat
+<fixed-absolute-git-executable>
+--no-pager
+--no-lazy-fetch
+-c core.commitGraph=false
+-c core.checkStat=default
+-c core.multiPackIndex=false
+-c core.fsmonitor=false
+-c core.fileMode=true
+-c core.ignoreStat=false
+-c core.trustCtime=true
+-c core.hooksPath=/dev/null
+-c core.attributesFile=/dev/null
+-c diff.external=
+-c color.ui=false
+-C <absolute-clean-workspace>
+```
+
+Each displayed `-c name=value` line represents two argv tokens. All other lines
+represent one token. The parent chooses the recorded path, locale, executable,
+and workspace values once; the reviewer may not substitute values, reorder
+tokens, add environment assignments or `-c` overrides, or reconstruct a
+semantically similar command.
+
+For every Git invocation, both the subagent and CLI adapters require the
+reviewer to copy this prefix token-for-token and append only the read-only Git
+subcommand and its arguments. Bare `git`, an alternate Git executable or
+wrapper, an additional `-C`, a global `--git-dir` / `--work-tree` selector, and
+a different workspace are forbidden. Every diff-producing subcommand also
+appends both `--no-ext-diff` and `--no-textconv`.
+
+The lane receipt records the prefix profile and digest, fixed Git path/version,
+workspace validation-receipt identity, verified prompt delivery, the established
+read-only adapter boundary, and the strongest Git-argv observation the adapter
+actually exposes: `complete`, `partial`, or `unobservable`. Record every observed
+deviation separately.
+
+Missing or altered prefix metadata, unproved prompt delivery, inability to
+launch under the required read-only adapter boundary, or any observed deviation
+makes the Codex lane `inconclusive`, never clean. `partial` or `unobservable`
+argv evidence is a recorded limitation, not evidence of deviation and not by
+itself a lane failure. When the prefix/digest was delivered intact, the required
+adapter boundary was established, and available evidence contains no deviation,
+the lane may still complete; report the observation limitation without claiming
+argv-level enforcement.
+
+This is a prompt and tool-observation boundary, not an operating-system
+enforcement claim. `/usr/bin/env -i` sanitizes only a process actually launched
+with the supplied argv. A prompt, prefix digest, or tool transcript does not by
+itself prove that the model could not invoke another executable; the parent may
+claim only the boundary and argv visibility that the adapter runtime actually
+attests, and must not reinterpret `unobservable` as either compliance proof or
+deviation.
 
 ## Local Codex Contract
 

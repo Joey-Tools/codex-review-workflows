@@ -83,6 +83,7 @@ OBJECT_STORE_LOGICAL_BYTES_LIMIT = 32 * 1024 * 1024 * 1024
 OBJECT_STORE_PHYSICAL_BYTES_LIMIT = 32 * 1024 * 1024 * 1024
 OBJECT_STORE_PATH_BYTES_LIMIT = 256 * 1024 * 1024
 WORKSPACE_PREPARATION_DEADLINE_SECONDS = 900.0
+PARENT_SUPPORT_VALIDATION_DEADLINE_SECONDS = 900.0
 OBJECT_STORE_FREE_SPACE_HEADROOM_BYTES = 512 * 1024 * 1024
 CONTROL_FILE_SIZE_LIMIT = 256 * 1024 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -1056,6 +1057,7 @@ def _run_git_raw(
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
     timeout_seconds: float = GIT_TIMEOUT_SECONDS,
     absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
     control_binding: _WorkspaceControlBinding | None = None,
     extra_environment: Mapping[str, str] | None = None,
     partial_recovery_control: _PartialRecoveryControl | None = None,
@@ -1113,6 +1115,7 @@ def _run_git_raw(
 
     primary_error: BaseException | None = None
     revalidation_error: BaseException | None = None
+    absolute_deadline_controls_timeout = False
     try:
         environment = _git_environment()
         environment["GIT_CEILING_DIRECTORIES"] = str(root.parent)
@@ -1124,39 +1127,48 @@ def _run_git_raw(
         if absolute_deadline is not None:
             remaining = absolute_deadline - time.monotonic()
             if remaining <= 0:
-                _check_object_store_deadline(absolute_deadline)
+                (deadline_checker or _check_object_store_deadline)(absolute_deadline)
+            absolute_deadline_controls_timeout = remaining <= timeout_seconds
             timeout_seconds = min(timeout_seconds, remaining)
-        capture = run_bounded_capture(
-            _git_argv(root, arguments),
-            env=environment,
-            stdin=None if stdin is None else bytearray(stdin),
-            timeout_seconds=timeout_seconds,
-            stdout_limit_bytes=output_limit_bytes,
-            stderr_limit_bytes=1024 * 1024,
-            prepare_process_spawned=(
-                _bind_recovery_process if partial_recovery_control is not None else None
-            ),
-            on_process_spawned=(
-                publish_process_binding
-                if partial_recovery_control is not None
-                else None
-            ),
-            on_process_starting=(
-                process_start.publish_starting
-                if partial_recovery_control is not None
-                else None
-            ),
-            on_process_started=(
-                process_start.publish_started
-                if partial_recovery_control is not None
-                else None
-            ),
-            on_process_quiescent=(
-                publish_process_quiescent
-                if partial_recovery_control is not None
-                else None
-            ),
-        )
+        try:
+            capture = run_bounded_capture(
+                _git_argv(root, arguments),
+                env=environment,
+                stdin=None if stdin is None else bytearray(stdin),
+                timeout_seconds=timeout_seconds,
+                stdout_limit_bytes=output_limit_bytes,
+                stderr_limit_bytes=1024 * 1024,
+                prepare_process_spawned=(
+                    _bind_recovery_process
+                    if partial_recovery_control is not None
+                    else None
+                ),
+                on_process_spawned=(
+                    publish_process_binding
+                    if partial_recovery_control is not None
+                    else None
+                ),
+                on_process_starting=(
+                    process_start.publish_starting
+                    if partial_recovery_control is not None
+                    else None
+                ),
+                on_process_started=(
+                    process_start.publish_started
+                    if partial_recovery_control is not None
+                    else None
+                ),
+                on_process_quiescent=(
+                    publish_process_quiescent
+                    if partial_recovery_control is not None
+                    else None
+                ),
+            )
+        except ReviewTimeoutError:
+            if absolute_deadline_controls_timeout:
+                assert absolute_deadline is not None
+                (deadline_checker or _check_object_store_deadline)(absolute_deadline)
+            raise
         try:
             return capture.returncode, bytes(capture.stdout), bytes(capture.stderr)
         finally:
@@ -1213,6 +1225,7 @@ def _run_git(
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
     timeout_seconds: float = GIT_TIMEOUT_SECONDS,
     absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
     control_binding: _WorkspaceControlBinding | None = None,
     extra_environment: Mapping[str, str] | None = None,
     partial_recovery_control: _PartialRecoveryControl | None = None,
@@ -1225,6 +1238,7 @@ def _run_git(
         output_limit_bytes=output_limit_bytes,
         timeout_seconds=timeout_seconds,
         absolute_deadline=absolute_deadline,
+        deadline_checker=deadline_checker,
         control_binding=control_binding,
         extra_environment=extra_environment,
         partial_recovery_control=partial_recovery_control,
@@ -1282,6 +1296,24 @@ def _check_object_store_deadline(deadline: float) -> None:
                 "metric": "elapsed seconds",
                 "observed": observed_seconds,
                 "limit": WORKSPACE_PREPARATION_DEADLINE_SECONDS,
+            },
+        )
+
+
+def _check_parent_support_validation_deadline(deadline: float) -> None:
+    observed_at = time.monotonic()
+    if observed_at >= deadline:
+        observed_seconds = max(
+            0.0,
+            PARENT_SUPPORT_VALIDATION_DEADLINE_SECONDS + observed_at - deadline,
+        )
+        raise ReviewWorkspaceError(
+            "workspace-parent-support-validation-deadline",
+            "workspace parent-support validation exceeded its monotonic deadline",
+            details={
+                "metric": "elapsed seconds",
+                "observed": observed_seconds,
+                "limit": PARENT_SUPPORT_VALIDATION_DEADLINE_SECONDS,
             },
         )
 
@@ -1700,6 +1732,7 @@ def _read_raw_commit_graph(
     head: str,
     *,
     deadline: float | None,
+    deadline_checker: Callable[[float], None] | None = None,
     control_binding: _WorkspaceControlBinding | None = None,
     workspace: bool,
 ) -> _RawCommitGraphProbe:
@@ -1712,6 +1745,7 @@ def _read_raw_commit_graph(
             + 1024
         ),
         absolute_deadline=deadline,
+        deadline_checker=deadline_checker,
         control_binding=control_binding,
         extra_environment={"GIT_SHALLOW_FILE": os.devnull},
     )
@@ -1725,7 +1759,7 @@ def _read_raw_commit_graph(
     parent_edge_count = 0
     for line_number, raw_line in enumerate(output.splitlines()):
         if deadline is not None and line_number % 4096 == 0:
-            _check_object_store_deadline(deadline)
+            (deadline_checker or _check_object_store_deadline)(deadline)
         if raw_line.startswith(b"?"):
             missing.add(
                 _decode_reported_missing_oid(
@@ -1784,7 +1818,7 @@ def _read_raw_commit_graph(
                 "raw parent graph exceeds the 1,000,000-parent-edge limit",
             )
     if deadline is not None:
-        _check_object_store_deadline(deadline)
+        (deadline_checker or _check_object_store_deadline)(deadline)
     if set(parents).intersection(missing):
         raise ReviewWorkspaceError(
             invalid_reason,
@@ -5469,9 +5503,40 @@ def _verify_range_object_contents(
     object_format: str,
     object_ids: Sequence[str],
     control_binding: _WorkspaceControlBinding,
+    *,
+    absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
 ) -> None:
-    query = b"".join(f"{oid}\n".encode("ascii") for oid in object_ids)
-    deadline = time.monotonic() + OBJECT_INTEGRITY_TIMEOUT_SECONDS
+    started_at = time.monotonic()
+    integrity_deadline = started_at + OBJECT_INTEGRITY_TIMEOUT_SECONDS
+    deadline = (
+        min(integrity_deadline, absolute_deadline)
+        if absolute_deadline is not None
+        else integrity_deadline
+    )
+    validation_deadline_controls = (
+        absolute_deadline is not None and absolute_deadline <= integrity_deadline
+    )
+
+    def check_deadline() -> None:
+        if time.monotonic() < deadline:
+            return
+        if validation_deadline_controls and deadline_checker is not None:
+            assert absolute_deadline is not None
+            deadline_checker(absolute_deadline)
+        raise ReviewWorkspaceError(
+            "workspace-range-object-integrity-deadline",
+            "workspace object-content verification exceeded its monotonic deadline",
+            details={"deadline_seconds": OBJECT_INTEGRITY_TIMEOUT_SECONDS},
+        )
+
+    query_parts: list[bytes] = []
+    for index, oid in enumerate(object_ids):
+        if index % 4096 == 0:
+            check_deadline()
+        query_parts.append(f"{oid}\n".encode("ascii"))
+    query = b"".join(query_parts)
+    check_deadline()
     stderr_limit = 1024 * 1024
     header_limit = 256
     maximum_output = RANGE_OBJECT_LOGICAL_BYTES_LIMIT + len(object_ids) * (
@@ -5519,6 +5584,7 @@ def _verify_range_object_contents(
     def consume_stdout(payload: bytes) -> None:
         nonlocal logical_bytes, need_separator, output_bytes
         nonlocal remaining_content, current_hasher
+        check_deadline()
         output_bytes += len(payload)
         if output_bytes > maximum_output:
             fail(
@@ -5605,6 +5671,7 @@ def _verify_range_object_contents(
             remaining_content = size
             if remaining_content == 0:
                 need_separator = True
+        check_deadline()
 
     try:
         process_environment = _git_environment()
@@ -5616,6 +5683,7 @@ def _verify_range_object_contents(
             }
         )
         process_command = _git_argv(root, ("cat-file", "--batch"))
+        check_deadline()
 
         def spawn_process() -> subprocess.Popen[bytes]:
             return subprocess.Popen(
@@ -5652,11 +5720,7 @@ def _verify_range_object_contents(
         while True:
             remaining_time = deadline - time.monotonic()
             if remaining_time <= 0:
-                fail(
-                    "workspace-range-object-integrity-deadline",
-                    "workspace object-content verification exceeded its monotonic deadline",
-                    deadline_seconds=OBJECT_INTEGRITY_TIMEOUT_SECONDS,
-                )
+                check_deadline()
             if process.poll() is not None and stdout_eof and stderr_eof:
                 break
             events = selector.select(min(0.25, remaining_time))
@@ -5700,6 +5764,7 @@ def _verify_range_object_contents(
                                 limit=stderr_limit,
                             )
         returncode = process.wait(timeout=5)
+        check_deadline()
         if (
             returncode != 0
             or input_offset != len(query)
@@ -6083,6 +6148,8 @@ def _validate_parent_support_manifest(
     shallow_bytes: str,
     control_binding: _WorkspaceControlBinding,
 ) -> None:
+    deadline = time.monotonic() + PARENT_SUPPORT_VALIDATION_DEADLINE_SECONDS
+    _check_parent_support_validation_deadline(deadline)
     try:
         payload = control_binding.payload((".git", PARENT_SUPPORT_OBJECT_MANIFEST))
     except ReviewWorkspaceError as error:
@@ -6105,28 +6172,43 @@ def _validate_parent_support_manifest(
             "workspace-parent-support-manifest-drift",
             "workspace parent-support manifest changed",
         )
-    try:
-        support_ids = tuple(line.decode("ascii") for line in payload.splitlines())
-    except UnicodeDecodeError as error:
-        raise ReviewWorkspaceError(
-            "workspace-parent-support-manifest-invalid",
-            "workspace parent-support manifest is not ASCII",
-        ) from error
+    support_id_list: list[str] = []
+    for line_number, line in enumerate(payload.splitlines()):
+        if line_number % 4096 == 0:
+            _check_parent_support_validation_deadline(deadline)
+        try:
+            support_id_list.append(line.decode("ascii"))
+        except UnicodeDecodeError as error:
+            raise ReviewWorkspaceError(
+                "workspace-parent-support-manifest-invalid",
+                "workspace parent-support manifest is not ASCII",
+            ) from error
+    support_ids = tuple(support_id_list)
+    _check_parent_support_validation_deadline(deadline)
     expected_length = 40 if object_format == "sha1" else 64
+    range_object_set = set(range_object_ids)
+    range_commit_set = set(range_commits)
+    support_id_set = set(support_ids)
+    _check_parent_support_validation_deadline(deadline)
+    malformed_support_id = False
+    for support_index, oid in enumerate(support_ids):
+        if support_index % 4096 == 0:
+            _check_parent_support_validation_deadline(deadline)
+        if len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid):
+            malformed_support_id = True
+            break
     if (
         len(support_ids) != expected_count
-        or tuple(sorted(set(support_ids))) != support_ids
-        or any(
-            len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid)
-            for oid in support_ids
-        )
-        or set(support_ids).intersection(range_object_ids)
+        or tuple(sorted(support_id_set)) != support_ids
+        or malformed_support_id
+        or not support_id_set.isdisjoint(range_object_set)
     ):
         raise ReviewWorkspaceError(
             "workspace-parent-support-manifest-invalid",
             "workspace parent-support manifest entries are malformed or overlap range",
         )
-    all_object_ids = tuple(sorted(set(range_object_ids).union(support_ids)))
+    all_object_ids = tuple(sorted(range_object_set.union(support_id_set)))
+    _check_parent_support_validation_deadline(deadline)
     if len(all_object_ids) > RANGE_OBJECT_COUNT_LIMIT:
         raise ReviewWorkspaceError(
             "workspace-range-object-limit",
@@ -6135,12 +6217,15 @@ def _validate_parent_support_manifest(
 
     support_commit_ids: set[str] = set()
     for offset in range(0, len(support_ids), 4_096):
+        _check_parent_support_validation_deadline(deadline)
         batch = support_ids[offset : offset + 4_096]
         output = _run_git(
             root,
             ("cat-file", "--batch-check=%(objectname) %(objecttype)"),
             stdin=b"".join(f"{oid}\n".encode("ascii") for oid in batch),
             reason="workspace-parent-support-object-missing",
+            absolute_deadline=deadline,
+            deadline_checker=_check_parent_support_validation_deadline,
             control_binding=control_binding,
         )
         rows = output.splitlines()
@@ -6162,14 +6247,17 @@ def _validate_parent_support_manifest(
                 )
             if fields[1] == b"commit":
                 support_commit_ids.add(expected_oid)
+    _check_parent_support_validation_deadline(deadline)
 
     probe = _read_raw_commit_graph(
         root,
         head,
-        deadline=None,
+        deadline=deadline,
+        deadline_checker=_check_parent_support_validation_deadline,
         control_binding=control_binding,
         workspace=True,
     )
+    _check_parent_support_validation_deadline(deadline)
     if probe.returncode != 0:
         raise ReviewWorkspaceError(
             "workspace-parent-support-graph-check-failed",
@@ -6179,8 +6267,9 @@ def _validate_parent_support_manifest(
                 "stderr_preview": probe.stderr_preview,
             },
         )
-    expected_graph_commits = set(range_commits).union(support_commit_ids, {base})
-    if set(probe.parents) != expected_graph_commits:
+    expected_graph_commits = range_commit_set.union(support_commit_ids, {base})
+    _check_parent_support_validation_deadline(deadline)
+    if probe.parents.keys() != expected_graph_commits:
         raise ReviewWorkspaceError(
             "workspace-parent-support-graph-mismatch",
             "workspace imported commit graph differs from its bound manifests",
@@ -6202,44 +6291,71 @@ def _validate_parent_support_manifest(
             "workspace-shallow-drift",
             "workspace shallow binding is not newline terminated",
         )
-    boundaries = tuple(line.decode("ascii") for line in encoded_shallow.splitlines())
+    boundary_list: list[str] = []
+    for line_number, line in enumerate(encoded_shallow.splitlines()):
+        if line_number % 4096 == 0:
+            _check_parent_support_validation_deadline(deadline)
+        boundary_list.append(line.decode("ascii"))
+    boundaries = tuple(boundary_list)
+    boundary_set = set(boundaries)
+    _check_parent_support_validation_deadline(deadline)
+    malformed_boundary = False
+    for boundary_index, oid in enumerate(boundaries):
+        if boundary_index % 4096 == 0:
+            _check_parent_support_validation_deadline(deadline)
+        if len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid):
+            malformed_boundary = True
+            break
     if (
-        tuple(sorted(set(boundaries))) != boundaries
-        or any(
-            len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid)
-            for oid in boundaries
-        )
-        or set(boundaries).intersection(range_commits)
+        tuple(sorted(boundary_set)) != boundaries
+        or malformed_boundary
+        or not boundary_set.isdisjoint(range_commit_set)
     ):
         raise ReviewWorkspaceError(
             "workspace-shallow-drift",
             "workspace shallow boundaries are malformed or cut a reviewed commit",
         )
     expected_boundaries: set[str] = set()
-    for commit_oid, parents in probe.parents.items():
-        missing_parents = [parent for parent in parents if parent in probe.missing]
-        if not missing_parents:
+    frontier_parent_index = 0
+    for commit_index, (commit_oid, parents) in enumerate(probe.parents.items()):
+        if commit_index % 4096 == 0:
+            _check_parent_support_validation_deadline(deadline)
+        has_missing_parent = False
+        has_present_parent = False
+        for parent in parents:
+            if frontier_parent_index % 4096 == 0:
+                _check_parent_support_validation_deadline(deadline)
+            frontier_parent_index += 1
+            if parent in probe.missing:
+                has_missing_parent = True
+            elif parent in probe.parents:
+                has_present_parent = True
+        if not has_missing_parent:
             continue
-        present_parents = [parent for parent in parents if parent in probe.parents]
-        if commit_oid in range_commits or present_parents:
+        if commit_oid in range_commit_set or has_present_parent:
             raise ReviewWorkspaceError(
                 "workspace-shallow-frontier-unsafe",
                 "workspace missing-parent frontier would cut a reviewed or available edge",
                 details={"commit": commit_oid},
             )
         expected_boundaries.add(commit_oid)
-    if set(boundaries) != expected_boundaries:
+    _check_parent_support_validation_deadline(deadline)
+    if boundary_set != expected_boundaries:
         raise ReviewWorkspaceError(
             "workspace-shallow-drift",
             "workspace shallow boundaries differ from the real missing-parent frontier",
         )
 
-    direct_external_parents = {
-        parent
-        for commit_oid in range_commits
-        for parent in probe.parents[commit_oid]
-        if parent not in set(range_commits) and parent != base
-    }
+    direct_external_parents: set[str] = set()
+    parent_edge_index = 0
+    for commit_oid in range_commits:
+        for parent in probe.parents[commit_oid]:
+            if parent_edge_index % 4096 == 0:
+                _check_parent_support_validation_deadline(deadline)
+            parent_edge_index += 1
+            if parent not in range_commit_set and parent != base:
+                direct_external_parents.add(parent)
+    _check_parent_support_validation_deadline(deadline)
     parent_snapshot_ids: set[str] = set()
     if direct_external_parents:
         snapshot_command = (
@@ -6257,10 +6373,14 @@ def _validate_parent_support_manifest(
                 f"{oid}\n".encode("ascii") for oid in sorted(direct_external_parents)
             ),
             output_limit_bytes=RANGE_OBJECT_COUNT_LIMIT * 65 + 1024,
+            absolute_deadline=deadline,
+            deadline_checker=_check_parent_support_validation_deadline,
             control_binding=control_binding,
             extra_environment={"GIT_SHALLOW_FILE": os.devnull},
         )
-        for line in output.splitlines():
+        for line_number, line in enumerate(output.splitlines()):
+            if line_number % 4096 == 0:
+                _check_parent_support_validation_deadline(deadline)
             if line.startswith(b"?"):
                 raise ReviewWorkspaceError(
                     "workspace-parent-support-object-missing",
@@ -6279,6 +6399,7 @@ def _validate_parent_support_manifest(
                     "workspace direct-parent snapshot returned a malformed object ID",
                 )
             parent_snapshot_ids.add(oid)
+        _check_parent_support_validation_deadline(deadline)
         if returncode != 0:
             raise ReviewWorkspaceError(
                 "workspace-parent-support-object-check-failed",
@@ -6289,8 +6410,9 @@ def _validate_parent_support_manifest(
                 },
             )
     expected_support = support_commit_ids.union(parent_snapshot_ids)
-    expected_support.difference_update(range_object_ids)
-    if set(support_ids) != expected_support:
+    expected_support.difference_update(range_object_set)
+    _check_parent_support_validation_deadline(deadline)
+    if support_id_set != expected_support:
         raise ReviewWorkspaceError(
             "workspace-parent-support-manifest-mismatch",
             "workspace parent-support closure differs from its bound manifest",
@@ -6304,7 +6426,10 @@ def _validate_parent_support_manifest(
         object_format,
         all_object_ids,
         control_binding,
+        absolute_deadline=deadline,
+        deadline_checker=_check_parent_support_validation_deadline,
     )
+    _check_parent_support_validation_deadline(deadline)
 
 
 def _validate_fixed_state(
@@ -6690,14 +6815,60 @@ def _descriptor_bound_path(descriptor: int) -> pathlib.Path | None:
     return pathlib.Path(payload)
 
 
-def _clear_directory_descriptor(
+@dataclass
+class _CleanupDirectoryFrame:
+    descriptor: int
+    display_path: pathlib.Path
+    entries: list[os.DirEntry[str]]
+    retained_marker_path: tuple[str, ...] | None
+    preserve_retained_marker: bool
+    owns_descriptor: bool
+    parent_descriptor: int | None = None
+    parent_entry_name: str | None = None
+    bound_metadata: os.stat_result | None = None
+    remove_from_parent: bool = False
+    cursor: int = 0
+
+
+def _close_cleanup_descriptor(
+    descriptor: int,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        os.close(descriptor)
+    except BaseException as close_error:
+        if primary_error is None:
+            raise
+        _attach_workspace_diagnostic(
+            primary_error,
+            "workspace cleanup child descriptor close failed: "
+            f"{type(close_error).__name__}",
+        )
+
+
+def _close_cleanup_frame(
+    frame: _CleanupDirectoryFrame,
+    primary_error: BaseException | None,
+) -> None:
+    if not frame.owns_descriptor:
+        return
+    frame.owns_descriptor = False
+    _close_cleanup_descriptor(frame.descriptor, primary_error)
+
+
+def _cleanup_directory_frame(
     descriptor: int,
     display_path: pathlib.Path,
     root_device: int,
     *,
-    retained_marker_path: tuple[str, ...] | None = None,
-    preserve_retained_marker: bool = False,
-) -> None:
+    retained_marker_path: tuple[str, ...] | None,
+    preserve_retained_marker: bool,
+    owns_descriptor: bool,
+    parent_descriptor: int | None = None,
+    parent_entry_name: str | None = None,
+    bound_metadata: os.stat_result | None = None,
+    remove_from_parent: bool = False,
+) -> _CleanupDirectoryFrame:
     current_metadata = os.fstat(descriptor)
     if current_metadata.st_dev != root_device:
         raise ReviewWorkspaceError(
@@ -6710,77 +6881,154 @@ def _clear_directory_descriptor(
     if retained_marker_path:
         retained_entry = retained_marker_path[0]
         entries.sort(key=lambda entry: entry.name == retained_entry)
-    for entry in entries:
-        entry_path = display_path / entry.name
-        retained_entry = bool(
-            retained_marker_path and entry.name == retained_marker_path[0]
+    return _CleanupDirectoryFrame(
+        descriptor=descriptor,
+        display_path=display_path,
+        entries=entries,
+        retained_marker_path=retained_marker_path,
+        preserve_retained_marker=preserve_retained_marker,
+        owns_descriptor=owns_descriptor,
+        parent_descriptor=parent_descriptor,
+        parent_entry_name=parent_entry_name,
+        bound_metadata=bound_metadata,
+        remove_from_parent=remove_from_parent,
+    )
+
+
+def _clear_directory_descriptor(
+    descriptor: int,
+    display_path: pathlib.Path,
+    root_device: int,
+    *,
+    retained_marker_path: tuple[str, ...] | None = None,
+    preserve_retained_marker: bool = False,
+) -> None:
+    frames = [
+        _cleanup_directory_frame(
+            descriptor,
+            display_path,
+            root_device,
+            retained_marker_path=retained_marker_path,
+            preserve_retained_marker=preserve_retained_marker,
+            owns_descriptor=False,
         )
-        try:
-            entry_metadata = entry.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(entry_metadata.st_mode):
-            if entry_metadata.st_dev != root_device or os.path.ismount(entry_path):
-                raise ReviewWorkspaceError(
-                    "workspace-cleanup-mount-boundary",
-                    "workspace cleanup refuses to descend into a mount boundary",
-                    details={"entry": str(entry_path)},
-                )
-            child_descriptor = os.open(
-                entry.name,
-                _nofollow_flags(directory=True),
-                dir_fd=descriptor,
+    ]
+    try:
+        while frames:
+            frame = frames[-1]
+            if frame.cursor >= len(frame.entries):
+                if not frame.owns_descriptor:
+                    frames.pop()
+                    continue
+                completion_error: BaseException | None = None
+                try:
+                    assert frame.parent_descriptor is not None
+                    assert frame.parent_entry_name is not None
+                    assert frame.bound_metadata is not None
+                    current_child = os.stat(
+                        frame.parent_entry_name,
+                        dir_fd=frame.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not os.path.samestat(frame.bound_metadata, current_child):
+                        raise ReviewWorkspaceError(
+                            "workspace-cleanup-entry-drift",
+                            "workspace directory entry changed during cleanup custody",
+                            details={"entry": str(frame.display_path)},
+                        )
+                    if frame.remove_from_parent:
+                        os.rmdir(
+                            frame.parent_entry_name,
+                            dir_fd=frame.parent_descriptor,
+                        )
+                except BaseException as error:
+                    completion_error = error
+                    raise
+                finally:
+                    _close_cleanup_frame(frame, completion_error)
+                    frames.pop()
+                continue
+
+            entry = frame.entries[frame.cursor]
+            frame.cursor += 1
+            entry_path = frame.display_path / entry.name
+            retained_entry = bool(
+                frame.retained_marker_path
+                and entry.name == frame.retained_marker_path[0]
             )
             try:
-                bound_child = os.fstat(child_descriptor)
-                if not os.path.samestat(entry_metadata, bound_child):
+                entry_metadata = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(entry_metadata.st_mode):
+                if entry_metadata.st_dev != root_device or os.path.ismount(entry_path):
                     raise ReviewWorkspaceError(
-                        "workspace-cleanup-entry-drift",
-                        "workspace directory entry changed before cleanup custody",
+                        "workspace-cleanup-mount-boundary",
+                        "workspace cleanup refuses to descend into a mount boundary",
                         details={"entry": str(entry_path)},
                     )
-                _clear_directory_descriptor(
-                    child_descriptor,
-                    entry_path,
-                    root_device,
-                    retained_marker_path=(
-                        retained_marker_path[1:]
-                        if retained_marker_path
-                        and entry.name == retained_marker_path[0]
-                        and len(retained_marker_path) > 1
+                child_descriptor: int | None = None
+                child_frame: _CleanupDirectoryFrame | None = None
+                try:
+                    child_descriptor = os.open(
+                        entry.name,
+                        _nofollow_flags(directory=True),
+                        dir_fd=frame.descriptor,
+                    )
+                    bound_child = os.fstat(child_descriptor)
+                    if not os.path.samestat(entry_metadata, bound_child):
+                        raise ReviewWorkspaceError(
+                            "workspace-cleanup-entry-drift",
+                            "workspace directory entry changed before cleanup custody",
+                            details={"entry": str(entry_path)},
+                        )
+                    child_retained_marker_path = (
+                        frame.retained_marker_path[1:]
+                        if frame.retained_marker_path
+                        and retained_entry
+                        and len(frame.retained_marker_path) > 1
                         else None
-                    ),
-                    preserve_retained_marker=(
-                        preserve_retained_marker and retained_entry
-                    ),
-                )
-                current_child = os.stat(
-                    entry.name,
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-                if not os.path.samestat(bound_child, current_child):
-                    raise ReviewWorkspaceError(
-                        "workspace-cleanup-entry-drift",
-                        "workspace directory entry changed during cleanup custody",
-                        details={"entry": str(entry_path)},
                     )
-                if not (preserve_retained_marker and retained_entry):
-                    os.rmdir(entry.name, dir_fd=descriptor)
-            finally:
-                os.close(child_descriptor)
-            continue
-        if (
-            preserve_retained_marker
-            and retained_entry
-            and retained_marker_path is not None
-            and len(retained_marker_path) == 1
-        ):
-            continue
-        try:
-            os.unlink(entry.name, dir_fd=descriptor)
-        except FileNotFoundError:
-            continue
+                    child_preserves_retained_marker = (
+                        frame.preserve_retained_marker and retained_entry
+                    )
+                    child_frame = _cleanup_directory_frame(
+                        child_descriptor,
+                        entry_path,
+                        root_device,
+                        retained_marker_path=child_retained_marker_path,
+                        preserve_retained_marker=child_preserves_retained_marker,
+                        owns_descriptor=True,
+                        parent_descriptor=frame.descriptor,
+                        parent_entry_name=entry.name,
+                        bound_metadata=bound_child,
+                        remove_from_parent=not child_preserves_retained_marker,
+                    )
+                    frames.append(child_frame)
+                except BaseException as child_error:
+                    if child_frame is not None:
+                        _close_cleanup_frame(child_frame, child_error)
+                        if frames and frames[-1] is child_frame:
+                            frames.pop()
+                    elif child_descriptor is not None:
+                        _close_cleanup_descriptor(child_descriptor, child_error)
+                    raise
+                continue
+            if (
+                frame.preserve_retained_marker
+                and retained_entry
+                and frame.retained_marker_path is not None
+                and len(frame.retained_marker_path) == 1
+            ):
+                continue
+            try:
+                os.unlink(entry.name, dir_fd=frame.descriptor)
+            except FileNotFoundError:
+                continue
+    except BaseException as primary_error:
+        for frame in reversed(frames):
+            _close_cleanup_frame(frame, primary_error)
+        raise
 
 
 def _read_descriptor_payload(descriptor: int, limit: int) -> bytes:

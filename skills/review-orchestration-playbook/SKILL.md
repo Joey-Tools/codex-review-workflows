@@ -24,6 +24,21 @@ The seven Joey-Tools skill repositories may route an unnamed PR-bound request to
 Freeze one committed `base_sha..head_sha` range for all local lanes. Resolve a PR selector separately.
 
 - A caller-supplied range stays authoritative. Do not silently replace it with a PR range.
+- At the first freeze, persist a parent-owned immutable `range_origin` lineage
+  header and first record. The header fixes a stable `lineage_id` and `kind`;
+  every record has a stable `record_id`, exact endpoints, and the parent binds
+  exactly one `active_record_id`. Missing or unknown origin blocks a local lane
+  that would count as PR-wide coverage.
+- A successor record must keep the same lineage and kind, name the previously
+  active record as its predecessor, and be created together with the parent's
+  active-record advancement as one parent-owned transition. Appending a record
+  alone never activates it; never replace a caller-supplied lineage with a
+  PR-derived lineage.
+- If the PR merge base changes while its head stays fixed, a `pr-derived` range
+  may be rederived automatically. Preserve a `caller-supplied` range until the
+  caller explicitly supplies or confirms the exact current endpoints; that
+  confirmation authorizes a new parent-owned successor record rather than
+  rewriting the old one.
 - Treat the range as the complete Git DAG comparison. Merge commits and in-range side history are valid; never project it to linear, first-parent, or ancestry-path history.
 - When PR-wide coverage matters, require one unique current merge base, `base_sha` to equal it and be an ancestor of `head_sha`, and `head_sha` to equal the selected PR's current head.
 - A report-only review request does not authorize a branch, commit, push, PR creation, PR retarget, or metadata change.
@@ -75,7 +90,7 @@ When the user authorizes implementation or PR repair, loop on the same explicit 
 4. Wait for required CI and read all review conversations with complete pagination.
 5. Confirm no unresolved blocking finding, the intended base/head relationship, open lifecycle, merge policy, and a final stable reread.
 
-If GitHub's `Require branches to be up to date before merging` policy is the blocker and a merge queue does not own freshness, merge the current base branch into the feature branch with a signed merge commit instead of rebasing, force-pushing, or linearizing it. The merge creates a new head, so freeze its new whole-PR range and rerun the entire pre-merge verification loop.
+GitHub's `Require branches to be up to date before merging` policy is distinct from `Require linear history`. If strict freshness is the blocker and no merge queue owns freshness, merge the current base branch into the feature branch with a signed merge commit instead of rebasing, force-pushing, or linearizing it. The merge creates a new head, invalidates all old-head evidence, and requires a newly frozen whole-PR range plus the entire pre-merge verification loop.
 
 Use [pr-readiness.md](references/pr-readiness.md) for the detailed gate. Transport errors and provider outages stay `pending` while the recovery policy can make progress; malformed or contradictory stable evidence is `inconclusive`. Do not turn uncertainty into a pass.
 

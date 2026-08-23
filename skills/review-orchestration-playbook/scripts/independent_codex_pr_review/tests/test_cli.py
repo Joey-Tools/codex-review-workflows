@@ -39,11 +39,15 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 
-from tests.support import bind_attempt_state, owned_temporary_directory
+from tests.support import (
+    LEGACY_SUPERVISOR_HARNESS,
+    bind_attempt_state,
+    owned_temporary_directory,
+)
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
-ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
+ENTRYPOINT = LEGACY_SUPERVISOR_HARNESS
 RELATIVE_TOOL = pathlib.Path(
     "personal_codex/skills/review-orchestration-playbook/"
     "scripts/independent_codex_pr_review"
@@ -332,27 +336,12 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
-    def test_readme_self_contained_examples_pin_distinct_runtime_roots(self) -> None:
-        readme = (TOOL_ROOT / "README.md").read_text()
-
-        self.assertIn('RETENTION="$TOOL_DIR/runtime/retention"', readme)
-        self.assertIn('CHECKOUTS="$TOOL_DIR/runtime/checkouts"', readme)
-        self.assertEqual(readme.count('--retention-root "$RETENTION"'), 9)
-        self.assertEqual(readme.count('--checkout-parent "$CHECKOUTS"'), 2)
-        self.assertNotIn('RETENTION="$STATE_ROOT/retention"', readme)
-        self.assertIn(
-            "account-local defaults 只用于标准 installed overlay catalog",
-            readme,
-        )
-        self.assertIn("### Standard Installed Overlay Defaults", readme)
-        self.assertEqual(
-            readme.count('python3.13 -B "$SUPERVISOR" preflight \\'),
-            2,
-        )
-        self.assertEqual(
-            readme.count('python3.13 -B "$SUPERVISOR" run \\'),
-            2,
-        )
+    def test_internal_harness_and_runtime_root_parser_contract(self) -> None:
+        self.assertTrue(ENTRYPOINT.is_file())
+        self.assertTrue(ENTRYPOINT.is_relative_to(TOOL_ROOT / "tests"))
+        self.assertFalse((TOOL_ROOT / "independent-codex-pr-review").exists())
+        self.assertFalse((TOOL_ROOT / "README.md").exists())
+        self.assertFalse(ENTRYPOINT.read_bytes().startswith(b"#!"))
 
         source_arguments = (
             "--helper-state",

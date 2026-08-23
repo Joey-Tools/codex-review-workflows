@@ -145,11 +145,12 @@ superseded_by:
   lineage that the GitHub OpenAI provider does not expose. Head-scoped clean
   evidence should prove only the GitHub lane; local and PR-readiness gates
   independently own base, merge-base, lifecycle, CI, and conversation state.
-- A provider review can bind directly through its commit field. When a known
-  terminal issue-comment carrier has no commit field, a stable request epoch
-  binds it to the unchanged current head by pre/post request, artifact, and
-  final rereads. This is head association only and makes no claim about the
-  provider's internal merge-base selection.
+- A provider review binds through its native commit field, and a clean terminal
+  issue comment binds through its exact reviewed-commit marker. The closed
+  version-1 consumer grammar accepts no hashless terminal carrier; a stable
+  request epoch is retained only for reaction fallback. This proves head
+  association only and makes no claim about the provider's internal merge-base
+  selection.
 - GitHub names the strict freshness setting **Require branches to be up to date
   before merging**. It is distinct from **Require linear history**. When the
   former blocks a PR and a merge queue is not responsible for freshness, merge
@@ -255,11 +256,11 @@ superseded_by:
   hash-verified file-redirection contract above.
 - The first valid whole-range fresh-context CLI reviewer completed under the
   prior installed control plane and returned six actionable findings. They
-  cover object-content integrity, no-follow and permission-bound control-file
+  covered object-content integrity, no-follow and permission-bound control-file
   identities, uppercase skip-worktree flags, receipt-publication cleanup
   ownership, total object-store copy budgets, and precise merge-base error
-  classification. All six are being fixed before a new whole-range review;
-  no earlier clean result is being carried forward.
+  classification. All six were fixed before later whole-range reviews; no
+  earlier clean result was carried forward.
 - The six findings were implemented in the first post-review checkpoint. Range
   objects were canonical-content hashed; control state gained no-follow
   descriptor-bound custody; hidden index flags were strictly rejected; the
@@ -330,8 +331,106 @@ superseded_by:
   If timestamps change again after the one allowed reread, they return
   inconclusive `revalidation-unavailable` evidence instead of accepting stale
   bytes or calling a timestamp delta a mutation.
+- Signed checkpoint `2e899710950e717aaebf69480beb98cb9373704c` passed the
+  complete 3,010-test suite with six conditional skips in 999.845 seconds,
+  the 117-test workspace suite, policy/reference validation, Ruff, source-only
+  compilation, shell checks, secret admission, and a formal whole-range CLI
+  review. That review found six integration gaps introduced or exposed by the
+  simplification; all six are fixed in the next checkpoint and receive fresh
+  validation rather than reusing the old-head result.
+- The public retired independent-review launcher and README remain absent.
+  Legacy supervisor code is reachable only through a non-executable,
+  test-internal harness so deterministic compatibility coverage can continue
+  without restoring an agent-facing entrypoint or adding deprecation
+  navigation.
+- The local Codex prompt now carries one parent-owned
+  `sanitized-git-argv-prefix-v1` token array and digest for either peer adapter.
+  Prefix delivery, the read-only adapter boundary, and observed deviations are
+  fail-closed; partial or unavailable argv telemetry is reported honestly and
+  is not misrepresented as operating-system enforcement.
+- GitHub terminal carriers now have a closed, versioned consumer grammar with
+  data-driven fixtures for clean issue comments, clean reviews, top-level
+  findings, joined inline findings, progress, stale/malformed records, actor
+  near-misses, and thread resolution. Producer Actions, statuses, workflows,
+  and rulesets remain owned by the separate PR #101 workstream.
+- Same-head merge-base recovery now preserves an immutable parent-owned
+  `range_origin`. A PR-derived range may be rederived automatically; a
+  caller-supplied range requires the caller to explicitly provide or confirm
+  the exact current endpoints, and missing provenance blocks PR-wide local
+  coverage without invalidating separately trustworthy head-only GitHub
+  evidence.
+- Parent-support validation now reuses one range-commit set, reducing graph
+  checks from `O(R*E)` to `O(R+E)`, and shares one 900-second monotonic phase
+  deadline through subprocess, parsing, graph, snapshot, content, and final
+  revalidation work. Descriptor-bound cleanup uses an iterative post-order
+  stack, preserving custody and retained-marker semantics without depending on
+  Python's recursion limit.
+- The second audit pass bound each `range_origin` to an immutable lineage,
+  append-only predecessor records, and one parent-owned active record. This
+  prevents a caller-supplied same-head range from being silently replaced by a
+  newly labelled PR-derived range after the merge base moves.
+- The same pass made GitHub terminal evidence executable rather than
+  prose-only. The closed consumer validates the parent-frozen repository, PR,
+  base and head, a complete sorted ancestor projection, exact review/child
+  joins, per-finding counts, and a basis-discriminated report. Terminal clean
+  requires a non-null current-head artifact commit; `stable-request-epoch`
+  remains reaction-only.
+- GitHub's exact **Require branches to be up to date before merging** rule is
+  now regression-tested as distinct from **Require linear history**. Without a
+  merge queue, the authorized recovery is a signed base-to-feature merge
+  commit followed by a newly frozen range and the complete validation, local
+  review, GitHub review, CI, conversation, policy, and final-reread gate.
+- The final integrated canonical run passed 3,028 tests with six conditional
+  skips in 945.897 seconds with `ResourceWarning` promoted to an error. The
+  final 33-test contract/carrier matrix, 127-test workspace module, Ruff lint
+  and touched-file format checks, source-only compilation, ShellCheck, C
+  syntax, core Action YAML validation, three skill validators, project-journal
+  validation, JSON parsing, and whitespace checks also passed.
 
 ## Formal Review Evidence
+
+### Review of `2e89971`
+
+- Reviewed range:
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..2e899710950e717aaebf69480beb98cb9373704c`.
+- Trusted control source: installed immutable private-overlay release
+  `f9e596f458a119fa88b89789c24c2290c37b4857`. The trusted skill, guard,
+  prompt-template, and lane-contract SHA-256 values were respectively
+  `76ae06111e6da1a04cab44e6fba5eb772af00b55c923e5234311edecb33449bd`,
+  `2c8432731619e40cfae28a59e27d97be9cf58d48672d33a8b675141436a62cf8`,
+  `4b2e05fbfc5cc79687b3cb7085a60821d5145bcd1aa29e6a895dbb6272b18bdf`,
+  and
+  `f16a47890bec42160703e7c0e353882df37a83dec911c0f0f93152641619a3b7`.
+- Materialization and final validation agreed on two scoped commits, one parent
+  edge, parent-graph SHA-256
+  `d2289b62572b406e13f39ad2224c4c5589521602079f44d6f30ddfa5be0b0a8f`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+- Codex CLI 0.149.0 ran a fresh ephemeral read-only review with requested
+  `gpt-5.6-sol` / `ultra`. The fixed prompt was 8,573 bytes with SHA-256
+  `30dece534844412617f3bab77e78d41e07bc6e031731d23343a90af0066251f0`.
+  Event-stream, terminal, and stderr SHA-256 values were respectively
+  `c695721900dd28f14ae5f90a902979ddb19230fc2d0016905ea3929549ad54d7`,
+  `bee1247e95eb05ed8a09cb41972544a8bf5f1a6f57970d3416f5574dfc84a30a`,
+  and
+  `0bc8ae9bf1bf500f59bcdfcf49c026c0ebce8f6e38b42f8cfa9103e19208236e`.
+- Finding disposition:
+  - `deleted-supervisor-entrypoint-still-required-by-ci`: fixed with a
+    non-executable test-only harness and explicit entrypoint injection; no
+    public launcher or README was restored.
+  - `reviewer-git-environment-not-fixed`: fixed by the shared parent-owned
+    sanitized Git argv-prefix contract, lane receipt fields, adapter guidance,
+    role prompt, and contract tests.
+  - `github-terminal-carrier-grammar-open`: fixed with the closed version-1
+    consumer grammar and reference classifier fixture matrix; hashless terminal
+    comments are malformed, while stable request epochs remain reaction-only.
+  - `parent-support-validation-quadratic-and-unbounded`: fixed with reused sets,
+    periodic checks, and one phase-wide monotonic deadline.
+  - `same-head-base-retarget-loses-range-provenance`: fixed with immutable
+    parent-owned `range_origin` records and distinct caller-supplied versus
+    PR-derived recovery.
+  - `recursive-descriptor-cleanup-can-overflow`: fixed with iterative
+    descriptor-custody post-order cleanup and deep-tree/error-unwind tests.
 
 ### Review of `163fa62`
 
@@ -352,8 +451,8 @@ superseded_by:
   `3182ded51e1593bd05e3f152570bd7823abc0d78f4e68c8b28759645c1e7e5b8`,
   and `96577e8b89d60bdd8eea67332b497169c7540eefdc81edb99e87c504a3f0704f`.
 - The requested profile was `gpt-5.6-sol` with Codex mode `ultra`. The five
-  findings and the subsequent merge-DAG clarification are being repaired
-  before a new signed head receives a completely fresh whole-range review.
+  findings and the subsequent merge-DAG clarification were repaired before
+  later signed heads received completely fresh whole-range reviews.
 
 ### Review of `aa99912`
 
@@ -463,11 +562,13 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-07-large-repo-range-materialization-wme001.md`.
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
-- Full `python3 -B -m unittest discover` review-playbook suite (`3,010`
-  tests, `6` conditional skips, `999.845` seconds) with `ResourceWarning`
-  promoted to an error.
+- Final full `python3 -B -m unittest discover` review-playbook suite (`3,028`
+  tests, `6` conditional skips, `945.897` seconds) with `ResourceWarning`
+  promoted to an error. The prior signed `2e89971` checkpoint passed `3,010`
+  tests with the same six skips in `999.845` seconds.
 - `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts`
-  (`26` focused policy/distribution contracts).
+  plus `test_github_terminal_carriers` (`33` focused policy, distribution,
+  carrier, and report contracts).
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
   parse; source-only Python compile; Ruff lint; Markdown relative-link check;

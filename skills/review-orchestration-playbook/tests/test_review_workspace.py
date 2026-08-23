@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dis
+import errno
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from collections.abc import Iterator
 from unittest import mock
 
 
@@ -3919,6 +3921,478 @@ class ReviewWorkspaceTest(unittest.TestCase):
             if target.exists():
                 target.rmdir()
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_handles_tree_deeper_than_recursion_limit(
+        self,
+    ) -> None:
+        cleanup_root = self.root / "deep-descriptor-cleanup"
+        cleanup_root.mkdir(mode=0o700)
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        current_descriptor = root_descriptor
+        current_descriptor_owned = False
+        depth = 220
+        previous_recursion_limit = sys.getrecursionlimit()
+        try:
+            for _index in range(depth):
+                os.mkdir("d", mode=0o700, dir_fd=current_descriptor)
+                child_descriptor = os.open(
+                    "d",
+                    workspace_runtime._nofollow_flags(directory=True),
+                    dir_fd=current_descriptor,
+                )
+                if current_descriptor_owned:
+                    os.close(current_descriptor)
+                current_descriptor = child_descriptor
+                current_descriptor_owned = True
+            leaf_descriptor = os.open(
+                "leaf",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=current_descriptor,
+            )
+            os.close(leaf_descriptor)
+            os.close(current_descriptor)
+            current_descriptor_owned = False
+
+            sys.setrecursionlimit(150)
+            workspace_runtime._clear_directory_descriptor(
+                root_descriptor,
+                cleanup_root,
+                os.fstat(root_descriptor).st_dev,
+            )
+            self.assertEqual(tuple(cleanup_root.iterdir()), ())
+        finally:
+            sys.setrecursionlimit(previous_recursion_limit)
+            if current_descriptor_owned:
+                os.close(current_descriptor)
+            if any(cleanup_root.iterdir()):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    os.fstat(root_descriptor).st_dev,
+                )
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_success_closes_owned_children(self) -> None:
+        cleanup_root = self.root / "successful-descriptor-cleanup"
+        leaf = cleanup_root / "one/two/three/leaf"
+        leaf.parent.mkdir(mode=0o700, parents=True)
+        leaf.write_text("payload\n", encoding="utf-8")
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        root_device = os.fstat(root_descriptor).st_dev
+        real_open = os.open
+        opened_child_descriptors: list[int] = []
+
+        def track_child_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            opened = real_open(path, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None and stat.S_ISDIR(os.fstat(opened).st_mode):
+                opened_child_descriptors.append(opened)
+            return opened
+
+        try:
+            with mock.patch.object(
+                workspace_runtime.os,
+                "open",
+                side_effect=track_child_open,
+            ):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                )
+            self.assertEqual(tuple(cleanup_root.iterdir()), ())
+            self.assertGreaterEqual(len(opened_child_descriptors), 3)
+            os.fstat(root_descriptor)
+            for child_descriptor in opened_child_descriptors:
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(child_descriptor)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            for child_descriptor in opened_child_descriptors:
+                try:
+                    os.fstat(child_descriptor)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+                else:
+                    os.close(child_descriptor)
+            if any(cleanup_root.iterdir()):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                )
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_processes_retained_marker_branch_last(self) -> None:
+        cleanup_root = self.root / "retained-marker-order-cleanup"
+        marker = cleanup_root / ".git" / workspace_runtime.WORKSPACE_MARKER
+        marker.parent.mkdir(mode=0o700, parents=True)
+        marker_payload = b'{"fixture": "retained"}\n'
+        marker.write_bytes(marker_payload)
+        git_payload = marker.parent / "git-payload"
+        git_payload.write_text("git payload\n", encoding="utf-8")
+        ordinary_payload = cleanup_root / "ordinary/payload"
+        ordinary_payload.parent.mkdir(mode=0o700)
+        ordinary_payload.write_text("ordinary payload\n", encoding="utf-8")
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        root_device = os.fstat(root_descriptor).st_dev
+        real_scandir = os.scandir
+        real_unlink = os.unlink
+        deleted: list[str] = []
+
+        @contextlib.contextmanager
+        def retained_first_scandir(
+            path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        ) -> Iterator[Iterator[os.DirEntry[str]]]:
+            with real_scandir(path) as iterator:
+                entries = list(iterator)
+                if path == root_descriptor:
+                    entries.sort(key=lambda entry: entry.name != ".git")
+                yield iter(entries)
+
+        def record_unlink(
+            path: object,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            deleted.append(os.fspath(path))
+            real_unlink(path, dir_fd=dir_fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "scandir",
+                    side_effect=retained_first_scandir,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "unlink",
+                    side_effect=record_unlink,
+                ),
+            ):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                    retained_marker_path=(
+                        ".git",
+                        workspace_runtime.WORKSPACE_MARKER,
+                    ),
+                    preserve_retained_marker=True,
+                )
+            self.assertEqual(marker.read_bytes(), marker_payload)
+            self.assertEqual(tuple(cleanup_root.iterdir()), (marker.parent,))
+            self.assertEqual(tuple(marker.parent.iterdir()), (marker,))
+            self.assertLess(
+                deleted.index(ordinary_payload.name),
+                deleted.index(git_payload.name),
+            )
+        finally:
+            workspace_runtime._clear_directory_descriptor(
+                root_descriptor,
+                cleanup_root,
+                root_device,
+            )
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_rejects_pre_custody_child_replacement(self) -> None:
+        cleanup_root = self.root / "pre-custody-replacement-cleanup"
+        child = cleanup_root / "child"
+        displaced = cleanup_root / "displaced"
+        payload = child / "payload"
+        displaced_payload = displaced / payload.name
+        payload.parent.mkdir(mode=0o700, parents=True)
+        payload.write_text("payload\n", encoding="utf-8")
+        sentinel = child / "sentinel"
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        root_device = os.fstat(root_descriptor).st_dev
+        real_open = os.open
+        replaced = False
+
+        def replace_before_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal replaced
+            if (
+                dir_fd == root_descriptor
+                and os.fspath(path) == child.name
+                and not replaced
+            ):
+                child.rename(displaced)
+                child.mkdir(mode=0o700)
+                sentinel.write_text("replacement sentinel\n", encoding="utf-8")
+                replaced = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "open",
+                    side_effect=replace_before_open,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                )
+            self.assertTrue(replaced)
+            self.assertEqual(caught.exception.reason, "workspace-cleanup-entry-drift")
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "replacement sentinel\n",
+            )
+            self.assertEqual(
+                displaced_payload.read_text(encoding="utf-8"),
+                "payload\n",
+            )
+        finally:
+            if sentinel.exists():
+                sentinel.unlink()
+            if child.exists():
+                child.rmdir()
+            if displaced_payload.exists():
+                displaced_payload.unlink()
+            if displaced.exists():
+                displaced.rmdir()
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_rejects_post_custody_child_replacement(self) -> None:
+        cleanup_root = self.root / "post-custody-replacement-cleanup"
+        child = cleanup_root / "child"
+        displaced = cleanup_root / "displaced"
+        payload = child / "payload"
+        payload.parent.mkdir(mode=0o700, parents=True)
+        payload.write_text("payload\n", encoding="utf-8")
+        sentinel = child / "sentinel"
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        root_device = os.fstat(root_descriptor).st_dev
+        real_stat = os.stat
+        replaced = False
+
+        def replace_before_post_custody_stat(
+            path: object,
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            nonlocal replaced
+            if (
+                dir_fd == root_descriptor
+                and os.fspath(path) == child.name
+                and not replaced
+            ):
+                child.rename(displaced)
+                child.mkdir(mode=0o700)
+                sentinel.write_text("replacement sentinel\n", encoding="utf-8")
+                replaced = True
+            return real_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "stat",
+                    side_effect=replace_before_post_custody_stat,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                )
+            self.assertTrue(replaced)
+            self.assertEqual(caught.exception.reason, "workspace-cleanup-entry-drift")
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "replacement sentinel\n",
+            )
+            self.assertFalse(payload.exists())
+        finally:
+            if sentinel.exists():
+                sentinel.unlink()
+            if child.exists():
+                child.rmdir()
+            if payload.exists():
+                payload.unlink()
+            if displaced.exists():
+                displaced.rmdir()
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "descriptor-bound cleanup requires POSIX directory descriptors",
+    )
+    def test_descriptor_cleanup_exception_closes_children_and_retains_marker(
+        self,
+    ) -> None:
+        cleanup_root = self.root / "exception-descriptor-cleanup"
+        blocked = cleanup_root / "payload/a/b/blocked"
+        blocked.parent.mkdir(mode=0o700, parents=True)
+        blocked.write_text("blocked\n", encoding="utf-8")
+        marker = cleanup_root / ".git" / workspace_runtime.WORKSPACE_MARKER
+        marker.parent.mkdir(mode=0o700)
+        marker_payload = b'{"fixture": "retained"}\n'
+        marker.write_bytes(marker_payload)
+        root_descriptor = os.open(
+            cleanup_root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        root_device = os.fstat(root_descriptor).st_dev
+        real_open = os.open
+        real_close = os.close
+        real_unlink = os.unlink
+        opened_child_descriptors: list[int] = []
+        close_failure_seen = False
+        primary_error = OSError(errno.EIO, "fixture unlink failure")
+
+        def track_child_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            opened = real_open(path, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None and stat.S_ISDIR(os.fstat(opened).st_mode):
+                opened_child_descriptors.append(opened)
+            return opened
+
+        def fail_blocked_unlink(
+            path: object,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            if os.fspath(path) == blocked.name:
+                raise primary_error
+            real_unlink(path, dir_fd=dir_fd)
+
+        def fail_one_child_close(descriptor: int) -> None:
+            nonlocal close_failure_seen
+            real_close(descriptor)
+            if descriptor in opened_child_descriptors and not close_failure_seen:
+                close_failure_seen = True
+                raise OSError(errno.EIO, "fixture close failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "open",
+                    side_effect=track_child_open,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "unlink",
+                    side_effect=fail_blocked_unlink,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=fail_one_child_close,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                    retained_marker_path=(
+                        ".git",
+                        workspace_runtime.WORKSPACE_MARKER,
+                    ),
+                    preserve_retained_marker=True,
+                )
+            self.assertIs(caught.exception, primary_error)
+            self.assertTrue(close_failure_seen)
+            self.assertGreaterEqual(len(opened_child_descriptors), 3)
+            self.assertEqual(marker.read_bytes(), marker_payload)
+            os.fstat(root_descriptor)
+            for child_descriptor in opened_child_descriptors:
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(child_descriptor)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+
+            workspace_runtime._clear_directory_descriptor(
+                root_descriptor,
+                cleanup_root,
+                root_device,
+            )
+            self.assertEqual(tuple(cleanup_root.iterdir()), ())
+        finally:
+            if any(cleanup_root.iterdir()):
+                workspace_runtime._clear_directory_descriptor(
+                    root_descriptor,
+                    cleanup_root,
+                    root_device,
+                )
+            os.close(root_descriptor)
+            if cleanup_root.exists():
+                cleanup_root.rmdir()
+
     def test_cleanup_requires_the_bound_token_and_root_identity(self) -> None:
         destination = self.root / "cleanup-workspace"
         prepared = prepare_workspace(
@@ -4162,6 +4636,184 @@ class ReviewWorkspaceTest(unittest.TestCase):
             self.atomically_replace_private_file(marker_path, original_marker)
             self.atomically_replace_private_file(support_path, original_support)
             self.cleanup(prepared)
+
+    def test_parent_support_validation_reuses_range_set_and_shared_deadline(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "support-validation-workspace",
+            self.commits[1],
+            self.commits[2],
+        )
+        real_validate_range_manifest = workspace_runtime._validate_range_manifest
+
+        class RangeCommitSentinel(tuple):
+            iterations = 0
+
+            def __iter__(self) -> Iterator[object]:
+                self.iterations += 1
+                return super().__iter__()
+
+            def __contains__(self, candidate: object) -> bool:
+                raise AssertionError(f"range tuple membership used for {candidate!r}")
+
+        sentinel: RangeCommitSentinel | None = None
+
+        def return_membership_sentinel(
+            *args: object,
+            **kwargs: object,
+        ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+            nonlocal sentinel
+            object_ids, range_commits = real_validate_range_manifest(
+                *args,
+                **kwargs,
+            )
+            sentinel = RangeCommitSentinel(range_commits)
+            return object_ids, sentinel
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_validate_range_manifest",
+                    side_effect=return_membership_sentinel,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_read_raw_commit_graph",
+                    wraps=workspace_runtime._read_raw_commit_graph,
+                ) as graph_reader,
+                mock.patch.object(
+                    workspace_runtime,
+                    "_verify_range_object_contents",
+                    wraps=workspace_runtime._verify_range_object_contents,
+                ) as content_verifier,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            assert sentinel is not None
+            self.assertGreaterEqual(sentinel.iterations, 1)
+            self.assertLessEqual(sentinel.iterations, 2)
+            deadline_graph_calls = [
+                call
+                for call in graph_reader.call_args_list
+                if call.kwargs.get("deadline_checker")
+                is workspace_runtime._check_parent_support_validation_deadline
+            ]
+            self.assertEqual(len(deadline_graph_calls), 1)
+            graph_deadline = deadline_graph_calls[0].kwargs["deadline"]
+            self.assertIsInstance(graph_deadline, float)
+            self.assertEqual(content_verifier.call_count, 1)
+            self.assertEqual(
+                content_verifier.call_args.kwargs["absolute_deadline"],
+                graph_deadline,
+            )
+            self.assertIs(
+                content_verifier.call_args.kwargs["deadline_checker"],
+                workspace_runtime._check_parent_support_validation_deadline,
+            )
+        finally:
+            self.cleanup(prepared)
+
+    def test_parent_support_validation_deadline_fails_closed(self) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "support-validation-deadline-workspace",
+            self.commits[1],
+            self.commits[2],
+        )
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "PARENT_SUPPORT_VALIDATION_DEADLINE_SECONDS",
+                    0.0,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "workspace-parent-support-validation-deadline",
+            )
+        finally:
+            self.cleanup(prepared)
+
+    def test_git_child_timeout_maps_controlling_parent_support_deadline(
+        self,
+    ) -> None:
+        deadline = 105.0
+        child_timeout = workspace_runtime.ReviewTimeoutError("fixture child timeout")
+        git_token = workspace_runtime._OPERATION_GIT.set(pathlib.Path("/fixture/git"))
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.time,
+                    "monotonic",
+                    side_effect=(100.0, deadline),
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "run_bounded_capture",
+                    side_effect=child_timeout,
+                ) as capture,
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._run_git_raw(
+                    self.repo,
+                    ("status", "--short"),
+                    timeout_seconds=workspace_runtime.GIT_TIMEOUT_SECONDS,
+                    absolute_deadline=deadline,
+                    deadline_checker=(
+                        workspace_runtime._check_parent_support_validation_deadline
+                    ),
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "workspace-parent-support-validation-deadline",
+            )
+            self.assertEqual(capture.call_args.kwargs["timeout_seconds"], 5.0)
+        finally:
+            workspace_runtime._OPERATION_GIT.reset(git_token)
+
+    def test_git_child_timeout_preserves_narrower_command_timeout(self) -> None:
+        child_timeout = workspace_runtime.ReviewTimeoutError("fixture child timeout")
+        deadline_checker = mock.Mock()
+        git_token = workspace_runtime._OPERATION_GIT.set(pathlib.Path("/fixture/git"))
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.time,
+                    "monotonic",
+                    return_value=100.0,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "run_bounded_capture",
+                    side_effect=child_timeout,
+                ) as capture,
+                self.assertRaises(workspace_runtime.ReviewTimeoutError) as caught,
+            ):
+                workspace_runtime._run_git_raw(
+                    self.repo,
+                    ("status", "--short"),
+                    timeout_seconds=5.0,
+                    absolute_deadline=200.0,
+                    deadline_checker=deadline_checker,
+                )
+            self.assertIs(caught.exception, child_timeout)
+            self.assertEqual(capture.call_args.kwargs["timeout_seconds"], 5.0)
+            deadline_checker.assert_not_called()
+        finally:
+            workspace_runtime._OPERATION_GIT.reset(git_token)
 
     def test_destination_git_commands_do_not_discover_an_ancestor_repository(
         self,

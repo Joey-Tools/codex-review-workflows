@@ -295,7 +295,10 @@ For the direct Claude lane, trusted real-`HOME` credential refresh or CLI contro
 
 ## Git Environment
 
-All helper and reviewer Git calls use direct bounded argv with:
+The workspace helper directly enforces these properties for its own Git
+subprocesses. A local Codex reviewer is required to preserve the same properties
+through the parent-owned `sanitized_git_argv_prefix` defined in
+[review-lane-contracts.md](review-lane-contracts.md):
 
 - one fixed absolute Git executable resolved before any source or workspace
   repository command and reused throughout the complete prepare or validate
@@ -312,6 +315,16 @@ All helper and reviewer Git calls use direct bounded argv with:
 - no submodule recursion.
 
 Diff-producing reviewer commands explicitly use `--no-ext-diff --no-textconv`.
+
+Successful workspace validation does not prove that a later model-issued Git
+command used this environment. The Codex prompt and lane receipt therefore bind
+the exact prefix, fixed Git path/version, workspace, verified prompt delivery,
+requested/established read-only adapter boundary, and the strongest tool-argv
+evidence the runtime actually exposes. That is a prompt/tool-observation
+boundary, not an operating-system enforcement claim. Missing or altered prefix
+delivery, an unavailable required boundary, or observed argv deviation makes
+the Codex lane inconclusive. `partial` or `unobservable` argv telemetry is
+recorded as a limitation and is not by itself evidence of deviation.
 
 ## Receipts
 
@@ -336,6 +349,12 @@ Preparation and validation each emit one bounded machine-readable receipt. At mi
 - an unguessable plaintext cleanup token only in the preparation receipt.
 
 Require the shared fields to match type-preservingly before launch. A path string alone is not an identity binding.
+
+These are workspace preparation/validation receipts. The parent-owned Codex
+lane receipt separately binds the reviewer Git-prefix digest, prompt delivery,
+adapter boundary, observation level, and any observed deviation. It must not
+infer argv-level compliance from workspace success or turn unavailable adapter
+telemetry into a synthetic mismatch.
 
 The consumer waits for the guard process to exit before adopting a receipt.
 Success requires exit `0`, empty stderr, and exactly one complete schema-valid

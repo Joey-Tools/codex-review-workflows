@@ -31,6 +31,7 @@ Freeze these fields before consuming evidence:
 repository: owner/name
 pull_request: 123
 host: github.com
+base_sha: 40-lowercase-hex # parent-proved unique merge base for ancestry only
 head_sha: 40-lowercase-hex
 ```
 
@@ -39,6 +40,21 @@ immediately before accepting a result and require the same head. A clean result
 for an older head is stale. A finding on the current head or a locally proved
 ancestor in the current PR range remains applicable until resolved or
 superseded under the rules below.
+
+`ancestor_shas` is not provider data. The parent orchestrator owns its closed
+local projection and binds it to the exact repository, PR number, locally
+proved unique merge base in the frozen scope's `base_sha`, and immutable head.
+The projection's `base_sha` and `head_sha` must equal those independent scope
+endpoints. The projection records its
+owner, `complete | incomplete` status, canonical ancestor count, and SHA-256
+digest. The canonical list is the sorted, duplicate-free lowercase full-SHA
+set in `base_sha..head_sha`, excluding `head_sha`; its digest covers each ASCII
+SHA followed by LF, including the final SHA. Before ancestor membership can
+make a finding applicable, the consumer must validate the projection's closed
+field set, scope endpoints, count, canonical order, and digest and require
+`status: complete`. A valid incomplete projection makes non-head applicability
+inconclusive. A mismatched, open, or invalid projection is malformed scope
+evidence; raw provider ancestry claims never substitute for this parent proof.
 
 An advance of the target base tip does not by itself invalidate head-bound
 provider evidence. If the head and unique merge base are unchanged, the frozen
@@ -49,7 +65,11 @@ comment, review, reaction, or ordinary check proves the base.
 After a merge-base change on an unchanged head, the parent may reuse the
 head-bound GitHub result after a complete final reread confirms the same head
 and no unresolved applicable provider finding. It must rerun every invalidated
-local and readiness gate against the new merge base, and it must reconcile any
+local and readiness gate against the new merge base only after the parent-owned
+`range_origin` provenance gate in [pr-readiness.md](pr-readiness.md) authorizes
+that local PR-wide range. This authority neither selects nor rewrites a local
+range: missing or unknown origin may block local readiness while the
+trustworthy head-only GitHub result remains reusable. Reconcile any
 base-sensitive merge/status check. Do not post another `@codex review` merely
 because the base changed, and never describe the reused provider artifact as a
 review of the new base.
@@ -123,24 +143,42 @@ plane still owns base assurance.
 
 No positive basis bypasses the complete unresolved-finding scan.
 
+## Closed Consumer Carrier Grammar
+
+[github-codex-terminal-carriers-v1.json](github-codex-terminal-carriers-v1.json)
+is the normative version-1 consumer grammar and fixture matrix for provider
+terminal comments, pull-request reviews, top-level findings, and joined inline
+findings. Consumers must implement that exact version's Unicode and line
+normalization, provider identity, terminal-looking and progress detection,
+body-effective semantic time, commit binding, closed carrier branches, and
+one-to-one thread join. Locally proved ancestor applicability additionally
+requires the grammar's closed parent-owned `ancestor_shas_projection`; a raw
+SHA list is insufficient. An exact-provider terminal-looking record that does
+not match an accepted branch is malformed; it is never generic clean prose.
+The same consumer resource's `required_report_schema` and `report_fixtures`
+are the executable, closed, basis-discriminated report contract. They reject
+cross-variant field combinations rather than relying on YAML examples alone.
+
+The resource is deliberately a consumer contract. It does not define, validate,
+or authorize a GitHub Action, status producer, workflow name, check conclusion,
+or ruleset. Those producer integrations belong to their separately reviewed
+workstream and can supply a preferred basis only through the association rules
+above.
+
 ## Terminal Results
 
 A terminal provider artifact is a provider-authored issue comment or review
-whose known carrier unambiguously reports either findings or no findings. Bind
-it to the current head through either:
+whose carrier is accepted by the normative version-1 grammar and unambiguously
+reports either findings or no findings. Every accepted version-1 terminal
+branch exposes its artifact commit: a clean issue-comment marker, a finding
+URL, a native review `commit_id`, or the joined parent/child commit. Resolve a
+known short clean-issue marker through the exact repository API, require a
+stable unique current-head match, and otherwise bind the native lowercase full
+SHA directly. A hashless issue comment is not a terminal carrier.
 
-- an exact full `commit_id` exposed by the carrier (resolve a known short ID
-  through the exact repository API and require a unique current-head match);
-  or
-- a stable current-head request epoch when an issue-comment carrier exposes no
-  commit field: select the unique latest exact `@codex review` request, prove
-  the same head immediately before and after that request and at artifact/final
-  reread, require the artifact's server time to follow the request, and require
-  no newer request in the complete snapshot.
-
-The second basis associates public evidence with a stable head epoch; it does
-not claim visibility into the provider's internal input selection. Record
-`head_binding: explicit-commit | stable-request-epoch`.
+`stable-request-epoch` is reserved for the reaction-only fallback below, where
+it records the stable current-head request epoch. It does not classify or bind
+a terminal payload.
 
 A terminal clean artifact passes only when all of these hold:
 
@@ -155,6 +193,11 @@ A terminal clean artifact passes only when all of these hold:
 
 An `APPROVED` review is not clean when an associated provider inline comment
 contains a finding. A clean body never overrides an unresolved thread finding.
+Parse and join all associated provider children before treating an ancestor
+`APPROVED`/`No findings.` parent as stale: a child bound to that locally proved
+ancestor is still an applicable inline finding. A top-level finding review must
+likewise parse and join every associated provider child; its top-level finding
+cannot hide an unresolved inline thread.
 
 A terminal finding blocks immediately once exact identity, scope, and carrier
 are trustworthy. Missing positive evidence cannot neutralize a finding.
@@ -166,9 +209,12 @@ Classify provider findings independently of human conversation state.
 - For an inline finding, only the raw GraphQL thread node's typed `isResolved`
   value resolves that thread. `isOutdated`, a human reply, or a synthesized
   REST field is not resolution.
-- Join an inline REST comment to exactly one GraphQL thread comment by stable
-  IDs and its parent review. An orphan, duplicate join, parent mismatch, or
-  incomplete nested page is inconclusive.
+- Join an inline REST comment to exactly one GraphQL thread comment by the
+  exact child comment ID, URL, and parent review ID. URL plus parent alone is
+  not an identity join. Require the URL's frozen repository and PR and its
+  `#discussion_r<ID>` suffix to match that exact child ID. An orphan, duplicate
+  join, child-ID mismatch, parent mismatch, or incomplete nested page is
+  inconclusive or malformed according to the closed grammar.
 - A top-level provider finding remains active until a later trustworthy
   provider clean artifact on the same or a locally proved descendant head
   supersedes it.
@@ -243,7 +289,9 @@ required checks can still block overall PR readiness.
 
 ## Required Report
 
-Record compact, reproducible evidence:
+Record compact, reproducible evidence. The normative executable shape is
+`required_report_schema` in the version-1 consumer resource above; the forms
+below are its human-readable projection. The common envelope is:
 
 ```yaml
 github_codex_lane:
@@ -254,18 +302,64 @@ github_codex_lane:
   scope_assurance: latest-head-only
   base_assurance: local-pr-readiness
   basis: merge-status | terminal-clean | reaction-clean | null
-  evidence:
-    id: stable-github-id-or-null
-    url: https://github.com/...-or-null
-    server_time: RFC3339-or-null
-    head_binding: explicit-commit | stable-request-epoch | current-head-status | null
-    request_id: stable-github-id-or-null
+  evidence: one-closed-variant-below-or-null
   request_policy:
     status: compliant | warning | unknown | not-applicable
     warnings: []
   unresolved_provider_findings: []
   last_reason: stable-machine-readable-reason
 ```
+
+`evidence` is a closed, basis-discriminated union; do not merge fields or
+alternatives between variants. `basis: terminal-clean` requires this exact
+binding shape (with the channel-specific server-time field):
+
+```yaml
+evidence:
+  kind: terminal-artifact
+  id: stable-github-id
+  url: https://github.com/...
+  channel: issue-comment | review
+  grammar: github-codex-terminal-carriers-v1
+  grammar_branch: clean-issue-v1 | clean-review-v1
+  grammar_status: accepted
+  artifact_commit: 40-lowercase-hex
+  server_time: RFC3339
+  server_time_field: created_at | updated_at | submitted_at
+  head_binding: explicit-commit
+  request_id: stable-github-id-or-null
+```
+
+For `basis: terminal-clean`, `artifact_commit` is required, non-null, and equal
+to the envelope `head_sha`; `head_binding` is exactly `explicit-commit`.
+`artifact_commit: null` and `head_binding: stable-request-epoch` are
+structurally invalid for terminal clean.
+
+Reaction fallback uses a separate closed shape:
+
+```yaml
+evidence:
+  kind: reaction
+  id: stable-github-reaction-id
+  url: https://github.com/...
+  channel: reaction
+  grammar: null
+  grammar_branch: null
+  grammar_status: null
+  artifact_commit: null
+  server_time: RFC3339
+  server_time_field: reaction-time
+  head_binding: stable-request-epoch
+  request_id: stable-github-request-id
+```
+
+`stable-request-epoch` is valid only in that `basis: reaction-clean` reaction
+variant. A `basis: merge-status` report instead uses a closed merge-status
+variant with `head_binding: current-head-status`; a findings report backed by
+an accepted terminal carrier uses `kind: terminal-artifact`, a non-null full
+`artifact_commit`, `head_binding: explicit-commit`, and its finding grammar
+branch. Pending, inconclusive, and not-applicable reports may use
+`evidence: null` when no stable diagnostic artifact is selected.
 
 Use `warning` for observed early or duplicate requests. Warnings do not change
 the provider verdict and never authorize another concurrent request. Use

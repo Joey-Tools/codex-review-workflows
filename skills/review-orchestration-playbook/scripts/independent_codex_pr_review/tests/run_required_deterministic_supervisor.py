@@ -12,7 +12,7 @@ from .run_required_no_child_profile import REQUIRED_TEST_KEYS
 EXPECTED_TEST_COUNT = 847
 # Update this only after reviewing the complete discovered test-identity change.
 EXPECTED_TEST_ID_SHA256 = (
-    "93cbe4c702f25d1cf3c5fdc1170f55df5217f6dad4ba170085b4aae63621a897"
+    "4af6506600f9666edb26fa4fd93894a9102ddaf71945f5dba8caa440e7f412dd"
 )
 
 
