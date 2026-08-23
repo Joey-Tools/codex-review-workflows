@@ -342,6 +342,26 @@
         "report_head_sha"
       ]
     },
+    "parent_input_profiles": {
+      "selected_pr_scope": [
+        "repository",
+        "pull_request",
+        "head_sha"
+      ],
+      "terminal_clean_identity": [
+        "kind",
+        "id",
+        "url",
+        "channel"
+      ],
+      "reaction_clean_identity": [
+        "kind",
+        "id",
+        "url",
+        "channel",
+        "request_id"
+      ]
+    },
     "status_values": [
       "pass",
       "findings",
@@ -412,12 +432,19 @@
           "clean-review-v1"
         ],
         "channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
+        "stable_identity": "positive evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<evidence-ID> for issue-comment or pullrequestreview-<evidence-ID> for review",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_identity_input": "separate closed parent-owned terminal identity whose kind, evidence ID, URL, and channel equal the report evidence",
         "artifact_commit": "required-full-sha-equals-report-head",
         "head_binding": "explicit-commit"
       },
       "reaction-clean": {
         "status": "pass",
         "evidence_kind": "reaction",
+        "stable_identity": "positive reaction evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<request-ID>",
+        "request_relation": "positive request_id equals the parent request comment ID encoded by the URL fragment",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_identity_input": "separate closed parent-owned reaction identity whose kind, reaction evidence ID, URL, channel, and parent request ID equal the report evidence",
         "artifact_commit": null,
         "head_binding": "stable-request-epoch"
       },
@@ -724,6 +751,82 @@
       "valid": true
     },
     {
+      "id": "terminal-clean-cross-repository-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/other/pull/7#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-cross-pr-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-cross-evidence-id",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "id": 102
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-coupled-evidence-id-url-mutation",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "id": 102,
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-coupled-scope-and-id-mutation",
+      "base": "terminal_clean",
+      "patch": {
+        "repository": "octo/other",
+        "pull_request": 8,
+        "evidence": {
+          "id": 102,
+          "url": "https://github.com/octo/other/pull/8#issuecomment-102"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-non-https-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "http://github.com/octo/review-fixture/pull/7#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-review-wrong-channel-fragment",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "channel": "review",
+          "grammar_branch": "clean-review-v1",
+          "server_time_field": "submitted_at"
+        }
+      },
+      "valid": false
+    },
+    {
       "id": "terminal-clean-null-artifact-commit",
       "base": "terminal_clean_null_commit",
       "patch": {},
@@ -772,6 +875,92 @@
       "base": "reaction_clean",
       "patch": {},
       "valid": true
+    },
+    {
+      "id": "reaction-clean-cross-repository-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/other/pull/7#issuecomment-91"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-cross-pr-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-91"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-request-fragment-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-request-id-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-reaction-id-only-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "id": 602
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-coupled-identity-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "id": 602,
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-coupled-scope-and-identity-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "repository": "octo/other",
+        "pull_request": 8,
+        "evidence": {
+          "id": 602,
+          "url": "https://github.com/octo/other/pull/8#issuecomment-92",
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-non-https-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "http://github.com/octo/review-fixture/pull/7#issuecomment-91"
+        }
+      },
+      "valid": false
     },
     {
       "id": "reaction-clean-explicit-commit",

@@ -319,8 +319,9 @@ through the parent-owned `sanitized_git_argv_prefix` defined in
   command, accepting the normal and Apple Git formats only and requiring Git
   `>=2.45.0`; an old, malformed, or unverifiable version is `blocked-safety`;
 - system/global config disabled;
-- lazy fetches and terminal prompts disabled with both `GIT_NO_LAZY_FETCH=1`
-  and `--no-lazy-fetch` on every repository Git argv that accepts global options;
+- lazy fetches disabled by the exact `GIT_NO_LAZY_FETCH=1` environment token
+  and terminal prompts disabled by `GIT_TERMINAL_PROMPT=0`; v1 deliberately has
+  no separate Git global `--no-lazy-fetch` token;
 - hooks, fsmonitor, replacement objects, external diffs, and text conversion disabled;
 - pagers and color disabled;
 - repository discovery fenced to the workspace;

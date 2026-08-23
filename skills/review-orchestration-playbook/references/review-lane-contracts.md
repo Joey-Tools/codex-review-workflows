@@ -156,7 +156,17 @@ ordered `sanitized_git_argv_prefix` for that exact Codex lane. It binds:
 - the canonical validated workspace and its validation-receipt identity;
 - the closed environment-key allowlist and fixed safe Git options below; and
 - `sanitized_git_argv_prefix_sha256`, the lowercase SHA-256 of the exact UTF-8
-  JSON token-array bytes placed in the control metadata.
+  canonical compact JSON token-array bytes placed in the control metadata.
+
+Generate and validate this record only through the independently trusted
+bundle's `named_lane_guard codex-git-prefix` command, passing
+`--worktree <absolute-clean-workspace>` and
+`--git-executable <fixed-absolute-git-executable>`. Its closed output records
+`sanitized_git_argv_prefix_conformance: exact-token-sequence`; a hand-built
+array, a digest-only receipt, or a differently ordered but semantically similar
+array does not conform to the named profile. During self-policy migration, the
+candidate guard remains review subject and cannot generate its own approval
+record.
 
 The ordered token profile is `sanitized-git-argv-prefix-v1`:
 
@@ -164,8 +174,8 @@ The ordered token profile is `sanitized-git-argv-prefix-v1`:
 /usr/bin/env
 -i
 PATH=<parent-recorded-trusted-path>
-LANG=<parent-fixed-locale>
-LC_ALL=<parent-fixed-locale>
+LANG=C
+LC_ALL=C
 GIT_ASKPASS=/usr/bin/false
 GIT_ATTR_NOSYSTEM=1
 GIT_CEILING_DIRECTORIES=<absolute-clean-workspace-parent>
@@ -174,14 +184,13 @@ GIT_CONFIG_SYSTEM=/dev/null
 GIT_CONFIG_NOSYSTEM=1
 GIT_GRAFT_FILE=/dev/null
 GIT_NO_LAZY_FETCH=1
+GIT_TERMINAL_PROMPT=0
 GIT_NO_REPLACE_OBJECTS=1
 GIT_OPTIONAL_LOCKS=0
-GIT_TERMINAL_PROMPT=0
 PAGER=cat
 GIT_PAGER=cat
 <fixed-absolute-git-executable>
 --no-pager
---no-lazy-fetch
 -c core.commitGraph=false
 -c core.checkStat=default
 -c core.multiPackIndex=false
@@ -193,11 +202,17 @@ GIT_PAGER=cat
 -c core.attributesFile=/dev/null
 -c diff.external=
 -c color.ui=false
--C <absolute-clean-workspace>
+-C
+<absolute-clean-workspace>
 ```
 
+`GIT_NO_LAZY_FETCH=1` is the sole no-lazy-fetch control in this v1 profile.
+There is no separate Git global `--no-lazy-fetch` token: adding one, omitting
+the environment token, or moving the environment token makes the array
+nonconforming even if a caller recomputes its digest.
+
 Each displayed `-c name=value` line represents two argv tokens. All other lines
-represent one token. The parent chooses the recorded path, locale, executable,
+represent one token. The parent chooses the recorded trusted path, executable,
 and workspace values once; the reviewer may not substitute values, reorder
 tokens, add environment assignments or `-c` overrides, or reconstruct a
 semantically similar command.
@@ -209,10 +224,11 @@ wrapper, an additional `-C`, a global `--git-dir` / `--work-tree` selector, and
 a different workspace are forbidden. Every diff-producing subcommand also
 appends both `--no-ext-diff` and `--no-textconv`.
 
-The lane receipt records the prefix profile and digest, fixed Git path/version,
-workspace validation-receipt identity, verified prompt delivery, the established
-read-only adapter boundary, and the strongest Git-argv observation the adapter
-actually exposes: `complete`, `partial`, or `unobservable`. Record every observed
+The lane receipt records the prefix profile, exact-sequence conformance and
+digest, fixed Git path/version, workspace validation-receipt identity, verified
+prompt delivery, the established read-only adapter boundary, and the strongest
+Git-argv observation the adapter actually exposes: `complete`, `partial`, or
+`unobservable`. Record every observed
 deviation separately.
 
 Missing or altered prefix metadata, unproved prompt delivery, inability to

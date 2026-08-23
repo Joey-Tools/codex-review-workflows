@@ -74,6 +74,9 @@ CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
     "cooperative-claude-control-directory-flock-same-uid-host-tcb"
 )
 CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
+SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v1"
+SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE = "exact-token-sequence"
+SANITIZED_GIT_ARGV_PREFIX_ENCODING = "canonical-json-utf8-v1"
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
@@ -124,6 +127,145 @@ CLAUDE_ENV_PASSTHROUGH_KEYS = (
 
 class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
+
+
+def _validate_prefix_path(path: pathlib.Path, label: str) -> str:
+    rendered = os.fspath(path)
+    if not path.is_absolute():
+        raise NamedLaneGuardError(f"{label} must be absolute")
+    if any(character in rendered for character in ("\x00", "\n", "\r")):
+        raise NamedLaneGuardError(f"{label} contains an unsupported control character")
+    return rendered
+
+
+def build_sanitized_git_argv_prefix(
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> tuple[str, ...]:
+    """Build the exact local-Codex Git argv prefix profile."""
+
+    rendered_worktree = _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    rendered_ceiling = os.fspath(worktree.parent)
+    if os.pathsep in rendered_ceiling:
+        raise NamedLaneGuardError(
+            "Codex review worktree parent cannot be encoded as a discovery ceiling"
+        )
+    return (
+        "/usr/bin/env",
+        "-i",
+        f"PATH={TRUSTED_PATH}",
+        "LANG=C",
+        "LC_ALL=C",
+        "GIT_ASKPASS=/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM=1",
+        f"GIT_CEILING_DIRECTORIES={rendered_ceiling}",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_GRAFT_FILE=/dev/null",
+        "GIT_NO_LAZY_FETCH=1",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_NO_REPLACE_OBJECTS=1",
+        "GIT_OPTIONAL_LOCKS=0",
+        "PAGER=cat",
+        "GIT_PAGER=cat",
+        rendered_git,
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.checkStat=default",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.ignoreStat=false",
+        "-c",
+        "core.trustCtime=true",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "color.ui=false",
+        "-C",
+        rendered_worktree,
+    )
+
+
+def validate_sanitized_git_argv_prefix(
+    tokens: Sequence[str],
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> tuple[str, ...]:
+    """Reject any token array that is not the exact selected v1 profile."""
+
+    if isinstance(tokens, (str, bytes)):
+        raise NamedLaneGuardError("sanitized Git argv prefix must be a token sequence")
+    try:
+        observed = tuple(tokens)
+    except (TypeError, ValueError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix could not be read as a token sequence"
+        ) from error
+    if not all(isinstance(token, str) for token in observed):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix contains a non-string token"
+        )
+    expected = build_sanitized_git_argv_prefix(
+        worktree=worktree,
+        git_executable=git_executable,
+    )
+    if observed != expected:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix does not conform to "
+            f"{SANITIZED_GIT_ARGV_PREFIX_PROFILE}"
+        )
+    return observed
+
+
+def sanitized_git_argv_prefix_receipt(
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Return the closed machine-generated v1 prefix record."""
+
+    tokens = validate_sanitized_git_argv_prefix(
+        build_sanitized_git_argv_prefix(
+            worktree=worktree,
+            git_executable=git_executable,
+        ),
+        worktree=worktree,
+        git_executable=git_executable,
+    )
+    encoded = json.dumps(
+        list(tokens),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "status": "complete",
+        "command": "codex-git-prefix",
+        "prefix_profile": SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+        "sanitized_git_argv_prefix_conformance": (
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE
+        ),
+        "sanitized_git_argv_prefix": list(tokens),
+        "sanitized_git_argv_prefix_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "sanitized_git_argv_prefix_sha256": hashlib.sha256(encoded).hexdigest(),
+        "git_executable": os.fspath(git_executable),
+        "worktree": os.fspath(worktree),
+        "no_lazy_fetch_control": "GIT_NO_LAZY_FETCH=1",
+    }
 
 
 @dataclass(frozen=True)
@@ -8985,6 +9127,13 @@ def _build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--control-file", required=True)
     recover.add_argument("--control-sha256", required=True)
 
+    codex_prefix = subparsers.add_parser(
+        "codex-git-prefix",
+        help="Generate the exact machine-validated local-Codex Git argv prefix.",
+    )
+    codex_prefix.add_argument("--worktree", required=True)
+    codex_prefix.add_argument("--git-executable", required=True)
+
     claude = subparsers.add_parser(
         "run-claude",
         help="Run an exact Claude executable under bounded process supervision.",
@@ -9739,15 +9888,24 @@ def legacy_short_prefix_compatibility_main(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    safety_command = args.command_name in {
+    workspace_command = args.command_name in {
         "cleanup-workspace",
         "prepare-workspace",
         "recover-partial-workspace",
         "validate-workspace",
     }
-    if safety_command:
+    safety_command = workspace_command or args.command_name == "codex-git-prefix"
+    if workspace_command:
         return _workspace_command_main(args)
     try:
+        if args.command_name == "codex-git-prefix":
+            _emit(
+                sanitized_git_argv_prefix_receipt(
+                    worktree=pathlib.Path(args.worktree),
+                    git_executable=pathlib.Path(args.git_executable),
+                )
+            )
+            return 0
         command = list(args.claude_argv)
         if command and command[0] == "--":
             command.pop(0)

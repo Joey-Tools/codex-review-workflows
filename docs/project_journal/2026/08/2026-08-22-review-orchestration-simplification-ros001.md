@@ -783,6 +783,55 @@ superseded_by:
   command, and `ResourceWarning`-as-error policy; all 3,063 tests passed with
   the same six skips in 984.620 seconds.
 
+### Exact-scope review follow-up
+
+- Signed head `a90ffc66652182d3f2d4c5caa9c7acbee3cf2b6e` received one
+  fresh-context GPT-5.6 Sol Ultra CLI review over
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..a90ffc66652182d3f2d4c5caa9c7acbee3cf2b6e`
+  under the independently trusted pre-migration release. Pre- and post-review
+  validation receipts were byte-identical: seven scoped commits, six parent
+  edges, parent-graph SHA-256
+  `a34e17792f9a526f92c8eea38b97e70f9875c1a08a6aa7a359a15546d67c51e3`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+- The 10,519-byte parent-owned prompt had SHA-256
+  `1f21c8aa3465e339ba5d06559ffa2d2d7ca09b1092da48537b89a05fbcf54bdf`.
+  Event-stream and terminal-artifact SHA-256 values were respectively
+  `6e5cca6bae213bb79864a4882be4b134fa58fd12ecd90d0944b70b7348568b8e`
+  and
+  `5d1efaecbf8b47f0a217be0aee9700fcb508201e87e609ce346bdc879cb7760b`;
+  stderr was empty. The ordinary authentication file remained unchanged and
+  the process-specific auth-only home was destroyed after review.
+- The reviewer found two remaining contract defects. Direct terminal and
+  reaction positive branches could accept evidence URLs whose repository, PR,
+  channel fragment, evidence ID, or request ID did not match the selected
+  report scope. The fix separately freezes parent-owned PR scope, terminal
+  identity, and reaction/request identity before the report is parsed, then
+  requires the report and exact HTTPS `github.com` channel fragment to match
+  those independent closed inputs. Cross-repository, cross-PR, cross-ID,
+  wrong-fragment, non-HTTPS, and coupled-mutation fixtures all fail closed; an
+  independent read-only audit reproduced the rejected coupled mutations and
+  accepted the issue, review, and reaction positive paths.
+- The same review found that the candidate published two incompatible meanings
+  of `sanitized-git-argv-prefix-v1`: documentation required a Git global
+  `--no-lazy-fetch` token that the accepted adapter did not contain. The fixed
+  profile uses `GIT_NO_LAZY_FETCH=1` as its sole no-lazy control and adds an
+  independently trusted `codex-git-prefix` machine producer plus an exact-token
+  validator. A recomputed digest cannot make an inserted, omitted, or reordered
+  token conform. Self-policy migration still uses only the prior trusted guard;
+  the candidate producer remains review subject until release.
+- The remediation passed the nine-test carrier matrix, the 34-test combined
+  contract/local-lane matrix, the complete 275-test named-lane module, Ruff
+  lint and format checks, JSON parsing, the skill validator, and whitespace
+  checks. These focused results do not replace the final whole-tree suite,
+  secret admission, or a new fresh-context review of the advanced signed head.
+- The final integrated tree then passed all 3,066 review-playbook tests with
+  six conditional skips in 974.578 seconds outside the outer sandbox, with
+  `ResourceWarning` promoted to an error. The first invocation used the wrong
+  repository-root `tests/` discovery path and exited before loading tests; the
+  authoritative run used the repository's documented
+  `skills/review-orchestration-playbook/tests` discovery root.
+
 ## Next Steps
 
 - Use the final signed squash candidate head for secret admission and obtain a

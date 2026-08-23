@@ -54,6 +54,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import (  # noqa: E402
     claude_version_policy,
+    named_lane,
     providers,
     state,
 )
@@ -495,18 +496,51 @@ class RepositoryContractTest(unittest.TestCase):
             "GIT_OPTIONAL_LOCKS=0",
             "GIT_TERMINAL_PROMPT=0",
             "--no-pager",
-            "--no-lazy-fetch",
             "-c core.commitGraph=false",
             "-c core.fsmonitor=false",
             "-c core.hooksPath=/dev/null",
             "-c core.attributesFile=/dev/null",
             "-c diff.external=",
-            "-C <absolute-clean-workspace>",
+            "<absolute-clean-workspace>",
         ):
             self.assertIn(fixed_token, contracts)
 
+        worktree = pathlib.Path("/review-control/workspace")
+        git_executable = pathlib.Path("/usr/bin/git")
+        profile_block = (
+            contracts.split(
+                "The ordered token profile is `sanitized-git-argv-prefix-v1`:", 1
+            )[1]
+            .split("```text", 1)[1]
+            .split("```", 1)[0]
+        )
+        documented_tokens: list[str] = []
+        substitutions = {
+            "PATH=<parent-recorded-trusted-path>": f"PATH={named_lane.TRUSTED_PATH}",
+            "GIT_CEILING_DIRECTORIES=<absolute-clean-workspace-parent>": (
+                f"GIT_CEILING_DIRECTORIES={worktree.parent}"
+            ),
+            "<fixed-absolute-git-executable>": str(git_executable),
+            "<absolute-clean-workspace>": str(worktree),
+        }
+        for line in profile_block.strip().splitlines():
+            token = substitutions.get(line, line)
+            if token.startswith("-c "):
+                documented_tokens.extend(("-c", token.removeprefix("-c ")))
+            else:
+                documented_tokens.append(token)
+        self.assertEqual(
+            tuple(documented_tokens),
+            named_lane.build_sanitized_git_argv_prefix(
+                worktree=worktree,
+                git_executable=git_executable,
+            ),
+        )
+        self.assertNotIn("--no-lazy-fetch", documented_tokens)
+
         for metadata_field in (
             "prefix_profile: <sanitized-git-argv-prefix-v1 | not-applicable>",
+            "sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>",
             "sanitized_git_argv_prefix:",
             "sanitized_git_argv_prefix_sha256:",
             "git_executable:",
@@ -545,7 +579,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("inconclusive", normalized)
             self.assertIn("unobservable", normalized)
 
-        self.assertIn("lane receipt records the prefix profile and digest", contracts)
+        self.assertIn("profile, exact-sequence conformance and", contracts)
         self.assertIn("prompt and tool-observation boundary", contracts)
         self.assertIn("not by itself a lane failure", normalized_contracts)
         self.assertIn("not by itself prevent a clean result", normalized_prompts)
@@ -581,6 +615,7 @@ class RepositoryContractTest(unittest.TestCase):
             "prepare-workspace",
             "validate-workspace",
             "cleanup-workspace",
+            "codex-git-prefix",
             "run-claude",
         ):
             self.assertIn(command, completed.stdout)

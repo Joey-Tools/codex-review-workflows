@@ -43,6 +43,9 @@ from review_runtime.named_lane import (  # noqa: E402
     LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
     MATERIALIZER_BASE_REF,
     MATERIALIZER_HEAD_REF,
+    SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE,
+    SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+    SANITIZED_GIT_ARGV_PREFIX_PROFILE,
     SYMLINK_COUNT_LIMIT,
     LegacyPrefixReceiptInconclusive,
     NamedLaneGuardError,
@@ -50,9 +53,12 @@ from review_runtime.named_lane import (  # noqa: E402
     _validate_materializer_git_version,
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
+    build_sanitized_git_argv_prefix,
     main as named_lane_main,
     materialize_worktree,
     run_claude as _run_claude,
+    sanitized_git_argv_prefix_receipt,
+    validate_sanitized_git_argv_prefix,
     validate_worktree,
 )
 
@@ -136,6 +142,141 @@ class NamedLaneGuardTest(unittest.TestCase):
         (self.repo / "tracked.txt").write_text("workspace head\n", encoding="utf-8")
         head = self.commit("workspace head")
         return base, head
+
+    def test_codex_git_prefix_v1_matches_exact_accepted_adapter_sequence(
+        self,
+    ) -> None:
+        worktree = self.root / "review-workspace"
+        git_executable = pathlib.Path("/usr/bin/git")
+        expected = (
+            "/usr/bin/env",
+            "-i",
+            f"PATH={TRUSTED_PATH}",
+            "LANG=C",
+            "LC_ALL=C",
+            "GIT_ASKPASS=/usr/bin/false",
+            "GIT_ATTR_NOSYSTEM=1",
+            f"GIT_CEILING_DIRECTORIES={self.root}",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_GRAFT_FILE=/dev/null",
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_OPTIONAL_LOCKS=0",
+            "PAGER=cat",
+            "GIT_PAGER=cat",
+            "/usr/bin/git",
+            "--no-pager",
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.checkStat=default",
+            "-c",
+            "core.multiPackIndex=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.fileMode=true",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+            "core.trustCtime=true",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "color.ui=false",
+            "-C",
+            str(worktree),
+        )
+
+        actual = build_sanitized_git_argv_prefix(
+            worktree=worktree,
+            git_executable=git_executable,
+        )
+        self.assertEqual(actual, expected)
+        self.assertNotIn("--no-lazy-fetch", actual)
+        self.assertEqual(actual[actual.index("--no-pager") + 1], "-c")
+        self.assertEqual(actual.count("GIT_NO_LAZY_FETCH=1"), 1)
+        self.assertEqual(
+            validate_sanitized_git_argv_prefix(
+                actual,
+                worktree=worktree,
+                git_executable=git_executable,
+            ),
+            expected,
+        )
+
+    def test_codex_git_prefix_rejects_recomputed_digest_for_nonprofile_tokens(
+        self,
+    ) -> None:
+        worktree = self.root / "review-workspace"
+        git_executable = pathlib.Path("/usr/bin/git")
+        generated = list(
+            build_sanitized_git_argv_prefix(
+                worktree=worktree,
+                git_executable=git_executable,
+            )
+        )
+        generated.insert(generated.index("--no-pager") + 1, "--no-lazy-fetch")
+        recomputed_digest = hashlib.sha256(
+            json.dumps(
+                generated,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertRegex(recomputed_digest, r"\A[0-9a-f]{64}\Z")
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "does not conform to sanitized-git-argv-prefix-v1",
+        ):
+            validate_sanitized_git_argv_prefix(
+                generated,
+                worktree=worktree,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_command_emits_closed_machine_receipt(self) -> None:
+        worktree = self.root / "review-workspace"
+        git_executable = pathlib.Path("/usr/bin/git")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = named_lane_main(
+                (
+                    "codex-git-prefix",
+                    "--worktree",
+                    str(worktree),
+                    "--git-executable",
+                    str(git_executable),
+                )
+            )
+        self.assertEqual(result, 0)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(
+            receipt,
+            sanitized_git_argv_prefix_receipt(
+                worktree=worktree,
+                git_executable=git_executable,
+            ),
+        )
+        self.assertEqual(receipt["prefix_profile"], SANITIZED_GIT_ARGV_PREFIX_PROFILE)
+        self.assertEqual(
+            receipt["sanitized_git_argv_prefix_conformance"],
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE,
+        )
+        self.assertEqual(
+            receipt["sanitized_git_argv_prefix_encoding"],
+            SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        )
+        self.assertEqual(receipt["no_lazy_fetch_control"], "GIT_NO_LAZY_FETCH=1")
+        self.assertNotIn("--no-lazy-fetch", receipt["sanitized_git_argv_prefix"])
 
     def prepare_workspace_argv(
         self,

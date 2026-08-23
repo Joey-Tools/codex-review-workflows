@@ -14,10 +14,10 @@ One requested lane has one parent-owned lane record:
 - effective-profile evidence basis;
 - instruction-surface isolation and, for every CLI launch, the neutral
   launch-root and temporary auth-only `CODEX_HOME` receipts;
-- parent-owned `sanitized_git_argv_prefix` profile/digest, fixed Git
-  path/version, workspace validation-receipt identity, prompt-delivery and
-  read-only-boundary evidence, plus the Git-argv observation level the adapter
-  actually exposes;
+- parent-owned machine-generated `sanitized_git_argv_prefix` profile,
+  exact-token-sequence conformance and digest, fixed Git path/version,
+  workspace validation-receipt identity, prompt-delivery and read-only-boundary
+  evidence, plus the Git-argv observation level the adapter actually exposes;
 - terminal result and cleanup status.
 
 Retries, switching adapters, or Codex Ultra's internal delegation do not increment the lane count. Never describe internal workers as a double or triple review.
@@ -25,6 +25,13 @@ Retries, switching adapters, or Codex Ultra's internal delegation do not increme
 ## Peer Adapters
 
 Neither adapter has a standing priority.
+
+After successful workspace validation, invoke the independently trusted
+bundle's `named_lane_guard codex-git-prefix` command for that exact worktree and
+fixed Git executable. Use its closed `sanitized-git-argv-prefix-v1` token array,
+canonical-JSON digest and `exact-token-sequence` conformance result unchanged in
+either peer adapter. Never hand-build the prefix or use the candidate guard to
+bootstrap a self-policy migration.
 
 | Adapter | Use when | Operational trade-off |
 | --- | --- | --- |
@@ -38,8 +45,9 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Launch the installed `reviewer` role with `fork_turns="none"` or the platform's exact zero-inherited-context equivalent.
 - Do not use a default coding child, a resumed child, or the parent conversation.
 - Give it only the control metadata and review prompt described below.
-- Include the exact parent-owned `sanitized_git_argv_prefix` token array and
-  digest. Require every Git tool call to copy it verbatim. Record available host
+- Include the exact parent-owned `sanitized_git_argv_prefix` token array,
+  exact-sequence conformance and digest. Require every Git tool call to copy it
+  verbatim. Record available host
   tool-call evidence; when the collaboration runtime does not expose complete
   argv, record `unobservable` rather than treating that absence as deviation.
 - Require a read-only sandbox and no state-changing external tools.
@@ -54,8 +62,9 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   below. The trusted prompt and sanitized Git prefix target the validated
   workspace. Never reuse a parent or earlier reviewer session.
 - Deliver the complete parent-constructed control metadata and shared review prompt through the CLI's initial-prompt channel. Do not assume a specialized review subcommand accepts, preserves, or combines a custom prompt with its range selector.
-- Include the same exact parent-owned `sanitized_git_argv_prefix` token array
-  and digest used by the subagent adapter. The CLI process `-C` selects its
+- Include the same exact parent-owned `sanitized_git_argv_prefix` token array,
+  exact-sequence conformance and digest used by the subagent adapter. The CLI
+  process `-C` selects its
   launch/model cwd, which must be the parent-owned neutral directory for every
   canonical CLI lane. It does not replace the prefix required for every
   model-issued Git call against the validated workspace. Retain structured
@@ -309,10 +318,11 @@ auth-home receipt binds the source pre/post
 identity/access/digest checks, initial exact-copy proof, temporary-home
 inventory and environment binding, any accepted temporary refresh, and final
 destruction without exposing credential bytes. The lane receipt also records
-the `sanitized-git-argv-prefix-v1` digest, fixed Git path/version, canonical
-workspace and validation-receipt identity, verified prompt delivery,
-established read-only adapter boundary, actual tool-event coverage (`complete`,
-`partial`, or `unobservable`), and any observed prefix deviation.
+the machine-generated `sanitized-git-argv-prefix-v1` exact-token-sequence
+conformance and digest, fixed Git path/version, canonical workspace and
+validation-receipt identity, verified prompt delivery, established read-only
+adapter boundary, actual tool-event coverage (`complete`, `partial`, or
+`unobservable`), and any observed prefix deviation.
 
 Use this effective-profile outcome matrix for both peer adapters:
 

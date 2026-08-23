@@ -13,7 +13,8 @@ Use one shared findings contract for both local lanes. Adapt transport fields to
   the candidate file is never control-plane guidance.
 - State allowed read-only tools and prohibited mutations.
 - For either Codex adapter, include the exact parent-owned
-  `sanitized_git_argv_prefix` token array and digest metadata from
+  machine-generated `sanitized_git_argv_prefix` token array,
+  `exact-token-sequence` conformance and digest metadata from
   [review-lane-contracts.md](review-lane-contracts.md). Never ask the reviewer
   to synthesize an equivalent prefix.
 - Keep evidence commands bounded. The reviewer narrows from stats and changed paths to hunks and necessary tracked context.
@@ -52,6 +53,7 @@ instruction_surface:
   neutral_launch_root_receipt: <digest or stable identity | not-applicable>
 codex_git:
   prefix_profile: <sanitized-git-argv-prefix-v1 | not-applicable>
+  sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>
   sanitized_git_argv_prefix: <exact UTF-8 JSON token array | not-applicable>
   sanitized_git_argv_prefix_sha256: <lowercase SHA-256 | not-applicable>
   executable: <fixed absolute Git path | not-applicable>
@@ -115,10 +117,11 @@ different workspace. Every diff-producing command must append both
 inspect a live source checkout, untracked files, private files, or unrelated
 repositories.
 
-If the prefix or digest metadata is absent, the tool cannot launch the supplied
-prefix under the required read-only boundary, or an invocation is observed to
-deviate from it, stop and return an inconclusive terminal explanation rather
-than `No findings.`. The parent records separately when the runtime does not
+If the prefix, exact-token-sequence conformance or digest metadata is absent,
+the tool cannot launch the supplied prefix under the required read-only
+boundary, or an invocation is observed to deviate from it, stop and return an
+inconclusive terminal explanation rather than `No findings.`. The parent
+records separately when the runtime does not
 expose complete Git argv; lack of that telemetry is not itself an instruction
 failure. This prompt/tool-observation rule is not proof of operating-system
 enforcement.
@@ -206,6 +209,7 @@ instruction_surface_receipt: <stable receipt identity | not-applicable>
 neutral_launch_root_receipt: <stable receipt identity | not-applicable>
 auth_only_codex_home_receipt: <stable parent-private receipt identity | not-applicable>
 sanitized_git_argv_prefix_profile: <sanitized-git-argv-prefix-v1 | not-applicable>
+sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>
 sanitized_git_argv_prefix_sha256: <lowercase SHA-256 | not-applicable>
 git_executable: <fixed absolute path | not-applicable>
 git_version: <exact accepted version output | not-applicable>
@@ -229,14 +233,16 @@ accepted pinned launch records the requested pinned model/mode as the
 execution-level effective values, while explicitly not claiming
 provider-authenticated backend alias, routing, or weight identity.
 
-For a Codex lane, `git_prefix_delivery` must be `verified` and
-`git_read_only_boundary` must be `established`. An observed `deviated` result is
-inconclusive. `partial` or `unobservable` records the adapter's telemetry limit;
-it does not by itself prevent a clean result when delivery and the read-only
-boundary are established and no deviation is observed. The receipt binds the
-prefix digest to the same fixed Git path/version, canonical workspace, and
-validation-receipt identity carried in the prompt. Do not infer argv-level
-compliance from a clean answer or turn missing telemetry into deviation.
+For a Codex lane, `sanitized_git_argv_prefix_conformance` must be
+`exact-token-sequence`, `git_prefix_delivery` must be `verified`, and
+`git_read_only_boundary` must be `established`. An observed `deviated` result
+is inconclusive. `partial` or `unobservable` records the adapter's telemetry
+limit; it does not by itself prevent a clean result when delivery and the
+read-only boundary are established and no deviation is observed. The receipt
+binds the machine-validated profile and prefix digest to the same fixed Git
+path/version, canonical workspace, and validation-receipt identity carried in
+the prompt. Do not infer argv-level compliance from a clean answer or turn
+missing telemetry into deviation.
 
 For every CLI lane, `instruction_surface` must be `isolated` and the
 version-bound instruction-surface, neutral launch-root, and temporary auth-only
