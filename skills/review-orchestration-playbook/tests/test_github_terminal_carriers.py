@@ -518,6 +518,7 @@ class _ReportValidator:
         self.fields = self.schema["closed_fields"]
         self.scope_rules = self.schema["scope_rules"]
         self.rules = self.schema["basis_rules"]
+        self.finding_rules = self.schema["unresolved_provider_findings_rules"]
 
     def _closed(self, value: object, profile: str) -> bool:
         return isinstance(value, dict) and set(value) == set(self.fields[profile])
@@ -566,6 +567,89 @@ class _ReportValidator:
             and evidence["head_binding"] == "explicit-commit"
         )
 
+    @staticmethod
+    def _finding_url_matches_scope(
+        report: dict[str, object],
+        evidence: dict[str, object],
+        finding: dict[str, object],
+    ) -> bool:
+        url = finding["url"]
+        if not isinstance(url, str):
+            return False
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.query:
+            return False
+        repository_parts = report["repository"].split("/")
+        path_parts = parsed.path.removeprefix("/").split("/")
+        if path_parts[:2] != repository_parts:
+            return False
+        branch = finding["grammar_branch"]
+        if branch == "top-level-finding-v1":
+            fragment_prefix = {
+                "issue-comment": "issuecomment-",
+                "review": "pullrequestreview-",
+            }.get(evidence["channel"])
+            return (
+                url == evidence["url"]
+                and path_parts
+                == [*repository_parts, "pull", str(report["pull_request"])]
+                and parsed.fragment == f"{fragment_prefix}{finding['id']}"
+            )
+        return (
+            branch == "inline-parent-v1"
+            and path_parts
+            == [
+                *repository_parts,
+                "pull",
+                str(report["pull_request"]),
+            ]
+            and parsed.fragment == f"discussion_r{finding['id']}"
+        )
+
+    def _unresolved_findings(
+        self, report: dict[str, object], evidence: dict[str, object]
+    ) -> bool:
+        findings = report["unresolved_provider_findings"]
+        seen_ids: set[int] = set()
+        seen_urls: set[str] = set()
+        branches: set[str] = set()
+        for finding in findings:
+            if not self._closed(finding, "unresolved_provider_finding"):
+                return False
+            branch = finding["grammar_branch"]
+            if (
+                not self._positive_int(finding["id"])
+                or not isinstance(finding["url"], str)
+                or branch not in {"top-level-finding-v1", "inline-parent-v1"}
+                or not self._full_sha(finding["artifact_commit"])
+                or finding["artifact_commit"] != evidence["artifact_commit"]
+                or not self._positive_int(finding["evidence_id"])
+                or finding["evidence_id"] != evidence["id"]
+                or finding["report_head_sha"] != report["head_sha"]
+                or not self._finding_url_matches_scope(report, evidence, finding)
+                or finding["id"] in seen_ids
+                or finding["url"] in seen_urls
+            ):
+                return False
+            if branch == "top-level-finding-v1":
+                if (
+                    finding["id"] != evidence["id"]
+                    or finding["thread_is_resolved"] is not None
+                ):
+                    return False
+            elif finding["thread_is_resolved"] is not False:
+                return False
+            seen_ids.add(finding["id"])
+            seen_urls.add(finding["url"])
+            branches.add(branch)
+        evidence_branch = evidence["grammar_branch"]
+        return (
+            evidence_branch == "inline-parent-v1" and branches == {"inline-parent-v1"}
+        ) or (
+            evidence_branch == "top-level-finding-v1"
+            and "top-level-finding-v1" in branches
+        )
+
     def _selected_pr_scope(self, report: dict[str, object]) -> bool:
         rule = self.scope_rules["selected-pr"]
         return (
@@ -604,6 +688,11 @@ class _ReportValidator:
             or not report["last_reason"]
             or not self._closed(report["request_policy"], "request_policy")
         ):
+            return False
+        cardinality = self.finding_rules["status_cardinality"][report["status"]]
+        if (
+            cardinality == "one-or-more" and not report["unresolved_provider_findings"]
+        ) or (cardinality == "exactly-zero" and report["unresolved_provider_findings"]):
             return False
         policy = report["request_policy"]
         if (
@@ -671,6 +760,7 @@ class _ReportValidator:
             and self._terminal_evidence(report, evidence)
             and evidence["kind"] == null_rule["finding_evidence_kind"]
             and evidence["grammar_branch"] in null_rule["finding_branches"]
+            and self._unresolved_findings(report, evidence)
         )
 
 
@@ -749,6 +839,28 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertEqual(
             report_schema["scope_rules"]["selected-pr"]["status_values"],
             ["pass", "findings", "pending", "inconclusive"],
+        )
+        self.assertEqual(
+            set(report_schema["closed_fields"]["unresolved_provider_finding"]),
+            {
+                "id",
+                "url",
+                "artifact_commit",
+                "grammar_branch",
+                "thread_is_resolved",
+                "evidence_id",
+                "report_head_sha",
+            },
+        )
+        self.assertEqual(
+            report_schema["unresolved_provider_findings_rules"]["status_cardinality"],
+            {
+                "pass": "exactly-zero",
+                "findings": "one-or-more",
+                "pending": "exactly-zero",
+                "inconclusive": "exactly-zero",
+                "not-applicable": "exactly-zero",
+            },
         )
         self.assertEqual(
             report_schema["scope_rules"]["no-selected-supported-pr"],
@@ -855,6 +967,18 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "reaction-clean-explicit-commit",
             "merge-status-report-positive",
             "finding-report-positive",
+            "inline-finding-report-positive",
+            "finding-report-empty-unresolved-list",
+            "pending-report-with-unresolved-finding",
+            "inconclusive-report-with-unresolved-finding",
+            "finding-entry-open-field",
+            "finding-entry-evidence-id-mismatch",
+            "finding-entry-artifact-commit-mismatch",
+            "finding-entry-report-head-mismatch",
+            "finding-entry-cross-repository-url",
+            "inline-finding-entry-resolved",
+            "finding-entry-duplicate-id",
+            "finding-entry-duplicate-url",
             "selected-pending-report-positive",
             "selected-inconclusive-report-positive",
             "no-selected-supported-pr-positive",

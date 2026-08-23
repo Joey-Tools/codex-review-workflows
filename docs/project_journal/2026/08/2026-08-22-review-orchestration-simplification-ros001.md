@@ -671,6 +671,58 @@ superseded_by:
   48 focused policy/carrier/CLI/manifest contracts, Ruff lint/format, skill
   validation, project-journal validation, and `git diff --check` also passed.
 
+### Auth-only CLI formal-review findings
+
+- The frozen formal-review range was
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..3e4313c786ff431754749aaf2262056f22039ff1`.
+  The independently trusted control source remained private-overlay release
+  `f9e596f458a119fa88b89789c24c2290c37b4857`; candidate executable code was
+  not used as review control.
+- The dedicated `reviewer` role was unavailable at launch time. Because the
+  accepted policy makes the fresh-context subagent and strict Codex CLI peer
+  adapters for one logical Codex lane, the parent used one fresh
+  `gpt-5.6-sol` Ultra CLI process rather than substituting a default child or
+  starting a second reviewer.
+- Materialization and post-review trusted validation agreed on five scoped
+  commits, four parent edges, parent-graph SHA-256
+  `482c7d50974eff31aa6c3ce4c79eac6dbffb95a39ce329257874b47802ecb68f`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+- The parent-owned prompt was 8,953 bytes with SHA-256
+  `907d0bbe10aaf289b5a98b967c792fca69108538ee47ac3bc38385783e11596a`.
+  The findings terminal artifact SHA-256 was
+  `bf278c54162160d2c9faf8c86c0c95616661cb0fb3140008fe6808d36183b93f`;
+  the complete JSON event stream SHA-256 was
+  `4f37058370487b86df0195cbbff6b00d0f426c8e7ee50f1d158d649159c3ee7e`;
+  stderr was empty with SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- The auth-only home preflight, postflight, and cleanup receipts proved the
+  ordinary login file remained unchanged and the process-specific credential
+  copy still matched it. The temporary review and empty-probe homes were
+  destroyed after the terminal event; no credential bytes or credential
+  digest are recorded here.
+- The reviewer found two actionable contract defects:
+  - ambiguous request delivery allowed a repeat in the GitHub probe/authority
+    but prohibited it in the always-read lane contract and prompt; and
+  - the lane-report validator accepted unresolved finding IDs without a
+    closed, head-bound entry shape and allowed their cardinality to contradict
+    the report status.
+- The accepted remediation keeps the recorded Q22 recovery decision: after a
+  read-before-repeat proves neither delivery nor absence, one recovery owner
+  may repeat the exact request after backoff, with no concurrent POST and any
+  duplicate reported as one logical-lane audit warning. The report schema must
+  use closed finding entries bound to the selected PR/head and terminal
+  evidence, require a non-empty list exactly for `status: findings`, and reject
+  unresolved entries for `pass`, `pending`, `inconclusive`, or
+  `not-applicable`.
+- Both defects were remediated with a four-document ambiguous-delivery
+  invariant and a closed report-entry/fixture matrix covering empty findings,
+  findings in non-finding statuses, open fields, scope/evidence/head mismatch,
+  resolved inline findings, and duplicate identities. The authoritative full
+  suite then ran outside the outer sandbox with `ResourceWarning` promoted to
+  an error: all 3,053 tests passed, with six conditional skips, in 980.329
+  seconds.
+
 ## Next Steps
 
 - Use the final signed squash candidate head for secret admission and obtain a

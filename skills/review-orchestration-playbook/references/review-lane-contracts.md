@@ -314,10 +314,14 @@ Each lane starts without another lane's output. The parent may aggregate only af
 
 The GitHub producer is the narrow exception for the authorized exact
 `@codex review` producer operation and any separately authorized,
-repository-predeclared idempotent or reentrant workflow reconciliation. An
-ambiguous request delivery enters only the evidence authority's single-flight
-read/reread recovery; it never authorizes another POST. The GitHub write is not
-intrinsically idempotent.
+repository-predeclared idempotent or reentrant workflow reconciliation. Under
+the named lane's authorized ambiguous-delivery recovery, first reread the
+unchanged current head and complete visible request set. If delivery still
+cannot be proved, the same exact `@codex review` POST may be repeated after
+backoff as an idempotent delivery retry. A single recovery owner must reread
+before every repetition, never run concurrent POSTs, and stop POSTing as soon
+as delivery or another definite outcome is proved. Any visible duplicate is an
+audit warning within the same logical review lane, never an additional lane.
 
 ## Outcome Vocabulary
 

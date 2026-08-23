@@ -173,9 +173,14 @@ The provider trigger is the exact issue comment:
 ```
 
 Do not append scope prose or retry markers. Do not post a concurrent or
-ordinary duplicate. If delivery of the exact request is ambiguous, use only
-the authority's single-flight read/reread recovery and never repeat the POST;
-the GitHub write is not intrinsically idempotent. Provider evidence and
+ordinary duplicate. Under the named lane's authorized ambiguous-delivery
+recovery, first reread the unchanged current head and complete visible request
+set. If delivery still cannot be proved, the same exact `@codex review` POST
+may be repeated after backoff as an idempotent delivery retry. A single
+recovery owner must reread before every repetition, never run concurrent
+POSTs, and stop POSTing as soon as delivery or another definite outcome is
+proved. Record any visible duplicate as an audit warning within the same
+logical review lane, never as an additional lane. Provider evidence and
 workflow reconciliation follow
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
 

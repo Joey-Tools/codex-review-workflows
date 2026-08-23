@@ -67,17 +67,19 @@ Post the exact body:
 ```
 
 Before posting, reread the PR head and enumerate visible exact requests for the
-current head epoch. Keep one recovery owner and one POST in flight. After a
-successful response, store its stable comment ID, URL, actor, body, and server
-time.
+current head epoch. Keep a single recovery owner and at most one POST in
+flight. After a successful response, store its stable comment ID, URL, actor,
+body, and server time.
 
-If the POST returns an ambiguous transport result, first reread comments to
-look for the request. If no result can be proved, the same exact POST may be
-repeated after backoff only under the named lane's authorized ambiguous-delivery
-recovery. A duplicate still counts as the same logical review lane, but the
-GitHub write is not intrinsically idempotent. Do not run two POSTs
-concurrently, and do not treat multiple visible requests as multiple review
-lanes.
+If the POST returns an ambiguous transport result, first reread the unchanged
+current head and its complete visible exact-request set. If delivery still
+cannot be proved, the same exact `@codex review` POST may be repeated after
+backoff as an idempotent delivery retry under the named lane's authorized
+ambiguous-delivery recovery. Before every repetition, the single recovery
+owner performs that reread again; stop POSTing as soon as delivery or another
+definite outcome is proved. Never run concurrent POSTs or issue an ordinary
+duplicate. Any visible duplicate remains part of the same logical review lane
+and is recorded as an audit warning; it never counts as an additional lane.
 
 A base-only retarget on the same head does not authorize or require another
 request. Reuse qualifying head-bound provider evidence, rerun the base-sensitive

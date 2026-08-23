@@ -244,26 +244,29 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "machine-decidable transient pending or infrastructure reason",
             "repository-predeclared idempotent or reentrant contract",
             "current authorization for the external mutation",
-            "it never authorizes another POST",
-            "The GitHub write is not intrinsically idempotent",
+            "the same exact `@codex review` POST may be repeated after backoff",
+            "as an idempotent delivery retry",
+            "never run concurrent POSTs",
+            "stop POSTing as soon as delivery or another definite outcome is proved",
             "neither alone changes code, creates a head, or invalidates stable local reviews",
             "If resolving a finding changes code",
         ):
             self.assertIn(required.lower(), normalized_contracts.lower())
 
         self.assertIn(
-            "single-flight read/reread recovery and never repeat the POST",
-            normalized_prompts,
+            "the same exact `@codex review` post may be repeated after backoff",
+            normalized_prompts.lower(),
         )
-        self.assertIn(
-            "the GitHub write is not intrinsically idempotent", normalized_prompts
-        )
+        self.assertIn("as an idempotent delivery retry", normalized_prompts.lower())
+        self.assertIn("never as an additional lane", normalized_prompts.lower())
 
         for retired in (
             "Explicit provider findings block.",
             "missing/stale/inconclusive/infrastructure",
             "single-flight idempotent repeat",
             "single-flight, idempotent producer recovery",
+            "never repeat the POST",
+            "never authorizes another POST",
         ):
             self.assertNotIn(retired, contracts + "\n" + prompts)
 

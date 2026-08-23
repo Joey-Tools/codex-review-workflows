@@ -271,13 +271,17 @@ Accept it only when every condition holds:
 `eyes` is liveness only. It never proves clean. A terminal artifact takes
 precedence over reaction fallback even if the reaction is later.
 
-If the POST outcome was ambiguous, the producer may repeat the same exact
-request after backoff only under the named lane's authorized
-ambiguous-delivery recovery. A duplicate remains one logical review lane, but
-the GitHub write is not intrinsically idempotent. Keep a single in-flight
-recovery owner, prefer the latest visible request for fallback, and report
-duplicates as an audit warning. Never let duplicate request count erase
-trustworthy terminal provider evidence.
+If the POST outcome was ambiguous, first reread the unchanged current head and
+its complete visible exact-request set. If delivery still cannot be proved,
+the same exact `@codex review` POST may be repeated after backoff as an
+idempotent delivery retry under the named lane's authorized ambiguous-delivery
+recovery. Before every repetition, the single recovery owner performs that
+reread again; never run concurrent POSTs, and stop POSTing as soon as delivery
+or another definite outcome is proved. Any visible duplicate remains part of
+the same logical review lane, is reported as an audit warning, and never counts
+as an additional lane. Prefer the latest visible request for fallback, and
+never let duplicate request count erase trustworthy terminal provider
+evidence.
 
 ## Service And Pending Evidence
 

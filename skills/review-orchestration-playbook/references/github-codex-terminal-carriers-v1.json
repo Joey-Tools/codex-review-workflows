@@ -291,6 +291,15 @@
       "request_policy": [
         "status",
         "warnings"
+      ],
+      "unresolved_provider_finding": [
+        "id",
+        "url",
+        "artifact_commit",
+        "grammar_branch",
+        "thread_is_resolved",
+        "evidence_id",
+        "report_head_sha"
       ]
     },
     "status_values": [
@@ -306,6 +315,27 @@
       "unknown",
       "not-applicable"
     ],
+    "unresolved_provider_findings_rules": {
+      "entry_profile": "unresolved_provider_finding",
+      "status_cardinality": {
+        "pass": "exactly-zero",
+        "findings": "one-or-more",
+        "pending": "exactly-zero",
+        "inconclusive": "exactly-zero",
+        "not-applicable": "exactly-zero"
+      },
+      "entry_binding": {
+        "id": "required-positive-integer; the stable GitHub artifact or inline-comment ID",
+        "url": "top-level-finding-v1 equals selected evidence URL; inline-parent-v1 is the exact current-repository-and-PR discussion URL for id",
+        "artifact_commit": "required-full-sha-equals-selected-evidence-artifact-commit",
+        "grammar_branch": "top-level-finding-v1 or inline-parent-v1",
+        "thread_is_resolved": "null for top-level-finding-v1; exact false for inline-parent-v1",
+        "evidence_id": "required-positive-integer-equals-selected-evidence-id",
+        "report_head_sha": "required-full-sha-equals-report-head-sha",
+        "carrier_relation": "inline-parent-v1 evidence permits only inline-parent-v1 entries; top-level-finding-v1 evidence requires at least one top-level-finding-v1 entry and may also carry joined inline-parent-v1 entries",
+        "uniqueness": "IDs and URLs are each independently unique"
+      }
+    },
     "scope_rules": {
       "selected-pr": {
         "status_values": [
@@ -515,9 +545,56 @@
         "warnings": []
       },
       "unresolved_provider_findings": [
-        301
+        {
+          "id": 301,
+          "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+          "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "grammar_branch": "top-level-finding-v1",
+          "thread_is_resolved": null,
+          "evidence_id": 301,
+          "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+        }
       ],
       "last_reason": "applicable-provider-finding"
+    },
+    "inline_finding": {
+      "status": "findings",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 302,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-302",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "inline-parent-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "server_time": "2026-08-23T09:03:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [
+        {
+          "id": 402,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r402",
+          "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "grammar_branch": "inline-parent-v1",
+          "thread_is_resolved": false,
+          "evidence_id": 302,
+          "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+        }
+      ],
+      "last_reason": "applicable-unresolved-provider-inline-finding"
     },
     "selected_pending": {
       "status": "pending",
@@ -631,6 +708,221 @@
       "base": "finding",
       "patch": {},
       "valid": true
+    },
+    {
+      "id": "inline-finding-report-positive",
+      "base": "inline_finding",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "finding-report-empty-unresolved-list",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": []
+      },
+      "valid": false
+    },
+    {
+      "id": "pending-report-with-unresolved-finding",
+      "base": "selected_pending",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "inconclusive-report-with-unresolved-finding",
+      "base": "selected_pending",
+      "patch": {
+        "status": "inconclusive",
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ],
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-open-field",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "provider_body": "unexpected"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-evidence-id-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 999,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-artifact-commit-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-report-head-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "1111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-cross-repository-url",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/other/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "inline-finding-entry-resolved",
+      "base": "inline_finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 402,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r402",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": true,
+            "evidence_id": 302,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-duplicate-id",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": false,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-duplicate-url",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
     },
     {
       "id": "selected-pending-report-positive",

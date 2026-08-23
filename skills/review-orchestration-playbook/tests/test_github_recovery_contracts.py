@@ -23,6 +23,8 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         cls.skill = _read(SKILL_ROOT / "SKILL.md")
         cls.probes = _read(REFERENCES / "github-pr-probes.md")
         cls.authority = _read(REFERENCES / "github-codex-evidence-authority.md")
+        cls.contracts = _read(REFERENCES / "review-lane-contracts.md")
+        cls.prompts = _read(REFERENCES / "review-prompt-templates.md")
         cls.readiness = _read(REFERENCES / "pr-readiness.md")
         cls.carriers = json.loads(
             _read(REFERENCES / "github-codex-terminal-carriers-v1.json")
@@ -53,6 +55,38 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "repeated reruns or dispatches are semantically idempotent",
             _normalize(self.skill + "\n" + self.probes + "\n" + self.authority),
         )
+
+    def test_ambiguous_delivery_retry_is_consistent_across_github_contracts(
+        self,
+    ) -> None:
+        documents = {
+            "probes": self.probes,
+            "authority": self.authority,
+            "lane-contracts": self.contracts,
+            "prompt-templates": self.prompts,
+        }
+        required = (
+            "named lane's authorized ambiguous-delivery recovery",
+            "the same exact `@codex review` post may be repeated after backoff",
+            "as an idempotent delivery retry",
+            "single recovery owner",
+            "reread",
+            "never run concurrent posts",
+            "stop posting as soon as delivery or another definite outcome is proved",
+            "audit warning",
+            "same logical review lane",
+        )
+
+        for name, document in documents.items():
+            normalized = _normalize(document)
+            with self.subTest(document=name):
+                for anchor in required:
+                    self.assertIn(anchor, normalized)
+                self.assertNotIn("never repeat the post", normalized)
+                self.assertNotIn("never authorizes another post", normalized)
+
+        combined = _normalize("\n".join(documents.values()))
+        self.assertNotIn("the github write is not intrinsically idempotent", combined)
 
     def test_unbounded_backoff_is_limited_to_typed_retryable_reasons(self) -> None:
         retry = self.probes.split("## Retry Schedule And Cost Control", 1)[1].split(
