@@ -71,6 +71,114 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             _normalized(local),
         )
 
+    def test_cli_uses_fresh_auth_only_codex_home(self) -> None:
+        local = _read("local-codex-lane.md")
+        contracts = _read("review-lane-contracts.md")
+        prompts = _read("review-prompt-templates.md")
+        normalized = _normalized(local)
+
+        for required in (
+            "Never give a canonical CLI lane the ambient or ordinary user `CODEX_HOME`",
+            "automatically loads `AGENTS.override.md` or `AGENTS.md` from that home",
+            "fresh, owner-private temporary `CODEX_HOME`",
+            "child environment: CODEX_HOME=<absolute-owner-private-temporary-auth-only-home>",
+            'cli_auth_credentials_store="file"',
+            "exact mode `0600`",
+            "exact mode `0700`",
+            "real parent directories owned by the launching user or a separately trusted root identity",
+            "no group or other write bit",
+            "group/other traverse or read bits are not mutation evidence and are allowed",
+            "descriptor-to-descriptor byte copy",
+            "source path-object identity, access policy, byte length, and SHA-256 digest",
+            "never copy a refreshed value back to the source",
+            "blocked-authentication",
+            "blocked-safety",
+            "peer subagent adapter with the same requested profile",
+            "credential-preserving `codex login status` check",
+            '<absolute-codex> -c cli_auth_credentials_store="file" login status',
+            "actual review `exec` receives its own fresh auth-only home",
+            "distinct from every status or diagnostic home",
+            "complete structured terminal event prove actual flag use",
+            "Do not run a separate paid model `exec` preflight on every review",
+            "optional diagnostic does not count as a review",
+            "not a clean-result prerequisite",
+            "Raw credential bytes are Codex runtime authentication material only",
+            "The Codex runtime must read the temporary `auth.json`",
+            "trusted-processor boundary, not OS-level credential isolation",
+            "authentication credential discovery",
+            "read, search for, or output the temporary `CODEX_HOME`",
+            "do not by themselves prove deny-read separation",
+            "not a filesystem deny-read control",
+        ):
+            self.assertIn(required.lower(), normalized.lower())
+
+        self.assertIn(
+            "Immediately before an authenticated CLI process, its new temporary home's inventory is exactly `auth.json`",
+            normalized,
+        )
+        self.assertIn(
+            "report-and-cleanup evidence, not a closed allowlist or input to another process",
+            normalized,
+        )
+        for transient in (
+            "installation_id",
+            ".sandbox_migration",
+            "cache",
+            "models_cache.json",
+            "shell_snapshots",
+            "tmp",
+        ):
+            self.assertIn(f"`{transient}`", local)
+        self.assertNotIn("`models_cache`", local)
+        self.assertIn(
+            "Any `AGENTS*`, config, skill, plugin, rule, or hook path", normalized
+        )
+        self.assertIn("Classify a session or history path as sensitive", normalized)
+        self.assertIn("Never purge a home for reuse", normalized)
+        self.assertIn(
+            "never carry any postlaunch state into another process", normalized
+        )
+        self.assertIn(
+            "incomplete credential cleanup prevents a clean CLI result", normalized
+        )
+        self.assertNotIn("owner-only real parent directories", local)
+        self.assertNotIn("exposes them to the reviewer", local)
+        self.assertNotIn("authenticated preflight status", local)
+        self.assertNotIn(
+            "run one bounded credential-preserving failure/status preflight", local
+        )
+
+        self.assertIn("version-bound hostile-home control", normalized)
+        self.assertIn("injects that marker", normalized)
+        self.assertIn("fresh empty temporary `CODEX_HOME`", normalized)
+        self.assertIn("none of the global, project, or skill markers", normalized)
+        self.assertNotIn(
+            "Populate the probe home with unique synthetic global `AGENTS.md`",
+            local,
+        )
+
+        cli_argv = local.split("normalized direct-argv shape is:", 1)[1].split(
+            "```", 2
+        )[1]
+        self.assertIn('-c cli_auth_credentials_store="file"', cli_argv)
+        self.assertIn(
+            '-c shell_environment_policy.filters={CODEX_HOME="exclude"}', cli_argv
+        )
+        self.assertIn(
+            "-c shell_environment_policy.ignore_default_excludes=false", cli_argv
+        )
+        self.assertFalse(
+            any(
+                line.strip().startswith("CODEX_HOME=") for line in cli_argv.splitlines()
+            )
+        )
+
+        for document in (contracts, prompts):
+            self.assertIn("auth-only `CODEX_HOME`", document)
+            self.assertIn("authentication credential discovery", document)
+            self.assertIn("auth.json", document)
+        self.assertIn("auth_only_codex_home_receipt:", prompts)
+
     def test_peer_adapters_share_fail_closed_effective_profile_matrix(self) -> None:
         local = _read("local-codex-lane.md")
         contracts = _read("review-lane-contracts.md")

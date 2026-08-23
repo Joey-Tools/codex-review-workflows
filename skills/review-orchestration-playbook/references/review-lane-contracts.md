@@ -95,11 +95,20 @@ The parent must:
 For the Codex CLI adapter, self-policy isolation additionally requires:
 
 - automatic `AGENTS.md`, skills-catalogue, plugin, hook, and user/project-rule
-  loading to be suppressed by version-proven controls;
+  loading to be absent through version-proven controls plus isolated roots;
 - an owner-private empty neutral launch root outside the candidate and source
   checkout when the CLI cannot disable every project-config layer before read;
-- a pre/post neutral-root receipt and a version-bound instruction-surface
-  receipt; and
+- a fresh owner-private temporary auth-only `CODEX_HOME`, because the ordinary
+  home remains a global-`AGENTS.md` source even when the other controls are
+  active;
+- a fixed shell-environment policy that hides `CODEX_HOME` and ordinary
+  key/secret/token variables from model-issued subprocess environments, plus a
+  prompt prohibition on authentication credential discovery or model-tool
+  access to `auth.json`; this reduces discoverability but does not prove
+  filesystem deny-read separation from the Codex runtime that must authenticate
+  with that file;
+- pre/post neutral-root, auth-home, and version-bound instruction-surface
+  receipts; and
 - every candidate Markdown file consumed as guidance to be explicitly listed
   by the trusted parent prompt with its workspace-relative path, digest, and
   purpose (`review-subject`, `scoped-convention`, or `both`).
@@ -232,6 +241,14 @@ Read [local-codex-lane.md](local-codex-lane.md).
 - Record requested and effective adapter, model, and mode.
 - Record `effective_profile_basis` as `runtime-attested`,
   `accepted-pinned-launch`, `unknown`, or `mismatch`.
+- Every CLI adapter uses the temporary auth-only `CODEX_HOME` contract in
+  [local-codex-lane.md](local-codex-lane.md). Each CLI process gets a fresh
+  home that is destroyed rather than purged and reused. Routine gating uses the
+  credential-free capability/prompt probe, forced-file `login status`, and the
+  actual review exec's own structured terminal evidence—not an additional paid
+  exec preflight. A non-file credential source or unsafe copy/validation blocks
+  that adapter; selecting the peer subagent at the same requested profile
+  remains the same logical lane.
 - Switch adapters before lowering the mode. Moving to an older model family requires explicit user confirmation.
 - One invocation remains one logical lane even when Ultra delegates internally.
 

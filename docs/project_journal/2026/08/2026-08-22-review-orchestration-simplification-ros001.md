@@ -625,6 +625,52 @@ superseded_by:
   contracts, three skill validators, Action workflow syntax, JSON parsing,
   project-journal validation, and `git diff --check` also passed.
 
+### CLI global-guidance isolation correction
+
+- A final instruction-surface probe against signed head `0259e77` disproved
+  the candidate contract's last CLI assumption. Codex CLI 0.149.0 still
+  injected the probe `CODEX_HOME/AGENTS.md` marker while using a neutral launch
+  root, `project_doc_max_bytes=0`, disabled skills/plugins/hooks, and the other
+  supported guidance controls. The marker-free project and skill assertions
+  passed, so the failure was isolated to global-home discovery rather than the
+  neutral-root design.
+- Official OpenAI documentation establishes both relevant boundaries: global
+  `AGENTS.override.md`/`AGENTS.md` is selected from `CODEX_HOME`, while a
+  file-backed login cache is `auth.json` under that same directory and may be
+  copied as password-equivalent material. The chosen correction therefore does
+  not trust or allowlist ambient global guidance. Every canonical CLI process
+  instead receives a distinct owner-private temporary auth-only `CODEX_HOME`;
+  the ordinary home remains parent-only source state, and a file-store or safe
+  copy failure makes the CLI adapter unavailable so the peer subagent can be
+  selected without changing the logical lane.
+- The protected properties are source object identity and content stability,
+  credential confidentiality, non-owner replacement exclusion, and destination
+  access policy. Source `auth.json` is an owner-owned regular `0600` file;
+  parent-directory traverse/read bits are benign, while group/other write is
+  rejected. Parent-private no-follow identity/digest receipts bind the exact
+  descriptor copy. Credential bytes are used only by the trusted Codex runtime
+  and never enter prompts, events, or receipts; the contract explicitly does
+  not claim that a read-only sandbox proves runtime/model-tool deny-read
+  separation.
+- Parent probes confirmed that an auth-only home preserved the existing
+  ChatGPT login, removed all synthetic global/project/skill markers from
+  `debug prompt-input`, and completed a bounded GPT-5.6 Sol Ultra sentinel
+  execution. The original credential object's identity, metadata, and digest
+  remained stable; no credential bytes or digest are recorded in this tracked
+  journal. Runtime-created cache/tmp state is report-and-cleanup evidence only:
+  no home is purged or reused, and each process-specific home is destroyed.
+- Routine reviews do not pay for a second model execution. A credential-free
+  prompt/capability probe plus forced-file `login status` precedes the actual
+  review, and the review's own exact strict argv and structured terminal event
+  provide accepted-pinned-launch evidence. A minimal model diagnostic is
+  optional only when version, authentication, or flag behavior remains
+  uncertain and never counts as a review.
+- After this correction, the authoritative complete suite ran with
+  `ResourceWarning` promoted to an error outside the outer sandbox restriction:
+  all 3,052 tests passed, with six conditional skips, in 958.951 seconds. The
+  48 focused policy/carrier/CLI/manifest contracts, Ruff lint/format, skill
+  validation, project-journal validation, and `git diff --check` also passed.
+
 ## Next Steps
 
 - Use the final signed squash candidate head for secret admission and obtain a

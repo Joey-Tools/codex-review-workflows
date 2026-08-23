@@ -12,8 +12,8 @@ One requested lane has one parent-owned lane record:
 - selected adapter;
 - requested and effective model and Codex mode;
 - effective-profile evidence basis;
-- instruction-surface isolation and, for a self-policy CLI launch, the neutral
-  launch-root receipt;
+- instruction-surface isolation and, for every CLI launch, the neutral
+  launch-root and temporary auth-only `CODEX_HOME` receipts;
 - parent-owned `sanitized_git_argv_prefix` profile/digest, fixed Git
   path/version, workspace validation-receipt identity, prompt-delivery and
   read-only-boundary evidence, plus the Git-argv observation level the adapter
@@ -70,6 +70,13 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   disables plugins and hooks. A credential-free capability probe must prove
   those exact controls for the resolved CLI version before authenticated
   launch.
+- Never give a canonical CLI lane the ambient or ordinary user `CODEX_HOME`.
+  Codex CLI 0.149.0 automatically loads `AGENTS.override.md` or `AGENTS.md`
+  from that home even with a neutral launch root, `project_doc_max_bytes=0`,
+  skills/plugins/hooks disabled, and the normalized exec-only ignore flags.
+  Those flags therefore cannot isolate a guidance-bearing home.
+  This matches OpenAI's [global guidance discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+  contract: the global instruction file is selected from `CODEX_HOME`.
 - Never use the candidate workspace as a canonical CLI launch root. Codex CLI
   0.149.0 has no public flag that disables every project-config layer before
   read, so session overrides cannot make candidate `.codex/config.toml` or its
@@ -90,7 +97,107 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Capture the effective CLI version, model, mode, exit status, and bounded final output.
 - Treat an output or process limit, interactive prompt, sandbox failure, or ambiguous profile selection as inconclusive rather than clean.
 
-For the currently supported CLI surface, the normalized direct-argv shape is:
+#### Temporary auth-only Codex home
+
+For every canonical CLI process, create a different fresh, owner-private
+temporary `CODEX_HOME` outside the candidate workspace, source checkout, and
+neutral launch root. This includes `login status`, any optional diagnostic, and
+the actual review `exec`; a home is never purged and reused for another
+process. Set that exact absolute path through the direct child-process
+environment, never through a shell assignment or model-visible command. The
+task-created home itself must be a real directory owned by the launching user
+with exact mode `0700`, reached without following symlinks.
+
+The only accepted authentication interface is a current file-backed Codex
+login cache. Force the launched CLI to use
+`cli_auth_credentials_store="file"`. An active OS credential-store source, an
+environment API key, a login flow, a missing file, or a source whose active
+storage mode cannot be proved is `blocked-authentication` for the CLI adapter.
+The parent may select the peer subagent adapter with the same requested profile;
+that switch neither increments the lane count nor constitutes a model/mode
+downgrade. OpenAI's [authentication documentation](https://learn.chatgpt.com/docs/auth)
+defines file storage as `auth.json` under `CODEX_HOME` and explicitly supports
+copying that cache while treating it as a password.
+
+Treat the source `auth.json` as a secret object, not reviewer input. The parent
+control plane must:
+
+1. traverse every source path component without following symlinks and open
+   the final file with no-follow semantics;
+2. require the launching user's ownership, an ordinary regular file, exact
+   mode `0600`, and real parent directories owned by the launching user or a
+   separately trusted root identity with no group or other write bit;
+3. bind the source path-object identity, access policy, byte length, and
+   SHA-256 digest before copying, after copying, immediately before the
+   authenticated CLI process, and after that process exits;
+4. create destination `auth.json` exclusively as an ordinary `0600` file,
+   perform one descriptor-to-descriptor byte copy, and prove its initial byte
+   length and SHA-256 digest exactly equal the bound source snapshot; and
+5. re-open both paths with no-follow semantics at each boundary so replacement
+   cannot pass as ordinary content stability.
+
+A failed no-follow, ownership, mode, identity, digest, copy, or source-stability
+check is `blocked-safety` for that CLI adapter.
+
+The protected properties are source object identity and content stability,
+credential confidentiality, exclusion of non-owner path replacement, and the
+destination's access policy. Source-directory group/other traverse or read bits
+are not mutation evidence and are allowed; a group/other write bit is not. File
+mode `0600` protects credential bytes, while trusted ownership plus non-writable
+real path components protects the selected object from non-owner replacement.
+Identity and access metadata alone do not prove content stability, so the
+receipt binds both identity and digest. The copy must not be a symlink, hard
+link, mount alias, or other shared writable object. The control plane may stream
+the bytes only between already validated descriptors and the parent-private
+digest calculation. Raw credential bytes are Codex runtime authentication
+material only: the control plane never parses or prints them, and they never
+enter the prompt, events, or receipt. The Codex runtime must read the temporary
+`auth.json`; this is a trusted-processor boundary, not OS-level credential
+isolation. The reviewer prompt must prohibit authentication credential
+discovery and every model or tool attempt to read, search for, or output the
+temporary `CODEX_HOME`, its `auth.json`, credential contents, or credential-store
+paths. A read-only sandbox and an unadvertised random path do not by themselves
+prove deny-read separation between runtime authentication and model-issued
+tools. Only an opaque auth-home receipt identity and status enter review
+metadata.
+
+Immediately before an authenticated CLI process, its new temporary home's
+inventory is exactly `auth.json`; the credential-free debug home's inventory is
+exactly empty. Neither prelaunch form may contain `AGENTS.override.md`,
+`AGENTS.md`, `config.toml`, skills, plugins, rules, hooks, session history, or
+another pre-existing file or directory.
+
+Postlaunch inventory is report-and-cleanup evidence, not a closed allowlist or
+input to another process. CLI 0.149.0 has been observed to create ordinary
+state including `installation_id`, `.sandbox_migration`, `cache`,
+`models_cache.json`, `shell_snapshots`, and `tmp`; record only path names,
+types, ownership, and access policy without reading contents. Do not treat a new
+ordinary cache/tmp name by itself as an instruction-surface failure. Any
+`AGENTS*`, config, skill, plugin, rule, or hook path is a safety finding that
+invalidates the attempt because it could become guidance. Classify a session or
+history path as sensitive process state, report it, and never inspect or reuse
+it. Regardless of inventory, delete the entire process-specific home without
+following links as soon as its status/evidence is captured. Never purge a home
+for reuse and never carry any postlaunch state into another process.
+
+Codex may refresh or replace the temporary `auth.json` within its one owning
+process. At exit, bind the refreshed object's identity, access policy, length,
+and digest and require it still to be an ordinary owner-owned `0600` file under
+the same private home. Never copy a refreshed value back to the source or into
+the next process's home. The original source must retain its bound pre-launch
+identity and digest, although that stability does not by itself attribute an
+unrelated external mutation. After the process, remove the whole home without
+inspecting credential bytes; incomplete credential cleanup prevents a clean
+CLI result.
+
+For the currently supported CLI surface, the normalized direct child-process
+environment binding is:
+
+```text
+child environment: CODEX_HOME=<absolute-owner-private-temporary-auth-only-home>
+```
+
+The normalized direct-argv shape is:
 
 ```text
 <absolute-codex> exec
@@ -103,6 +210,9 @@ For the currently supported CLI surface, the normalized direct-argv shape is:
   -c project_doc_max_bytes=0
   -c skills.include_instructions=false
   -c skills.bundled.enabled=false
+  -c cli_auth_credentials_store="file"
+  -c shell_environment_policy.filters={CODEX_HOME="exclude"}
+  -c shell_environment_policy.ignore_default_excludes=false
   -s read-only
   -m gpt-5.6-sol
   -c model_reasoning_effort="ultra"
@@ -112,38 +222,75 @@ For the currently supported CLI surface, the normalized direct-argv shape is:
   -
 ```
 
-The prompt and sanitized Git prefix bind the absolute validated workspace; the
-CLI launch cwd never does. Do not use `--add-dir`, a project profile, or a
-candidate-provided configuration file to bridge the two directories.
+The parent sets that environment entry through the direct process API and
+removes credential-bearing authentication environment variables. The fixed
+shell-environment policy removes `CODEX_HOME` from model-issued subprocess
+environments and enables the CLI's automatic exclusions for variable names
+containing `KEY`, `SECRET`, or `TOKEN`. This lowers tool-side discoverability;
+it is not a filesystem deny-read control and does not turn the read-only
+sandbox into runtime/model-tool separation. The prompt and sanitized Git prefix
+bind the absolute validated workspace; the CLI launch cwd never does. Do not
+use `--add-dir`, a project profile, or a candidate-provided configuration file
+to bridge the two directories.
 
 The parent must retain a version-bound instruction-surface receipt. Prefer a
 credential-free model-visible prompt probe when the selected CLI exposes one;
 otherwise use an equivalently strong, version-reviewed capability artifact.
-The receipt must show that automatic `AGENTS.md` content and the skills
-catalogue are absent, the listed config/feature overrides were accepted under
-`--strict-config`, the neutral launch directory supplied no project config, and
-the exact `exec` launch used both ignore flags. Built-in model, permission, and
-platform developer messages may remain; record them as the version-bound CLI
-baseline rather than claiming total prompt isolation.
+The receipt must show that automatic global/project `AGENTS.md`, project config
+or developer instructions, and skills-catalogue content are absent; the listed
+config/feature overrides were accepted under `--strict-config`; the neutral
+launch directory supplied no project config; the exact `exec` launch used both
+ignore flags; and the process environment bound the validated temporary
+auth-only home. Built-in model, permission, and platform developer messages may
+remain; record them as the version-bound CLI baseline rather than claiming
+total prompt isolation.
 
 For CLI 0.149.0, run `codex debug prompt-input` as a direct process against a
-separate parent-owned probe root and probe `CODEX_HOME`. Populate the probe home
-with unique synthetic global `AGENTS.md` and personal-skill markers, but no
-real authentication, config instructions, project config, or user content.
-Use a fixed sentinel prompt and the same two `--disable` plus three `-c`
-guidance overrides. That probe needs no authentication and verifies only the
-model-visible guidance controls it accepts: its JSON must contain none of the
-synthetic markers or an automatic skills block. Destroy the probe inputs after
-recording the receipt.
+separate owner-private neutral probe root. A version-bound hostile-home control
+must first record the known behavior: when the probe's own `CODEX_HOME`
+contains a unique synthetic global `AGENTS.md` marker, 0.149.0 injects that
+marker despite the other normalized guidance controls. This control never uses
+real credentials and is never the formal review home.
+
+Run the formal debug probe with a fresh empty temporary `CODEX_HOME` created
+under the same private-directory and no-follow contract as the auth-only home;
+omit `auth.json` because `debug prompt-input` needs no authentication. Put
+distinct synthetic global-home, project-document/config, and skill-catalogue
+markers only in sacrificial sources outside that active home and neutral root.
+Use a fixed sentinel prompt and the same two `--disable` plus three guidance
+`-c` overrides. The probe verifies only the model-visible guidance controls it
+accepts: its JSON must contain none of the global, project, or skill markers and
+no automatic skills block. Destroy every probe input after recording the
+receipt.
 
 `debug prompt-input` does not accept the exec-only `--strict-config`,
 `--ignore-user-config`, or `--ignore-rules` flags. Prove their availability
-with the resolved version's help/capability output, then prove strict parsing
-and actual use with the exact authenticated `exec` argv and event stream. The
-neutral launch root, rather than a contradictory probe assertion, prevents
-candidate project config from entering the instruction stack. The debug probe
-does not prove the later service request by itself; the exact authenticated
-argv and pre/post receipts complete the evidence chain.
+with the resolved version's help/capability output. For each review, run a
+credential-preserving `codex login status` check with its own fresh auth-only
+home and the literal direct argv
+`<absolute-codex> -c cli_auth_credentials_store="file" login status`; retain
+only its exit/classification, never credential content, then destroy that home.
+A login prompt, fallback credential source, or authentication failure blocks
+that CLI adapter. The status check does not prove model execution.
+
+The actual review `exec` receives its own fresh auth-only home, distinct from
+every status or diagnostic home. Its exact argv, successful `--strict-config`
+parsing, and complete structured terminal event prove actual flag use and the
+accepted pinned execution profile. Do not run a separate paid model `exec`
+preflight on every review. Only when version,
+authentication, or flag behavior remains uncertain after the credential-free
+probe, capability evidence, and `login status` may the parent run one minimal
+real-`exec` diagnostic with its own fresh home and a fixed non-repository
+sentinel. That optional diagnostic does not count as a review and is not a
+clean-result prerequisite; it never substitutes for the actual review's own
+structured evidence.
+
+The neutral launch root prevents candidate project config from entering the
+instruction stack, while the temporary auth-only home prevents the independent
+global-home guidance injection. Neither boundary substitutes for the other.
+The debug probe and login status do not prove the later service request by
+themselves; the exact review argv, its structured terminal event, the review
+process's auth-home receipt, and pre/post receipts complete the evidence chain.
 
 Keep every Codex argument literal. Write the exact UTF-8 prompt bytes to the child's stdin descriptor and then close it; `-` is the explicit stdin-prompt selector. The prompt carries the full `base_sha` and `head_sha`, while the validated detached `HEAD` is the same full `head_sha`.
 
@@ -155,7 +302,13 @@ The CLI lane receipt binds the resolved binary/version, exact argv projection,
 prompt transport (`direct-stdin` or `hashed-file-redirection`), prompt file
 identity when applicable, prompt byte length and SHA-256 digest before and after launch, workspace prepare/validate receipt digests, base/head, process
 exit, output digest, instruction-surface receipt, neutral launch-root receipt
-when applicable, and any runtime-reported effective model/mode. It also records
+when applicable, review-process auth-only home receipt, login-status result,
+credential cleanup status, an optional diagnostic result when one was actually
+needed, and any runtime-reported effective model/mode. The parent-private
+auth-home receipt binds the source pre/post
+identity/access/digest checks, initial exact-copy proof, temporary-home
+inventory and environment binding, any accepted temporary refresh, and final
+destruction without exposing credential bytes. The lane receipt also records
 the `sanitized-git-argv-prefix-v1` digest, fixed Git path/version, canonical
 workspace and validation-receipt identity, verified prompt delivery,
 established read-only adapter boundary, actual tool-event coverage (`complete`,
@@ -172,7 +325,9 @@ Use this effective-profile outcome matrix for both peer adapters:
 
 For the CLI, `accepted-pinned-launch` requires a version-proven exact argv,
 successful parsing under `--strict-config`, zero process status, a complete
-structured terminal event, and no error, substitution, or downgrade signal.
+structured terminal event, valid neutral-root/instruction-surface/auth-home
+receipts, complete credential cleanup, and no error, substitution, or downgrade
+signal.
 For the subagent, it requires the trusted role digest, exact zero-context
 `reviewer` launch, host acceptance, and no contradictory host telemetry. If
 the runtime exposes no effective-profile field and either adapter cannot meet
@@ -226,18 +381,29 @@ When the first adapter cannot realize the intended profile:
 2. If both adapters cannot realize `ultra` on the same model, use the highest supported lower mode only when the review can still be meaningfully completed; record the downgrade prominently.
 3. Do not move to an older model family without explicit user confirmation.
 
-A transient adapter or service failure is retryable. A stable rejected profile with no authorized fallback is blocked. An unproved effective profile is inconclusive; never report it as the requested profile.
+A transient adapter or service failure is retryable. A CLI adapter that cannot
+prove a file-backed credential source or construct and validate its temporary
+auth-only home is blocked, but the parent may choose the peer subagent at the
+same requested profile without changing the logical lane. A stable rejected
+profile with no authorized fallback is blocked. An unproved effective profile
+is inconclusive; never report it as the requested profile.
 
 ## Launch Sequence
 
 1. Freeze the committed range and choose one adapter.
 2. Prepare a lane-unique workspace through [review-workspace.md](review-workspace.md).
 3. Validate the same workspace and endpoints immediately before launch.
-4. For a self-policy migration, bind the prior trusted installed bundle as described in [review-lane-contracts.md](review-lane-contracts.md).
-5. Launch the reviewer with [review-prompt-templates.md](review-prompt-templates.md).
-6. Let the reviewer load only the parent-enumerated applicable guidance and inspect the diff itself.
-7. Classify the bounded terminal output.
-8. Clean up the workspace by default and record the cleanup result.
+4. For a CLI adapter, validate the version-bound credential-free
+   instruction-surface/capability receipt, run `login status` in its own fresh
+   auth-only home, record the result, and destroy that home.
+5. Run a minimal real-`exec` diagnostic in another fresh home only when the
+   version, authentication, or flag behavior remains uncertain.
+6. For a self-policy migration, bind the prior trusted installed bundle as described in [review-lane-contracts.md](review-lane-contracts.md).
+7. Launch the reviewer with [review-prompt-templates.md](review-prompt-templates.md); a CLI review gets a newly created auth-only home not used above.
+8. Let the reviewer load only the parent-enumerated applicable guidance and inspect the diff itself.
+9. Classify the bounded terminal output.
+10. Clean up the workspace and every temporary credential/probe directory by
+   default and record both cleanup results.
 
 Do not give the reviewer a prebuilt full diff, parent findings, another reviewer's output, or untracked/private files.
 
