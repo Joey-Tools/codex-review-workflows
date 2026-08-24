@@ -6397,6 +6397,255 @@ class ReviewWorkspaceTest(unittest.TestCase):
             if prepared.root.exists():
                 self.cleanup(prepared)
 
+    def test_object_integrity_selector_close_control_flow_still_settles_lease(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "object-selector-close-control-flow",
+            self.commits[1],
+            self.commits[2],
+        )
+        original_close = workspace_runtime.selectors.DefaultSelector.close
+        original_settle = workspace_runtime.OwnedProcessLease.settle
+        close_error = KeyboardInterrupt("fixture selector close interruption")
+        settlement_called = False
+
+        def fail_close(selector: object) -> None:
+            original_close(selector)
+            raise close_error
+
+        def observe_settle(lease: object, **kwargs: object) -> None:
+            nonlocal settlement_called
+            settlement_called = True
+            original_settle(lease, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.selectors.DefaultSelector,
+                    "close",
+                    new=fail_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime.OwnedProcessLease,
+                    "settle",
+                    new=observe_settle,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertIs(caught.exception, close_error)
+            self.assertTrue(settlement_called)
+            self.assertFalse(
+                workspace_runtime.process_quiescence_unproven(caught.exception)
+            )
+            self.assertFalse(
+                tuple(
+                    prepared.root.parent.glob(
+                        f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                    )
+                )
+            )
+        finally:
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
+    def test_object_integrity_selector_close_primary_retains_unquiesced_workspace(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "object-selector-close-process-leak",
+            self.commits[1],
+            self.commits[2],
+        )
+        original_close = workspace_runtime.selectors.DefaultSelector.close
+        close_error = KeyboardInterrupt("fixture selector close interruption")
+
+        def fail_close(selector: object) -> None:
+            original_close(selector)
+            raise close_error
+
+        with (
+            mock.patch.object(
+                workspace_runtime.selectors.DefaultSelector,
+                "close",
+                new=fail_close,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_process_group_exists",
+                return_value=True,
+            ),
+            mock.patch.object(workspace_runtime, "terminate_process_group"),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            validate_workspace(
+                prepared.root,
+                self.commits[1],
+                self.commits[2],
+            )
+        self.assertEqual(
+            caught.exception.reason,
+            "workspace-range-object-process-leak",
+        )
+        self.assertIs(caught.exception.__cause__, close_error)
+        self.assertTrue(workspace_runtime.process_quiescence_unproven(caught.exception))
+        self.assertTrue(prepared.root.is_dir())
+        recovery = workspace_runtime._partial_workspace_recovery_payload(
+            caught.exception
+        )
+        self.assertIsNotNone(recovery)
+        assert recovery is not None
+        control = recovery["partial_recovery_control"]
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_process_start_identity",
+                side_effect=ProcessLookupError,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_process_group_exists",
+                return_value=False,
+            ),
+        ):
+            workspace_runtime.recover_partial_workspace(
+                pathlib.Path(control["path"]),
+                control["sha256"],
+            )
+        self.assertTrue(prepared.root.is_dir())
+
+    def test_object_integrity_selector_close_reason_survives_revalidation_failure(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "object-selector-close-revalidation",
+            self.commits[1],
+            self.commits[2],
+        )
+        original_close = workspace_runtime.selectors.DefaultSelector.close
+        original_revalidate = workspace_runtime._WorkspaceControlBinding.revalidate
+        close_error = KeyboardInterrupt("fixture selector close interruption")
+        revalidation_error = PermissionError("fixture control revalidation failure")
+        close_failed = False
+
+        def fail_close(selector: object) -> None:
+            nonlocal close_failed
+            original_close(selector)
+            close_failed = True
+            raise close_error
+
+        def fail_revalidate(binding: object) -> None:
+            if close_failed:
+                raise revalidation_error
+            original_revalidate(binding)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.selectors.DefaultSelector,
+                    "close",
+                    new=fail_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime._WorkspaceControlBinding,
+                    "revalidate",
+                    new=fail_revalidate,
+                ),
+                self.assertRaises(PermissionError) as caught,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertIs(caught.exception, revalidation_error)
+            self.assertIs(caught.exception.__cause__, close_error)
+        finally:
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
+    def test_object_integrity_selector_close_failure_is_secondary_to_verification(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "object-selector-close-secondary",
+            self.commits[1],
+            self.commits[2],
+        )
+        original_close = workspace_runtime.selectors.DefaultSelector.close
+        original_settle = workspace_runtime.OwnedProcessLease.settle
+        primary = ReviewWorkspaceError(
+            "fixture-object-verification-failure",
+            "fixture object verification failure",
+        )
+        close_error = PermissionError("fixture selector close failure")
+        settlement_called = False
+
+        def fail_select(*_args: object, **_kwargs: object) -> object:
+            raise primary
+
+        def fail_close(selector: object) -> None:
+            original_close(selector)
+            raise close_error
+
+        def observe_settle(lease: object, **kwargs: object) -> None:
+            nonlocal settlement_called
+            settlement_called = True
+            original_settle(lease, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.selectors.DefaultSelector,
+                    "select",
+                    side_effect=fail_select,
+                ),
+                mock.patch.object(
+                    workspace_runtime.selectors.DefaultSelector,
+                    "close",
+                    new=fail_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime.OwnedProcessLease,
+                    "settle",
+                    new=observe_settle,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertIs(caught.exception, primary)
+            self.assertTrue(settlement_called)
+            self.assertIn(
+                "object verifier selector close failed: PermissionError",
+                getattr(caught.exception, "__notes__", ()),
+            )
+            self.assertFalse(
+                workspace_runtime.process_quiescence_unproven(caught.exception)
+            )
+            self.assertFalse(
+                tuple(
+                    prepared.root.parent.glob(
+                        f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                    )
+                )
+            )
+        finally:
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
     def test_post_root_git_process_leak_retains_partial_workspace(self) -> None:
         destination = self.root / "post-root-git-process-leak-workspace"
         real_capture = workspace_runtime.run_bounded_capture

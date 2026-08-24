@@ -1209,11 +1209,61 @@ superseded_by:
   `ResourceWarning`-as-error policy outside the outer restriction; all 3,116
   tests passed with six conditional skips in 1,118.931 seconds.
 
+### Formal review remediation after `5a924cf`
+
+- Signed head `5a924cf9292a07abc2314a55fe858e1346eea8fe` received a fresh,
+  non-resumed, ephemeral GPT-5.6 Sol Ultra Codex CLI review in a newly
+  materialized host-bound workspace. The reviewer found one P1 cleanup defect:
+  `_verify_range_object_contents()` called `selector.close()` before entering
+  the mandatory `OwnedProcessLease.settle()` path. A selector-close exception,
+  including a main-thread forwarded-signal control-flow exception, could
+  therefore leave the lease worker waiting forever, orphan the verifier's
+  `git cat-file --batch` process, and let ordinary rollback remove a workspace
+  whose process-group quiescence had not been proved. That head did not pass
+  local review and none of its review evidence will be reused for a later head.
+- The review attempt itself passed its post-run evidence gates. The prior
+  trusted bundle manifest remained
+  `d12328d7a2da38c7c2edc58287a194faedbc4a37587ca047dbd48db34ac0a5b9`;
+  materialization and revalidation retained 14 commits, 13 parent edges,
+  parent-graph digest
+  `b416e281d9e09760ee15c226770038f9441aaab84fd159f2c2ef1daa1d3f6784`,
+  and local-config digest
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 606-event JSON stream ended in `turn.completed`; all 58 Git calls used
+  the exact parent-bound sanitized prefix and no bare Git invocation appeared.
+  Prompt bytes retained SHA-256
+  `95614a8df2639bd3340bf9f072ca5dc12f3bd284630af935e23734b7c0b413ce`.
+  The source authentication object remained exact, no guidance-bearing path
+  appeared in the temporary auth home, the neutral launch root remained empty,
+  and the temporary auth home was removed after verification.
+- Selector teardown now captures its own `BaseException` inside an outer
+  `finally` whose mandatory action is lease settlement. A close-only failure is
+  the cleanup primary; an earlier verification failure remains primary and
+  receives close failure as a secondary diagnostic. Quiescence-unproven
+  settlement raises the synthetic process-leak result from that exact primary
+  and retains the recovery control/workspace. A later control revalidation
+  failure remains the safety-primary result but explicitly retains the prior
+  selector/verification failure as its cause.
+- Four new fault-injection cases cover close-only control flow, close-only plus
+  forced process-group non-quiescence and retained recovery state,
+  verification-plus-close dual failure, and close-plus-control-revalidation
+  dual failure. Together with the adjacent release-publication regression, the
+  five exact tests passed in 13.120 seconds. The complete
+  `test_review_workspace.py` file then passed all 154 tests in 188.564 seconds.
+  An independent read-only audit found no remaining blocker in this P1 scope;
+  the broader problem of masking asynchronous signals around every cleanup
+  opcode would require a separate lease-API redesign and is not part of this
+  remediation.
+- The authoritative post-fix complete suite ran outside the nested macOS
+  sandbox with `ResourceWarning` promoted to an error. All 3,120 tests passed
+  with six conditional skips in 1,128.061 seconds.
+
 ## Next Steps
 
-- Sign the corrected head, rerun exact-head secret admission and one fresh whole-range
-  GPT-5.6 Sol Ultra Codex review under the prior trusted release, then complete
-  PR 108's current-head GitHub lane, CI, final reread, and squash merge.
+- Sign the corrected head, rerun exact-head secret admission and one fresh
+  whole-range GPT-5.6 Sol Ultra Codex review under the prior trusted release,
+  then complete PR 108's current-head GitHub lane, CI, final reread, and squash
+  merge.
 - Merge the private companion and generated sync PR, confirm the immutable
   private-overlay release, run the local installer, and record the final merge,
   release, and installation identities here.
@@ -1226,14 +1276,16 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-07-large-repo-range-materialization-wme001.md`.
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
-- Final full `python3 -W error::ResourceWarning -m unittest discover`
-  review-playbook suite (`3,116` tests, `6` conditional skips, `1,118.931`
-  seconds) outside the outer sandbox restriction. The corresponding restricted
-  probe reached one environment-only nested-broker failure, whose exact test
-  passed separately in `1.990` seconds before the authoritative full rerun.
-  The earlier stable tree passed `3,112` tests with the same six skips in
-  `1,000.276` seconds; the prior signed `2e89971` checkpoint passed `3,010`
-  tests with the same six skips in `999.845` seconds.
+- Final post-fix full
+  `python3 -B -W error::ResourceWarning -m unittest discover` review-playbook
+  suite (`3,120` tests, `6` conditional skips, `1,128.061` seconds) outside the
+  nested macOS sandbox restriction. The preceding stable tree passed `3,116`
+  tests with the same six skips in `1,118.931` seconds. Its corresponding
+  restricted probe reached one environment-only nested-broker failure, whose
+  exact test passed separately in `1.990` seconds before that authoritative
+  full rerun. The earlier stable tree passed `3,112` tests with the same six
+  skips in `1,000.276` seconds; the prior signed `2e89971` checkpoint passed
+  `3,010` tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
   matrix (`77` focused policy, distribution, carrier, report, and self-policy

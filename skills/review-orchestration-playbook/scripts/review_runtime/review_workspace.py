@@ -6489,20 +6489,35 @@ def _verify_range_object_contents(
         verification_error = error
         raise
     finally:
-        selector.close()
+        selector_error: BaseException | None = None
         process_leak: ReviewWorkspaceError | None = None
         settlement_error: BaseException | None = None
         release_error: BaseException | None = None
         recovery_payload: dict[str, object] | None = None
         try:
-            process_lease.settle(
-                primary_error=verification_error,
-                cleanup_signal=signal.SIGKILL,
-                grace_seconds=5.0,
+            try:
+                selector.close()
+            except BaseException as error:
+                selector_error = error
+        finally:
+            primary_error = (
+                verification_error if verification_error is not None else selector_error
             )
-        except BaseException as error:
-            settlement_error = error
-        unsafe_error = settlement_error or verification_error
+            try:
+                process_lease.settle(
+                    primary_error=primary_error,
+                    cleanup_signal=signal.SIGKILL,
+                    grace_seconds=5.0,
+                )
+            except BaseException as error:
+                settlement_error = error
+        if selector_error is not None and verification_error is not None:
+            _attach_workspace_diagnostic(
+                verification_error,
+                "object verifier selector close failed: "
+                f"{type(selector_error).__name__}",
+            )
+        unsafe_error = settlement_error or primary_error
         if unsafe_error is not None and process_quiescence_unproven(unsafe_error):
             if not control_binding_published:
                 try:
@@ -6630,9 +6645,9 @@ def _verify_range_object_contents(
             try:
                 partial_control.release_process(process_binding)
             except BaseException as error:
-                if verification_error is not None:
+                if primary_error is not None:
                     _attach_workspace_diagnostic(
-                        verification_error,
+                        primary_error,
                         "partial recovery process release failed: "
                         f"{type(error).__name__}",
                     )
@@ -6652,6 +6667,8 @@ def _verify_range_object_contents(
                 else:
                     mark_process_quiescence_unproven(revalidation_error)
                     _mark_partial_workspace_for_retention(revalidation_error)
+            if primary_error is not None:
+                raise revalidation_error from primary_error
             raise
         finally:
             retain_control = process_leak is not None
@@ -6659,10 +6676,7 @@ def _verify_range_object_contents(
                 partial_control.close(retain=retain_control)
             except BaseException as control_error:
                 selected_error = (
-                    process_leak
-                    or settlement_error
-                    or verification_error
-                    or release_error
+                    process_leak or settlement_error or primary_error or release_error
                 )
                 if selected_error is None:
                     raise
@@ -6672,11 +6686,13 @@ def _verify_range_object_contents(
                     f"{type(control_error).__name__}",
                 )
         if process_leak is not None:
-            raise process_leak from verification_error
+            raise process_leak from primary_error
         if settlement_error is not None:
-            raise settlement_error from verification_error
+            raise settlement_error from primary_error
         if release_error is not None:
             raise release_error
+        if selector_error is not None and verification_error is None:
+            raise selector_error
 
 
 def _validate_range_manifest(
