@@ -363,6 +363,77 @@
         "url",
         "channel"
       ],
+      "complete_pr_snapshot": [
+        "owner",
+        "status",
+        "initial_scope",
+        "final_scope",
+        "initial_page_inventory",
+        "final_page_inventory",
+        "initial_terminal_selection",
+        "final_terminal_selection",
+        "initial_basis_selection",
+        "final_basis_selection",
+        "unresolved_provider_findings",
+        "initial_snapshot_sha256",
+        "final_snapshot_sha256"
+      ],
+      "complete_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count",
+        "reactions_pages_complete",
+        "reaction_count",
+        "check_runs_pages_complete",
+        "check_run_count",
+        "commit_statuses_pages_complete",
+        "commit_status_count",
+        "trustworthy_terminal_count"
+      ],
+      "terminal_selection": [
+        "classification",
+        "evidence"
+      ],
+      "basis_selection": [
+        "kind",
+        "terminal_evidence",
+        "reaction",
+        "merge_status"
+      ],
+      "reaction_basis_selection": [
+        "request_kind",
+        "request_id",
+        "request_url",
+        "request_command",
+        "request_server_time",
+        "reaction_id",
+        "reaction_url",
+        "reaction_content",
+        "reaction_actor_login",
+        "reaction_actor_type",
+        "reaction_server_time"
+      ],
+      "merge_status_basis_selection": [
+        "id",
+        "url",
+        "check_name",
+        "status",
+        "conclusion",
+        "artifact_commit",
+        "app",
+        "server_time",
+        "server_time_field",
+        "head_binding",
+        "contract",
+        "provider_clean_evidence"
+      ],
       "reaction_clean_epoch": [
         "owner",
         "status",
@@ -415,6 +486,17 @@
       ]
     },
     "parent_input_rules": {
+      "complete_pr_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from complete raw selected-PR observations before report validation; read-only to the consumer and never derived from report, evidence, association, or merge-status fields",
+        "scope_binding": "initial_scope and final_scope are type-preserving equal closed selected_pr_scope values exactly equal to the independently selected report repository, pull request, and current head",
+        "page_state": "initial_page_inventory and final_page_inventory are type-preserving equal closed complete_page_inventory values; issue comments, reviews, associated inline comments, GraphQL review threads, every nested thread-comment page, reactions on every candidate review request, check runs, and commit statuses each have an exact true completion flag and a typed non-negative integer count",
+        "terminal_selection": "initial_terminal_selection and final_terminal_selection are type-preserving equal closed terminal_selection values selected under version-1 precedence; terminal-clean and merge-status pass require classification clean with a complete evidence projection exactly equal to the report terminal artifact or merge-status provider_clean_evidence, while reaction-clean requires classification absent and null evidence",
+        "basis_selection": "initial_basis_selection and final_basis_selection are type-preserving equal closed basis_selection values frozen from the complete raw snapshot and selected independently before report validation; terminal-clean binds the exact terminal evidence, reaction-clean binds the exact request and provider reaction actor/IDs/URLs/times from reaction_clean_epoch, and merge-status binds the exact check run/App/head/status/conclusion, producer-contract descriptor, and associated provider-clean evidence from the report and merge_status_parent_contract; report, epoch, association, and contract fields cannot self-prove or repair this selection",
+        "finding_state": "unresolved_provider_findings is integer zero for every pass basis",
+        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal result, the independently selected pass-basis projection, unresolved applicable findings, and check/status records; they are not digests of report summaries"
+      },
       "reaction_clean_epoch": {
         "owner": "parent-orchestrator",
         "status": "complete",
@@ -467,6 +549,18 @@
       "warning",
       "unknown",
       "not-applicable"
+    ],
+    "terminal_selection_classification_values": [
+      "clean",
+      "findings",
+      "resolved-inline",
+      "malformed",
+      "absent"
+    ],
+    "basis_selection_kind_values": [
+      "terminal-clean",
+      "reaction-clean",
+      "merge-status"
     ],
     "unresolved_provider_findings_rules": {
       "entry_profile": "unresolved_provider_finding",
@@ -530,6 +624,7 @@
         "stable_identity": "positive evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<evidence-ID> for issue-comment or pullrequestreview-<evidence-ID> for review",
         "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
         "parent_identity_input": "separate closed parent-owned terminal identity whose kind, evidence ID, URL, and channel equal the report evidence",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, unique latest trustworthy clean terminal selection, exact stable terminal-clean basis selection, and zero unresolved applicable findings; report fields cannot supply or repair this input",
         "artifact_commit": "required-full-sha-equals-report-head",
         "head_binding": "explicit-commit"
       },
@@ -540,6 +635,7 @@
         "request_relation": "positive request_id equals the parent request comment ID encoded by the URL fragment",
         "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
         "parent_identity_input": "separate closed parent-owned reaction_clean_epoch whose four selected-PR scope snapshots equal the report scope and whose exact request, reaction, actor, semantic times, complete pages, exclusion flags, and zero-unresolved count bind the report evidence",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, stable absence of a trustworthy terminal artifact, exact stable reaction-clean request/reaction/actor/time basis selection, and zero unresolved applicable findings; epoch or report fields cannot supply or repair this input",
         "artifact_commit": null,
         "head_binding": "stable-request-epoch"
       },
@@ -570,6 +666,7 @@
         "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
         "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
         "parent_contract_input": "separate closed parent-owned record whose contract-descriptor UTF-8 bytes, trusted App ID and slug, exact check name, check-run ID and URL, and provider-clean evidence ID and URL equal the report association",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, unique latest trustworthy clean terminal selection equal to provider_clean_evidence, exact stable merge-status check/App/head/status/conclusion/producer-contract/provider-clean basis selection, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
         "provider_clean_channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
         "association": "complete parent-owned binding of this exact check run to one accepted current-head provider clean result and independently verified producer-contract bytes"
       },

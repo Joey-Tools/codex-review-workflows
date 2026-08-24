@@ -155,8 +155,12 @@ superseded_by:
   before merging**. It is distinct from **Require linear history**. When the
   former blocks a PR and a merge queue is not responsible for freshness, merge
   the current base branch into the feature branch; do not infer a rebase or
-  force-push requirement. The resulting new head invalidates all prior
-  head-bound test, review, CI, conversation, and final-reread evidence.
+  force-push requirement. The resulting new head invalidates prior positive,
+  pass, and clean evidence plus every head-bound readiness gate, so tests,
+  review, GitHub/CI, conversation, policy, and final-reread gates all run again.
+  An ancestry-proven unresolved provider finding that still applies to the new
+  head remains blocking until a typed resolution or accepted later corrective
+  artifact clears it.
 - Obsolete public review entrypoints and their standalone reference are removed
   so the new skill cannot route agents back to them. Unadvertised internal
   compatibility code remains temporarily to avoid a risky one-shot deletion;
@@ -975,12 +979,62 @@ superseded_by:
   authentication file was unchanged, and the one-time auth-only home was
   destroyed. A new signed head must receive a fresh host-bound review.
 
+### Final policy closure after `4c8636d`
+
+- Signed head `4c8636d17e16773f6445b3ff34f1d77adb72c22a` received a fresh
+  host-bound GPT-5.6 Sol Ultra CLI review under the independently trusted
+  pre-migration release. The reviewer found three policy defects: the positive
+  GitHub result did not bind a complete stable PR snapshot, an observed target
+  base change did not invalidate all non-provider readiness gates, and the
+  self-policy contract could not express Joey's selected local-Codex-only use
+  of an applicable candidate `AGENTS.md` as both scoped convention and review
+  subject. No clean result from that head is reused.
+- The complete snapshot now closes initial and final parent-owned inventories,
+  terminal selection, unresolved-finding/thread state, and the exact positive
+  basis. Terminal, reaction fallback, and preferred merge/status paths each
+  bind their own independently selected IDs, URLs, actors/apps, times, head,
+  and producer contract before joining the lane report. Coupled report plus
+  reaction/check mutation, open fields, missing projections, and initial/final
+  drift all fail closed. The 61-test carrier/recovery/contract matrix and an
+  independent fresh-context audit passed with `No findings.`.
+- Self-policy migration now derives a closed
+  `candidate-markdown-required-subject-set-v1` directly from the frozen range
+  and binds its base, head, path count, and canonical ordered-path digest into
+  parent, prompt, and lane-report projections. The exact candidate Markdown
+  inventory must reproduce that independent set, and local Codex admission
+  must reproduce the inventory. Only a parent-proved applicable candidate
+  `AGENTS.md` may use `purpose: both` with
+  `role: scoped-convention-and-review-subject`; every other candidate Markdown
+  remains review-subject only. Claude obeys only prior trusted external
+  guidance and treats every candidate file, including `AGENTS.md`, solely as
+  review subject. Empty/subset/superset inventories, same-cardinality path
+  substitution, coupled omission, byte drift, and open-field variants are
+  rejected. The 44-test self-policy/contract matrix and two independent audits
+  passed with `No findings.`.
+- GitHub's exact **Require branches to be up to date before merging** setting
+  remains explicitly distinct from **Require linear history**. When no merge
+  queue owns freshness, a signed base-to-feature merge is the supported branch
+  update. The new head reacquires tests, local review, GitHub review, CI,
+  conversations, policy, and final reread. Only old-head positive/pass/clean
+  evidence becomes stale; an ancestry-proven unresolved provider finding that
+  still applies remains blocking. A final independent Q44 audit found and
+  removed one residual merge-queue phrase that had incorrectly said all
+  old-head evidence was invalidated. The contract now rejects that broad phrase
+  across both the top-level skill and the complete readiness reference; the
+  final audit returned `No findings.`.
+- The combined focused policy matrix passed 73 tests. Ruff lint and format,
+  reviewer TOML parsing, terminal-carrier JSON parsing, skill validation,
+  project-journal validation, and `git diff --check` also passed. The
+  authoritative complete suite then ran outside the nested macOS sandbox
+  restriction with `ResourceWarning` promoted to an error: all 3,095 tests
+  passed with six conditional skips in 1,148.966 seconds.
+
 ## Next Steps
 
-- Sign and push the cross-platform CI correction, rerun exact-head secret
-  admission and a fresh whole-range GPT-5.6 Sol Ultra Codex review under the
-  prior trusted release, then complete PR 108's current-head GitHub lane, CI,
-  final reread, and squash merge.
+- Sign and push the final policy closure, rerun exact-head secret admission and
+  one fresh whole-range GPT-5.6 Sol Ultra Codex review under the prior trusted
+  release, then complete PR 108's current-head GitHub lane, CI, final reread,
+  and squash merge.
 - Merge the private companion and generated sync PR, confirm the immutable
   private-overlay release, run the local installer, and record the final merge,
   release, and installation identities here.
@@ -993,13 +1047,14 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-07-large-repo-range-materialization-wme001.md`.
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
-- Final full `python3 -B -m unittest discover` review-playbook suite (`3,028`
-  tests, `6` conditional skips, `945.897` seconds) with `ResourceWarning`
-  promoted to an error. The prior signed `2e89971` checkpoint passed `3,010`
-  tests with the same six skips in `999.845` seconds.
-- `python3 -B -m unittest skills.review-orchestration-playbook.tests.test_contracts`
-  plus `test_github_terminal_carriers` (`33` focused policy, distribution,
-  carrier, and report contracts).
+- Final full `python3 -B -W error::ResourceWarning -m unittest discover`
+  review-playbook suite (`3,095` tests, `6` conditional skips, `1,148.966`
+  seconds). The prior signed `2e89971` checkpoint passed `3,010` tests with the
+  same six skips in `999.845` seconds.
+- Combined `test_contracts`, `test_github_terminal_carriers`,
+  `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
+  matrix (`73` focused policy, distribution, carrier, report, and self-policy
+  contracts).
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
   parse; source-only Python compile; Ruff lint; Markdown relative-link check;

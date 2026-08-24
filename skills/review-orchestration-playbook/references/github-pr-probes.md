@@ -24,8 +24,11 @@ gh pr view <number-or-url> --repo <owner/repo> \
   --json url,number,state,isDraft,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,statusCheckRollup,reviewDecision
 ```
 
-Record exact repository, PR number, `baseRefOid`, and `headRefOid`. Use commit
-OIDs rather than mutable branch names for every later comparison.
+Record exact repository, PR number, `baseRefName`, `baseRefOid`, and
+`headRefOid`. Use commit OIDs rather than mutable branch names for range
+comparisons, but keep exact repository plus `baseRefName` as the target-ref
+identity. Keep the exact `baseRefOid` as another independent readiness binding
+rather than collapsing it into the unique merge base.
 
 ## Fetch Complete Provider Evidence
 
@@ -58,6 +61,15 @@ Immediately before accepting a result, repeat the PR detail, all provider
 evidence pages used by the decision, finding-thread state, and selected
 check/status. A changed head restarts the head-bound lane.
 
+An observed `baseRefName` change, even with the same OID, or a changed
+`baseRefOid` invalidates all previously counted local reviews, local validation
+and tests, CI/status results, conversation decisions, readiness decisions, and
+the final reread, even when the head and unique merge base remain unchanged. A
+trustworthy head-bound provider artifact is the only exception: retain it only
+after this complete repeat proves its exact head is still current and no
+applicable provider finding remains unresolved. It supplies no base,
+merge-base, or target-ref coverage.
+
 ## Request The Review
 
 Post the exact body:
@@ -81,13 +93,17 @@ definite outcome is proved. Never run concurrent POSTs or issue an ordinary
 duplicate. Any visible duplicate remains part of the same logical review lane
 and is recorded as an audit warning; it never counts as an additional lane.
 
-A base-only retarget on the same head does not authorize or require another
-request. Reuse qualifying head-bound provider evidence, rerun the base-sensitive
-local/readiness gates only after the parent-owned `range_origin` gate in
-[pr-readiness.md](pr-readiness.md) authorizes their exact local PR-wide range,
-and reconcile a related merge/status check when its contract is base-sensitive.
+A base-only retarget, including one whose new ref has the same OID, or
+target-base-tip advance on the same head does not authorize or require another
+request. Reuse qualifying head-bound provider
+evidence only after the exact-current-head and complete unresolved-finding
+reread above. Rerun every invalidated local review, validation/test, CI/status,
+conversation, readiness, and final-reread gate; when the merge base changed,
+first require the parent-owned `range_origin` gate in
+[pr-readiness.md](pr-readiness.md) to authorize the exact local PR-wide range.
+Reconcile a related merge/status check when its contract is base-sensitive.
 This probe layer never selects or rewrites that range. Never claim the provider
-inspected the retargeted base.
+inspected the changed base tip or retargeted base.
 
 ## Discover Related Checks Dynamically
 
@@ -111,6 +127,52 @@ When a trustworthy related merge/status check exists, prefer it as the
 positive GitHub-lane basis, while still enumerating unresolved Codex-provider
 findings. The check does not prove the PR base unless its documented contract
 does so; ordinary readiness still validates base and merge base locally.
+
+Before an authorized merge, acquire complete applicable branch-protection or
+ruleset evidence for the exact base branch. A direct merge's base binding is
+proved only by a documented server-side expected-base mutation precondition or
+a repository-proved exact-base guard that rejects every
+`baseRefOid != merge_expected_base` mutation without bypass. The strict setting
+for **Require branches to be up to date before merging** is useful when a
+branch is behind, but it is not an exact-base comparison: a different base tip
+that is already an ancestor of the unchanged feature head may still satisfy
+strict freshness. Required checks plus strict, `mergeStateStatus`, a
+mergeability snapshot, or another `baseRefOid` read therefore do not by
+themselves protect the later mutation.
+
+The only direct-merge alternative is a complete parent proof of monotonic range
+contraction. Require all of these from the complete applicable protection and
+ruleset snapshot: the frozen `merge_expected_base_ref` equals the selected
+repository plus `baseRefName`; the final unique merge base and
+`merge_expected_base` both equal reviewed `base_sha`; the mutation carries
+exact reviewed head; strict up-to-date is enforced in that merge transaction;
+every update to that same frozen target ref from `merge_expected_base` must be
+fast-forward; deletion and non-fast-forward updates are forbidden; and the
+complete current protection/ruleset and actor inventory contains no configured
+base-update or merge bypass and enumerates actors authorized to retarget the
+PR. An allowed force push, allowed deletion, configured
+administrator/App/ruleset bypass, incomplete ruleset or bypass page,
+incomplete base-ref or retarget-actor inventory, or merely point-read strict
+state makes the alternative unproved and blocks direct merge. GitHub and
+authorized repository collaborators or administrators who can retarget the PR
+or reconfigure rules are the trusted external control plane. Any observed
+`baseRefName`, applicable-rule, bypass, or actor-inventory change invalidates
+the proof. Malicious or concurrent unobserved retargeting or control-plane
+reconfiguration is outside this consumer guarantee; never claim that the
+proof excludes it. These are consumer-side proof requirements only; this
+playbook does not define a producer implementation or require a nonexistent
+server-side retarget hold.
+
+A configured merge queue owns only latest-base merge-group freshness by
+default; it does not reacquire
+out-of-band local review or conversation gates. Before enrollment, require a
+repository-proved, non-bypassed merge-group hold that prevents completion after
+any target-base change until every invalidated gate is reacquired for the new
+exact base tip.
+If no such hold exists, the queue path is blocked. A narrowly equivalent
+contract may instead prove that every invalidated gate is itself a required,
+non-bypassed check on the rebuilt merge group. See
+[pr-readiness.md](pr-readiness.md).
 
 ## Reconcile Only Recoverable States
 

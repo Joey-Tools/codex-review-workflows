@@ -539,6 +539,7 @@ class _ReportValidator:
         merge_status_parent_scope: dict[str, object],
         merge_status_parent_contract: dict[str, object],
         resolved_inline_parent_snapshot: dict[str, object] | None = None,
+        complete_pr_parent_snapshot: dict[str, object] | None = None,
     ) -> None:
         self.grammar_name = grammar["schema"]
         self.schema = grammar["required_report_schema"]
@@ -558,6 +559,7 @@ class _ReportValidator:
         self.resolved_inline_parent_snapshot = copy.deepcopy(
             resolved_inline_parent_snapshot
         )
+        self.complete_pr_parent_snapshot = copy.deepcopy(complete_pr_parent_snapshot)
         self.provider_identity = copy.deepcopy(grammar["provider_identity"])
 
     def _closed(self, value: object, profile: str) -> bool:
@@ -573,8 +575,28 @@ class _ReportValidator:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
     @staticmethod
+    def _nonnegative_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    @staticmethod
     def _full_sha(value: object) -> bool:
         return isinstance(value, str) and FULL_SHA.fullmatch(value) is not None
+
+    @staticmethod
+    def _type_preserving_equal(left: object, right: object) -> bool:
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return set(left) == set(right) and all(
+                _ReportValidator._type_preserving_equal(left[key], right[key])
+                for key in left
+            )
+        if isinstance(left, list):
+            return len(left) == len(right) and all(
+                _ReportValidator._type_preserving_equal(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        return left == right
 
     def _common_evidence(self, report: dict[str, object], evidence: object) -> bool:
         if not self._closed(evidence, "evidence"):
@@ -683,6 +705,198 @@ class _ReportValidator:
                 for field in self.parent_input_profiles["terminal_clean_identity"]
             )
             and self._clean_evidence_url_matches_scope(report, evidence)
+        )
+
+    def _basis_selection_matches(
+        self,
+        report: dict[str, object],
+        terminal_evidence: dict[str, object] | None,
+        selection: object,
+    ) -> bool:
+        if (
+            not self._closed_parent_input(selection, "basis_selection")
+            or selection["kind"] not in self.schema["basis_selection_kind_values"]
+            or selection["kind"] != report["basis"]
+        ):
+            return False
+        if selection["kind"] == "terminal-clean":
+            return (
+                selection["reaction"] is None
+                and selection["merge_status"] is None
+                and terminal_evidence is not None
+                and self._closed(selection["terminal_evidence"], "evidence")
+                and self._type_preserving_equal(
+                    selection["terminal_evidence"], terminal_evidence
+                )
+            )
+        if selection["kind"] == "reaction-clean":
+            reaction = selection["reaction"]
+            epoch = self.reaction_clean_parent_epoch
+            evidence = report["evidence"]
+            if (
+                selection["terminal_evidence"] is not None
+                or selection["merge_status"] is not None
+                or not self._closed_parent_input(reaction, "reaction_basis_selection")
+                or not self._closed_parent_input(epoch, "reaction_clean_epoch")
+                or not self._closed(evidence, "evidence")
+            ):
+                return False
+            expected_reaction = {
+                field: epoch[field]
+                for field in self.parent_input_profiles["reaction_basis_selection"]
+            }
+            return (
+                self._type_preserving_equal(reaction, expected_reaction)
+                and reaction["reaction_id"] == evidence["id"]
+                and reaction["reaction_url"] == evidence["url"]
+                and reaction["reaction_server_time"] == evidence["server_time"]
+                and reaction["request_id"] == evidence["request_id"]
+                and reaction["request_url"] == evidence["url"]
+            )
+
+        merge_status = selection["merge_status"]
+        evidence = report["evidence"]
+        parent_contract = self.merge_status_parent_contract
+        if (
+            selection["terminal_evidence"] is not None
+            or selection["reaction"] is not None
+            or not self._closed_parent_input(
+                merge_status, "merge_status_basis_selection"
+            )
+            or not self._closed(evidence, "merge_status_evidence")
+            or not isinstance(parent_contract, dict)
+        ):
+            return False
+        provider_clean = evidence["association"]["provider_clean_evidence"]
+        expected_merge_status = {
+            field: (
+                provider_clean
+                if field == "provider_clean_evidence"
+                else (
+                    evidence["association"]["contract"]
+                    if field == "contract"
+                    else evidence[field]
+                )
+            )
+            for field in self.parent_input_profiles["merge_status_basis_selection"]
+        }
+        return (
+            self._type_preserving_equal(merge_status, expected_merge_status)
+            and merge_status["id"] == parent_contract["check_run_id"]
+            and merge_status["url"] == parent_contract["check_run_url"]
+            and merge_status["check_name"] == parent_contract["check_name"]
+            and merge_status["app"]["id"] == parent_contract["app_id"]
+            and merge_status["app"]["slug"] == parent_contract["app_slug"]
+            and self._type_preserving_equal(
+                merge_status["contract"], parent_contract["contract_descriptor"]
+            )
+            and merge_status["provider_clean_evidence"]["id"]
+            == parent_contract["provider_clean_evidence_id"]
+            and merge_status["provider_clean_evidence"]["url"]
+            == parent_contract["provider_clean_evidence_url"]
+        )
+
+    def _complete_pr_snapshot_matches(
+        self,
+        report: dict[str, object],
+        evidence: dict[str, object] | None,
+        expected_classification: str,
+    ) -> bool:
+        snapshot = self.complete_pr_parent_snapshot
+        if not self._closed_parent_input(snapshot, "complete_pr_snapshot"):
+            return False
+        initial_inventory = snapshot["initial_page_inventory"]
+        final_inventory = snapshot["final_page_inventory"]
+        initial_selection = snapshot["initial_terminal_selection"]
+        final_selection = snapshot["final_terminal_selection"]
+        initial_basis_selection = snapshot["initial_basis_selection"]
+        final_basis_selection = snapshot["final_basis_selection"]
+        initial_scope = snapshot["initial_scope"]
+        final_scope = snapshot["final_scope"]
+        if (
+            not self._selected_pr_scope_value(initial_scope)
+            or not self._selected_pr_scope_value(final_scope)
+            or not self._closed_parent_input(
+                initial_inventory, "complete_page_inventory"
+            )
+            or not self._closed_parent_input(final_inventory, "complete_page_inventory")
+            or not self._closed_parent_input(initial_selection, "terminal_selection")
+            or not self._closed_parent_input(final_selection, "terminal_selection")
+            or not self._closed_parent_input(initial_basis_selection, "basis_selection")
+            or not self._closed_parent_input(final_basis_selection, "basis_selection")
+        ):
+            return False
+        page_fields = (
+            "issue_comments_pages_complete",
+            "reviews_pages_complete",
+            "inline_comments_pages_complete",
+            "review_threads_pages_complete",
+            "review_thread_comments_pages_complete",
+            "reactions_pages_complete",
+            "check_runs_pages_complete",
+            "commit_statuses_pages_complete",
+        )
+        count_fields = (
+            "issue_comment_count",
+            "review_count",
+            "inline_comment_count",
+            "review_thread_count",
+            "review_thread_comment_count",
+            "reaction_count",
+            "check_run_count",
+            "commit_status_count",
+            "trustworthy_terminal_count",
+        )
+        initial_digest = snapshot["initial_snapshot_sha256"]
+        final_digest = snapshot["final_snapshot_sha256"]
+        if not (
+            self._direct_positive_scope_matches(report)
+            and snapshot["owner"] == "parent-orchestrator"
+            and snapshot["status"] == "complete"
+            and self._type_preserving_equal(initial_scope, final_scope)
+            and initial_scope
+            == {
+                "repository": report["repository"],
+                "pull_request": report["pull_request"],
+                "head_sha": report["head_sha"],
+            }
+            and self._type_preserving_equal(initial_inventory, final_inventory)
+            and all(initial_inventory[field] is True for field in page_fields)
+            and all(
+                self._nonnegative_int(initial_inventory[field])
+                for field in count_fields
+            )
+            and self._type_preserving_equal(initial_selection, final_selection)
+            and self._type_preserving_equal(
+                initial_basis_selection, final_basis_selection
+            )
+            and snapshot["unresolved_provider_findings"] == 0
+            and self._nonnegative_int(snapshot["unresolved_provider_findings"])
+            and isinstance(initial_digest, str)
+            and SHA256.fullmatch(initial_digest) is not None
+            and final_digest == initial_digest
+            and initial_selection["classification"]
+            in self.schema["terminal_selection_classification_values"]
+            and initial_selection["classification"] == expected_classification
+        ):
+            return False
+        selected_evidence = initial_selection["evidence"]
+        if expected_classification == "absent":
+            return (
+                selected_evidence is None
+                and initial_inventory["trustworthy_terminal_count"] == 0
+                and evidence is None
+                and self._basis_selection_matches(
+                    report, evidence, initial_basis_selection
+                )
+            )
+        return (
+            expected_classification == "clean"
+            and self._positive_int(initial_inventory["trustworthy_terminal_count"])
+            and evidence is not None
+            and self._clean_terminal_evidence(report, selected_evidence)
+            and self._type_preserving_equal(selected_evidence, evidence)
+            and self._basis_selection_matches(report, evidence, initial_basis_selection)
         )
 
     def _direct_reaction_epoch_matches(
@@ -932,6 +1146,7 @@ class _ReportValidator:
             or not self._clean_evidence_url_matches_scope(report, provider_clean)
             or provider_clean["id"] != parent_contract["provider_clean_evidence_id"]
             or provider_clean["url"] != parent_contract["provider_clean_evidence_url"]
+            or not self._complete_pr_snapshot_matches(report, provider_clean, "clean")
         ):
             return False
         try:
@@ -1124,6 +1339,7 @@ class _ReportValidator:
                 and not report["unresolved_provider_findings"]
                 and self._clean_terminal_evidence(report, evidence)
                 and self._direct_terminal_identity_matches(report, evidence)
+                and self._complete_pr_snapshot_matches(report, evidence, "clean")
                 and evidence["kind"] == rule["evidence_kind"]
                 and evidence["grammar_branch"] in rule["branches"]
                 and evidence["artifact_commit"] == report["head_sha"]
@@ -1145,6 +1361,7 @@ class _ReportValidator:
                 and evidence["head_binding"] == rule["head_binding"]
                 and self._positive_int(evidence["request_id"])
                 and self._direct_reaction_epoch_matches(report, evidence)
+                and self._complete_pr_snapshot_matches(report, None, "absent")
             )
         if basis == "resolved-inline-awaiting-clean":
             rule = self.rules[basis]
@@ -1212,6 +1429,72 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
             "channel": "issue-comment",
         }
+        terminal_clean_evidence = copy.deepcopy(
+            cls.grammar["report_bases"]["terminal_clean"]["evidence"]
+        )
+        page_inventory = {
+            "issue_comments_pages_complete": True,
+            "issue_comment_count": 2,
+            "reviews_pages_complete": True,
+            "review_count": 1,
+            "inline_comments_pages_complete": True,
+            "inline_comment_count": 0,
+            "review_threads_pages_complete": True,
+            "review_thread_count": 0,
+            "review_thread_comments_pages_complete": True,
+            "review_thread_comment_count": 0,
+            "reactions_pages_complete": True,
+            "reaction_count": 1,
+            "check_runs_pages_complete": True,
+            "check_run_count": 1,
+            "commit_statuses_pages_complete": True,
+            "commit_status_count": 0,
+            "trustworthy_terminal_count": 1,
+        }
+        cls.clean_complete_pr_parent_snapshot = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "initial_scope": copy.deepcopy(cls.direct_positive_parent_scope),
+            "final_scope": copy.deepcopy(cls.direct_positive_parent_scope),
+            "initial_page_inventory": copy.deepcopy(page_inventory),
+            "final_page_inventory": copy.deepcopy(page_inventory),
+            "initial_terminal_selection": {
+                "classification": "clean",
+                "evidence": copy.deepcopy(terminal_clean_evidence),
+            },
+            "final_terminal_selection": {
+                "classification": "clean",
+                "evidence": copy.deepcopy(terminal_clean_evidence),
+            },
+            "initial_basis_selection": {
+                "kind": "terminal-clean",
+                "terminal_evidence": copy.deepcopy(terminal_clean_evidence),
+                "reaction": None,
+                "merge_status": None,
+            },
+            "final_basis_selection": {
+                "kind": "terminal-clean",
+                "terminal_evidence": copy.deepcopy(terminal_clean_evidence),
+                "reaction": None,
+                "merge_status": None,
+            },
+            "unresolved_provider_findings": 0,
+            "initial_snapshot_sha256": "6" * 64,
+            "final_snapshot_sha256": "6" * 64,
+        }
+        cls.absent_complete_pr_parent_snapshot = copy.deepcopy(
+            cls.clean_complete_pr_parent_snapshot
+        )
+        for phase in ("initial", "final"):
+            cls.absent_complete_pr_parent_snapshot[f"{phase}_page_inventory"][
+                "trustworthy_terminal_count"
+            ] = 0
+            cls.absent_complete_pr_parent_snapshot[f"{phase}_terminal_selection"] = {
+                "classification": "absent",
+                "evidence": None,
+            }
+        cls.absent_complete_pr_parent_snapshot["initial_snapshot_sha256"] = "7" * 64
+        cls.absent_complete_pr_parent_snapshot["final_snapshot_sha256"] = "7" * 64
         epoch_scope = copy.deepcopy(cls.direct_positive_parent_scope)
         cls.reaction_clean_parent_epoch = {
             "owner": "parent-orchestrator",
@@ -1242,6 +1525,19 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "no_malformed_terminal_looking_provider_artifact": True,
             "unresolved_provider_findings": 0,
         }
+        reaction_basis_selection = {
+            field: cls.reaction_clean_parent_epoch[field]
+            for field in cls.grammar["required_report_schema"]["parent_input_profiles"][
+                "reaction_basis_selection"
+            ]
+        }
+        for phase in ("initial", "final"):
+            cls.absent_complete_pr_parent_snapshot[f"{phase}_basis_selection"] = {
+                "kind": "reaction-clean",
+                "terminal_evidence": None,
+                "reaction": copy.deepcopy(reaction_basis_selection),
+                "merge_status": None,
+            }
         cls.resolved_inline_parent_snapshot = {
             "owner": "parent-orchestrator",
             "status": "complete",
@@ -1283,6 +1579,35 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "provider_clean_evidence_id": 101,
             "provider_clean_evidence_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
         }
+        merge_evidence = copy.deepcopy(
+            cls.grammar["report_bases"]["merge_status"]["evidence"]
+        )
+        merge_basis_selection = {
+            field: (
+                copy.deepcopy(merge_evidence["association"]["provider_clean_evidence"])
+                if field == "provider_clean_evidence"
+                else (
+                    copy.deepcopy(merge_evidence["association"]["contract"])
+                    if field == "contract"
+                    else copy.deepcopy(merge_evidence[field])
+                )
+            )
+            for field in cls.grammar["required_report_schema"]["parent_input_profiles"][
+                "merge_status_basis_selection"
+            ]
+        }
+        cls.merge_complete_pr_parent_snapshot = copy.deepcopy(
+            cls.clean_complete_pr_parent_snapshot
+        )
+        for phase in ("initial", "final"):
+            cls.merge_complete_pr_parent_snapshot[f"{phase}_basis_selection"] = {
+                "kind": "merge-status",
+                "terminal_evidence": None,
+                "reaction": None,
+                "merge_status": copy.deepcopy(merge_basis_selection),
+            }
+        cls.merge_complete_pr_parent_snapshot["initial_snapshot_sha256"] = "8" * 64
+        cls.merge_complete_pr_parent_snapshot["final_snapshot_sha256"] = "8" * 64
         cls.report_validator = _ReportValidator(
             cls.grammar,
             cls.selected_parent_selection_outcome,
@@ -1292,6 +1617,29 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_scope,
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
+            cls.clean_complete_pr_parent_snapshot,
+        )
+        cls.reaction_report_validator = _ReportValidator(
+            cls.grammar,
+            cls.selected_parent_selection_outcome,
+            cls.direct_positive_parent_scope,
+            cls.terminal_clean_parent_identity,
+            cls.reaction_clean_parent_epoch,
+            cls.merge_status_parent_scope,
+            cls.merge_status_parent_contract,
+            cls.resolved_inline_parent_snapshot,
+            cls.absent_complete_pr_parent_snapshot,
+        )
+        cls.merge_report_validator = _ReportValidator(
+            cls.grammar,
+            cls.selected_parent_selection_outcome,
+            cls.direct_positive_parent_scope,
+            cls.terminal_clean_parent_identity,
+            cls.reaction_clean_parent_epoch,
+            cls.merge_status_parent_scope,
+            cls.merge_status_parent_contract,
+            cls.resolved_inline_parent_snapshot,
+            cls.merge_complete_pr_parent_snapshot,
         )
         cls.no_pr_report_validator = _ReportValidator(
             cls.grammar,
@@ -1302,6 +1650,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_scope,
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
+            cls.clean_complete_pr_parent_snapshot,
         )
 
     def _validator_for_selection(
@@ -1316,7 +1665,94 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.merge_status_parent_scope,
             self.merge_status_parent_contract,
             self.resolved_inline_parent_snapshot,
+            self.clean_complete_pr_parent_snapshot,
         )
+
+    def _validator_with_complete_snapshot(
+        self,
+        snapshot: dict[str, object] | None,
+        *,
+        terminal_identity: dict[str, object] | None = None,
+        reaction_epoch: dict[str, object] | None = None,
+        merge_contract: dict[str, object] | None = None,
+    ) -> _ReportValidator:
+        return _ReportValidator(
+            self.grammar,
+            self.selected_parent_selection_outcome,
+            self.direct_positive_parent_scope,
+            (
+                terminal_identity
+                if terminal_identity is not None
+                else self.terminal_clean_parent_identity
+            ),
+            (
+                reaction_epoch
+                if reaction_epoch is not None
+                else self.reaction_clean_parent_epoch
+            ),
+            self.merge_status_parent_scope,
+            (
+                merge_contract
+                if merge_contract is not None
+                else self.merge_status_parent_contract
+            ),
+            self.resolved_inline_parent_snapshot,
+            snapshot,
+        )
+
+    def _clean_snapshot_for_evidence(
+        self, evidence: dict[str, object], digest_character: str = "8"
+    ) -> dict[str, object]:
+        snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            snapshot[f"{phase}_terminal_selection"] = {
+                "classification": "clean",
+                "evidence": copy.deepcopy(evidence),
+            }
+            snapshot[f"{phase}_basis_selection"] = {
+                "kind": "terminal-clean",
+                "terminal_evidence": copy.deepcopy(evidence),
+                "reaction": None,
+                "merge_status": None,
+            }
+        snapshot["initial_snapshot_sha256"] = digest_character * 64
+        snapshot["final_snapshot_sha256"] = digest_character * 64
+        return snapshot
+
+    def _merge_snapshot_for_report(
+        self, report: dict[str, object], digest_character: str = "9"
+    ) -> dict[str, object]:
+        snapshot = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        merge_evidence = report["evidence"]
+        provider_clean = merge_evidence["association"]["provider_clean_evidence"]
+        merge_projection = {
+            field: (
+                copy.deepcopy(provider_clean)
+                if field == "provider_clean_evidence"
+                else (
+                    copy.deepcopy(merge_evidence["association"]["contract"])
+                    if field == "contract"
+                    else copy.deepcopy(merge_evidence[field])
+                )
+            )
+            for field in self.grammar["required_report_schema"][
+                "parent_input_profiles"
+            ]["merge_status_basis_selection"]
+        }
+        for phase in ("initial", "final"):
+            snapshot[f"{phase}_terminal_selection"] = {
+                "classification": "clean",
+                "evidence": copy.deepcopy(provider_clean),
+            }
+            snapshot[f"{phase}_basis_selection"] = {
+                "kind": "merge-status",
+                "terminal_evidence": None,
+                "reaction": None,
+                "merge_status": copy.deepcopy(merge_projection),
+            }
+        snapshot["initial_snapshot_sha256"] = digest_character * 64
+        snapshot["final_snapshot_sha256"] = digest_character * 64
+        return snapshot
 
     def test_resource_is_versioned_closed_and_consumer_only(self) -> None:
         self.assertEqual(self.grammar["schema"], "github-codex-terminal-carriers-v1")
@@ -1419,15 +1855,87 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "separate closed parent-owned reaction_clean_epoch",
             report_schema["basis_rules"]["reaction-clean"]["parent_identity_input"],
         )
+        self.assertIn(
+            "stable absence of a trustworthy terminal artifact",
+            report_schema["basis_rules"]["reaction-clean"][
+                "parent_complete_snapshot_input"
+            ],
+        )
         self.assertEqual(
             set(report_schema["parent_input_profiles"]),
             {
                 "selection_outcome",
                 "selected_pr_scope",
                 "terminal_clean_identity",
+                "complete_pr_snapshot",
+                "complete_page_inventory",
+                "terminal_selection",
+                "basis_selection",
+                "reaction_basis_selection",
+                "merge_status_basis_selection",
                 "reaction_clean_epoch",
                 "resolved_inline_snapshot",
             },
+        )
+        self.assertIn(
+            "never derived from report, evidence, association, or merge-status fields",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "trust_boundary"
+            ],
+        )
+        self.assertIn(
+            "type-preserving equal",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"]["page_state"],
+        )
+        self.assertIn(
+            "not digests of report summaries",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "snapshot_stability"
+            ],
+        )
+        self.assertIn(
+            "reaction pages",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "snapshot_stability"
+            ],
+        )
+        self.assertIn(
+            "independently selected pass-basis projection",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "snapshot_stability"
+            ],
+        )
+        self.assertEqual(
+            set(report_schema["terminal_selection_classification_values"]),
+            {"clean", "findings", "resolved-inline", "malformed", "absent"},
+        )
+        self.assertEqual(
+            set(report_schema["basis_selection_kind_values"]),
+            {"terminal-clean", "reaction-clean", "merge-status"},
+        )
+        self.assertIn(
+            "cannot self-prove or repair this selection",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "basis_selection"
+            ],
+        )
+        self.assertIn(
+            "complete typed initial/final page state",
+            report_schema["basis_rules"]["terminal-clean"][
+                "parent_complete_snapshot_input"
+            ],
+        )
+        self.assertIn(
+            "exact stable terminal-clean basis selection",
+            report_schema["basis_rules"]["terminal-clean"][
+                "parent_complete_snapshot_input"
+            ],
+        )
+        self.assertIn(
+            "exact stable reaction-clean request/reaction/actor/time basis selection",
+            report_schema["basis_rules"]["reaction-clean"][
+                "parent_complete_snapshot_input"
+            ],
         )
         self.assertIn(
             "pre_request_scope",
@@ -1494,6 +2002,18 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertIn(
             "separate closed parent-owned record",
             report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
+        )
+        self.assertIn(
+            "complete typed initial/final page state",
+            report_schema["basis_rules"]["merge-status"][
+                "parent_complete_snapshot_input"
+            ],
+        )
+        self.assertIn(
+            "exact stable merge-status check/App/head/status/conclusion/producer-contract/provider-clean basis selection",
+            report_schema["basis_rules"]["merge-status"][
+                "parent_complete_snapshot_input"
+            ],
         )
         self.assertEqual(
             report_schema["basis_rules"]["merge-status"][
@@ -1611,6 +2131,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "`head_binding` is exactly `explicit-commit`",
             "`stable-request-epoch` is valid only in that `basis: reaction-clean`",
             "closed,\nparent-owned `reaction_clean_epoch` input",
+            "separate closed parent-owned\n`complete_pr_snapshot`",
+            "They are not digests of the report summary",
+            "selected pass-basis projection",
+            "leaving this frozen selection unchanged fails closed",
+            "reaction-clean pass requires both",
             "Reusing a head-A request or reaction while reporting head B",
             "`resolved-inline-awaiting-clean` basis",
             "closed\n`resolved_inline_snapshot`",
@@ -1784,6 +2309,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     "selected_pr": self.report_validator,
                     "proved_no_selected_supported_pr": self.no_pr_report_validator,
                 }[selection_name]
+                if fixture["base"] == "reaction_clean":
+                    validator = self.reaction_report_validator
+                elif fixture["base"] == "merge_status":
+                    validator = self.merge_report_validator
                 self.assertEqual(validator.validate(report), fixture["valid"])
 
         terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
@@ -1885,6 +2414,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "url": review_url,
             "channel": "review",
         }
+        review_snapshot = self._clean_snapshot_for_evidence(
+            review_report["evidence"], "7"
+        )
         review_validator = _ReportValidator(
             self.grammar,
             self.selected_parent_selection_outcome,
@@ -1893,12 +2425,701 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.reaction_clean_parent_epoch,
             self.merge_status_parent_scope,
             self.merge_status_parent_contract,
+            None,
+            review_snapshot,
         )
         self.assertTrue(review_validator.validate(review_report))
 
+    def test_every_pass_basis_requires_an_independent_complete_pr_snapshot(
+        self,
+    ) -> None:
+        reports_and_validators = (
+            (
+                self.grammar["report_bases"]["terminal_clean"],
+                self.report_validator,
+            ),
+            (
+                self.grammar["report_bases"]["merge_status"],
+                self.merge_report_validator,
+            ),
+            (
+                self.grammar["report_bases"]["reaction_clean"],
+                self.reaction_report_validator,
+            ),
+        )
+        missing_snapshot_validator = self._validator_with_complete_snapshot(None)
+        for report, validator in reports_and_validators:
+            with self.subTest(basis=report["basis"]):
+                self.assertTrue(validator.validate(report))
+                self.assertFalse(missing_snapshot_validator.validate(report))
+
+        for base in ("finding", "selected_pending", "resolved_inline_awaiting_clean"):
+            with self.subTest(non_pass_base=base):
+                self.assertTrue(
+                    missing_snapshot_validator.validate(
+                        self.grammar["report_bases"][base]
+                    )
+                )
+        no_pr_without_snapshot = _ReportValidator(
+            self.grammar,
+            self.no_pr_parent_selection_outcome,
+            self.direct_positive_parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+            None,
+        )
+        self.assertTrue(
+            no_pr_without_snapshot.validate(
+                self.grammar["report_bases"]["no_selected_supported_pr"]
+            )
+        )
+
+    def test_complete_pr_snapshot_is_closed_scope_bound_and_stable(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+
+        for field in self.grammar["required_report_schema"]["parent_input_profiles"][
+            "complete_pr_snapshot"
+        ]:
+            with self.subTest(missing_top_level_field=field):
+                snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                snapshot.pop(field)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(report)
+                )
+
+        opened = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        opened["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(opened).validate(report)
+        )
+
+        for field, replacement in {
+            "owner": "consumer",
+            "status": "incomplete",
+        }.items():
+            with self.subTest(field=field):
+                snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                snapshot[field] = replacement
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(report)
+                )
+
+        scope_replacements = {
+            "repository": "octo/other",
+            "pull_request": 8,
+            "head_sha": "1111111111111111111111111111111111111111",
+        }
+        for phase in ("initial", "final"):
+            for field, replacement in scope_replacements.items():
+                with self.subTest(phase=phase, scope_field=field):
+                    snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_scope"][field] = replacement
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            report
+                        )
+                    )
+            for replacement in (True, 7.0):
+                with self.subTest(phase=phase, pull_request_alias=replacement):
+                    snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_scope"]["pull_request"] = replacement
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            report
+                        )
+                    )
+
+        invalid_digest_snapshots: list[dict[str, object]] = []
+        for field, replacement in (
+            ("initial_snapshot_sha256", "A" * 64),
+            ("initial_snapshot_sha256", "not-a-digest"),
+            ("final_snapshot_sha256", "9" * 64),
+        ):
+            snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+            snapshot[field] = replacement
+            invalid_digest_snapshots.append(snapshot)
+        for snapshot in invalid_digest_snapshots:
+            self.assertFalse(
+                self._validator_with_complete_snapshot(snapshot).validate(report)
+            )
+
+    def test_complete_pr_snapshot_requires_complete_typed_page_inventories(
+        self,
+    ) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        profile = self.grammar["required_report_schema"]["parent_input_profiles"][
+            "complete_page_inventory"
+        ]
+        page_fields = [field for field in profile if field.endswith("pages_complete")]
+        count_fields = [field for field in profile if field.endswith("count")]
+
+        for phase in ("initial", "final"):
+            inventory_name = f"{phase}_page_inventory"
+            for field in profile:
+                with self.subTest(phase=phase, missing_inventory_field=field):
+                    snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                    snapshot[inventory_name].pop(field)
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            report
+                        )
+                    )
+            for field in page_fields:
+                for replacement in (False, 1):
+                    with self.subTest(
+                        phase=phase, page_field=field, replacement=replacement
+                    ):
+                        snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                        snapshot[inventory_name][field] = replacement
+                        self.assertFalse(
+                            self._validator_with_complete_snapshot(snapshot).validate(
+                                report
+                            )
+                        )
+            for field in count_fields:
+                replacements = (
+                    (-1, True, 0.0, 0)
+                    if field == "trustworthy_terminal_count"
+                    else (-1, True, 0.0)
+                )
+                for replacement in replacements:
+                    with self.subTest(
+                        phase=phase, count_field=field, replacement=replacement
+                    ):
+                        snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                        snapshot[inventory_name][field] = replacement
+                        self.assertFalse(
+                            self._validator_with_complete_snapshot(snapshot).validate(
+                                report
+                            )
+                        )
+
+        drifted = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        drifted["final_page_inventory"]["issue_comment_count"] += 1
+        self.assertFalse(
+            self._validator_with_complete_snapshot(drifted).validate(report)
+        )
+
+    def test_complete_pr_snapshot_binds_closed_stable_pass_basis_selection(
+        self,
+    ) -> None:
+        terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        reaction_report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        merge_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        positives = (
+            (terminal_report, self.report_validator),
+            (reaction_report, self.reaction_report_validator),
+            (merge_report, self.merge_report_validator),
+        )
+        for report, validator in positives:
+            with self.subTest(positive_basis=report["basis"]):
+                self.assertTrue(validator.validate(report))
+
+        basis_profile = self.grammar["required_report_schema"]["parent_input_profiles"][
+            "basis_selection"
+        ]
+        for phase in ("initial", "final"):
+            for field in basis_profile:
+                with self.subTest(phase=phase, missing_basis_field=field):
+                    snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_basis_selection"].pop(field)
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            terminal_report
+                        )
+                    )
+            opened = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+            opened[f"{phase}_basis_selection"]["opaque"] = True
+            with self.subTest(phase=phase, open_basis_selection=True):
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(opened).validate(
+                        terminal_report
+                    )
+                )
+
+        terminal_profile = self.grammar["required_report_schema"]["closed_fields"][
+            "evidence"
+        ]
+        for field in terminal_profile:
+            with self.subTest(missing_terminal_basis_field=field):
+                snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                snapshot["initial_basis_selection"]["terminal_evidence"].pop(field)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(
+                        terminal_report
+                    )
+                )
+        open_terminal = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        open_terminal["initial_basis_selection"]["terminal_evidence"]["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(open_terminal).validate(
+                terminal_report
+            )
+        )
+
+        reaction_profile = self.grammar["required_report_schema"][
+            "parent_input_profiles"
+        ]["reaction_basis_selection"]
+        for phase in ("initial", "final"):
+            for field in reaction_profile:
+                with self.subTest(phase=phase, missing_reaction_basis_field=field):
+                    snapshot = copy.deepcopy(self.absent_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_basis_selection"]["reaction"].pop(field)
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            reaction_report
+                        )
+                    )
+        open_reaction = copy.deepcopy(self.absent_complete_pr_parent_snapshot)
+        open_reaction["initial_basis_selection"]["reaction"]["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(open_reaction).validate(
+                reaction_report
+            )
+        )
+
+        merge_profile = self.grammar["required_report_schema"]["parent_input_profiles"][
+            "merge_status_basis_selection"
+        ]
+        for phase in ("initial", "final"):
+            for field in merge_profile:
+                with self.subTest(phase=phase, missing_merge_basis_field=field):
+                    snapshot = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_basis_selection"]["merge_status"].pop(field)
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            merge_report
+                        )
+                    )
+        open_merge = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        open_merge["initial_basis_selection"]["merge_status"]["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(open_merge).validate(merge_report)
+        )
+
+        drifted = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        drifted["final_basis_selection"]["terminal_evidence"]["id"] = 102
+        self.assertFalse(
+            self._validator_with_complete_snapshot(drifted).validate(terminal_report)
+        )
+        reaction_drift = copy.deepcopy(self.absent_complete_pr_parent_snapshot)
+        reaction_drift["final_basis_selection"]["reaction"]["reaction_id"] = 602
+        self.assertFalse(
+            self._validator_with_complete_snapshot(reaction_drift).validate(
+                reaction_report
+            )
+        )
+        merge_drift = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        merge_drift["final_basis_selection"]["merge_status"]["id"] = 702
+        self.assertFalse(
+            self._validator_with_complete_snapshot(merge_drift).validate(merge_report)
+        )
+
+    def test_complete_pr_snapshot_rejects_coupled_basis_carrier_mutations(
+        self,
+    ) -> None:
+        terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        terminal_report["evidence"]["id"] = 102
+        terminal_report["evidence"]["url"] = (
+            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        )
+        terminal_identity = copy.deepcopy(self.terminal_clean_parent_identity)
+        terminal_identity["id"] = 102
+        terminal_identity["url"] = terminal_report["evidence"]["url"]
+        stale_terminal_basis = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            stale_terminal_basis[f"{phase}_terminal_selection"]["evidence"] = (
+                copy.deepcopy(terminal_report["evidence"])
+            )
+        stale_terminal_basis["initial_snapshot_sha256"] = "c" * 64
+        stale_terminal_basis["final_snapshot_sha256"] = "c" * 64
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                stale_terminal_basis,
+                terminal_identity=terminal_identity,
+            ).validate(terminal_report)
+        )
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._clean_snapshot_for_evidence(terminal_report["evidence"], "c"),
+                terminal_identity=terminal_identity,
+            ).validate(terminal_report)
+        )
+
+        reaction_report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        reaction_report["evidence"].update(
+            {
+                "id": 602,
+                "url": (
+                    "https://github.com/octo/review-fixture/pull/7#issuecomment-92"
+                ),
+                "server_time": "2026-08-23T09:08:00Z",
+                "request_id": 92,
+            }
+        )
+        reaction_epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+        reaction_epoch.update(
+            {
+                "request_id": 92,
+                "request_url": reaction_report["evidence"]["url"],
+                "request_server_time": "2026-08-23T09:07:00Z",
+                "reaction_id": 602,
+                "reaction_url": reaction_report["evidence"]["url"],
+                "reaction_server_time": reaction_report["evidence"]["server_time"],
+            }
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.absent_complete_pr_parent_snapshot,
+                reaction_epoch=reaction_epoch,
+            ).validate(reaction_report)
+        )
+        reaction_snapshot = copy.deepcopy(self.absent_complete_pr_parent_snapshot)
+        reaction_projection = {
+            field: copy.deepcopy(reaction_epoch[field])
+            for field in self.grammar["required_report_schema"][
+                "parent_input_profiles"
+            ]["reaction_basis_selection"]
+        }
+        for phase in ("initial", "final"):
+            reaction_snapshot[f"{phase}_basis_selection"]["reaction"] = copy.deepcopy(
+                reaction_projection
+            )
+        reaction_snapshot["initial_snapshot_sha256"] = "d" * 64
+        reaction_snapshot["final_snapshot_sha256"] = "d" * 64
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                reaction_snapshot,
+                reaction_epoch=reaction_epoch,
+            ).validate(reaction_report)
+        )
+
+        merge_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        merge_report["evidence"]["id"] = 702
+        merge_report["evidence"]["url"] = (
+            "https://github.com/octo/review-fixture/runs/702"
+        )
+        association = merge_report["evidence"]["association"]
+        association["check_run_id"] = 702
+        association["check_run_url"] = merge_report["evidence"]["url"]
+        merge_contract = copy.deepcopy(self.merge_status_parent_contract)
+        merge_contract["check_run_id"] = 702
+        merge_contract["check_run_url"] = merge_report["evidence"]["url"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.merge_complete_pr_parent_snapshot,
+                merge_contract=merge_contract,
+            ).validate(merge_report)
+        )
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(merge_report, "e"),
+                merge_contract=merge_contract,
+            ).validate(merge_report)
+        )
+
+        provider_merge = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        provider_clean = provider_merge["evidence"]["association"][
+            "provider_clean_evidence"
+        ]
+        provider_clean["id"] = 102
+        provider_clean["url"] = (
+            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        )
+        provider_contract = copy.deepcopy(self.merge_status_parent_contract)
+        provider_contract["provider_clean_evidence_id"] = 102
+        provider_contract["provider_clean_evidence_url"] = provider_clean["url"]
+        stale_provider_basis = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            stale_provider_basis[f"{phase}_terminal_selection"]["evidence"] = (
+                copy.deepcopy(provider_clean)
+            )
+        stale_provider_basis["initial_snapshot_sha256"] = "1" * 64
+        stale_provider_basis["final_snapshot_sha256"] = "1" * 64
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                stale_provider_basis,
+                merge_contract=provider_contract,
+            ).validate(provider_merge)
+        )
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(provider_merge, "1"),
+                merge_contract=provider_contract,
+            ).validate(provider_merge)
+        )
+
+        descriptor_merge = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        alternate_descriptor = {
+            "source_repository": "octo/alternate-review-gate",
+            "source_commit": "4" * 40,
+            "source_path": "contracts/alternate-status-v1.json",
+            "source_sha256": "5" * 64,
+        }
+        descriptor_merge["evidence"]["association"]["contract"] = copy.deepcopy(
+            alternate_descriptor
+        )
+        descriptor_contract = copy.deepcopy(self.merge_status_parent_contract)
+        descriptor_contract["contract_descriptor"] = copy.deepcopy(alternate_descriptor)
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.merge_complete_pr_parent_snapshot,
+                merge_contract=descriptor_contract,
+            ).validate(descriptor_merge)
+        )
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(descriptor_merge, "2"),
+                merge_contract=descriptor_contract,
+            ).validate(descriptor_merge)
+        )
+
+        alternate_merge = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        alternate_merge["evidence"]["check_name"] = "Alternate Codex Merge Gate"
+        alternate_merge["evidence"]["app"] = {
+            "id": 15369,
+            "slug": "alternate-github-actions",
+        }
+        alternate_association = alternate_merge["evidence"]["association"]
+        alternate_association["check_name"] = alternate_merge["evidence"]["check_name"]
+        alternate_association["app_id"] = alternate_merge["evidence"]["app"]["id"]
+        alternate_association["app_slug"] = alternate_merge["evidence"]["app"]["slug"]
+        alternate_contract = copy.deepcopy(self.merge_status_parent_contract)
+        alternate_contract["check_name"] = alternate_merge["evidence"]["check_name"]
+        alternate_contract["app_id"] = alternate_merge["evidence"]["app"]["id"]
+        alternate_contract["app_slug"] = alternate_merge["evidence"]["app"]["slug"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.merge_complete_pr_parent_snapshot,
+                merge_contract=alternate_contract,
+            ).validate(alternate_merge)
+        )
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(alternate_merge, "f"),
+                merge_contract=alternate_contract,
+            ).validate(alternate_merge)
+        )
+
+    def test_complete_pr_snapshot_binds_latest_terminal_selection(self) -> None:
+        terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        merge_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+
+        coupled_report = copy.deepcopy(terminal_report)
+        coupled_report["evidence"]["id"] = 102
+        coupled_report["evidence"]["url"] = (
+            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        )
+        coupled_identity = copy.deepcopy(self.terminal_clean_parent_identity)
+        coupled_identity["id"] = 102
+        coupled_identity["url"] = coupled_report["evidence"]["url"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.clean_complete_pr_parent_snapshot,
+                terminal_identity=coupled_identity,
+            ).validate(coupled_report)
+        )
+
+        coupled_merge = copy.deepcopy(merge_report)
+        provider_clean = coupled_merge["evidence"]["association"][
+            "provider_clean_evidence"
+        ]
+        provider_clean["id"] = 102
+        provider_clean["url"] = (
+            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        )
+        coupled_contract = copy.deepcopy(self.merge_status_parent_contract)
+        coupled_contract["provider_clean_evidence_id"] = 102
+        coupled_contract["provider_clean_evidence_url"] = provider_clean["url"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.merge_complete_pr_parent_snapshot,
+                merge_contract=coupled_contract,
+            ).validate(coupled_merge)
+        )
+
+        later_clean = copy.deepcopy(terminal_report["evidence"])
+        later_clean["id"] = 102
+        later_clean["url"] = (
+            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        )
+        later_clean["server_time"] = "2026-08-23T09:08:00Z"
+        later_clean_snapshot = self._clean_snapshot_for_evidence(later_clean, "9")
+        later_clean_snapshot["initial_page_inventory"]["trustworthy_terminal_count"] = 2
+        later_clean_snapshot["final_page_inventory"]["trustworthy_terminal_count"] = 2
+        self.assertFalse(
+            self._validator_with_complete_snapshot(later_clean_snapshot).validate(
+                terminal_report
+            )
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(later_clean_snapshot).validate(
+                merge_report
+            )
+        )
+
+        later_finding = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        finding_selection = {
+            "classification": "findings",
+            "evidence": copy.deepcopy(later_finding["evidence"]),
+        }
+        finding_snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            finding_snapshot[f"{phase}_terminal_selection"] = copy.deepcopy(
+                finding_selection
+            )
+            finding_snapshot[f"{phase}_page_inventory"][
+                "trustworthy_terminal_count"
+            ] = 2
+        finding_snapshot["initial_snapshot_sha256"] = "a" * 64
+        finding_snapshot["final_snapshot_sha256"] = "a" * 64
+        self.assertFalse(
+            self._validator_with_complete_snapshot(finding_snapshot).validate(
+                terminal_report
+            )
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(finding_snapshot).validate(
+                merge_report
+            )
+        )
+
+        for classification in ("resolved-inline", "malformed", "absent"):
+            with self.subTest(classification=classification):
+                snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                for phase in ("initial", "final"):
+                    snapshot[f"{phase}_terminal_selection"] = {
+                        "classification": classification,
+                        "evidence": None,
+                    }
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(
+                        terminal_report
+                    )
+                )
+
+        for phase in ("initial", "final"):
+            for field in ("classification", "evidence"):
+                with self.subTest(phase=phase, missing_selection_field=field):
+                    snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                    snapshot[f"{phase}_terminal_selection"].pop(field)
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            terminal_report
+                        )
+                    )
+        open_selection = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        open_selection["initial_terminal_selection"]["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(open_selection).validate(
+                terminal_report
+            )
+        )
+
+        evidence_replacements = {
+            "id": 102,
+            "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102",
+            "channel": "review",
+            "grammar_branch": "clean-review-v1",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "server_time": "2026-08-23T09:08:00Z",
+        }
+        for field, replacement in evidence_replacements.items():
+            with self.subTest(selected_evidence_field=field):
+                snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+                for phase in ("initial", "final"):
+                    snapshot[f"{phase}_terminal_selection"]["evidence"][field] = (
+                        replacement
+                    )
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(
+                        terminal_report
+                    )
+                )
+
+        selection_drift = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        selection_drift["final_terminal_selection"]["evidence"]["id"] = 102
+        self.assertFalse(
+            self._validator_with_complete_snapshot(selection_drift).validate(
+                terminal_report
+            )
+        )
+        open_evidence = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            open_evidence[f"{phase}_terminal_selection"]["evidence"]["opaque"] = True
+        self.assertFalse(
+            self._validator_with_complete_snapshot(open_evidence).validate(
+                terminal_report
+            )
+        )
+
+    def test_complete_pr_snapshot_blocks_pass_on_unresolved_or_unstable_state(
+        self,
+    ) -> None:
+        cases = (
+            (
+                self.grammar["report_bases"]["terminal_clean"],
+                self.clean_complete_pr_parent_snapshot,
+            ),
+            (
+                self.grammar["report_bases"]["merge_status"],
+                self.merge_complete_pr_parent_snapshot,
+            ),
+            (
+                self.grammar["report_bases"]["reaction_clean"],
+                self.absent_complete_pr_parent_snapshot,
+            ),
+        )
+        for report, baseline in cases:
+            for replacement in (1, False, 0.0):
+                with self.subTest(basis=report["basis"], unresolved=replacement):
+                    snapshot = copy.deepcopy(baseline)
+                    snapshot["unresolved_provider_findings"] = replacement
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            report
+                        )
+                    )
+            for mutation in ("incomplete-page", "digest-drift"):
+                with self.subTest(basis=report["basis"], mutation=mutation):
+                    snapshot = copy.deepcopy(baseline)
+                    if mutation == "incomplete-page":
+                        snapshot["final_page_inventory"][
+                            "review_thread_comments_pages_complete"
+                        ] = False
+                    else:
+                        snapshot["final_snapshot_sha256"] = "b" * 64
+                    self.assertFalse(
+                        self._validator_with_complete_snapshot(snapshot).validate(
+                            report
+                        )
+                    )
+
+        reaction_report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self.clean_complete_pr_parent_snapshot
+            ).validate(reaction_report)
+        )
+        for classification in ("findings", "malformed", "resolved-inline"):
+            snapshot = copy.deepcopy(self.absent_complete_pr_parent_snapshot)
+            for phase in ("initial", "final"):
+                snapshot[f"{phase}_terminal_selection"] = {
+                    "classification": classification,
+                    "evidence": None,
+                }
+            self.assertFalse(
+                self._validator_with_complete_snapshot(snapshot).validate(
+                    reaction_report
+                )
+            )
+
     def test_reaction_epoch_cannot_be_repaired_to_a_different_head(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
-        self.assertTrue(self.report_validator.validate(report))
+        self.assertTrue(self.reaction_report_validator.validate(report))
 
         other_head = "1111111111111111111111111111111111111111"
         report["head_sha"] = other_head
@@ -2128,7 +3349,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
 
     def test_merge_status_uses_independent_parent_scope_inputs(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
-        self.assertTrue(self.report_validator.validate(report))
+        self.assertTrue(self.merge_report_validator.validate(report))
         replacements = {
             "repository": "octo/other",
             "pull_request": 8,
@@ -2151,7 +3372,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
 
     def test_merge_status_uses_independent_parent_contract_input(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
-        self.assertTrue(self.report_validator.validate(report))
+        self.assertTrue(self.merge_report_validator.validate(report))
         replacements = {
             "contract_descriptor": {
                 "source_repository": "octo/other-gate",
@@ -2207,6 +3428,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         )
         review_parent_contract = copy.deepcopy(self.merge_status_parent_contract)
         review_parent_contract["provider_clean_evidence_url"] = review_url
+        review_snapshot = self._merge_snapshot_for_report(review_report, "7")
         review_validator = _ReportValidator(
             self.grammar,
             self.selected_parent_selection_outcome,
@@ -2215,6 +3437,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.reaction_clean_parent_epoch,
             self.merge_status_parent_scope,
             review_parent_contract,
+            None,
+            review_snapshot,
         )
         self.assertTrue(review_validator.validate(review_report))
         review_clean["grammar_branch"] = "clean-issue-v1"
@@ -2240,7 +3464,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
 
         for report in selected_reports:
             with self.subTest(status=report["status"], basis=report["basis"]):
-                self.assertTrue(self.report_validator.validate(report))
+                validator = {
+                    "reaction-clean": self.reaction_report_validator,
+                    "merge-status": self.merge_report_validator,
+                }.get(report["basis"], self.report_validator)
+                self.assertTrue(validator.validate(report))
                 self.assertFalse(self.no_pr_report_validator.validate(report))
 
         no_pr_report = copy.deepcopy(

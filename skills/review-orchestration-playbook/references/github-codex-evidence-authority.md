@@ -61,11 +61,24 @@ field set, scope endpoints, count, canonical order, and digest and require
 inconclusive. A mismatched, open, or invalid projection is malformed scope
 evidence; raw provider ancestry claims never substitute for this parent proof.
 
-An advance of the target base tip does not by itself invalidate head-bound
-provider evidence. If the head and unique merge base are unchanged, the frozen
-local range is unchanged too, although freshness, mergeability, queue, and
-base-tip-sensitive CI gates must be reacquired. Do not claim that a provider
-comment, review, reaction, or ordinary check proves the base.
+An observed target `baseRefName` change or advance of the target base tip does
+not by itself invalidate head-bound provider evidence. If the head and unique
+merge base are unchanged, the frozen local range endpoints are unchanged too,
+but the new exact target-ref identity or `baseRefOid`
+invalidates every prior local PR-wide review, local validation and test result,
+CI/status result, conversation/readiness decision, and final reread. Reacquire
+all of them before counting readiness again; unchanged range provenance does
+not preserve those earlier results. Retain the head-bound provider result only
+after a complete final reread confirms its exact head is still current and no
+applicable provider finding remains unresolved. Do not claim that a provider
+comment, review, reaction, or ordinary check proves the base. The retained
+result supplies no base, merge-base, or target-ref coverage.
+
+This observed-change invalidation rule is unchanged by the narrow atomic-window
+alternative in [pr-readiness.md](pr-readiness.md): only an unobserved movement
+of the same frozen target ref during the direct merge's atomic window may use a
+parent-proved monotonic range contraction. Authorized PR-retarget actors belong
+to that proof's trusted external control plane, not provider evidence.
 
 After a merge-base change on an unchanged head, the parent may reuse the
 head-bound GitHub result after a complete final reread confirms the same head
@@ -110,8 +123,7 @@ Fetch and retain every page needed for the selected PR:
 - pull-request reviews;
 - all inline comments associated with every candidate provider review;
 - GraphQL review threads and every nested thread-comment page;
-- reactions on each candidate exact `@codex review` request when the fallback
-  may be needed; and
+- reactions on each candidate exact `@codex review` request; and
 - current-head check runs or statuses used as a preferred merge/status basis.
 
 Start each connection at its first page, follow the returned cursor or next
@@ -123,6 +135,42 @@ Preserve raw IDs, URLs, actor fields, states, bodies, commit IDs, and server
 timestamps. Parse only documented provider carriers with an anchored parser.
 Unknown terminal-looking provider prose is malformed evidence, not a clean
 result and not silently ignorable.
+
+Before any `pass`, freeze a separate closed parent-owned
+`complete_pr_snapshot` from two complete raw observations. Its initial and
+final closed selected-PR scopes must be type-preserving equal and bind the
+exact report repository, PR, and head. Its initial and final page inventories
+must also be type-preserving equal: issue comments, reviews, associated inline
+comments, GraphQL review threads, every nested thread-comment page, reactions
+on every candidate exact review request, check runs, and
+commit statuses each carry an exact `true` completion flag and a typed
+non-negative count. The two closed terminal selections must be equal and
+bind the unique latest trustworthy terminal result selected under this
+authority's precedence. Terminal-clean and merge-status pass require
+`classification: clean` plus the complete selected evidence; reaction-clean
+requires `classification: absent` plus null evidence. Every pass requires an
+exact integer zero unresolved-provider-finding count. The same record also
+contains equal initial and final closed pass-basis selections derived from the
+complete raw observations: terminal-clean repeats the exact selected terminal
+evidence, reaction-clean binds the exact request and provider reaction
+kind/command/actor/IDs/URLs/server times, and merge-status binds the exact
+check-run ID/URL/name/App/head/status/conclusion/time fields, producer-contract
+descriptor, and complete associated provider-clean evidence. The unused union
+branches are null.
+
+The snapshot's initial and final lowercase SHA-256 values must be equal digests
+of RFC 8785 canonical JSON for the complete raw snapshot: exact scope/head,
+raw issue/review/inline/thread, nested thread-comment, and reaction pages,
+pagination envelopes and typed counts, derived terminal candidates and
+ordering, the selected latest terminal result, selected pass-basis projection,
+unresolved applicable findings, and check/status records.
+They are not digests of the report summary.
+The parent persists this record independently before report validation;
+report, association, epoch, or check fields cannot create,
+amend, or self-prove it. The consumer requires both basis selections to be
+type-preserving equal and to join exactly to the report and its orthogonal
+epoch or merge-contract carrier; changing those carriers together while
+leaving this frozen selection unchanged fails closed.
 
 ## Evidence Strength
 
@@ -144,6 +192,13 @@ and slug, `completed` status, `success` conclusion, and full head SHA to that
 contract. The same association must name one accepted current-head provider
 terminal-clean result. A generic successful check, an App start marker, or a
 status from another head does not qualify.
+
+The check association and its separately verified producer contract are
+necessary but not sufficient. A merge-status pass also requires the common
+`complete_pr_snapshot` above to select that exact associated clean evidence as
+the stable latest trustworthy terminal result, and to select the exact check
+run and association as its stable merge-status basis, with zero unresolved
+applicable findings.
 
 Preference does not silently enlarge what the check proves. Unless its
 documented contract explicitly binds the PR base, the related merge/status
@@ -313,6 +368,15 @@ terminal artifacts, malformed terminal-looking artifacts, and unresolved
 findings. Reusing a head-A request or reaction while reporting head B therefore
 fails closed even if the visible IDs and URL are unchanged.
 
+The epoch remains orthogonal to the common `complete_pr_snapshot`: a
+reaction-clean pass requires both. The common snapshot must have stable
+`classification: absent` / null terminal selection, complete typed page
+inventories, a stable exact reaction-clean basis selection, equal canonical
+snapshot digests, and integer zero unresolved findings. The basis selection
+must repeat the epoch's request and provider-reaction identity/actor/times and
+join to the report evidence. An epoch cannot self-prove that final whole-PR
+snapshot.
+
 If the POST outcome was ambiguous, first reread the unchanged current head and
 its complete visible exact-request set. If delivery still cannot be proved,
 the same exact `@codex review` POST may be repeated after backoff as an
@@ -431,6 +495,11 @@ structurally invalid for terminal clean. The clean channel and grammar branch
 are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
 requires `clean-review-v1`; crossing those pairs is malformed evidence.
 
+This evidence object cannot self-prove complete final state: terminal-clean
+pass also requires the independent `complete_pr_snapshot` to select this exact
+evidence as both its stable latest clean terminal result and its stable
+terminal-clean basis selection.
+
 `basis: resolved-inline-awaiting-clean` uses the same closed terminal-artifact
 evidence fields, but only with `status: pending`, `channel: review`,
 `grammar_branch: inline-parent-v1`, a non-null `artifact_commit` equal to the
@@ -462,7 +531,11 @@ evidence:
 
 `stable-request-epoch` is valid only in that `basis: reaction-clean` reaction
 variant, and the evidence is accepted only alongside the closed parent-owned
-`reaction_clean_epoch` described above. A `basis: merge-status` report uses
+`reaction_clean_epoch` and common absent-terminal `complete_pr_snapshot`
+described above. The snapshot's stable reaction-clean basis selection must
+repeat the epoch's exact request and reaction identity, provider actor, and
+server times and join exactly to the report evidence. A `basis: merge-status`
+report uses
 this distinct closed check-run shape; `provider_clean_evidence` is the complete
 terminal-clean evidence shape shown above, not an ID-only assertion:
 
@@ -512,6 +585,15 @@ string by exact UTF-8 byte identity with the independently verified record and
 compare every remaining field exactly. Coupled edits to the report's contract,
 App, check, or stable association identities therefore fail even when the
 edited report remains internally self-consistent.
+
+The consumer also receives the independent common `complete_pr_snapshot`.
+Its stable latest clean selection must equal `provider_clean_evidence`
+type-for-type. Its stable merge-status basis selection must also equal the
+outer check's complete identity/App/head/status/conclusion/time projection and
+the producer-contract descriptor and associated provider-clean evidence
+type-for-type, and must join exactly to the independently supplied parent
+contract. Neither the check association nor the parent contract may self-prove
+or repair that whole-PR snapshot.
 
 The parent independently verifies the exact contract bytes and digest and
 confirms that the contract binds this App identity, check name, check identity,

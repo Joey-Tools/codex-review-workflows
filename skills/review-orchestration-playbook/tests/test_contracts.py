@@ -363,6 +363,7 @@ class RepositoryContractTest(unittest.TestCase):
         skill = _read("SKILL.md")
         readiness = _read("references/pr-readiness.md")
         normalized_skill = _normalize(skill)
+        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
         freshness_contract = readiness.split(
             "## Branch Freshness Is Not Linear History", 1
         )[1].split("### Head-Only Provider Responsibility Boundary", 1)[0]
@@ -388,11 +389,30 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "freeze the resulting `merge_base..new_head`", normalized_freshness
         )
-        self.assertIn("invalidates all old-head evidence", normalized_skill)
         self.assertIn(
-            "no clean evidence bound to the old head is reusable",
+            "invalidates every old-head positive/pass/clean result and every head-bound readiness gate",
+            normalized_skill,
+        )
+        self.assertIn(
+            "every positive, pass, or clean result bound to the old head is stale",
             normalized_freshness,
         )
+        self.assertIn(
+            "every head-bound readiness gate must be reacquired",
+            normalized_freshness,
+        )
+        for retained_negative in (
+            "an ancestry-proven unresolved provider finding that remains applicable to the new head",
+            "negative evidence, not reusable positive evidence",
+            "continues to block until typed resolution or an accepted later corrective artifact",
+        ):
+            self.assertIn(retained_negative, normalized_freshness)
+        self.assertIn(
+            "every old-head positive github codex result is stale; unresolved findings remain applicable",
+            authority,
+        )
+        self.assertNotIn("invalidates all old-head evidence", normalized_skill)
+        self.assertNotIn("all old-head evidence", _normalize(readiness))
 
         for rerun_gate in (
             "local validation and tests",
@@ -405,9 +425,86 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(rerun_gate, normalized_freshness)
 
-    def test_merge_execution_atomically_binds_the_reviewed_head(self) -> None:
+    def test_base_tip_change_invalidates_pr_readiness_evidence(self) -> None:
+        skill = _normalize(_read("SKILL.md"))
+        readiness_raw = _read("references/pr-readiness.md")
+        readiness = _normalize(readiness_raw)
+        probes = _normalize(_read("references/github-pr-probes.md"))
+        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        invalidation = _normalize(
+            readiness_raw.split("## Change Invalidation", 1)[1].split("## Fix Loop", 1)[
+                0
+            ]
+        )
+        final_reread = _normalize(
+            readiness_raw.split("## Final Reread", 1)[1].split(
+                "## Atomic Head Binding For Merge Execution", 1
+            )[0]
+        )
+
+        for document in (skill, readiness, probes, authority):
+            self.assertIn("`baserefname`", document)
+            self.assertIn("`baserefoid`", document)
+            self.assertIn("readiness", document)
+
+        self.assertIn(
+            "even when the head and unique merge base remain unchanged",
+            probes,
+        )
+        self.assertIn(
+            "all local pr-wide reviews, all local validation and tests, all ci/status results, all conversation decisions",
+            invalidation,
+        )
+        self.assertIn(
+            "the current exact repository, `baserefname`, and `baserefoid` binding",
+            final_reread,
+        )
+        self.assertIn(
+            "the same selected repository, current exact `baserefname`, exact `baserefoid`, head, and appropriate merge base",
+            final_reread,
+        )
+        self.assertIn("a stale scope, target-ref, or base-tip binding", final_reread)
+        self.assertIn("readiness decisions, and final reread", invalidation)
+        self.assertIn(
+            "no evidence from the old base tip remains countable",
+            invalidation,
+        )
+        self.assertIn(
+            "the range endpoints and active range-origin record are unchanged",
+            invalidation,
+        )
+        self.assertIn(
+            "target `baserefname` changes, even when its oid is unchanged",
+            invalidation,
+        )
+        self.assertIn(
+            "all local pr-wide reviews, all local validation and tests, all ci/status results, all conversation decisions",
+            invalidation,
+        )
+
+        for document in (readiness, probes, authority):
+            self.assertIn(
+                "exact head is still current",
+                document,
+            )
+            self.assertIn(
+                "no applicable provider finding remains unresolved",
+                document,
+            )
+            self.assertIn("no base", document)
+
+        self.assertNotIn("base-sensitive local/readiness gates only", probes)
+        self.assertNotIn(
+            "the frozen local range itself is unchanged",
+            invalidation,
+        )
+
+    def test_merge_execution_binds_head_and_server_enforces_base_freshness(
+        self,
+    ) -> None:
         skill = _normalize(_read("SKILL.md"))
         readiness = _read("references/pr-readiness.md")
+        probes = _normalize(_read("references/github-pr-probes.md"))
         execution = readiness.split("## Atomic Head Binding For Merge Execution", 1)[
             1
         ].split("## Merge-Ready Report", 1)[0]
@@ -416,11 +513,17 @@ class RepositoryContractTest(unittest.TestCase):
         for required in (
             "direct merge and to merge-queue enrollment",
             "server-enforced precondition in the operation itself",
+            "server-enforced base-freshness binding",
             "--match-head-commit",
             "select the exact repository and pr",
-            "a separate `headrefoid` read followed by an unconditional mutation "
+            "a separate `headrefoid` or `baserefoid` read followed by an unconditional mutation "
             "has a race",
-            "never emulate the condition with a second read in the client",
+            "never emulate either condition with a second read in the client",
+            "it does not expose an expected-target-base field",
+            "a point read of the base, mergeability, or `mergestatestatus` is not an atomic substitute",
+            "the protected property is exactly one of",
+            "exact base equality",
+            "proven monotonic range contraction",
             "do not retry the stale mutation",
             "the pr's final feature head to remain exactly `merge_expected_head`",
         ):
@@ -479,6 +582,52 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(invalidated_gate, normalized_execution)
 
+        for base_race_anchor in (
+            "require branches to be up to date before merging",
+            "it is not an exact-base comparison",
+            "a different base tip that is already an ancestor of the unchanged feature head may still satisfy strict freshness",
+            "required checks plus strict",
+            "do not by themselves protect the later mutation",
+            "a configured merge queue owns only latest-base merge-group freshness by default",
+            "it does not reacquire out-of-band local review or conversation gates",
+            "if no such hold exists, the queue path is blocked",
+            "the only direct-merge alternative is a complete parent proof of monotonic range contraction",
+            "the frozen `merge_expected_base_ref` equals the selected repository plus `baserefname`",
+            "every update to that same frozen target ref from `merge_expected_base` must be fast-forward",
+            "deletion and non-fast-forward updates are forbidden",
+            "configured administrator/app/ruleset bypass",
+            "trusted external control plane",
+            "any observed `baserefname`, applicable-rule, bypass, or actor-inventory change invalidates the proof",
+            "does not define a producer implementation or require a nonexistent server-side retarget hold",
+        ):
+            self.assertIn(base_race_anchor, probes)
+
+        self.assertIn(
+            "if the target ref or base tip changes again before the direct merge and the parent observes it, start the full invalidation loop again",
+            normalized_execution,
+        )
+        self.assertIn(
+            "when the change leaves the feature branch behind, strict freshness additionally blocks",
+            normalized_execution,
+        )
+        self.assertIn(
+            "the queue, rather than a nonexistent expected-base request field, owns base freshness only under a repository-proved required hold",
+            normalized_execution,
+        )
+        for queue_base_change_anchor in (
+            "such a change invalidates the existing enrollment, `merge_expected_base`, and every earlier local review",
+            "cancel or observe cancellation of that enrollment",
+            "complete the full rerun for the new exact base tip",
+            "a rebuilt merge group never preserves out-of-band evidence",
+            "every invalidated gate is itself a required, non-bypassed check on that new merge group",
+            "without either contract, the queue path is blocked",
+        ):
+            self.assertIn(queue_base_change_anchor, normalized_execution)
+        self.assertNotIn(
+            "must cancel or rebuild its merge group when the target base changes",
+            normalized_execution,
+        )
+
         self.assertIn("direct merge and merge-queue enrollment", skill)
         self.assertIn("--match-head-commit <head_sha>", skill)
         self.assertIn("asynchronous merge request", skill)
@@ -488,12 +637,105 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("the queue path is blocked", skill)
         self.assertIn("a separate head read is not an atomic substitute", skill)
         self.assertIn("a mismatch fails closed", skill)
+        self.assertIn("exact-base property is preferred", skill)
+        self.assertIn("proven monotonic range contraction", skill)
+        self.assertIn("frozen `merge_expected_base_ref`", skill)
+        self.assertIn("strict alone", skill)
+        self.assertIn("force-push or deletion permission", skill)
+        self.assertIn("any configured base-update or merge bypass", skill)
+        self.assertIn("trusted external control plane", skill)
+        self.assertIn("a separate base read is not an atomic substitute", skill)
 
         report = _normalize(readiness.split("## Merge-Ready Report", 1)[1])
+        self.assertIn("base_ref_name: exact-base-ref-name", report)
         self.assertIn("merge_expected_head: same-as-head-ref-oid", report)
         self.assertIn(
-            "merge_execution_binding: required-server-side | not-authorized",
+            "merge_expected_base: same-as-base-ref-oid-at-final-reread", report
+        )
+        self.assertIn("merge_expected_base_ref:", report)
+        self.assertIn("repository: same-as-report-repository", report)
+        self.assertIn("base_ref_name: exact-base-ref-name-at-final-reread", report)
+        self.assertIn(
+            "merge_execution_binding: required-server-side-head-and-base-freshness | not-authorized",
             report,
+        )
+        self.assertIn(
+            "protected_base_property: exact-base-equality | monotonic-range-contraction | merge-queue-full-gate-binding | blocked-unproved",
+            report,
+        )
+        self.assertIn(
+            "base_freshness_binding: merge-queue-full-gate-binding | expected-base-precondition | repository-exact-base-guard | monotonic-range-contraction | blocked-unbound",
+            report,
+        )
+
+    def test_monotonic_contraction_direct_merge_alternative_is_closed(self) -> None:
+        readiness_raw = _read("references/pr-readiness.md")
+        decision = _normalize(
+            readiness_raw.split("### Direct Base Protection Decision", 1)[1].split(
+                "For a direct merge", 1
+            )[0]
+        )
+        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+
+        for required_proof in (
+            "the frozen `merge_expected_base_ref` equals the final-reread repository plus `baserefname`",
+            "the final unique merge base, `merge_expected_base`, and reviewed `base_sha` are equal",
+            "strict up-to-date is enforced by the server in the merge transaction",
+            "that same frozen target base ref can only move by fast-forward and cannot be deleted or non-fast-forward rewritten",
+            "the complete current applicable protection/ruleset and actor inventory",
+            "contains no configured base-update or merge bypass",
+            "including an administrator, app, or ruleset bypass entry",
+            "enumerates actors authorized to retarget the pr",
+            "that inventory is complete rather than inferred from one visible rule",
+            "`merge_expected_base` is an ancestor of `current_base`",
+            "`current_base` is an ancestor of `head_sha`",
+            "is a subset of the reviewed `merge_expected_base..head_sha` range",
+        ):
+            self.assertIn(required_proof, decision)
+
+        for negative_case in (
+            "strict up-to-date alone | blocked",
+            "force push or another non-fast-forward base update is allowed | blocked",
+            "base deletion is allowed | blocked",
+            "any configured base-update or merge bypass exists | blocked",
+            "applicable protection/ruleset or actor/bypass inventory is incomplete | blocked",
+            "base-ref or authorized retarget-actor inventory is incomplete | blocked",
+            "an observed `baserefname` retarget, even to the same oid or another `head_sha` ancestor | full invalidation; contraction unavailable",
+            "any rule, actor, endpoint, or transactional-enforcement proof is missing or ambiguous | blocked",
+        ):
+            self.assertIn(negative_case, decision)
+
+        self.assertIn(
+            "transactional strict plus frozen target ref, complete fast-forward-only/no-delete/no-configured-bypass proof, and exact reviewed head | eligible through proven monotonic range contraction",
+            decision,
+        )
+        self.assertIn(
+            "once the parent observes any `baserefname` or `baserefoid` change, the ordinary full invalidation and rerun rule applies",
+            decision,
+        )
+        self.assertIn(
+            "do not infer contraction across two different target ref names",
+            decision,
+        )
+        self.assertIn(
+            "a retarget to another `head_sha` ancestor need not make that new tip a descendant of `merge_expected_base`",
+            decision,
+        )
+        self.assertIn(
+            "github and authorized repository collaborators or administrators who can retarget the pr or reconfigure rules are the trusted external control plane",
+            decision,
+        )
+        self.assertIn(
+            "any observed `baserefname`, applicable-rule, bypass, or actor-inventory change invalidates the contraction proof",
+            decision,
+        )
+        self.assertIn(
+            "malicious or concurrent unobserved retargeting or control-plane reconfiguration after the final reread is outside the consumer guarantee",
+            decision,
+        )
+        self.assertIn(
+            "only an unobserved movement of the same frozen target ref during the direct merge's atomic window",
+            authority,
         )
 
     def test_change_delivery_reviews_the_exact_final_landing_head(self) -> None:
