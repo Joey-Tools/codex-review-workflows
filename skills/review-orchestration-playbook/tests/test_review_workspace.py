@@ -1879,9 +1879,15 @@ class ReviewWorkspaceTest(unittest.TestCase):
                     (destination / ".git").mkdir(mode=0o700)
                 if case == "control-replaced":
                     control_bytes = control_path.read_bytes()
-                    control_path.unlink()
-                    control_path.write_bytes(control_bytes)
-                    control_path.chmod(0o600)
+                    original_control = control_path.stat(follow_symlinks=False)
+                    self.atomically_replace_private_file(
+                        control_path,
+                        control_bytes,
+                    )
+                    replacement_control = control_path.stat(follow_symlinks=False)
+                    self.assertFalse(
+                        os.path.samestat(original_control, replacement_control)
+                    )
 
                 def process_identity(pid: int) -> str:
                     if pid == owner_pid:

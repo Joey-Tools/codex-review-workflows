@@ -949,10 +949,35 @@ superseded_by:
   `skill-repo-codex-gate` uses one fresh local Codex processor plus exact-current-
   head GitHub Codex, leaves named single/double/triple semantics untouched, and
   keeps repository-specific exceptions out of this installed skill.
+- Draft PR 108's first current-head CI run exposed two cross-platform test-
+  control defects. On Linux, an `unlink`-then-recreate replacement fixture could
+  immediately reuse the released inode, so its own object-identity premise did
+  not hold; the fixture now allocates a distinct private object before atomic
+  replacement and explicitly proves `samestat` is false. On macOS, the closed
+  source-only loader did not mark its manifest-bound module spec as having a
+  location, so importlib omitted `__file__`. The loader now retains its captured-
+  byte execution and empty package search path while publishing the exact
+  authenticated source path through standard `__file__`, `origin`, and
+  `has_location` metadata.
+- The stabilized Mac loader tree passed all 848 deterministic supervisor tests
+  in 261.366 seconds, seven focused loader tests, and four manifest tests. An
+  earlier 848-test invocation is not evidence because its task wrapper used
+  `umask 077` and created synthetic Git worktree files with the wrong mode; the
+  valid rerun restored `umask 022`. Four focused recovery tests and an
+  independent read-only review of the combined four-file CI correction also
+  passed with `No findings`.
+- The corrected integrated tree passed all 3,081 review-playbook tests with six
+  conditional skips in 1,028.611 seconds outside the outer sandbox, with
+  `ResourceWarning` promoted to an error. A same-head CLI review attempt is
+  explicitly inconclusive rather than clean: the outer sandbox prevented every
+  nested model command with `sandbox_apply: Operation not permitted`. The
+  trusted post-attempt workspace receipt remained byte-identical, the ordinary
+  authentication file was unchanged, and the one-time auth-only home was
+  destroyed. A new signed head must receive a fresh host-bound review.
 
 ## Next Steps
 
-- Freeze and sign the repaired canonical head, rerun exact-head secret
+- Sign and push the cross-platform CI correction, rerun exact-head secret
   admission and a fresh whole-range GPT-5.6 Sol Ultra Codex review under the
   prior trusted release, then complete PR 108's current-head GitHub lane, CI,
   final reread, and squash merge.
