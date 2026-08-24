@@ -30,31 +30,71 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             _read(REFERENCES / "github-codex-terminal-carriers-v1.json")
         )
 
-    def test_actions_mutation_requires_contract_and_authorization(self) -> None:
+    def test_actions_repeat_is_exact_tuple_idempotent_and_authorized(self) -> None:
         recovery = self.probes.split("## Reconcile Only Recoverable States", 1)[
             1
         ].split("## Retry Schedule And Cost Control", 1)[0]
         normalized = _normalize(recovery)
 
-        self.assertIn("an actions mutation has two independent gates", normalized)
         self.assertIn(
-            "predeclares the exact rerun or dispatch operation as idempotent or reentrant",
+            "freeze one exact recovery tuple",
             normalized,
         )
-        self.assertIn("the current task authorizes that external mutation", normalized)
+        self.assertIn("repetitions of that same tuple as idempotent", normalized)
+        self.assertIn("no repository-specific idempotency", normalized)
+        self.assertIn(
+            "the current task must still authorize the external mutation", normalized
+        )
         self.assertIn("keep the recovery owner in status-only mode", normalized)
         self.assertIn(
-            "report the missing contract or authorization instead of triggering",
+            "report the missing authorization instead of triggering",
             normalized,
         )
         self.assertLess(
-            normalized.index("an actions mutation has two independent gates"),
+            normalized.index("freeze one exact recovery tuple"),
             normalized.index("illustrative commands"),
         )
-        self.assertNotIn(
-            "repeated reruns or dispatches are semantically idempotent",
-            _normalize(self.skill + "\n" + self.probes + "\n" + self.authority),
+        combined = _normalize(
+            self.skill
+            + "\n"
+            + self.probes
+            + "\n"
+            + self.authority
+            + "\n"
+            + self.contracts
+            + "\n"
+            + self.prompts
         )
+        self.assertNotIn("repository-predeclared", combined)
+        self.assertNotIn("predeclares it as idempotent", combined)
+        for anchor in (
+            "single-flight",
+            "changed scope",
+            "workflow",
+            "input set",
+            "ordinary confirmation",
+            "never reconcile an explicit review finding",
+        ):
+            self.assertIn(anchor, combined)
+
+    def test_merge_status_basis_binds_subject_scope_and_contract_clean(self) -> None:
+        combined = _normalize(self.skill + "\n" + self.probes + "\n" + self.authority)
+        for anchor in (
+            "feature head",
+            "current base",
+            "unique merge base",
+            "check_subject_sha",
+            "github-synthetic-merge",
+            "latest-feature-head",
+            "current-merge-scope",
+            "app/workflow/run/check",
+            "does not require a separate terminal clean comment or review",
+            "generic successful check",
+            "service-start marker",
+            "zero unresolved applicable",
+            "type-preserving equality",
+        ):
+            self.assertIn(anchor, combined)
 
     def test_ambiguous_delivery_retry_is_consistent_across_github_contracts(
         self,

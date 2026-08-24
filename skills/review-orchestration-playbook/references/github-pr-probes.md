@@ -42,6 +42,14 @@ gh api --paginate repos/<owner>/<repo>/commits/<head>/check-runs
 gh api --paginate repos/<owner>/<repo>/commits/<head>/status
 ```
 
+Always retain the exact feature head independently. If a dynamically verified
+producer contract declares GitHub's synthetic merge commit as the check
+subject, also read the PR REST resource's exact `merge_commit_sha`, verify that
+the associated check suite/run reports that same subject, and fetch the complete
+check-run and status collections for that exact SHA. Never substitute the
+synthetic subject for `headRefOid`, and never infer it from a name or local
+merge.
+
 For each candidate request comment, fetch its individual reactions with the
 GitHub reactions media type and full pagination. Aggregate reaction counts do
 not include the actor identity required by the authority.
@@ -58,17 +66,22 @@ Bind every GraphQL response back to raw `repository.nameWithOwner` and
 records. Never synthesize `thread_resolved` on REST comments.
 
 Immediately before accepting a result, repeat the PR detail, all provider
-evidence pages used by the decision, finding-thread state, and selected
-check/status. A changed head restarts the head-bound lane.
+evidence pages used by the decision, finding-thread state, exact feature-head
+checks/statuses, and selected check subject plus its complete checks/statuses.
+Require type-preserving equality with the initial closed scope and selection.
+A changed head restarts the head-bound lane; a changed base ref/tip, merge base,
+or synthetic subject invalidates a synthetic-merge basis.
 
 An observed `baseRefName` change, even with the same OID, or a changed
 `baseRefOid` invalidates all previously counted local reviews, local validation
 and tests, CI/status results, conversation decisions, readiness decisions, and
 the final reread, even when the head and unique merge base remain unchanged. A
-trustworthy head-bound provider artifact is the only exception: retain it only
-after this complete repeat proves its exact head is still current and no
-applicable provider finding remains unresolved. It supplies no base,
-merge-base, or target-ref coverage.
+trustworthy terminal artifact, reaction, or feature-head-only producer result
+is the only exception: retain it only after this complete repeat proves its
+exact head is still current and no applicable provider finding remains
+unresolved. It supplies no base, merge-base, or target-ref coverage. A
+synthetic-merge producer basis is base-sensitive and must be reacquired for the
+new exact scope and check subject.
 
 ## Request The Review
 
@@ -108,16 +121,25 @@ inspected the changed base tip or retargeted base.
 ## Discover Related Checks Dynamically
 
 Do not hard-code a workflow filename, workflow display name, job name, or
-check name. Start from checks and statuses attached to the exact current head:
+check name. Start from the exact current feature head, then select the check
+subject only through the verified producer contract:
 
-1. Read `statusCheckRollup` plus the complete current-head check-run and status
-   collections.
+1. Read `statusCheckRollup` plus the complete feature-head check-run and status
+   collections. Preserve `headRefOid` even if no selected check is attached to
+   it.
 2. Select a candidate only when its App identity, `details_url`, check suite,
    external ID, or documented repository contract associates it with the
    GitHub Codex review or merge aggregation.
-3. Follow the associated run URL or API identity to the workflow run and jobs.
-4. Preserve the check ID, suite/run ID, workflow ID, attempt, head SHA,
-   conclusion, and details URL.
+3. If that contract declares `github-synthetic-merge`, independently read the
+   current base ref/tip, locally proved unique merge base, PR
+   `merge_commit_sha`, and complete check/status collections for that subject.
+   If it declares `feature-head`, require the subject SHA to equal
+   `headRefOid` and make no base-coverage claim.
+4. Follow the associated run URL or API identity to the exact workflow run and
+   jobs.
+5. Preserve the App ID/slug, workflow ID, run ID/attempt, check-suite ID, check
+   ID/name/URL, feature head, base ref/tip, merge base, subject kind/SHA,
+   status, conclusion, server time, and producer-contract descriptor.
 
 A name substring is a hint for discovery, not proof. A check attached to an
 older head, a generic App success, or a run found only by static name guessing
@@ -125,8 +147,13 @@ is not a valid basis.
 
 When a trustworthy related merge/status check exists, prefer it as the
 positive GitHub-lane basis, while still enumerating unresolved Codex-provider
-findings. The check does not prove the PR base unless its documented contract
-does so; ordinary readiness still validates base and merge base locally.
+findings. Its independently verified contract must define successful completion
+as `github-codex-provider-clean`, require zero unresolved applicable findings,
+and declare either `latest-feature-head` or `current-merge-scope`. The former
+does not prove the PR base. The latter additionally requires the exact synthetic
+subject and current base/merge bindings above. Ordinary readiness still
+validates base and merge base locally. A generic successful check or
+service-start marker cannot use this basis.
 
 Before an authorized merge, acquire complete applicable branch-protection or
 ruleset evidence for the exact base branch. A direct merge's base binding is
@@ -201,20 +228,17 @@ Never reconcile an explicit review finding that is applicable and unresolved,
 a test failure, lint failure, policy failure, or other substantive negative
 result. Those require resolution, a fix, or an explicit policy decision.
 
-An Actions mutation has two independent gates:
-
-1. The repository's documented producer contract predeclares the exact rerun
-   or dispatch operation as idempotent or reentrant for the frozen head and
-   exact inputs.
-2. The current task authorizes that external mutation.
-
-The existence of a run, workflow ID, or `gh` subcommand proves neither gate.
-When either gate is absent, keep the recovery owner in status-only mode, poll
-the scoped evidence on the schedule below, and report the missing contract or
+Before an Actions mutation, freeze one exact recovery tuple containing the
+repository, PR, head, dynamically identified Action or workflow, operation,
+and exact inputs. This consumer treats repetitions of that same tuple as
+idempotent; no repository-specific idempotency or reentrancy predeclaration is
+required. The current task must still authorize the external mutation. When
+that authorization is absent, keep the recovery owner in status-only mode,
+poll the scoped evidence on the schedule below, and report the missing
 authorization instead of triggering the workflow.
 
-After both mutation gates pass, choose the smallest operation that can recover
-the machine-decidable retryable state:
+After the tuple and authorization are established, choose the smallest
+operation that can recover the machine-decidable retryable state:
 
 1. Retry failed jobs when the associated run exists and only jobs failed.
 2. Rerun the full associated run for a run-level infrastructure failure or a
@@ -222,8 +246,7 @@ the machine-decidable retryable state:
 3. Dispatch a new run only for missing, stale, or aggregation-only state, and
    only after dynamic discovery proves the exact workflow and required inputs.
 
-Illustrative commands for an already authorized, repository-declared recovery
-are:
+Illustrative commands for an already authorized exact-tuple recovery are:
 
 ```bash
 gh run rerun <run-id> --failed --repo <owner/repo>
@@ -232,10 +255,10 @@ gh workflow run <workflow-id> --repo <owner/repo> --ref <current-head-branch>
 ```
 
 Repository-specific inputs come from the discovered workflow contract. Never
-invent input names or assume that a rerun or dispatch is idempotent. Even when
-the repository contract declares the operation idempotent or reentrant,
-single-flight still applies: wait until the current attempt is terminal or
-proved lost before starting another.
+invent input names. Single-flight still applies: wait until the current attempt
+is terminal or proved lost before repeating the same tuple. A different
+repository/PR/head scope, Action, workflow, operation, or input set is not a
+retry of that tuple; stop and obtain ordinary confirmation before mutating it.
 
 ## Retry Schedule And Cost Control
 
@@ -285,7 +308,7 @@ recovery:
   next_retry_at: RFC3339
   reason_class: retryable-pending | retryable-infrastructure
   last_reason: stable-machine-readable-reason
-  mutation_gate: authorized-predeclared-reentrant | status-only
+  mutation_gate: authorized-exact-repeat | status-only
   rolling_full_run_equivalents: 0
 ```
 
@@ -293,11 +316,11 @@ Do not convert a retryable recovery into `pass` or `inconclusive` merely because
 the active wait crossed an hour.
 
 Persistent monitoring does not expand authorization. A wake may always reread
-scoped evidence; it may repeat an Actions mutation only when the exact
-repository contract still predeclares it as idempotent or reentrant and the
-current mutation remains authorized. A new workflow, new inputs, branch or PR
-mutation, destination, or other materially different action still requires
-its ordinary authorization.
+scoped evidence; it may repeat an Actions mutation only when the frozen
+recovery tuple is type-preservingly unchanged and the current mutation remains
+authorized. A new scope, Action, workflow, operation, input set, branch or PR
+mutation, destination, or other materially different action requires ordinary
+confirmation.
 
 ## Active Thread And Automation
 

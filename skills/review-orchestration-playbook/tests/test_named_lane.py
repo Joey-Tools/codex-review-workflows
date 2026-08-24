@@ -149,7 +149,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         head = self.commit("workspace head")
         return base, head
 
-    def test_codex_git_prefix_v1_matches_exact_accepted_adapter_sequence(
+    def test_codex_git_prefix_v2_matches_exact_accepted_adapter_sequence(
         self,
     ) -> None:
         worktree = self.root / "review-workspace"
@@ -167,6 +167,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "GIT_CONFIG_SYSTEM=/dev/null",
             "GIT_CONFIG_NOSYSTEM=1",
             "GIT_GRAFT_FILE=/dev/null",
+            "GIT_LITERAL_PATHSPECS=1",
             "GIT_NO_LAZY_FETCH=1",
             "GIT_TERMINAL_PROMPT=0",
             "GIT_NO_REPLACE_OBJECTS=1",
@@ -209,6 +210,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertNotIn("--no-lazy-fetch", actual)
         self.assertEqual(actual[actual.index("--no-pager") + 1], "-c")
         self.assertEqual(actual.count("GIT_NO_LAZY_FETCH=1"), 1)
+        self.assertEqual(actual.count("GIT_LITERAL_PATHSPECS=1"), 1)
         self.assertEqual(
             validate_sanitized_git_argv_prefix(
                 actual,
@@ -241,7 +243,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "does not conform to sanitized-git-argv-prefix-v1",
+            "does not conform to sanitized-git-argv-prefix-v2",
         ):
             validate_sanitized_git_argv_prefix(
                 generated,
@@ -10453,6 +10455,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             self.assertNotIn(key, child)
         self.assertNotIn("NODE_EXTRA_CA_CERTS", default_child)
         self.assertEqual(child["NODE_EXTRA_CA_CERTS"], str(node_extra_ca))
+        self.assertEqual(child["GIT_LITERAL_PATHSPECS"], "1")
         self.assertEqual(child["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(child["GIT_NO_REPLACE_OBJECTS"], "1")

@@ -147,6 +147,10 @@ force permission mode back to `default`, which conflicts with the closed
 variables from the direct child environment and requests the credential and
 sandbox controls above; this does not claim arbitrary subprocess secrets are
 scrubbed.
+The closed child environment also fixes `GIT_LITERAL_PATHSPECS=1`. Every
+candidate-controlled path passed to Git must be one decoded canonical-JSON
+value carried as one exact argv token after `--`; failure to preserve that
+token is inconclusive, never permission to expand a pathspec.
 The `/dev` deny remains intact. The only permitted read-boundary overlap is the
 predeclared exact pair `allowRead: /dev/null` within `denyRead: /dev`, relying
 on Claude Code's documented rule that `allowRead` takes precedence over

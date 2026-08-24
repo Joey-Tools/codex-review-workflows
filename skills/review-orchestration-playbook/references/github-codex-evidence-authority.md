@@ -12,8 +12,13 @@ contract. PR lifecycle, base and merge-base validation, CI, all-conversation
 resolution, and merge readiness belong to [pr-readiness.md](pr-readiness.md).
 Probe and retry mechanics belong to [github-pr-probes.md](github-pr-probes.md).
 
-The GitHub lane proves a result for one exact PR head. It does not prove which
-base or merge base the provider inspected. Local readiness owns that proof.
+The GitHub lane proves a result for one exact PR head. An ordinary terminal
+artifact, reaction, or feature-head producer contract does not prove which
+base or merge base the provider inspected; local readiness owns that proof. A
+trusted synthetic-merge producer contract may additionally prove only its
+closed current-merge-scope assertion when it binds the exact current base and
+check subject under this authority. Local readiness still validates that scope
+independently.
 
 This is an explicit product boundary, not a missing proof obligation for this
 lane. A trustworthy latest-head terminal clean result, or another accepted
@@ -72,7 +77,11 @@ not preserve those earlier results. Retain the head-bound provider result only
 after a complete final reread confirms its exact head is still current and no
 applicable provider finding remains unresolved. Do not claim that a provider
 comment, review, reaction, or ordinary check proves the base. The retained
-result supplies no base, merge-base, or target-ref coverage.
+result supplies no base, merge-base, or target-ref coverage. A feature-head
+merge/status basis follows that same rule. A synthetic-merge basis is
+base-sensitive instead: any change to its frozen base ref, base tip, unique
+merge base, feature head, or check-subject SHA invalidates it and requires a
+new producer result for the recomputed current scope.
 
 This observed-change invalidation rule is unchanged by the narrow atomic-window
 alternative in [pr-readiness.md](pr-readiness.md): only an unobserved movement
@@ -124,7 +133,9 @@ Fetch and retain every page needed for the selected PR:
 - all inline comments associated with every candidate provider review;
 - GraphQL review threads and every nested thread-comment page;
 - reactions on each candidate exact `@codex review` request; and
-- current-head check runs or statuses used as a preferred merge/status basis.
+- feature-head check runs and statuses and, when distinct, the selected
+  synthetic-subject check runs and statuses used as a preferred merge/status
+  basis.
 
 Start each connection at its first page, follow the returned cursor or next
 link, and stop only at the provider's typed terminal pagination state. Summary
@@ -142,28 +153,52 @@ final closed selected-PR scopes must be type-preserving equal and bind the
 exact report repository, PR, and head. Its initial and final page inventories
 must also be type-preserving equal: issue comments, reviews, associated inline
 comments, GraphQL review threads, every nested thread-comment page, reactions
-on every candidate exact review request, check runs, and
-commit statuses each carry an exact `true` completion flag and a typed
-non-negative count. The two closed terminal selections must be equal and
-bind the unique latest trustworthy terminal result selected under this
-authority's precedence. Terminal-clean and merge-status pass require
-`classification: clean` plus the complete selected evidence; reaction-clean
-requires `classification: absent` plus null evidence. Every pass requires an
-exact integer zero unresolved-provider-finding count. The same record also
-contains equal initial and final closed pass-basis selections derived from the
-complete raw observations: terminal-clean repeats the exact selected terminal
-evidence, reaction-clean binds the exact request and provider reaction
-kind/command/actor/IDs/URLs/server times, and merge-status binds the exact
-check-run ID/URL/name/App/head/status/conclusion/time fields, producer-contract
-descriptor, and complete associated provider-clean evidence. The unused union
+on every candidate exact review request, feature-head check runs/statuses, and
+selected-subject check runs/statuses each carry an exact `true` completion flag
+and a typed non-negative count. Each check/status inventory also binds the
+exact queried subject SHA and a lowercase SHA-256 identity over that subject
+plus its raw pagination envelopes and records. The feature-head inventory is
+always present and binds the exact current feature head. The selected-subject
+inventory is also always present. For a feature-head subject it must identify
+the same page set type-for-type; for a GitHub synthetic merge subject it must
+bind that distinct subject and a separately fetched, distinct page-set identity.
+Missing either subject's check-run or status pages, coupling the synthetic
+inventory to the feature-head inventory, or changing both subject labels
+together is incomplete evidence. The two closed terminal selections must be
+equal and bind the selected positive result under this authority's precedence.
+Terminal-clean requires `classification: clean` plus the exact terminal
+artifact. Merge-status requires `classification: clean` plus the exact
+contract-verified producer check; it does not require a second terminal clean
+comment or review. Reaction-clean requires `classification: absent` plus null
+evidence. Every pass requires an exact integer zero unresolved-provider-finding
+count. The same record also contains equal initial and final closed pass-basis
+selections derived from the complete raw observations: terminal-clean repeats
+the exact selected terminal evidence, reaction-clean binds the exact request
+and provider reaction kind/command/actor/IDs/URLs/server times, and merge-status
+binds the exact feature head, current base ref/tip and unique merge base,
+check-subject kind/SHA, App/workflow/run/attempt/check-suite/check-run identity,
+producer-contract descriptor, and provider-clean assertion. The unused union
 branches are null.
+
+For merge-status only, the snapshot also carries equal initial/final closed
+`merge_status_scope` values. They bind repository, PR, feature head, exact base
+ref, current base tip, unique merge base, check-subject kind, and
+`check_subject_sha`, and must equal the independently frozen parent scope. They
+are null for the other bases. For a producer contract that names the GitHub
+synthetic merge commit as its subject, both observations must read that exact
+subject's complete check-run and status pages in addition to the exact feature
+head's complete pages. A feature-head-only contract sets the subject to the
+feature head, requires exact identity equality between those two inventory
+projections, and receives no base-coverage claim.
 
 The snapshot's initial and final lowercase SHA-256 values must be equal digests
 of RFC 8785 canonical JSON for the complete raw snapshot: exact scope/head,
 raw issue/review/inline/thread, nested thread-comment, and reaction pages,
 pagination envelopes and typed counts, derived terminal candidates and
-ordering, the selected latest terminal result, selected pass-basis projection,
-unresolved applicable findings, and check/status records.
+ordering, the selected latest terminal or producer result, selected pass-basis projection,
+unresolved applicable findings, check/status records, and the complete
+merge-status scope when that basis is selected. Check/status records include
+both subject-discriminated page sets and their subject-bound identities.
 They are not digests of the report summary.
 The parent persists this record independently before report validation;
 report, association, epoch, or check fields cannot create,
@@ -176,34 +211,45 @@ leaving this frozen selection unchanged fails closed.
 
 Evaluate the following bases in order:
 
-1. A trustworthy repository merge/status check that is demonstrably associated
-   with the current head and the GitHub Codex review result.
+1. A trustworthy repository merge/status check whose independently verified
+   producer contract defines successful completion as a GitHub Codex clean
+   result for its exact declared scope.
 2. A trustworthy exact-provider terminal clean issue comment or pull-request
    review for the current head.
 3. The exact-provider `+1` reaction fallback on the selected current-head
    request.
 
 The first basis is preferred when it exists because repositories commonly
-aggregate the review into a merge-oriented check. Association requires both
-current-head check-run metadata and an independently parent-verified repository
-contract; never guess a workflow, check name, or App identity. The raw check
-run must bind its stable ID and exact repository `/runs/<ID>` URL, exact App ID
-and slug, `completed` status, `success` conclusion, and full head SHA to that
-contract. The same association must name one accepted current-head provider
-terminal-clean result. A generic successful check, an App start marker, or a
-status from another head does not qualify.
+aggregate the review into a merge-oriented check. Association requires an
+independently parent-verified repository contract; never guess a workflow,
+check name, App identity, check subject, or producer semantics. The raw evidence
+must bind exact App, workflow, run, attempt, check suite, check run, check name,
+status, conclusion, feature head, and check-subject identities to that contract.
+The contract itself must say that `completed` / `success` means GitHub Codex
+provider clean for either `latest-feature-head` or `current-merge-scope` and
+must require zero unresolved applicable provider findings. No separate terminal
+clean comment or review is required for this basis.
 
-The check association and its separately verified producer contract are
-necessary but not sufficient. A merge-status pass also requires the common
-`complete_pr_snapshot` above to select that exact associated clean evidence as
-the stable latest trustworthy terminal result, and to select the exact check
-run and association as its stable merge-status basis, with zero unresolved
+For `latest-feature-head`, require `check_subject_sha == feature_head_sha` and
+describe the result only as feature-head coverage; base and merge-base assurance
+remain local readiness facts. For `current-merge-scope`, require the contract's
+`github-synthetic-merge` subject and independently bind the exact feature head,
+base ref, current base tip, unique merge base, and synthetic
+`check_subject_sha`. A generic successful check, service-start marker, static
+name match, unknown producer contract, or check from another subject does not
+qualify.
+
+The check association and producer contract are necessary but not sufficient.
+A merge-status pass also requires the common `complete_pr_snapshot` to select
+that exact contract-verified check as the stable positive result and stable
+merge-status basis, with equal initial/final scope and zero unresolved
 applicable findings.
 
-Preference does not silently enlarge what the check proves. Unless its
-documented contract explicitly binds the PR base, the related merge/status
-check remains head-associated GitHub-lane evidence and the local readiness
-plane still owns base assurance.
+Preference does not silently enlarge what the check proves. The feature-head
+branch remains head-only. The synthetic branch may state current-merge-scope
+coverage only when every declared base/merge/subject binding above is closed
+and stable; the local readiness plane still revalidates those facts
+independently before merge.
 
 No positive basis bypasses the complete unresolved-finding scan.
 
@@ -408,7 +454,7 @@ defined in [github-pr-probes.md](github-pr-probes.md).
 
 | Complete current-head state | Lane result |
 | --- | --- |
-| Trusted associated merge/status check is clean and no provider finding is unresolved | `pass` |
+| Trusted contract-verified merge/status producer is clean for its exact feature-head or synthetic-merge scope and no provider finding is unresolved | `pass` |
 | Trusted terminal clean artifact and no provider finding is unresolved | `pass` |
 | Valid reaction fallback and no provider finding is unresolved | `pass` |
 | Any applicable unresolved provider finding | `findings` |
@@ -432,8 +478,8 @@ github_codex_lane:
   repository: owner/name
   pull_request: 123
   head_sha: 40-lowercase-hex
-  scope_assurance: latest-head-only
-  base_assurance: local-pr-readiness
+  scope_assurance: latest-head-only | latest-feature-head | current-merge-scope
+  base_assurance: local-pr-readiness | producer-contract-current-scope-plus-local-pr-readiness
   basis: merge-status | terminal-clean | resolved-inline-awaiting-clean | reaction-clean | null
   evidence: one-closed-variant-below-or-null
   request_policy:
@@ -535,9 +581,8 @@ variant, and the evidence is accepted only alongside the closed parent-owned
 described above. The snapshot's stable reaction-clean basis selection must
 repeat the epoch's exact request and reaction identity, provider actor, and
 server times and join exactly to the report evidence. A `basis: merge-status`
-report uses
-this distinct closed check-run shape; `provider_clean_evidence` is the complete
-terminal-clean evidence shape shown above, not an ID-only assertion:
+report uses this distinct closed check-run shape. The producer's clean
+assertion is contract semantics, not a copied terminal artifact:
 
 ```yaml
 evidence:
@@ -548,20 +593,33 @@ evidence:
   check_name: exact-name-from-verified-contract
   status: completed
   conclusion: success
-  artifact_commit: 40-lowercase-hex-equal-to-report-head
+  feature_head_sha: 40-lowercase-hex-equal-to-report-head
+  check_subject_sha: exact-feature-head-or-synthetic-merge-sha
+  workflow_id: exact-positive-workflow-id
+  run_id: exact-positive-run-id
+  run_attempt: exact-positive-attempt
+  check_suite_id: exact-positive-check-suite-id
   app:
     id: exact-positive-app-id-from-verified-contract
     slug: exact-app-slug-from-verified-contract
   server_time: RFC3339
   server_time_field: completed_at
-  head_binding: explicit-commit
   association:
     kind: parent-verified-repository-contract
     owner: parent-orchestrator
     status: complete
     repository: owner/name
     pull_request: 123
-    head_sha: 40-lowercase-hex-equal-to-report-head
+    feature_head_sha: 40-lowercase-hex-equal-to-report-head
+    base_ref: refs/heads/exact-base
+    base_tip_sha: exact-current-base-tip
+    merge_base_sha: exact-parent-proved-unique-merge-base
+    check_subject_kind: feature-head | github-synthetic-merge
+    check_subject_sha: exact-feature-head-or-synthetic-merge-sha
+    workflow_id: exact-positive-workflow-id
+    run_id: exact-positive-run-id
+    run_attempt: exact-positive-attempt
+    check_suite_id: exact-positive-check-suite-id
     check_run_id: stable-check-run-id
     check_run_url: https://github.com/owner/name/runs/<same-id>
     check_name: exact-name-from-verified-contract
@@ -572,39 +630,42 @@ evidence:
       source_commit: 40-lowercase-hex
       source_path: safe/repository-relative/path
       source_sha256: 64-lowercase-hex
-    provider_clean_evidence: exact-terminal-clean-evidence-object
+    provider_clean_assertion:
+      kind: verified-producer-contract
+      semantics: github-codex-provider-clean
+      scope: latest-feature-head | current-merge-scope
+      unresolved_findings_required_zero: true
 ```
 
 Before accepting this shape, the consumer receives a separate closed
 parent-owned `merge_status_parent_contract` record; it must not derive that
 record from the report being validated. The record carries the four contract
 descriptor strings (`source_repository`, `source_commit`, `source_path`, and
-`source_sha256`), trusted App ID and slug, exact check name, stable check-run ID
-and URL, and stable provider-clean evidence ID and URL. Compare every descriptor
-string by exact UTF-8 byte identity with the independently verified record and
-compare every remaining field exactly. Coupled edits to the report's contract,
-App, check, or stable association identities therefore fail even when the
-edited report remains internally self-consistent.
+`source_sha256`), trusted App ID and slug, exact workflow/run/attempt, check
+suite/name/run ID and URL, and exact closed provider-clean assertion. Compare
+every descriptor string by exact UTF-8 byte identity with the independently
+verified record and compare every remaining field type-preservingly. Coupled
+edits to the report's contract, App, run, check, assertion, or stable
+association identities therefore fail even when the edited report remains
+internally self-consistent.
 
 The consumer also receives the independent common `complete_pr_snapshot`.
-Its stable latest clean selection must equal `provider_clean_evidence`
-type-for-type. Its stable merge-status basis selection must also equal the
-outer check's complete identity/App/head/status/conclusion/time projection and
-the producer-contract descriptor and associated provider-clean evidence
-type-for-type, and must join exactly to the independently supplied parent
-contract. Neither the check association nor the parent contract may self-prove
-or repair that whole-PR snapshot.
+Its stable positive selection must equal the complete outer merge-status
+evidence type-for-type. Its stable merge-status basis selection must also equal
+the feature-head/base/merge/check-subject scope, complete App/workflow/run/check
+identity, status/conclusion/time projection, producer-contract descriptor, and
+provider-clean assertion type-for-type, and must join exactly to the
+independently supplied parent contract. Neither the check association nor the
+parent contract may self-prove or repair that whole-PR snapshot.
 
 The parent independently verifies the exact contract bytes and digest and
-confirms that the contract binds this App identity, check name, check identity,
-current-head scope, and provider-clean association. The association fields must
-equal the outer raw check-run fields, while the report and association
-repository, PR, and head must separately equal the parent's
-independently supplied frozen scope inputs. Its accepted clean artifact must
-use the closed channel/branch pair above, bind the same head, and have semantic
-time no later than `completed_at`.
-Thus a successful service-start check cannot become a merge-status pass merely
-by copying the App identity or current head.
+confirms that the contract binds this App/workflow/run/check identity, subject
+mode, scope, and provider-clean semantics. The association fields must equal
+the outer raw check-run fields, while repository, PR, feature head, base ref and
+tip, unique merge base, and subject must separately equal the parent's frozen
+scope inputs and the initial/final complete snapshot. Thus a generic successful
+check or service-start marker cannot become a merge-status pass merely by
+copying the App identity, feature head, or check name.
 
 A findings report backed by an accepted terminal carrier uses
 `kind: terminal-artifact`, a non-null full `artifact_commit`,

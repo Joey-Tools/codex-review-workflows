@@ -151,7 +151,7 @@ CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS = (
     "https_proxy",
     "no_proxy",
 )
-SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v1"
+SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v2"
 SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE = "exact-token-sequence"
 SANITIZED_GIT_ARGV_PREFIX_ENCODING = "canonical-json-utf8-v1"
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
@@ -242,6 +242,7 @@ def build_sanitized_git_argv_prefix(
         "GIT_CONFIG_SYSTEM=/dev/null",
         "GIT_CONFIG_NOSYSTEM=1",
         "GIT_GRAFT_FILE=/dev/null",
+        "GIT_LITERAL_PATHSPECS=1",
         "GIT_NO_LAZY_FETCH=1",
         "GIT_TERMINAL_PROMPT=0",
         "GIT_NO_REPLACE_OBJECTS=1",
@@ -7299,6 +7300,7 @@ def _claude_environment(
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_CEILING_DIRECTORIES": str(worktree.parent),
         "GIT_GRAFT_FILE": os.devnull,
+        "GIT_LITERAL_PATHSPECS": "1",
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",

@@ -298,11 +298,15 @@
         "check_name",
         "status",
         "conclusion",
-        "artifact_commit",
+        "feature_head_sha",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
         "app",
         "server_time",
         "server_time_field",
-        "head_binding",
         "association"
       ],
       "merge_status_app": [
@@ -315,20 +319,35 @@
         "status",
         "repository",
         "pull_request",
-        "head_sha",
+        "feature_head_sha",
+        "base_ref",
+        "base_tip_sha",
+        "merge_base_sha",
+        "check_subject_kind",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
         "check_run_id",
         "check_run_url",
         "check_name",
         "app_id",
         "app_slug",
         "contract",
-        "provider_clean_evidence"
+        "provider_clean_assertion"
       ],
       "merge_status_contract": [
         "source_repository",
         "source_commit",
         "source_path",
         "source_sha256"
+      ],
+      "merge_status_clean_assertion": [
+        "kind",
+        "semantics",
+        "scope",
+        "unresolved_findings_required_zero"
       ],
       "request_policy": [
         "status",
@@ -368,6 +387,8 @@
         "status",
         "initial_scope",
         "final_scope",
+        "initial_merge_status_scope",
+        "final_merge_status_scope",
         "initial_page_inventory",
         "final_page_inventory",
         "initial_terminal_selection",
@@ -391,10 +412,20 @@
         "review_thread_comment_count",
         "reactions_pages_complete",
         "reaction_count",
-        "check_runs_pages_complete",
-        "check_run_count",
-        "commit_statuses_pages_complete",
-        "commit_status_count",
+        "feature_head_check_subject_sha",
+        "feature_head_check_runs_pages_complete",
+        "feature_head_check_run_count",
+        "feature_head_commit_statuses_pages_complete",
+        "feature_head_commit_status_count",
+        "feature_head_check_pages_sha256",
+        "selected_subject_kind",
+        "selected_subject_sha",
+        "selected_subject_check_runs_pages_complete",
+        "selected_subject_check_run_count",
+        "selected_subject_commit_statuses_pages_complete",
+        "selected_subject_commit_status_count",
+        "selected_subject_check_pages_sha256",
+        "selected_subject_page_relation",
         "trustworthy_terminal_count"
       ],
       "terminal_selection": [
@@ -426,13 +457,43 @@
         "check_name",
         "status",
         "conclusion",
-        "artifact_commit",
+        "feature_head_sha",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
         "app",
         "server_time",
         "server_time_field",
-        "head_binding",
+        "scope",
         "contract",
-        "provider_clean_evidence"
+        "provider_clean_assertion"
+      ],
+      "merge_status_scope": [
+        "repository",
+        "pull_request",
+        "feature_head_sha",
+        "base_ref",
+        "base_tip_sha",
+        "merge_base_sha",
+        "check_subject_kind",
+        "check_subject_sha"
+      ],
+      "merge_status_parent_contract": [
+        "owner",
+        "status",
+        "contract_descriptor",
+        "app_id",
+        "app_slug",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "check_name",
+        "check_run_id",
+        "check_run_url",
+        "provider_clean_assertion"
       ],
       "reaction_clean_epoch": [
         "owner",
@@ -491,11 +552,13 @@
         "status": "complete",
         "trust_boundary": "frozen and persisted independently by the parent from complete raw selected-PR observations before report validation; read-only to the consumer and never derived from report, evidence, association, or merge-status fields",
         "scope_binding": "initial_scope and final_scope are type-preserving equal closed selected_pr_scope values exactly equal to the independently selected report repository, pull request, and current head",
-        "page_state": "initial_page_inventory and final_page_inventory are type-preserving equal closed complete_page_inventory values; issue comments, reviews, associated inline comments, GraphQL review threads, every nested thread-comment page, reactions on every candidate review request, check runs, and commit statuses each have an exact true completion flag and a typed non-negative integer count",
-        "terminal_selection": "initial_terminal_selection and final_terminal_selection are type-preserving equal closed terminal_selection values selected under version-1 precedence; terminal-clean and merge-status pass require classification clean with a complete evidence projection exactly equal to the report terminal artifact or merge-status provider_clean_evidence, while reaction-clean requires classification absent and null evidence",
-        "basis_selection": "initial_basis_selection and final_basis_selection are type-preserving equal closed basis_selection values frozen from the complete raw snapshot and selected independently before report validation; terminal-clean binds the exact terminal evidence, reaction-clean binds the exact request and provider reaction actor/IDs/URLs/times from reaction_clean_epoch, and merge-status binds the exact check run/App/head/status/conclusion, producer-contract descriptor, and associated provider-clean evidence from the report and merge_status_parent_contract; report, epoch, association, and contract fields cannot self-prove or repair this selection",
+        "page_state": "initial_page_inventory and final_page_inventory are type-preserving equal closed complete_page_inventory values; issue comments, reviews, associated inline comments, GraphQL review threads, every nested thread-comment page, and reactions on every candidate review request each have an exact true completion flag and a typed non-negative integer count; feature-head check runs/statuses and selected-subject check runs/statuses independently bind their exact query subject, exact true completion flags, typed non-negative counts, and lowercase SHA-256 identity of the subject-bound raw pagination envelopes and records",
+        "check_subject_page_state": "feature_head_check_subject_sha always equals the selected PR head; selected_subject_sha equals the merge-status check subject when that basis is selected and otherwise equals the feature head; selected_subject_kind feature-head requires same-feature-head-page-set plus exact type-preserving equality of both subject-bound check/status page identities and counts, while github-synthetic-merge requires independent-synthetic-subject-page-set, a distinct selected subject, and a distinct second subject-bound page identity",
+        "terminal_selection": "initial_terminal_selection and final_terminal_selection are type-preserving equal closed terminal_selection values selected under version-1 precedence; terminal-clean requires classification clean with the exact terminal artifact, merge-status requires classification clean with the exact independently contract-verified producer check evidence and does not require a separate terminal comment or review, while reaction-clean requires classification absent and null evidence",
+        "basis_selection": "initial_basis_selection and final_basis_selection are type-preserving equal closed basis_selection values frozen from the complete raw snapshot and selected independently before report validation; terminal-clean binds the exact terminal evidence, reaction-clean binds the exact request and provider reaction actor/IDs/URLs/times from reaction_clean_epoch, and merge-status binds the exact feature head, current base and merge scope, check subject, App/workflow/run/check identity, producer-contract descriptor, and provider-clean assertion from the report and merge_status_parent_contract; report, epoch, association, and contract fields cannot self-prove or repair this selection",
         "finding_state": "unresolved_provider_findings is integer zero for every pass basis",
-        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal result, the independently selected pass-basis projection, unresolved applicable findings, and check/status records; they are not digests of report summaries"
+        "merge_status_scope": "initial_merge_status_scope and final_merge_status_scope are null for non-merge-status bases; for merge-status they are type-preserving equal closed merge_status_scope values that equal the separately frozen parent scope and bind the exact feature head, base ref/tip, unique merge base, subject kind, and check-subject SHA",
+        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, merge-status scope when selected, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal or producer result, the independently selected pass-basis projection, unresolved applicable findings, and both subject-discriminated check/status page sets; they are not digests of report summaries"
       },
       "reaction_clean_epoch": {
         "owner": "parent-orchestrator",
@@ -593,8 +656,15 @@
         ],
         "pull_request": "required-positive-integer",
         "head_sha": "required-full-sha",
-        "scope_assurance": "latest-head-only",
-        "base_assurance": "local-pr-readiness",
+        "scope_assurance_values": [
+          "latest-head-only",
+          "latest-feature-head",
+          "current-merge-scope"
+        ],
+        "base_assurance_values": [
+          "local-pr-readiness",
+          "producer-contract-current-scope-plus-local-pr-readiness"
+        ],
         "parent_selection_outcome": "selected-pr"
       },
       "no-selected-supported-pr": {
@@ -660,15 +730,15 @@
         "channel": "check-run",
         "check_status": "completed",
         "conclusion": "success",
-        "artifact_commit": "required-full-sha-equals-report-head",
-        "head_binding": "explicit-commit",
-        "parent_scope_binding": "report repository, pull request, and head equal independently supplied parent scope inputs",
+        "feature_head_binding": "feature_head_sha equals the report head and the separately supplied merge_status_scope",
+        "check_subject_binding": "feature-head contract requires check_subject_sha equal feature_head_sha; github-synthetic-merge contract requires the exact independently read synthetic merge commit/check subject and binds the current base ref/tip and unique merge base",
+        "parent_scope_binding": "report repository, pull request, and head plus the current base/merge/check-subject scope equal independently supplied parent inputs",
         "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
         "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
-        "parent_contract_input": "separate closed parent-owned record whose contract-descriptor UTF-8 bytes, trusted App ID and slug, exact check name, check-run ID and URL, and provider-clean evidence ID and URL equal the report association",
-        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, unique latest trustworthy clean terminal selection equal to provider_clean_evidence, exact stable merge-status check/App/head/status/conclusion/producer-contract/provider-clean basis selection, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
-        "provider_clean_channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
-        "association": "complete parent-owned binding of this exact check run to one accepted current-head provider clean result and independently verified producer-contract bytes"
+        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and exact provider-clean assertion equal the report association",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds equal initial/final current feature-head/base/merge/check-subject scope, complete typed page state, stable canonical snapshot digests, exact stable contract-verified producer-clean selection, exact App/workflow/run/check/producer-contract basis, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
+        "provider_clean_assertion": "exact github-codex-provider-clean semantics with scope latest-feature-head for a feature-head subject or current-merge-scope for a github-synthetic-merge subject, and exact true unresolved_findings_required_zero",
+        "association": "complete parent-owned binding of this exact check subject and App/workflow/run/check to independently verified producer-contract bytes whose success conclusion itself means GitHub Codex provider clean for the declared scope; a generic successful check or service-start marker is invalid"
       },
       "null": {
         "null_evidence_statuses": [
@@ -807,8 +877,8 @@
       "repository": "octo/review-fixture",
       "pull_request": 7,
       "head_sha": "0123456789abcdef0123456789abcdef01234567",
-      "scope_assurance": "latest-head-only",
-      "base_assurance": "local-pr-readiness",
+      "scope_assurance": "current-merge-scope",
+      "base_assurance": "producer-contract-current-scope-plus-local-pr-readiness",
       "basis": "merge-status",
       "evidence": {
         "kind": "merge-status",
@@ -818,21 +888,34 @@
         "check_name": "Codex Review Merge Gate",
         "status": "completed",
         "conclusion": "success",
-        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "feature_head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "check_subject_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "workflow_id": 901,
+        "run_id": 801,
+        "run_attempt": 1,
+        "check_suite_id": 601,
         "app": {
           "id": 15368,
           "slug": "github-actions"
         },
         "server_time": "2026-08-23T09:07:00Z",
         "server_time_field": "completed_at",
-        "head_binding": "explicit-commit",
         "association": {
           "kind": "parent-verified-repository-contract",
           "owner": "parent-orchestrator",
           "status": "complete",
           "repository": "octo/review-fixture",
           "pull_request": 7,
-          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "feature_head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "base_ref": "refs/heads/master",
+          "base_tip_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "check_subject_kind": "github-synthetic-merge",
+          "check_subject_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "workflow_id": 901,
+          "run_id": 801,
+          "run_attempt": 1,
+          "check_suite_id": 601,
           "check_run_id": 701,
           "check_run_url": "https://github.com/octo/review-fixture/runs/701",
           "check_name": "Codex Review Merge Gate",
@@ -844,19 +927,11 @@
             "source_path": "contracts/github-codex-merge-status-v1.json",
             "source_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
           },
-          "provider_clean_evidence": {
-            "kind": "terminal-artifact",
-            "id": 101,
-            "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
-            "channel": "issue-comment",
-            "grammar": "github-codex-terminal-carriers-v1",
-            "grammar_branch": "clean-issue-v1",
-            "grammar_status": "accepted",
-            "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
-            "server_time": "2026-08-23T09:00:00Z",
-            "server_time_field": "created_at",
-            "head_binding": "explicit-commit",
-            "request_id": 91
+          "provider_clean_assertion": {
+            "kind": "verified-producer-contract",
+            "semantics": "github-codex-provider-clean",
+            "scope": "current-merge-scope",
+            "unresolved_findings_required_zero": true
           }
         }
       },
@@ -1344,21 +1419,21 @@
       "valid": true
     },
     {
-      "id": "merge-status-null-artifact-commit",
+      "id": "merge-status-null-check-subject",
       "base": "merge_status",
       "patch": {
         "evidence": {
-          "artifact_commit": null
+          "check_subject_sha": null
         }
       },
       "valid": false
     },
     {
-      "id": "merge-status-old-head",
+      "id": "merge-status-old-feature-head",
       "base": "merge_status",
       "patch": {
         "evidence": {
-          "artifact_commit": "1111111111111111111111111111111111111111"
+          "feature_head_sha": "1111111111111111111111111111111111111111"
         }
       },
       "valid": false
@@ -1555,13 +1630,50 @@
       "valid": false
     },
     {
-      "id": "merge-status-provider-clean-cross-pr",
+      "id": "merge-status-synthetic-base-tip-mismatch",
       "base": "merge_status",
       "patch": {
         "evidence": {
           "association": {
-            "provider_clean_evidence": {
-              "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-101"
+            "base_tip_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-subject-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_subject_sha": "dddddddddddddddddddddddddddddddddddddddd",
+          "association": {
+            "check_subject_sha": "dddddddddddddddddddddddddddddddddddddddd"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-missing-provider-clean-assertion",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": null
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-scope-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": {
+              "scope": "latest-feature-head"
             }
           }
         }
@@ -1569,14 +1681,13 @@
       "valid": false
     },
     {
-      "id": "merge-status-coupled-provider-clean-identity-mutation",
+      "id": "merge-status-provider-clean-generic-semantics",
       "base": "merge_status",
       "patch": {
         "evidence": {
           "association": {
-            "provider_clean_evidence": {
-              "id": 102,
-              "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+            "provider_clean_assertion": {
+              "semantics": "generic-success"
             }
           }
         }
@@ -1584,25 +1695,13 @@
       "valid": false
     },
     {
-      "id": "merge-status-missing-provider-clean-result",
+      "id": "merge-status-provider-clean-generic-kind",
       "base": "merge_status",
       "patch": {
         "evidence": {
           "association": {
-            "provider_clean_evidence": null
-          }
-        }
-      },
-      "valid": false
-    },
-    {
-      "id": "merge-status-stale-provider-clean-result",
-      "base": "merge_status",
-      "patch": {
-        "evidence": {
-          "association": {
-            "provider_clean_evidence": {
-              "artifact_commit": "1111111111111111111111111111111111111111"
+            "provider_clean_assertion": {
+              "kind": "service-start"
             }
           }
         }
@@ -1610,44 +1709,13 @@
       "valid": false
     },
     {
-      "id": "merge-status-provider-clean-after-check",
+      "id": "merge-status-provider-clean-does-not-require-zero-findings",
       "base": "merge_status",
       "patch": {
         "evidence": {
           "association": {
-            "provider_clean_evidence": {
-              "server_time": "2026-08-23T09:08:00Z"
-            }
-          }
-        }
-      },
-      "valid": false
-    },
-    {
-      "id": "merge-status-provider-clean-issue-review-branch",
-      "base": "merge_status",
-      "patch": {
-        "evidence": {
-          "association": {
-            "provider_clean_evidence": {
-              "grammar_branch": "clean-review-v1"
-            }
-          }
-        }
-      },
-      "valid": false
-    },
-    {
-      "id": "merge-status-provider-clean-review-issue-branch",
-      "base": "merge_status",
-      "patch": {
-        "evidence": {
-          "association": {
-            "provider_clean_evidence": {
-              "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-101",
-              "channel": "review",
-              "grammar_branch": "clean-issue-v1",
-              "server_time_field": "submitted_at"
+            "provider_clean_assertion": {
+              "unresolved_findings_required_zero": false
             }
           }
         }

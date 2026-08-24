@@ -824,6 +824,7 @@ class RepositoryContractTest(unittest.TestCase):
             "GIT_CONFIG_SYSTEM=/dev/null",
             "GIT_CONFIG_NOSYSTEM=1",
             "GIT_GRAFT_FILE=/dev/null",
+            "GIT_LITERAL_PATHSPECS=1",
             "GIT_NO_LAZY_FETCH=1",
             "GIT_NO_REPLACE_OBJECTS=1",
             "GIT_OPTIONAL_LOCKS=0",
@@ -842,7 +843,7 @@ class RepositoryContractTest(unittest.TestCase):
         git_executable = pathlib.Path("/usr/bin/git")
         profile_block = (
             contracts.split(
-                "The ordered token profile is `sanitized-git-argv-prefix-v1`:", 1
+                "The ordered token profile is `sanitized-git-argv-prefix-v2`:", 1
             )[1]
             .split("```text", 1)[1]
             .split("```", 1)[0]
@@ -872,7 +873,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--no-lazy-fetch", documented_tokens)
 
         for metadata_field in (
-            "prefix_profile: <sanitized-git-argv-prefix-v1 | not-applicable>",
+            "prefix_profile: <sanitized-git-argv-prefix-v2 | not-applicable>",
             "sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>",
             "sanitized_git_argv_prefix:",
             "sanitized_git_argv_prefix_sha256:",
@@ -923,13 +924,18 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_codex_profile_discovery_and_fallback_are_bounded(self) -> None:
         local = _read("references/local-codex-lane.md")
-        self.assertIn("Do not query the network or enumerate model catalogs", local)
-        self.assertIn("parent session's effective model family", local)
+        normalized = _normalize(local)
         self.assertIn(
-            "runtime rejects, silently downgrades, or reports a mismatch", local
+            "do not query the network or enumerate model catalogs", normalized
         )
-        self.assertIn("Try the peer adapter with the same model", local)
-        self.assertIn("older model family without explicit user confirmation", local)
+        self.assertIn("parent session's", normalized)
+        self.assertIn("effective model family or codex mode", normalized)
+        self.assertIn("this is the sole latest-model-lookup trigger", normalized)
+        self.assertIn("it never triggers latest-model discovery", normalized)
+        self.assertIn("try the peer adapter with the exact same model", normalized)
+        self.assertIn("do not silently lower the", normalized)
+        self.assertIn("requires explicit user confirmation", normalized)
+        self.assertNotIn("highest supported lower mode", normalized)
         self.assertNotIn("cache model discovery for", local.lower())
 
     def test_workspace_public_commands_and_bound_import_closure(self) -> None:
@@ -1123,11 +1129,16 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("association", normalized)
         self.assertIn(
             _normalize(
-                "A trustworthy repository merge/status check that is demonstrably "
-                "associated with the current head and the GitHub Codex review result"
+                "A trustworthy repository merge/status check whose independently "
+                "verified producer contract defines successful completion as a "
+                "GitHub Codex clean result for its exact declared scope"
             ),
             normalized,
         )
+        self.assertIn("does not require a second terminal clean", normalized)
+        self.assertIn("github-synthetic-merge", normalized)
+        self.assertIn("check_subject_sha", normalized)
+        self.assertIn("generic successful check", normalized)
         self.assertIn(
             "no positive basis bypasses the complete unresolved-finding scan",
             normalized,

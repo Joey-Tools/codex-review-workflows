@@ -764,18 +764,28 @@ class _ReportValidator:
                 merge_status, "merge_status_basis_selection"
             )
             or not self._closed(evidence, "merge_status_evidence")
-            or not isinstance(parent_contract, dict)
+            or not self._closed_parent_input(
+                parent_contract, "merge_status_parent_contract"
+            )
         ):
             return False
-        provider_clean = evidence["association"]["provider_clean_evidence"]
+        association = evidence["association"]
+        scope = {
+            field: association[field]
+            for field in self.parent_input_profiles["merge_status_scope"]
+        }
         expected_merge_status = {
             field: (
-                provider_clean
-                if field == "provider_clean_evidence"
+                scope
+                if field == "scope"
                 else (
-                    evidence["association"]["contract"]
+                    association["contract"]
                     if field == "contract"
-                    else evidence[field]
+                    else (
+                        association["provider_clean_assertion"]
+                        if field == "provider_clean_assertion"
+                        else evidence[field]
+                    )
                 )
             )
             for field in self.parent_input_profiles["merge_status_basis_selection"]
@@ -787,13 +797,17 @@ class _ReportValidator:
             and merge_status["check_name"] == parent_contract["check_name"]
             and merge_status["app"]["id"] == parent_contract["app_id"]
             and merge_status["app"]["slug"] == parent_contract["app_slug"]
+            and merge_status["workflow_id"] == parent_contract["workflow_id"]
+            and merge_status["run_id"] == parent_contract["run_id"]
+            and merge_status["run_attempt"] == parent_contract["run_attempt"]
+            and merge_status["check_suite_id"] == parent_contract["check_suite_id"]
             and self._type_preserving_equal(
                 merge_status["contract"], parent_contract["contract_descriptor"]
             )
-            and merge_status["provider_clean_evidence"]["id"]
-            == parent_contract["provider_clean_evidence_id"]
-            and merge_status["provider_clean_evidence"]["url"]
-            == parent_contract["provider_clean_evidence_url"]
+            and self._type_preserving_equal(
+                merge_status["provider_clean_assertion"],
+                parent_contract["provider_clean_assertion"],
+            )
         )
 
     def _complete_pr_snapshot_matches(
@@ -811,6 +825,8 @@ class _ReportValidator:
         final_selection = snapshot["final_terminal_selection"]
         initial_basis_selection = snapshot["initial_basis_selection"]
         final_basis_selection = snapshot["final_basis_selection"]
+        initial_merge_scope = snapshot["initial_merge_status_scope"]
+        final_merge_scope = snapshot["final_merge_status_scope"]
         initial_scope = snapshot["initial_scope"]
         final_scope = snapshot["final_scope"]
         if (
@@ -833,8 +849,10 @@ class _ReportValidator:
             "review_threads_pages_complete",
             "review_thread_comments_pages_complete",
             "reactions_pages_complete",
-            "check_runs_pages_complete",
-            "commit_statuses_pages_complete",
+            "feature_head_check_runs_pages_complete",
+            "feature_head_commit_statuses_pages_complete",
+            "selected_subject_check_runs_pages_complete",
+            "selected_subject_commit_statuses_pages_complete",
         )
         count_fields = (
             "issue_comment_count",
@@ -843,8 +861,10 @@ class _ReportValidator:
             "review_thread_count",
             "review_thread_comment_count",
             "reaction_count",
-            "check_run_count",
-            "commit_status_count",
+            "feature_head_check_run_count",
+            "feature_head_commit_status_count",
+            "selected_subject_check_run_count",
+            "selected_subject_commit_status_count",
             "trustworthy_terminal_count",
         )
         initial_digest = snapshot["initial_snapshot_sha256"]
@@ -880,6 +900,78 @@ class _ReportValidator:
             and initial_selection["classification"] == expected_classification
         ):
             return False
+        feature_page_projection = (
+            initial_inventory["feature_head_check_subject_sha"],
+            initial_inventory["feature_head_check_runs_pages_complete"],
+            initial_inventory["feature_head_check_run_count"],
+            initial_inventory["feature_head_commit_statuses_pages_complete"],
+            initial_inventory["feature_head_commit_status_count"],
+            initial_inventory["feature_head_check_pages_sha256"],
+        )
+        selected_page_projection = (
+            initial_inventory["selected_subject_sha"],
+            initial_inventory["selected_subject_check_runs_pages_complete"],
+            initial_inventory["selected_subject_check_run_count"],
+            initial_inventory["selected_subject_commit_statuses_pages_complete"],
+            initial_inventory["selected_subject_commit_status_count"],
+            initial_inventory["selected_subject_check_pages_sha256"],
+        )
+        if (
+            initial_inventory["feature_head_check_subject_sha"] != report["head_sha"]
+            or not isinstance(initial_inventory["feature_head_check_pages_sha256"], str)
+            or SHA256.fullmatch(initial_inventory["feature_head_check_pages_sha256"])
+            is None
+            or not isinstance(
+                initial_inventory["selected_subject_check_pages_sha256"], str
+            )
+            or SHA256.fullmatch(
+                initial_inventory["selected_subject_check_pages_sha256"]
+            )
+            is None
+        ):
+            return False
+        if report["basis"] == "merge-status":
+            if (
+                not self._closed_parent_input(initial_merge_scope, "merge_status_scope")
+                or not self._type_preserving_equal(
+                    initial_merge_scope, final_merge_scope
+                )
+                or not self._type_preserving_equal(
+                    initial_merge_scope, self.merge_status_parent_scope
+                )
+            ):
+                return False
+            selected_kind = initial_merge_scope["check_subject_kind"]
+            selected_sha = initial_merge_scope["check_subject_sha"]
+        elif initial_merge_scope is not None or final_merge_scope is not None:
+            return False
+        else:
+            selected_kind = "feature-head"
+            selected_sha = report["head_sha"]
+        if (
+            initial_inventory["selected_subject_kind"] != selected_kind
+            or initial_inventory["selected_subject_sha"] != selected_sha
+        ):
+            return False
+        if selected_kind == "feature-head":
+            if initial_inventory[
+                "selected_subject_page_relation"
+            ] != "same-feature-head-page-set" or not self._type_preserving_equal(
+                feature_page_projection, selected_page_projection
+            ):
+                return False
+        elif selected_kind == "github-synthetic-merge":
+            if (
+                initial_inventory["selected_subject_page_relation"]
+                != "independent-synthetic-subject-page-set"
+                or initial_inventory["selected_subject_sha"]
+                == initial_inventory["feature_head_check_subject_sha"]
+                or initial_inventory["selected_subject_check_pages_sha256"]
+                == initial_inventory["feature_head_check_pages_sha256"]
+            ):
+                return False
+        else:
+            return False
         selected_evidence = initial_selection["evidence"]
         if expected_classification == "absent":
             return (
@@ -890,11 +982,20 @@ class _ReportValidator:
                     report, evidence, initial_basis_selection
                 )
             )
+        if expected_classification != "clean" or evidence is None:
+            return False
+        if not self._positive_int(initial_inventory["trustworthy_terminal_count"]):
+            return False
+        if report["basis"] == "merge-status":
+            return (
+                self._closed(selected_evidence, "merge_status_evidence")
+                and self._type_preserving_equal(selected_evidence, evidence)
+                and self._basis_selection_matches(
+                    report, evidence, initial_basis_selection
+                )
+            )
         return (
-            expected_classification == "clean"
-            and self._positive_int(initial_inventory["trustworthy_terminal_count"])
-            and evidence is not None
-            and self._clean_terminal_evidence(report, selected_evidence)
+            self._clean_terminal_evidence(report, selected_evidence)
             and self._type_preserving_equal(selected_evidence, evidence)
             and self._basis_selection_matches(report, evidence, initial_basis_selection)
         )
@@ -1016,29 +1117,21 @@ class _ReportValidator:
         parent_scope = self.merge_status_parent_scope
         parent_contract = self.merge_status_parent_contract
         if (
-            not isinstance(parent_scope, dict)
-            or not isinstance(parent_contract, dict)
-            or set(parent_scope) != {"repository", "pull_request", "head_sha"}
+            not self._closed_parent_input(parent_scope, "merge_status_scope")
+            or not self._closed_parent_input(
+                parent_contract, "merge_status_parent_contract"
+            )
             or report["repository"] != parent_scope["repository"]
             or report["pull_request"] != parent_scope["pull_request"]
-            or report["head_sha"] != parent_scope["head_sha"]
-            or set(parent_contract)
-            != {
-                "contract_descriptor",
-                "app_id",
-                "app_slug",
-                "check_name",
-                "check_run_id",
-                "check_run_url",
-                "provider_clean_evidence_id",
-                "provider_clean_evidence_url",
-            }
+            or report["head_sha"] != parent_scope["feature_head_sha"]
+            or parent_contract["owner"] != "parent-orchestrator"
+            or parent_contract["status"] != "complete"
         ):
             return False
         if not self._closed(evidence, "merge_status_evidence"):
             return False
         try:
-            completed_at = _time(evidence["server_time"])
+            _time(evidence["server_time"])
         except (TypeError, ValueError):
             return False
         check_name = evidence["check_name"]
@@ -1055,10 +1148,18 @@ class _ReportValidator:
             )
             or evidence["status"] != "completed"
             or evidence["conclusion"] != "success"
-            or not self._full_sha(evidence["artifact_commit"])
-            or evidence["artifact_commit"] != report["head_sha"]
+            or evidence["feature_head_sha"] != report["head_sha"]
+            or not self._full_sha(evidence["check_subject_sha"])
+            or any(
+                not self._positive_int(evidence[field])
+                for field in (
+                    "workflow_id",
+                    "run_id",
+                    "run_attempt",
+                    "check_suite_id",
+                )
+            )
             or evidence["server_time_field"] != "completed_at"
-            or evidence["head_binding"] != "explicit-commit"
             or evidence["id"] != parent_contract["check_run_id"]
             or evidence["url"] != parent_contract["check_run_url"]
         ):
@@ -1087,6 +1188,27 @@ class _ReportValidator:
 
         association = evidence["association"]
         if not self._closed(association, "merge_status_association"):
+            return False
+        association_scope = {
+            field: association[field]
+            for field in self.parent_input_profiles["merge_status_scope"]
+        }
+        base_ref = association["base_ref"]
+        if (
+            not self._type_preserving_equal(association_scope, parent_scope)
+            or not isinstance(base_ref, str)
+            or not base_ref.startswith("refs/heads/")
+            or len(base_ref) > 255
+            or any(token in base_ref for token in ("..", "//", "@{"))
+            or base_ref.endswith(("/", "."))
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in base_ref
+            )
+            or not self._full_sha(association["base_tip_sha"])
+            or not self._full_sha(association["merge_base_sha"])
+            or not self._full_sha(association["check_subject_sha"])
+        ):
             return False
         contract = association["contract"]
         if not self._closed(contract, "merge_status_contract"):
@@ -1128,32 +1250,68 @@ class _ReportValidator:
         ):
             return False
 
-        provider_clean = association["provider_clean_evidence"]
+        assertion = association["provider_clean_assertion"]
+        if (
+            not self._closed(assertion, "merge_status_clean_assertion")
+            or not self._closed(
+                parent_contract["provider_clean_assertion"],
+                "merge_status_clean_assertion",
+            )
+            or not self._type_preserving_equal(
+                assertion, parent_contract["provider_clean_assertion"]
+            )
+            or assertion["kind"] != "verified-producer-contract"
+            or assertion["semantics"] != "github-codex-provider-clean"
+            or assertion["unresolved_findings_required_zero"] is not True
+        ):
+            return False
+        subject_kind = association["check_subject_kind"]
+        if subject_kind == "feature-head":
+            if (
+                association["check_subject_sha"] != report["head_sha"]
+                or assertion["scope"] != "latest-feature-head"
+            ):
+                return False
+        elif subject_kind == "github-synthetic-merge":
+            if (
+                association["check_subject_sha"] == report["head_sha"]
+                or assertion["scope"] != "current-merge-scope"
+            ):
+                return False
+        else:
+            return False
+
         if (
             association["kind"] != "parent-verified-repository-contract"
             or association["owner"] != "parent-orchestrator"
             or association["status"] != "complete"
             or association["repository"] != report["repository"]
             or association["pull_request"] != report["pull_request"]
-            or association["head_sha"] != report["head_sha"]
+            or association["feature_head_sha"] != report["head_sha"]
+            or evidence["check_subject_sha"] != association["check_subject_sha"]
             or association["check_run_id"] != evidence["id"]
             or association["check_run_url"] != evidence["url"]
             or association["check_name"] != check_name
             or association["app_id"] != app["id"]
             or association["app_slug"] != app["slug"]
-            or not self._clean_terminal_evidence(report, provider_clean)
-            or provider_clean["artifact_commit"] != report["head_sha"]
-            or not self._clean_evidence_url_matches_scope(report, provider_clean)
-            or provider_clean["id"] != parent_contract["provider_clean_evidence_id"]
-            or provider_clean["url"] != parent_contract["provider_clean_evidence_url"]
-            or not self._complete_pr_snapshot_matches(report, provider_clean, "clean")
+            or any(
+                association[field] != evidence[field]
+                or association[field] != parent_contract[field]
+                for field in (
+                    "workflow_id",
+                    "run_id",
+                    "run_attempt",
+                    "check_suite_id",
+                )
+            )
+            or association["check_run_id"] != parent_contract["check_run_id"]
+            or association["check_run_url"] != parent_contract["check_run_url"]
+            or association["check_name"] != parent_contract["check_name"]
+            or association["app_id"] != parent_contract["app_id"]
+            or association["app_slug"] != parent_contract["app_slug"]
         ):
             return False
-        try:
-            provider_clean_time = _time(provider_clean["server_time"])
-        except (TypeError, ValueError):
-            return False
-        return provider_clean_time <= completed_at
+        return True
 
     @staticmethod
     def _clean_evidence_url_matches_scope(
@@ -1275,13 +1433,40 @@ class _ReportValidator:
 
     def _selected_pr_scope(self, report: dict[str, object]) -> bool:
         rule = self.scope_rules["selected-pr"]
-        return (
+        if not (
             report["status"] in rule["status_values"]
             and self._positive_int(report["pull_request"])
             and self._full_sha(report["head_sha"])
-            and report["scope_assurance"] == rule["scope_assurance"]
-            and report["base_assurance"] == rule["base_assurance"]
-        )
+            and report["scope_assurance"] in rule["scope_assurance_values"]
+            and report["base_assurance"] in rule["base_assurance_values"]
+        ):
+            return False
+        if report["basis"] != "merge-status":
+            return (
+                report["scope_assurance"] == "latest-head-only"
+                and report["base_assurance"] == "local-pr-readiness"
+            )
+        evidence = report["evidence"]
+        if not isinstance(evidence, dict):
+            return False
+        association = evidence.get("association")
+        if not isinstance(association, dict):
+            return False
+        assertion = association.get("provider_clean_assertion")
+        if not isinstance(assertion, dict):
+            return False
+        if assertion.get("scope") == "latest-feature-head":
+            return (
+                report["scope_assurance"] == "latest-feature-head"
+                and report["base_assurance"] == "local-pr-readiness"
+            )
+        if assertion.get("scope") == "current-merge-scope":
+            return (
+                report["scope_assurance"] == "current-merge-scope"
+                and report["base_assurance"]
+                == "producer-contract-current-scope-plus-local-pr-readiness"
+            )
+        return False
 
     def _no_selected_supported_pr_scope(self, report: dict[str, object]) -> bool:
         rule = self.scope_rules["no-selected-supported-pr"]
@@ -1388,8 +1573,8 @@ class _ReportValidator:
                 and evidence["channel"] == rule["channel"]
                 and evidence["status"] == rule["check_status"]
                 and evidence["conclusion"] == rule["conclusion"]
-                and evidence["artifact_commit"] == report["head_sha"]
-                and evidence["head_binding"] == rule["head_binding"]
+                and evidence["feature_head_sha"] == report["head_sha"]
+                and self._complete_pr_snapshot_matches(report, evidence, "clean")
             )
         null_rule = self.rules["null"]
         if basis is not None:
@@ -1445,10 +1630,22 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "review_thread_comment_count": 0,
             "reactions_pages_complete": True,
             "reaction_count": 1,
-            "check_runs_pages_complete": True,
-            "check_run_count": 1,
-            "commit_statuses_pages_complete": True,
-            "commit_status_count": 0,
+            "feature_head_check_subject_sha": cls.direct_positive_parent_scope[
+                "head_sha"
+            ],
+            "feature_head_check_runs_pages_complete": True,
+            "feature_head_check_run_count": 1,
+            "feature_head_commit_statuses_pages_complete": True,
+            "feature_head_commit_status_count": 0,
+            "feature_head_check_pages_sha256": "a" * 64,
+            "selected_subject_kind": "feature-head",
+            "selected_subject_sha": cls.direct_positive_parent_scope["head_sha"],
+            "selected_subject_check_runs_pages_complete": True,
+            "selected_subject_check_run_count": 1,
+            "selected_subject_commit_statuses_pages_complete": True,
+            "selected_subject_commit_status_count": 0,
+            "selected_subject_check_pages_sha256": "a" * 64,
+            "selected_subject_page_relation": "same-feature-head-page-set",
             "trustworthy_terminal_count": 1,
         }
         cls.clean_complete_pr_parent_snapshot = {
@@ -1456,6 +1653,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "status": "complete",
             "initial_scope": copy.deepcopy(cls.direct_positive_parent_scope),
             "final_scope": copy.deepcopy(cls.direct_positive_parent_scope),
+            "initial_merge_status_scope": None,
+            "final_merge_status_scope": None,
             "initial_page_inventory": copy.deepcopy(page_inventory),
             "final_page_inventory": copy.deepcopy(page_inventory),
             "initial_terminal_selection": {
@@ -1562,9 +1761,16 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         cls.merge_status_parent_scope = {
             "repository": "octo/review-fixture",
             "pull_request": 7,
-            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "feature_head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "base_ref": "refs/heads/master",
+            "base_tip_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+            "check_subject_kind": "github-synthetic-merge",
+            "check_subject_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }
         cls.merge_status_parent_contract = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
             "contract_descriptor": {
                 "source_repository": "octo/review-gate",
                 "source_commit": "2222222222222222222222222222222222222222",
@@ -1573,23 +1779,37 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             },
             "app_id": 15368,
             "app_slug": "github-actions",
+            "workflow_id": 901,
+            "run_id": 801,
+            "run_attempt": 1,
+            "check_suite_id": 601,
             "check_name": "Codex Review Merge Gate",
             "check_run_id": 701,
             "check_run_url": "https://github.com/octo/review-fixture/runs/701",
-            "provider_clean_evidence_id": 101,
-            "provider_clean_evidence_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+            "provider_clean_assertion": {
+                "kind": "verified-producer-contract",
+                "semantics": "github-codex-provider-clean",
+                "scope": "current-merge-scope",
+                "unresolved_findings_required_zero": True,
+            },
         }
         merge_evidence = copy.deepcopy(
             cls.grammar["report_bases"]["merge_status"]["evidence"]
         )
         merge_basis_selection = {
             field: (
-                copy.deepcopy(merge_evidence["association"]["provider_clean_evidence"])
-                if field == "provider_clean_evidence"
+                copy.deepcopy(cls.merge_status_parent_scope)
+                if field == "scope"
                 else (
                     copy.deepcopy(merge_evidence["association"]["contract"])
                     if field == "contract"
-                    else copy.deepcopy(merge_evidence[field])
+                    else (
+                        copy.deepcopy(
+                            merge_evidence["association"]["provider_clean_assertion"]
+                        )
+                        if field == "provider_clean_assertion"
+                        else copy.deepcopy(merge_evidence[field])
+                    )
                 )
             )
             for field in cls.grammar["required_report_schema"]["parent_input_profiles"][
@@ -1600,6 +1820,24 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.clean_complete_pr_parent_snapshot
         )
         for phase in ("initial", "final"):
+            cls.merge_complete_pr_parent_snapshot[f"{phase}_merge_status_scope"] = (
+                copy.deepcopy(cls.merge_status_parent_scope)
+            )
+            merge_inventory = cls.merge_complete_pr_parent_snapshot[
+                f"{phase}_page_inventory"
+            ]
+            merge_inventory["selected_subject_kind"] = "github-synthetic-merge"
+            merge_inventory["selected_subject_sha"] = cls.merge_status_parent_scope[
+                "check_subject_sha"
+            ]
+            merge_inventory["selected_subject_check_pages_sha256"] = "b" * 64
+            merge_inventory["selected_subject_page_relation"] = (
+                "independent-synthetic-subject-page-set"
+            )
+            cls.merge_complete_pr_parent_snapshot[f"{phase}_terminal_selection"] = {
+                "classification": "clean",
+                "evidence": copy.deepcopy(merge_evidence),
+            }
             cls.merge_complete_pr_parent_snapshot[f"{phase}_basis_selection"] = {
                 "kind": "merge-status",
                 "terminal_evidence": None,
@@ -1724,15 +1962,25 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
     ) -> dict[str, object]:
         snapshot = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
         merge_evidence = report["evidence"]
-        provider_clean = merge_evidence["association"]["provider_clean_evidence"]
+        association = merge_evidence["association"]
+        merge_scope = {
+            field: copy.deepcopy(association[field])
+            for field in self.grammar["required_report_schema"][
+                "parent_input_profiles"
+            ]["merge_status_scope"]
+        }
         merge_projection = {
             field: (
-                copy.deepcopy(provider_clean)
-                if field == "provider_clean_evidence"
+                copy.deepcopy(merge_scope)
+                if field == "scope"
                 else (
-                    copy.deepcopy(merge_evidence["association"]["contract"])
+                    copy.deepcopy(association["contract"])
                     if field == "contract"
-                    else copy.deepcopy(merge_evidence[field])
+                    else (
+                        copy.deepcopy(association["provider_clean_assertion"])
+                        if field == "provider_clean_assertion"
+                        else copy.deepcopy(merge_evidence[field])
+                    )
                 )
             )
             for field in self.grammar["required_report_schema"][
@@ -1740,9 +1988,38 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             ]["merge_status_basis_selection"]
         }
         for phase in ("initial", "final"):
+            snapshot[f"{phase}_merge_status_scope"] = copy.deepcopy(merge_scope)
+            inventory = snapshot[f"{phase}_page_inventory"]
+            inventory["feature_head_check_subject_sha"] = report["head_sha"]
+            inventory["selected_subject_kind"] = association["check_subject_kind"]
+            inventory["selected_subject_sha"] = association["check_subject_sha"]
+            if association["check_subject_kind"] == "feature-head":
+                inventory["selected_subject_check_runs_pages_complete"] = inventory[
+                    "feature_head_check_runs_pages_complete"
+                ]
+                inventory["selected_subject_check_run_count"] = inventory[
+                    "feature_head_check_run_count"
+                ]
+                inventory["selected_subject_commit_statuses_pages_complete"] = (
+                    inventory["feature_head_commit_statuses_pages_complete"]
+                )
+                inventory["selected_subject_commit_status_count"] = inventory[
+                    "feature_head_commit_status_count"
+                ]
+                inventory["selected_subject_check_pages_sha256"] = inventory[
+                    "feature_head_check_pages_sha256"
+                ]
+                inventory["selected_subject_page_relation"] = (
+                    "same-feature-head-page-set"
+                )
+            else:
+                inventory["selected_subject_check_pages_sha256"] = "b" * 64
+                inventory["selected_subject_page_relation"] = (
+                    "independent-synthetic-subject-page-set"
+                )
             snapshot[f"{phase}_terminal_selection"] = {
                 "classification": "clean",
-                "evidence": copy.deepcopy(provider_clean),
+                "evidence": copy.deepcopy(merge_evidence),
             }
             snapshot[f"{phase}_basis_selection"] = {
                 "kind": "merge-status",
@@ -1873,6 +2150,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "basis_selection",
                 "reaction_basis_selection",
                 "merge_status_basis_selection",
+                "merge_status_scope",
+                "merge_status_parent_contract",
                 "reaction_clean_epoch",
                 "resolved_inline_snapshot",
             },
@@ -1886,6 +2165,18 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertIn(
             "type-preserving equal",
             report_schema["parent_input_rules"]["complete_pr_snapshot"]["page_state"],
+        )
+        self.assertIn(
+            "selected_subject_kind feature-head requires same-feature-head-page-set",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "check_subject_page_state"
+            ],
+        )
+        self.assertIn(
+            "github-synthetic-merge requires independent-synthetic-subject-page-set",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "check_subject_page_state"
+            ],
         )
         self.assertIn(
             "not digests of report summaries",
@@ -1987,39 +2278,39 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             set(report_schema["selection_outcome_rules"]["outcomes"]),
             {"selected-pr", "proved-no-selected-supported-pr"},
         )
-        self.assertEqual(
-            report_schema["basis_rules"]["merge-status"]["artifact_commit"],
-            "required-full-sha-equals-report-head",
+        self.assertIn(
+            "feature_head_sha equals the report head",
+            report_schema["basis_rules"]["merge-status"]["feature_head_binding"],
         )
-        self.assertEqual(
-            report_schema["basis_rules"]["merge-status"]["head_binding"],
-            "explicit-commit",
+        self.assertIn(
+            "github-synthetic-merge",
+            report_schema["basis_rules"]["merge-status"]["check_subject_binding"],
         )
         self.assertEqual(
             report_schema["basis_rules"]["merge-status"]["conclusion"],
             "success",
         )
         self.assertIn(
-            "separate closed parent-owned record",
+            "separate closed parent-owned merge_status_parent_contract",
             report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
         )
         self.assertIn(
-            "complete typed initial/final page state",
+            "equal initial/final current feature-head/base/merge/check-subject scope",
             report_schema["basis_rules"]["merge-status"][
                 "parent_complete_snapshot_input"
             ],
         )
         self.assertIn(
-            "exact stable merge-status check/App/head/status/conclusion/producer-contract/provider-clean basis selection",
+            "exact App/workflow/run/check/producer-contract basis",
             report_schema["basis_rules"]["merge-status"][
                 "parent_complete_snapshot_input"
             ],
         )
-        self.assertEqual(
-            report_schema["basis_rules"]["merge-status"][
-                "provider_clean_channel_branch_binding"
+        self.assertIn(
+            "does not require a separate terminal comment or review",
+            report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "terminal_selection"
             ],
-            "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
         )
         self.assertEqual(
             set(report_schema["closed_fields"]["merge_status_evidence"]),
@@ -2031,11 +2322,15 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "check_name",
                 "status",
                 "conclusion",
-                "artifact_commit",
+                "feature_head_sha",
+                "check_subject_sha",
+                "workflow_id",
+                "run_id",
+                "run_attempt",
+                "check_suite_id",
                 "app",
                 "server_time",
                 "server_time_field",
-                "head_binding",
                 "association",
             },
         )
@@ -2047,14 +2342,23 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "status",
                 "repository",
                 "pull_request",
-                "head_sha",
+                "feature_head_sha",
+                "base_ref",
+                "base_tip_sha",
+                "merge_base_sha",
+                "check_subject_kind",
+                "check_subject_sha",
+                "workflow_id",
+                "run_id",
+                "run_attempt",
+                "check_suite_id",
                 "check_run_id",
                 "check_run_url",
                 "check_name",
                 "app_id",
                 "app_slug",
                 "contract",
-                "provider_clean_evidence",
+                "provider_clean_assertion",
             },
         )
         self.assertEqual(
@@ -2134,6 +2438,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "separate closed parent-owned\n`complete_pr_snapshot`",
             "They are not digests of the report summary",
             "selected pass-basis projection",
+            "feature-head check runs/statuses",
+            "selected-subject check runs/statuses",
+            "same page set type-for-type",
+            "separately fetched, distinct page-set identity",
             "leaving this frozen selection unchanged fails closed",
             "reaction-clean pass requires both",
             "Reusing a head-A request or reaction while reporting head B",
@@ -2143,13 +2451,20 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "parent-verified-repository-contract",
             "status: completed",
             "conclusion: success",
-            "provider_clean_evidence: exact-terminal-clean-evidence-object",
-            "independently supplied frozen scope inputs",
-            "successful service-start check cannot become a merge-status pass",
-            "separate closed\nparent-owned `merge_status_parent_contract` record",
+            "feature_head_sha: 40-lowercase-hex-equal-to-report-head",
+            "check_subject_sha: exact-feature-head-or-synthetic-merge-sha",
+            "workflow_id: exact-positive-workflow-id",
+            "run_id: exact-positive-run-id",
+            "check_suite_id: exact-positive-check-suite-id",
+            "semantics: github-codex-provider-clean",
+            "scope: latest-feature-head | current-merge-scope",
+            "unresolved_findings_required_zero: true",
+            "parent's frozen\nscope inputs",
+            "service-start marker cannot become a merge-status pass",
+            "parent-owned `merge_status_parent_contract` record",
             "exact UTF-8 byte identity",
-            "`issue-comment` requires `clean-issue-v1`",
-            "`review`\nrequires `clean-review-v1`",
+            "does not require a second terminal clean\ncomment or review",
+            "feature-head-only contract",
         ):
             self.assertIn(anchor, authority)
         self.assertNotIn("artifact_commit: 40-lowercase-hex-or-null", authority)
@@ -2242,8 +2557,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "reaction-clean-non-https-url",
             "reaction-clean-explicit-commit",
             "merge-status-report-positive",
-            "merge-status-null-artifact-commit",
-            "merge-status-old-head",
+            "merge-status-null-check-subject",
+            "merge-status-old-feature-head",
             "merge-status-not-completed",
             "merge-status-unsuccessful-conclusion",
             "merge-status-untrusted-app-id",
@@ -2260,13 +2575,13 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "merge-status-association-repository-mismatch",
             "merge-status-association-pr-mismatch",
             "merge-status-service-start-not-association",
-            "merge-status-provider-clean-cross-pr",
-            "merge-status-coupled-provider-clean-identity-mutation",
-            "merge-status-missing-provider-clean-result",
-            "merge-status-stale-provider-clean-result",
-            "merge-status-provider-clean-after-check",
-            "merge-status-provider-clean-issue-review-branch",
-            "merge-status-provider-clean-review-issue-branch",
+            "merge-status-synthetic-base-tip-mismatch",
+            "merge-status-coupled-check-subject-mutation",
+            "merge-status-missing-provider-clean-assertion",
+            "merge-status-provider-clean-scope-mismatch",
+            "merge-status-provider-clean-generic-semantics",
+            "merge-status-provider-clean-generic-kind",
+            "merge-status-provider-clean-does-not-require-zero-findings",
             "merge-status-invalid-contract-digest",
             "merge-status-coupled-contract-descriptor-mutation",
             "finding-report-positive",
@@ -2603,6 +2918,77 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self._validator_with_complete_snapshot(drifted).validate(report)
         )
 
+    def test_merge_status_snapshot_requires_two_subject_bound_page_sets(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        self.assertTrue(self.merge_report_validator.validate(report))
+
+        missing_selected_status_page = copy.deepcopy(
+            self.merge_complete_pr_parent_snapshot
+        )
+        missing_selected_status_page["initial_page_inventory"].pop(
+            "selected_subject_commit_status_count"
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                missing_selected_status_page
+            ).validate(report)
+        )
+
+        incomplete_feature_page = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            incomplete_feature_page[f"{phase}_page_inventory"][
+                "feature_head_check_runs_pages_complete"
+            ] = False
+        self.assertFalse(
+            self._validator_with_complete_snapshot(incomplete_feature_page).validate(
+                report
+            )
+        )
+
+        coupled_subject_pages = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            inventory = coupled_subject_pages[f"{phase}_page_inventory"]
+            inventory["selected_subject_sha"] = inventory[
+                "feature_head_check_subject_sha"
+            ]
+            inventory["selected_subject_check_pages_sha256"] = inventory[
+                "feature_head_check_pages_sha256"
+            ]
+            inventory["selected_subject_page_relation"] = "same-feature-head-page-set"
+        self.assertFalse(
+            self._validator_with_complete_snapshot(coupled_subject_pages).validate(
+                report
+            )
+        )
+
+        coupled_subject_labels = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            inventory = coupled_subject_labels[f"{phase}_page_inventory"]
+            inventory["feature_head_check_subject_sha"] = inventory[
+                "selected_subject_sha"
+            ]
+            inventory["feature_head_check_pages_sha256"] = inventory[
+                "selected_subject_check_pages_sha256"
+            ]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(coupled_subject_labels).validate(
+                report
+            )
+        )
+
+        selected_subject_mismatch = copy.deepcopy(
+            self.merge_complete_pr_parent_snapshot
+        )
+        for phase in ("initial", "final"):
+            selected_subject_mismatch[f"{phase}_page_inventory"][
+                "selected_subject_sha"
+            ] = "d" * 40
+        self.assertFalse(
+            self._validator_with_complete_snapshot(selected_subject_mismatch).validate(
+                report
+            )
+        )
+
     def test_complete_pr_snapshot_binds_closed_stable_pass_basis_selection(
         self,
     ) -> None:
@@ -2698,6 +3084,25 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         open_merge["initial_basis_selection"]["merge_status"]["opaque"] = True
         self.assertFalse(
             self._validator_with_complete_snapshot(open_merge).validate(merge_report)
+        )
+        merge_scope_profile = self.grammar["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_scope"]
+        for field in merge_scope_profile:
+            with self.subTest(missing_merge_scope_field=field):
+                snapshot = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+                snapshot["initial_merge_status_scope"].pop(field)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(snapshot).validate(
+                        merge_report
+                    )
+                )
+        merge_scope_drift = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        merge_scope_drift["final_merge_status_scope"]["base_tip_sha"] = "1" * 40
+        self.assertFalse(
+            self._validator_with_complete_snapshot(merge_scope_drift).validate(
+                merge_report
+            )
         )
 
         drifted = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
@@ -2822,21 +3227,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         )
 
         provider_merge = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
-        provider_clean = provider_merge["evidence"]["association"][
-            "provider_clean_evidence"
-        ]
-        provider_clean["id"] = 102
-        provider_clean["url"] = (
-            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
-        )
+        provider_merge["evidence"]["run_id"] = 802
+        provider_merge["evidence"]["association"]["run_id"] = 802
         provider_contract = copy.deepcopy(self.merge_status_parent_contract)
-        provider_contract["provider_clean_evidence_id"] = 102
-        provider_contract["provider_clean_evidence_url"] = provider_clean["url"]
+        provider_contract["run_id"] = 802
         stale_provider_basis = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
-        for phase in ("initial", "final"):
-            stale_provider_basis[f"{phase}_terminal_selection"]["evidence"] = (
-                copy.deepcopy(provider_clean)
-            )
         stale_provider_basis["initial_snapshot_sha256"] = "1" * 64
         stale_provider_basis["final_snapshot_sha256"] = "1" * 64
         self.assertFalse(
@@ -2924,16 +3319,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         )
 
         coupled_merge = copy.deepcopy(merge_report)
-        provider_clean = coupled_merge["evidence"]["association"][
-            "provider_clean_evidence"
-        ]
-        provider_clean["id"] = 102
-        provider_clean["url"] = (
-            "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
-        )
+        coupled_merge["evidence"]["run_id"] = 802
+        coupled_merge["evidence"]["association"]["run_id"] = 802
         coupled_contract = copy.deepcopy(self.merge_status_parent_contract)
-        coupled_contract["provider_clean_evidence_id"] = 102
-        coupled_contract["provider_clean_evidence_url"] = provider_clean["url"]
+        coupled_contract["run_id"] = 802
         self.assertFalse(
             self._validator_with_complete_snapshot(
                 self.merge_complete_pr_parent_snapshot,
@@ -3353,7 +3742,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         replacements = {
             "repository": "octo/other",
             "pull_request": 8,
-            "head_sha": "1111111111111111111111111111111111111111",
+            "feature_head_sha": "1111111111111111111111111111111111111111",
+            "base_ref": "refs/heads/other",
+            "base_tip_sha": "1111111111111111111111111111111111111111",
+            "merge_base_sha": "1111111111111111111111111111111111111111",
+            "check_subject_kind": "feature-head",
+            "check_subject_sha": "1111111111111111111111111111111111111111",
         }
         for field, replacement in replacements.items():
             with self.subTest(field=field):
@@ -3374,6 +3768,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
         self.assertTrue(self.merge_report_validator.validate(report))
         replacements = {
+            "owner": "consumer",
+            "status": "incomplete",
             "contract_descriptor": {
                 "source_repository": "octo/other-gate",
                 "source_commit": "4444444444444444444444444444444444444444",
@@ -3382,11 +3778,19 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             },
             "app_id": 99999,
             "app_slug": "other-actions",
+            "workflow_id": 902,
+            "run_id": 802,
+            "run_attempt": 2,
+            "check_suite_id": 602,
             "check_name": "Other Review Gate",
             "check_run_id": 702,
             "check_run_url": "https://github.com/octo/review-fixture/runs/702",
-            "provider_clean_evidence_id": 102,
-            "provider_clean_evidence_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102",
+            "provider_clean_assertion": {
+                "kind": "service-start",
+                "semantics": "generic-success",
+                "scope": "current-merge-scope",
+                "unresolved_findings_required_zero": True,
+            },
         }
         for field, replacement in replacements.items():
             with self.subTest(field=field):
@@ -3403,46 +3807,70 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 )
                 self.assertFalse(validator.validate(report))
 
-    def test_merge_status_provider_clean_channel_branch_pairs_are_closed(
+    def test_merge_status_feature_head_and_synthetic_subject_branches_are_closed(
         self,
     ) -> None:
-        issue_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
-        issue_clean = issue_report["evidence"]["association"]["provider_clean_evidence"]
-        issue_clean["grammar_branch"] = "clean-review-v1"
-        self.assertFalse(self.report_validator.validate(issue_report))
+        synthetic_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        self.assertTrue(self.merge_report_validator.validate(synthetic_report))
+        synthetic_report["evidence"]["association"]["provider_clean_assertion"][
+            "scope"
+        ] = "latest-feature-head"
+        self.assertFalse(self.merge_report_validator.validate(synthetic_report))
 
-        review_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
-        review_clean = review_report["evidence"]["association"][
-            "provider_clean_evidence"
-        ]
-        review_url = (
-            "https://github.com/octo/review-fixture/pull/7#pullrequestreview-101"
-        )
-        review_clean.update(
-            {
-                "url": review_url,
-                "channel": "review",
-                "grammar_branch": "clean-review-v1",
-                "server_time_field": "submitted_at",
-            }
-        )
-        review_parent_contract = copy.deepcopy(self.merge_status_parent_contract)
-        review_parent_contract["provider_clean_evidence_url"] = review_url
-        review_snapshot = self._merge_snapshot_for_report(review_report, "7")
-        review_validator = _ReportValidator(
+        feature_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        head = feature_report["head_sha"]
+        feature_report["evidence"]["check_subject_sha"] = head
+        feature_association = feature_report["evidence"]["association"]
+        feature_association["check_subject_kind"] = "feature-head"
+        feature_association["check_subject_sha"] = head
+        feature_association["provider_clean_assertion"]["scope"] = "latest-feature-head"
+        feature_report["scope_assurance"] = "latest-feature-head"
+        feature_report["base_assurance"] = "local-pr-readiness"
+        feature_scope = copy.deepcopy(self.merge_status_parent_scope)
+        feature_scope["check_subject_kind"] = "feature-head"
+        feature_scope["check_subject_sha"] = head
+        feature_contract = copy.deepcopy(self.merge_status_parent_contract)
+        feature_contract["provider_clean_assertion"]["scope"] = "latest-feature-head"
+        feature_snapshot = self._merge_snapshot_for_report(feature_report, "7")
+        feature_validator = _ReportValidator(
             self.grammar,
             self.selected_parent_selection_outcome,
             self.direct_positive_parent_scope,
             self.terminal_clean_parent_identity,
             self.reaction_clean_parent_epoch,
-            self.merge_status_parent_scope,
-            review_parent_contract,
+            feature_scope,
+            feature_contract,
             None,
-            review_snapshot,
+            feature_snapshot,
         )
-        self.assertTrue(review_validator.validate(review_report))
-        review_clean["grammar_branch"] = "clean-issue-v1"
-        self.assertFalse(review_validator.validate(review_report))
+        self.assertTrue(feature_validator.validate(feature_report))
+        split_feature_pages = copy.deepcopy(feature_snapshot)
+        for phase in ("initial", "final"):
+            split_feature_pages[f"{phase}_page_inventory"][
+                "selected_subject_check_run_count"
+            ] += 1
+        split_feature_validator = _ReportValidator(
+            self.grammar,
+            self.selected_parent_selection_outcome,
+            self.direct_positive_parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            feature_scope,
+            feature_contract,
+            None,
+            split_feature_pages,
+        )
+        self.assertFalse(split_feature_validator.validate(feature_report))
+        mislabeled_feature = copy.deepcopy(feature_report)
+        mislabeled_feature["scope_assurance"] = "current-merge-scope"
+        mislabeled_feature["base_assurance"] = (
+            "producer-contract-current-scope-plus-local-pr-readiness"
+        )
+        self.assertFalse(feature_validator.validate(mislabeled_feature))
+        feature_report["evidence"]["association"]["provider_clean_assertion"][
+            "scope"
+        ] = "current-merge-scope"
+        self.assertFalse(feature_validator.validate(feature_report))
 
     def test_parent_selection_outcome_binds_every_report_variant(self) -> None:
         selected_reports = [

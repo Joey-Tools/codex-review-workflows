@@ -35,19 +35,22 @@ superseded_by:
 
 ## Decision Rationale
 
-- The current dedicated reviewer profile resolves to GPT-5.6 Sol `xhigh`,
-  while a fresh Codex CLI session supports GPT-5.6 Sol `ultra`. The adapters
-  should therefore be peers selected by verified effective capability and
-  parent convenience, rather than by a fixed transport priority.
+- The prior installed reviewer role resolved to GPT-5.6 Sol `xhigh`, while a
+  fresh Codex CLI session supports GPT-5.6 Sol `ultra`. This candidate updates
+  the role to the same `ultra` profile. The adapters are peers selected by
+  verified effective capability and parent convenience, rather than by a fixed
+  transport priority.
 - OpenAI's API documentation names `max` as GPT-5.6 Sol's highest API
   `reasoning.effort`, while Codex exposes `ultra` as a product-level mode that
   may delegate internally. The released reviewer configuration therefore uses
   the Codex `ultra` profile and counts the resulting fresh session as one
   logical lane, without claiming that `ultra` is an API effort enum.
 - Model discovery is intentionally exceptional. Query the latest eligible
-  model only when the parent is clearly stronger than the configured reviewer
-  or the reviewer runtime rejects, downgrades, or mismatches the requested
-  model/effort. Ordinary reviews trust the released role and skill defaults.
+  model only when the parent's effective model family or Codex mode is clearly
+  stronger than the configured reviewer. A runtime rejection, downgrade, or
+  mismatch instead triggers local capability diagnosis and same-profile peer
+  fallback; it does not widen the lookup condition. Ordinary reviews trust the
+  released role and skill defaults.
 - A formal launch preflight showed that Codex CLI 0.149.0 rejects a positional
   custom prompt when `review --base` is selected, while that specialized
   surface supplies no receipt proving an stdin prompt was preserved. The CLI
@@ -60,9 +63,11 @@ superseded_by:
   config file, not the ambient instruction stack. Global `AGENTS.md` and any
   externally loaded skill therefore remain admissible only when their resolved
   paths and digests are parent-bound trusted guidance; an unexpected external
-  read invalidates that attempt. A runtime that accepts the strict requested
-  profile but does not report effective model/mode records `unknown`; only an
-  observed mismatch or downgrade makes profile evidence inconclusive.
+  read invalidates that attempt. When runtime telemetry omits effective
+  model/mode, only a qualifying `accepted-pinned-launch` basis may project the
+  requested pinned values as the execution-level effective profile. Without
+  that basis the unproved fields are `unknown` and the lane is inconclusive; an
+  observed mismatch or downgrade is likewise inconclusive.
 - A subsequent PTY-based delivery visibly dropped and joined prompt bytes, so
   that process was stopped and invalidated before its output could count as a
   lane. Reliable CLI transport is direct stdin or a fixed parent-owned prompt
@@ -579,8 +584,9 @@ superseded_by:
     unproved or mismatched runtime;
   - replace host `Path.resolve()` symlink traversal with bounded lexical and
     tracked-symlink-map containment;
-  - require an explicit repository idempotency/reentrancy declaration and
-    mutation authority before any workflow rerun or dispatch;
+  - freeze the exact repository/PR/head, Action/workflow, operation, and input
+    tuple before a workflow rerun or dispatch, treat exact repetitions as
+    idempotent, and still require external-mutation authority and single-flight;
   - retry only machine-classified transient infrastructure outcomes, never
     stable malformed or contradictory evidence;
   - add a closed no-selected-supported-PR report variant without weakening
@@ -608,8 +614,9 @@ superseded_by:
     instructions; the model-visible debug probe and exec-only capability/
     strict-launch evidence are separate, non-overclaiming receipts;
   - the always-read lane contract and prompt template now share the same
-    transient-only recovery, non-intrinsic-idempotency, and same-head typed
-    resolution rules as the GitHub field authority; and
+    transient-only recovery, exact-tuple intrinsic idempotency, mutation-
+    authorization, and same-head typed-resolution rules as the GitHub field
+    authority; and
   - the trusted Mac source-manifest generator now enforces the consumer's
     exact ASCII path grammar, no-follow ordinary-directory policy, entry,
     depth, path-byte, per-file, double-read total-byte, and manifest-byte
@@ -1086,6 +1093,122 @@ superseded_by:
   seconds outside the nested macOS sandbox, with `ResourceWarning` promoted to
   an error.
 
+### Formal review remediation after `236242e`
+
+- Signed head `236242e212f552181dcce6aa8374caae3f46f658` received a fresh
+  host-bound GPT-5.6 Sol Ultra CLI review under the independently trusted prior
+  release. The terminal process completed, but the result contained three
+  findings, so that head is not a local-review pass: ordinary reviews could
+  silently omit candidate-head repository guidance while automatic project-
+  document loading was disabled; Shared Metadata did not bind the actual
+  review process's auth-only `CODEX_HOME` receipt; and the journal's profile
+  rule did not make every unqualified `unknown` effective profile
+  inconclusive. The post-review workspace receipts matched the frozen range,
+  the source authentication file remained byte-identical, and the temporary
+  review root was deleted.
+- Ordinary review now uses two mutually exclusive candidate-Markdown surfaces.
+  `self_policy_migration: false` requires the range-bound
+  `ordinary-candidate-guidance-required-set-v1` receipt plus the closed
+  `ordinary-candidate-guidance-v1` projection, while every
+  `candidate_markdown_*` field is not applicable. Self-policy migration
+  requires every `ordinary_candidate_guidance*` field to be not applicable and
+  retains the stricter required-subject, inventory, and admission records.
+  Simultaneously supplying both surfaces is inconclusive in the role and both
+  model prompts.
+- The ordinary required-set receipt binds the frozen base/head, the complete
+  recursively enumerated endpoint-tree non-tree leaf changed-path set, the
+  total guidance path set, and four
+  independently parent-derived purpose partitions by exact count and canonical
+  path-array digest. OpenAI's documented
+  [instruction discovery order](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+  selects at most one file per directory: `AGENTS.override.md`, then
+  `AGENTS.md`, then configured fallback names. This closed launch binds the
+  exact fallback list as empty in parent, prompt, and report evidence because
+  user configuration is ignored. The selected root file is the repository
+  convention; a selected non-root file is path-scoped only when its parent
+  directory is an ancestor of at least one changed path. Domain/project
+  guidance cannot relabel either instruction filename. Applicability retains
+  a distinct root-to-leaf stack for each changed leaf, while each purpose
+  partition uses UTF-8 path-byte order only as canonical transport. The
+  projection must reproduce every partition and candidate-head digest across
+  parent, prompt, and report. `parent-proved-empty` therefore cannot be an
+  empty-array assertion: it must bind the current changed-path scope and prove
+  all four independently derived sets empty. Old-range replay, omitted
+  applicable guidance, label swaps, unrelated nested conventions, non-UTF-8
+  paths, and open or mismatched records are inconclusive.
+- Ordinary and self-policy candidate projections now use exact compact
+  canonical UTF-8 JSON as their transport. Parent, prompt, and report bind the
+  encoded bytes and decoded types; the sanitized Git prefix is version 2 and
+  fixes `GIT_LITERAL_PATHSPECS=1`, while each decoded candidate path is one
+  exact argv token after `--`. Quoted, newline-bearing, and pathspec-shaped
+  names therefore remain data rather than Git selectors; a path that is not
+  losslessly representable in the closed encoding is inconclusive rather than
+  an exception or an invitation to reinterpret it. Directory tree nodes are
+  excluded from the changed-path inventory even when their tree OIDs change;
+  tracked regular blobs, symlink blobs, and gitlinks are the endpoint leaves.
+- Both ordinary model prompts now share the same closed guidance boundary:
+  only enumerated candidate Markdown may be obeyed or used as guidance, each
+  path is limited to its declared purpose, and candidate content cannot route
+  to an unlisted control source. Unenumerated changed Markdown such as a
+  `README.md` remains fully reviewable as subject code/documentation and may be
+  read with necessary tracked context; it simply never becomes guidance or a
+  control-plane input. The Local Codex and Claude actual prompts are each
+  self-contained for the endpoint-leaf algorithm, empty proof, four exact
+  purpose/path couplings, and canonical UTF-8 JSON encoder, including fixed
+  non-ASCII, U+2028, backslash, NUL, and lone-surrogate behavior. Neither
+  reviewer is asked to prevalidate a future report-only equality field.
+- The exact boolean `self_policy_migration` discriminant is bound between
+  parent and prompt before launch and among parent, prompt, and report after
+  termination. Its inactive route has one closed `not-applicable` shape, so a
+  coupled route reinterpretation, non-boolean value, or later discriminant
+  drift is inconclusive. Executable oracles also reject malformed endpoint
+  modes/object IDs, tree/leaf contradictions, unhashable status fields, and
+  omitted changed leaves rather than raising or manufacturing evidence.
+- Candidate guidance and self-policy subject records accept only exact regular
+  Git blob modes `100644` and `100755`, bind the blob bytes without filesystem
+  dereference, and reject symlink, gitlink, tree, or other modes as
+  inconclusive. Because adding `git_mode` changes two already published closed
+  self-policy record shapes, the active profiles are
+  `candidate-markdown-subject-inventory-v2` and
+  `candidate-markdown-admission-v2`; their old v1 forms cannot satisfy the new
+  candidate control plane. `candidate-markdown-required-subject-set-v1`
+  remains v1 because its endpoint/count/path-digest shape did not change, and
+  the newly introduced ordinary-guidance profiles remain v1 because they have
+  not previously shipped. Bootstrap review still runs under the independently
+  trusted prior policy rather than executing candidate-head control code. For
+  self-policy Local Codex admission, the parent-selected applicable
+  `AGENTS.override.md` shadows same-directory `AGENTS.md`; Claude treats either
+  filename solely as review subject.
+- The actual CLI review process receives a prelaunch opaque parent-private
+  auth-home receipt identity and the final lane report must repeat that identity
+  after post-run validation and cleanup.
+  The effective-profile rule now permits
+  requested-value projection only under a qualifying
+  `accepted-pinned-launch`; otherwise missing runtime telemetry is `unknown`
+  and inconclusive, as is any observed mismatch or downgrade.
+- GitHub's official protected-branch documentation confirms the exact strict
+  setting name [Require branches to be up to date before merging](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+  It remains separate from `Require linear history`. When strict freshness
+  blocks and no merge queue owns it, this workstream authorizes a signed merge
+  of the current base into the feature branch, followed by a new frozen range
+  and the complete test, local-review, GitHub-review, CI, conversation, policy,
+  and final-reread gate. No new guidance routes reviewers toward the retired
+  supplied-diff helper.
+- The post-remediation focused contract, recovery, terminal-carrier, and local-
+  lane matrix passes all 77 tests in 3.608 seconds. Ruff lint and format, the
+  skill validator, and `git diff --check` pass, and the final independent
+  stable-snapshot contract audit returned `No findings.`. This is focused
+  evidence only; the complete authoritative suite and fresh whole-range review
+  must be rerun after the candidate snapshot is frozen.
+- The first complete post-remediation probe ran 3,116 tests in 1,137.817
+  seconds: 3,115 passed, six were conditionally skipped, and the existing
+  nested macOS keychain-broker test was rejected by the outer sandbox with
+  `sandbox_apply: Operation not permitted` and return code 71. The exact test
+  then passed independently outside that nesting restriction in 1.990 seconds.
+  The authoritative complete rerun used the same source and
+  `ResourceWarning`-as-error policy outside the outer restriction; all 3,116
+  tests passed with six conditional skips in 1,118.931 seconds.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh whole-range
@@ -1103,14 +1226,17 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-07-large-repo-range-materialization-wme001.md`.
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
-- Final full `python3 -B -W error::ResourceWarning -m unittest discover`
-  review-playbook suite (`3,112` tests, `6` conditional skips, `1,000.276`
-  seconds). The earlier policy-closure tree passed `3,095` tests with the same
-  six skips in `1,148.966` seconds; the prior signed `2e89971` checkpoint passed
-  `3,010` tests with the same six skips in `999.845` seconds.
+- Final full `python3 -W error::ResourceWarning -m unittest discover`
+  review-playbook suite (`3,116` tests, `6` conditional skips, `1,118.931`
+  seconds) outside the outer sandbox restriction. The corresponding restricted
+  probe reached one environment-only nested-broker failure, whose exact test
+  passed separately in `1.990` seconds before the authoritative full rerun.
+  The earlier stable tree passed `3,112` tests with the same six skips in
+  `1,000.276` seconds; the prior signed `2e89971` checkpoint passed `3,010`
+  tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`73` focused policy, distribution, carrier, report, and self-policy
+  matrix (`77` focused policy, distribution, carrier, report, and self-policy
   contracts).
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
