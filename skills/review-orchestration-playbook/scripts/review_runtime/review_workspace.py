@@ -54,7 +54,7 @@ PARENT_SUPPORT_OBJECT_MANIFEST = "review-parent-support-objects"
 SOURCE_SHALLOW_MANIFEST = "review-source-shallow"
 PARTIAL_RECOVERY_SCHEMA_VERSION = "review-workspace-partial-recovery-v1"
 PARTIAL_RECOVERY_PREFIX = ".review-partial-recovery-"
-ATTRIBUTES_PAYLOAD = b"* -text -eol -filter -ident -working-tree-encoding\n"
+ATTRIBUTES_PAYLOAD = b"* diff -text -eol -filter -ident -working-tree-encoding\n"
 GIT_TIMEOUT_SECONDS = 120.0
 OBJECT_INTEGRITY_TIMEOUT_SECONDS = 900.0
 GIT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
@@ -7401,34 +7401,190 @@ def _validate_clean(
     )
 
 
-def _index_contains_split_link_extension(payload: bytes, oid_width: int) -> bool:
-    if len(payload) < 12 + oid_width or payload[:4] != b"DIRC":
-        raise ReviewWorkspaceError(
-            "workspace-index-invalid", "workspace index header is malformed"
+def _raise_workspace_index_invalid(message: str) -> None:
+    raise ReviewWorkspaceError("workspace-index-invalid", message)
+
+
+def _validate_index_name_length(flags: int, path_length: int) -> None:
+    encoded_length = flags & 0x0FFF
+    if encoded_length == 0x0FFF:
+        if path_length < 0x0FFF:
+            _raise_workspace_index_invalid(
+                "workspace index entry pathname length is malformed"
+            )
+        return
+    if encoded_length != path_length:
+        _raise_workspace_index_invalid(
+            "workspace index entry pathname length is malformed"
         )
-    extension_end = len(payload) - oid_width
-    search_offset = 12
-    while True:
-        candidate = payload.find(b"link", search_offset, extension_end)
-        if candidate < 0:
-            return False
-        cursor = candidate
-        first = True
-        while cursor < extension_end:
-            if cursor + 8 > extension_end:
-                break
-            signature = payload[cursor : cursor + 4]
-            size = struct.unpack(">I", payload[cursor + 4 : cursor + 8])[0]
-            cursor += 8
-            if size > extension_end - cursor:
-                break
-            if first and signature != b"link":
-                break
-            first = False
-            cursor += size
-        if cursor == extension_end:
-            return True
-        search_offset = candidate + 1
+
+
+def _accumulate_index_path_bytes(accumulated: int, path_length: int) -> int:
+    if (
+        accumulated < 0
+        or path_length < 0
+        or accumulated > CHECKOUT_PATH_BYTES_LIMIT
+        or path_length > CHECKOUT_PATH_BYTES_LIMIT - accumulated
+    ):
+        _raise_workspace_index_invalid(
+            "workspace index pathname bytes exceed the checkout path-byte limit"
+        )
+    return accumulated + path_length
+
+
+def _materialize_index_v4_path(
+    previous_path: bytes,
+    retained_length: int,
+    payload: bytes,
+    suffix_start: int,
+    suffix_end: int,
+) -> bytes:
+    return b"".join(
+        (
+            memoryview(previous_path)[:retained_length],
+            memoryview(payload)[suffix_start:suffix_end],
+        )
+    )
+
+
+def _decode_index_v4_strip_length(
+    payload: bytes,
+    cursor: int,
+    entries_end: int,
+    previous_path_length: int,
+) -> tuple[int, int]:
+    if cursor >= entries_end:
+        _raise_workspace_index_invalid(
+            "workspace index v4 pathname prefix is truncated"
+        )
+    octet = payload[cursor]
+    cursor += 1
+    value = octet & 0x7F
+    while octet & 0x80:
+        if value >= previous_path_length:
+            _raise_workspace_index_invalid(
+                "workspace index v4 pathname prefix is malformed"
+            )
+        if cursor >= entries_end:
+            _raise_workspace_index_invalid(
+                "workspace index v4 pathname prefix is truncated"
+            )
+        octet = payload[cursor]
+        cursor += 1
+        value = ((value + 1) << 7) | (octet & 0x7F)
+    if value > previous_path_length:
+        _raise_workspace_index_invalid(
+            "workspace index v4 pathname prefix exceeds the previous pathname"
+        )
+    return value, cursor
+
+
+def _index_entries_end(payload: bytes, oid_width: int) -> tuple[int, int]:
+    if oid_width not in {20, 32} or len(payload) < 12 + oid_width:
+        _raise_workspace_index_invalid("workspace index header is malformed")
+    if payload[:4] != b"DIRC":
+        _raise_workspace_index_invalid("workspace index header is malformed")
+    version, entry_count = struct.unpack(">II", payload[4:12])
+    if version not in {2, 3, 4}:
+        _raise_workspace_index_invalid("workspace index version is unsupported")
+    if entry_count > CHECKOUT_ENTRY_COUNT_LIMIT:
+        _raise_workspace_index_invalid(
+            "workspace index entry count exceeds the checkout entry limit"
+        )
+
+    entries_end = len(payload) - oid_width
+    payload_view = memoryview(payload)
+    expected_checksum = (
+        hashlib.sha1(
+            payload_view[:entries_end],
+            usedforsecurity=False,
+        ).digest()
+        if oid_width == 20
+        else hashlib.sha256(payload_view[:entries_end]).digest()
+    )
+    if not secrets.compare_digest(expected_checksum, payload_view[entries_end:]):
+        _raise_workspace_index_invalid("workspace index checksum is invalid")
+
+    cursor = 12
+    fixed_entry_size = 40 + oid_width + 2
+    previous_path = b""
+    path_bytes = 0
+    for _entry_index in range(entry_count):
+        entry_start = cursor
+        if fixed_entry_size > entries_end - cursor:
+            _raise_workspace_index_invalid("workspace index entry is truncated")
+        cursor += fixed_entry_size
+        flags = struct.unpack(">H", payload[cursor - 2 : cursor])[0]
+        if flags & 0x4000:
+            if version == 2:
+                _raise_workspace_index_invalid(
+                    "workspace index v2 entry has extended flags"
+                )
+            if entries_end - cursor < 2:
+                _raise_workspace_index_invalid(
+                    "workspace index extended flags are truncated"
+                )
+            cursor += 2
+
+        if version == 4:
+            strip_length, cursor = _decode_index_v4_strip_length(
+                payload,
+                cursor,
+                entries_end,
+                len(previous_path),
+            )
+            terminator = payload.find(b"\0", cursor, entries_end)
+            if terminator < 0:
+                _raise_workspace_index_invalid(
+                    "workspace index v4 pathname is unterminated"
+                )
+            retained_length = len(previous_path) - strip_length
+            path_length = retained_length + (terminator - cursor)
+            _validate_index_name_length(flags, path_length)
+            path_bytes = _accumulate_index_path_bytes(path_bytes, path_length)
+            previous_path = _materialize_index_v4_path(
+                previous_path,
+                retained_length,
+                payload,
+                cursor,
+                terminator,
+            )
+            cursor = terminator + 1
+            continue
+
+        terminator = payload.find(b"\0", cursor, entries_end)
+        if terminator < 0:
+            _raise_workspace_index_invalid("workspace index pathname is unterminated")
+        path_length = terminator - cursor
+        _validate_index_name_length(flags, path_length)
+        path_bytes = _accumulate_index_path_bytes(path_bytes, path_length)
+        unpadded_size = terminator + 1 - entry_start
+        padded_size = (unpadded_size + 7) & ~7
+        cursor = entry_start + padded_size
+        if cursor > entries_end:
+            _raise_workspace_index_invalid("workspace index entry padding is truncated")
+        if any(payload[terminator:cursor]):
+            _raise_workspace_index_invalid("workspace index entry padding is malformed")
+    return cursor, entries_end
+
+
+def _index_contains_split_link_extension(payload: bytes, oid_width: int) -> bool:
+    cursor, extension_end = _index_entries_end(payload, oid_width)
+    found_link = False
+    while cursor < extension_end:
+        if extension_end - cursor < 8:
+            _raise_workspace_index_invalid("workspace index extension is truncated")
+        signature = payload[cursor : cursor + 4]
+        size = struct.unpack(">I", payload[cursor + 4 : cursor + 8])[0]
+        cursor += 8
+        if size > extension_end - cursor:
+            _raise_workspace_index_invalid(
+                "workspace index extension payload is truncated"
+            )
+        if signature == b"link":
+            found_link = True
+        cursor += size
+    return found_link
 
 
 def _validate_no_split_index(

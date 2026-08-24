@@ -1319,6 +1319,41 @@ class RepositoryContractTest(unittest.TestCase):
             "findings-only",
         ):
             self.assertIn(anchor, lane)
+        normalized_lane = _normalize(lane)
+        normalized_runtime = _normalize(runtime)
+        for contract in (
+            "the parent independently rebuilds the expected closed profile",
+            "a self-consistent receipt hash without that field-by-field comparison is insufficient",
+            "settings_assurance: requested-configuration-only",
+            "settings_parser_acceptance_attested: false",
+            "managed_policy_residual: true",
+            "native_sandbox_effectiveness_attested: false",
+            "any missing, differently typed, differently valued, or non-recomputable field is inconclusive and stops before stream validation",
+            "`validate-claude-stream` does not consume or authenticate the `run-claude` receipt",
+            "parent-owned exact receipt comparison above supplies that link and must finish first",
+        ):
+            self.assertIn(contract, normalized_lane)
+        self.assertLess(
+            lane.index("### Launch Receipt Consumption"),
+            lane.index("## Stream Validation"),
+        )
+        self.assertIn(
+            "parent receipt consumption and stream validation are distinct mandatory gates",
+            normalized_runtime,
+        )
+        self.assertIn(
+            "`claude_code_subprocess_env_scrub` is intentionally absent",
+            normalized_lane,
+        )
+        self.assertIn("allowallunixsockets: false", normalized_lane)
+        self.assertIn("allowlocalbinding: false", normalized_lane)
+        for contract in (
+            "the direct guard rejects `claude-opus-4-7` and every other caller-selected model",
+            "retained 4.7 stream schemas or legacy/helper failure classifiers do not authorize a named-direct launch",
+            "the named-direct guard remains 4.8-only and is inconclusive until a separately closed fallback bridge exists",
+            "retained 4.7 stream-schema recognition supplies validation compatibility rather than launch authority",
+        ):
+            self.assertIn(contract, normalized_lane + "\n" + normalized_runtime)
         self.assertIn("publisher", runtime.lower())
         self.assertIn("bounded", runtime.lower())
 

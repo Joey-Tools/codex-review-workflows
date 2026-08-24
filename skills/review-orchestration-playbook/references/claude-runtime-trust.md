@@ -62,12 +62,24 @@ revalidation remains an output-publication gate. Output publication, rollback,
 and the complete flushed `launch_binding` receipt share one signal-masked CLI
 commit transaction: a pre-receipt signal or receipt write/flush failure removes
 the output pair, while a post-receipt signal cannot create a false failure.
-Before stream validation, the parent
-compares that receipt's preflight SHA-256, source identity/path, and signed
-artifact size/SHA-256 with the accepted launch binding. For guarded
+Before stream validation, the parent compares that receipt's preflight SHA-256,
+source identity/path, signed artifact size/SHA-256, and the complete
+`launch_binding.argv_profile` with the independently reconstructed canonical
+profile. That exact comparison includes all profile/schema/conformance fields;
+worktree, Git, source, output, account, and environment bindings; requested
+settings and digest; the exact Git-null exception path and character-device
+identity binding; guard-constructed and effective arguments plus digests; and
+the whole-profile digest. The profile must state
+`settings_assurance: requested-configuration-only` and
+`settings_parser_acceptance_attested: false`, `managed_policy_residual: true`,
+and `native_sandbox_effectiveness_attested: false`; neither a self-consistent
+hash, the compatibility range, nor init evidence upgrades requested settings
+into parser acceptance or applied sandbox proof. Managed policy remains part of
+the host TCB. For guarded
 `named-direct >=2.1.226`, it also exact-checks the canonical session ID and the
 closed session-environment guarantee descriptor defined below. The validator
-separately rereads the preflight result and does not consume `launch_binding`. Sections below
+separately rereads the preflight result and does not consume `launch_binding`;
+parent receipt consumption and stream validation are distinct mandatory gates. Sections below
 that describe executable snapshots or dependency closures, `.git`-free
 materialization, supplied-diff prompts, helper-private credential carriers, or
 helper-owned outer sandboxes remain helper-only: the canonical launch snapshot
@@ -205,7 +217,7 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 
 - For the canonical direct lane, real `HOME` is the trusted ordinary Claude CLI control plane and its clean detached Git worktree is the review scope. The low-level helper instead uses its supplied-diff/private-Git workspace and, for local login, its broker/carrier/catalog transaction; those helper guarantees do not transfer to the direct lane.
 - The model may receive `Read`, `Grep`, `Glob`, and sandboxed `Bash`, with read-only behavior required by the prompt and permission contract.
-- Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. Keep global `denyWrite` intact and add no `allowWrite` exception for the guard-managed, descriptor-bound session-environment path: precreation and cleanup are outer control-plane actions and do not authorize sandboxed Bash to write there. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
+- Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. Keep global `denyWrite` intact and add no `allowWrite` exception for the guard-managed, descriptor-bound session-environment path: precreation and cleanup are outer control-plane actions and do not authorize sandboxed Bash to write there. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory. The sole read-boundary overlap is the identity-validated exact `allowRead: /dev/null` inside `denyRead: /dev`, using Claude Code's documented allow-before-deny precedence because sanitized Git sets `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, and `GIT_GRAFT_FILE` to that device. The guard permits no `/dev/zero` or other overlap, revalidates the no-follow character-device identity before receipt publication, and binds that identity plus the settings and profile digests in the parent-consumed receipt.
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
 - Capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation; that limitation applies even to Claude Code 2.1.212 baseline output. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
 - For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. For guarded `named-direct >=2.1.226`, the parent must require a canonical receipt `launch_binding.session_id` and pass it unchanged as `--expected-session-id`; init `session_id` is mandatory and must equal that canonical UUIDv4. Every admitted intermediate event retains its existing required match-to-init binding, and terminal `session_id`, when present, must match init. Absence, malformed syntax, or a valid mismatch of the frozen init value is inconclusive. The CLI input stays optional for older named-direct and helper/provider profiles. Missing, duplicate, malformed, misordered, or mismatched observable evidence must otherwise fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
@@ -1523,7 +1535,7 @@ described as an enforced final launch.
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
 | Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-Claude-runtime model fallback; a different backend is supplemental only | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | The low-level helper may use its existing machine-classified same-runtime fallback; the named-direct guard remains 4.8-only and is inconclusive until a separately closed fallback bridge exists | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 
 If the primary runtime is unavailable and the authorized fallback executable is
 also absent before any model launch, the lane is deterministically blocked with
@@ -1541,9 +1553,15 @@ Only stderr and structured primary error fields are failure-classification
 evidence. Primary authentication evidence wins over mixed transient or
 entitlement words, while repository-controlled partial result text is never
 classified and cannot authorize an authentication, model, or Copilot fallback.
-Only a strict entitlement result from a launched final review can advance to the
-later Opus model. After the complete Claude chain is entitlement-blocked, the
-low-level helper may enter its compatibility Copilot backend only when the user
+Only a strict entitlement result from a launched final review can advance the
+low-level helper to its later Opus model. It does not authorize the canonical
+named-direct `run-claude` guard to accept 4.7: that interface is 4.8-only, and
+retained 4.7 stream-schema recognition supplies validation compatibility rather
+than launch authority. Until a separate bridge consumes and binds the trusted
+4.8 launch, stream, return-code, cwd, preflight, session, and closed denial
+classification, a 4.8 entitlement or organization-policy denial leaves the
+named-direct lane inconclusive. After the complete low-level Claude chain is
+entitlement-blocked, the low-level helper may enter its compatibility Copilot backend only when the user
 separately requested that supplemental provider; named double/triple consent is
 not that request, and the result never completes the Claude Code lane. Missing
 or mismatched model metadata stops the lane as `runtime-unverified` or
@@ -1627,6 +1645,10 @@ metadata that can act as a bearer secret, or unbounded probe output.
   information. Platform signatures are not a current helper acceptance gate.
 - [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing): Seatbelt
   on macOS, `bubblewrap` plus `socat` on Linux and WSL2, and the WSL1 limitation.
+- [Claude Code settings](https://code.claude.com/docs/en/settings): native
+  sandbox filesystem `allowRead` entries take precedence over `denyRead`
+  entries; the direct lane uses that precedence only for exact `/dev/null`
+  inside the retained `/dev` deny.
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication):
   macOS Keychain storage and the Linux `0600` credential file.
 - The additional macOS `pwd`-home credential-file source is an empirically

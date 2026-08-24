@@ -160,6 +160,12 @@ stable private refs for the frozen endpoints. It never copies the live source
 worktree, index, configuration, hooks, filters, attributes, fsmonitor state, or
 Git administration.
 
+The destination's private highest-precedence attributes force the built-in text
+diff treatment while disabling checkout transformations. Candidate-tracked
+`-diff`, `diff=<driver>`, and attribute macros therefore cannot hide textual
+hunks. Reviewer diff commands still require both `--no-ext-diff` and
+`--no-textconv`; forcing the `diff` attribute does not authorize either path.
+
 One 15-minute monotonic deadline covers source discovery, range freezing,
 base-history enumeration, pack production, and indexing. Current ceilings are:
 
@@ -287,6 +293,13 @@ Immediately before launch, validation rejects:
 Lowercase `h` (`assume-unchanged`) and lowercase or uppercase `s`/`S`
 (`skip-worktree`) are blocking hidden-index state; every malformed record or
 unknown tag is a validation failure rather than clean evidence.
+
+The bound index is parsed structurally as DIRC version 2, 3, or 4 for either
+SHA-1 or SHA-256 repositories. Its cumulative decoded pathname bytes share the
+64 MiB checkout-path ceiling. For prefix-compressed version 4 entries, the
+validator computes and admits the decoded length before it constructs the next
+full pathname, so repeated long shared prefixes cannot amplify memory beyond
+that aggregate budget.
 
 An absent, uninitialized gitlink is acceptable. The protected property is that
 ordinary tracked content has no worktree or index drift and that a gitlink has no

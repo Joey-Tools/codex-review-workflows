@@ -74,6 +74,83 @@ CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
     "cooperative-claude-control-directory-flock-same-uid-host-tcb"
 )
 CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
+CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v1"
+CLAUDE_DIRECT_ARGV_CONFORMANCE = "guard-constructed-exact-token-sequence"
+CLAUDE_DIRECT_SETTINGS_SCHEMA = "named-direct-claude-settings-v1"
+CLAUDE_DIRECT_ENVIRONMENT_PROFILE = "named-direct-claude-environment-v1"
+CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION = pathlib.Path("/dev/null")
+CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS = frozenset(
+    ((CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION, pathlib.Path("/dev")),)
+)
+CLAUDE_DIRECT_MODELS = ("claude-opus-4-8",)
+CLAUDE_DIRECT_REQUIRED_OPTIONS = (
+    "--print",
+    "--input-format",
+    "--model",
+    "--effort",
+    "--permission-mode",
+    "--output-format",
+    "--verbose",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--no-chrome",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--setting-sources",
+    "--settings",
+    "--tools",
+    "--allowedTools",
+    "--disallowedTools",
+)
+CLAUDE_DIRECT_EFFORT = "max"
+CLAUDE_DIRECT_PERMISSION_MODE = "dontAsk"
+CLAUDE_DIRECT_VISIBLE_TOOLS = "Read,Grep,Glob,Bash"
+CLAUDE_DIRECT_ALLOWED_TOOLS = "Read(./**),Grep,Glob,Bash"
+CLAUDE_DIRECT_DISALLOWED_TOOLS = "Edit,Write,NotebookEdit,WebFetch,WebSearch"
+CLAUDE_DIRECT_PERMISSION_DENY_RULES = (
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+)
+CLAUDE_DIRECT_PRIVATE_HOME_PATHS = (
+    ".aws",
+    ".claude",
+    ".codex",
+    ".config",
+    ".copilot",
+    ".gnupg",
+    ".kube",
+    ".ssh",
+    ".git-credentials",
+    ".netrc",
+)
+CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ALL_PROXY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CURL_CA_BUNDLE",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_SSL_CAINFO",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "NO_PROXY",
+    "OPENAI_API_KEY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v1"
 SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE = "exact-token-sequence"
 SANITIZED_GIT_ARGV_PREFIX_ENCODING = "canonical-json-utf8-v1"
@@ -676,6 +753,23 @@ class _ClaudeExecutableBinding:
     artifact_size: int
     artifact_checksum: str
     preflight_checksum: str
+
+
+@dataclass(frozen=True)
+class _ClaudeDirectArgvProfile:
+    model: str
+    worktree: pathlib.Path
+    git_metadata: pathlib.Path
+    account_home: pathlib.Path
+    source_worktree: pathlib.Path
+    source_read_deny_roots: tuple[pathlib.Path, ...]
+    preflight_result: pathlib.Path
+    output_bindings: Mapping[str, object]
+    environment_binding: Mapping[str, object]
+    git_null_read_exception: Mapping[str, object]
+    settings: Mapping[str, object]
+    settings_json: str
+    arguments: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -7233,6 +7327,465 @@ def _claude_environment(
     return environment
 
 
+def _resolve_claude_isolation_directory(
+    path: pathlib.Path,
+    *,
+    label: str,
+) -> pathlib.Path:
+    if not path.is_absolute():
+        raise NamedLaneGuardError(f"{label} must be absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(f"{label} cannot be resolved safely") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != path
+    ):
+        raise NamedLaneGuardError(f"{label} must be a canonical real directory")
+    return resolved
+
+
+def _resolve_claude_source_read_deny_roots(
+    source_worktree: pathlib.Path,
+) -> tuple[pathlib.Path, tuple[pathlib.Path, ...]]:
+    source = _resolve_claude_isolation_directory(
+        source_worktree,
+        label="Claude source worktree",
+    )
+    resolved_source, marker = _resolve_materializer_source(source)
+    if resolved_source != source:
+        raise NamedLaneGuardError(
+            "Claude source worktree must be a canonical Git worktree root"
+        )
+    _verify_materializer_source_marker(marker, source)
+    admin = marker.expected_admin
+    _verify_materializer_source_back_pointer(marker, admin)
+    commondir = admin / "commondir"
+    try:
+        commondir.lstat()
+    except FileNotFoundError:
+        common = admin
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude source Git common directory cannot be inspected"
+        ) from error
+    else:
+        payload = _read_materializer_control_file(
+            commondir,
+            label="Git common-directory marker",
+        )
+        try:
+            common = _materializer_control_path(
+                payload,
+                relative_to=admin,
+                label="Git common-directory marker",
+            )
+        finally:
+            payload[:] = b"\x00" * len(payload)
+    for path, label in (
+        (admin, "Claude source Git admin directory"),
+        (common, "Claude source Git common directory"),
+    ):
+        resolved = _resolve_claude_isolation_directory(path, label=label)
+        try:
+            metadata = resolved.stat()
+        except OSError as error:
+            raise NamedLaneGuardError(f"{label} cannot be inspected") from error
+        if metadata.st_uid != _current_user_id():
+            raise NamedLaneGuardError(f"{label} must be current-user-owned")
+    roots = tuple(dict.fromkeys((source, admin, common)))
+    return source, roots
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _unique_rendered_paths(paths: Iterable[pathlib.Path]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        rendered = str(path)
+        if rendered not in seen:
+            result.append(rendered)
+            seen.add(rendered)
+    return result
+
+
+def _claude_git_null_read_exception_binding(
+    path: pathlib.Path = CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION,
+) -> dict[str, object]:
+    if (
+        os.name != "posix"
+        or pathlib.Path(os.devnull) != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+        or path != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be exact canonical /dev/null"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblocking is None:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception requires no-follow nonblocking open"
+        )
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception cannot be resolved safely"
+        ) from error
+    if (
+        resolved != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISCHR(before.st_mode)
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be exact canonical /dev/null"
+        )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
+        )
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be a readable character device"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed during validation"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+    def identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_rdev,
+        )
+
+    if (
+        not stat.S_ISCHR(opened.st_mode)
+        or identity(before) != identity(opened)
+        or identity(opened) != identity(after)
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed during validation"
+        )
+    return {
+        "path": str(path),
+        "identity_binding": "canonical-no-follow-character-device",
+        "identity": {
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "file_type": stat.S_IFMT(opened.st_mode),
+            "mode": stat.S_IMODE(opened.st_mode),
+            "uid": opened.st_uid,
+            "gid": opened.st_gid,
+            "rdev": opened.st_rdev,
+        },
+    }
+
+
+def _claude_output_profile_binding(target: _OutputTarget) -> dict[str, object]:
+    _revalidate_output_parent(target)
+    try:
+        metadata = os.fstat(target.parent_fd)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude output parent cannot be inspected for the argv profile"
+        ) from error
+    return {
+        "path": str(target.path),
+        "parent": str(target.path.parent),
+        "parent_identity": {
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "file_type": stat.S_IFMT(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "mode": stat.S_IMODE(metadata.st_mode),
+        },
+    }
+
+
+def _claude_environment_profile_binding(
+    child_environment: Mapping[str, str],
+) -> dict[str, object]:
+    environment = dict(child_environment)
+    return {
+        "profile": CLAUDE_DIRECT_ENVIRONMENT_PROFILE,
+        "assurance": "guard-supplied-process-environment",
+        "requested_keys": sorted(environment),
+        "requested_environment_sha256": hashlib.sha256(
+            _canonical_json_bytes(environment)
+        ).hexdigest(),
+        "present_passthrough_keys": sorted(
+            set(environment).intersection(CLAUDE_ENV_PASSTHROUGH_KEYS)
+        ),
+        "node_extra_ca_certs_inherited": "NODE_EXTRA_CA_CERTS" in environment,
+    }
+
+
+def _claude_direct_required_options(
+    version: tuple[int, int, int],
+) -> tuple[str, ...]:
+    if version < CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION:
+        return CLAUDE_DIRECT_REQUIRED_OPTIONS
+    insertion = CLAUDE_DIRECT_REQUIRED_OPTIONS.index("--safe-mode")
+    return (
+        *CLAUDE_DIRECT_REQUIRED_OPTIONS[:insertion],
+        "--session-id",
+        *CLAUDE_DIRECT_REQUIRED_OPTIONS[insertion:],
+    )
+
+
+def _validate_claude_read_boundary_nonoverlap(
+    *,
+    allow_read: Sequence[pathlib.Path],
+    deny_read: Sequence[pathlib.Path],
+) -> None:
+    for allowed in allow_read:
+        for denied in deny_read:
+            if (allowed, denied) in CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS:
+                continue
+            if (
+                allowed == denied
+                or is_relative_to(allowed, denied)
+                or is_relative_to(denied, allowed)
+            ):
+                raise NamedLaneGuardError(
+                    "Claude allowRead and denyRead roots must not overlap"
+                )
+
+
+def _build_claude_direct_argv_profile(
+    *,
+    worktree: pathlib.Path,
+    source_worktree: pathlib.Path,
+    preflight_result: pathlib.Path,
+    stdout: _OutputTarget,
+    stderr: _OutputTarget,
+    child_environment: Mapping[str, str],
+    model: str,
+) -> _ClaudeDirectArgvProfile:
+    if model not in CLAUDE_DIRECT_MODELS:
+        raise NamedLaneGuardError(
+            "Claude model must match the canonical named-direct model profile"
+        )
+    source, source_read_deny_roots = _resolve_claude_source_read_deny_roots(
+        source_worktree
+    )
+    if (
+        source == worktree
+        or is_relative_to(source, worktree)
+        or is_relative_to(worktree, source)
+    ):
+        raise NamedLaneGuardError(
+            "Claude source and review worktrees must be independent"
+        )
+    git_metadata = _resolve_claude_isolation_directory(
+        worktree / ".git",
+        label="Claude review Git metadata",
+    )
+    if not is_relative_to(git_metadata, worktree):
+        raise NamedLaneGuardError(
+            "Claude review Git metadata must stay inside the review worktree"
+        )
+    home_value = child_environment.get("HOME")
+    if type(home_value) is not str or not home_value:
+        raise NamedLaneGuardError(
+            "Claude account home is missing from the child profile"
+        )
+    home = _resolve_claude_isolation_directory(
+        pathlib.Path(home_value),
+        label="Claude account home",
+    )
+    private_home_paths = tuple(
+        home / relative for relative in CLAUDE_DIRECT_PRIVATE_HOME_PATHS
+    )
+    git_null_read_exception = _claude_git_null_read_exception_binding()
+    git_null_path = pathlib.Path(str(git_null_read_exception["path"]))
+    deny_read = _unique_rendered_paths(
+        (
+            *private_home_paths,
+            *source_read_deny_roots,
+            preflight_result,
+            stdout.path,
+            stderr.path,
+            pathlib.Path("/proc"),
+            pathlib.Path("/dev"),
+        )
+    )
+    allow_read_paths = (worktree, git_metadata, git_null_path)
+    deny_read_paths = tuple(pathlib.Path(path) for path in deny_read)
+    _validate_claude_read_boundary_nonoverlap(
+        allow_read=allow_read_paths,
+        deny_read=deny_read_paths,
+    )
+    settings: dict[str, object] = {
+        "disableAllHooks": True,
+        "disableBundledSkills": True,
+        "permissions": {"deny": list(CLAUDE_DIRECT_PERMISSION_DENY_RULES)},
+        "sandbox": {
+            "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": False,
+            "credentials": {
+                "envVars": [
+                    {"mode": "deny", "name": key}
+                    for key in CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS
+                ],
+                "files": [
+                    {"mode": "deny", "path": str(path)} for path in private_home_paths
+                ],
+            },
+            "enabled": True,
+            "enableWeakerNestedSandbox": False,
+            "enableWeakerNetworkIsolation": False,
+            "excludedCommands": [],
+            "failIfUnavailable": True,
+            "filesystem": {
+                "allowRead": [str(path) for path in allow_read_paths],
+                "denyRead": deny_read,
+                "denyWrite": ["/"],
+            },
+            "network": {
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
+                "allowUnixSockets": [],
+                "allowedDomains": [],
+            },
+        },
+    }
+    settings_json = _canonical_json_bytes(settings).decode("utf-8")
+    arguments = (
+        "--print",
+        "--input-format",
+        "text",
+        "--model",
+        model,
+        "--effort",
+        CLAUDE_DIRECT_EFFORT,
+        "--permission-mode",
+        CLAUDE_DIRECT_PERMISSION_MODE,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--setting-sources",
+        "",
+        "--settings",
+        settings_json,
+        "--tools",
+        CLAUDE_DIRECT_VISIBLE_TOOLS,
+        "--allowedTools",
+        CLAUDE_DIRECT_ALLOWED_TOOLS,
+        "--disallowedTools",
+        CLAUDE_DIRECT_DISALLOWED_TOOLS,
+    )
+    if (
+        tuple(
+            argument
+            for argument in arguments
+            if argument in CLAUDE_DIRECT_REQUIRED_OPTIONS
+        )
+        != CLAUDE_DIRECT_REQUIRED_OPTIONS
+    ):
+        raise NamedLaneGuardError(
+            "Claude guard-owned argv does not match its capability contract"
+        )
+    return _ClaudeDirectArgvProfile(
+        model=model,
+        worktree=worktree,
+        git_metadata=git_metadata,
+        account_home=home,
+        source_worktree=source,
+        source_read_deny_roots=source_read_deny_roots,
+        preflight_result=preflight_result,
+        output_bindings={
+            "stdout": _claude_output_profile_binding(stdout),
+            "stderr": _claude_output_profile_binding(stderr),
+        },
+        environment_binding=_claude_environment_profile_binding(child_environment),
+        git_null_read_exception=git_null_read_exception,
+        settings=settings,
+        settings_json=settings_json,
+        arguments=arguments,
+    )
+
+
+def _claude_direct_argv_profile_receipt(
+    profile: _ClaudeDirectArgvProfile,
+    *,
+    effective_arguments: Sequence[str],
+) -> dict[str, object]:
+    if _claude_git_null_read_exception_binding() != profile.git_null_read_exception:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed before receipt generation"
+        )
+    payload: dict[str, object] = {
+        "profile": CLAUDE_DIRECT_ARGV_PROFILE,
+        "conformance": CLAUDE_DIRECT_ARGV_CONFORMANCE,
+        "settings_schema": CLAUDE_DIRECT_SETTINGS_SCHEMA,
+        "settings_assurance": "requested-configuration-only",
+        "settings_parser_acceptance_attested": False,
+        "managed_policy_residual": True,
+        "native_sandbox_effectiveness_attested": False,
+        "model": profile.model,
+        "effort": CLAUDE_DIRECT_EFFORT,
+        "worktree": str(profile.worktree),
+        "review_git_metadata": str(profile.git_metadata),
+        "account_home": str(profile.account_home),
+        "source_worktree": str(profile.source_worktree),
+        "source_worktree_binding": "parent-supplied-deny-root",
+        "source_read_deny_roots": [
+            str(path) for path in profile.source_read_deny_roots
+        ],
+        "preflight_result": str(profile.preflight_result),
+        "output_bindings": profile.output_bindings,
+        "environment_binding": profile.environment_binding,
+        "git_null_read_exception": profile.git_null_read_exception,
+        "settings": profile.settings,
+        "settings_sha256": hashlib.sha256(
+            profile.settings_json.encode("utf-8")
+        ).hexdigest(),
+        "guard_constructed_arguments": list(profile.arguments),
+        "guard_constructed_arguments_sha256": hashlib.sha256(
+            _canonical_json_bytes(list(profile.arguments))
+        ).hexdigest(),
+        "effective_arguments": list(effective_arguments),
+        "effective_arguments_sha256": hashlib.sha256(
+            _canonical_json_bytes(list(effective_arguments))
+        ).hexdigest(),
+    }
+    payload["profile_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(payload)
+    ).hexdigest()
+    return payload
+
+
 def _claude_directory_stat_identity(
     metadata: os.stat_result,
 ) -> tuple[int, int, int, int]:
@@ -7771,51 +8324,6 @@ def _claude_session_env_custody_error(
     )
 
 
-def _command_has_claude_session_selector(command: Sequence[str]) -> bool:
-    exact = {
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
-        "--teleport",
-        "--cloud",
-        "--environment",
-        "--remote-control",
-        "--background",
-        "--bg",
-        "--worktree",
-        "-w",
-        "--tmux",
-    }
-    prefixes = (
-        "--session-id=",
-        "--resume=",
-        "--continue=",
-        "--fork-session=",
-        "--from-pr=",
-        "--teleport=",
-        "--cloud=",
-        "--environment=",
-        "--remote-control=",
-        "--background=",
-        "--worktree=",
-        "--tmux=",
-        "-r=",
-        "-w=",
-    )
-    return any(
-        argument in exact
-        or argument.startswith(prefixes)
-        or (argument.startswith("-r") and len(argument) > 2)
-        or (argument.startswith("-c") and len(argument) > 2)
-        or (argument.startswith("-w") and len(argument) > 2)
-        for argument in command
-    )
-
-
 def _open_private_temporary(
     target: _OutputTarget,
     *,
@@ -8111,6 +8619,17 @@ def _load_claude_executable_binding(
         raise NamedLaneGuardError(
             "Claude preflight version binding is invalid"
         ) from error
+    capability_contract = evidence.get("capability_contract")
+    if (
+        type(capability_contract) is not dict
+        or frozenset(capability_contract) != {"required_options", "status"}
+        or capability_contract.get("status") != "accepted"
+        or capability_contract.get("required_options")
+        != list(_claude_direct_required_options(parsed_version))
+    ):
+        raise NamedLaneGuardError(
+            "Claude preflight capability contract does not match the closed argv profile"
+        )
     identity = evidence.get("identity")
     if (
         type(identity) is not dict
@@ -8536,11 +9055,13 @@ def _write_private_bytes(
 def run_claude(
     *,
     worktree: pathlib.Path,
+    source_worktree: pathlib.Path,
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     command: Sequence[str],
     preflight_result: pathlib.Path,
     prompt: bytes,
+    model: str = CLAUDE_DIRECT_MODELS[0],
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
     inherit_node_extra_ca_certs: bool = False,
@@ -8564,6 +9085,11 @@ def run_claude(
     )
     if not command:
         raise NamedLaneGuardError("Claude command is required")
+    if len(command) != 1:
+        raise NamedLaneGuardError(
+            "Claude arguments are owned by the named-lane guard; only the "
+            "preflight-bound executable may follow --"
+        )
     executable = pathlib.Path(command[0])
     if not executable.is_absolute():
         raise NamedLaneGuardError("Claude executable path must be absolute")
@@ -8575,10 +9101,6 @@ def run_claude(
     session_env_required = (
         binding.selected_version >= CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
     )
-    if session_env_required and _command_has_claude_session_selector(command[1:]):
-        raise NamedLaneGuardError(
-            "Claude session selection is owned by the named-lane guard"
-        )
     child_environment = _claude_environment(
         root,
         inherit_node_extra_ca_certs,
@@ -8589,6 +9111,15 @@ def run_claude(
         try:
             if stdout.path == stderr.path:
                 raise NamedLaneGuardError("stdout and stderr paths must differ")
+            argv_profile = _build_claude_direct_argv_profile(
+                worktree=root,
+                source_worktree=source_worktree,
+                preflight_result=preflight_result,
+                stdout=stdout,
+                stderr=stderr,
+                child_environment=child_environment,
+                model=model,
+            )
             snapshot_mask = block_forwarded_signals()
             if snapshot_mask is None:
                 raise NamedLaneGuardError(
@@ -8646,7 +9177,7 @@ def run_claude(
                     stdout,
                     deadline_monotonic=deadline,
                 )
-                snapshot_arguments = tuple(command[1:])
+                snapshot_arguments = argv_profile.arguments
                 if session_env is not None:
                     snapshot_arguments = (
                         "--session-id",
@@ -8959,6 +9490,10 @@ def run_claude(
                         "identity": dict(_expected_executable_identity(binding)),
                         "artifact_sha256": binding.artifact_checksum,
                         "artifact_size": binding.artifact_size,
+                        "argv_profile": _claude_direct_argv_profile_receipt(
+                            argv_profile,
+                            effective_arguments=snapshot_arguments,
+                        ),
                     }
                     if session_env is not None:
                         launch_binding["session_id"] = session_env.session_id
@@ -9139,6 +9674,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run an exact Claude executable under bounded process supervision.",
     )
     claude.add_argument("--worktree", required=True)
+    claude.add_argument("--source-worktree", required=True)
     claude.add_argument("--preflight-result", required=True)
     claude.add_argument("--stdout-path", required=True)
     claude.add_argument("--stderr-path", required=True)
@@ -9156,6 +9692,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROMPT_LIMIT_BYTES,
     )
     claude.add_argument("--inherit-node-extra-ca-certs", action="store_true")
+    claude.add_argument(
+        "--model",
+        choices=CLAUDE_DIRECT_MODELS,
+        default=CLAUDE_DIRECT_MODELS[0],
+    )
     claude.add_argument("claude_argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -9933,11 +10474,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             result = run_claude(
                 worktree=pathlib.Path(args.worktree),
+                source_worktree=pathlib.Path(args.source_worktree),
                 stdout_path=pathlib.Path(args.stdout_path),
                 stderr_path=pathlib.Path(args.stderr_path),
                 command=command,
                 preflight_result=pathlib.Path(args.preflight_result),
                 prompt=prompt,
+                model=args.model,
                 timeout_seconds=_remaining_deadline_seconds(
                     deadline,
                     "Claude named lane",

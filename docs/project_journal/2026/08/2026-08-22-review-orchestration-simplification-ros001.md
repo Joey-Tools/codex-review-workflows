@@ -1029,12 +1029,68 @@ superseded_by:
   restriction with `ResourceWarning` promoted to an error: all 3,095 tests
   passed with six conditional skips in 1,148.966 seconds.
 
+### Formal review remediation after `8d4f7b5`
+
+- Signed head `8d4f7b50586049ff176cb061fd96cf8267670149` received one
+  fresh host-bound GPT-5.6 Sol Ultra CLI review under the independently trusted
+  pre-migration release. The reviewer found three implementation defects: the
+  named-direct Claude guard forwarded caller-owned argv beyond the validated
+  executable, candidate `.gitattributes` could hide textual hunks through
+  `-diff`, and the split-index check could mistake pathname bytes containing
+  `link` for a real index extension. That head did not pass local review and no
+  clean evidence from it will be reused.
+- The Claude named-direct lane now accepts exactly one absolute,
+  preflight-bound executable after `--` and constructs the complete argument
+  vector itself. The closed 4.8 profile fixes text input, maximum effort,
+  `dontAsk`, stream JSON, safe mode, settings sources, an empty MCP map, the
+  four read-only review tools, explicit disallowed mutation/network tools, and
+  a canonical inline settings object. The launch receipt binds the selected
+  executable, exact settings, guard/effective argv, environment, outputs,
+  source deny roots, and guard-managed session identity. Direct 4.7 launch was
+  removed; retained 4.7 stream schemas remain compatibility evidence only.
+- The settings receipt deliberately says
+  `requested-configuration-only`: capability probing and runtime init evidence
+  do not attest that managed policy left the requested sandbox arrays
+  unchanged, that the selected binary accepted every settings field, or that
+  the merged native sandbox was effective. A trusted parent must independently
+  reconstruct and exact-check the launch receipt before separately validating
+  the raw stream. Source/materialization lineage likewise remains a parent
+  comparison; the guard validates canonical source/admin/common roots for its
+  deny boundary without claiming that an arbitrary caller path is authoritative.
+- The independent workspace now writes the highest-precedence private
+  attributes rule `* diff -text -eol -filter -ident -working-tree-encoding`.
+  It therefore forces Git's built-in textual diff while retaining the existing
+  checkout-transform closure. Index validation now parses DIRC v2, v3, and v4
+  entries for SHA-1 or SHA-256 repositories, validates entry counts, flags,
+  pathname framing, padding, prefix compression, checksum, and extension
+  framing, and treats only an actual `link` extension as split-index state.
+- Two final cross-contract audits found and closed runtime/resource boundary
+  gaps. The Claude child fixes sanitized Git's global/system/graft paths at
+  `/dev/null` while denying `/dev`; the settings now retain the broad deny but
+  add the sole identity-validated exact `/dev/null` read exception required by
+  those Git controls. Every other overlap, including `/dev/zero`, remains
+  blocked, and the receipt revalidates and binds the character-device identity
+  before publication. Separately, DIRC v4 prefix compression could amplify a
+  small encoded index into repeated large pathname copies. The parser now
+  computes each decoded length and applies the existing 64 MiB aggregate
+  checkout path-byte ceiling before materializing the path; v2 and v3 use the
+  same aggregate bound.
+- The stable combined candidate passed `test_named_lane.py` (284 tests in
+  177.273 seconds), `test_review_workspace.py` (150 tests in 171.047 seconds),
+  `test_claude_capabilities.py` (31 tests), and `test_contracts.py` (32 tests),
+  all with `ResourceWarning` promoted to an error. The final cross-contract
+  read-only audit returned `No findings.`. Ruff lint/format, source-only
+  compile, reviewer TOML parsing, all three affected skill validators, project-
+  journal validation, and whitespace checks passed. The authoritative complete
+  suite then passed all 3,112 tests with six conditional skips in 1,000.276
+  seconds outside the nested macOS sandbox, with `ResourceWarning` promoted to
+  an error.
+
 ## Next Steps
 
-- Sign and push the final policy closure, rerun exact-head secret admission and
-  one fresh whole-range GPT-5.6 Sol Ultra Codex review under the prior trusted
-  release, then complete PR 108's current-head GitHub lane, CI, final reread,
-  and squash merge.
+- Sign the corrected head, rerun exact-head secret admission and one fresh whole-range
+  GPT-5.6 Sol Ultra Codex review under the prior trusted release, then complete
+  PR 108's current-head GitHub lane, CI, final reread, and squash merge.
 - Merge the private companion and generated sync PR, confirm the immutable
   private-overlay release, run the local installer, and record the final merge,
   release, and installation identities here.
@@ -1048,9 +1104,10 @@ superseded_by:
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
 - Final full `python3 -B -W error::ResourceWarning -m unittest discover`
-  review-playbook suite (`3,095` tests, `6` conditional skips, `1,148.966`
-  seconds). The prior signed `2e89971` checkpoint passed `3,010` tests with the
-  same six skips in `999.845` seconds.
+  review-playbook suite (`3,112` tests, `6` conditional skips, `1,000.276`
+  seconds). The earlier policy-closure tree passed `3,095` tests with the same
+  six skips in `1,148.966` seconds; the prior signed `2e89971` checkpoint passed
+  `3,010` tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
   matrix (`73` focused policy, distribution, carrier, report, and self-policy

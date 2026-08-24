@@ -80,13 +80,149 @@ Launch only through the trusted guard's direct process supervisor. It must:
 - forward termination, drain output, and reap the supervised process before publication;
 - write raw stdout and the process receipt outside the workspace.
 
+The `run-claude` interface is intentionally closed. After the guard's typed
+control options, `--` is followed by exactly the preflight-bound absolute Claude
+executable and no caller-owned Claude argument. This is a security-tightening
+replacement for the former full-tail call shape; do not preserve or reconstruct
+that obsolete entrypoint. The only accepted model control is
+`--model claude-opus-4-8`; the direct guard rejects `claude-opus-4-7` and every
+other caller-selected model. Retained 4.7 stream schemas or legacy/helper
+failure classifiers do not authorize a named-direct launch. A final 4.8
+entitlement or organization-policy denial therefore leaves the named-direct
+lane inconclusive until a separately closed, evidence-bound fallback bridge is
+defined. The guard constructs this exact ordered argument profile:
+
+```text
+--print
+--input-format text
+--model <guard-validated-model>
+--effort max
+--permission-mode dontAsk
+--output-format stream-json
+--verbose
+--no-session-persistence
+--safe-mode
+--no-chrome
+--disable-slash-commands
+--strict-mcp-config
+--mcp-config {"mcpServers":{}}
+--setting-sources <empty-string>
+--settings <guard-constructed-canonical-JSON>
+--tools Read,Grep,Glob,Bash
+--allowedTools Read(./**),Grep,Glob,Bash
+--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch
+```
+
+For a compatible version at the guarded session feature gate, the guard alone
+prefixes `--session-id <guard-created-UUIDv4>`. It rejects every other tail,
+including a duplicate, alias, attached-value spelling, positional prompt,
+settings override, tool override, resume selector, or unknown option, before
+snapshot creation or prompt exposure. The accepted preflight must report the
+exact version-appropriate public-option capability list used by this profile;
+missing, duplicated, extra, reordered, or unaccepted capability evidence fails
+closed.
+
+The canonical inline settings object has exactly `disableAllHooks: true`,
+`disableBundledSkills: true`, the stable edit/write/web permission-deny list,
+and the native sandbox object. The evolving `Task` and `Agent` names are instead
+excluded by the closed tool surface and exact-four-tools init contract. That
+sandbox requests `enabled: true`,
+`failIfUnavailable: true`, `autoAllowBashIfSandboxed: false`,
+`allowUnsandboxedCommands: false`, global `denyWrite: ["/"]`, the validated
+workspace, its private Git directory, and the identity-validated exact
+`/dev/null` character device in `allowRead`, and the guard-derived critical
+paths in `denyRead`; it includes closed credential-file and
+credential-environment deny lists. It explicitly keeps
+`enableWeakerNestedSandbox` and `enableWeakerNetworkIsolation` false. The
+network object has exact empty `allowedDomains` and `allowUnixSockets` arrays,
+plus `allowAllUnixSockets: false` and `allowLocalBinding: false`. It has no
+`allowWrite` entry and requests exact empty `excludedCommands`. Evolving
+subagent tool names are intentionally absent from the deny list: the closed
+`--tools` surface and exact-four-tools init contract exclude them without
+risking rejection of the complete settings document on older compatible
+patches. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is intentionally absent from the
+named-direct process environment: the selected runtime defines that switch to
+force permission mode back to `default`, which conflicts with the closed
+`dontAsk` argv and stream contract. The guard instead removes credential
+variables from the direct child environment and requests the credential and
+sandbox controls above; this does not claim arbitrary subprocess secrets are
+scrubbed.
+The `/dev` deny remains intact. The only permitted read-boundary overlap is the
+predeclared exact pair `allowRead: /dev/null` within `denyRead: /dev`, relying
+on Claude Code's documented rule that `allowRead` takes precedence over
+`denyRead`. This narrow exception is required by the sanitized Git environment's
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, and `GIT_GRAFT_FILE` values. The guard
+requires canonical `/dev/null`, opens it no-follow and nonblocking, verifies the
+same character-device identity before/open/after, and revalidates it before
+receipt generation; `/dev/zero` and every other equal or ancestor/descendant
+overlap fail closed. This exception does not turn `allowRead` into a global
+host-read whitelist or attest the runtime's final merged path rules.
+The
+source-worktree input must be the parent-authoritative source used by workspace
+materialization, not merely another Git repository. The guard resolves its
+worktree, linked-worktree admin, and common Git directories and records all
+distinct roots as requested `denyRead` paths. The parent must compare those
+roots with its materialization authority; guard path validation alone does not
+prove source lineage or rule out an authority the materializer separately
+forbids, such as alternate object storage.
+
 The process supervisor proves only the launch and process evidence it records. It does not prove compatible-version provenance by itself and is not a whole-process-tree sandbox.
 
 ## Native Sandbox Boundary
 
 Request global `denyWrite` and `denyRead` for critical sensitive roots. Keep no write exception for the review workspace or session-control path.
 
-Native `allowRead` is not a global host-read whitelist. The prompt/model scope forbids reads outside the validated workspace, while requested native controls enforce only the roots and operations the runtime actually supports. Record those settings as requested configuration; capability or init output does not attest the final merged sandbox or managed permission arrays.
+Native `allowRead` is not a global host-read whitelist. Its exact `/dev/null`
+entry is only the documented-precedence exception needed by sanitized Git
+configuration while the surrounding `/dev` deny remains requested. The
+prompt/model scope forbids reads outside the validated workspace, while
+requested native controls enforce only the roots and operations the runtime
+actually supports. Record those settings as requested configuration;
+capability or init output does not attest the final merged sandbox or managed
+permission arrays.
+
+The native sandbox applies to `Bash` and its children. Built-in `Read`, `Grep`,
+and `Glob` remain permission- and prompt-controlled rather than acquiring the
+native filesystem boundary. Empty requested network and Unix-socket arrays can
+also merge with other settings scopes, including managed policy; do not claim a
+host-wide read or network-denial guarantee from these requested values.
+
+Accordingly, the receipt reports `settings_assurance:
+requested-configuration-only` and
+`settings_parser_acceptance_attested: false`, `managed_policy_residual: true`,
+and `native_sandbox_effectiveness_attested: false`. The public-option probe proves
+the accepted `--settings`, safe-mode, tool, and permission surfaces, but neither
+the compatibility range nor stream init proves that a particular patch parsed
+every inline settings key or applied the merged sandbox. Managed policy remains
+part of the host TCB. A runtime-reported settings rejection or
+contradiction is inconclusive; never relabel the requested profile as effective
+enforcement.
+
+### Launch Receipt Consumption
+
+A successful process receipt contains `launch_binding.argv_profile`. Before
+stream validation, the parent independently rebuilds the expected closed
+profile from its authoritative preflight, workspace/materialization receipts,
+source identity, output destinations, account identity, model choice, and
+environment decision. It must exact-check the profile/schema/conformance
+identifiers; model and effort; worktree, private Git, account-home, source,
+preflight, output-parent, and environment bindings; canonical settings and its
+SHA-256; the exact Git-null exception path, identity binding, and device
+identity; all requested-only, parser-attestation, managed-policy, and sandbox-
+attestation fields; guard-constructed arguments and SHA-256; final effective
+arguments and SHA-256; and the whole-profile SHA-256. A self-consistent receipt
+hash without that field-by-field comparison is insufficient.
+
+For guarded session versions, the effective argument list must equal the
+guard-created `--session-id` pair followed by the exact guard-constructed list,
+and that ID must equal `launch_binding.session_id` plus the closed
+session-environment receipt. For older versions, constructed and effective
+arguments must be identical and no session binding may appear. The environment
+binding records the exact guard-supplied process-environment keys and digest,
+including whether explicit Node extra-CA inheritance was requested; it does
+not claim that the operating system injected no additional process metadata.
+Any missing, differently typed, differently valued, or non-recomputable field
+is inconclusive and stops before stream validation.
 
 If structured tool evidence names an external path or a symlink escape, block the lane. If Claude reports that large command output spilled to an external CLI-managed file, it must not follow that path; it should rerun a narrower bounded command within the workspace.
 
@@ -100,11 +236,18 @@ The validator binds:
 - exact validated cwd;
 - requested model;
 - local-login authentication source;
-- process return code and launch binding;
+- process return code and, when required, the parent-validated expected session ID;
 - one leading init event, admitted intermediate events, and one terminal result;
 - tool/path scope and the findings-only result contract.
 
 Only `classification: accepted` supplies a lane result. Prose inspection, partial output, an ad hoc parser, or direct compatibility-wrapper execution never substitutes for formal validation.
+
+`validate-claude-stream` does not consume or authenticate the `run-claude`
+receipt. The parent-owned exact receipt comparison above supplies that link and
+must finish first; stream validation then checks only its separately declared
+preflight, cwd, model, authentication-source, return-code, session, and stream
+inputs. Do not merge those two responsibilities or claim that validator
+acceptance repairs a missing launch-profile check.
 
 Validator acceptance attests the closed observable stream contract. It still does not prove the final merged sandbox, managed permissions, host-wide read exclusion, or behavior of descendants outside the supervised process boundary.
 

@@ -10,6 +10,7 @@ import os
 import pathlib
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,52 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def synthetic_index_payload(
+    paths: tuple[bytes, ...],
+    *,
+    version: int,
+    oid_width: int,
+) -> bytes:
+    content = bytearray(b"DIRC" + struct.pack(">II", version, len(paths)))
+    previous_path = b""
+    for path in paths:
+        entry_start = len(content)
+        flags = min(len(path), 0x0FFF)
+        content.extend(b"\0" * (40 + oid_width))
+        content.extend(struct.pack(">H", flags))
+        if version == 4:
+            common_length = 0
+            for previous_octet, current_octet in zip(previous_path, path):
+                if previous_octet != current_octet:
+                    break
+                common_length += 1
+            strip_length = len(previous_path) - common_length
+            content.extend(encode_index_v4_strip_length(strip_length))
+            content.extend(path[common_length:])
+            content.append(0)
+            previous_path = path
+            continue
+        content.extend(path)
+        content.append(0)
+        while (len(content) - entry_start) % 8:
+            content.append(0)
+    checksum = (
+        hashlib.sha1(content, usedforsecurity=False).digest()
+        if oid_width == 20
+        else hashlib.sha256(content).digest()
+    )
+    return bytes(content) + checksum
+
+
+def encode_index_v4_strip_length(value: int) -> bytes:
+    encoded = bytearray((value & 0x7F,))
+    while value > 0x7F:
+        value = (value >> 7) - 1
+        encoded.append(0x80 | (value & 0x7F))
+    encoded.reverse()
+    return bytes(encoded)
 
 
 class ReviewWorkspaceTest(unittest.TestCase):
@@ -983,6 +1030,65 @@ class ReviewWorkspaceTest(unittest.TestCase):
                 )
             )
             validate_workspace(prepared.root, self.commits[2], head)
+        finally:
+            self.cleanup(prepared)
+
+    def test_private_diff_override_keeps_tracked_text_hunks_visible(self) -> None:
+        base = self.commits[2]
+        (self.repo / ".gitattributes").write_text(
+            "hidden.txt -diff\n"
+            "driver.txt diff=review-hidden\n"
+            "[attr]conceal -diff\n"
+            "macro.txt conceal\n",
+            encoding="utf-8",
+        )
+        expected_lines = {
+            "hidden.txt": "visible direct-unset hunk",
+            "driver.txt": "visible custom-driver hunk",
+            "macro.txt": "visible macro-unset hunk",
+        }
+        for path, line in expected_lines.items():
+            (self.repo / path).write_text(f"{line}\n", encoding="utf-8")
+        git(self.repo, "add", ".gitattributes", *expected_lines)
+        git(self.repo, "commit", "-m", "tracked diff attribute fixtures")
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.assertIn(
+            "Binary files /dev/null and b/hidden.txt differ",
+            git(
+                self.repo,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                f"{base}..{head}",
+                "--",
+                "hidden.txt",
+            ),
+        )
+
+        destination = self.root / "diff-attribute-workspace"
+        prepared = prepare_workspace(self.repo, destination, base, head)
+        try:
+            self.assertEqual(
+                (prepared.root / ".git/info/attributes").read_bytes(),
+                workspace_runtime.ATTRIBUTES_PAYLOAD,
+            )
+            diff = git(
+                prepared.root,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                f"{base}..{head}",
+                "--",
+                *expected_lines,
+            )
+            for path, line in expected_lines.items():
+                self.assertEqual(
+                    git(prepared.root, "check-attr", "diff", "--", path),
+                    f"{path}: diff: set",
+                )
+                self.assertIn(f"+{line}", diff)
+            self.assertNotIn("Binary files", diff)
+            validate_workspace(prepared.root, base, head)
         finally:
             self.cleanup(prepared)
 
@@ -5138,6 +5244,12 @@ class ReviewWorkspaceTest(unittest.TestCase):
             git(prepared.root, "update-index", "--split-index")
             index = prepared.root / ".git/index"
             os.chmod(index, 0o600)
+            self.assertTrue(
+                workspace_runtime._index_contains_split_link_extension(
+                    index.read_bytes(),
+                    20,
+                )
+            )
             shared = next((prepared.root / ".git").glob("sharedindex.*"))
             shared.rename(outside)
             shared.symlink_to(outside)
@@ -5153,6 +5265,338 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
             self.cleanup(prepared)
+
+    def test_index_parser_accepts_real_v2_v3_v4_and_link_pathnames(self) -> None:
+        (self.repo / "zzlink").write_text("not an index extension\n", encoding="utf-8")
+        git(self.repo, "add", "zzlink")
+        git(self.repo, "commit", "-m", "link pathname fixtures")
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        for version in (2, 3, 4):
+            with self.subTest(version=version):
+                destination = self.root / f"index-v{version}-workspace"
+                prepared = prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[2],
+                    head,
+                )
+                try:
+                    if version == 3:
+                        git(
+                            prepared.root,
+                            "update-index",
+                            "--skip-worktree",
+                            "tracked.txt",
+                        )
+                    git(prepared.root, "update-index", "--index-version", str(version))
+                    index_path = prepared.root / ".git/index"
+                    os.chmod(index_path, 0o600)
+                    payload = index_path.read_bytes()
+                    self.assertEqual(struct.unpack(">I", payload[4:8])[0], version)
+                    self.assertFalse(
+                        workspace_runtime._index_contains_split_link_extension(
+                            payload,
+                            20,
+                        )
+                    )
+                    if version == 3:
+                        self.assertTrue(
+                            git(
+                                prepared.root,
+                                "ls-files",
+                                "-v",
+                                "--",
+                                "tracked.txt",
+                            ).startswith("S ")
+                        )
+                        git(
+                            prepared.root,
+                            "update-index",
+                            "--no-skip-worktree",
+                            "tracked.txt",
+                        )
+                        os.chmod(index_path, 0o600)
+                    validate_workspace(prepared.root, self.commits[2], head)
+                finally:
+                    self.cleanup(prepared)
+
+        sha256_repo = self.root / "sha256-source"
+        sha256_repo.mkdir()
+        git(sha256_repo, "init", "--object-format=sha256", "-b", "master")
+        git(sha256_repo, "config", "user.name", "Review Workspace Test")
+        git(
+            sha256_repo,
+            "config",
+            "user.email",
+            "review-workspace@example.invalid",
+        )
+        git(sha256_repo, "config", "commit.gpgsign", "false")
+        (sha256_repo / "tracked.txt").write_text("sha256 fixture\n", encoding="utf-8")
+        (sha256_repo / "zzlink").write_text(
+            "not an index extension\n",
+            encoding="utf-8",
+        )
+        git(sha256_repo, "add", "tracked.txt", "zzlink")
+        git(sha256_repo, "commit", "-m", "sha256 index fixtures")
+        for version in (2, 3, 4):
+            with self.subTest(object_format="sha256", version=version):
+                if version == 3:
+                    git(sha256_repo, "update-index", "--skip-worktree", "tracked.txt")
+                git(sha256_repo, "update-index", "--index-version", str(version))
+                payload = (sha256_repo / ".git/index").read_bytes()
+                self.assertEqual(struct.unpack(">I", payload[4:8])[0], version)
+                self.assertFalse(
+                    workspace_runtime._index_contains_split_link_extension(
+                        payload,
+                        32,
+                    )
+                )
+                if version == 3:
+                    self.assertTrue(
+                        git(
+                            sha256_repo, "ls-files", "-v", "--", "tracked.txt"
+                        ).startswith("S ")
+                    )
+                    git(
+                        sha256_repo,
+                        "update-index",
+                        "--no-skip-worktree",
+                        "tracked.txt",
+                    )
+        git(sha256_repo, "update-index", "--split-index")
+        self.assertTrue(
+            workspace_runtime._index_contains_split_link_extension(
+                (sha256_repo / ".git/index").read_bytes(),
+                32,
+            )
+        )
+
+    def test_index_parser_rejects_truncation_and_malformed_extensions(self) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "malformed-index-workspace",
+            self.commits[1],
+            self.commits[2],
+        )
+        try:
+            payload = (prepared.root / ".git/index").read_bytes()
+            with self.assertRaises(ReviewWorkspaceError) as truncated:
+                workspace_runtime._index_contains_split_link_extension(
+                    payload[:-1],
+                    20,
+                )
+            self.assertEqual(truncated.exception.reason, "workspace-index-invalid")
+
+            bad_checksum = bytearray(payload)
+            bad_checksum[-1] ^= 0x01
+            with self.assertRaises(ReviewWorkspaceError) as checksum:
+                workspace_runtime._index_contains_split_link_extension(
+                    bytes(bad_checksum),
+                    20,
+                )
+            self.assertEqual(checksum.exception.reason, "workspace-index-invalid")
+            self.assertIn("checksum", str(checksum.exception))
+
+            content = payload[:-20]
+            malformed_entries = bytearray(content)
+            entry_count = struct.unpack(">I", malformed_entries[8:12])[0]
+            malformed_entries[8:12] = struct.pack(">I", entry_count + 1)
+            malformed_entry_payload = (
+                bytes(malformed_entries)
+                + hashlib.sha1(
+                    malformed_entries,
+                    usedforsecurity=False,
+                ).digest()
+            )
+            with self.assertRaises(ReviewWorkspaceError) as entry:
+                workspace_runtime._index_contains_split_link_extension(
+                    malformed_entry_payload,
+                    20,
+                )
+            self.assertEqual(entry.exception.reason, "workspace-index-invalid")
+
+            over_limit_entries = bytearray(content)
+            over_limit_entries[8:12] = struct.pack(
+                ">I",
+                workspace_runtime.CHECKOUT_ENTRY_COUNT_LIMIT + 1,
+            )
+            over_limit_payload = (
+                bytes(over_limit_entries)
+                + hashlib.sha1(
+                    over_limit_entries,
+                    usedforsecurity=False,
+                ).digest()
+            )
+            with self.assertRaises(ReviewWorkspaceError) as over_limit:
+                workspace_runtime._index_contains_split_link_extension(
+                    over_limit_payload,
+                    20,
+                )
+            self.assertEqual(over_limit.exception.reason, "workspace-index-invalid")
+
+            malformed_content = content + b"TEST" + struct.pack(">I", 8) + b"short"
+            malformed = (
+                malformed_content
+                + hashlib.sha1(
+                    malformed_content,
+                    usedforsecurity=False,
+                ).digest()
+            )
+            with self.assertRaises(ReviewWorkspaceError) as extension:
+                workspace_runtime._index_contains_split_link_extension(
+                    malformed,
+                    20,
+                )
+            self.assertEqual(extension.exception.reason, "workspace-index-invalid")
+
+            non_link_content = content + b"TEST" + struct.pack(">I", 4) + b"link"
+            non_link = (
+                non_link_content
+                + hashlib.sha1(
+                    non_link_content,
+                    usedforsecurity=False,
+                ).digest()
+            )
+            self.assertFalse(
+                workspace_runtime._index_contains_split_link_extension(non_link, 20)
+            )
+        finally:
+            self.cleanup(prepared)
+
+    def test_index_parser_bounds_v4_decompressed_path_bytes_before_join(self) -> None:
+        shared_prefix = b"a" * 4094
+        paths = tuple(shared_prefix + suffix for suffix in (b"0", b"1", b"2"))
+        aggregate_path_bytes = sum(map(len, paths))
+
+        for oid_width in (20, 32):
+            with self.subTest(oid_width=oid_width):
+                payload = synthetic_index_payload(
+                    paths,
+                    version=4,
+                    oid_width=oid_width,
+                )
+                with mock.patch.object(
+                    workspace_runtime,
+                    "CHECKOUT_PATH_BYTES_LIMIT",
+                    aggregate_path_bytes,
+                ):
+                    self.assertFalse(
+                        workspace_runtime._index_contains_split_link_extension(
+                            payload,
+                            oid_width,
+                        )
+                    )
+
+                materialize = workspace_runtime._materialize_index_v4_path
+                with (
+                    mock.patch.object(
+                        workspace_runtime,
+                        "CHECKOUT_PATH_BYTES_LIMIT",
+                        aggregate_path_bytes - 1,
+                    ),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_materialize_index_v4_path",
+                        wraps=materialize,
+                    ) as join_path,
+                    self.assertRaises(ReviewWorkspaceError) as over_limit,
+                ):
+                    workspace_runtime._index_contains_split_link_extension(
+                        payload,
+                        oid_width,
+                    )
+                self.assertEqual(
+                    over_limit.exception.reason,
+                    "workspace-index-invalid",
+                )
+                self.assertIn("path-byte limit", str(over_limit.exception))
+                self.assertEqual(join_path.call_count, 2)
+
+    def test_index_parser_accepts_and_bounds_multibyte_v4_strip_lengths(
+        self,
+    ) -> None:
+        paths = (b"a" * 127 + b"z", b"b")
+        self.assertEqual(encode_index_v4_strip_length(128), b"\x80\x00")
+
+        for oid_width in (20, 32):
+            with self.subTest(oid_width=oid_width):
+                payload = synthetic_index_payload(
+                    paths,
+                    version=4,
+                    oid_width=oid_width,
+                )
+                self.assertFalse(
+                    workspace_runtime._index_contains_split_link_extension(
+                        payload,
+                        oid_width,
+                    )
+                )
+
+        encoded = encode_index_v4_strip_length(129)
+        with self.assertRaises(ReviewWorkspaceError) as exceeds_previous:
+            workspace_runtime._decode_index_v4_strip_length(
+                encoded,
+                0,
+                len(encoded),
+                128,
+            )
+        self.assertEqual(
+            exceeds_previous.exception.reason,
+            "workspace-index-invalid",
+        )
+        self.assertIn("exceeds", str(exceeds_previous.exception))
+
+        with self.assertRaises(ReviewWorkspaceError) as truncated:
+            workspace_runtime._decode_index_v4_strip_length(
+                b"\x80",
+                0,
+                1,
+                128,
+            )
+        self.assertEqual(truncated.exception.reason, "workspace-index-invalid")
+        self.assertIn("truncated", str(truncated.exception))
+
+    def test_index_parser_applies_path_byte_boundary_to_v2_and_v3(self) -> None:
+        paths = (b"a" * 17, b"b" * 19, b"c" * 23)
+        aggregate_path_bytes = sum(map(len, paths))
+
+        for version in (2, 3):
+            for oid_width in (20, 32):
+                with self.subTest(version=version, oid_width=oid_width):
+                    payload = synthetic_index_payload(
+                        paths,
+                        version=version,
+                        oid_width=oid_width,
+                    )
+                    with mock.patch.object(
+                        workspace_runtime,
+                        "CHECKOUT_PATH_BYTES_LIMIT",
+                        aggregate_path_bytes,
+                    ):
+                        self.assertFalse(
+                            workspace_runtime._index_contains_split_link_extension(
+                                payload,
+                                oid_width,
+                            )
+                        )
+                    with (
+                        mock.patch.object(
+                            workspace_runtime,
+                            "CHECKOUT_PATH_BYTES_LIMIT",
+                            aggregate_path_bytes - 1,
+                        ),
+                        self.assertRaises(ReviewWorkspaceError) as over_limit,
+                    ):
+                        workspace_runtime._index_contains_split_link_extension(
+                            payload,
+                            oid_width,
+                        )
+                    self.assertEqual(
+                        over_limit.exception.reason,
+                        "workspace-index-invalid",
+                    )
+                    self.assertIn("path-byte limit", str(over_limit.exception))
 
     def test_marker_count_token_and_receipt_identity_bindings_are_exact(self) -> None:
         destination = self.root / "marker-binding-workspace"

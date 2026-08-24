@@ -84,6 +84,9 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
 
 
 def run_claude(**kwargs: object) -> dict[str, object]:
+    if "source_worktree" not in kwargs:
+        worktree = pathlib.Path(kwargs["worktree"])
+        kwargs["source_worktree"] = worktree.parent / "source-control"
     if "preflight_result" not in kwargs:
         command = kwargs["command"]
         executable = pathlib.Path(command[0])
@@ -123,6 +126,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.root = pathlib.Path(self.temporary.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.source_control = self.root / "source-control"
+        self.source_control.mkdir(mode=0o700)
+        git(self.source_control, "init", "-b", "master")
         git(self.repo, "init", "-b", "master")
         git(self.repo, "config", "user.name", "Named Lane Test")
         git(self.repo, "config", "user.email", "named-lane@example.invalid")
@@ -1529,7 +1535,11 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         checksum = hashlib.sha256(executable.read_bytes()).hexdigest()
         evidence = {
             "capability_contract": {
-                "required_options": [],
+                "required_options": list(
+                    named_lane_runtime._claude_direct_required_options(
+                        named_lane_runtime.parse_compatible_release_version(version)
+                    )
+                ),
                 "status": "accepted",
             },
             "classification": "accepted",
@@ -9482,6 +9492,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
                 "--preflight-result",
                 str(self.preflight_result_path(executable)),
                 "--stdout-path",
@@ -9506,6 +9518,53 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(stdout_path.read_bytes(), b"review")
         self.assertEqual(stderr_path.read_bytes(), b"")
         self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_cli_run_claude_rejects_caller_owned_arguments(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        marker = self.root / "caller-argv-cli.marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+        )
+        stdout_path = self.root / "caller-argv-cli.stdout"
+        stderr_path = self.root / "caller-argv-cli.stderr"
+
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
+                "--stdout-path",
+                str(stdout_path),
+                "--stderr-path",
+                str(stderr_path),
+                "--timeout-seconds",
+                "5",
+                "--",
+                str(executable),
+                "--safe-mode",
+            ),
+            check=False,
+            input=b"review",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(
+            "arguments are owned by the named-lane guard",
+            json.loads(completed.stderr)["reason"],
+        )
+        self.assertFalse(marker.exists())
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
 
     def test_process_rejects_a_command_that_differs_from_preflight(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -10328,6 +10387,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "ANTHROPIC_API_KEY": "secret",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
             "CLAUDE_CONFIG_DIR": "/private/claude",
             "GITHUB_TOKEN": "secret",
             "GH_TOKEN": "secret",
@@ -10384,6 +10444,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             default_child["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
             "1",
         )
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", child)
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", default_child)
         for key in denied.keys() - {
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
             "NODE_EXTRA_CA_CERTS",
@@ -10432,7 +10494,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "    fcntl.flock(anchor_fd, fcntl.LOCK_UN)\n"
             "finally:\n"
             "    os.close(anchor_fd)\n"
-            "json.dump({'session_id': session_id, 'mode': "
+            "json.dump({'arguments': arguments, 'session_id': session_id, 'mode': "
             "leaf.stat().st_mode & 0o777, 'namespace_lock_blocked': "
             "namespace_lock_blocked}, sys.stdout)\n",
             version="2.1.226",
@@ -10444,7 +10506,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
-                command=(str(executable), "--print"),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
@@ -10496,6 +10558,25 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(observed["mode"], 0o700)
         self.assertTrue(observed["namespace_lock_blocked"])
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+        profile = result["launch_binding"]["argv_profile"]
+        self.assertEqual(
+            observed["arguments"],
+            [
+                "--session-id",
+                observed["session_id"],
+                *profile["guard_constructed_arguments"],
+            ],
+        )
+        self.assertEqual(profile["effective_arguments"], observed["arguments"])
+        self.assertNotIn("--session-id", profile["guard_constructed_arguments"])
+        canonical = named_lane_runtime._canonical_json_bytes
+        self.assertEqual(
+            profile["effective_arguments_sha256"],
+            hashlib.sha256(canonical(observed["arguments"])).hexdigest(),
+        )
+        payload = dict(profile)
+        digest = payload.pop("profile_sha256")
+        self.assertEqual(digest, hashlib.sha256(canonical(payload)).hexdigest())
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
     def test_claude_session_namespace_lease_failure_blocks_launch(self) -> None:
@@ -11623,22 +11704,27 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 )
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
-    def test_claude_2_1_225_does_not_receive_a_guard_managed_session(self) -> None:
+    def test_claude_2_1_225_receives_the_exact_guard_owned_profile(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
         home = self.make_claude_home()
         executable = self.make_executable(
-            "import json, sys\njson.dump({'arguments': sys.argv[1:]}, sys.stdout)\n",
+            "import json, os, sys\n"
+            "json.dump({'arguments': sys.argv[1:], "
+            "'environment': dict(os.environ)}, sys.stdout)\n",
             version="2.1.225",
         )
         stdout = self.root / "pre-session-env.json"
         stderr = self.root / "pre-session-env.err"
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
+            requested_environment = named_lane_runtime._claude_environment(
+                self.repo.resolve()
+            )
             result = run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
-                command=(str(executable), "--print"),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
@@ -11650,6 +11736,531 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertNotIn("session_id", result["launch_binding"])
         self.assertNotIn("session_env", result["launch_binding"])
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+        profile = result["launch_binding"]["argv_profile"]
+        settings = profile["settings"]
+        settings_json = json.dumps(
+            settings,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_arguments = [
+            "--print",
+            "--input-format",
+            "text",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "max",
+            "--permission-mode",
+            "dontAsk",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--setting-sources",
+            "",
+            "--settings",
+            settings_json,
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allowedTools",
+            "Read(./**),Grep,Glob,Bash",
+            "--disallowedTools",
+            "Edit,Write,NotebookEdit,WebFetch,WebSearch",
+        ]
+        self.assertEqual(observed["arguments"], expected_arguments)
+        self.assertEqual(profile["guard_constructed_arguments"], expected_arguments)
+        self.assertEqual(profile["effective_arguments"], expected_arguments)
+        self.assertEqual(profile["profile"], "named-direct-claude-argv-v1")
+        self.assertEqual(
+            profile["conformance"], "guard-constructed-exact-token-sequence"
+        )
+        self.assertEqual(profile["settings_schema"], "named-direct-claude-settings-v1")
+        self.assertEqual(profile["settings_assurance"], "requested-configuration-only")
+        self.assertIs(profile["settings_parser_acceptance_attested"], False)
+        self.assertIs(profile["managed_policy_residual"], True)
+        self.assertIs(profile["native_sandbox_effectiveness_attested"], False)
+        self.assertEqual(profile["model"], "claude-opus-4-8")
+        self.assertEqual(profile["effort"], "max")
+        self.assertEqual(profile["worktree"], str(self.repo.resolve()))
+        self.assertEqual(
+            profile["review_git_metadata"], str((self.repo / ".git").resolve())
+        )
+        self.assertEqual(profile["account_home"], str(home))
+        self.assertEqual(profile["source_worktree"], str(self.source_control))
+        self.assertEqual(
+            profile["source_worktree_binding"], "parent-supplied-deny-root"
+        )
+        self.assertEqual(
+            profile["source_read_deny_roots"],
+            [str(self.source_control), str(self.source_control / ".git")],
+        )
+        self.assertEqual(
+            profile["preflight_result"], str(self.preflight_result_path(executable))
+        )
+        self.assertEqual(set(profile["output_bindings"]), {"stdout", "stderr"})
+        for label, path in (("stdout", stdout), ("stderr", stderr)):
+            binding = profile["output_bindings"][label]
+            self.assertEqual(binding["path"], str(path))
+            self.assertEqual(binding["parent"], str(path.parent))
+            self.assertEqual(binding["parent_identity"]["uid"], os.getuid())
+            self.assertEqual(binding["parent_identity"]["mode"], 0o700)
+
+        self.assertEqual(
+            set(settings),
+            {
+                "disableAllHooks",
+                "disableBundledSkills",
+                "permissions",
+                "sandbox",
+            },
+        )
+        self.assertIs(settings["disableAllHooks"], True)
+        self.assertIs(settings["disableBundledSkills"], True)
+        self.assertEqual(
+            settings["permissions"],
+            {
+                "deny": [
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                    "WebFetch",
+                    "WebSearch",
+                ]
+            },
+        )
+        sandbox = settings["sandbox"]
+        self.assertEqual(
+            set(sandbox),
+            {
+                "allowUnsandboxedCommands",
+                "autoAllowBashIfSandboxed",
+                "credentials",
+                "enabled",
+                "enableWeakerNestedSandbox",
+                "enableWeakerNetworkIsolation",
+                "excludedCommands",
+                "failIfUnavailable",
+                "filesystem",
+                "network",
+            },
+        )
+        self.assertIs(sandbox["allowUnsandboxedCommands"], False)
+        self.assertIs(sandbox["autoAllowBashIfSandboxed"], False)
+        self.assertIs(sandbox["enabled"], True)
+        self.assertIs(sandbox["enableWeakerNestedSandbox"], False)
+        self.assertIs(sandbox["enableWeakerNetworkIsolation"], False)
+        self.assertEqual(sandbox["excludedCommands"], [])
+        self.assertIs(sandbox["failIfUnavailable"], True)
+        self.assertEqual(
+            sandbox["network"],
+            {
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
+                "allowUnixSockets": [],
+                "allowedDomains": [],
+            },
+        )
+        filesystem = sandbox["filesystem"]
+        self.assertEqual(
+            filesystem["allowRead"],
+            [
+                str(self.repo.resolve()),
+                str((self.repo / ".git").resolve()),
+                "/dev/null",
+            ],
+        )
+        self.assertEqual(filesystem["denyWrite"], ["/"])
+        self.assertNotIn("allowWrite", filesystem)
+        self.assertEqual(
+            set(filesystem["denyRead"]),
+            {
+                *(
+                    str(home / path)
+                    for path in (
+                        ".aws",
+                        ".claude",
+                        ".codex",
+                        ".config",
+                        ".copilot",
+                        ".gnupg",
+                        ".kube",
+                        ".ssh",
+                        ".git-credentials",
+                        ".netrc",
+                    )
+                ),
+                str(self.source_control),
+                str(self.source_control / ".git"),
+                str(self.preflight_result_path(executable)),
+                str(stdout),
+                str(stderr),
+                "/proc",
+                "/dev",
+            },
+        )
+        self.assertEqual(
+            sandbox["credentials"]["files"],
+            [
+                {"mode": "deny", "path": str(home / path)}
+                for path in (
+                    ".aws",
+                    ".claude",
+                    ".codex",
+                    ".config",
+                    ".copilot",
+                    ".gnupg",
+                    ".kube",
+                    ".ssh",
+                    ".git-credentials",
+                    ".netrc",
+                )
+            ],
+        )
+        self.assertEqual(
+            sandbox["credentials"]["envVars"],
+            [
+                {"mode": "deny", "name": name}
+                for name in named_lane_runtime.CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS
+            ],
+        )
+
+        git_null_binding = profile["git_null_read_exception"]
+        self.assertEqual(
+            set(git_null_binding), {"path", "identity_binding", "identity"}
+        )
+        self.assertEqual(git_null_binding["path"], filesystem["allowRead"][-1])
+        self.assertEqual(
+            git_null_binding["identity_binding"],
+            "canonical-no-follow-character-device",
+        )
+        null_metadata = pathlib.Path("/dev/null").lstat()
+        self.assertEqual(
+            git_null_binding["identity"],
+            {
+                "device": null_metadata.st_dev,
+                "inode": null_metadata.st_ino,
+                "file_type": stat.S_IFMT(null_metadata.st_mode),
+                "mode": stat.S_IMODE(null_metadata.st_mode),
+                "uid": null_metadata.st_uid,
+                "gid": null_metadata.st_gid,
+                "rdev": null_metadata.st_rdev,
+            },
+        )
+
+        canonical = named_lane_runtime._canonical_json_bytes
+        self.assertEqual(
+            profile["settings_sha256"],
+            hashlib.sha256(settings_json.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            profile["guard_constructed_arguments_sha256"],
+            hashlib.sha256(canonical(expected_arguments)).hexdigest(),
+        )
+        self.assertEqual(
+            profile["effective_arguments_sha256"],
+            hashlib.sha256(canonical(expected_arguments)).hexdigest(),
+        )
+        profile_without_digest = dict(profile)
+        observed_profile_digest = profile_without_digest.pop("profile_sha256")
+        self.assertEqual(
+            observed_profile_digest,
+            hashlib.sha256(canonical(profile_without_digest)).hexdigest(),
+        )
+        environment_binding = profile["environment_binding"]
+        self.assertEqual(
+            environment_binding["profile"], "named-direct-claude-environment-v1"
+        )
+        self.assertEqual(
+            environment_binding["assurance"],
+            "guard-supplied-process-environment",
+        )
+        self.assertEqual(
+            environment_binding["requested_keys"], sorted(requested_environment)
+        )
+        self.assertEqual(
+            environment_binding["requested_environment_sha256"],
+            hashlib.sha256(canonical(requested_environment)).hexdigest(),
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in observed["environment"].items()
+                if key != "__CF_USER_TEXT_ENCODING"
+            },
+            requested_environment,
+        )
+        self.assertIs(environment_binding["node_extra_ca_certs_inherited"], False)
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", requested_environment)
+        self.assertNotIn(
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+            environment_binding["requested_keys"],
+        )
+        permission_index = expected_arguments.index("--permission-mode")
+        self.assertEqual(expected_arguments[permission_index + 1], "dontAsk")
+
+    def test_claude_guard_owned_profile_is_primary_model_only(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        for model in ("claude-opus-4-7", "claude-opus-4-8-latest"):
+            with self.subTest(model=model):
+                marker = self.root / f"invalid-model-{model}.marker"
+                invalid = self.make_executable(
+                    f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+                )
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "model must match the canonical named-direct model profile",
+                ):
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"invalid-model-{model}.stdout",
+                        stderr_path=self.root / f"invalid-model-{model}.stderr",
+                        command=(str(invalid),),
+                        model=model,
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+                self.assertFalse(marker.exists())
+
+    def test_claude_preflight_options_match_the_guard_owned_argv(self) -> None:
+        from review_runtime.claude_capabilities import (
+            CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS,
+            named_direct_required_options,
+        )
+
+        self.assertEqual(
+            named_lane_runtime.CLAUDE_DIRECT_REQUIRED_OPTIONS,
+            CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS,
+        )
+        for version in ("2.1.211", "2.1.225", "2.1.226", "2.9.999"):
+            with self.subTest(version=version):
+                parsed = named_lane_runtime.parse_compatible_release_version(version)
+                self.assertEqual(
+                    named_lane_runtime._claude_direct_required_options(parsed),
+                    named_direct_required_options(version),
+                )
+
+    def test_claude_rejects_preflight_option_contract_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        cases = (
+            ("missing", lambda value: value["required_options"].pop()),
+            (
+                "duplicate",
+                lambda value: value["required_options"].append("--print"),
+            ),
+            (
+                "unknown",
+                lambda value: value["required_options"].append("--unsafe-fixture"),
+            ),
+            ("unaccepted", lambda value: value.__setitem__("status", "unaccepted")),
+            ("extra-field", lambda value: value.__setitem__("extra", True)),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                marker = self.root / f"preflight-{label}.marker"
+                executable = self.make_executable(
+                    f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+                )
+                preflight = self.preflight_result_path(executable)
+                evidence = json.loads(preflight.read_text(encoding="utf-8"))
+                mutate(evidence["capability_contract"])
+                preflight.write_text(
+                    json.dumps(evidence, sort_keys=True), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "capability contract does not match the closed argv profile",
+                ):
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"preflight-{label}.stdout",
+                        stderr_path=self.root / f"preflight-{label}.stderr",
+                        command=(str(executable),),
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+                self.assertFalse(marker.exists())
+
+    def test_claude_source_deny_roots_include_linked_git_storage(self) -> None:
+        git(self.source_control, "config", "user.name", "Named Lane Source Test")
+        git(
+            self.source_control,
+            "config",
+            "user.email",
+            "named-lane-source@example.invalid",
+        )
+        (self.source_control / "tracked.txt").write_text("source\n", encoding="utf-8")
+        git(self.source_control, "add", "tracked.txt")
+        git(self.source_control, "commit", "-m", "source fixture")
+        linked = self.root / "linked-source"
+        git(self.source_control, "worktree", "add", "--detach", str(linked), "HEAD")
+
+        source, roots = named_lane_runtime._resolve_claude_source_read_deny_roots(
+            linked.resolve()
+        )
+
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        common = pathlib.Path(git(linked, "rev-parse", "--git-common-dir")).resolve()
+        self.assertEqual(source, linked.resolve())
+        self.assertEqual(roots, (linked.resolve(), admin, common))
+
+    def test_claude_source_deny_root_rejects_non_git_alias_and_overlap(self) -> None:
+        plain = self.root / "plain-source"
+        plain.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "exact Git worktree root",
+        ):
+            named_lane_runtime._resolve_claude_source_read_deny_roots(plain)
+
+        alias = self.root / "source-alias"
+        alias.symlink_to(self.source_control, target_is_directory=True)
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "canonical real directory",
+        ):
+            named_lane_runtime._resolve_claude_source_read_deny_roots(alias)
+
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("raise SystemExit(97)\n")
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "source and review worktrees must be independent",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.repo.resolve(),
+                stdout_path=self.root / "overlap-source.stdout",
+                stderr_path=self.root / "overlap-source.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+    def test_claude_read_boundary_rejects_every_cross_profile_overlap(self) -> None:
+        cases = (
+            (pathlib.Path("/review"), pathlib.Path("/review")),
+            (pathlib.Path("/review/worktree"), pathlib.Path("/review")),
+            (pathlib.Path("/review"), pathlib.Path("/review/control")),
+        )
+        for allowed, denied in cases:
+            with (
+                self.subTest(allowed=allowed, denied=denied),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "allowRead and denyRead roots must not overlap",
+                ),
+            ):
+                named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+                    allow_read=(allowed,),
+                    deny_read=(denied,),
+                )
+
+        named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+            allow_read=(pathlib.Path("/review/worktree"),),
+            deny_read=(pathlib.Path("/review-state"), pathlib.Path("/source")),
+        )
+        named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+            allow_read=(pathlib.Path("/dev/null"),),
+            deny_read=(pathlib.Path("/dev"),),
+        )
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "allowRead and denyRead roots must not overlap",
+        ):
+            named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+                allow_read=(pathlib.Path("/dev/zero"),),
+                deny_read=(pathlib.Path("/dev"),),
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and pathlib.Path("/dev/zero").exists(),
+        "Git null exception validation requires POSIX device nodes",
+    )
+    def test_claude_git_null_read_exception_is_exact_and_identity_bound(
+        self,
+    ) -> None:
+        binding = named_lane_runtime._claude_git_null_read_exception_binding()
+        self.assertEqual(binding["path"], "/dev/null")
+        self.assertEqual(
+            binding["identity_binding"],
+            "canonical-no-follow-character-device",
+        )
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "must be exact canonical /dev/null",
+        ):
+            named_lane_runtime._claude_git_null_read_exception_binding(
+                pathlib.Path("/dev/zero")
+            )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime.os,
+                "fstat",
+                return_value=pathlib.Path("/dev/zero").stat(),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed during validation",
+            ),
+        ):
+            named_lane_runtime._claude_git_null_read_exception_binding()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "Git null exception receipt binding requires POSIX",
+    )
+    def test_claude_git_null_identity_drift_blocks_receipt_publication(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.225")
+        stdout = self.root / "null-drift.stdout"
+        stderr = self.root / "null-drift.stderr"
+        initial = named_lane_runtime._claude_git_null_read_exception_binding()
+        changed = json.loads(json.dumps(initial))
+        changed["identity"]["inode"] += 1
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime,
+                "_claude_git_null_read_exception_binding",
+                side_effect=(initial, changed),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed before receipt generation",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
 
     @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
     def test_claude_environment_rejects_mismatched_real_and_effective_users(
@@ -11872,11 +12483,17 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertFalse((displaced / context.exception.session_id).exists())
         self.assertTrue(displaced.is_dir())
 
-    def test_claude_session_selection_is_guard_owned(self) -> None:
+    def test_claude_rejects_every_caller_owned_argument(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
         executable = self.make_executable("raise SystemExit(97)\n", version="2.1.226")
         for selector in (
+            ("--print",),
+            ("--safe-mode",),
+            ("--settings", "{}"),
+            ("--settings={}",),
+            ("--allowedTools", "Read(./**),Grep,Glob,Bash"),
+            ("--unknown",),
             ("--session-id", "00000000-0000-4000-8000-000000000000"),
             ("--session-id=00000000-0000-4000-8000-000000000000",),
             ("--resume", "fixture"),
@@ -11899,7 +12516,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 self.subTest(selector=selector),
                 self.assertRaisesRegex(
                     NamedLaneGuardError,
-                    "session selection is owned",
+                    "arguments are owned by the named-lane guard",
                 ),
             ):
                 run_claude(
@@ -12056,7 +12673,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.commit()
         pid_path = self.root / "detached.pid"
         executable = self.make_executable(
-            "import os, pathlib, sys, time\n"
+            "import os, pathlib, time\n"
             "ready_read, ready_write = os.pipe()\n"
             "pid = os.fork()\n"
             "if pid == 0:\n"
@@ -12073,7 +12690,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "    time.sleep(30)\n"
             "    os._exit(0)\n"
             "os.close(ready_read)\n"
-            "pid_path = pathlib.Path(sys.argv[1])\n"
+            f"pid_path = pathlib.Path({str(pid_path)!r})\n"
             "temporary_path = pid_path.with_suffix('.tmp')\n"
             "temporary_path.write_text(str(pid), encoding='ascii')\n"
             "os.replace(temporary_path, pid_path)\n"
@@ -12087,7 +12704,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "detached.out",
                 stderr_path=self.root / "detached.err",
-                command=(str(executable), str(pid_path)),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=64,
@@ -12216,7 +12833,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         output_parent.mkdir(mode=0o700)
         output_parent.chmod(0o700)
         executable = self.make_executable(
-            "import os, pathlib, sys\nos.chmod(pathlib.Path(sys.argv[1]), 0o755)\n"
+            "import os, pathlib\n"
+            f"os.chmod(pathlib.Path({str(output_parent)!r}), 0o755)\n"
         )
 
         try:
@@ -12228,7 +12846,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout",
                     stderr_path=output_parent / "stderr",
-                    command=(str(executable), str(output_parent)),
+                    command=(str(executable),),
                     prompt=b"",
                     timeout_seconds=2.0,
                     stream_limit_bytes=64,
@@ -12251,9 +12869,9 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         output_parent.chmod(0o700)
         executable = self.make_executable(
             "import os, pathlib, sys\n"
-            "parent = pathlib.Path(sys.argv[1])\n"
-            "displaced = pathlib.Path(sys.argv[2])\n"
-            "redirect = pathlib.Path(sys.argv[3])\n"
+            f"parent = pathlib.Path({str(output_parent)!r})\n"
+            f"displaced = pathlib.Path({str(displaced_parent)!r})\n"
+            f"redirect = pathlib.Path({str(self.repo)!r})\n"
             "os.rename(parent, displaced)\n"
             "os.symlink(redirect, parent, target_is_directory=True)\n"
             "sys.stdout.write('captured stdout')\n"
@@ -12265,12 +12883,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 worktree=self.repo.resolve(),
                 stdout_path=output_parent / "stdout.bin",
                 stderr_path=output_parent / "stderr.bin",
-                command=(
-                    str(executable),
-                    str(output_parent),
-                    str(displaced_parent),
-                    str(self.repo),
-                ),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=64,
@@ -12296,10 +12909,10 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         output_parent.mkdir(mode=0o700)
         output_parent.chmod(0o700)
         executable = self.make_executable(
-            "import os, pathlib, sys\n"
-            "parent = pathlib.Path(sys.argv[1])\n"
-            "displaced = pathlib.Path(sys.argv[2])\n"
-            "redirect = pathlib.Path(sys.argv[3])\n"
+            "import os, pathlib\n"
+            f"parent = pathlib.Path({str(output_parent)!r})\n"
+            f"displaced = pathlib.Path({str(displaced_parent)!r})\n"
+            f"redirect = pathlib.Path({str(self.repo)!r})\n"
             "os.rename(parent, displaced)\n"
             "os.symlink(redirect, parent, target_is_directory=True)\n"
         )
@@ -12332,12 +12945,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout.bin",
                     stderr_path=output_parent / "stderr.bin",
-                    command=(
-                        str(executable),
-                        str(output_parent),
-                        str(displaced_parent),
-                        str(self.repo),
-                    ),
+                    command=(str(executable),),
                     prompt=b"",
                     timeout_seconds=2.0,
                     stream_limit_bytes=64,
@@ -12815,6 +13423,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
                 "--preflight-result",
                 str(self.preflight_result_path(executable)),
                 "--stdout-path",
@@ -12872,6 +13482,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-prompt-signal-preflight.json"),
             "--stdout-path",
@@ -12960,6 +13572,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-prompt-budget-preflight.json"),
                     "--stdout-path",
@@ -13047,6 +13661,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                             "run-claude",
                             "--worktree",
                             str(self.repo.resolve()),
+                            "--source-worktree",
+                            str(self.source_control),
                             "--preflight-result",
                             str(preflight),
                             "--stdout-path",
@@ -13186,6 +13802,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(preflight),
                     "--stdout-path",
@@ -13296,6 +13914,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / f"unused-{label}-cap-preflight.json"),
                     "--stdout-path",
@@ -13412,6 +14032,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-cleanup-preflight.json"),
             "--stdout-path",
@@ -13460,6 +14082,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-locator-preflight.json"),
             "--stdout-path",
@@ -13513,6 +14137,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-session-cleanup-preflight.json"),
             "--stdout-path",
@@ -13574,6 +14200,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-unquiescent-preflight.json"),
                     "--stdout-path",
@@ -13629,6 +14257,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-session-custody-preflight.json"),
             "--stdout-path",
@@ -13689,6 +14319,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-control-cleanup-preflight.json"),
             "--stdout-path",
@@ -13742,6 +14374,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-process-leak-preflight.json"),
             "--stdout-path",
@@ -13892,6 +14526,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-classification-preflight.json"),
                     "--stdout-path",
@@ -13981,6 +14617,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.preflight_result_path(executable)),
                     "--stdout-path",

@@ -56,18 +56,25 @@ CLAUDE_REQUIRED_OPTIONS = (
     "--allowedTools",
     "--disallowedTools",
 )
+# Named-direct sends a text prompt on stdin explicitly; retained helper launch
+# profiles keep their separately audited option contract above.
+CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS = (
+    "--print",
+    "--input-format",
+    *CLAUDE_REQUIRED_OPTIONS[1:],
+)
 
 
 def named_direct_required_options(version: str) -> tuple[str, ...]:
     """Return the exact named-direct option contract for one release."""
 
     if not requires_guard_managed_session(version):
-        return CLAUDE_REQUIRED_OPTIONS
-    insertion = CLAUDE_REQUIRED_OPTIONS.index("--safe-mode")
+        return CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS
+    insertion = CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS.index("--safe-mode")
     return (
-        *CLAUDE_REQUIRED_OPTIONS[:insertion],
+        *CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS[:insertion],
         "--session-id",
-        *CLAUDE_REQUIRED_OPTIONS[insertion:],
+        *CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS[insertion:],
     )
 
 
