@@ -831,6 +831,68 @@ superseded_by:
   repository-root `tests/` discovery path and exited before loading tests; the
   authoritative run used the repository's documented
   `skills/review-orchestration-playbook/tests` discovery root.
+- Signed head `bfe194cbdde87895180b2f0433b319515145fd46` then received a
+  fresh-context GPT-5.6 Sol Ultra CLI review over the same frozen base. The
+  independently trusted prior-release materializer and validator agreed
+  before and after review on eight scoped commits, seven parent edges,
+  parent-graph SHA-256
+  `e6945a0331570797a33bbac96cb7398d571a1ecdb9ebf3f742061e4c45fa0c61`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 11,658-byte prompt SHA-256 was
+  `96fbc5289072cc551cb6699c4999d0aea4ae87e53b8cd5ea60aa7f6b6e9a8c1b`;
+  the 580-event JSONL and terminal findings SHA-256 values were respectively
+  `c9ab27bc9c81fd6a0cbde4fd9ac8c975dc9cb063dba4746c6c68c90ff0a5ccc4`
+  and
+  `9b1074dcc5fe6c54189fdb211c3374460749330bb9ca3f335871e29618ec925f`.
+  The process exited zero with one complete turn; a single model-catalog
+  refresh connection error was retained separately on stderr and was not
+  silently treated as clean evidence. Because the published candidate has no
+  version-bound classifier for that error and the terminal event does not
+  attest the effective model/mode, the raw findings are actionable but the
+  effective profile remains `unknown` and this attempt is lane-inconclusive.
+  The ordinary authentication file stayed byte-identical, the actual review
+  home introduced no guidance-bearing path, and that one-time home was
+  destroyed after its inventory was recorded.
+- That review found three remaining defects: non-positive GitHub terminal
+  variants were not bound to an independent parent-owned PR-selection outcome;
+  a caller could place a materialized destination inside the source, Git
+  administration, common, or object-store authority; and the missing-object
+  snapshot bound undercounted SHA-256 marker rows while failing to combine
+  present and missing rows under one object ceiling.
+- The report grammar now requires a closed parent-owned selection outcome before
+  every pass, findings, pending, inconclusive, or not-applicable branch. Selected
+  PR and proved-no-selected-supported-PR outcomes are mutually exclusive and
+  must match the complete report repository/PR/head projection. Coupled report
+  and parent mutations fail closed; the complete 12-test carrier module and an
+  independent read-only audit passed.
+- Workspace creation now binds the resolved source worktree, Git directory,
+  common directory, and every local object-store authority, revalidates their
+  descriptor identities immediately before creation, and rejects a destination
+  parent equal to or below any authority through its real ancestor chain. The
+  SHA-1/SHA-256-aware object snapshot reader budgets `?OID` rows correctly and
+  counts every present, missing, and duplicate row before deduplication. The
+  complete 144-test workspace module, a six-test focused rerun, Ruff, the skill
+  validator, whitespace checks, and an independent read-only audit passed; the
+  audit's one low-severity parent-fd cleanup finding was fixed and regression
+  tested. A final audit then requested explicit duplicate present/missing row
+  cases and all-owned-fd closure assertions; both were added and passed with
+  `ResourceWarning` promoted to an error before the audit returned
+  `No findings`.
+- The final integrated tree passed all 3,074 review-playbook tests with six
+  conditional skips in 958.714 seconds outside the outer sandbox, with
+  `ResourceWarning` promoted to an error. An earlier run was intentionally
+  interrupted after the audit identified the two missing regression cases and
+  is not counted as validation evidence; its exact temporary directory was
+  subsequently absent.
+- Private-release readiness inventory confirmed the canonical reviewer role is
+  copied through `personal_codex/agents/reviewer.toml` into the installed
+  `agents/reviewer.toml`. It also found two downstream prerequisites: the
+  companion exact inventory must use
+  `scripts/independent_codex_pr_review/tests/internal_supervisor_child_fixture.py`,
+  and the seven-repository default `skill-repo-codex-gate` routing must land in
+  the `codex-workspace` mother-repository `AGENTS.md` before the companion can
+  truthfully remove that exception from global guidance.
 
 ## Next Steps
 

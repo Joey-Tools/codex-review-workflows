@@ -103,6 +103,15 @@ _OPERATION_GIT: contextvars.ContextVar[pathlib.Path | None] = contextvars.Contex
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+_OBJECT_SNAPSHOT_COMMAND = (
+    "rev-list",
+    "--objects",
+    "--missing=print",
+    "--no-object-names",
+    "--no-walk=unsorted",
+    "--stdin",
+)
+
 _CONTROL_DIRECTORIES = (
     (".git",),
     (".git", "info"),
@@ -417,11 +426,19 @@ class CleanedWorkspace:
 
 
 @dataclass(frozen=True)
+class _SourceDirectoryAuthority:
+    label: str
+    path: pathlib.Path
+    identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class _SourceRepository:
     root: pathlib.Path
     git_dir: pathlib.Path
     common_dir: pathlib.Path
     object_stores: tuple[pathlib.Path, ...]
+    authorities: tuple[_SourceDirectoryAuthority, ...]
     object_format: str
     shallow_path: pathlib.Path | None
     shallow_payload: bytes
@@ -1268,6 +1285,72 @@ def _absolute_existing_directory(path: pathlib.Path, label: str) -> pathlib.Path
     return resolved
 
 
+def _bind_source_directory_authority(
+    path: pathlib.Path,
+    label: str,
+) -> _SourceDirectoryAuthority:
+    """Bind one resolved source directory to its advertised filesystem object."""
+
+    try:
+        descriptor = os.open(path, _nofollow_flags(directory=True))
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-authority-unavailable",
+            f"{label} cannot be opened without following links",
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        observed = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-authority-unavailable",
+            f"{label} identity cannot be inspected",
+        ) from error
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or not os.path.samestat(metadata, observed)
+    ):
+        raise ReviewWorkspaceError(
+            "source-authority-identity-mismatch",
+            f"{label} does not resolve to one stable directory object",
+        )
+    return _SourceDirectoryAuthority(
+        label=label,
+        path=path,
+        identity=(metadata.st_dev, metadata.st_ino, metadata.st_uid),
+    )
+
+
+def _bind_source_directory_authorities(
+    root: pathlib.Path,
+    git_dir: pathlib.Path,
+    common_dir: pathlib.Path,
+    object_stores: Sequence[pathlib.Path],
+) -> tuple[_SourceDirectoryAuthority, ...]:
+    candidates = (
+        ("source worktree", root),
+        ("source Git directory", git_dir),
+        ("source common Git directory", common_dir),
+        *(
+            (f"source object authority {index}", path)
+            for index, path in enumerate(object_stores)
+        ),
+    )
+    authorities: list[_SourceDirectoryAuthority] = []
+    seen: set[tuple[int, int]] = set()
+    for label, path in candidates:
+        authority = _bind_source_directory_authority(path, label)
+        object_identity = authority.identity[:2]
+        if object_identity in seen:
+            continue
+        seen.add(object_identity)
+        authorities.append(authority)
+    return tuple(authorities)
+
+
 def _decode_git_path(payload: bytes, label: str) -> pathlib.Path:
     try:
         value = os.fsdecode(payload.rstrip(b"\n"))
@@ -1584,11 +1667,18 @@ def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository
             ) from error
         finally:
             os.close(pack_descriptor)
+    authorities = _bind_source_directory_authorities(
+        root,
+        git_dir,
+        common_dir,
+        object_stores,
+    )
     return _SourceRepository(
         root=root,
         git_dir=git_dir,
         common_dir=common_dir,
         object_stores=object_stores,
+        authorities=authorities,
         object_format=object_format,
         shallow_path=present[0][0] if present else None,
         shallow_payload=present[0][1] if present else b"",
@@ -1726,6 +1816,111 @@ def _decode_reported_missing_oid(
             f"Git returned a malformed {label}",
         )
     return oid
+
+
+def _object_id_hex_length(object_format: str) -> int:
+    if object_format == "sha1":
+        return 40
+    if object_format == "sha256":
+        return 64
+    raise ReviewWorkspaceError(
+        "object-format-unsupported",
+        "object snapshot format must be sha1 or sha256",
+    )
+
+
+def _object_snapshot_output_limit_bytes(object_format: str) -> int:
+    # The longest admitted row is ``?OID\n``.  Keep a small framing margin so
+    # the parser, rather than the process sink, supplies the stable row-limit
+    # classification for the first over-limit records.
+    return RANGE_OBJECT_COUNT_LIMIT * (_object_id_hex_length(object_format) + 2) + 1024
+
+
+def _parse_object_snapshot_rows(
+    payload: bytes,
+    object_format: str,
+    *,
+    invalid_reason: str,
+    limit_reason: str,
+    label: str,
+    deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
+) -> tuple[set[str], list[str]]:
+    expected_length = _object_id_hex_length(object_format)
+    present: set[str] = set()
+    missing: list[str] = []
+    for row_count, raw_line in enumerate(payload.splitlines(), start=1):
+        if deadline is not None and (row_count - 1) % 4096 == 0:
+            (deadline_checker or _check_object_store_deadline)(deadline)
+        if row_count > RANGE_OBJECT_COUNT_LIMIT:
+            raise ReviewWorkspaceError(
+                limit_reason,
+                f"{label} exceeds the object-row count limit",
+                details={
+                    "observed_row_count": row_count,
+                    "limit": RANGE_OBJECT_COUNT_LIMIT,
+                },
+            )
+        if raw_line.startswith(b"?"):
+            missing.append(
+                _decode_reported_missing_oid(
+                    raw_line,
+                    expected_length,
+                    reason=invalid_reason,
+                    label=f"missing {label} object ID",
+                )
+            )
+            continue
+        try:
+            oid = raw_line.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ReviewWorkspaceError(
+                invalid_reason,
+                f"Git returned non-ASCII {label} output",
+            ) from error
+        if len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid):
+            raise ReviewWorkspaceError(
+                invalid_reason,
+                f"Git returned a malformed {label} object ID",
+            )
+        present.add(oid)
+    if deadline is not None:
+        (deadline_checker or _check_object_store_deadline)(deadline)
+    return present, missing
+
+
+def _read_object_snapshot(
+    root: pathlib.Path,
+    requested_ids: Sequence[str],
+    object_format: str,
+    *,
+    invalid_reason: str,
+    limit_reason: str,
+    label: str,
+    absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
+    control_binding: _WorkspaceControlBinding | None = None,
+) -> tuple[int, set[str], list[str], bytes]:
+    returncode, output, stderr = _run_git_raw(
+        root,
+        _OBJECT_SNAPSHOT_COMMAND,
+        stdin=b"".join(f"{oid}\n".encode("ascii") for oid in requested_ids),
+        output_limit_bytes=_object_snapshot_output_limit_bytes(object_format),
+        absolute_deadline=absolute_deadline,
+        deadline_checker=deadline_checker,
+        control_binding=control_binding,
+        extra_environment={"GIT_SHALLOW_FILE": os.devnull},
+    )
+    present, missing = _parse_object_snapshot_rows(
+        output,
+        object_format,
+        invalid_reason=invalid_reason,
+        limit_reason=limit_reason,
+        label=label,
+        deadline=absolute_deadline,
+        deadline_checker=deadline_checker,
+    )
+    return returncode, present, missing, stderr
 
 
 def _read_raw_commit_graph(
@@ -2316,59 +2511,17 @@ def _freeze_range(
     )
     range_commits = scope.range_commits
 
-    snapshot_command = (
-        "rev-list",
-        "--objects",
-        "--missing=print",
-        "--no-object-names",
-        "--no-walk=unsorted",
-        "--stdin",
+    snapshot_code, range_objects, missing_objects, snapshot_stderr = (
+        _read_object_snapshot(
+            root,
+            (base, *range_commits),
+            object_format,
+            invalid_reason="range-object-output-invalid",
+            limit_reason="range-object-limit",
+            label="range snapshot",
+            absolute_deadline=deadline,
+        )
     )
-    snapshot_query = b"".join(
-        f"{oid}\n".encode("ascii") for oid in (base, *range_commits)
-    )
-    snapshot_code, snapshot_output, snapshot_stderr = _run_git_raw(
-        root,
-        snapshot_command,
-        stdin=snapshot_query,
-        output_limit_bytes=RANGE_OBJECT_COUNT_LIMIT * 65 + 1024,
-        absolute_deadline=deadline,
-        extra_environment={"GIT_SHALLOW_FILE": os.devnull},
-    )
-    range_objects: set[str] = set()
-    missing_objects: list[str] = []
-    for line_number, line in enumerate(snapshot_output.splitlines()):
-        if line_number % 4096 == 0:
-            _check_object_store_deadline(deadline)
-        if line.startswith(b"?"):
-            missing_objects.append(
-                _decode_reported_missing_oid(
-                    line,
-                    len(base),
-                    reason="range-object-output-invalid",
-                    label="missing range snapshot object ID",
-                )
-            )
-            continue
-        try:
-            oid = line.decode("ascii")
-        except UnicodeDecodeError as error:
-            raise ReviewWorkspaceError(
-                "range-object-output-invalid",
-                "Git returned a non-ASCII range snapshot object ID",
-            ) from error
-        if not FULL_OBJECT_ID.fullmatch(oid) or len(oid) != len(base):
-            raise ReviewWorkspaceError(
-                "range-object-output-invalid",
-                "Git returned a malformed range snapshot object ID",
-            )
-        range_objects.add(oid)
-        if len(range_objects) > RANGE_OBJECT_COUNT_LIMIT:
-            raise ReviewWorkspaceError(
-                "range-object-limit",
-                "frozen range exceeds the 1,000,000-object safety limit",
-            )
-    _check_object_store_deadline(deadline)
     missing = tuple(sorted(set(missing_objects)))
     if missing:
         raise RangeIncomplete(
@@ -2389,7 +2542,7 @@ def _freeze_range(
                 "head": head,
                 "failures": [
                     {
-                        "command": list(snapshot_command),
+                        "command": list(_OBJECT_SNAPSHOT_COMMAND),
                         "returncode": snapshot_code,
                         "stderr_preview": snapshot_stderr.decode(
                             "utf-8", "backslashreplace"
@@ -2400,44 +2553,20 @@ def _freeze_range(
         )
     parent_snapshot_objects: set[str] = set()
     if scope.parent_snapshot_commits:
-        parent_query = b"".join(
-            f"{oid}\n".encode("ascii") for oid in scope.parent_snapshot_commits
-        )
-        parent_code, parent_output, parent_stderr = _run_git_raw(
+        (
+            parent_code,
+            parent_snapshot_objects,
+            missing_parent_objects,
+            parent_stderr,
+        ) = _read_object_snapshot(
             root,
-            snapshot_command,
-            stdin=parent_query,
-            output_limit_bytes=RANGE_OBJECT_COUNT_LIMIT * 65 + 1024,
+            scope.parent_snapshot_commits,
+            object_format,
+            invalid_reason="parent-support-object-output-invalid",
+            limit_reason="range-object-limit",
+            label="direct-parent snapshot",
             absolute_deadline=deadline,
-            extra_environment={"GIT_SHALLOW_FILE": os.devnull},
         )
-        missing_parent_objects: list[str] = []
-        for line_number, line in enumerate(parent_output.splitlines()):
-            if line_number % 4096 == 0:
-                _check_object_store_deadline(deadline)
-            if line.startswith(b"?"):
-                missing_parent_objects.append(
-                    _decode_reported_missing_oid(
-                        line,
-                        len(base),
-                        reason="parent-support-object-output-invalid",
-                        label="missing direct-parent snapshot object ID",
-                    )
-                )
-                continue
-            try:
-                oid = line.decode("ascii")
-            except UnicodeDecodeError as error:
-                raise ReviewWorkspaceError(
-                    "parent-support-object-output-invalid",
-                    "Git returned a non-ASCII direct-parent snapshot object ID",
-                ) from error
-            if not FULL_OBJECT_ID.fullmatch(oid) or len(oid) != len(base):
-                raise ReviewWorkspaceError(
-                    "parent-support-object-output-invalid",
-                    "Git returned a malformed direct-parent snapshot object ID",
-                )
-            parent_snapshot_objects.add(oid)
         if missing_parent_objects:
             raise RangeIncomplete(
                 "parent-support-object-missing",
@@ -2509,6 +2638,111 @@ def _destination_path(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
             "workspace-exists", "workspace destination must be absent"
         )
     return parent, destination
+
+
+def _open_revalidated_source_authority(
+    authority: _SourceDirectoryAuthority,
+) -> int:
+    try:
+        descriptor = os.open(authority.path, _nofollow_flags(directory=True))
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-authority-revalidation-unavailable",
+            f"{authority.label} cannot be reopened before workspace creation",
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        observed = authority.path.stat(follow_symlinks=False)
+    except OSError as error:
+        os.close(descriptor)
+        raise ReviewWorkspaceError(
+            "source-authority-revalidation-unavailable",
+            f"{authority.label} identity cannot be revalidated before creation",
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or not os.path.samestat(metadata, observed)
+        or (metadata.st_dev, metadata.st_ino, metadata.st_uid) != authority.identity
+    ):
+        os.close(descriptor)
+        raise ReviewWorkspaceError(
+            "source-authority-identity-mismatch",
+            f"{authority.label} changed before workspace creation",
+        )
+    return descriptor
+
+
+def _reject_destination_source_overlap(
+    parent_descriptor: int,
+    authorities: Sequence[_SourceDirectoryAuthority],
+) -> None:
+    """Reject an absent destination whose bound parent is inside source state."""
+
+    authority_descriptors: list[int] = []
+    ancestor_descriptor: int | None = None
+    next_ancestor_descriptor: int | None = None
+    try:
+        authority_by_identity: dict[tuple[int, int], _SourceDirectoryAuthority] = {}
+        for authority in authorities:
+            descriptor = _open_revalidated_source_authority(authority)
+            authority_descriptors.append(descriptor)
+            metadata = os.fstat(descriptor)
+            authority_by_identity[(metadata.st_dev, metadata.st_ino)] = authority
+
+        ancestor_descriptor = os.dup(parent_descriptor)
+        visited: set[tuple[int, int]] = set()
+        while True:
+            metadata = os.fstat(ancestor_descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ReviewWorkspaceError(
+                    "workspace-source-overlap-check-failed",
+                    "workspace parent ancestry contains a non-directory object",
+                )
+            identity = (metadata.st_dev, metadata.st_ino)
+            authority = authority_by_identity.get(identity)
+            if authority is not None:
+                raise ReviewWorkspaceError(
+                    "workspace-source-overlap",
+                    "workspace destination must be outside every source authority",
+                    details={
+                        "source_authority": authority.label,
+                        "source_authority_path": str(authority.path),
+                    },
+                )
+            if identity in visited:
+                raise ReviewWorkspaceError(
+                    "workspace-source-overlap-check-failed",
+                    "workspace parent ancestry could not be traversed uniquely",
+                )
+            visited.add(identity)
+            next_ancestor_descriptor = os.open(
+                "..",
+                _nofollow_flags(directory=True),
+                dir_fd=ancestor_descriptor,
+            )
+            parent_metadata = os.fstat(next_ancestor_descriptor)
+            if os.path.samestat(metadata, parent_metadata):
+                closing_descriptor = next_ancestor_descriptor
+                next_ancestor_descriptor = None
+                os.close(closing_descriptor)
+                break
+            closing_descriptor = ancestor_descriptor
+            ancestor_descriptor = next_ancestor_descriptor
+            next_ancestor_descriptor = None
+            os.close(closing_descriptor)
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "workspace-source-overlap-check-failed",
+            "workspace parent ancestry cannot be inspected safely",
+        ) from error
+    finally:
+        if next_ancestor_descriptor is not None:
+            os.close(next_ancestor_descriptor)
+        if ancestor_descriptor is not None:
+            os.close(ancestor_descriptor)
+        for descriptor in authority_descriptors:
+            os.close(descriptor)
 
 
 def _base_ancestry_support_objects(
@@ -5929,65 +6163,29 @@ def _derive_destination_range_objects(
                 )
     range_commits = tuple(sorted(expected_set))
 
-    snapshot_command = (
-        "rev-list",
-        "--objects",
-        "--missing=print",
-        "--no-object-names",
-        "--no-walk=unsorted",
-        "--stdin",
-    )
-    snapshot_query = b"".join(
-        f"{oid}\n".encode("ascii") for oid in (base, *range_commits)
-    )
-    returncode, snapshot_output, snapshot_stderr = _run_git_raw(
+    returncode, object_ids, missing_objects, snapshot_stderr = _read_object_snapshot(
         root,
-        snapshot_command,
-        stdin=snapshot_query,
-        output_limit_bytes=RANGE_OBJECT_COUNT_LIMIT * 65 + 1024,
+        (base, *range_commits),
+        object_format,
+        invalid_reason="workspace-range-object-invalid",
+        limit_reason="workspace-range-object-limit",
+        label="workspace range snapshot",
         control_binding=control_binding,
-        extra_environment={"GIT_SHALLOW_FILE": os.devnull},
     )
-    object_ids: set[str] = set()
-    missing_objects: list[str] = []
-    for raw_line in snapshot_output.splitlines():
-        if raw_line.startswith(b"?"):
-            missing_objects.append(
-                _decode_reported_missing_oid(
-                    raw_line,
-                    len(base),
-                    reason="workspace-range-object-invalid",
-                    label="missing range snapshot object ID",
-                )
-            )
-            continue
-        try:
-            oid = raw_line.decode("ascii")
-        except UnicodeDecodeError as error:
-            raise ReviewWorkspaceError(
-                "workspace-range-object-invalid",
-                "workspace range snapshot returned a non-ASCII object ID",
-            ) from error
-        if not FULL_OBJECT_ID.fullmatch(oid) or len(oid) != len(base):
-            raise ReviewWorkspaceError(
-                "workspace-range-object-invalid",
-                "workspace range snapshot returned a malformed object ID",
-            )
-        object_ids.add(oid)
-        if len(object_ids) > RANGE_OBJECT_COUNT_LIMIT:
-            raise ReviewWorkspaceError(
-                "workspace-range-object-limit",
-                "workspace exact frozen range exceeds the object-count limit",
-            )
     if missing_objects:
-        missing_sample = sorted(set(missing_objects))[:32]
+        missing = tuple(sorted(set(missing_objects)))
+        missing_sample = missing[:MISSING_OBJECT_SAMPLE_LIMIT]
         raise ReviewWorkspaceError(
             "workspace-range-object-missing",
             (
                 "workspace exact frozen range snapshot is incomplete; first missing "
                 f"object is {missing_sample[0]}"
             ),
-            details={"missing_objects": missing_sample},
+            details={
+                "missing_object_count": len(missing),
+                "missing_objects": list(missing_sample),
+                "missing_objects_truncated": len(missing) > len(missing_sample),
+            },
         )
     if returncode != 0:
         raise ReviewWorkspaceError(
@@ -6863,47 +7061,34 @@ def _validate_parent_support_manifest(
     _check_parent_support_validation_deadline(deadline)
     parent_snapshot_ids: set[str] = set()
     if direct_external_parents:
-        snapshot_command = (
-            "rev-list",
-            "--objects",
-            "--missing=print",
-            "--no-object-names",
-            "--no-walk=unsorted",
-            "--stdin",
-        )
-        returncode, output, stderr = _run_git_raw(
+        (
+            returncode,
+            parent_snapshot_ids,
+            missing_parent_objects,
+            stderr,
+        ) = _read_object_snapshot(
             root,
-            snapshot_command,
-            stdin=b"".join(
-                f"{oid}\n".encode("ascii") for oid in sorted(direct_external_parents)
-            ),
-            output_limit_bytes=RANGE_OBJECT_COUNT_LIMIT * 65 + 1024,
+            tuple(sorted(direct_external_parents)),
+            object_format,
+            invalid_reason="workspace-parent-support-object-invalid",
+            limit_reason="workspace-range-object-limit",
+            label="workspace direct-parent snapshot",
             absolute_deadline=deadline,
             deadline_checker=_check_parent_support_validation_deadline,
             control_binding=control_binding,
-            extra_environment={"GIT_SHALLOW_FILE": os.devnull},
         )
-        for line_number, line in enumerate(output.splitlines()):
-            if line_number % 4096 == 0:
-                _check_parent_support_validation_deadline(deadline)
-            if line.startswith(b"?"):
-                raise ReviewWorkspaceError(
-                    "workspace-parent-support-object-missing",
-                    "workspace direct-parent snapshot is incomplete",
-                )
-            try:
-                oid = line.decode("ascii")
-            except UnicodeDecodeError as error:
-                raise ReviewWorkspaceError(
-                    "workspace-parent-support-object-invalid",
-                    "workspace direct-parent snapshot returned non-ASCII output",
-                ) from error
-            if len(oid) != expected_length or not FULL_OBJECT_ID.fullmatch(oid):
-                raise ReviewWorkspaceError(
-                    "workspace-parent-support-object-invalid",
-                    "workspace direct-parent snapshot returned a malformed object ID",
-                )
-            parent_snapshot_ids.add(oid)
+        if missing_parent_objects:
+            missing = tuple(sorted(set(missing_parent_objects)))
+            missing_sample = missing[:MISSING_OBJECT_SAMPLE_LIMIT]
+            raise ReviewWorkspaceError(
+                "workspace-parent-support-object-missing",
+                "workspace direct-parent snapshot is incomplete",
+                details={
+                    "missing_object_count": len(missing),
+                    "missing_objects": list(missing_sample),
+                    "missing_objects_truncated": len(missing) > len(missing_sample),
+                },
+            )
         _check_parent_support_validation_deadline(deadline)
         if returncode != 0:
             raise ReviewWorkspaceError(
@@ -9317,6 +9502,10 @@ def prepare_workspace(
                 "workspace-parent-identity-mismatch",
                 "workspace parent identity changed before workspace creation",
             )
+        _reject_destination_source_overlap(
+            parent_descriptor,
+            source_repo.authorities,
+        )
         os.mkdir(root.name, mode=0o700, dir_fd=parent_descriptor)
         created = True
         created_metadata = os.stat(

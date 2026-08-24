@@ -466,6 +466,181 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             self.cleanup(prepared)
 
+    def test_destination_inside_source_worktree_is_rejected_through_path_aliases(
+        self,
+    ) -> None:
+        parent = self.repo / "review-parent"
+        parent.mkdir(mode=0o700)
+        source_alias = self.root / "source-alias"
+        source_alias.symlink_to(self.repo, target_is_directory=True)
+
+        destinations = (
+            parent / "direct-lane",
+            source_alias / parent.name / "aliased-lane",
+        )
+        for destination in destinations:
+            with (
+                self.subTest(destination=destination.name),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    source_alias,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(caught.exception.reason, "workspace-source-overlap")
+            self.assertFalse(destination.exists())
+
+    def test_destination_inside_linked_git_and_common_authorities_is_rejected(
+        self,
+    ) -> None:
+        linked = self.root / "linked-overlap-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked), self.commits[2])
+        git_dir = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir"))
+        common_dir = pathlib.Path(
+            git(linked, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        )
+
+        for label, authority in (("git", git_dir), ("common", common_dir)):
+            parent = authority / f"review-{label}-parent"
+            parent.mkdir(mode=0o700)
+            destination = parent / "lane"
+            with (
+                self.subTest(authority=label),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    linked,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(caught.exception.reason, "workspace-source-overlap")
+            self.assertFalse(destination.exists())
+
+    def test_destination_inside_alternate_object_authority_is_rejected(self) -> None:
+        alternate = self.root / "alternate-overlap-source"
+        subprocess.run(
+            (
+                "git",
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                str(self.repo),
+                str(alternate),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        borrowed_objects = pathlib.Path(
+            git(
+                self.repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            )
+        )
+        parent = borrowed_objects / "review-object-parent"
+        parent.mkdir(mode=0o700)
+        destination = parent / "lane"
+
+        with self.assertRaises(ReviewWorkspaceError) as caught:
+            prepare_workspace(
+                alternate,
+                destination,
+                self.commits[1],
+                self.commits[2],
+            )
+        self.assertEqual(caught.exception.reason, "workspace-source-overlap")
+        self.assertFalse(destination.exists())
+
+    def test_source_overlap_ancestry_fstat_failure_closes_new_parent_fd(self) -> None:
+        source = workspace_runtime._discover_source(self.repo, float("inf"))
+        parent_descriptor = os.open(
+            self.root,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        real_open = os.open
+        real_fstat = os.fstat
+        real_close = os.close
+        real_dup = os.dup
+        next_parent_descriptor: int | None = None
+        operation_descriptors: list[int] = []
+        closed: list[int] = []
+
+        def capture_parent_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal next_parent_descriptor
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            operation_descriptors.append(descriptor)
+            if path == ".." and dir_fd is not None:
+                next_parent_descriptor = descriptor
+            return descriptor
+
+        def capture_ancestry_dup(descriptor: int) -> int:
+            duplicate = real_dup(descriptor)
+            operation_descriptors.append(duplicate)
+            return duplicate
+
+        def fail_new_parent_fstat(descriptor: int) -> os.stat_result:
+            if descriptor == next_parent_descriptor:
+                raise OSError("fixture parent fstat failure")
+            return real_fstat(descriptor)
+
+        def record_close(descriptor: int) -> None:
+            closed.append(descriptor)
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "open",
+                    side_effect=capture_parent_open,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fstat",
+                    side_effect=fail_new_parent_fstat,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "dup",
+                    side_effect=capture_ancestry_dup,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=record_close,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._reject_destination_source_overlap(
+                    parent_descriptor,
+                    source.authorities,
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "workspace-source-overlap-check-failed",
+            )
+            self.assertIsNotNone(next_parent_descriptor)
+            assert next_parent_descriptor is not None
+            self.assertGreater(len(operation_descriptors), 2)
+            self.assertEqual(set(closed), set(operation_descriptors))
+            for descriptor in operation_descriptors:
+                self.assertEqual(closed.count(descriptor), 1)
+        finally:
+            real_close(parent_descriptor)
+
     def test_merge_side_history_is_included_in_the_bounded_range(self) -> None:
         git(self.repo, "switch", "-c", "side", self.commits[0])
         (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
@@ -3815,6 +3990,111 @@ class ReviewWorkspaceTest(unittest.TestCase):
         self.assertEqual(failures[0]["returncode"], 2)
         self.assertEqual(len(failures[0]["stderr_preview"]), 4096)
 
+    def test_object_snapshot_budget_counts_present_and_missing_rows_by_format(
+        self,
+    ) -> None:
+        for object_format, oid_length in (("sha1", 40), ("sha256", 64)):
+            present_oid = "a" * oid_length
+            missing_oid = "b" * oid_length
+            payload = f"{present_oid}\n?{missing_oid}\n".encode("ascii")
+            observed_limit: int | None = None
+
+            def snapshot(
+                root: pathlib.Path,
+                arguments: tuple[str, ...],
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal observed_limit
+                self.assertEqual(arguments, workspace_runtime._OBJECT_SNAPSHOT_COMMAND)
+                observed = kwargs["output_limit_bytes"]
+                self.assertIsInstance(observed, int)
+                assert isinstance(observed, int)
+                observed_limit = observed
+                return 0, payload, b""
+
+            with (
+                self.subTest(object_format=object_format, boundary="accepted"),
+                mock.patch.object(workspace_runtime, "RANGE_OBJECT_COUNT_LIMIT", 2),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_run_git_raw",
+                    side_effect=snapshot,
+                ),
+            ):
+                returncode, present, missing, stderr = (
+                    workspace_runtime._read_object_snapshot(
+                        self.repo,
+                        (present_oid,),
+                        object_format,
+                        invalid_reason="fixture-invalid",
+                        limit_reason="fixture-limit",
+                        label="fixture snapshot",
+                    )
+                )
+            self.assertEqual(returncode, 0)
+            self.assertEqual(present, {present_oid})
+            self.assertEqual(missing, [missing_oid])
+            self.assertEqual(stderr, b"")
+            self.assertEqual(observed_limit, 2 * (oid_length + 2) + 1024)
+            self.assertGreaterEqual(observed_limit, len(payload))
+
+            with (
+                self.subTest(object_format=object_format, boundary="rejected"),
+                mock.patch.object(workspace_runtime, "RANGE_OBJECT_COUNT_LIMIT", 1),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_run_git_raw",
+                    return_value=(0, payload, b""),
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._read_object_snapshot(
+                    self.repo,
+                    (present_oid,),
+                    object_format,
+                    invalid_reason="fixture-invalid",
+                    limit_reason="fixture-limit",
+                    label="fixture snapshot",
+                )
+            self.assertEqual(caught.exception.reason, "fixture-limit")
+            self.assertEqual(caught.exception.details["observed_row_count"], 2)
+            self.assertEqual(caught.exception.details["limit"], 1)
+
+            for duplicate_kind, duplicate_payload in (
+                ("present", f"{present_oid}\n{present_oid}\n".encode("ascii")),
+                ("missing", f"?{missing_oid}\n?{missing_oid}\n".encode("ascii")),
+            ):
+                with (
+                    self.subTest(
+                        object_format=object_format,
+                        duplicate_kind=duplicate_kind,
+                    ),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "RANGE_OBJECT_COUNT_LIMIT",
+                        1,
+                    ),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_run_git_raw",
+                        return_value=(0, duplicate_payload, b""),
+                    ),
+                    self.assertRaises(ReviewWorkspaceError) as duplicate_caught,
+                ):
+                    workspace_runtime._read_object_snapshot(
+                        self.repo,
+                        (present_oid,),
+                        object_format,
+                        invalid_reason="fixture-invalid",
+                        limit_reason="fixture-limit",
+                        label="fixture snapshot",
+                    )
+                self.assertEqual(duplicate_caught.exception.reason, "fixture-limit")
+                self.assertEqual(
+                    duplicate_caught.exception.details["observed_row_count"],
+                    2,
+                )
+
     def test_range_completeness_requires_a_valid_missing_oid(self) -> None:
         original_run_git_raw = workspace_runtime._run_git_raw
         command = (
@@ -3863,6 +4143,15 @@ class ReviewWorkspaceTest(unittest.TestCase):
             malformed.exception.reason,
             "range-object-output-invalid",
         )
+
+        many_missing = tuple(f"{number:040x}" for number in range(1, 41))
+        with self.assertRaises(RangeIncomplete) as bounded:
+            freeze_with_snapshot_output(
+                b"".join(f"?{oid}\n".encode("ascii") for oid in many_missing)
+            )
+        self.assertEqual(bounded.exception.details["missing_object_count"], 40)
+        self.assertEqual(len(bounded.exception.details["missing_objects"]), 32)
+        self.assertTrue(bounded.exception.details["missing_objects_truncated"])
 
     def test_base_support_probe_has_missing_and_operational_states(self) -> None:
         missing_oid = "f" * 40
@@ -5211,13 +5500,20 @@ class ReviewWorkspaceTest(unittest.TestCase):
     def test_destination_git_commands_do_not_discover_an_ancestor_repository(
         self,
     ) -> None:
-        parent = self.repo / ".review-parent"
+        git(self.root, "init", "-b", "outer")
+        git(self.root, "config", "user.name", "Outer Repository Test")
+        git(self.root, "config", "user.email", "outer@example.invalid")
+        git(self.root, "config", "commit.gpgsign", "false")
+        (self.root / "outer.txt").write_text("outer\n", encoding="utf-8")
+        git(self.root, "add", "outer.txt")
+        git(self.root, "commit", "-m", "outer fixture")
+        parent = self.root / ".review-parent"
         parent.mkdir(mode=0o700)
         destination = parent / "workspace"
         prepared = prepare_workspace(
             self.repo, destination, self.commits[1], self.commits[2]
         )
-        outer_index = self.repo / ".git/index"
+        outer_index = self.root / ".git/index"
         before = hashlib.sha256(outer_index.read_bytes()).hexdigest()
         binding = workspace_runtime._bind_workspace_controls(
             prepared.root,

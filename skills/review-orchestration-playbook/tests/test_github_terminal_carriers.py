@@ -516,6 +516,7 @@ class _ReportValidator:
     def __init__(
         self,
         grammar: dict[str, object],
+        parent_selection_outcome: dict[str, object],
         direct_positive_parent_scope: dict[str, object],
         terminal_clean_parent_identity: dict[str, object],
         reaction_clean_parent_identity: dict[str, object],
@@ -529,6 +530,7 @@ class _ReportValidator:
         self.scope_rules = self.schema["scope_rules"]
         self.rules = self.schema["basis_rules"]
         self.finding_rules = self.schema["unresolved_provider_findings_rules"]
+        self.parent_selection_outcome = copy.deepcopy(parent_selection_outcome)
         self.direct_positive_parent_scope = copy.deepcopy(direct_positive_parent_scope)
         self.terminal_clean_parent_identity = copy.deepcopy(
             terminal_clean_parent_identity
@@ -571,6 +573,28 @@ class _ReportValidator:
             )
             and (request_id is None or self._positive_int(request_id))
         )
+
+    def _selection_outcome_matches(self, report: dict[str, object]) -> bool:
+        selection = self.parent_selection_outcome
+        rules = self.schema["selection_outcome_rules"]
+        if (
+            not self._closed_parent_input(selection, "selection_outcome")
+            or selection["owner"] != rules["owner"]
+            or not isinstance(selection["repository"], str)
+            or selection["repository"].count("/") != 1
+            or not all(selection["repository"].split("/"))
+            or report["repository"] != selection["repository"]
+            or report["pull_request"] != selection["pull_request"]
+            or report["head_sha"] != selection["head_sha"]
+        ):
+            return False
+        if selection["outcome"] == "selected-pr":
+            return self._positive_int(selection["pull_request"]) and self._full_sha(
+                selection["head_sha"]
+            )
+        if selection["outcome"] == "proved-no-selected-supported-pr":
+            return selection["pull_request"] is None and selection["head_sha"] is None
+        return False
 
     def _terminal_evidence(self, report: dict[str, object], evidence: object) -> bool:
         if not self._common_evidence(report, evidence):
@@ -980,6 +1004,8 @@ class _ReportValidator:
             or not all(isinstance(warning, str) for warning in policy["warnings"])
         ):
             return False
+        if not self._selection_outcome_matches(report):
+            return False
         if self._no_selected_supported_pr_scope(report):
             return True
         if not self._selected_pr_scope(report):
@@ -1047,6 +1073,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.grammar = json.loads(GRAMMAR_PATH.read_text(encoding="utf-8"))
         cls.classifier = _ReferenceClassifier(cls.grammar)
+        cls.selected_parent_selection_outcome = copy.deepcopy(
+            cls.grammar["report_parent_selection_outcomes"]["selected_pr"]
+        )
+        cls.no_pr_parent_selection_outcome = copy.deepcopy(
+            cls.grammar["report_parent_selection_outcomes"][
+                "proved_no_selected_supported_pr"
+            ]
+        )
         cls.direct_positive_parent_scope = {
             "repository": "octo/review-fixture",
             "pull_request": 7,
@@ -1087,11 +1121,34 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         }
         cls.report_validator = _ReportValidator(
             cls.grammar,
+            cls.selected_parent_selection_outcome,
             cls.direct_positive_parent_scope,
             cls.terminal_clean_parent_identity,
             cls.reaction_clean_parent_identity,
             cls.merge_status_parent_scope,
             cls.merge_status_parent_contract,
+        )
+        cls.no_pr_report_validator = _ReportValidator(
+            cls.grammar,
+            cls.no_pr_parent_selection_outcome,
+            cls.direct_positive_parent_scope,
+            cls.terminal_clean_parent_identity,
+            cls.reaction_clean_parent_identity,
+            cls.merge_status_parent_scope,
+            cls.merge_status_parent_contract,
+        )
+
+    def _validator_for_selection(
+        self, selection_outcome: dict[str, object]
+    ) -> _ReportValidator:
+        return _ReportValidator(
+            self.grammar,
+            selection_outcome,
+            self.direct_positive_parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_identity,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
         )
 
     def test_resource_is_versioned_closed_and_consumer_only(self) -> None:
@@ -1194,6 +1251,13 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertEqual(
             report_schema["parent_input_profiles"],
             {
+                "selection_outcome": [
+                    "owner",
+                    "outcome",
+                    "repository",
+                    "pull_request",
+                    "head_sha",
+                ],
                 "selected_pr_scope": ["repository", "pull_request", "head_sha"],
                 "terminal_clean_identity": ["kind", "id", "url", "channel"],
                 "reaction_clean_identity": [
@@ -1204,6 +1268,18 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     "request_id",
                 ],
             },
+        )
+        self.assertEqual(
+            report_schema["selection_outcome_rules"]["owner"],
+            "parent-orchestrator",
+        )
+        self.assertIn(
+            "every report variant",
+            report_schema["selection_outcome_rules"]["application"],
+        )
+        self.assertEqual(
+            set(report_schema["selection_outcome_rules"]["outcomes"]),
+            {"selected-pr", "proved-no-selected-supported-pr"},
         )
         self.assertEqual(
             report_schema["basis_rules"]["merge-status"]["artifact_commit"],
@@ -1268,6 +1344,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             ["pass", "findings", "pending", "inconclusive"],
         )
         self.assertEqual(
+            report_schema["scope_rules"]["selected-pr"]["parent_selection_outcome"],
+            "selected-pr",
+        )
+        self.assertEqual(
             set(report_schema["closed_fields"]["unresolved_provider_finding"]),
             {
                 "id",
@@ -1303,7 +1383,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "request_policy_warnings": "required-empty",
                 "unresolved_provider_findings": "required-empty",
                 "last_reason": "no-selected-supported-pr",
+                "parent_selection_outcome": "proved-no-selected-supported-pr",
             },
+        )
+        self.assertEqual(
+            set(self.grammar["report_base_parent_selection_outcomes"]),
+            set(self.grammar["report_bases"]),
         )
 
     def test_authority_strongly_links_the_consumer_grammar(self) -> None:
@@ -1478,9 +1563,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 self.assertEqual(set(fixture), {"id", "base", "patch", "valid"})
                 base = self.grammar["report_bases"][fixture["base"]]
                 report = _merge_patch(base, fixture["patch"])
-                self.assertEqual(
-                    self.report_validator.validate(report), fixture["valid"]
-                )
+                selection_name = self.grammar["report_base_parent_selection_outcomes"][
+                    fixture["base"]
+                ]
+                validator = {
+                    "selected_pr": self.report_validator,
+                    "proved_no_selected_supported_pr": self.no_pr_report_validator,
+                }[selection_name]
+                self.assertEqual(validator.validate(report), fixture["valid"])
 
         terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
         reaction_report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
@@ -1495,6 +1585,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 parent_scope[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
+                    self.selected_parent_selection_outcome,
                     parent_scope,
                     self.terminal_clean_parent_identity,
                     self.reaction_clean_parent_identity,
@@ -1515,6 +1606,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 parent_identity[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
+                    self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     parent_identity,
                     self.reaction_clean_parent_identity,
@@ -1535,6 +1627,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 parent_identity[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
+                    self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
                     parent_identity,
@@ -1565,6 +1658,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         }
         review_validator = _ReportValidator(
             self.grammar,
+            self.selected_parent_selection_outcome,
             self.direct_positive_parent_scope,
             review_parent_identity,
             self.reaction_clean_parent_identity,
@@ -1587,6 +1681,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 parent_scope[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
+                    self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
                     self.reaction_clean_parent_identity,
@@ -1619,6 +1714,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 parent_contract[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
+                    self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
                     self.reaction_clean_parent_identity,
@@ -1654,6 +1750,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         review_parent_contract["provider_clean_evidence_url"] = review_url
         review_validator = _ReportValidator(
             self.grammar,
+            self.selected_parent_selection_outcome,
             self.direct_positive_parent_scope,
             self.terminal_clean_parent_identity,
             self.reaction_clean_parent_identity,
@@ -1663,6 +1760,149 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertTrue(review_validator.validate(review_report))
         review_clean["grammar_branch"] = "clean-issue-v1"
         self.assertFalse(review_validator.validate(review_report))
+
+    def test_parent_selection_outcome_binds_every_report_variant(self) -> None:
+        selected_reports = [
+            copy.deepcopy(self.grammar["report_bases"][base])
+            for base in (
+                "terminal_clean",
+                "reaction_clean",
+                "merge_status",
+                "finding",
+                "inline_finding",
+                "selected_pending",
+            )
+        ]
+        inconclusive = copy.deepcopy(self.grammar["report_bases"]["selected_pending"])
+        inconclusive["status"] = "inconclusive"
+        inconclusive["last_reason"] = "provider-evidence-inconclusive"
+        selected_reports.append(inconclusive)
+
+        for report in selected_reports:
+            with self.subTest(status=report["status"], basis=report["basis"]):
+                self.assertTrue(self.report_validator.validate(report))
+                self.assertFalse(self.no_pr_report_validator.validate(report))
+
+        no_pr_report = copy.deepcopy(
+            self.grammar["report_bases"]["no_selected_supported_pr"]
+        )
+        self.assertTrue(self.no_pr_report_validator.validate(no_pr_report))
+        self.assertFalse(self.report_validator.validate(no_pr_report))
+
+    def test_parent_selection_outcome_is_closed_and_outcome_discriminated(
+        self,
+    ) -> None:
+        selected_report = copy.deepcopy(
+            self.grammar["report_bases"]["selected_pending"]
+        )
+        no_pr_report = copy.deepcopy(
+            self.grammar["report_bases"]["no_selected_supported_pr"]
+        )
+        malformed_selections = []
+
+        missing_owner = copy.deepcopy(self.selected_parent_selection_outcome)
+        missing_owner.pop("owner")
+        malformed_selections.append((missing_owner, selected_report))
+
+        extra_field = copy.deepcopy(self.selected_parent_selection_outcome)
+        extra_field["source"] = "report"
+        malformed_selections.append((extra_field, selected_report))
+
+        wrong_owner = copy.deepcopy(self.selected_parent_selection_outcome)
+        wrong_owner["owner"] = "consumer"
+        malformed_selections.append((wrong_owner, selected_report))
+
+        selected_shape_with_no_pr_outcome = copy.deepcopy(
+            self.selected_parent_selection_outcome
+        )
+        selected_shape_with_no_pr_outcome["outcome"] = "proved-no-selected-supported-pr"
+        malformed_selections.append(
+            (selected_shape_with_no_pr_outcome, selected_report)
+        )
+
+        no_pr_shape_with_selected_outcome = copy.deepcopy(
+            self.no_pr_parent_selection_outcome
+        )
+        no_pr_shape_with_selected_outcome["outcome"] = "selected-pr"
+        malformed_selections.append((no_pr_shape_with_selected_outcome, no_pr_report))
+
+        for selection, report in malformed_selections:
+            with self.subTest(selection=selection):
+                self.assertFalse(
+                    self._validator_for_selection(selection).validate(report)
+                )
+
+    def test_parent_selection_outcome_rejects_coupled_report_scope_mutations(
+        self,
+    ) -> None:
+        other_head = "1111111111111111111111111111111111111111"
+        selected_pending = copy.deepcopy(
+            self.grammar["report_bases"]["selected_pending"]
+        )
+        for field, replacement in {
+            "repository": "octo/other",
+            "pull_request": 8,
+            "head_sha": other_head,
+        }.items():
+            with self.subTest(single_field_mismatch=field):
+                mismatched = copy.deepcopy(selected_pending)
+                mismatched[field] = replacement
+                self.assertFalse(self.report_validator.validate(mismatched))
+
+        coupled_pending = copy.deepcopy(selected_pending)
+        coupled_pending.update(
+            {
+                "repository": "octo/other",
+                "pull_request": 8,
+                "head_sha": other_head,
+            }
+        )
+        coupled_inconclusive = copy.deepcopy(coupled_pending)
+        coupled_inconclusive["status"] = "inconclusive"
+        coupled_inconclusive["last_reason"] = "provider-evidence-inconclusive"
+
+        coupled_finding = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        coupled_finding.update(
+            {
+                "repository": "octo/other",
+                "pull_request": 8,
+                "head_sha": other_head,
+            }
+        )
+        coupled_finding["evidence"]["url"] = (
+            "https://github.com/octo/other/pull/8#pullrequestreview-301"
+        )
+        coupled_finding["unresolved_provider_findings"][0].update(
+            {
+                "url": "https://github.com/octo/other/pull/8#pullrequestreview-301",
+                "report_head_sha": other_head,
+            }
+        )
+
+        other_selected = copy.deepcopy(self.selected_parent_selection_outcome)
+        other_selected.update(
+            {
+                "repository": "octo/other",
+                "pull_request": 8,
+                "head_sha": other_head,
+            }
+        )
+        other_selected_validator = self._validator_for_selection(other_selected)
+        for report in (coupled_pending, coupled_inconclusive, coupled_finding):
+            with self.subTest(status=report["status"]):
+                self.assertTrue(other_selected_validator.validate(report))
+                self.assertFalse(self.report_validator.validate(report))
+
+        coupled_no_pr = copy.deepcopy(
+            self.grammar["report_bases"]["no_selected_supported_pr"]
+        )
+        coupled_no_pr["repository"] = "octo/other"
+        other_no_pr = copy.deepcopy(self.no_pr_parent_selection_outcome)
+        other_no_pr["repository"] = "octo/other"
+        self.assertTrue(
+            self._validator_for_selection(other_no_pr).validate(coupled_no_pr)
+        )
+        self.assertFalse(self.no_pr_report_validator.validate(coupled_no_pr))
 
     def test_selected_pr_report_variants_reject_present_null_scope(self) -> None:
         selected_reports = [

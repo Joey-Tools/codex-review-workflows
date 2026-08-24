@@ -343,6 +343,13 @@
       ]
     },
     "parent_input_profiles": {
+      "selection_outcome": [
+        "owner",
+        "outcome",
+        "repository",
+        "pull_request",
+        "head_sha"
+      ],
       "selected_pr_scope": [
         "repository",
         "pull_request",
@@ -361,6 +368,24 @@
         "channel",
         "request_id"
       ]
+    },
+    "selection_outcome_rules": {
+      "owner": "parent-orchestrator",
+      "application": "required exact match before every report variant, including pass, findings, pending, inconclusive, and not-applicable",
+      "outcomes": {
+        "selected-pr": {
+          "repository": "required-owner-and-repository-name",
+          "pull_request": "required-positive-integer",
+          "head_sha": "required-full-sha",
+          "report_binding": "repository, pull_request, and head_sha all equal the parent-owned selection outcome"
+        },
+        "proved-no-selected-supported-pr": {
+          "repository": "required-owner-and-repository-name",
+          "pull_request": null,
+          "head_sha": null,
+          "report_binding": "repository, null pull_request, and null head_sha all equal the parent-owned selection outcome"
+        }
+      }
     },
     "status_values": [
       "pass",
@@ -407,7 +432,8 @@
         "pull_request": "required-positive-integer",
         "head_sha": "required-full-sha",
         "scope_assurance": "latest-head-only",
-        "base_assurance": "local-pr-readiness"
+        "base_assurance": "local-pr-readiness",
+        "parent_selection_outcome": "selected-pr"
       },
       "no-selected-supported-pr": {
         "status": "not-applicable",
@@ -420,7 +446,8 @@
         "request_policy_status": "not-applicable",
         "request_policy_warnings": "required-empty",
         "unresolved_provider_findings": "required-empty",
-        "last_reason": "no-selected-supported-pr"
+        "last_reason": "no-selected-supported-pr",
+        "parent_selection_outcome": "proved-no-selected-supported-pr"
       }
     },
     "basis_rules": {
@@ -742,6 +769,32 @@
       "unresolved_provider_findings": [],
       "last_reason": "no-selected-supported-pr"
     }
+  },
+  "report_parent_selection_outcomes": {
+    "selected_pr": {
+      "owner": "parent-orchestrator",
+      "outcome": "selected-pr",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "proved_no_selected_supported_pr": {
+      "owner": "parent-orchestrator",
+      "outcome": "proved-no-selected-supported-pr",
+      "repository": "octo/review-fixture",
+      "pull_request": null,
+      "head_sha": null
+    }
+  },
+  "report_base_parent_selection_outcomes": {
+    "terminal_clean": "selected_pr",
+    "terminal_clean_null_commit": "selected_pr",
+    "reaction_clean": "selected_pr",
+    "merge_status": "selected_pr",
+    "finding": "selected_pr",
+    "inline_finding": "selected_pr",
+    "selected_pending": "selected_pr",
+    "no_selected_supported_pr": "proved_no_selected_supported_pr"
   },
   "report_fixtures": [
     {

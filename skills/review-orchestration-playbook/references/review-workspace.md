@@ -35,6 +35,12 @@ Use absolute paths and a parent-validated absolute Python interpreter. Do not ex
 
 The source may be a normal checkout or a linked worktree. It may be dirty, shallow, partial/promisor, or backed by alternates. Preparation never copies its live worktree, index, untracked files, config, hooks, remotes, or submodule checkout. Source storage dependencies are discovery inputs only: every required object must be imported into independent destination storage.
 
+Before creating the absent destination, preparation descriptor-binds and
+revalidates the resolved source worktree, Git directory, common directory, and
+every local object-store authority. The destination parent must not be that
+directory or any descendant of it, including through a symlink or filesystem
+path alias.
+
 With lazy fetching and credential prompts disabled, require:
 
 - both full object IDs resolve locally as commits;
