@@ -332,8 +332,16 @@ class _ReferenceClassifier:
                 )
                 if applicability != "applicable":
                     return self._result(applicability, "inline-parent-v1", semantic)
+                if (
+                    not unresolved
+                    and record["commit_id"] != record["scope"]["head_sha"]
+                ):
+                    return self._result("stale", "inline-parent-v1", semantic)
                 return self._result(
-                    "findings", "inline-parent-v1", semantic, unresolved
+                    "findings" if unresolved else "resolved-inline-only",
+                    "inline-parent-v1",
+                    semantic,
+                    unresolved,
                 )
             if record["commit_id"] != record["scope"]["head_sha"]:
                 return self._result("stale", "clean-review-v1", semantic)
@@ -427,8 +435,16 @@ class _ReferenceClassifier:
         applicability = self._ancestor_applicability(record["scope"], commit)
         if applicability != "applicable":
             return self._result(applicability, "inline-parent-v1", semantic)
+        if not unresolved and commit != record["scope"]["head_sha"]:
+            return self._result("stale", "inline-parent-v1", semantic)
         return self._result(
-            "findings" if count else "malformed",
+            (
+                "findings"
+                if unresolved
+                else "resolved-inline-only"
+                if count
+                else "malformed"
+            ),
             "inline-parent-v1" if count else None,
             semantic,
             unresolved,
@@ -519,9 +535,10 @@ class _ReportValidator:
         parent_selection_outcome: dict[str, object],
         direct_positive_parent_scope: dict[str, object],
         terminal_clean_parent_identity: dict[str, object],
-        reaction_clean_parent_identity: dict[str, object],
+        reaction_clean_parent_epoch: dict[str, object],
         merge_status_parent_scope: dict[str, object],
         merge_status_parent_contract: dict[str, object],
+        resolved_inline_parent_snapshot: dict[str, object] | None = None,
     ) -> None:
         self.grammar_name = grammar["schema"]
         self.schema = grammar["required_report_schema"]
@@ -535,11 +552,13 @@ class _ReportValidator:
         self.terminal_clean_parent_identity = copy.deepcopy(
             terminal_clean_parent_identity
         )
-        self.reaction_clean_parent_identity = copy.deepcopy(
-            reaction_clean_parent_identity
-        )
+        self.reaction_clean_parent_epoch = copy.deepcopy(reaction_clean_parent_epoch)
         self.merge_status_parent_scope = copy.deepcopy(merge_status_parent_scope)
         self.merge_status_parent_contract = copy.deepcopy(merge_status_parent_contract)
+        self.resolved_inline_parent_snapshot = copy.deepcopy(
+            resolved_inline_parent_snapshot
+        )
+        self.provider_identity = copy.deepcopy(grammar["provider_identity"])
 
     def _closed(self, value: object, profile: str) -> bool:
         return isinstance(value, dict) and set(value) == set(self.fields[profile])
@@ -631,15 +650,20 @@ class _ReportValidator:
     def _direct_positive_scope_matches(self, report: dict[str, object]) -> bool:
         parent_scope = self.direct_positive_parent_scope
         return (
-            self._closed_parent_input(parent_scope, "selected_pr_scope")
-            and isinstance(parent_scope["repository"], str)
-            and parent_scope["repository"].count("/") == 1
-            and all(parent_scope["repository"].split("/"))
-            and self._positive_int(parent_scope["pull_request"])
-            and self._full_sha(parent_scope["head_sha"])
+            self._selected_pr_scope_value(parent_scope)
             and report["repository"] == parent_scope["repository"]
             and report["pull_request"] == parent_scope["pull_request"]
             and report["head_sha"] == parent_scope["head_sha"]
+        )
+
+    def _selected_pr_scope_value(self, scope: object) -> bool:
+        return (
+            self._closed_parent_input(scope, "selected_pr_scope")
+            and isinstance(scope["repository"], str)
+            and scope["repository"].count("/") == 1
+            and all(scope["repository"].split("/"))
+            and self._positive_int(scope["pull_request"])
+            and self._full_sha(scope["head_sha"])
         )
 
     def _direct_terminal_identity_matches(
@@ -661,23 +685,104 @@ class _ReportValidator:
             and self._clean_evidence_url_matches_scope(report, evidence)
         )
 
-    def _direct_reaction_identity_matches(
+    def _direct_reaction_epoch_matches(
         self, report: dict[str, object], evidence: dict[str, object]
     ) -> bool:
-        parent_identity = self.reaction_clean_parent_identity
+        epoch = self.reaction_clean_parent_epoch
+        if not self._direct_positive_scope_matches(
+            report
+        ) or not self._closed_parent_input(epoch, "reaction_clean_epoch"):
+            return False
+        expected_scope = {
+            "repository": report["repository"],
+            "pull_request": report["pull_request"],
+            "head_sha": report["head_sha"],
+        }
+        for field in (
+            "pre_request_scope",
+            "post_request_scope",
+            "reaction_read_scope",
+            "final_scope",
+        ):
+            scope = epoch[field]
+            if not self._selected_pr_scope_value(scope) or scope != expected_scope:
+                return False
+        try:
+            request_time = _time(epoch["request_server_time"])
+            reaction_time = _time(epoch["reaction_server_time"])
+        except (TypeError, ValueError):
+            return False
+        true_fields = (
+            "request_pages_complete",
+            "reaction_pages_complete",
+            "provider_pages_complete",
+            "thread_pages_complete",
+            "no_later_request",
+            "no_conflicting_provider_reaction",
+            "no_provider_eyes_at_or_after_reaction",
+            "no_terminal_provider_artifact",
+            "no_malformed_terminal_looking_provider_artifact",
+        )
         return (
-            self._direct_positive_scope_matches(report)
-            and self._closed_parent_input(parent_identity, "reaction_clean_identity")
-            and parent_identity["kind"] == "reaction"
-            and self._positive_int(parent_identity["id"])
-            and isinstance(parent_identity["url"], str)
-            and parent_identity["channel"] == "reaction"
-            and self._positive_int(parent_identity["request_id"])
-            and all(
-                evidence[field] == parent_identity[field]
-                for field in self.parent_input_profiles["reaction_clean_identity"]
-            )
+            epoch["owner"] == "parent-orchestrator"
+            and epoch["status"] == "complete"
+            and epoch["request_kind"] == "issue-comment"
+            and self._positive_int(epoch["request_id"])
+            and epoch["request_id"] == evidence["request_id"]
+            and epoch["request_url"] == evidence["url"]
+            and epoch["request_command"] == "@codex review"
+            and self._positive_int(epoch["reaction_id"])
+            and epoch["reaction_id"] == evidence["id"]
+            and epoch["reaction_url"] == evidence["url"]
+            and epoch["reaction_content"] == "+1"
+            and epoch["reaction_actor_login"] == self.provider_identity["login"]
+            and epoch["reaction_actor_type"] == self.provider_identity["type"]
+            and epoch["reaction_server_time"] == evidence["server_time"]
+            and reaction_time > request_time
+            and all(epoch[field] is True for field in true_fields)
+            and isinstance(epoch["unresolved_provider_findings"], int)
+            and not isinstance(epoch["unresolved_provider_findings"], bool)
+            and epoch["unresolved_provider_findings"] == 0
             and self._reaction_evidence_url_matches_scope(report, evidence)
+        )
+
+    def _resolved_inline_snapshot_matches(
+        self, report: dict[str, object], evidence: dict[str, object]
+    ) -> bool:
+        snapshot = self.resolved_inline_parent_snapshot
+        if not self._direct_positive_scope_matches(
+            report
+        ) or not self._closed_parent_input(snapshot, "resolved_inline_snapshot"):
+            return False
+        initial_digest = snapshot["initial_snapshot_sha256"]
+        final_digest = snapshot["final_snapshot_sha256"]
+        return (
+            snapshot["owner"] == "parent-orchestrator"
+            and snapshot["status"] == "complete"
+            and snapshot["repository"] == report["repository"]
+            and self._positive_int(snapshot["pull_request"])
+            and snapshot["pull_request"] == report["pull_request"]
+            and snapshot["head_sha"] == report["head_sha"]
+            and snapshot["initial_head_sha"] == report["head_sha"]
+            and snapshot["final_head_sha"] == report["head_sha"]
+            and snapshot["evidence_kind"] == evidence["kind"]
+            and self._positive_int(snapshot["evidence_id"])
+            and snapshot["evidence_id"] == evidence["id"]
+            and snapshot["evidence_url"] == evidence["url"]
+            and snapshot["evidence_channel"] == evidence["channel"]
+            and snapshot["artifact_commit"] == evidence["artifact_commit"]
+            and snapshot["artifact_commit"] == report["head_sha"]
+            and snapshot["grammar_branch"] == evidence["grammar_branch"]
+            and snapshot["grammar_branch"] == "inline-parent-v1"
+            and self._positive_int(snapshot["provider_target_children"])
+            and isinstance(snapshot["unresolved_provider_findings"], int)
+            and not isinstance(snapshot["unresolved_provider_findings"], bool)
+            and snapshot["unresolved_provider_findings"] == 0
+            and snapshot["children_pages_complete"] is True
+            and snapshot["threads_pages_complete"] is True
+            and isinstance(initial_digest, str)
+            and SHA256.fullmatch(initial_digest) is not None
+            and final_digest == initial_digest
         )
 
     @staticmethod
@@ -1039,7 +1144,22 @@ class _ReportValidator:
                 and evidence["server_time_field"] == "reaction-time"
                 and evidence["head_binding"] == rule["head_binding"]
                 and self._positive_int(evidence["request_id"])
-                and self._direct_reaction_identity_matches(report, evidence)
+                and self._direct_reaction_epoch_matches(report, evidence)
+            )
+        if basis == "resolved-inline-awaiting-clean":
+            rule = self.rules[basis]
+            return (
+                report["status"] == rule["status"]
+                and report["last_reason"] == rule["last_reason"]
+                and not report["unresolved_provider_findings"]
+                and self._terminal_evidence(report, evidence)
+                and evidence["kind"] == rule["evidence_kind"]
+                and evidence["channel"] == rule["channel"]
+                and evidence["grammar_branch"] == rule["branch"]
+                and evidence["artifact_commit"] == report["head_sha"]
+                and evidence["head_binding"] == rule["head_binding"]
+                and self._clean_evidence_url_matches_scope(report, evidence)
+                and self._resolved_inline_snapshot_matches(report, evidence)
             )
         if basis == "merge-status":
             rule = self.rules[basis]
@@ -1092,12 +1212,56 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
             "channel": "issue-comment",
         }
-        cls.reaction_clean_parent_identity = {
-            "kind": "reaction",
-            "id": 601,
-            "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-91",
-            "channel": "reaction",
+        epoch_scope = copy.deepcopy(cls.direct_positive_parent_scope)
+        cls.reaction_clean_parent_epoch = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "pre_request_scope": copy.deepcopy(epoch_scope),
+            "post_request_scope": copy.deepcopy(epoch_scope),
+            "reaction_read_scope": copy.deepcopy(epoch_scope),
+            "final_scope": copy.deepcopy(epoch_scope),
+            "request_kind": "issue-comment",
             "request_id": 91,
+            "request_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-91",
+            "request_command": "@codex review",
+            "request_server_time": "2026-08-23T09:05:00Z",
+            "reaction_id": 601,
+            "reaction_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-91",
+            "reaction_content": "+1",
+            "reaction_actor_login": "chatgpt-codex-connector[bot]",
+            "reaction_actor_type": "Bot",
+            "reaction_server_time": "2026-08-23T09:06:00Z",
+            "request_pages_complete": True,
+            "reaction_pages_complete": True,
+            "provider_pages_complete": True,
+            "thread_pages_complete": True,
+            "no_later_request": True,
+            "no_conflicting_provider_reaction": True,
+            "no_provider_eyes_at_or_after_reaction": True,
+            "no_terminal_provider_artifact": True,
+            "no_malformed_terminal_looking_provider_artifact": True,
+            "unresolved_provider_findings": 0,
+        }
+        cls.resolved_inline_parent_snapshot = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "repository": "octo/review-fixture",
+            "pull_request": 7,
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "initial_head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "final_head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "evidence_kind": "terminal-artifact",
+            "evidence_id": 401,
+            "evidence_url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-401",
+            "evidence_channel": "review",
+            "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+            "grammar_branch": "inline-parent-v1",
+            "provider_target_children": 1,
+            "unresolved_provider_findings": 0,
+            "children_pages_complete": True,
+            "threads_pages_complete": True,
+            "initial_snapshot_sha256": "4" * 64,
+            "final_snapshot_sha256": "4" * 64,
         }
         cls.merge_status_parent_scope = {
             "repository": "octo/review-fixture",
@@ -1124,18 +1288,20 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.selected_parent_selection_outcome,
             cls.direct_positive_parent_scope,
             cls.terminal_clean_parent_identity,
-            cls.reaction_clean_parent_identity,
+            cls.reaction_clean_parent_epoch,
             cls.merge_status_parent_scope,
             cls.merge_status_parent_contract,
+            cls.resolved_inline_parent_snapshot,
         )
         cls.no_pr_report_validator = _ReportValidator(
             cls.grammar,
             cls.no_pr_parent_selection_outcome,
             cls.direct_positive_parent_scope,
             cls.terminal_clean_parent_identity,
-            cls.reaction_clean_parent_identity,
+            cls.reaction_clean_parent_epoch,
             cls.merge_status_parent_scope,
             cls.merge_status_parent_contract,
+            cls.resolved_inline_parent_snapshot,
         )
 
     def _validator_for_selection(
@@ -1146,9 +1312,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             selection_outcome,
             self.direct_positive_parent_scope,
             self.terminal_clean_parent_identity,
-            self.reaction_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
             self.merge_status_parent_scope,
             self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
         )
 
     def test_resource_is_versioned_closed_and_consumer_only(self) -> None:
@@ -1200,6 +1367,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             ],
             "malformed",
         )
+        self.assertIn(
+            "never completes the lane",
+            self.grammar["closed_world"]["resolved_inline_only"],
+        )
         report_schema = self.grammar["required_report_schema"]
         self.assertEqual(report_schema["schema"], "github-codex-lane-report-v1")
         self.assertEqual(report_schema["role"], "consumer-report-schema")
@@ -1245,29 +1416,56 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             report_schema["basis_rules"]["reaction-clean"]["parent_scope_binding"],
         )
         self.assertIn(
-            "separate closed parent-owned reaction identity",
+            "separate closed parent-owned reaction_clean_epoch",
             report_schema["basis_rules"]["reaction-clean"]["parent_identity_input"],
         )
         self.assertEqual(
-            report_schema["parent_input_profiles"],
+            set(report_schema["parent_input_profiles"]),
             {
-                "selection_outcome": [
-                    "owner",
-                    "outcome",
-                    "repository",
-                    "pull_request",
-                    "head_sha",
-                ],
-                "selected_pr_scope": ["repository", "pull_request", "head_sha"],
-                "terminal_clean_identity": ["kind", "id", "url", "channel"],
-                "reaction_clean_identity": [
-                    "kind",
-                    "id",
-                    "url",
-                    "channel",
-                    "request_id",
-                ],
+                "selection_outcome",
+                "selected_pr_scope",
+                "terminal_clean_identity",
+                "reaction_clean_epoch",
+                "resolved_inline_snapshot",
             },
+        )
+        self.assertIn(
+            "pre_request_scope",
+            report_schema["parent_input_profiles"]["reaction_clean_epoch"],
+        )
+        self.assertIn(
+            "final_scope",
+            report_schema["parent_input_profiles"]["reaction_clean_epoch"],
+        )
+        self.assertEqual(
+            report_schema["parent_input_rules"]["reaction_clean_epoch"]["owner"],
+            "parent-orchestrator",
+        )
+        self.assertIn(
+            "never derived from report or evidence fields",
+            report_schema["parent_input_rules"]["reaction_clean_epoch"][
+                "trust_boundary"
+            ],
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["resolved-inline-awaiting-clean"]["branch"],
+            "inline-parent-v1",
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["resolved-inline-awaiting-clean"]["status"],
+            "pending",
+        )
+        self.assertEqual(
+            report_schema["basis_rules"]["resolved-inline-awaiting-clean"][
+                "completion"
+            ],
+            "forbidden-until-later-accepted-current-head-terminal-clean",
+        )
+        self.assertIn(
+            "two equal canonical snapshot digests",
+            report_schema["basis_rules"]["resolved-inline-awaiting-clean"][
+                "parent_snapshot_input"
+            ],
         )
         self.assertEqual(
             report_schema["selection_outcome_rules"]["owner"],
@@ -1412,6 +1610,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "`artifact_commit` is required, non-null, and equal",
             "`head_binding` is exactly `explicit-commit`",
             "`stable-request-epoch` is valid only in that `basis: reaction-clean`",
+            "closed,\nparent-owned `reaction_clean_epoch` input",
+            "Reusing a head-A request or reaction while reporting head B",
+            "`resolved-inline-awaiting-clean` basis",
+            "closed\n`resolved_inline_snapshot`",
+            "positive\nchild count",
             "parent-verified-repository-contract",
             "status: completed",
             "conclusion: success",
@@ -1440,6 +1643,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "inline-finding-resolved",
             "clean-review-with-inline-finding",
             "approved-ancestor-inline-finding",
+            "approved-ancestor-inline-resolved-is-not-current-head-clean",
             "approved-ancestor-inline-incomplete-projection",
             "approved-nonancestor-inline-finding",
             "ancestor-projection-count-mismatch",
@@ -1492,6 +1696,16 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "terminal-clean-artifact-commit-mismatch",
             "terminal-clean-reaction-kind-mismatch",
             "terminal-clean-open-evidence",
+            "resolved-inline-awaiting-clean-report-valid-pending",
+            "resolved-inline-awaiting-clean-cannot-pass",
+            "resolved-inline-awaiting-clean-cannot-claim-pass-reason",
+            "resolved-inline-awaiting-clean-cannot-claim-terminal-clean",
+            "resolved-inline-awaiting-clean-old-head",
+            "resolved-inline-awaiting-clean-top-level-branch",
+            "resolved-inline-awaiting-clean-clean-review-branch",
+            "resolved-inline-awaiting-clean-wrong-channel",
+            "resolved-inline-awaiting-clean-coupled-identity-mutation",
+            "resolved-inline-awaiting-clean-cannot-carry-unresolved-finding",
             "reaction-clean-report-positive",
             "reaction-clean-cross-repository-url",
             "reaction-clean-cross-pr-url",
@@ -1588,7 +1802,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.selected_parent_selection_outcome,
                     parent_scope,
                     self.terminal_clean_parent_identity,
-                    self.reaction_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
                     self.merge_status_parent_scope,
                     self.merge_status_parent_contract,
                 )
@@ -1609,28 +1823,43 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     parent_identity,
-                    self.reaction_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
                     self.merge_status_parent_scope,
                     self.merge_status_parent_contract,
                 )
                 self.assertFalse(validator.validate(terminal_report))
 
         for field, replacement in {
-            "kind": "terminal-artifact",
-            "id": 602,
-            "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
-            "channel": "issue-comment",
+            "owner": "consumer",
+            "status": "incomplete",
             "request_id": 92,
+            "request_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
+            "reaction_id": 602,
+            "reaction_url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
+            "reaction_content": "eyes",
+            "reaction_actor_login": "lookalike[bot]",
+            "reaction_actor_type": "User",
+            "reaction_server_time": "2026-08-23T09:07:00Z",
+            "request_pages_complete": False,
+            "reaction_pages_complete": False,
+            "provider_pages_complete": False,
+            "thread_pages_complete": False,
+            "no_later_request": False,
+            "no_conflicting_provider_reaction": False,
+            "no_provider_eyes_at_or_after_reaction": False,
+            "no_terminal_provider_artifact": False,
+            "no_malformed_terminal_looking_provider_artifact": False,
+            "unresolved_provider_findings": 1,
         }.items():
-            with self.subTest(parent_reaction_identity_field=field):
-                parent_identity = copy.deepcopy(self.reaction_clean_parent_identity)
-                parent_identity[field] = replacement
+            with self.subTest(parent_reaction_epoch_field=field):
+                parent_epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+                parent_epoch[field] = replacement
                 validator = _ReportValidator(
                     self.grammar,
                     self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
-                    parent_identity,
+                    parent_epoch,
                     self.merge_status_parent_scope,
                     self.merge_status_parent_contract,
                 )
@@ -1661,11 +1890,241 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.selected_parent_selection_outcome,
             self.direct_positive_parent_scope,
             review_parent_identity,
-            self.reaction_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
             self.merge_status_parent_scope,
             self.merge_status_parent_contract,
         )
         self.assertTrue(review_validator.validate(review_report))
+
+    def test_reaction_epoch_cannot_be_repaired_to_a_different_head(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        self.assertTrue(self.report_validator.validate(report))
+
+        other_head = "1111111111111111111111111111111111111111"
+        report["head_sha"] = other_head
+        report["evidence"].update(
+            {
+                "id": 602,
+                "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
+                "request_id": 92,
+                "server_time": "2026-08-23T09:07:00Z",
+            }
+        )
+        parent_selection = copy.deepcopy(self.selected_parent_selection_outcome)
+        parent_selection["head_sha"] = other_head
+        parent_scope = copy.deepcopy(self.direct_positive_parent_scope)
+        parent_scope["head_sha"] = other_head
+        validator = _ReportValidator(
+            self.grammar,
+            parent_selection,
+            parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+        )
+        self.assertFalse(validator.validate(report))
+
+        for scope_field in (
+            "pre_request_scope",
+            "post_request_scope",
+            "reaction_read_scope",
+            "final_scope",
+        ):
+            with self.subTest(scope_field=scope_field):
+                epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+                epoch[scope_field]["head_sha"] = other_head
+                validator = _ReportValidator(
+                    self.grammar,
+                    self.selected_parent_selection_outcome,
+                    self.direct_positive_parent_scope,
+                    self.terminal_clean_parent_identity,
+                    epoch,
+                    self.merge_status_parent_scope,
+                    self.merge_status_parent_contract,
+                    self.resolved_inline_parent_snapshot,
+                )
+                self.assertFalse(
+                    validator.validate(self.grammar["report_bases"]["reaction_clean"])
+                )
+
+    def test_reaction_epoch_is_closed_and_time_ordered(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        malformed_epochs: list[dict[str, object]] = []
+
+        missing = copy.deepcopy(self.reaction_clean_parent_epoch)
+        missing.pop("pre_request_scope")
+        malformed_epochs.append(missing)
+
+        open_epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+        open_epoch["opaque"] = True
+        malformed_epochs.append(open_epoch)
+
+        equal_time = copy.deepcopy(self.reaction_clean_parent_epoch)
+        equal_time["request_server_time"] = equal_time["reaction_server_time"]
+        malformed_epochs.append(equal_time)
+
+        invalid_time = copy.deepcopy(self.reaction_clean_parent_epoch)
+        invalid_time["reaction_server_time"] = "2026-08-23T09:06:00.000Z"
+        malformed_epochs.append(invalid_time)
+
+        for scope_field in (
+            "pre_request_scope",
+            "post_request_scope",
+            "reaction_read_scope",
+            "final_scope",
+        ):
+            float_pr = copy.deepcopy(self.reaction_clean_parent_epoch)
+            float_pr[scope_field]["pull_request"] = 7.0
+            malformed_epochs.append(float_pr)
+
+        for epoch in malformed_epochs:
+            with self.subTest(epoch=epoch):
+                validator = _ReportValidator(
+                    self.grammar,
+                    self.selected_parent_selection_outcome,
+                    self.direct_positive_parent_scope,
+                    self.terminal_clean_parent_identity,
+                    epoch,
+                    self.merge_status_parent_scope,
+                    self.merge_status_parent_contract,
+                    self.resolved_inline_parent_snapshot,
+                )
+                self.assertFalse(validator.validate(report))
+
+    def test_parent_scope_exact_integer_types_reject_pr_one_boolean_aliases(
+        self,
+    ) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        report["pull_request"] = 1
+        report["evidence"]["url"] = (
+            "https://github.com/octo/review-fixture/pull/1#issuecomment-91"
+        )
+        selection = copy.deepcopy(self.selected_parent_selection_outcome)
+        selection["pull_request"] = 1
+        direct_scope = copy.deepcopy(self.direct_positive_parent_scope)
+        direct_scope["pull_request"] = 1
+        epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+        for scope_field in (
+            "pre_request_scope",
+            "post_request_scope",
+            "reaction_read_scope",
+            "final_scope",
+        ):
+            epoch[scope_field]["pull_request"] = True
+        epoch["request_url"] = report["evidence"]["url"]
+        epoch["reaction_url"] = report["evidence"]["url"]
+        validator = _ReportValidator(
+            self.grammar,
+            selection,
+            direct_scope,
+            self.terminal_clean_parent_identity,
+            epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+        )
+        self.assertFalse(validator.validate(report))
+
+        pending_report = copy.deepcopy(
+            self.grammar["report_bases"]["resolved_inline_awaiting_clean"]
+        )
+        pending_report["pull_request"] = 1
+        pending_report["evidence"]["url"] = (
+            "https://github.com/octo/review-fixture/pull/1#pullrequestreview-401"
+        )
+        snapshot = copy.deepcopy(self.resolved_inline_parent_snapshot)
+        snapshot["pull_request"] = True
+        snapshot["evidence_url"] = pending_report["evidence"]["url"]
+        pending_validator = _ReportValidator(
+            self.grammar,
+            selection,
+            direct_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            snapshot,
+        )
+        self.assertFalse(pending_validator.validate(pending_report))
+
+    def test_resolved_inline_awaiting_clean_requires_stable_complete_current_head_snapshot(
+        self,
+    ) -> None:
+        report = copy.deepcopy(
+            self.grammar["report_bases"]["resolved_inline_awaiting_clean"]
+        )
+        self.assertTrue(self.report_validator.validate(report))
+        replacements = {
+            "owner": "consumer",
+            "status": "incomplete",
+            "repository": "octo/other",
+            "pull_request": 8,
+            "head_sha": "1111111111111111111111111111111111111111",
+            "initial_head_sha": "1111111111111111111111111111111111111111",
+            "final_head_sha": "1111111111111111111111111111111111111111",
+            "evidence_kind": "reaction",
+            "evidence_id": 402,
+            "evidence_url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-402",
+            "evidence_channel": "issue-comment",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "grammar_branch": "top-level-finding-v1",
+            "provider_target_children": 0,
+            "unresolved_provider_findings": 1,
+            "children_pages_complete": False,
+            "threads_pages_complete": False,
+            "initial_snapshot_sha256": "not-a-digest",
+            "final_snapshot_sha256": "5" * 64,
+        }
+        for field, replacement in replacements.items():
+            with self.subTest(snapshot_field=field):
+                snapshot = copy.deepcopy(self.resolved_inline_parent_snapshot)
+                snapshot[field] = replacement
+                validator = _ReportValidator(
+                    self.grammar,
+                    self.selected_parent_selection_outcome,
+                    self.direct_positive_parent_scope,
+                    self.terminal_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
+                    self.merge_status_parent_scope,
+                    self.merge_status_parent_contract,
+                    snapshot,
+                )
+                self.assertFalse(validator.validate(report))
+
+        for field in ("pull_request", "evidence_id"):
+            with self.subTest(snapshot_float_alias=field):
+                snapshot = copy.deepcopy(self.resolved_inline_parent_snapshot)
+                snapshot[field] = float(snapshot[field])
+                validator = _ReportValidator(
+                    self.grammar,
+                    self.selected_parent_selection_outcome,
+                    self.direct_positive_parent_scope,
+                    self.terminal_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
+                    self.merge_status_parent_scope,
+                    self.merge_status_parent_contract,
+                    snapshot,
+                )
+                self.assertFalse(validator.validate(report))
+
+        missing = copy.deepcopy(self.resolved_inline_parent_snapshot)
+        missing.pop("final_head_sha")
+        opened = copy.deepcopy(self.resolved_inline_parent_snapshot)
+        opened["opaque"] = True
+        for snapshot in (missing, opened):
+            validator = _ReportValidator(
+                self.grammar,
+                self.selected_parent_selection_outcome,
+                self.direct_positive_parent_scope,
+                self.terminal_clean_parent_identity,
+                self.reaction_clean_parent_epoch,
+                self.merge_status_parent_scope,
+                self.merge_status_parent_contract,
+                snapshot,
+            )
+            self.assertFalse(validator.validate(report))
 
     def test_merge_status_uses_independent_parent_scope_inputs(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
@@ -1684,7 +2143,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
-                    self.reaction_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
                     parent_scope,
                     self.merge_status_parent_contract,
                 )
@@ -1717,7 +2176,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.selected_parent_selection_outcome,
                     self.direct_positive_parent_scope,
                     self.terminal_clean_parent_identity,
-                    self.reaction_clean_parent_identity,
+                    self.reaction_clean_parent_epoch,
                     self.merge_status_parent_scope,
                     parent_contract,
                 )
@@ -1753,7 +2212,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.selected_parent_selection_outcome,
             self.direct_positive_parent_scope,
             self.terminal_clean_parent_identity,
-            self.reaction_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
             self.merge_status_parent_scope,
             review_parent_contract,
         )
@@ -1766,6 +2225,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             copy.deepcopy(self.grammar["report_bases"][base])
             for base in (
                 "terminal_clean",
+                "resolved_inline_awaiting_clean",
                 "reaction_clean",
                 "merge_status",
                 "finding",

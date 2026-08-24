@@ -215,22 +215,31 @@ class ReviewWorkspaceTest(unittest.TestCase):
         self.assertNotIn("validate-worktree", help_text)
 
         destination = self.root / "cli-workspace"
-        returncode, stdout, stderr = self.invoke(
-            (
-                "prepare-workspace",
-                "--source",
-                str(self.repo),
-                "--worktree",
-                str(destination),
-                "--base",
-                self.commits[1],
-                "--head",
-                self.commits[2],
+        with mock.patch.object(
+            workspace_runtime.secrets,
+            "token_urlsafe",
+            return_value="-would-look-like-an-option",
+        ):
+            returncode, stdout, stderr = self.invoke(
+                (
+                    "prepare-workspace",
+                    "--source",
+                    str(self.repo),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    self.commits[1],
+                    "--head",
+                    self.commits[2],
+                )
             )
-        )
         self.assertEqual(returncode, 0, stderr)
         prepared = json.loads(stdout)
         self.assertEqual(prepared["command"], "prepare-workspace")
+        self.assertEqual(
+            prepared["cleanup_token"],
+            "rw1_-would-look-like-an-option",
+        )
 
         returncode, stdout, stderr = self.invoke(
             (

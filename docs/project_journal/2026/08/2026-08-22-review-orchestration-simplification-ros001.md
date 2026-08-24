@@ -3,9 +3,9 @@ id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
 status: active
 created: 2026-08-22
-updated: 2026-08-23
+updated: 2026-08-24
 branch: review-orchestration-simplification
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/108
 supersedes: [20260807-wme001, 20260805-wpe001]
 superseded_by:
 ---
@@ -893,14 +893,72 @@ superseded_by:
   and the seven-repository default `skill-repo-codex-gate` routing must land in
   the `codex-workspace` mother-repository `AGENTS.md` before the companion can
   truthfully remove that exception from global guidance.
+- A later fresh-context review of signed head
+  `b9504e4b8f3ff68da67150c924f0a8423d0eefee` found four remaining policy and
+  delivery defects. Self-policy review could still let candidate guidance enter
+  a subagent control surface; reaction evidence could be rebound to another
+  head; merge execution lacked an atomic reviewed-head precondition; and an
+  all-resolved inline-finding state had no closed outcome. None of that review's
+  output is reused as clean evidence for the repaired head.
+- The local Codex contract now treats candidate policy Markdown only as a
+  parent-enumerated, digest-bound review subject. A subagent counts only when a
+  parent-verifiable receipt covers every host instruction-injection source; if
+  that cannot be proved, the CLI peer is required or the lane is inconclusive.
+  Role identity, zero inherited turns, and a read-only sandbox are necessary
+  but not sufficient evidence for self-policy isolation.
+- Reaction fallback is now bound to one independently parent-frozen exact-head
+  epoch. A record for head A cannot be relabelled or coupled to producer fields
+  for head B. A latest current-head inline-finding artifact whose complete
+  stable thread scan proves all findings resolved is explicitly
+  `resolved-inline-awaiting-clean`: it remains pending and may drive an
+  idempotent Action reconcile, but it cannot pass until a later accepted
+  current-head terminal clean artifact exists and the full scan still proves
+  no unresolved provider finding.
+- Direct merge now carries the reviewed head through GitHub CLI's
+  `--match-head-commit`. Merge-queue enrollment uses the asynchronous REST
+  merge endpoint with exact `sha` plus `merge_action: merge_queue`, persists
+  its UUID, and requires every pending result's `expected_head_sha` to remain
+  equal to the reviewed head. Long-lived `autoMergeRequest` is not equivalent;
+  unavailable asynchronous queue support blocks instead of weakening the
+  contract.
+- The deterministic macOS supervisor inventory advanced from 847 to 848
+  selected tests after a new in-process CLI signal-restoration regression was
+  added. Its recomputed selected-identity SHA-256 is
+  `6c7be4c1f1fe9a69c5e0af931f9f9c404bd5a7d8c9b7c0b856d5085616a02f18`;
+  the exact secure runner first passed all 848 selected tests in 279.914
+  seconds, an independent inventory audit returned `No findings`, and the
+  final frozen-tree rerun passed the same 848 identities in 249.971 seconds.
+- The final full-suite run exposed a probabilistic public-CLI defect rather
+  than accepting a flaky retry: a URL-safe cleanup token has a 1-in-64 chance
+  to begin with `-`, which argparse interprets as a new option in the documented
+  `--token VALUE` form. New tokens now carry a fixed `rw1_` prefix while
+  retaining all 32 random bytes; digest validation remains compatible with old
+  receipts, including old leading-dash values supplied as `--token=VALUE`. A
+  deterministic leading-dash regression and an independent diagnosis both
+  confirmed the fix.
+- The authoritative final outer-environment suite passed all 3,081 tests with
+  six conditional skips in 982.646 seconds with `ResourceWarning` promoted to
+  an error. The immediately preceding restricted-outer run is not counted as
+  success: it found the cleanup-token defect above and separately hit the known
+  nested macOS `sandbox_apply: Operation not permitted` limitation. The exact
+  broker test then passed independently outside that nested restriction in
+  1.865 seconds before the complete outer-environment run passed.
+- The mother-repository routing prerequisite landed through
+  `Joey-Tools/codex-workspace` PR 12 as signed squash merge
+  `1c3b9c9662ef8c3ed5ddad2c3e272fb6a0eec526`. Its self-contained
+  `skill-repo-codex-gate` uses one fresh local Codex processor plus exact-current-
+  head GitHub Codex, leaves named single/double/triple semantics untouched, and
+  keeps repository-specific exceptions out of this installed skill.
 
 ## Next Steps
 
-- Use the final signed squash candidate head for secret admission and obtain a
-  clean whole-range fresh-context Codex review under the prior trusted release.
-- Merge the canonical PR, complete the private companion and generated sync
-  release chain, install locally, and update this entry with final merge,
-  release, and installation evidence.
+- Freeze and sign the repaired canonical head, rerun exact-head secret
+  admission and a fresh whole-range GPT-5.6 Sol Ultra Codex review under the
+  prior trusted release, then complete PR 108's current-head GitHub lane, CI,
+  final reread, and squash merge.
+- Merge the private companion and generated sync PR, confirm the immutable
+  private-overlay release, run the local installer, and record the final merge,
+  release, and installation identities here.
 
 ## Evidence
 

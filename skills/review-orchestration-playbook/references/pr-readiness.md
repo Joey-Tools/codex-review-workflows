@@ -308,6 +308,83 @@ base-sensitive evidence to remain on the same merge base. If any page is
 incomplete, state changes during the reread, or evidence belongs to a stale
 scope, return to the fix/recovery loop.
 
+## Atomic Head Binding For Merge Execution
+
+The final reread produces one exact `merge_expected_head`, equal to the
+reviewed `head_sha`. Every authorized state-changing operation that can lead to
+merge must carry that value as a server-enforced precondition in the operation
+itself. This applies both to a direct merge and to merge-queue enrollment. A
+separate `headRefOid` read followed by an unconditional mutation has a race and
+does not satisfy this contract.
+
+For a direct merge, GitHub CLI exposes the required compare-and-mutate
+condition as `--match-head-commit`. Select the exact repository and PR rather
+than relying on the current directory or branch:
+
+```text
+# Direct squash merge on a repository without a required merge queue.
+gh pr merge <PR_NUMBER> --repo OWNER/REPO --squash \
+  --match-head-commit <HEAD_SHA>
+```
+
+An equivalent direct-merge client is acceptable only when the same mutation
+carries the exact reviewed head, such as the synchronous pull-request merge
+API's `sha` field. Never emulate the condition with a second read in the
+client.
+
+The queue path needs a persistent expected-head binding, not merely an atomic
+request to enable auto-merge. After every pre-enrollment gate is current and
+clean, use GitHub's documented asynchronous merge endpoint with the exact body
+fields shown here:
+
+```text
+PUT /repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async
+{"sha":"<HEAD_SHA>","merge_action":"merge_queue"}
+
+# The same request through GitHub CLI's API transport.
+gh api --include --method PUT \
+  -H "X-GitHub-Api-Version: 2026-03-10" \
+  repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async \
+  -f sha="<HEAD_SHA>" -f merge_action="merge_queue"
+```
+
+Persist the request's status, response, and UUID. Poll
+`GET /repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async/<UUID>` and require every
+pending result to report `details.expected_head_sha == merge_expected_head`
+and `details.merge_action == "merge_queue"`. A `409` may identify an older
+request whose options differ; never adopt it from status alone. It can count
+only after its result proves the same expected head and queue action. A `200`
+already-merged or already-queued result likewise needs complete current PR,
+queue, and final-head evidence rather than an inferred binding.
+
+For a queue path, atomically enroll the exact reviewed feature head, then
+follow the resulting merge-group checks and reread queue state. Any later
+feature-head change must be observed as cancellation of the bound asynchronous
+merge; it invalidates the enrollment and all old-head evidence and starts the
+applicable full pre-merge verification loop for the new head. An
+`autoMergeRequest` is not equivalent to this persistent binding: if
+`gh pr merge` would only enable long-lived auto-merge rather than prove an
+exact-head queue entry, do not use it. If the async endpoint or an equally
+persistent server-side expected-head queue primitive is unavailable, report
+the queue path blocked; never fall back to an unbound auto-merge request.
+Before any new enrollment, require no active stale `autoMergeRequest` or queue
+entry that could promote another head.
+
+If the expected-head condition reports a mismatch, fails with GitHub's
+conflict response, or the immediate post-operation reread does not show the
+same feature `head_sha`, fail closed. Do not retry the stale mutation. Reread
+the PR, establish the actual current head and range, and rerun every invalidated
+test, review, GitHub, CI, conversation, lifecycle, merge-policy, and final
+reread gate before constructing a new conditionally bound operation. A signed
+merge of the current base into the feature branch under the strict-freshness
+rule is not an exception: it intentionally creates a new head and requires
+that complete rerun.
+
+After a direct merge or queue completion, verify merged lifecycle and resulting
+default-branch state, and require the PR's final feature head to remain exactly
+`merge_expected_head`. A successful command without those postconditions is
+not proof that the reviewed head was the one merged.
+
 ## Merge-Ready Report
 
 Report the decisive state rather than a long transcript:
@@ -321,6 +398,8 @@ pr_readiness:
   base_ref_oid: 40-lowercase-hex
   head_ref_oid: 40-lowercase-hex
   merge_base: 40-lowercase-hex
+  merge_expected_head: same-as-head-ref-oid
+  merge_execution_binding: required-server-side | not-authorized
   range_origin:
     lineage_id: stable-parent-generated-lineage-id
     kind: caller-supplied | pr-derived
@@ -342,5 +421,6 @@ pr_readiness:
 
 `ready` means every required gate was simultaneously true on the final reread.
 It does not itself authorize the merge. If the user authorized merge, perform
-the repository's intended merge method and then verify the merged lifecycle
-and resulting default-branch state.
+the repository's intended merge method through the atomic expected-head
+contract above, then verify the merged lifecycle and resulting default-branch
+state.

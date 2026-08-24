@@ -91,6 +91,7 @@ FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 FILTER_DRIVER = re.compile(r"[A-Za-z0-9_.-]+\Z")
 LOOSE_OBJECT_PATH = re.compile(r"[0-9a-f]{2}/(?:[0-9a-f]{38}|[0-9a-f]{62})\Z")
 CLEANUP_TOKEN_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+CLEANUP_TOKEN_PREFIX = "rw1_"
 MINIMUM_GIT_VERSION = (2, 45, 0)
 _GIT_VERSION_OUTPUT = re.compile(
     rb"git version ([0-9]+)\.([0-9]+)\.([0-9]+)"
@@ -9664,7 +9665,11 @@ def prepare_workspace(
             object_store_deadline,
         )
         _checkout_head(root, head)
-        cleanup_token = secrets.token_urlsafe(32)
+        # argparse treats a separate option value that begins with "-" as a new
+        # option. Prefix the still-unguessable random value so every preparation
+        # receipt can be passed back through the documented ``--token VALUE``
+        # CLI form without probabilistic parsing failures.
+        cleanup_token = CLEANUP_TOKEN_PREFIX + secrets.token_urlsafe(32)
         cleanup_token_sha256 = _cleanup_token_digest(cleanup_token)
         git_identity = _directory_identity(root / ".git")
         objects_identity = _directory_identity(root / ".git/objects")

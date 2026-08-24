@@ -169,7 +169,8 @@
       "provider_children_minimum": 1,
       "child_binding": "exact parent review ID and parent commit_id/original_commit_id",
       "thread_join": "one REST child ID and exact frozen-repository/PR discussion_r<ID> URL to one GraphQL thread comment under the exact parent review with typed isResolved",
-      "incomplete_join": "inconclusive"
+      "incomplete_join": "inconclusive",
+      "all_threads_resolved": "resolved-inline-only classification when the artifact is bound to the exact current head, all pages and joins are complete, at least one provider target child exists, and every typed isResolved value is true"
     }
   },
   "closed_record_fields": {
@@ -254,7 +255,8 @@
     "invalid_or_unbound_ancestor_projection": "malformed",
     "orphaned_or_conflicting_join": "malformed",
     "non_unique_or_incomplete_join_or_pagination": "inconclusive",
-    "inline_resolution_source": "typed GraphQL isResolved only"
+    "inline_resolution_source": "typed GraphQL isResolved only",
+    "resolved_inline_only": "non-positive terminal classification reported as resolved-inline-awaiting-clean with a complete stable parent-owned current-head snapshot; it never completes the lane, never applies to top-level findings, and permits same-head reconcile for a new clean artifact"
   },
   "required_report_schema": {
     "schema": "github-codex-lane-report-v1",
@@ -361,13 +363,79 @@
         "url",
         "channel"
       ],
-      "reaction_clean_identity": [
-        "kind",
-        "id",
-        "url",
-        "channel",
-        "request_id"
+      "reaction_clean_epoch": [
+        "owner",
+        "status",
+        "pre_request_scope",
+        "post_request_scope",
+        "reaction_read_scope",
+        "final_scope",
+        "request_kind",
+        "request_id",
+        "request_url",
+        "request_command",
+        "request_server_time",
+        "reaction_id",
+        "reaction_url",
+        "reaction_content",
+        "reaction_actor_login",
+        "reaction_actor_type",
+        "reaction_server_time",
+        "request_pages_complete",
+        "reaction_pages_complete",
+        "provider_pages_complete",
+        "thread_pages_complete",
+        "no_later_request",
+        "no_conflicting_provider_reaction",
+        "no_provider_eyes_at_or_after_reaction",
+        "no_terminal_provider_artifact",
+        "no_malformed_terminal_looking_provider_artifact",
+        "unresolved_provider_findings"
+      ],
+      "resolved_inline_snapshot": [
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "initial_head_sha",
+        "final_head_sha",
+        "evidence_kind",
+        "evidence_id",
+        "evidence_url",
+        "evidence_channel",
+        "artifact_commit",
+        "grammar_branch",
+        "provider_target_children",
+        "unresolved_provider_findings",
+        "children_pages_complete",
+        "threads_pages_complete",
+        "initial_snapshot_sha256",
+        "final_snapshot_sha256"
       ]
+    },
+    "parent_input_rules": {
+      "reaction_clean_epoch": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted by the parent from raw observations before report validation; read-only to the consumer and never derived from report or evidence fields",
+        "scope_binding": "pre_request_scope, post_request_scope, reaction_read_scope, and final_scope are each closed selected_pr_scope values exactly equal to the report repository, pull request, and head",
+        "request_identity": "issue-comment kind; positive request ID; exact selected-PR issuecomment URL; exact @codex review command; canonical request server time",
+        "reaction_identity": "positive reaction ID; same exact request URL; exact +1 content; exact provider login and Bot type; canonical reaction server time strictly later than request server time",
+        "page_state": "request_pages_complete, reaction_pages_complete, provider_pages_complete, and thread_pages_complete are exact true",
+        "exclusions": "no_later_request, no_conflicting_provider_reaction, no_provider_eyes_at_or_after_reaction, no_terminal_provider_artifact, and no_malformed_terminal_looking_provider_artifact are exact true; unresolved_provider_findings is integer zero",
+        "report_binding": "request ID, reaction ID, reaction URL, reaction server time, and stable-request-epoch evidence fields exactly equal the epoch"
+      },
+      "resolved_inline_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted by the parent from two complete raw current-head snapshots before report validation; read-only to the consumer and never derived from report fields",
+        "scope_binding": "repository, pull request, head_sha, initial_head_sha, final_head_sha, and artifact_commit all equal the selected report scope and exact current head",
+        "evidence_binding": "terminal-artifact kind; exact report evidence ID, URL, review channel, and inline-parent-v1 branch",
+        "finding_state": "provider_target_children is a positive integer and unresolved_provider_findings is integer zero",
+        "page_state": "children_pages_complete and threads_pages_complete are exact true",
+        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the closed parent review, complete provider-target child pages, and exact joined GraphQL thread state sorted by child ID"
+      }
     },
     "selection_outcome_rules": {
       "owner": "parent-orchestrator",
@@ -471,9 +539,23 @@
         "stable_identity": "positive reaction evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<request-ID>",
         "request_relation": "positive request_id equals the parent request comment ID encoded by the URL fragment",
         "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
-        "parent_identity_input": "separate closed parent-owned reaction identity whose kind, reaction evidence ID, URL, channel, and parent request ID equal the report evidence",
+        "parent_identity_input": "separate closed parent-owned reaction_clean_epoch whose four selected-PR scope snapshots equal the report scope and whose exact request, reaction, actor, semantic times, complete pages, exclusion flags, and zero-unresolved count bind the report evidence",
         "artifact_commit": null,
         "head_binding": "stable-request-epoch"
+      },
+      "resolved-inline-awaiting-clean": {
+        "status": "pending",
+        "completion": "forbidden-until-later-accepted-current-head-terminal-clean",
+        "recovery": "same-head idempotent repository-Action reconcile under github-pr-probes retry policy",
+        "last_reason": "resolved-inline-awaiting-current-head-clean",
+        "evidence_kind": "terminal-artifact",
+        "branch": "inline-parent-v1",
+        "channel": "review",
+        "stable_identity": "positive review evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR>#pullrequestreview-<evidence-ID> URL",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_snapshot_input": "separate closed parent-owned resolved_inline_snapshot binds the exact current-head evidence, positive child count, complete child/thread pages, two equal canonical snapshot digests, and zero unresolved provider findings; this remains non-positive until a later accepted current-head clean artifact exists",
+        "artifact_commit": "required-full-sha-equals-report-head",
+        "head_binding": "explicit-commit"
       },
       "merge-status": {
         "status": "pass",
@@ -564,6 +646,35 @@
       },
       "unresolved_provider_findings": [],
       "last_reason": "invalid-null-terminal-commit"
+    },
+    "resolved_inline_awaiting_clean": {
+      "status": "pending",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "resolved-inline-awaiting-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 401,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-401",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "inline-parent-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "server_time": "2026-08-23T09:03:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "resolved-inline-awaiting-current-head-clean"
     },
     "reaction_clean": {
       "status": "pass",
@@ -789,6 +900,7 @@
   "report_base_parent_selection_outcomes": {
     "terminal_clean": "selected_pr",
     "terminal_clean_null_commit": "selected_pr",
+    "resolved_inline_awaiting_clean": "selected_pr",
     "reaction_clean": "selected_pr",
     "merge_status": "selected_pr",
     "finding": "selected_pr",
@@ -920,6 +1032,108 @@
         "evidence": {
           "provider_epoch": "opaque"
         }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-report-valid-pending",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-pass",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "status": "pass"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-claim-pass-reason",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "last_reason": "terminal-clean-current-head"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-claim-terminal-clean",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "status": "pass",
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-old-head",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-top-level-branch",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "grammar_branch": "top-level-finding-v1"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-clean-review-branch",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "grammar_branch": "clean-review-v1"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-wrong-channel",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "channel": "issue-comment",
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-401",
+          "server_time_field": "created_at"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-coupled-identity-mutation",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "id": 402,
+          "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-402"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-carry-unresolved-finding",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": false,
+            "evidence_id": 401,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
       },
       "valid": false
     },
@@ -2118,7 +2332,7 @@
         ]
       },
       "expected": {
-        "classification": "findings",
+        "classification": "resolved-inline-only",
         "branch": "inline-parent-v1",
         "semantic_time_field": "submitted_at",
         "semantic_time": "2026-08-23T09:03:00Z",
@@ -2150,6 +2364,40 @@
         "semantic_time_field": "submitted_at",
         "semantic_time": "2026-08-23T09:05:00Z",
         "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-resolved-is-not-current-head-clean",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 503,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
       }
     },
     {

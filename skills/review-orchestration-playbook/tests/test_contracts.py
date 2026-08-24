@@ -405,6 +405,97 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(rerun_gate, normalized_freshness)
 
+    def test_merge_execution_atomically_binds_the_reviewed_head(self) -> None:
+        skill = _normalize(_read("SKILL.md"))
+        readiness = _read("references/pr-readiness.md")
+        execution = readiness.split("## Atomic Head Binding For Merge Execution", 1)[
+            1
+        ].split("## Merge-Ready Report", 1)[0]
+        normalized_execution = _normalize(execution)
+
+        for required in (
+            "direct merge and to merge-queue enrollment",
+            "server-enforced precondition in the operation itself",
+            "--match-head-commit",
+            "select the exact repository and pr",
+            "a separate `headrefoid` read followed by an unconditional mutation "
+            "has a race",
+            "never emulate the condition with a second read in the client",
+            "do not retry the stale mutation",
+            "the pr's final feature head to remain exactly `merge_expected_head`",
+        ):
+            self.assertIn(required, normalized_execution)
+
+        self.assertIn(
+            "gh pr merge <pr_number> --repo owner/repo --squash",
+            normalized_execution,
+        )
+        self.assertIn(
+            "gh pr merge <pr_number> --repo owner/repo",
+            normalized_execution,
+        )
+        self.assertEqual(
+            normalized_execution.count("--match-head-commit <head_sha>"), 1
+        )
+        self.assertIn(
+            "the same mutation carries the exact reviewed head", normalized_execution
+        )
+
+        for persistent_queue_anchor in (
+            "put /repos/owner/repo/pulls/<pr_number>/merge-async",
+            '{"sha":"<head_sha>","merge_action":"merge_queue"}',
+            "get /repos/owner/repo/pulls/<pr_number>/merge-async/<uuid>",
+            "details.expected_head_sha == merge_expected_head",
+            'details.merge_action == "merge_queue"',
+            "persist the request's status, response, and uuid",
+            "a `409` may identify an older request whose options differ",
+            "feature-head change must be observed as cancellation",
+            "an `automergeRequest` is not equivalent to this persistent binding",
+            "if the async endpoint or an equally persistent server-side expected-head queue primitive is unavailable",
+            "never fall back to an unbound auto-merge request",
+            "require no active stale `automergeRequest` or queue entry",
+        ):
+            self.assertIn(persistent_queue_anchor.lower(), normalized_execution)
+
+        queue_example = normalized_execution.split(
+            "# the same request through github cli's api transport.", 1
+        )[1].split("```", 1)[0]
+        self.assertIn("gh api --include --method put", queue_example)
+        self.assertIn("x-github-api-version: 2026-03-10", queue_example)
+        self.assertIn("merge-async", queue_example)
+        self.assertIn('-f sha="<head_sha>"', queue_example)
+        self.assertIn('-f merge_action="merge_queue"', queue_example)
+        self.assertNotIn("gh pr merge", queue_example)
+
+        for invalidated_gate in (
+            "test",
+            "review",
+            "github",
+            "ci",
+            "conversation",
+            "lifecycle",
+            "merge-policy",
+            "final reread",
+        ):
+            self.assertIn(invalidated_gate, normalized_execution)
+
+        self.assertIn("direct merge and merge-queue enrollment", skill)
+        self.assertIn("--match-head-commit <head_sha>", skill)
+        self.assertIn("asynchronous merge request", skill)
+        self.assertIn("`merge_action: merge_queue`", skill)
+        self.assertIn("a polled `expected_head_sha`", skill)
+        self.assertIn("long-lived auto-merge request", skill)
+        self.assertIn("the queue path is blocked", skill)
+        self.assertIn("a separate head read is not an atomic substitute", skill)
+        self.assertIn("a mismatch fails closed", skill)
+
+        report = _normalize(readiness.split("## Merge-Ready Report", 1)[1])
+        self.assertIn("merge_expected_head: same-as-head-ref-oid", report)
+        self.assertIn(
+            "merge_execution_binding: required-server-side | not-authorized",
+            report,
+        )
+
     def test_change_delivery_reviews_the_exact_final_landing_head(self) -> None:
         delivery_path = POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
         delivery = delivery_path.read_text(encoding="utf-8")

@@ -200,6 +200,27 @@ A terminal clean artifact passes only when all of these hold:
 - scope, lifecycle, raw pages, and selected evidence remain stable on the
   final reread.
 
+A current-head `inline-parent-v1` artifact whose provider-target inline
+children are all resolved is a closed non-positive terminal classification,
+not a clean artifact. Report it as `pending` with the distinct
+`resolved-inline-awaiting-clean` basis. The parent must supply the closed
+`resolved_inline_snapshot` input, frozen independently from two complete raw
+snapshots before report validation and never derived from report fields:
+exact repository, PR,
+initial/current/final head and artifact commit; exact artifact ID, URL, review
+channel, and branch; a positive provider-target child count; complete child
+and GraphQL thread pages; integer zero unresolved provider findings; and equal
+initial/final SHA-256 digests of the RFC 8785 canonical closed carrier plus
+joined thread snapshot sorted by child ID. A top-level finding, an unresolved
+child, a zero-child carrier, an ancestor-head artifact, incomplete pagination,
+a malformed join, or an unstable snapshot cannot use this basis.
+
+`resolved-inline-awaiting-clean` never completes the lane and never satisfies
+the required latest-current-head terminal-clean conjunction. Because the
+terminal artifact also excludes reaction fallback, recovery may reconcile the
+same head by idempotently rerunning the repository Action under the retry
+policy to obtain a later accepted clean comment or review.
+
 An `APPROVED` review is not clean when an associated provider inline comment
 contains a finding. A clean body never overrides an unresolved thread finding.
 Parse and join all associated provider children before treating an ancestor
@@ -245,11 +266,12 @@ result, and final reread required by PR readiness. Do not create an empty
 commit merely to turn a resolved finding into a fresh review.
 
 When terminal candidates share the latest semantic server time, findings win
-over clean within the same GitHub channel. Conflicting latest candidates from
-different channels, a latest malformed candidate, or a contradictory commit
-binding is inconclusive. Use `submitted_at` for reviews and the body-effective
-server time for issue comments (`updated_at` when edited, otherwise
-`created_at`). Do not compare IDs across GitHub resource types.
+over clean or resolved-inline-only within the same GitHub channel. Conflicting
+latest candidates from different channels, a latest malformed candidate, or a
+contradictory commit binding is inconclusive. Use `submitted_at` for reviews
+and the body-effective server time for issue comments (`updated_at` when
+edited, otherwise `created_at`). Do not compare IDs across GitHub resource
+types.
 
 ## Reaction-Only Fallback
 
@@ -260,8 +282,9 @@ Accept it only when every condition holds:
 
 1. The parent selected the unique latest visible exact `@codex review` request
    for the current head epoch.
-2. The PR head was read immediately before and after the request and has the
-   same value when the reaction and final snapshot are read.
+2. The PR scope and head were read immediately before and after the request
+   and have the same repository, PR, and head when the reaction and final
+   snapshot are read.
 3. The exact provider actor placed a `+1` reaction on that request after the
    request's server creation time.
 4. Request and reaction pagination is complete, and there is no later request,
@@ -274,6 +297,21 @@ Accept it only when every condition holds:
 
 `eyes` is liveness only. It never proves clean. A terminal artifact takes
 precedence over reaction fallback even if the reaction is later.
+
+The report consumer accepts reaction fallback only with a separate closed,
+parent-owned `reaction_clean_epoch` input. The parent freezes and persists it
+from the raw observations before report validation; the consumer reads it as
+an independent trust input and never derives it from report or evidence
+fields. Its `pre_request_scope`,
+`post_request_scope`, `reaction_read_scope`, and `final_scope` are each closed
+selected-PR scope values and must all equal the report scope and exact head.
+The epoch also binds the exact request ID/URL/command/server time and reaction
+ID/URL/`+1`/provider actor/server time, requires the reaction to be later than
+the request, records complete request/reaction/provider/thread pages, and
+records the absence of later requests, conflicting reactions, later `eyes`,
+terminal artifacts, malformed terminal-looking artifacts, and unresolved
+findings. Reusing a head-A request or reaction while reporting head B therefore
+fails closed even if the visible IDs and URL are unchanged.
 
 If the POST outcome was ambiguous, first reread the unchanged current head and
 its complete visible exact-request set. If delivery still cannot be proved,
@@ -310,6 +348,7 @@ defined in [github-pr-probes.md](github-pr-probes.md).
 | Trusted terminal clean artifact and no provider finding is unresolved | `pass` |
 | Valid reaction fallback and no provider finding is unresolved | `pass` |
 | Any applicable unresolved provider finding | `findings` |
+| Stable current-head inline-only artifact has one or more provider children and all are GraphQL-resolved, but no later terminal clean exists | `pending` with `resolved-inline-awaiting-clean`; reconcile may retry the Action |
 | Work is running or failure is retryable | `pending` |
 | Pagination, identity, grammar, scope, ordering, or final stability cannot be proved | `inconclusive` |
 | Authenticated selection proves no supported PR | `not-applicable` using the closed null-PR/head variant |
@@ -331,7 +370,7 @@ github_codex_lane:
   head_sha: 40-lowercase-hex
   scope_assurance: latest-head-only
   base_assurance: local-pr-readiness
-  basis: merge-status | terminal-clean | reaction-clean | null
+  basis: merge-status | terminal-clean | resolved-inline-awaiting-clean | reaction-clean | null
   evidence: one-closed-variant-below-or-null
   request_policy:
     status: compliant | warning | unknown | not-applicable
@@ -392,6 +431,17 @@ structurally invalid for terminal clean. The clean channel and grammar branch
 are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
 requires `clean-review-v1`; crossing those pairs is malformed evidence.
 
+`basis: resolved-inline-awaiting-clean` uses the same closed terminal-artifact
+evidence fields, but only with `status: pending`, `channel: review`,
+`grammar_branch: inline-parent-v1`, a non-null `artifact_commit` equal to the
+report head, and `head_binding: explicit-commit`. It additionally requires the
+separate closed parent-owned `resolved_inline_snapshot` described above. Empty
+report findings alone are never enough: the snapshot must prove a positive
+child count, complete joined pages, typed GraphQL resolution for every
+provider child, and stable initial/final canonical snapshot digests. Changing
+this report to `status: pass` or `basis: terminal-clean` is structurally
+invalid; a later accepted current-head clean artifact is still required.
+
 Reaction fallback uses a separate closed shape:
 
 ```yaml
@@ -411,9 +461,10 @@ evidence:
 ```
 
 `stable-request-epoch` is valid only in that `basis: reaction-clean` reaction
-variant. A `basis: merge-status` report uses this distinct closed check-run
-shape; `provider_clean_evidence` is the complete terminal-clean evidence shape
-shown above, not an ID-only assertion:
+variant, and the evidence is accepted only alongside the closed parent-owned
+`reaction_clean_epoch` described above. A `basis: merge-status` report uses
+this distinct closed check-run shape; `provider_clean_evidence` is the complete
+terminal-clean evidence shape shown above, not an ID-only assertion:
 
 ```yaml
 evidence:
