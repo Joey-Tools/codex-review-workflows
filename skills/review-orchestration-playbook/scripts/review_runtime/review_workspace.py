@@ -173,6 +173,57 @@ def _attach_workspace_diagnostic(error: BaseException, diagnostic: str) -> None:
     error.__cause__ = node
 
 
+def _attach_workspace_failure_diagnostic(
+    primary: BaseException,
+    secondary: BaseException,
+    *,
+    context: str,
+) -> None:
+    """Expose a secondary failure without replacing an explicit primary cause."""
+
+    if primary is secondary:
+        return
+    detail = str(secondary).strip()
+    diagnostic = f"{context} ({type(secondary).__name__})"
+    reason = getattr(secondary, "reason", None)
+    if isinstance(reason, str) and reason:
+        diagnostic += f" [{reason}]"
+    if detail:
+        diagnostic += f": {detail}"
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(diagnostic)
+        return
+    # Python 3.10 has no exception notes. Attach the visible diagnostic below
+    # an existing explicit cause so the direct cause identity remains intact.
+    if primary.__cause__ is not None:
+        _attach_workspace_diagnostic(primary.__cause__, diagnostic)
+        return
+    _attach_workspace_diagnostic(primary, diagnostic)
+
+
+def _bind_workspace_failure_cause(
+    primary: BaseException,
+    cause: BaseException | None,
+    *,
+    context: str,
+) -> None:
+    """Bind one causal predecessor while retaining any existing explicit cause."""
+
+    if cause is None or primary is cause:
+        return
+    if primary.__cause__ is None:
+        primary.__cause__ = cause
+        primary.__suppress_context__ = True
+        return
+    if primary.__cause__ is not cause:
+        _attach_workspace_failure_diagnostic(
+            primary,
+            cause,
+            context=context,
+        )
+
+
 @dataclass(frozen=True)
 class _RecoveryProcessIdentity:
     pid: int
@@ -4217,6 +4268,7 @@ class _PartialRecoveryControl:
         self.descriptor = -1
         self.parent_descriptor = -1
         self.root_descriptor = -1
+        operation_error: BaseException | None = None
         try:
             if retain and self.payload.get("state") not in {
                 "retained-quiescence-unproven",
@@ -4244,10 +4296,40 @@ class _PartialRecoveryControl:
                     )
                 os.unlink(self.path.name, dir_fd=parent_descriptor)
                 os.fsync(parent_descriptor)
+        except BaseException as error:
+            operation_error = error
+            raise
         finally:
-            os.close(descriptor)
-            os.close(root_descriptor)
-            os.close(parent_descriptor)
+            close_errors: list[tuple[str, BaseException]] = []
+            for label, opened in (
+                ("control", descriptor),
+                ("workspace root", root_descriptor),
+                ("workspace parent", parent_descriptor),
+            ):
+                try:
+                    os.close(opened)
+                except BaseException as error:
+                    close_errors.append((label, error))
+            if operation_error is not None:
+                for label, error in close_errors:
+                    _attach_workspace_failure_diagnostic(
+                        operation_error,
+                        error,
+                        context=f"partial recovery {label} descriptor close failed",
+                    )
+            elif close_errors:
+                selected_label, selected_error = close_errors[0]
+                _attach_workspace_diagnostic(
+                    selected_error,
+                    f"partial recovery {selected_label} descriptor close failed",
+                )
+                for label, error in close_errors[1:]:
+                    _attach_workspace_failure_diagnostic(
+                        selected_error,
+                        error,
+                        context=f"partial recovery {label} descriptor close failed",
+                    )
+                raise selected_error
 
 
 def retain_workspace_for_owner_exit_recovery(
@@ -5158,6 +5240,14 @@ def _finish_forwarded_signal_mask(
             status=status,
             details=details,
         )
+        if primary_error is not None:
+            if process_quiescence_unproven(primary_error):
+                mark_process_quiescence_unproven(failure)
+            if _partial_workspace_requires_retention(primary_error):
+                _mark_partial_workspace_for_retention(failure)
+            recovery_payload = _partial_workspace_recovery_payload(primary_error)
+            if recovery_payload is not None:
+                _record_partial_workspace_recovery(failure, recovery_payload)
         if pending_error is not None:
             _attach_workspace_diagnostic(
                 failure,
@@ -6202,7 +6292,7 @@ def _derive_destination_range_objects(
     return tuple(sorted(object_ids))
 
 
-def _verify_range_object_contents(
+def _verify_range_object_contents_under_signal_mask(
     root: pathlib.Path,
     object_format: str,
     object_ids: Sequence[str],
@@ -6222,7 +6312,13 @@ def _verify_range_object_contents(
         absolute_deadline is not None and absolute_deadline <= integrity_deadline
     )
 
+    def check_forwarded_signal() -> None:
+        pending = consume_pending_forwarded_signal()
+        if pending is not None:
+            raise ForwardedSignal(pending)
+
     def check_deadline() -> None:
+        check_forwarded_signal()
         if time.monotonic() < deadline:
             return
         if validation_deadline_controls and deadline_checker is not None:
@@ -6399,6 +6495,9 @@ def _verify_range_object_contents(
                 start_new_session=True,
             )
 
+        # Keep forwarded signals blocked in the lease worker and verifier child.
+        # The main-thread checkpoints drain them while the outer mask retains
+        # custody through lease settlement and recovery-control finalization.
         process = process_lease.spawn(
             spawn_process,
             command=process_command,
@@ -6406,6 +6505,8 @@ def _verify_range_object_contents(
             terminate=terminate_process_group,
             process_group_exists=_process_group_exists,
             grace_seconds=5.0,
+            check_interruption=check_forwarded_signal,
+            unblock_signals=(),
         )
         process_binding = _bind_recovery_process(process.pid)
         partial_control.bind_process(
@@ -6422,12 +6523,14 @@ def _verify_range_object_contents(
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         while True:
+            check_forwarded_signal()
             remaining_time = deadline - time.monotonic()
             if remaining_time <= 0:
                 check_deadline()
             if process.poll() is not None and stdout_eof and stderr_eof:
                 break
             events = selector.select(min(0.25, remaining_time))
+            check_forwarded_signal()
             for key, _events in events:
                 if key.data == "stdin":
                     if input_offset >= len(query):
@@ -6645,30 +6748,81 @@ def _verify_range_object_contents(
             try:
                 partial_control.release_process(process_binding)
             except BaseException as error:
-                if primary_error is not None:
-                    _attach_workspace_diagnostic(
-                        primary_error,
-                        "partial recovery process release failed: "
-                        f"{type(error).__name__}",
-                    )
-                else:
-                    release_error = error
+                release_error = error
         for index in range(len(stderr)):
             stderr[index] = 0
+
+        selected_teardown_error = (
+            process_leak or settlement_error or primary_error or release_error
+        )
+        revalidation_error: BaseException | None = None
+        revalidation_original_cause: BaseException | None = None
+        finalization_error: BaseException | None = None
         try:
-            control_binding.revalidate()
-        except BaseException as revalidation_error:
+            if settlement_error is not None:
+                _bind_workspace_failure_cause(
+                    settlement_error,
+                    primary_error,
+                    context=(
+                        "object verifier primary failure preceded lease "
+                        "settlement failure"
+                    ),
+                )
             if process_leak is not None:
-                if recovery_payload is not None:
-                    _inherit_unquiesced_workspace_retention(
-                        revalidation_error,
-                        recovery_payload,
+                _bind_workspace_failure_cause(
+                    process_leak,
+                    settlement_error or primary_error,
+                    context="object verifier process leak had another teardown source",
+                )
+            if (
+                release_error is not None
+                and release_error is not selected_teardown_error
+            ):
+                if selected_teardown_error is primary_error and isinstance(
+                    release_error, ForwardedSignal
+                ):
+                    _attach_workspace_diagnostic(
+                        selected_teardown_error,
+                        "forwarded signal "
+                        f"{int(release_error.signum)} was deferred behind the "
+                        "primary failure",
                     )
-                else:
-                    mark_process_quiescence_unproven(revalidation_error)
-                    _mark_partial_workspace_for_retention(revalidation_error)
-            if primary_error is not None:
-                raise revalidation_error from primary_error
+                elif selected_teardown_error is not None:
+                    _attach_workspace_failure_diagnostic(
+                        selected_teardown_error,
+                        release_error,
+                        context="partial recovery process release failed",
+                    )
+
+            try:
+                control_binding.revalidate()
+            except BaseException as error:
+                revalidation_error = error
+                revalidation_original_cause = error.__cause__
+                if process_leak is not None:
+                    if recovery_payload is not None:
+                        _inherit_unquiesced_workspace_retention(
+                            revalidation_error,
+                            recovery_payload,
+                        )
+                    else:
+                        mark_process_quiescence_unproven(revalidation_error)
+                        _mark_partial_workspace_for_retention(revalidation_error)
+                if revalidation_original_cause is not None:
+                    for teardown_error in (
+                        process_leak,
+                        settlement_error,
+                        primary_error,
+                        release_error,
+                    ):
+                        if teardown_error is not None:
+                            _attach_workspace_failure_diagnostic(
+                                revalidation_error,
+                                teardown_error,
+                                context="object verifier teardown also failed",
+                            )
+        except BaseException as error:
+            finalization_error = error
             raise
         finally:
             retain_control = process_leak is not None
@@ -6676,23 +6830,64 @@ def _verify_range_object_contents(
                 partial_control.close(retain=retain_control)
             except BaseException as control_error:
                 selected_error = (
-                    process_leak or settlement_error or primary_error or release_error
+                    revalidation_error or finalization_error or selected_teardown_error
                 )
                 if selected_error is None:
                     raise
-                _attach_workspace_diagnostic(
+                _attach_workspace_failure_diagnostic(
                     selected_error,
-                    "partial recovery control finalization failed: "
-                    f"{type(control_error).__name__}",
+                    control_error,
+                    context="partial recovery control finalization failed",
                 )
+
+        if revalidation_error is not None:
+            if revalidation_original_cause is not None:
+                raise revalidation_error from revalidation_original_cause
+            if selected_teardown_error is not None:
+                raise revalidation_error from selected_teardown_error
+            raise revalidation_error
         if process_leak is not None:
-            raise process_leak from primary_error
+            raise process_leak from process_leak.__cause__
         if settlement_error is not None:
-            raise settlement_error from primary_error
-        if release_error is not None:
+            if settlement_error.__cause__ is not None:
+                raise settlement_error from settlement_error.__cause__
+            raise settlement_error
+        if release_error is not None and selected_teardown_error is release_error:
             raise release_error
         if selector_error is not None and verification_error is None:
             raise selector_error
+
+
+def _verify_range_object_contents(
+    root: pathlib.Path,
+    object_format: str,
+    object_ids: Sequence[str],
+    control_binding: _WorkspaceControlBinding,
+    *,
+    absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
+) -> None:
+    """Verify exact objects while deferring forwarded signals through teardown."""
+
+    signal_owner = _begin_forwarded_signal_mask()
+    primary_error: BaseException | None = None
+    try:
+        _verify_range_object_contents_under_signal_mask(
+            root,
+            object_format,
+            object_ids,
+            control_binding,
+            absolute_deadline=absolute_deadline,
+            deadline_checker=deadline_checker,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _finish_forwarded_signal_mask(
+            signal_owner,
+            primary_error=primary_error,
+        )
 
 
 def _validate_range_manifest(

@@ -76,13 +76,22 @@ instruction_surface:
 auth_only_codex_home_status: <validated-review-process | invalid | not-applicable>
 auth_only_codex_home_receipt: <stable opaque parent-private receipt identity | not-applicable>
 codex_git:
+  prefix_receipt_schema: <sanitized-git-argv-prefix-receipt-v2 | not-applicable>
+  prefix_receipt: <compact canonical closed composite JSON object | not-applicable>
+  prefix_receipt_sha256: <lowercase SHA-256 | not-applicable>
+  prefix_receipt_parent_prompt_match: <exact-type-preserving | invalid | not-applicable>
+  prefix_receipt_cross_field_match: <exact-type-preserving | invalid | not-applicable>
   prefix_profile: <sanitized-git-argv-prefix-v2 | not-applicable>
   sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>
   sanitized_git_argv_prefix: <exact UTF-8 JSON token array | not-applicable>
   sanitized_git_argv_prefix_sha256: <lowercase SHA-256 | not-applicable>
   executable: <fixed absolute Git path | not-applicable>
-  version: <exact accepted Git version output | not-applicable>
-  workspace_validation_receipt: <stable receipt identity | not-applicable>
+  executable_identity: <exact closed lexical/target stat identity | not-applicable>
+  version: <exact accepted normalized Git version output | not-applicable>
+  version_stdout: <exact accepted Git version stdout | not-applicable>
+  version_stdout_sha256: <lowercase SHA-256 | not-applicable>
+  workspace_validation_receipt: <compact canonical closed JSON object | not-applicable>
+  workspace_validation_receipt_sha256: <lowercase SHA-256 | not-applicable>
 candidate_projection_encoding: <canonical-json-utf8-v1>
 candidate_projection_encoding_parent_prompt_match: <exact-type-preserving | invalid>
 ordinary_candidate_guidance_profile: <ordinary-candidate-guidance-v1 | not-applicable>
@@ -112,8 +121,10 @@ non_goals:
   - <optional explicitly excluded work>
 ```
 
-The object/array placeholders above are exact transport slots, not nested
-metadata containers. Every active value under
+The object/array placeholders above are exact transport slots, not prompt
+syntax or nested free-form metadata containers. Every active value under
+`codex_git.prefix_receipt`, `codex_git.sanitized_git_argv_prefix`,
+`codex_git.executable_identity`, `codex_git.workspace_validation_receipt`,
 `ordinary_candidate_guidance_required_set`, `ordinary_candidate_guidance`,
 `ordinary_candidate_guidance_fallback_filenames`,
 `candidate_markdown_required_subject_set`,
@@ -123,6 +134,20 @@ and parent lane report. The decoded object/array schemas are defined below.
 JSON string escaping preserves every exact path without allowing a newline,
 control byte, quote, backslash, colon, or path-like prompt text to create
 another metadata field.
+
+For an active Codex lane, `prefix_receipt_schema` is exact-type equal to
+`prefix_receipt.schema_version` and `prefix_receipt_sha256` is exact-type equal
+to the embedded `prefix_receipt.receipt_sha256`; it is not a second digest over
+the full transported object. `prefix_receipt_cross_field_match` is
+`exact-type-preserving` only when the outer workspace/base/head and every
+duplicated prefix, Git, and workspace-validation field equal their exact nested
+values. The top-level `workspace_receipts.validate` identity is the exact
+`codex_git.workspace_validation_receipt_sha256` for this live receipt, never an
+older standalone validation. Before launch the parent independently validates
+the composite closed schema and all three equalities, then records exact
+parent/prompt equality for the entire composite object. A coupled mutation with
+recomputed inner and outer digests still fails these independent frozen-scope
+and duplicated-field equalities.
 
 `canonical-json-utf8-v1` has one closed encoder: recursively sort every JSON
 object's string member names by their UTF-8 bytes, serialize with UTF-8,
@@ -745,6 +770,8 @@ prompt_bytes: <exact UTF-8 byte count>
 prompt_sha256: <lowercase SHA-256 hex>
 base_sha: <full object id>
 head_sha: <full object id>
+workspace: <absolute validated lane-private path>
+workspace_parent_prompt_report_match: <exact-type-preserving | invalid>
 requested_model: <value>
 effective_model: <runtime-attested or accepted-pinned-launch value, or unknown>
 requested_codex_mode: <value or not-applicable>
@@ -788,9 +815,20 @@ candidate_markdown_parent_prompt_report_match: <exact-type-preserving | invalid 
 candidate_markdown_admission_inventory_match: <exact-type-preserving | invalid | not-applicable>
 sanitized_git_argv_prefix_profile: <sanitized-git-argv-prefix-v2 | not-applicable>
 sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>
+sanitized_git_argv_prefix: <exact UTF-8 JSON token array | not-applicable>
 sanitized_git_argv_prefix_sha256: <lowercase SHA-256 | not-applicable>
+codex_git_prefix_receipt_schema: <sanitized-git-argv-prefix-receipt-v2 | not-applicable>
+codex_git_prefix_receipt: <exact closed composite JSON object | not-applicable>
+codex_git_prefix_receipt_sha256: <lowercase SHA-256 | not-applicable>
+codex_git_prefix_receipt_parent_prompt_report_match: <exact-type-preserving | invalid | not-applicable>
+codex_git_prefix_receipt_cross_field_match: <exact-type-preserving | invalid | not-applicable>
 git_executable: <fixed absolute path | not-applicable>
-git_version: <exact accepted version output | not-applicable>
+git_executable_identity: <exact closed lexical/target stat identity | not-applicable>
+git_version: <exact accepted normalized version output | not-applicable>
+git_version_stdout: <exact accepted version stdout | not-applicable>
+git_version_stdout_sha256: <lowercase SHA-256 | not-applicable>
+workspace_validation_receipt: <exact closed JSON object | not-applicable>
+workspace_validation_receipt_sha256: <lowercase SHA-256 | not-applicable>
 git_prefix_delivery: <verified | failed | not-applicable>
 git_read_only_boundary: <established | unavailable | not-applicable>
 git_prefix_observation: <complete | partial | unobservable | deviated | not-applicable>
@@ -826,10 +864,23 @@ For a Codex lane, `sanitized_git_argv_prefix_conformance` must be
 is inconclusive. `partial` or `unobservable` records the adapter's telemetry
 limit; it does not by itself prevent a clean result when delivery and the
 read-only boundary are established and no deviation is observed. The receipt
-binds the machine-validated profile and prefix digest to the same fixed Git
-path/version, canonical workspace, and validation-receipt identity carried in
-the prompt. Do not infer argv-level compliance from a clean answer or turn
-missing telemetry into deviation.
+must be the closed `sanitized-git-argv-prefix-receipt-v2` record and remain
+type-preservingly identical across parent state, prompt, and report. Its stable
+digest must validate after excluding only its final `receipt_sha256`, and
+`codex_git_prefix_receipt_cross_field_match` must prove that every repeated raw
+prefix, frozen endpoint, canonical workspace, Git path/version/identity, and
+raw validation-receipt field exactly matches the corresponding composite
+field. In particular,
+`codex_git_prefix_receipt_schema == codex_git_prefix_receipt.schema_version`,
+`codex_git_prefix_receipt_sha256 == codex_git_prefix_receipt.receipt_sha256`,
+and the receipt's `worktree` / `base` / `head` exactly match the repeated
+`workspace` / `base_sha` / `head_sha` values before the cross-field result can
+be exact. The parent must also rerun the live composite consumer immediately
+before launch; structure/self-digest validation alone is insufficient. A
+scalar/object/array type drift, a recomputed digest over altered cross-fields,
+or a missing executable/validation identity is inconclusive. Do not infer
+argv-level compliance from a clean answer or turn missing telemetry into
+deviation.
 
 For every CLI lane, `instruction_surface` must be `isolated`; the
 version-bound instruction-surface and neutral launch-root receipts must

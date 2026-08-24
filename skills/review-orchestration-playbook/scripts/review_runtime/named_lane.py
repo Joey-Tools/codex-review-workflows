@@ -30,6 +30,8 @@ from .common import (
     ReviewProcessLeakError,
     ReviewTimeoutError,
     TRUSTED_PATH,
+    _executable_candidate_identity,
+    _is_process_control_flow_error,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
     forwarded_signals,
@@ -47,6 +49,7 @@ from .review_workspace import (
     PreparedWorkspace,
     RangeIncomplete,
     ReviewWorkspaceError,
+    WORKSPACE_SCHEMA_VERSION,
     _finish_forwarded_signal_mask,
     _partial_workspace_recovery_payload,
     cleanup_workspace,
@@ -154,6 +157,83 @@ CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS = (
 SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v2"
 SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE = "exact-token-sequence"
 SANITIZED_GIT_ARGV_PREFIX_ENCODING = "canonical-json-utf8-v1"
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION = (
+    "sanitized-git-argv-prefix-receipt-v2"
+)
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM = (
+    "sha256-canonical-json-utf8-v1-without-receipt-sha256"
+)
+_SANITIZED_GIT_VERSION_OUTPUT = re.compile(
+    rb"git version ([0-9]+)\.([0-9]+)\.([0-9]+)"
+    rb"(?: \(Apple Git-[0-9]+(?:\.[0-9]+)*\))?\n?\Z"
+)
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_EXECUTABLE_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "file_type",
+    "mode",
+    "uid",
+    "gid",
+    "nlink",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+)
+_WORKSPACE_VALIDATION_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "command",
+        "worktree",
+        "base",
+        "head",
+        "object_format",
+        "strategy",
+        "source_shallow",
+        "commit_count",
+        "range_object_count",
+        "range_object_sha256",
+        "parent_support_object_count",
+        "parent_support_object_sha256",
+        "config_sha256",
+        "shallow_bytes",
+        "shallow_sha256",
+        "symlink_count",
+        "parent_identity",
+        "workspace_identity",
+        "git_identity",
+        "objects_identity",
+        "marker_sha256",
+        "cleanup_token_sha256",
+    }
+)
+_SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST = frozenset(
+    {
+        "schema_version",
+        "status",
+        "command",
+        "prefix_profile",
+        "sanitized_git_argv_prefix_conformance",
+        "sanitized_git_argv_prefix",
+        "sanitized_git_argv_prefix_encoding",
+        "sanitized_git_argv_prefix_sha256",
+        "git_executable",
+        "git_executable_identity",
+        "git_version",
+        "git_version_stdout",
+        "git_version_stdout_sha256",
+        "worktree",
+        "base",
+        "head",
+        "workspace_validation_receipt",
+        "workspace_validation_receipt_encoding",
+        "workspace_validation_receipt_sha256",
+        "no_lazy_fetch_control",
+        "receipt_identity_encoding",
+        "receipt_identity_algorithm",
+    }
+)
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
@@ -294,7 +374,7 @@ def validate_sanitized_git_argv_prefix(
         raise NamedLaneGuardError(
             "sanitized Git argv prefix could not be read as a token sequence"
         ) from error
-    if not all(isinstance(token, str) for token in observed):
+    if not all(type(token) is str for token in observed):
         raise NamedLaneGuardError(
             "sanitized Git argv prefix contains a non-string token"
         )
@@ -310,27 +390,544 @@ def validate_sanitized_git_argv_prefix(
     return observed
 
 
-def sanitized_git_argv_prefix_receipt(
-    *,
-    worktree: pathlib.Path,
+def _require_closed_mapping(
+    value: object,
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise NamedLaneGuardError(f"{label} must be an exact JSON object")
+    if frozenset(value) != expected_keys:
+        raise NamedLaneGuardError(f"{label} does not match its closed schema")
+    return value
+
+
+def _require_nonnegative_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise NamedLaneGuardError(f"{label} must be a nonnegative JSON integer")
+    return value
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if type(value) is not str or _LOWER_SHA256.fullmatch(value) is None:
+        raise NamedLaneGuardError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _executable_identity_record(metadata: os.stat_result) -> dict[str, int]:
+    return dict(
+        zip(
+            _EXECUTABLE_IDENTITY_FIELDS,
+            _executable_candidate_identity(metadata),
+            strict=True,
+        )
+    )
+
+
+def _capture_prefix_git_executable_identity(
     git_executable: pathlib.Path,
 ) -> dict[str, object]:
-    """Return the closed machine-generated v1 prefix record."""
+    try:
+        lexical = git_executable.lstat()
+        resolved_path = git_executable.resolve(strict=True)
+        target = git_executable.stat()
+        resolved_target = resolved_path.stat()
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Codex review Git executable identity cannot be inspected"
+        ) from error
+    if (
+        _executable_candidate_identity(target)
+        != _executable_candidate_identity(resolved_target)
+        or not stat.S_ISREG(target.st_mode)
+        or not bool(target.st_mode & 0o111)
+        or not os.access(git_executable, os.X_OK)
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git executable identity is not a stable executable"
+        )
+    return {
+        "lexical": _executable_identity_record(lexical),
+        "resolved_path": str(resolved_path),
+        "target": _executable_identity_record(target),
+    }
 
-    tokens = validate_sanitized_git_argv_prefix(
-        build_sanitized_git_argv_prefix(
-            worktree=worktree,
-            git_executable=git_executable,
+
+def _validate_executable_identity_record(value: object) -> dict[str, object]:
+    record = _require_closed_mapping(
+        value,
+        frozenset({"lexical", "resolved_path", "target"}),
+        "Codex review Git executable identity",
+    )
+    resolved_path = record["resolved_path"]
+    if (
+        type(resolved_path) is not str
+        or not pathlib.Path(resolved_path).is_absolute()
+        or any(character in resolved_path for character in ("\x00", "\n", "\r"))
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git resolved executable path is invalid"
+        )
+    for key in ("lexical", "target"):
+        identity = _require_closed_mapping(
+            record[key],
+            frozenset(_EXECUTABLE_IDENTITY_FIELDS),
+            f"Codex review Git executable {key} identity",
+        )
+        for field in _EXECUTABLE_IDENTITY_FIELDS:
+            _require_nonnegative_integer(
+                identity[field],
+                f"Codex review Git executable {key}.{field}",
+            )
+        if identity["file_type"] != stat.S_IFMT(identity["mode"]):
+            raise NamedLaneGuardError(
+                f"Codex review Git executable {key} mode/type binding is invalid"
+            )
+    lexical = record["lexical"]
+    target = record["target"]
+    assert isinstance(lexical, dict)
+    assert isinstance(target, dict)
+    if lexical["file_type"] not in {stat.S_IFREG, stat.S_IFLNK}:
+        raise NamedLaneGuardError("Codex review Git lexical executable type is invalid")
+    if target["file_type"] != stat.S_IFREG or not bool(target["mode"] & 0o111):
+        raise NamedLaneGuardError("Codex review Git target identity is not executable")
+    return record
+
+
+def _validate_workspace_validation_receipt(
+    value: object,
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+) -> dict[str, object]:
+    receipt = _require_closed_mapping(
+        value,
+        _WORKSPACE_VALIDATION_RECEIPT_FIELDS,
+        "workspace validation receipt",
+    )
+    exact_values = {
+        "schema_version": WORKSPACE_SCHEMA_VERSION,
+        "status": "ok",
+        "command": "validate-workspace",
+        "worktree": str(worktree),
+        "base": base,
+        "head": head,
+        "strategy": "exact-pack",
+    }
+    for key, expected in exact_values.items():
+        if type(receipt[key]) is not type(expected) or receipt[key] != expected:
+            raise NamedLaneGuardError(
+                f"workspace validation receipt {key} does not match the frozen lane"
+            )
+    object_format = receipt["object_format"]
+    if type(object_format) is not str or object_format not in {"sha1", "sha256"}:
+        raise NamedLaneGuardError(
+            "workspace validation receipt object_format is invalid"
+        )
+    expected_oid_length = 40 if object_format == "sha1" else 64
+    if len(base) != expected_oid_length or len(head) != expected_oid_length:
+        raise NamedLaneGuardError(
+            "workspace validation receipt object format conflicts with its endpoints"
+        )
+    if type(receipt["source_shallow"]) is not bool:
+        raise NamedLaneGuardError(
+            "workspace validation receipt source_shallow must be a JSON boolean"
+        )
+    for key in (
+        "commit_count",
+        "range_object_count",
+        "parent_support_object_count",
+        "symlink_count",
+    ):
+        _require_nonnegative_integer(receipt[key], f"workspace receipt {key}")
+    if receipt["commit_count"] == 0 or receipt["range_object_count"] == 0:
+        raise NamedLaneGuardError(
+            "workspace validation receipt cannot describe an empty frozen range closure"
+        )
+    for key in (
+        "range_object_sha256",
+        "parent_support_object_sha256",
+        "config_sha256",
+        "shallow_sha256",
+        "marker_sha256",
+        "cleanup_token_sha256",
+    ):
+        _require_sha256(receipt[key], f"workspace receipt {key}")
+    if type(receipt["shallow_bytes"]) is not str:
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow_bytes must be a JSON string"
+        )
+    try:
+        shallow_bytes = receipt["shallow_bytes"].encode("ascii", "strict")
+    except UnicodeEncodeError as error:
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow_bytes must be ASCII"
+        ) from error
+    if receipt["shallow_sha256"] != hashlib.sha256(shallow_bytes).hexdigest():
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow digest is invalid"
+        )
+    for key in (
+        "parent_identity",
+        "workspace_identity",
+        "git_identity",
+        "objects_identity",
+    ):
+        identity = _require_closed_mapping(
+            receipt[key],
+            frozenset({"device", "inode", "uid"}),
+            f"workspace receipt {key}",
+        )
+        for field in ("device", "inode", "uid"):
+            _require_nonnegative_integer(
+                identity[field], f"workspace receipt {key}.{field}"
+            )
+    return receipt
+
+
+def _validated_prefix_git_version(
+    git_executable: pathlib.Path,
+    worktree: pathlib.Path,
+    expected_identity: Mapping[str, object],
+) -> tuple[str, str, str]:
+    before = _capture_prefix_git_executable_identity(git_executable)
+    if before != expected_identity:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed after workspace validation"
+        )
+    capture = None
+    try:
+        try:
+            capture = run_bounded_capture(
+                (str(git_executable), "--version"),
+                cwd=worktree,
+                env=_git_environment(),
+                timeout_seconds=30.0,
+                stdout_limit_bytes=1024,
+                stderr_limit_bytes=1024,
+            )
+        except (
+            ForwardedSignal,
+            ReviewTimeoutError,
+            ReviewOutputLimitError,
+            ReviewOutputDrainError,
+            ReviewProcessLeakError,
+        ):
+            raise
+        except BaseException as error:
+            if _is_process_control_flow_error(error):
+                raise
+            raise NamedLaneGuardError(
+                "Codex review Git executable version could not be validated"
+            ) from error
+        stdout = bytes(capture.stdout)
+        if capture.returncode != 0 or capture.stderr:
+            raise NamedLaneGuardError(
+                "Codex review Git executable version could not be validated"
+            )
+        match = _SANITIZED_GIT_VERSION_OUTPUT.fullmatch(stdout)
+        if match is None:
+            raise NamedLaneGuardError(
+                "Codex review Git executable returned a malformed version"
+            )
+        version = tuple(int(component) for component in match.groups())
+        if version < MATERIALIZER_MINIMUM_GIT_VERSION:
+            raise NamedLaneGuardError(
+                "Codex review workspace requires Git 2.45.0 or newer"
+            )
+        try:
+            exact_stdout = stdout.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise NamedLaneGuardError(
+                "Codex review Git executable returned a non-ASCII version"
+            ) from error
+        normalized = exact_stdout.removesuffix("\n")
+        stdout_sha256 = hashlib.sha256(stdout).hexdigest()
+    finally:
+        if capture is not None:
+            capture.stdout[:] = b"\x00" * len(capture.stdout)
+            capture.stderr[:] = b"\x00" * len(capture.stderr)
+    after = _capture_prefix_git_executable_identity(git_executable)
+    if after != before:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed during version validation"
+        )
+    return normalized, exact_stdout, stdout_sha256
+
+
+def validate_sanitized_git_argv_prefix_receipt(
+    value: object,
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Validate the closed composite prefix receipt without trusting prose."""
+
+    rendered_worktree = _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    if (
+        LOWER_FULL_OBJECT_ID.fullmatch(base) is None
+        or LOWER_FULL_OBJECT_ID.fullmatch(head) is None
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git prefix endpoints must be full lowercase object IDs"
+        )
+    receipt = _require_closed_mapping(
+        value,
+        _SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST | {"receipt_sha256"},
+        "sanitized Git argv prefix receipt",
+    )
+    exact_values = {
+        "schema_version": SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        "command": "codex-git-prefix",
+        "prefix_profile": SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+        "sanitized_git_argv_prefix_conformance": (
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE
         ),
+        "sanitized_git_argv_prefix_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "git_executable": rendered_git,
+        "worktree": rendered_worktree,
+        "base": base,
+        "head": head,
+        "workspace_validation_receipt_encoding": (SANITIZED_GIT_ARGV_PREFIX_ENCODING),
+        "no_lazy_fetch_control": "GIT_NO_LAZY_FETCH=1",
+        "receipt_identity_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "receipt_identity_algorithm": (
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM
+        ),
+    }
+    for key, expected in exact_values.items():
+        if type(receipt[key]) is not type(expected) or receipt[key] != expected:
+            raise NamedLaneGuardError(
+                f"sanitized Git argv prefix receipt {key} is invalid"
+            )
+    tokens = receipt["sanitized_git_argv_prefix"]
+    if type(tokens) is not list:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt tokens must be a JSON array"
+        )
+    validated_tokens = validate_sanitized_git_argv_prefix(
+        tokens,
         worktree=worktree,
         git_executable=git_executable,
     )
-    encoded = json.dumps(
-        list(tokens),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return {
+    token_sha256 = hashlib.sha256(
+        _canonical_json_bytes(list(validated_tokens))
+    ).hexdigest()
+    if receipt["sanitized_git_argv_prefix_sha256"] != token_sha256:
+        raise NamedLaneGuardError("sanitized Git argv prefix digest is invalid")
+    _validate_executable_identity_record(receipt["git_executable_identity"])
+    git_version = receipt["git_version"]
+    git_version_stdout = receipt["git_version_stdout"]
+    if type(git_version) is not str or type(git_version_stdout) is not str:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version fields must be JSON strings"
+        )
+    try:
+        version_stdout_bytes = git_version_stdout.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version output must be ASCII"
+        ) from error
+    match = _SANITIZED_GIT_VERSION_OUTPUT.fullmatch(version_stdout_bytes)
+    if (
+        match is None
+        or git_version != git_version_stdout.removesuffix("\n")
+        or tuple(int(component) for component in match.groups())
+        < MATERIALIZER_MINIMUM_GIT_VERSION
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version binding is invalid"
+        )
+    if (
+        receipt["git_version_stdout_sha256"]
+        != hashlib.sha256(version_stdout_bytes).hexdigest()
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version digest is invalid"
+        )
+    workspace_receipt = _validate_workspace_validation_receipt(
+        receipt["workspace_validation_receipt"],
+        worktree=worktree,
+        base=base,
+        head=head,
+    )
+    if (
+        receipt["workspace_validation_receipt_sha256"]
+        != hashlib.sha256(_canonical_json_bytes(workspace_receipt)).hexdigest()
+    ):
+        raise NamedLaneGuardError("workspace validation receipt digest is invalid")
+    _require_sha256(
+        receipt["receipt_sha256"], "sanitized Git argv prefix receipt identity"
+    )
+    receipt_without_digest = {
+        key: receipt[key]
+        for key in _SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST
+    }
+    if (
+        receipt["receipt_sha256"]
+        != hashlib.sha256(_canonical_json_bytes(receipt_without_digest)).hexdigest()
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt identity is invalid"
+        )
+    selected_git = resolve_git()
+    if selected_git != git_executable:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git path is no longer selected"
+        )
+    current_git_identity = _capture_prefix_git_executable_identity(selected_git)
+    if receipt["git_executable_identity"] != current_git_identity:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git executable identity is stale"
+        )
+    current_version, current_stdout, current_stdout_sha256 = (
+        _validated_prefix_git_version(
+            selected_git,
+            selected_git.parent,
+            current_git_identity,
+        )
+    )
+    if (
+        receipt["git_version"] != current_version
+        or receipt["git_version_stdout"] != current_stdout
+        or receipt["git_version_stdout_sha256"] != current_stdout_sha256
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git version evidence is stale"
+        )
+    current_workspace_receipt = _validate_workspace_validation_receipt(
+        validate_workspace(worktree, base, head).receipt(),
+        worktree=worktree,
+        base=base,
+        head=head,
+    )
+    if current_workspace_receipt != workspace_receipt:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix workspace validation receipt is stale"
+        )
+    if (
+        resolve_git() != selected_git
+        or _capture_prefix_git_executable_identity(selected_git) != current_git_identity
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git executable changed during receipt validation"
+        )
+    return receipt
+
+
+def _revalidate_prefix_receipt_publication_identities(
+    receipt: Mapping[str, object],
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> None:
+    if (
+        resolve_git() != git_executable
+        or _capture_prefix_git_executable_identity(git_executable)
+        != receipt["git_executable_identity"]
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed before prefix receipt publication"
+        )
+    workspace_receipt = receipt["workspace_validation_receipt"]
+    assert isinstance(workspace_receipt, dict)
+    try:
+        parent = worktree.parent.lstat()
+        root = worktree.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Codex review workspace changed before prefix receipt publication"
+        ) from error
+    expected_parent = workspace_receipt["parent_identity"]
+    expected_root = workspace_receipt["workspace_identity"]
+    assert isinstance(expected_parent, dict)
+    assert isinstance(expected_root, dict)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or (parent.st_dev, parent.st_ino, parent.st_uid)
+        != (
+            expected_parent["device"],
+            expected_parent["inode"],
+            expected_parent["uid"],
+        )
+        or (root.st_dev, root.st_ino, root.st_uid)
+        != (
+            expected_root["device"],
+            expected_root["inode"],
+            expected_root["uid"],
+        )
+    ):
+        raise NamedLaneGuardError(
+            "Codex review workspace identity changed before prefix receipt publication"
+        )
+
+
+def sanitized_git_argv_prefix_receipt(
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Revalidate a frozen workspace and return its composite prefix record."""
+
+    _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    if (
+        LOWER_FULL_OBJECT_ID.fullmatch(base) is None
+        or LOWER_FULL_OBJECT_ID.fullmatch(head) is None
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git prefix endpoints must be full lowercase object IDs"
+        )
+    selected_git = resolve_git()
+    if str(selected_git) != rendered_git:
+        raise NamedLaneGuardError(
+            "Codex review Git executable differs from the fixed trusted Git path"
+        )
+    git_identity = _capture_prefix_git_executable_identity(selected_git)
+    git_version, git_version_stdout, git_version_stdout_sha256 = (
+        _validated_prefix_git_version(
+            selected_git,
+            selected_git.parent,
+            git_identity,
+        )
+    )
+    validated = validate_workspace(worktree, base, head)
+    canonical_worktree = validated.root
+    workspace_receipt = _validate_workspace_validation_receipt(
+        validated.receipt(),
+        worktree=canonical_worktree,
+        base=base,
+        head=head,
+    )
+    if resolve_git() != selected_git:
+        raise NamedLaneGuardError(
+            "fixed trusted Git path changed during workspace validation"
+        )
+    if _capture_prefix_git_executable_identity(selected_git) != git_identity:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed during workspace validation"
+        )
+    tokens = validate_sanitized_git_argv_prefix(
+        build_sanitized_git_argv_prefix(
+            worktree=canonical_worktree,
+            git_executable=selected_git,
+        ),
+        worktree=canonical_worktree,
+        git_executable=selected_git,
+    )
+    encoded = _canonical_json_bytes(list(tokens))
+    receipt: dict[str, object] = {
+        "schema_version": SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
         "status": "complete",
         "command": "codex-git-prefix",
         "prefix_profile": SANITIZED_GIT_ARGV_PREFIX_PROFILE,
@@ -340,10 +937,35 @@ def sanitized_git_argv_prefix_receipt(
         "sanitized_git_argv_prefix": list(tokens),
         "sanitized_git_argv_prefix_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
         "sanitized_git_argv_prefix_sha256": hashlib.sha256(encoded).hexdigest(),
-        "git_executable": os.fspath(git_executable),
-        "worktree": os.fspath(worktree),
+        "git_executable": str(selected_git),
+        "git_executable_identity": git_identity,
+        "git_version": git_version,
+        "git_version_stdout": git_version_stdout,
+        "git_version_stdout_sha256": git_version_stdout_sha256,
+        "worktree": str(canonical_worktree),
+        "base": base,
+        "head": head,
+        "workspace_validation_receipt": workspace_receipt,
+        "workspace_validation_receipt_encoding": (SANITIZED_GIT_ARGV_PREFIX_ENCODING),
+        "workspace_validation_receipt_sha256": hashlib.sha256(
+            _canonical_json_bytes(workspace_receipt)
+        ).hexdigest(),
         "no_lazy_fetch_control": "GIT_NO_LAZY_FETCH=1",
+        "receipt_identity_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "receipt_identity_algorithm": (
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM
+        ),
     }
+    receipt["receipt_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(receipt)
+    ).hexdigest()
+    return validate_sanitized_git_argv_prefix_receipt(
+        receipt,
+        worktree=canonical_worktree,
+        base=base,
+        head=head,
+        git_executable=selected_git,
+    )
 
 
 @dataclass(frozen=True)
@@ -7405,6 +8027,7 @@ def _resolve_claude_source_read_deny_roots(
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -9669,6 +10292,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Generate the exact machine-validated local-Codex Git argv prefix.",
     )
     codex_prefix.add_argument("--worktree", required=True)
+    codex_prefix.add_argument("--base", required=True)
+    codex_prefix.add_argument("--head", required=True)
     codex_prefix.add_argument("--git-executable", required=True)
 
     claude = subparsers.add_parser(
@@ -10442,12 +11067,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _workspace_command_main(args)
     try:
         if args.command_name == "codex-git-prefix":
-            _emit(
-                sanitized_git_argv_prefix_receipt(
-                    worktree=pathlib.Path(args.worktree),
-                    git_executable=pathlib.Path(args.git_executable),
-                )
+            worktree = pathlib.Path(args.worktree)
+            git_executable = pathlib.Path(args.git_executable)
+            receipt = sanitized_git_argv_prefix_receipt(
+                worktree=worktree,
+                base=args.base,
+                head=args.head,
+                git_executable=git_executable,
             )
+            _revalidate_prefix_receipt_publication_identities(
+                receipt,
+                worktree=pathlib.Path(receipt["worktree"]),
+                git_executable=git_executable,
+            )
+            _emit(receipt)
             return 0
         command = list(args.claude_argv)
         if command and command[0] == "--":

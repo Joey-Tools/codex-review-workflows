@@ -46,6 +46,8 @@ from review_runtime.named_lane import (  # noqa: E402
     SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE,
     SANITIZED_GIT_ARGV_PREFIX_ENCODING,
     SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM,
+    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
     SYMLINK_COUNT_LIMIT,
     LegacyPrefixReceiptInconclusive,
     NamedLaneGuardError,
@@ -59,6 +61,7 @@ from review_runtime.named_lane import (  # noqa: E402
     run_claude as _run_claude,
     sanitized_git_argv_prefix_receipt,
     validate_sanitized_git_argv_prefix,
+    validate_sanitized_git_argv_prefix_receipt,
     validate_worktree,
 )
 
@@ -124,6 +127,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             dir=temp_root,
         )
         self.root = pathlib.Path(self.temporary.name)
+        self._prefix_test_workspaces: list[
+            review_workspace_runtime.PreparedWorkspace
+        ] = []
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.source_control = self.root / "source-control"
@@ -135,6 +141,12 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "config", "commit.gpgsign", "false")
 
     def tearDown(self) -> None:
+        for prepared in reversed(self._prefix_test_workspaces):
+            if prepared.root.exists():
+                review_workspace_runtime.cleanup_workspace(
+                    prepared.root,
+                    prepared.cleanup_token,
+                )
         self.temporary.cleanup()
 
     def commit(self, message: str = "fixture") -> str:
@@ -148,6 +160,20 @@ class NamedLaneGuardTest(unittest.TestCase):
         (self.repo / "tracked.txt").write_text("workspace head\n", encoding="utf-8")
         head = self.commit("workspace head")
         return base, head
+
+    def prepared_review_workspace(
+        self,
+        name: str,
+    ) -> tuple[review_workspace_runtime.PreparedWorkspace, str, str]:
+        base, head = self.workspace_range()
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / name,
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        return prepared, base, head
 
     def test_codex_git_prefix_v2_matches_exact_accepted_adapter_sequence(
         self,
@@ -252,8 +278,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             )
 
     def test_codex_git_prefix_command_emits_closed_machine_receipt(self) -> None:
-        worktree = self.root / "review-workspace"
-        git_executable = pathlib.Path("/usr/bin/git")
+        prepared, base, head = self.prepared_review_workspace("review-workspace")
+        worktree = prepared.root
+        git_executable = named_lane_runtime.resolve_git()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             result = named_lane_main(
@@ -261,6 +288,10 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "codex-git-prefix",
                     "--worktree",
                     str(worktree),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
                     "--git-executable",
                     str(git_executable),
                 )
@@ -269,10 +300,17 @@ class NamedLaneGuardTest(unittest.TestCase):
         receipt = json.loads(output.getvalue())
         self.assertEqual(
             receipt,
-            sanitized_git_argv_prefix_receipt(
+            validate_sanitized_git_argv_prefix_receipt(
+                receipt,
                 worktree=worktree,
+                base=base,
+                head=head,
                 git_executable=git_executable,
             ),
+        )
+        self.assertEqual(
+            receipt["schema_version"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
         )
         self.assertEqual(receipt["prefix_profile"], SANITIZED_GIT_ARGV_PREFIX_PROFILE)
         self.assertEqual(
@@ -285,6 +323,457 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(receipt["no_lazy_fetch_control"], "GIT_NO_LAZY_FETCH=1")
         self.assertNotIn("--no-lazy-fetch", receipt["sanitized_git_argv_prefix"])
+        self.assertEqual(receipt["base"], base)
+        self.assertEqual(receipt["head"], head)
+        self.assertEqual(receipt["worktree"], str(worktree))
+        self.assertEqual(receipt["git_executable"], str(git_executable))
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["command"],
+            "validate-workspace",
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["base"],
+            receipt["base"],
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["head"],
+            receipt["head"],
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["worktree"],
+            receipt["worktree"],
+        )
+        self.assertEqual(
+            receipt["receipt_identity_algorithm"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM,
+        )
+        receipt_without_digest = dict(receipt)
+        receipt_without_digest.pop("receipt_sha256")
+        self.assertEqual(
+            receipt["receipt_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    receipt_without_digest,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    def test_codex_git_prefix_guard_entrypoint_issues_composite_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "guard-entrypoint-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                "codex-git-prefix",
+                "--worktree",
+                str(prepared.root),
+                "--base",
+                base,
+                "--head",
+                head,
+                "--git-executable",
+                str(git_executable),
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(receipt["base"], base)
+        self.assertEqual(receipt["head"], head)
+        self.assertEqual(receipt["worktree"], str(prepared.root))
+        self.assertEqual(
+            receipt["schema_version"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        )
+        validate_sanitized_git_argv_prefix_receipt(
+            receipt,
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+
+    def test_codex_git_prefix_rejects_absent_or_wrong_range_workspace(self) -> None:
+        base, head = self.workspace_range()
+        git_executable = named_lane_runtime.resolve_git()
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError) as absent:
+            sanitized_git_argv_prefix_receipt(
+                worktree=self.root / "absent-review-workspace",
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+        self.assertEqual(absent.exception.reason, "invalid-path")
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            sanitized_git_argv_prefix_receipt(
+                worktree=self.repo.resolve(),
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / "wrong-range-review-workspace",
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=head,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_rejects_nonselected_git_path(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "wrong-git-review-workspace"
+        )
+        selected_git = named_lane_runtime.resolve_git()
+        other_git = pathlib.Path("/usr/bin/git")
+        if other_git == selected_git:
+            other_git = pathlib.Path("/bin/false")
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "differs from the fixed trusted Git path",
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=other_git,
+            )
+
+    def test_codex_git_prefix_rejects_malformed_git_version(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "malformed-version-review-workspace"
+        )
+        fake_git = self.root / "malformed-git"
+        fake_git.write_text("#!/bin/sh\nprintf 'not git\\n'\n", encoding="utf-8")
+        fake_git.chmod(0o700)
+        with (
+            mock.patch.object(named_lane_runtime, "resolve_git", return_value=fake_git),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "returned a malformed version",
+            ),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+
+    def test_codex_git_prefix_rejects_git_replacement_during_version_probe(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "git-replacement-review-workspace"
+        )
+        fake_git = self.root / "selected-git"
+        replacement = self.root / "replacement-git"
+        script = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
+        fake_git.write_text(script, encoding="utf-8")
+        replacement.write_text(script, encoding="utf-8")
+        fake_git.chmod(0o700)
+        replacement.chmod(0o700)
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        def replace_after_capture(*args: object, **kwargs: object) -> object:
+            captured = real_capture(*args, **kwargs)
+            os.replace(replacement, fake_git)
+            return captured
+
+        with (
+            mock.patch.object(named_lane_runtime, "resolve_git", return_value=fake_git),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=replace_after_capture,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed during version validation",
+            ),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+
+    def test_codex_git_prefix_version_probe_precedes_final_workspace_validation(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "version-workspace-race-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        def mutate_workspace_after_version(*args: object, **kwargs: object) -> object:
+            captured = real_capture(*args, **kwargs)
+            (prepared.root / "tracked.txt").write_text(
+                "mutated during version probe\n",
+                encoding="utf-8",
+            )
+            return captured
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=mutate_workspace_after_version,
+            ),
+            self.assertRaises(review_workspace_runtime.ReviewWorkspaceError),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_version_probe_preserves_process_leak_error(self) -> None:
+        git_executable = named_lane_runtime.resolve_git()
+        identity = named_lane_runtime._capture_prefix_git_executable_identity(
+            git_executable
+        )
+        process_error = ReviewProcessLeakError("synthetic version-probe leak")
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=process_error,
+            ),
+            self.assertRaises(ReviewProcessLeakError) as caught,
+        ):
+            named_lane_runtime._validated_prefix_git_version(
+                git_executable,
+                git_executable.parent,
+                identity,
+            )
+        self.assertIs(caught.exception, process_error)
+
+    def test_codex_git_prefix_receipt_validator_rejects_closed_schema_and_type_drift(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "receipt-schema-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        receipt = sanitized_git_argv_prefix_receipt(
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+
+        def clone() -> dict[str, object]:
+            return json.loads(json.dumps(receipt))
+
+        def resign(value: dict[str, object]) -> None:
+            value.pop("receipt_sha256", None)
+            value["receipt_sha256"] = hashlib.sha256(
+                json.dumps(
+                    value,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        extra = clone()
+        extra["unexpected"] = "value"
+        resign(extra)
+
+        wrong_workspace_base = clone()
+        workspace_receipt = wrong_workspace_base["workspace_validation_receipt"]
+        assert isinstance(workspace_receipt, dict)
+        workspace_receipt["base"] = head
+        wrong_workspace_base["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(wrong_workspace_base)
+
+        coupled_resign = clone()
+        coupled_workspace_receipt = coupled_resign["workspace_validation_receipt"]
+        assert isinstance(coupled_workspace_receipt, dict)
+        coupled_commit_count = coupled_workspace_receipt["commit_count"]
+        assert isinstance(coupled_commit_count, int)
+        coupled_workspace_receipt["commit_count"] = coupled_commit_count + 1
+        coupled_resign["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                coupled_workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(coupled_resign)
+
+        integer_executable = clone()
+        integer_executable["git_executable"] = 7
+        resign(integer_executable)
+
+        identity_type_drift = clone()
+        executable_identity = identity_type_drift["git_executable_identity"]
+        assert isinstance(executable_identity, dict)
+        target_identity = executable_identity["target"]
+        assert isinstance(target_identity, dict)
+        target_identity["inode"] = str(target_identity["inode"])
+        resign(identity_type_drift)
+
+        coupled_git_identity = clone()
+        coupled_executable_identity = coupled_git_identity["git_executable_identity"]
+        assert isinstance(coupled_executable_identity, dict)
+        coupled_target_identity = coupled_executable_identity["target"]
+        assert isinstance(coupled_target_identity, dict)
+        coupled_inode = coupled_target_identity["inode"]
+        assert isinstance(coupled_inode, int)
+        coupled_target_identity["inode"] = coupled_inode + 1
+        resign(coupled_git_identity)
+
+        boolean_as_integer = clone()
+        boolean_workspace_receipt = boolean_as_integer["workspace_validation_receipt"]
+        assert isinstance(boolean_workspace_receipt, dict)
+        boolean_workspace_receipt["commit_count"] = True
+        boolean_as_integer["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                boolean_workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(boolean_as_integer)
+
+        malformed_version = clone()
+        malformed_version["git_version"] = "not git"
+        malformed_version["git_version_stdout"] = "not git\n"
+        malformed_version["git_version_stdout_sha256"] = hashlib.sha256(
+            b"not git\n"
+        ).hexdigest()
+        resign(malformed_version)
+
+        coupled_version = clone()
+        coupled_version["git_version"] = "git version 99.0.0"
+        coupled_version["git_version_stdout"] = "git version 99.0.0\n"
+        coupled_version["git_version_stdout_sha256"] = hashlib.sha256(
+            b"git version 99.0.0\n"
+        ).hexdigest()
+        resign(coupled_version)
+
+        for label, candidate in (
+            ("extra-key", extra),
+            ("workspace-cross-field", wrong_workspace_base),
+            ("coupled-resign", coupled_resign),
+            ("executable-type", integer_executable),
+            ("identity-type", identity_type_drift),
+            ("coupled-git-identity", coupled_git_identity),
+            ("bool-as-int", boolean_as_integer),
+            ("version-grammar", malformed_version),
+            ("coupled-version", coupled_version),
+        ):
+            with self.subTest(label=label), self.assertRaises(NamedLaneGuardError):
+                validate_sanitized_git_argv_prefix_receipt(
+                    candidate,
+                    worktree=prepared.root,
+                    base=base,
+                    head=head,
+                    git_executable=git_executable,
+                )
+
+    def test_codex_git_prefix_receipt_validator_rejects_stale_workspace(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-receipt-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        receipt = sanitized_git_argv_prefix_receipt(
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+        (prepared.root / "tracked.txt").write_text(
+            "stale receipt mutation\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            validate_sanitized_git_argv_prefix_receipt(
+                receipt,
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_receipt_validator_rejects_stale_git_identity(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-git-receipt-review-workspace"
+        )
+        fake_git = self.root / "receipt-selected-git"
+        replacement = self.root / "receipt-replacement-git"
+        script = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
+        fake_git.write_text(script, encoding="utf-8")
+        replacement.write_text(script, encoding="utf-8")
+        fake_git.chmod(0o700)
+        replacement.chmod(0o700)
+        with mock.patch.object(
+            named_lane_runtime,
+            "resolve_git",
+            return_value=fake_git,
+        ):
+            receipt = sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+            os.replace(replacement, fake_git)
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "identity is stale",
+            ):
+                validate_sanitized_git_argv_prefix_receipt(
+                    receipt,
+                    worktree=prepared.root,
+                    base=base,
+                    head=head,
+                    git_executable=fake_git,
+                )
 
     def prepare_workspace_argv(
         self,

@@ -873,17 +873,74 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--no-lazy-fetch", documented_tokens)
 
         for metadata_field in (
+            "prefix_receipt_schema: <sanitized-git-argv-prefix-receipt-v2 | not-applicable>",
+            "prefix_receipt: <compact canonical closed composite JSON object | not-applicable>",
+            "prefix_receipt_parent_prompt_match: <exact-type-preserving | invalid | not-applicable>",
+            "prefix_receipt_cross_field_match: <exact-type-preserving | invalid | not-applicable>",
             "prefix_profile: <sanitized-git-argv-prefix-v2 | not-applicable>",
             "sanitized_git_argv_prefix_conformance: <exact-token-sequence | not-applicable>",
             "sanitized_git_argv_prefix:",
             "sanitized_git_argv_prefix_sha256:",
             "git_executable:",
+            "git_executable_identity:",
             "git_version:",
+            "git_version_stdout:",
+            "workspace_validation_receipt:",
+            "workspace_validation_receipt_sha256:",
             "git_prefix_delivery:",
             "git_read_only_boundary:",
             "git_prefix_observation:",
         ):
             self.assertIn(metadata_field, prompts)
+
+        shared_metadata = prompts.split("## Shared Metadata", 1)[1].split(
+            "## Local Codex Prompt", 1
+        )[0]
+        parent_classification = prompts.split("## Parent Classification", 1)[1]
+        for required in (
+            "prefix_receipt: <compact canonical closed composite JSON object | not-applicable>",
+            "executable_identity: <exact closed lexical/target stat identity | not-applicable>",
+            "workspace_validation_receipt: <compact canonical closed JSON object | not-applicable>",
+        ):
+            self.assertIn(required, shared_metadata)
+        for required in (
+            "sanitized_git_argv_prefix: <exact UTF-8 JSON token array | not-applicable>",
+            "codex_git_prefix_receipt: <exact closed composite JSON object | not-applicable>",
+            "codex_git_prefix_receipt_parent_prompt_report_match: <exact-type-preserving | invalid | not-applicable>",
+            "codex_git_prefix_receipt_cross_field_match: <exact-type-preserving | invalid | not-applicable>",
+            "git_executable_identity: <exact closed lexical/target stat identity | not-applicable>",
+            "workspace_validation_receipt: <exact closed JSON object | not-applicable>",
+            "workspace: <absolute validated lane-private path>",
+            "workspace_parent_prompt_report_match: <exact-type-preserving | invalid>",
+        ):
+            self.assertIn(required, parent_classification)
+        self.assertIn(
+            "scalar/object/array type drift",
+            parent_classification,
+        )
+        self.assertIn(
+            "codex_git_prefix_receipt_schema == codex_git_prefix_receipt.schema_version",
+            parent_classification,
+        )
+        self.assertIn(
+            "codex_git_prefix_receipt_sha256 == codex_git_prefix_receipt.receipt_sha256",
+            parent_classification,
+        )
+        for transport_slot in (
+            "`codex_git.prefix_receipt`",
+            "`codex_git.sanitized_git_argv_prefix`",
+            "`codex_git.executable_identity`",
+            "`codex_git.workspace_validation_receipt`",
+        ):
+            self.assertIn(transport_slot, prompts)
+        self.assertIn(
+            "--base <frozen-base-sha> --head <frozen-head-sha>",
+            contracts,
+        )
+        self.assertIn(
+            "sha256-canonical-json-utf8-v1-without-receipt-sha256",
+            contracts,
+        )
 
         subagent = local.split("### Subagent adapter", 1)[1].split(
             "### CLI adapter", 1

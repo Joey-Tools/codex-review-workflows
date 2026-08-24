@@ -380,12 +380,39 @@ ordered `sanitized_git_argv_prefix` for that exact Codex lane. It binds:
 Generate and validate this record only through the independently trusted
 bundle's `named_lane_guard codex-git-prefix` command, passing
 `--worktree <absolute-clean-workspace>` and
+`--base <frozen-base-sha> --head <frozen-head-sha>` and
 `--git-executable <fixed-absolute-git-executable>`. Its closed output records
 `sanitized_git_argv_prefix_conformance: exact-token-sequence`; a hand-built
 array, a digest-only receipt, or a differently ordered but semantically similar
 array does not conform to the named profile. During self-policy migration, the
 candidate guard remains review subject and cannot generate its own approval
 record.
+
+`codex-git-prefix` is a composite issuer, not a string-template renderer. It
+first requires the supplied Git path to equal the guard's independently
+resolved fixed absolute Git path and runs bounded `git --version` under the
+closed Git environment, rejecting malformed output or any lexical/resolved
+executable identity drift. It then runs the final `validate-workspace` for the
+exact worktree and frozen endpoints and strictly parses the resulting closed
+`review-workspace-v1` receipt. Its closed consumer repeats the current Git
+identity/version probe before a fresh final workspace validation and requires
+exact equality with the embedded records; the command also rechecks Git and
+workspace root identities at the publication boundary. A missing directory, an
+ordinary clone that was not created by `prepare-workspace`, mismatched
+endpoints, an alternate Git path, an executable replacement, or a stale
+same-scope receipt cannot receive or retain a complete prefix receipt.
+
+The closed `sanitized-git-argv-prefix-receipt-v2` output carries the exact raw
+workspace-validation receipt and its canonical JSON SHA-256, the canonical
+worktree plus frozen endpoints, the Git lexical and resolved-target stat
+identity, exact version stdout and its SHA-256, and the prefix array and its
+SHA-256. `receipt_sha256` is SHA-256 over the canonical
+`canonical-json-utf8-v1` bytes of the complete closed record after adding
+`receipt_identity_encoding` and `receipt_identity_algorithm` but before adding
+`receipt_sha256` itself. The exact algorithm identifier is
+`sha256-canonical-json-utf8-v1-without-receipt-sha256`; no field other than the
+final digest is excluded. This deliberate one-field exclusion avoids
+self-reference while binding every substantive field.
 
 The ordered token profile is `sanitized-git-argv-prefix-v2`:
 
@@ -444,12 +471,25 @@ wrapper, an additional `-C`, a global `--git-dir` / `--work-tree` selector, and
 a different workspace are forbidden. Every diff-producing subcommand also
 appends both `--no-ext-diff` and `--no-textconv`.
 
-The lane receipt records the prefix profile, exact-sequence conformance and
-digest, fixed Git path/version, workspace validation-receipt identity, verified
-prompt delivery, the established read-only adapter boundary, and the strongest
-Git-argv observation the adapter actually exposes: `complete`, `partial`, or
-`unobservable`. Record every observed
-deviation separately.
+The lane receipt records the complete composite prefix receipt and its stable
+identity. That composite binds the profile, exact-sequence conformance and
+digest, the raw prefix, fixed Git path/version/identity, raw
+workspace-validation receipt plus its identity, and the frozen endpoints. Those
+are the composite issuer's complete claims. The outer lane receipt separately
+records verified prompt delivery, the established read-only adapter boundary,
+and the strongest Git-argv observation the adapter actually exposes:
+`complete`, `partial`, or `unobservable`; none of those outer observations is
+inside or attested by the composite receipt. The parent must require exact
+type-preserving parent/prompt/report equality for the composite record, then
+require its duplicated schema/digest, frozen endpoints, workspace, prefix, Git,
+and validation-receipt fields to match the composite fields exactly. Record
+every observed deviation separately.
+
+Immediately before launch, apply that same live composite consumer again to the
+exact receipt, worktree, endpoints and Git path. This is a point-in-time
+current-state proof under the same-UID host TCB, not a filesystem lease: if the
+workspace or executable changes after that proof, do not launch until a fresh
+receipt validates.
 
 Missing or altered prefix metadata, unproved prompt delivery, inability to
 launch under the required read-only adapter boundary, or any observed deviation

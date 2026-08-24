@@ -62,10 +62,14 @@ surrogate, is inconclusive rather than raised, rewritten, or omitted.
 
 After successful workspace validation, invoke the independently trusted
 bundle's `named_lane_guard codex-git-prefix` command for that exact worktree and
-fixed Git executable. Use its closed `sanitized-git-argv-prefix-v2` token array,
-canonical-JSON digest and `exact-token-sequence` conformance result unchanged in
-either peer adapter. Never hand-build the prefix or use the candidate guard to
-bootstrap a self-policy migration.
+frozen `base_sha..head_sha` plus the fixed Git executable. The command itself
+revalidates that workspace/range, verifies the selected Git path, version and
+stat identity, and emits one closed
+`sanitized-git-argv-prefix-receipt-v2`. Use that entire composite receipt—raw
+validation receipt, executable identity/version, token array, canonical-JSON
+digests and `exact-token-sequence` conformance result—unchanged in either peer
+adapter. Never hand-build the prefix, sign an unverified directory, or use the
+candidate guard to bootstrap a self-policy migration.
 
 | Adapter | Use when | Operational trade-off |
 | --- | --- | --- |

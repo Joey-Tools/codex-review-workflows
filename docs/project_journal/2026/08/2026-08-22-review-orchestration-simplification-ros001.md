@@ -1258,13 +1258,129 @@ superseded_by:
   sandbox with `ResourceWarning` promoted to an error. All 3,120 tests passed
   with six conditional skips in 1,128.061 seconds.
 
+### Formal review remediation after `a6782e6`
+
+- Signed head `a6782e6ceea6ac1d6d02e0bd229f22d7550fe768` received a new
+  non-resumed, ephemeral GPT-5.6 Sol Ultra Codex CLI review in another clean
+  host-bound workspace. The reviewer found one P1 teardown defect that
+  superseded the prior audit's narrower conclusion: selector closure and lease
+  settlement were protected, but a forwarded signal could still interrupt
+  after settlement and before process-control release, stderr zeroization,
+  control revalidation, and `_PartialRecoveryControl.close()`. The same signal
+  class could also arrive at the `OwnedProcessLease.settle()` entry opcode
+  before its settlement latch was published. Either path could leave an armed
+  or process-bound control without a sealed recovery receipt, and the latter
+  could leave child quiescence unproved while ordinary rollback removed the
+  workspace. This head did not pass local review and none of its review result
+  is reusable for a later head.
+- The review attempt itself passed its post-run evidence gates. The prior
+  trusted bundle manifest remained
+  `d12328d7a2da38c7c2edc58287a194faedbc4a37587ca047dbd48db34ac0a5b9`;
+  materialization and post-run validation retained 15 commits, 14 parent
+  edges, parent-graph digest
+  `db5ba7d5f459666be834250ac59d72e6e7fe9dfaee7de7498776b0f3ce547eb4`,
+  and local-config digest
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 515-event JSON stream ended in `turn.completed`; all 63 Git calls used
+  the exact parent-bound sanitized prefix and no bare Git invocation appeared.
+  Prompt bytes retained SHA-256
+  `e81806c8ab7fbf10a56c000b580d60e1ce59ce0e738658973352c3ddb0abd54a`,
+  stderr was empty, the neutral launch root remained empty, the source
+  authentication object retained exact identity, and the temporary auth-only
+  home was removed after post-run verification.
+- Forwarded signals are now blocked before any verifier lease worker or child
+  can exist and remain blocked in the worker and child. Spawn waits and the
+  selector loop check pending signals at bounded intervals and convert them to
+  an explicit `ForwardedSignal`; the outer owner restores and propagates only
+  after lease settlement, close-or-seal recovery-control disposition,
+  revalidation, and sensitive-buffer clearing. A mask-restore failure inherits
+  quiescence, retention, and recovery metadata from the primary error instead
+  of making a retained workspace look ordinarily cleanable.
+- Real-signal tests cover a process-directed signal during select, a normal
+  pre-settlement signal, a post-release signal, and the decisive combined
+  sequence: an ordinary verification primary with a live `/bin/sleep 60`
+  child followed by process-directed SIGTERM at the real settle entry. The
+  combined case proves the exact primary object survives with a deferred-signal
+  diagnostic, the child exits, the process group disappears, and no partial
+  control sidecar remains. The stable focused signal/restore/selector matrix
+  passed 9 tests in 19.942 seconds; seven adjacent assignment,
+  process-leak, and recovery tests passed in 14.546 seconds. A later complete
+  workspace-file run after all teardown remediations and cross-version test
+  corrections passed 166 tests in 188.164 seconds.
+- A separate independent audit found another P1 in the candidate-only
+  `codex-git-prefix` v2 issuer. The old implementation could produce a
+  `complete` token-template receipt for a nonexistent workspace and caller-
+  supplied Git path even though the contract claimed a binding to a validated
+  workspace receipt and accepted Git identity/version. Its final Parent
+  Classification also could not carry or compare that composite evidence.
+- The candidate v2 command now requires the frozen base and head, reruns the
+  trusted workspace validator, binds the complete closed validation receipt,
+  captures the selected Git executable's lexical and resolved identities,
+  runs the exact bounded clean-environment version probe, and publishes a
+  one-field-exclusion canonical-JSON composite digest. Its public validator
+  repeats the real Git identity/version probe and fresh workspace validation,
+  then requires exact semantic equality rather than merely accepting
+  self-consistent recomputed hashes. Process-control exceptions from the Git
+  probe, including an unquiesced process leak, propagate unchanged. Shared
+  Metadata and Parent Classification carry the same raw composite, schema,
+  digest, workspace receipt, executable identity, and type-preserving
+  cross-field equalities while keeping prompt delivery, read-only enforcement,
+  and argv observation as separate outer-lane evidence.
+- This strengthened v2 interface is deliberately fail closed and requires
+  `--base` and `--head`. It cannot approve its own self-policy migration: the
+  independently trusted prior installed bundle remains the control plane for
+  this candidate review, and the new composite issuer activates only after the
+  reviewed release is installed. No production repository caller still uses
+  the retired two-argument route. The final focused prefix matrix passed 13
+  tests in 30.538 seconds, and the complete `test_named_lane.py` passed all 294
+  tests with `ResourceWarning` promoted to an error in 198.967 seconds. Ruff,
+  format, contract, local-lane, guard-entrypoint, and diff checks passed on the
+  same stable implementation.
+- A late independent teardown audit found that the revalidation path could
+  replace its own explicit low-level `OSError` cause with one selected teardown
+  failure. The same single-selection logic could omit the lease-settlement
+  source of a synthesized process leak or a concurrent process-release
+  failure. The corrected ordering preserves an existing revalidation cause,
+  links `process leak -> settlement -> primary`, and records every unselected
+  release or control-finalization failure as a stable secondary diagnostic.
+  The top-level revalidation failure still inherits the exact quiescence,
+  retention, and recovery payload of an unquiesced process leak; no diagnostic
+  change authorizes ordinary cleanup.
+- That follow-up also exposed a control-finalization defect: the first
+  descriptor-close failure in `_PartialRecoveryControl.close()` could skip the
+  remaining owned descriptors and obscure an earlier unlink, fsync, or
+  retention failure. Finalization now attempts each owned control, workspace-
+  root, and workspace-parent descriptor independently. An existing operation
+  failure remains primary; otherwise the first close exception retains its
+  identity, and every close failure is labeled in visible diagnostics. Focused
+  verification passed 20 object-integrity tests in 44.739 seconds and 16
+  signal tests in 21.592 seconds. The final 166-test workspace-file run passed
+  in 188.164 seconds; Ruff format/check and `git diff --check` also passed.
+- A closing audit found that newly added diagnostics assertions initially read
+  Python 3.11 exception notes directly even though Python 3.10 carries the
+  same secondary diagnostics through the explicit cause/context fallback. The
+  tests now traverse both representations with cycle protection and exercise
+  `add_note = None`, an existing explicit cause, and visible context. The
+  process-leak recovery regression also verifies the actual postcondition:
+  ordinary payload is removed while the exact formal marker tombstone and
+  external control tombstone remain authenticated. Ten focused closing tests
+  passed in 14.406 seconds, followed by the final workspace-file run above.
+- The post-prefix, pre-late-remediation full playbook baseline passed 3,135
+  tests with six conditional skips in 1,098.645 seconds. It is retained as a
+  baseline only. The final stable tree then passed the authoritative 3,142-test
+  whole suite with the same six conditional skips in 1,147.173 seconds, and
+  the independent closing audit reported `No findings.`
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh
   whole-range GPT-5.6 Sol Ultra Codex review under the prior trusted release,
-  then complete PR 108's current-head GitHub lane, CI, final reread, and squash
-  merge.
-- Merge the private companion and generated sync PR, confirm the immutable
+  and push that stable candidate without merging it.
+- Refresh the private companion's immutable candidate/tree anchors, merge the
+  current private base with a signed merge commit, rerun its complete gates,
+  merge the companion, and confirm the pre-activation private release.
+- Complete PR 108's current-head GitHub lane, CI, final reread, and squash
+  merge. Then merge the generated source-sync PR, confirm the activated
   private-overlay release, run the local installer, and record the final merge,
   release, and installation identities here.
 
@@ -1278,14 +1394,17 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
 - Final post-fix full
   `python3 -B -W error::ResourceWarning -m unittest discover` review-playbook
-  suite (`3,120` tests, `6` conditional skips, `1,128.061` seconds) outside the
-  nested macOS sandbox restriction. The preceding stable tree passed `3,116`
-  tests with the same six skips in `1,118.931` seconds. Its corresponding
-  restricted probe reached one environment-only nested-broker failure, whose
-  exact test passed separately in `1.990` seconds before that authoritative
-  full rerun. The earlier stable tree passed `3,112` tests with the same six
-  skips in `1,000.276` seconds; the prior signed `2e89971` checkpoint passed
-  `3,010` tests with the same six skips in `999.845` seconds.
+  suite (`3,142` tests, `6` conditional skips, `1,147.173` seconds) outside the
+  nested macOS sandbox restriction. The post-prefix, pre-late-remediation tree
+  passed `3,135` tests with the same six skips in `1,098.645` seconds; the
+  earlier signal-remediation tree passed `3,120` tests with the same six skips
+  in `1,128.061` seconds. The preceding stable tree passed `3,116` tests with
+  the same six skips in `1,118.931` seconds. Its corresponding restricted probe
+  reached one environment-only nested-broker failure, whose exact test passed
+  separately in `1.990` seconds before that authoritative full rerun. The
+  earlier stable tree passed `3,112` tests with the same six skips in
+  `1,000.276` seconds; the prior signed `2e89971` checkpoint passed `3,010`
+  tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
   matrix (`77` focused policy, distribution, carrier, report, and self-policy
