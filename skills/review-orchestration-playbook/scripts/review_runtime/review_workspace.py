@@ -9190,7 +9190,8 @@ def _remove_bound_directory(
     recovery_marker_payload: bytes | None = None,
 ) -> None:
     parent_descriptor = os.open(path.parent, _nofollow_flags(directory=True))
-    root_descriptor: int | None = None
+    root_descriptor = -1
+    operation_error: BaseException | None = None
     try:
         root_descriptor = os.open(
             path.name,
@@ -9204,10 +9205,30 @@ def _remove_bound_directory(
             root_descriptor,
             recovery_marker_payload=recovery_marker_payload,
         )
-    finally:
-        if root_descriptor is not None:
-            os.close(root_descriptor)
-        os.close(parent_descriptor)
+    except BaseException as error:
+        operation_error = error
+    root_to_close = root_descriptor
+    parent_to_close = parent_descriptor
+    root_descriptor = -1
+    parent_descriptor = -1
+    teardown_failures = _attempt_workspace_descriptor_closes(
+        (
+            (
+                "workspace removal root descriptor close failed",
+                root_to_close,
+            ),
+            (
+                "workspace removal parent descriptor close failed",
+                parent_to_close,
+            ),
+        )
+    )
+    if operation_error is not None:
+        _attach_workspace_teardown_failures(operation_error, teardown_failures)
+        raise operation_error
+    teardown_error = _select_workspace_teardown_failure(teardown_failures)
+    if teardown_error is not None:
+        raise teardown_error
 
 
 def _partial_recovery_tombstone_matches(
@@ -11024,19 +11045,42 @@ def cleanup_workspace(
     cleanup_root_descriptor = -1
     cleanup_parent_locked = False
 
-    def release_cleanup_parent() -> None:
+    def release_cleanup_parent(
+        primary_error: BaseException | None = None,
+    ) -> BaseException | None:
         nonlocal cleanup_parent_descriptor, cleanup_root_descriptor
         nonlocal cleanup_parent_locked
+        teardown_failures: list[tuple[str, BaseException]] = []
         if cleanup_parent_locked:
-            with contextlib.suppress(OSError):
+            try:
                 fcntl.flock(cleanup_parent_descriptor, fcntl.LOCK_UN)
+            except BaseException as unlock_error:
+                teardown_failures.append(
+                    ("workspace cleanup parent unlock failed", unlock_error)
+                )
             cleanup_parent_locked = False
-        if cleanup_parent_descriptor >= 0:
-            os.close(cleanup_parent_descriptor)
-            cleanup_parent_descriptor = -1
-        if cleanup_root_descriptor >= 0:
-            os.close(cleanup_root_descriptor)
-            cleanup_root_descriptor = -1
+        root_to_close = cleanup_root_descriptor
+        parent_to_close = cleanup_parent_descriptor
+        cleanup_root_descriptor = -1
+        cleanup_parent_descriptor = -1
+        teardown_failures.extend(
+            _attempt_workspace_descriptor_closes(
+                (
+                    (
+                        "workspace cleanup root descriptor close failed",
+                        root_to_close,
+                    ),
+                    (
+                        "workspace cleanup parent descriptor close failed",
+                        parent_to_close,
+                    ),
+                )
+            )
+        )
+        if primary_error is not None:
+            _attach_workspace_teardown_failures(primary_error, teardown_failures)
+            return primary_error
+        return _select_workspace_teardown_failure(teardown_failures)
 
     try:
         cleanup_parent_descriptor = os.open(
@@ -11081,11 +11125,12 @@ def cleanup_workspace(
             cleanup_parent_descriptor,
         )
         signal_owner = _begin_forwarded_signal_mask()
-    except BaseException:
-        release_cleanup_parent()
+    except BaseException as error:
+        release_cleanup_parent(error)
         raise
-    primary_error: BaseException | None = None
+    operation_error: BaseException | None = None
     rollback_error: BaseException | None = None
+    cleaned: CleanedWorkspace | None = None
     try:
         try:
             marker_binding.revalidate()
@@ -11157,8 +11202,7 @@ def cleanup_workspace(
                     "workspace-cleanup-incomplete",
                     "workspace cleanup could not be proved in the bound parent",
                 )
-        except BaseException as error:
-            primary_error = error
+        except BaseException as primary_error:
             retained_candidate: pathlib.Path | None = None
             if isinstance(primary_error, ReviewWorkspaceError):
                 retained_path = primary_error.details.get("retained_path")
@@ -11212,30 +11256,27 @@ def cleanup_workspace(
                     **recovery_locator,
                 },
             )
-            _finish_forwarded_signal_mask(
-                signal_owner,
-                primary_error=failure,
+            _bind_workspace_failure_cause(
+                failure,
+                primary_error,
+                context="workspace cleanup primary operation failed",
             )
-            raise failure from primary_error
+            raise failure
         cleaned = CleanedWorkspace(
             root=root,
             _handoff_signal_mask=signal_owner if defer_signal_handoff else None,
         )
-        if defer_signal_handoff:
-            release_cleanup_parent()
-            return cleaned
-        try:
-            _finish_forwarded_signal_mask(signal_owner, primary_error=None)
-        finally:
-            release_cleanup_parent()
-        return cleaned
     except BaseException as error:
-        try:
-            if signal_owner.active:
-                _finish_forwarded_signal_mask(
-                    signal_owner,
-                    primary_error=primary_error if primary_error is not None else error,
-                )
-        finally:
-            release_cleanup_parent()
-        raise
+        operation_error = error
+    selected_error = release_cleanup_parent(operation_error)
+    if defer_signal_handoff and selected_error is None:
+        assert cleaned is not None
+        return cleaned
+    _finish_forwarded_signal_mask(
+        signal_owner,
+        primary_error=selected_error,
+    )
+    if selected_error is not None:
+        raise selected_error
+    assert cleaned is not None
+    return cleaned

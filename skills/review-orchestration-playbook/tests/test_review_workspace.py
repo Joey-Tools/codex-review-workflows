@@ -5219,6 +5219,623 @@ class ReviewWorkspaceTest(unittest.TestCase):
             if displaced.exists():
                 displaced.rmdir()
 
+    def test_cleanup_custody_failure_closes_both_descriptors_without_replacing_primary(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-custody-close-primary"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        primary_cause = OSError("fixture custody validation cause")
+        primary = ReviewWorkspaceError(
+            "fixture-cleanup-custody-failure",
+            "fixture cleanup custody failure",
+            details={"retained_path": str(prepared.root)},
+        )
+        primary.__cause__ = primary_cause
+        recovery = {
+            "retained_path": str(prepared.root),
+            "cleanup_unavailable_until_quiescent": True,
+        }
+        workspace_runtime._mark_partial_workspace_for_retention(primary)
+        workspace_runtime._record_partial_workspace_recovery(primary, recovery)
+        close_errors = (
+            OSError("fixture cleanup root descriptor close failure"),
+            OSError("fixture cleanup parent descriptor close failure"),
+        )
+        real_close = workspace_runtime.os.close
+        close_failures_enabled = False
+        attempted: list[int] = []
+        attempted_identities: list[tuple[int, int]] = []
+
+        def fail_after_cleanup_custody(*_args: object, **_kwargs: object) -> None:
+            nonlocal close_failures_enabled
+            close_failures_enabled = True
+            raise primary
+
+        def close_then_report(descriptor: int) -> None:
+            if not close_failures_enabled:
+                real_close(descriptor)
+                return
+            attempted.append(descriptor)
+            metadata = os.fstat(descriptor)
+            attempted_identities.append((metadata.st_dev, metadata.st_ino))
+            error = close_errors[len(attempted) - 1]
+            real_close(descriptor)
+            raise error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_assert_no_bound_partial_recovery_control",
+                    side_effect=fail_after_cleanup_custody,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                cleanup_workspace(prepared.root, prepared.cleanup_token)
+            self.assertIs(caught.exception, primary)
+            self.assertIs(caught.exception.__cause__, primary_cause)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(len(set(attempted)), 2)
+            root_metadata = prepared.root.stat(follow_symlinks=False)
+            parent_metadata = prepared.root.parent.stat(follow_symlinks=False)
+            self.assertEqual(
+                attempted_identities,
+                [
+                    (root_metadata.st_dev, root_metadata.st_ino),
+                    (parent_metadata.st_dev, parent_metadata.st_ino),
+                ],
+            )
+            self.assertTrue(
+                workspace_runtime._partial_workspace_requires_retention(
+                    caught.exception
+                )
+            )
+            self.assertEqual(
+                workspace_runtime._partial_workspace_recovery_payload(caught.exception),
+                recovery,
+            )
+            diagnostics = self.exception_diagnostics(caught.exception)
+            self.assertIn(
+                "workspace cleanup root descriptor close failed (OSError): "
+                "fixture cleanup root descriptor close failure",
+                diagnostics,
+            )
+            self.assertIn(
+                "workspace cleanup parent descriptor close failed (OSError): "
+                "fixture cleanup parent descriptor close failure",
+                diagnostics,
+            )
+        finally:
+            self.cleanup(prepared)
+
+    def test_cleanup_recovery_wrapper_survives_both_descriptor_close_failures(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-recovery-close-primary"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        primary = PermissionError("fixture cleanup payload removal failure")
+        close_errors = (
+            OSError("fixture recovery root descriptor close failure"),
+            OSError("fixture recovery parent descriptor close failure"),
+        )
+        real_close = workspace_runtime.os.close
+        owned_descriptors: tuple[int, int] | None = None
+        attempted: list[int] = []
+        retained: pathlib.Path | None = None
+
+        def fail_payload_removal(*args: object, **_kwargs: object) -> None:
+            nonlocal owned_descriptors
+            owned_descriptors = (int(args[3]), int(args[2]))
+            raise primary
+
+        def close_then_report(descriptor: int) -> None:
+            if owned_descriptors is None or descriptor not in owned_descriptors:
+                real_close(descriptor)
+                return
+            attempted.append(descriptor)
+            error = close_errors[len(attempted) - 1]
+            real_close(descriptor)
+            raise error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_remove_bound_directory_at",
+                    side_effect=fail_payload_removal,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                cleanup_workspace(prepared.root, prepared.cleanup_token)
+            self.assertEqual(caught.exception.reason, "workspace-cleanup-incomplete")
+            self.assertIs(caught.exception.__cause__, primary)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(len(set(attempted)), 2)
+            retained_value = caught.exception.details.get("retained_path")
+            self.assertIsInstance(retained_value, str)
+            retained = pathlib.Path(str(retained_value))
+            self.assertTrue(retained.is_dir())
+            self.assertEqual(
+                caught.exception.details["recovery_command_argv"],
+                [
+                    "cleanup-workspace",
+                    "--worktree",
+                    str(retained),
+                    "--token",
+                    "<cleanup-token-from-prepare-receipt>",
+                ],
+            )
+            diagnostics = self.exception_diagnostics(caught.exception)
+            self.assertIn(
+                "workspace cleanup root descriptor close failed (OSError): "
+                "fixture recovery root descriptor close failure",
+                diagnostics,
+            )
+            self.assertIn(
+                "workspace cleanup parent descriptor close failed (OSError): "
+                "fixture recovery parent descriptor close failure",
+                diagnostics,
+            )
+        finally:
+            if retained is not None and retained.exists():
+                cleanup_workspace(retained, prepared.cleanup_token)
+            elif prepared.root.exists():
+                self.cleanup(prepared)
+
+    def test_cleanup_root_open_failure_closes_only_parent_and_preserves_primary(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-root-open-close-primary"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        original_digest = workspace_runtime._marker_cleanup_token_digest
+        real_open = workspace_runtime.os.open
+        real_close = workspace_runtime.os.close
+        primary = PermissionError("fixture cleanup root descriptor open failure")
+        parent_close_error = OSError(
+            "fixture cleanup parent-only descriptor close failure"
+        )
+        root_open_failure_enabled = False
+        cleanup_parent_descriptor: int | None = None
+        attempted: list[int] = []
+
+        def digest_then_enable(marker: object) -> str:
+            nonlocal root_open_failure_enabled
+            digest = original_digest(marker)
+            root_open_failure_enabled = True
+            return digest
+
+        def fail_cleanup_root_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal cleanup_parent_descriptor
+            if (
+                root_open_failure_enabled
+                and os.fspath(path) == prepared.root.name
+                and dir_fd is not None
+            ):
+                cleanup_parent_descriptor = dir_fd
+                raise primary
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        def close_then_report(descriptor: int) -> None:
+            real_close(descriptor)
+            if descriptor == cleanup_parent_descriptor:
+                attempted.append(descriptor)
+                raise parent_close_error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_marker_cleanup_token_digest",
+                    side_effect=digest_then_enable,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "open",
+                    side_effect=fail_cleanup_root_open,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(PermissionError) as caught,
+            ):
+                cleanup_workspace(prepared.root, prepared.cleanup_token)
+            self.assertIs(caught.exception, primary)
+            self.assertIsNotNone(cleanup_parent_descriptor)
+            self.assertEqual(attempted, [cleanup_parent_descriptor])
+            self.assertIn(
+                "workspace cleanup parent descriptor close failed (OSError): "
+                "fixture cleanup parent-only descriptor close failure",
+                self.exception_diagnostics(caught.exception),
+            )
+            self.assertTrue(prepared.root.is_dir())
+        finally:
+            self.cleanup(prepared)
+
+    def test_cleanup_selects_first_standalone_close_failure_after_attempting_both(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-standalone-close-failure"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        original_remove = workspace_runtime._remove_bound_directory_at
+        real_close = workspace_runtime.os.close
+        close_failures_enabled = False
+        attempted: list[int] = []
+        close_errors = (
+            OSError("fixture standalone root descriptor close failure"),
+            OSError("fixture standalone parent descriptor close failure"),
+        )
+
+        def remove_then_enable_close_failures(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal close_failures_enabled
+            original_remove(*args, **kwargs)
+            close_failures_enabled = True
+
+        def close_then_report(descriptor: int) -> None:
+            if not close_failures_enabled:
+                real_close(descriptor)
+                return
+            attempted.append(descriptor)
+            error = close_errors[len(attempted) - 1]
+            real_close(descriptor)
+            raise error
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_remove_bound_directory_at",
+                side_effect=remove_then_enable_close_failures,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "close",
+                side_effect=close_then_report,
+            ),
+            self.assertRaises(OSError) as caught,
+        ):
+            cleanup_workspace(prepared.root, prepared.cleanup_token)
+        self.assertIs(caught.exception, close_errors[0])
+        self.assertEqual(len(attempted), 2)
+        self.assertEqual(len(set(attempted)), 2)
+        self.assertFalse(prepared.root.exists())
+        diagnostics = self.exception_diagnostics(caught.exception)
+        self.assertIn(
+            "workspace cleanup root descriptor close failed",
+            diagnostics,
+        )
+        self.assertIn(
+            "workspace cleanup parent descriptor close failed (OSError): "
+            "fixture standalone parent descriptor close failure",
+            diagnostics,
+        )
+
+    def test_cleanup_deferred_handoff_close_failure_restores_mask_before_raise(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-deferred-close-failure"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        original_begin = workspace_runtime._begin_forwarded_signal_mask
+        original_finish = workspace_runtime._finish_forwarded_signal_mask
+        original_remove = workspace_runtime._remove_bound_directory_at
+        real_close = workspace_runtime.os.close
+        close_error = OSError("fixture deferred root descriptor close failure")
+        close_failures_enabled = False
+        attempted: list[int] = []
+        observed_owner: workspace_runtime.ForwardedSignalMaskOwner | None = None
+        finish_observations: list[tuple[bool, int, BaseException | None]] = []
+
+        def restore_observed_owner() -> None:
+            if observed_owner is not None and observed_owner.active:
+                observed_owner.restore()
+
+        self.addCleanup(restore_observed_owner)
+
+        def observe_begin() -> workspace_runtime.ForwardedSignalMaskOwner:
+            nonlocal observed_owner
+            observed_owner = original_begin()
+            return observed_owner
+
+        def remove_then_enable_close_failure(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal close_failures_enabled
+            original_remove(*args, **kwargs)
+            close_failures_enabled = True
+
+        def close_then_report(descriptor: int) -> None:
+            if not close_failures_enabled:
+                real_close(descriptor)
+                return
+            attempted.append(descriptor)
+            real_close(descriptor)
+            if len(attempted) == 1:
+                raise close_error
+
+        def observe_finish(
+            owner: workspace_runtime.ForwardedSignalMaskOwner,
+            *,
+            primary_error: BaseException | None,
+        ) -> None:
+            finish_observations.append((owner.active, len(attempted), primary_error))
+            original_finish(owner, primary_error=primary_error)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_begin_forwarded_signal_mask",
+                side_effect=observe_begin,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_remove_bound_directory_at",
+                side_effect=remove_then_enable_close_failure,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "close",
+                side_effect=close_then_report,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_finish_forwarded_signal_mask",
+                side_effect=observe_finish,
+            ),
+            self.assertRaises(OSError) as caught,
+        ):
+            cleanup_workspace(
+                prepared.root,
+                prepared.cleanup_token,
+                defer_signal_handoff=True,
+            )
+        self.assertIs(caught.exception, close_error)
+        self.assertEqual(len(attempted), 2)
+        self.assertEqual(len(set(attempted)), 2)
+        self.assertEqual(finish_observations, [(True, 2, close_error)])
+        self.assertIsNotNone(observed_owner)
+        assert observed_owner is not None
+        self.assertFalse(observed_owner.active)
+        self.assertFalse(prepared.root.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace cleanup signal custody requires POSIX pthread masks",
+    )
+    def test_cleanup_signal_before_first_descriptor_close_waits_for_teardown(
+        self,
+    ) -> None:
+        destination = self.root / "cleanup-final-close-signal"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        original_attempt_closes = workspace_runtime._attempt_workspace_descriptor_closes
+        original_os_close = workspace_runtime.os.close
+        events: list[str] = []
+        handler_calls = 0
+        queued = False
+
+        def signal_then_close(descriptors: object) -> object:
+            nonlocal queued
+            items = tuple(descriptors)
+            if items and items[0][0].startswith("workspace cleanup root descriptor"):
+                queued = True
+                signal.raise_signal(signal.SIGTERM)
+                events.append("signal-queued")
+            return original_attempt_closes(items)
+
+        def observe_close(descriptor: int) -> None:
+            original_os_close(descriptor)
+            if queued:
+                events.append("descriptor-closed")
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_attempt_workspace_descriptor_closes",
+                    side_effect=signal_then_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=observe_close,
+                ),
+                self.assertRaises(workspace_runtime.ForwardedSignal) as caught,
+            ):
+                cleanup_workspace(prepared.root, prepared.cleanup_token)
+            self.assertEqual(caught.exception.signum, signal.SIGTERM)
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                events,
+                ["signal-queued", "descriptor-closed", "descriptor-closed"],
+            )
+            self.assertFalse(prepared.root.exists())
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
+    def test_bound_removal_failure_closes_both_descriptors_without_replacing_primary(
+        self,
+    ) -> None:
+        target = self.root / "bound-removal-close-primary"
+        target.mkdir(mode=0o700)
+        metadata = target.stat(follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+        primary_cause = OSError("fixture bound removal cause")
+        primary = ReviewWorkspaceError(
+            "fixture-bound-removal-failure",
+            "fixture bound removal failure",
+            details={"retained_path": str(target)},
+        )
+        primary.__cause__ = primary_cause
+        recovery = {"retained_path": str(target), "fixture_recovery": True}
+        workspace_runtime._mark_partial_workspace_for_retention(primary)
+        workspace_runtime._record_partial_workspace_recovery(primary, recovery)
+        close_errors = (
+            OSError("fixture bound root descriptor close failure"),
+            OSError("fixture bound parent descriptor close failure"),
+        )
+        real_close = workspace_runtime.os.close
+        attempted: list[int] = []
+
+        def close_then_report(descriptor: int) -> None:
+            attempted.append(descriptor)
+            error = close_errors[len(attempted) - 1]
+            real_close(descriptor)
+            raise error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_remove_bound_directory_at",
+                    side_effect=primary,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._remove_bound_directory(target, identity)
+            self.assertIs(caught.exception, primary)
+            self.assertIs(caught.exception.__cause__, primary_cause)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(len(set(attempted)), 2)
+            self.assertTrue(
+                workspace_runtime._partial_workspace_requires_retention(
+                    caught.exception
+                )
+            )
+            self.assertEqual(
+                workspace_runtime._partial_workspace_recovery_payload(caught.exception),
+                recovery,
+            )
+            diagnostics = self.exception_diagnostics(caught.exception)
+            self.assertIn(
+                "workspace removal root descriptor close failed (OSError): "
+                "fixture bound root descriptor close failure",
+                diagnostics,
+            )
+            self.assertIn(
+                "workspace removal parent descriptor close failed (OSError): "
+                "fixture bound parent descriptor close failure",
+                diagnostics,
+            )
+        finally:
+            target.rmdir()
+
+    def test_bound_removal_selects_first_standalone_close_failure_after_both_attempts(
+        self,
+    ) -> None:
+        target = self.root / "bound-removal-standalone-close-failure"
+        target.mkdir(mode=0o700)
+        metadata = target.stat(follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+        close_errors = (
+            OSError("fixture standalone bound root close failure"),
+            OSError("fixture standalone bound parent close failure"),
+        )
+        real_close = workspace_runtime.os.close
+        attempted: list[int] = []
+
+        def close_then_report(descriptor: int) -> None:
+            attempted.append(descriptor)
+            error = close_errors[len(attempted) - 1]
+            real_close(descriptor)
+            raise error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_remove_bound_directory_at",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                workspace_runtime._remove_bound_directory(target, identity)
+            self.assertIs(caught.exception, close_errors[0])
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(len(set(attempted)), 2)
+            diagnostics = self.exception_diagnostics(caught.exception)
+            self.assertIn(
+                "workspace removal root descriptor close failed",
+                diagnostics,
+            )
+            self.assertIn(
+                "workspace removal parent descriptor close failed (OSError): "
+                "fixture standalone bound parent close failure",
+                diagnostics,
+            )
+        finally:
+            target.rmdir()
+
     @unittest.skipUnless(
         os.name == "posix",
         "descriptor-bound cleanup requires POSIX directory descriptors",

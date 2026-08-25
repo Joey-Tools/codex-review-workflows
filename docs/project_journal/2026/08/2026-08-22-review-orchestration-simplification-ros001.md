@@ -1517,6 +1517,52 @@ superseded_by:
   `ResourceWarning` promoted to an error. A new signed head, exact-head
   admission, and a new whole-range fresh review remain mandatory next gates.
 
+### Formal review remediation after `4420739`
+
+- Signed head `4420739070522ae7e9598298424b0e54ac824886` received a
+  new, non-resumed GPT-5.6 Sol Ultra Codex CLI review under the prior trusted
+  release. The reviewer found one P2 teardown defect: both
+  `_remove_bound_directory()` and `cleanup_workspace()` still retired owned
+  root and parent descriptors sequentially. A first close fault could skip the
+  second descriptor, replace an active cleanup primary, discard its recovery
+  route, or permit a reused descriptor number to be closed twice. That head did
+  not pass and none of its positive review evidence is reusable for a later
+  head.
+- The finding run was complete and auditable. Its 815 events contained 401
+  paired command executions and 36 Git invocations; every Git invocation used
+  the exact parent-bound sanitized prefix. Materialization, initial validation,
+  and post-run validation remained type-preserving equal at 18 inclusive
+  commits, 17 parent edges, parent-graph digest
+  `f1bd18cb70ac681924225c80ccf240370c4168fd9d73543a579d9a114839b58a`,
+  and the unchanged local-config digest. Auth-home verification passed. The
+  only stderr was an analytics 503 and one WebSocket reset followed by a
+  successful bounded sampling retry; the stream reached its terminal P2.
+- Both paths now transfer descriptor ownership to local teardown state and set
+  the owner fields to `-1` before attempting closure. Root and parent
+  descriptors are always attempted in fixed order. An active operation error
+  retains the same object, explicit cause, status, details, retention state,
+  and recovery payload while every unlock or close fault remains diagnostic;
+  without an active primary, the first teardown fault is selected and every
+  later fault remains visible. A proved completed deletion is not mislabeled as
+  an incomplete payload-removal recovery merely because descriptor retirement
+  later failed.
+- `cleanup_workspace()` now follows the same terminal funnel as partial
+  recovery: it keeps forwarded-signal custody through unlock and every
+  descriptor-close attempt, selects or annotates the terminal error, and only
+  then restores the signal mask. Deferred handoff returns an active mask only
+  after descriptor custody is fully retired; a teardown fault first completes
+  that handoff and then propagates.
+- Eight new regression tests cover active-primary and standalone dual-close
+  faults for both paths, the real cleanup wrapper with its exact cause and
+  recovery argv, root-open failure with parent-only retirement, deferred
+  handoff failure, and a real pending SIGTERM that is delivered only after both
+  descriptors close. The 14-test focused matrix passed, the complete
+  `test_review_workspace.py` file passed 193 tests in 232.932 seconds, and a
+  fresh-context focused read-only review returned `No findings.` Ruff 0.13.2
+  default checks, format checks, source compilation, and `git diff --check`
+  passed. The authoritative whole suite, a new signed head, exact-head secret
+  admission, and a new whole-range fresh review remain mandatory next gates.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh
