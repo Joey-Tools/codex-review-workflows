@@ -1889,6 +1889,24 @@ superseded_by:
   skips. That exact broker test then passed alone outside the host sandbox in
   `2.277` seconds with `ResourceWarning` still promoted to an error.
 
+### Codex CLI shell-environment capability correction after `0c58178`
+
+- The final fresh-context whole-range reviewer found that the normalized Codex
+  CLI launch still used `shell_environment_policy.filters`, which is not a key
+  accepted by the version-bound Codex CLI 0.149.0 configuration schema. A
+  strict-config launch would therefore fail before the reviewer process could
+  start, potentially leaving a self-policy review without an eligible local
+  adapter.
+- The normalized argv now uses exact
+  `shell_environment_policy.exclude=["CODEX_HOME"]`. The companion test parses
+  the complete documented argv, validates option arity, TOML-decodes every
+  `-c` override, checks the version-bound config and shell-policy key/type
+  schema, and proves that substituting the retired `filters` spelling is
+  rejected. It no longer treats presence of one literal as capability proof.
+- All `15` local Codex lane contract tests and all `32` general contract tests
+  passed. Ruff lint/format and `git diff --check` also passed. No runtime helper
+  or retired supplied-diff entrypoint changed.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

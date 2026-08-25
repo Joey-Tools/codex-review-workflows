@@ -409,7 +409,7 @@ The normalized direct-argv shape is:
   -c skills.include_instructions=false
   -c skills.bundled.enabled=false
   -c cli_auth_credentials_store="file"
-  -c shell_environment_policy.filters={CODEX_HOME="exclude"}
+  -c shell_environment_policy.exclude=["CODEX_HOME"]
   -c shell_environment_policy.ignore_default_excludes=false
   -s read-only
   -m gpt-5.6-sol

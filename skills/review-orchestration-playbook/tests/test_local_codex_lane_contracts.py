@@ -5,7 +5,13 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
 import unittest
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
+    import tomli as tomllib
 
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -50,6 +56,34 @@ SELF_ADMISSION_FIELDS = {
     "candidate_markdown_parent_prompt_match",
     "candidate_markdown_admission_inventory_match",
 }
+_CODEX_CLI_0_149_0_EXEC_OPTION_ARITY = {
+    "--disable": 1,
+    "--ephemeral": 0,
+    "--ignore-rules": 0,
+    "--ignore-user-config": 0,
+    "--json": 0,
+    "--skip-git-repo-check": 0,
+    "--strict-config": 0,
+    "-C": 1,
+    "-c": 1,
+    "-m": 1,
+    "-s": 1,
+}
+_CODEX_CLI_0_149_0_CONFIG_VALUE_TYPES = {
+    "cli_auth_credentials_store": str,
+    "model_reasoning_effort": str,
+    "project_doc_max_bytes": int,
+    "skills.bundled.enabled": bool,
+    "skills.include_instructions": bool,
+}
+_CODEX_CLI_0_149_0_SHELL_ENVIRONMENT_POLICY_VALUE_TYPES = {
+    "exclude": list,
+    "experimental_use_profile": bool,
+    "ignore_default_excludes": bool,
+    "include_only": list,
+    "inherit": str,
+    "set": dict,
+}
 
 
 def _read(name: str) -> str:
@@ -58,6 +92,88 @@ def _read(name: str) -> str:
 
 def _normalized(value: str) -> str:
     return " ".join(value.split())
+
+
+def _normalized_cli_argv(document: str) -> tuple[str, ...]:
+    block = document.split("normalized direct-argv shape is:", 1)[1].split("```", 2)[1]
+    lines = block.strip().splitlines()
+    if lines and lines[0] == "text":
+        lines = lines[1:]
+    return tuple(token for line in lines for token in shlex.split(line, posix=False))
+
+
+def _string_collection(value: object) -> bool:
+    return type(value) is list and all(type(item) is str for item in value)
+
+
+def _string_mapping(value: object) -> bool:
+    return type(value) is dict and all(
+        type(key) is str and type(item) is str for key, item in value.items()
+    )
+
+
+def _codex_cli_0_149_0_strict_config_accepts(argv: tuple[str, ...]) -> bool:
+    if argv[:2] != ("<absolute-codex>", "exec"):
+        return False
+
+    option_values: dict[str, list[str | None]] = {}
+    index = 2
+    while index < len(argv):
+        option = argv[index]
+        if option == "-":
+            if index != len(argv) - 1:
+                return False
+            option_values.setdefault(option, []).append(None)
+            index += 1
+            continue
+        arity = _CODEX_CLI_0_149_0_EXEC_OPTION_ARITY.get(option)
+        if arity is None or index + arity >= len(argv):
+            return False
+        value = argv[index + 1] if arity else None
+        option_values.setdefault(option, []).append(value)
+        index += arity + 1
+
+    if "--strict-config" not in option_values:
+        return False
+    if option_values.get("--disable") != ["plugins", "hooks"]:
+        return False
+    if option_values.get("-s") != ["read-only"]:
+        return False
+    if option_values.get("-m") != ["gpt-5.6-sol"]:
+        return False
+    if option_values.get("-") != [None]:
+        return False
+
+    for override in option_values.get("-c", []):
+        if type(override) is not str:
+            return False
+        key, separator, literal = override.partition("=")
+        if separator != "=" or not key or not literal:
+            return False
+        try:
+            value = tomllib.loads(f"value = {literal}")["value"]
+        except (tomllib.TOMLDecodeError, KeyError):
+            return False
+
+        shell_prefix = "shell_environment_policy."
+        if key.startswith(shell_prefix):
+            field = key.removeprefix(shell_prefix)
+            expected_type = _CODEX_CLI_0_149_0_SHELL_ENVIRONMENT_POLICY_VALUE_TYPES.get(
+                field
+            )
+            if expected_type is None or type(value) is not expected_type:
+                return False
+            if expected_type is list and not _string_collection(value):
+                return False
+            if expected_type is dict and not _string_mapping(value):
+                return False
+            continue
+
+        expected_type = _CODEX_CLI_0_149_0_CONFIG_VALUE_TYPES.get(key)
+        if expected_type is None or type(value) is not expected_type:
+            return False
+
+    return True
 
 
 def _type_preserving_equal(left: object, right: object) -> bool:
@@ -3721,9 +3837,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "```", 2
         )[1]
         self.assertIn('-c cli_auth_credentials_store="file"', cli_argv)
-        self.assertIn(
-            '-c shell_environment_policy.filters={CODEX_HOME="exclude"}', cli_argv
-        )
+        self.assertIn('-c shell_environment_policy.exclude=["CODEX_HOME"]', cli_argv)
         self.assertIn(
             "-c shell_environment_policy.ignore_default_excludes=false", cli_argv
         )
@@ -3759,6 +3873,25 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "The final lane report repeats that exact identity",
             _normalized(prompts),
         )
+
+    def test_cli_normalized_argv_matches_version_bound_capability_schema(
+        self,
+    ) -> None:
+        argv = _normalized_cli_argv(_read("local-codex-lane.md"))
+
+        self.assertTrue(_codex_cli_0_149_0_strict_config_accepts(argv))
+        self.assertIn('shell_environment_policy.exclude=["CODEX_HOME"]', argv)
+        self.assertNotIn(
+            'shell_environment_policy.filters={CODEX_HOME="exclude"}', argv
+        )
+
+        legacy_argv = tuple(
+            'shell_environment_policy.filters={CODEX_HOME="exclude"}'
+            if value == 'shell_environment_policy.exclude=["CODEX_HOME"]'
+            else value
+            for value in argv
+        )
+        self.assertFalse(_codex_cli_0_149_0_strict_config_accepts(legacy_argv))
 
     def test_peer_adapters_share_fail_closed_effective_profile_matrix(self) -> None:
         local = _read("local-codex-lane.md")
