@@ -180,6 +180,24 @@ def _attach_workspace_diagnostic(error: BaseException, diagnostic: str) -> None:
     error.__cause__ = node
 
 
+def _attach_workspace_diagnostic_preserving_cause(
+    error: BaseException,
+    diagnostic: str,
+) -> None:
+    """Expose text without replacing any already-bound causal predecessor."""
+
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(diagnostic)
+        return
+    tail = error
+    visited: set[int] = set()
+    while tail.__cause__ is not None and id(tail) not in visited:
+        visited.add(id(tail))
+        tail = tail.__cause__
+    _attach_workspace_diagnostic(tail, diagnostic)
+
+
 def _attach_workspace_failure_diagnostic(
     primary: BaseException,
     secondary: BaseException,
@@ -201,12 +219,9 @@ def _attach_workspace_failure_diagnostic(
     if callable(add_note):
         add_note(diagnostic)
         return
-    # Python 3.10 has no exception notes. Attach the visible diagnostic below
-    # an existing explicit cause so the direct cause identity remains intact.
-    if primary.__cause__ is not None:
-        _attach_workspace_diagnostic(primary.__cause__, diagnostic)
-        return
-    _attach_workspace_diagnostic(primary, diagnostic)
+    # Python 3.10 has no exception notes. Append the visible diagnostic below
+    # the existing explicit-cause chain so every causal identity remains intact.
+    _attach_workspace_diagnostic_preserving_cause(primary, diagnostic)
 
 
 def _bind_workspace_failure_cause(
@@ -6029,7 +6044,7 @@ def _retain_unquiesced_workspace(
     try:
         recovery = control.recovery_payload()
     except BaseException as publication_error:
-        _attach_workspace_diagnostic(
+        _attach_workspace_diagnostic_preserving_cause(
             error,
             f"{diagnostic_context} recovery publication failed: "
             f"{type(publication_error).__name__}",
@@ -6042,7 +6057,7 @@ def _retain_unquiesced_workspace(
             try:
                 recovery = control.unavailable_recovery_payload(publication_error)
             except BaseException as fallback_error:
-                _attach_workspace_diagnostic(
+                _attach_workspace_diagnostic_preserving_cause(
                     error,
                     f"{diagnostic_context} recovery fallback failed: "
                     f"{type(fallback_error).__name__}",
@@ -6944,6 +6959,14 @@ def _finish_forwarded_signal_mask(
             status=status,
             details=details,
         )
+        selected_cause = direct_fallback_error or (
+            restore_errors[-1] if restore_errors else primary_error
+        )
+        _bind_workspace_failure_cause(
+            failure,
+            selected_cause,
+            context="signal-mask restoration had another causal predecessor",
+        )
         if primary_error is not None:
             if process_quiescence_unproven(primary_error):
                 mark_process_quiescence_unproven(failure)
@@ -6953,27 +6976,24 @@ def _finish_forwarded_signal_mask(
             if recovery_payload is not None:
                 _record_partial_workspace_recovery(failure, recovery_payload)
         if pending_error is not None:
-            _attach_workspace_diagnostic(
+            _attach_workspace_diagnostic_preserving_cause(
                 failure,
                 f"pending-signal drain also failed: {pending_error}",
             )
-        raise failure from (
-            direct_fallback_error
-            or (restore_errors[-1] if restore_errors else primary_error)
-        )
+        raise failure
     if primary_error is not None:
         if pending is not None:
-            _attach_workspace_diagnostic(
+            _attach_workspace_diagnostic_preserving_cause(
                 primary_error,
                 f"forwarded signal {int(pending)} was deferred behind the primary failure",
             )
         for error in restore_errors:
-            _attach_workspace_diagnostic(
+            _attach_workspace_diagnostic_preserving_cause(
                 primary_error,
                 f"signal-mask restoration also failed: {error}",
             )
         if pending_error is not None:
-            _attach_workspace_diagnostic(
+            _attach_workspace_diagnostic_preserving_cause(
                 primary_error,
                 f"pending-signal drain also failed: {pending_error}",
             )
@@ -8322,8 +8342,16 @@ def _verify_range_object_contents_under_signal_mask(
                 )
             except BaseException as error:
                 settlement_error = error
+        if settlement_error is not None:
+            _bind_workspace_failure_cause(
+                settlement_error,
+                primary_error,
+                context=(
+                    "object verifier primary failure preceded lease settlement failure"
+                ),
+            )
         if selector_error is not None and verification_error is not None:
-            _attach_workspace_diagnostic(
+            _attach_workspace_diagnostic_preserving_cause(
                 verification_error,
                 "object verifier selector close failed: "
                 f"{type(selector_error).__name__}",
@@ -8358,7 +8386,7 @@ def _verify_range_object_contents_under_signal_mask(
                         )
                     control_binding_published = True
                 except BaseException as identity_error:
-                    _attach_workspace_diagnostic(
+                    _attach_workspace_diagnostic_preserving_cause(
                         unsafe_error,
                         "partial recovery process binding failed: "
                         f"{type(identity_error).__name__}",
@@ -8490,15 +8518,6 @@ def _verify_range_object_contents_under_signal_mask(
         revalidation_original_cause: BaseException | None = None
         finalization_error: BaseException | None = None
         try:
-            if settlement_error is not None:
-                _bind_workspace_failure_cause(
-                    settlement_error,
-                    primary_error,
-                    context=(
-                        "object verifier primary failure preceded lease "
-                        "settlement failure"
-                    ),
-                )
             if process_leak is not None:
                 process_leak_predecessor = (
                     settlement_error if settlement_error is not None else primary_error
@@ -8515,7 +8534,7 @@ def _verify_range_object_contents_under_signal_mask(
                 if selected_teardown_error is primary_error and isinstance(
                     release_error, ForwardedSignal
                 ):
-                    _attach_workspace_diagnostic(
+                    _attach_workspace_diagnostic_preserving_cause(
                         selected_teardown_error,
                         "forwarded signal "
                         f"{int(release_error.signum)} was deferred behind the "
@@ -8533,6 +8552,13 @@ def _verify_range_object_contents_under_signal_mask(
             except BaseException as error:
                 revalidation_error = error
                 revalidation_original_cause = error.__cause__
+                _bind_workspace_failure_cause(
+                    revalidation_error,
+                    revalidation_original_cause or selected_teardown_error,
+                    context=(
+                        "object verifier teardown failed during final revalidation"
+                    ),
+                )
                 if process_leak is not None:
                     if recovery_payload is not None:
                         _inherit_unquiesced_workspace_retention(
@@ -8575,10 +8601,6 @@ def _verify_range_object_contents_under_signal_mask(
                 )
 
         if revalidation_error is not None:
-            if revalidation_original_cause is not None:
-                raise revalidation_error from revalidation_original_cause
-            if selected_teardown_error is not None:
-                raise revalidation_error from selected_teardown_error
             raise revalidation_error
         if process_leak is not None:
             raise process_leak from process_leak.__cause__
@@ -11782,11 +11804,16 @@ def prepare_workspace(
                     ),
                 },
             )
+            _bind_workspace_failure_cause(
+                failure,
+                primary_error,
+                context="workspace creation failure preceded rollback failure",
+            )
             _finish_forwarded_signal_mask(
                 creation_mask,
                 primary_error=failure,
             )
-            raise failure from primary_error
+            raise failure
         _finish_forwarded_signal_mask(
             creation_mask,
             primary_error=primary_error,
@@ -12065,12 +12092,17 @@ def prepare_workspace(
             if recovery_payload:
                 _mark_partial_workspace_for_retention(failure)
                 _record_partial_workspace_recovery(failure, recovery_payload)
+            _bind_workspace_failure_cause(
+                failure,
+                primary_error,
+                context="workspace preparation failure preceded rollback failure",
+            )
             if recovery_owner is not None:
                 _finish_forwarded_signal_mask(
                     recovery_owner,
                     primary_error=failure,
                 )
-            raise failure from primary_error
+            raise failure
         raise
 
 

@@ -772,6 +772,17 @@ class ReviewWorkspaceTest(unittest.TestCase):
         )
         source_visible = set(git(self.repo, "rev-list", f"{base}..{head}").splitlines())
         self.assertEqual(source_visible, {feature, head})
+        self.assertEqual(
+            set(
+                git(
+                    self.repo,
+                    "rev-list",
+                    "--ancestry-path",
+                    f"{base}..{head}",
+                ).splitlines()
+            ),
+            {head},
+        )
         source_diff = git(self.repo, "diff", "--binary", f"{base}..{head}")
 
         destination = self.root / "merge-updated-feature-workspace"
@@ -5390,7 +5401,9 @@ class ReviewWorkspaceTest(unittest.TestCase):
         self.assertIn("direct secondary", self.exception_diagnostics(direct))
 
         primary = LegacyError("primary with explicit cause")
-        original_cause = OSError("original explicit cause")
+        original_cause = LegacyError("original explicit cause")
+        causal_predecessor = LegacyError("earlier causal predecessor")
+        original_cause.__cause__ = causal_predecessor
         primary.__cause__ = original_cause
         secondary = LegacyError("secondary failure")
         workspace_runtime._attach_workspace_failure_diagnostic(
@@ -5399,8 +5412,20 @@ class ReviewWorkspaceTest(unittest.TestCase):
             context="legacy secondary path",
         )
         self.assertIs(primary.__cause__, original_cause)
+        self.assertIs(original_cause.__cause__, causal_predecessor)
         self.assertIn(
             "legacy secondary path (LegacyError): secondary failure",
+            self.exception_diagnostics(primary),
+        )
+
+        workspace_runtime._attach_workspace_diagnostic_preserving_cause(
+            primary,
+            "legacy text diagnostic",
+        )
+        self.assertIs(primary.__cause__, original_cause)
+        self.assertIs(original_cause.__cause__, causal_predecessor)
+        self.assertIn(
+            "legacy text diagnostic",
             self.exception_diagnostics(primary),
         )
 
@@ -8211,6 +8236,9 @@ class ReviewWorkspaceTest(unittest.TestCase):
     def test_object_integrity_process_leak_keeps_settlement_chain_on_revalidation(
         self,
     ) -> None:
+        class LegacyPermissionError(PermissionError):
+            add_note = None
+
         prepared = prepare_workspace(
             self.repo,
             self.root / "object-process-leak-settlement-revalidation",
@@ -8226,7 +8254,7 @@ class ReviewWorkspaceTest(unittest.TestCase):
         settlement_error = workspace_runtime.ReviewProcessLeakError(
             "fixture lease settlement failure"
         )
-        late_revalidation_error = PermissionError(
+        late_revalidation_error = LegacyPermissionError(
             "fixture late control revalidation failure"
         )
         settlement_failed = False
@@ -8261,6 +8289,18 @@ class ReviewWorkspaceTest(unittest.TestCase):
                 workspace_runtime._WorkspaceControlBinding,
                 "revalidate",
                 new=fail_late_revalidate,
+            ),
+            mock.patch.object(
+                workspace_runtime.ReviewWorkspaceError,
+                "add_note",
+                None,
+                create=True,
+            ),
+            mock.patch.object(
+                workspace_runtime.ReviewProcessLeakError,
+                "add_note",
+                None,
+                create=True,
             ),
             self.assertRaises(PermissionError) as caught,
         ):

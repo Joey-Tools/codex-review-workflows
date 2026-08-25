@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 import venv
 from collections.abc import Callable
@@ -86,6 +87,12 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def visible_exception_text(error: BaseException) -> str:
+    """Render notes or the Python 3.10 fallback cause chain alike."""
+
+    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
 
 def call_run_claude(**kwargs: object) -> dict[str, object]:
@@ -1358,7 +1365,7 @@ raise SystemExit(returncode)
         for descriptor in close_attempts:
             with self.assertRaises(OSError):
                 os.fstat(descriptor)
-        diagnostics = "\n".join(getattr(primary, "__notes__", ()))
+        diagnostics = visible_exception_text(primary)
         self.assertIn("receipt descriptor close failed", diagnostics)
         self.assertIn("receipt real-close-then-error", diagnostics)
         self.assertIn("parent descriptor close failed", diagnostics)
@@ -1413,7 +1420,7 @@ raise SystemExit(returncode)
                 "reason": "receipt real-close-then-error",
             },
         )
-        diagnostics = "\n".join(getattr(receipt_close, "__notes__", ()))
+        diagnostics = visible_exception_text(receipt_close)
         self.assertEqual(str(receipt_close), "receipt real-close-then-error")
         self.assertIn("receipt descriptor close failed", diagnostics)
         self.assertIn("parent descriptor close failed", diagnostics)

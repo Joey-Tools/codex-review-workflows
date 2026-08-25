@@ -1,7 +1,7 @@
 ---
 id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
-status: active
+status: completed
 created: 2026-08-22
 updated: 2026-08-25
 branch: review-orchestration-simplification
@@ -1851,6 +1851,43 @@ superseded_by:
   other 3,215 tests passed. That exact broker test then passed alone outside
   the host sandbox in 2.127 seconds with `ResourceWarning` still promoted to an
   error.
+
+### Python 3.10 exception-diagnostic compatibility after `6f40453`
+
+- The first GitHub Actions run on the signed candidate exposed four Python
+  3.10-only failures across both Linux and macOS. Two tests incorrectly assumed
+  `BaseException.__notes__` existed, while two production paths appended a
+  diagnostic and then used a late `raise ... from ...`; on Python 3.10 that
+  final cause assignment replaced the compatibility fallback chain and hid the
+  diagnostic from the rendered exception.
+- The tests now inspect the complete formatted exception rather than a
+  Python-3.11-only field. Production diagnostic attachment uses one preserving
+  helper: native notes remain the Python 3.11+ representation, while Python
+  3.10 appends a diagnostic node below the existing explicit-cause chain.
+  Settlement-to-primary binding is completed before diagnostics are attached,
+  and selector, recovery-publication, identity, deferred-signal, rollback, and
+  object-revalidation paths no longer overwrite that chain with a late
+  `raise ... from ...`.
+- The focused Python 3.10 compatibility matrix passed all six repaired cases;
+  the same six passed on Python 3.13. A broader Python 3.10 two-module run
+  passed 528 of 529 tests; its only failure was a host-local uv-managed
+  temporary virtual environment whose copied interpreter could not load its
+  relocated `libpython3.10.dylib`, outside the exception logic and unlike the
+  GitHub `setup-python` environment. The authoritative Python 3.13
+  warning-strict two-module run passed all 529 tests in 900.243 seconds.
+- A fresh focused audit found no remaining overwritten primary cause,
+  diagnostic loss, cause cycle, or process-leak/recovery precedence regression.
+  The active `prepare-workspace` full-DAG tests continue to cover a feature
+  branched from a pre-base commit and refreshed by merging the current base:
+  the resulting current-base-to-head range retains the feature commit and merge
+  commit, exact diff, commit patches, and parent-support evidence. The retired
+  internal materializer has no CLI entrypoint and receives no new routing or
+  documentation.
+- The final warning-strict whole-skill discovery ran all `3,216` tests in
+  `1,522.718` seconds. It reproduced only the known restricted-host nested
+  `sandbox-exec` denial; the other `3,215` tests passed with six conditional
+  skips. That exact broker test then passed alone outside the host sandbox in
+  `2.277` seconds with `ResourceWarning` still promoted to an error.
 
 ## Next Steps
 
