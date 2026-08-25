@@ -1,0 +1,3323 @@
+{
+  "schema": "github-codex-terminal-carriers-v1",
+  "schema_version": 1,
+  "role": "consumer-terminal-carrier-grammar",
+  "producer_contract": "out-of-scope",
+  "fixture_patch_semantics": "RFC7396",
+  "normalization": {
+    "input": "unicode-scalar-values",
+    "line_breaks_to_lf": [
+      "CRLF",
+      "U+000D",
+      "U+000B",
+      "U+000C",
+      "U+0085",
+      "U+2028",
+      "U+2029"
+    ],
+    "reject": "surrogates, NUL, and remaining C0/C1 controls except HT and LF",
+    "outer_trim": [
+      "U+0009",
+      "U+000A",
+      "U+0020"
+    ],
+    "other_transformations": "none"
+  },
+  "provider_identity": {
+    "login": "chatgpt-codex-connector[bot]",
+    "type": "Bot",
+    "issue_comment_app_slug": "chatgpt-codex-connector"
+  },
+  "terminal_detection": {
+    "issue_comment": {
+      "anchor": "Codex Review",
+      "first_line_max_start_scalar_index": 63,
+      "prefix_must_contain_no_ascii_alnum": true,
+      "progress_stems": [
+        "Codex Review in progress",
+        "Codex Review still in progress"
+      ],
+      "progress_detail_max_scalars": 160,
+      "progress_requires_no_later_nonempty_line": true
+    },
+    "review": {
+      "nonterminal_states": [
+        "PENDING"
+      ],
+      "admitted_states": [
+        "APPROVED",
+        "COMMENTED",
+        "CHANGES_REQUESTED"
+      ],
+      "inadmissible_terminal_states": [
+        "DISMISSED"
+      ],
+      "missing_or_unknown_state_with_body_or_child": "malformed"
+    }
+  },
+  "semantic_time": {
+    "issue_comment": "updated_at when updated_at is later than created_at; otherwise created_at",
+    "review": "submitted_at",
+    "requirements": "canonical GitHub UTC-second RFC3339 strings; updated_at must not precede created_at"
+  },
+  "terminal_commit_binding": {
+    "hashless_branches": [],
+    "clean_issue_v1": "reviewed-commit marker",
+    "clean_review_v1": "native review commit_id",
+    "top_level_finding_v1": "finding blob URL, native review commit_id when applicable, and complete ancestor projection for a non-head commit",
+    "inline_parent_v1": "native parent, child commit_id, child original_commit_id, exact child thread join, and complete ancestor projection for a non-head commit"
+  },
+  "ancestor_shas_projection": {
+    "owner": "parent-orchestrator",
+    "status_values": [
+      "complete",
+      "incomplete"
+    ],
+    "base_endpoint": "locally proved unique PR merge base",
+    "head_endpoint": "exact immutable scope head",
+    "ancestor_set": "complete lowercase full-SHA set from base_sha..head_sha excluding head_sha when status is complete",
+    "canonical_order": "ascending lowercase ASCII SHA order with no duplicates",
+    "digest": "SHA-256 of the ASCII bytes of each ordered ancestor SHA followed by LF, including LF after the final SHA",
+    "membership_rule": "only a closed, scope-bound, digest-valid projection with status complete may make ancestor membership applicable; incomplete makes non-head applicability inconclusive"
+  },
+  "disclosure_lines": [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    "- Comment \"@codex review\".",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
+    "</details>"
+  ],
+  "branches": {
+    "clean_issue_v1": {
+      "lead": "Codex Review: Didn't find any major issues.",
+      "body_to_marker_separator": "\n\n",
+      "marker_template": "**Reviewed commit:** `<LOWERCASE_10_OR_40_HEX_SHA>`",
+      "commit_ref_lengths": [
+        10,
+        40
+      ],
+      "full_ref_binding": "equals-current-head",
+      "short_ref_binding": "stable-unique-exact-repository-resolution-to-current-head",
+      "allowed_tagline_symbols": [
+        ":rocket:",
+        ":tada:",
+        ":+1:",
+        "🚀",
+        "🎉",
+        "👍",
+        "✨",
+        "✅"
+      ],
+      "allowed_tagline_stems": [
+        "Nice work",
+        "Chef's kiss",
+        "What shall we delve into next",
+        "Already looking forward to the next diff",
+        "Keep them coming",
+        "Swish",
+        "Another round soon, please",
+        "Breezy",
+        "Can't wait for the next one",
+        "More of your lovely PRs please",
+        "Bravo",
+        "Keep it up",
+        "Delightful",
+        "Hooray",
+        "You're on a roll"
+      ],
+      "tagline_stem_terminal_punctuation": [
+        ".",
+        "!",
+        "?"
+      ],
+      "optional_disclosure": "two LF, nonblank first line, then disclosure_lines after per-line trim and blank-line removal"
+    },
+    "clean_review_v1": {
+      "state": "APPROVED",
+      "body": "No findings.",
+      "commit_binding": "native-full-sha-equals-current-head",
+      "provider_target_children": "zero",
+      "associated_pages": "complete"
+    },
+    "top_level_finding_v1": {
+      "header": "### 💡 Codex Review",
+      "line_template": "- [P<0..3>] <TITLE> — <BLOB_URL>",
+      "title_max_scalars": 240,
+      "review_states": [
+        "COMMENTED",
+        "CHANGES_REQUESTED"
+      ],
+      "blob_url": "lowercase https github.com, exact repository, full lowercase SHA, safe RFC3986 path, positive line anchor",
+      "commit_binding": "current-head-or-locally-proved-ancestor",
+      "ancestor_binding": "closed parent-owned ancestor_shas_projection",
+      "provider_target_children": "parse and join every associated child before returning the top-level finding",
+      "optional_disclosure": "exact two-LF boundary and byte-exact disclosure_lines"
+    },
+    "inline_parent_v1": {
+      "parent_forms": "COMMENTED empty/exact-container body, or APPROVED exact clean-review body whose provider target child overrides clean",
+      "commit_binding": "current-head-or-locally-proved-ancestor",
+      "empty_parent_body_allowed": true,
+      "nonempty_parent_lines": [
+        "### 💡 Codex Review",
+        "Here are some automated review suggestions for this pull request.",
+        "**Reviewed commit:** `<PARENT_FULL_SHA>`"
+      ],
+      "provider_children_minimum": 1,
+      "child_binding": "exact parent review ID and parent commit_id/original_commit_id",
+      "thread_join": "one REST child ID and exact frozen-repository/PR discussion_r<ID> URL to one GraphQL thread comment under the exact parent review with typed isResolved",
+      "incomplete_join": "inconclusive",
+      "all_threads_resolved": "resolved-inline-only classification when the artifact is bound to the exact current head, all pages and joins are complete, at least one provider target child exists, and every typed isResolved value is true"
+    }
+  },
+  "closed_record_fields": {
+    "issue_comment": [
+      "kind",
+      "id",
+      "user",
+      "performed_via_github_app",
+      "body",
+      "created_at",
+      "updated_at",
+      "scope",
+      "commit_resolution"
+    ],
+    "review": [
+      "kind",
+      "id",
+      "user",
+      "state",
+      "commit_id",
+      "body",
+      "submitted_at",
+      "scope",
+      "children_complete",
+      "threads_complete",
+      "children"
+    ],
+    "scope": [
+      "repository",
+      "pull_request",
+      "base_sha",
+      "head_sha",
+      "ancestor_shas",
+      "ancestor_shas_projection"
+    ],
+    "ancestor_shas_projection": [
+      "owner",
+      "status",
+      "repository",
+      "pull_request",
+      "base_sha",
+      "head_sha",
+      "ancestor_count",
+      "ancestor_shas_sha256"
+    ],
+    "user": [
+      "login",
+      "type"
+    ],
+    "app": [
+      "slug"
+    ],
+    "commit_resolution": [
+      "repository",
+      "commit_ref",
+      "initial_resolved_commit",
+      "final_resolved_commit"
+    ],
+    "child": [
+      "id",
+      "url",
+      "user",
+      "pull_request_review_id",
+      "commit_id",
+      "original_commit_id",
+      "body",
+      "thread_join"
+    ],
+    "thread_join": [
+      "match_count",
+      "parent_review_id",
+      "child_comment_id",
+      "url",
+      "isResolved"
+    ]
+  },
+  "closed_world": {
+    "unknown_terminal_looking_exact_provider_carrier": "malformed",
+    "wrong_or_lookalike_actor": "irrelevant-audit-context",
+    "old_head_positive": "stale",
+    "incomplete_ancestor_projection_for_non_head": "inconclusive",
+    "invalid_or_unbound_ancestor_projection": "malformed",
+    "orphaned_or_conflicting_join": "malformed",
+    "non_unique_or_incomplete_join_or_pagination": "inconclusive",
+    "inline_resolution_source": "typed GraphQL isResolved only",
+    "resolved_inline_only": "non-positive terminal classification reported as resolved-inline-awaiting-clean with a complete stable parent-owned current-head snapshot; it never completes the lane, never applies to top-level findings, and permits same-head reconcile for a new clean artifact"
+  },
+  "required_report_schema": {
+    "schema": "github-codex-lane-report-v1",
+    "role": "consumer-report-schema",
+    "producer_contract": "out-of-scope",
+    "closed_fields": {
+      "report": [
+        "status",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "scope_assurance",
+        "base_assurance",
+        "basis",
+        "evidence",
+        "request_policy",
+        "unresolved_provider_findings",
+        "last_reason"
+      ],
+      "evidence": [
+        "kind",
+        "id",
+        "url",
+        "channel",
+        "grammar",
+        "grammar_branch",
+        "grammar_status",
+        "artifact_commit",
+        "server_time",
+        "server_time_field",
+        "head_binding",
+        "request_id"
+      ],
+      "merge_status_evidence": [
+        "kind",
+        "id",
+        "url",
+        "channel",
+        "check_name",
+        "status",
+        "conclusion",
+        "feature_head_sha",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "app",
+        "server_time",
+        "server_time_field",
+        "association"
+      ],
+      "merge_status_app": [
+        "id",
+        "slug"
+      ],
+      "merge_status_association": [
+        "kind",
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "feature_head_sha",
+        "base_ref",
+        "base_tip_sha",
+        "merge_base_sha",
+        "check_subject_kind",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "check_run_id",
+        "check_run_url",
+        "check_name",
+        "app_id",
+        "app_slug",
+        "contract",
+        "provider_clean_assertion"
+      ],
+      "merge_status_contract": [
+        "source_repository",
+        "source_commit",
+        "source_path",
+        "source_sha256"
+      ],
+      "merge_status_clean_assertion": [
+        "kind",
+        "semantics",
+        "scope",
+        "unresolved_findings_required_zero"
+      ],
+      "request_policy": [
+        "status",
+        "warnings"
+      ],
+      "unresolved_provider_finding": [
+        "id",
+        "url",
+        "artifact_commit",
+        "grammar_branch",
+        "thread_is_resolved",
+        "evidence_id",
+        "report_head_sha"
+      ]
+    },
+    "parent_input_profiles": {
+      "selection_outcome": [
+        "owner",
+        "outcome",
+        "repository",
+        "pull_request",
+        "head_sha"
+      ],
+      "selected_pr_scope": [
+        "repository",
+        "pull_request",
+        "head_sha"
+      ],
+      "terminal_clean_identity": [
+        "kind",
+        "id",
+        "url",
+        "channel"
+      ],
+      "complete_pr_snapshot": [
+        "owner",
+        "status",
+        "initial_scope",
+        "final_scope",
+        "initial_merge_status_scope",
+        "final_merge_status_scope",
+        "initial_page_inventory",
+        "final_page_inventory",
+        "initial_terminal_selection",
+        "final_terminal_selection",
+        "initial_basis_selection",
+        "final_basis_selection",
+        "unresolved_provider_findings",
+        "initial_snapshot_sha256",
+        "final_snapshot_sha256"
+      ],
+      "complete_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count",
+        "reactions_pages_complete",
+        "reaction_count",
+        "feature_head_check_subject_sha",
+        "feature_head_check_runs_pages_complete",
+        "feature_head_check_run_count",
+        "feature_head_commit_statuses_pages_complete",
+        "feature_head_commit_status_count",
+        "feature_head_check_pages_sha256",
+        "selected_subject_kind",
+        "selected_subject_sha",
+        "selected_subject_check_runs_pages_complete",
+        "selected_subject_check_run_count",
+        "selected_subject_commit_statuses_pages_complete",
+        "selected_subject_commit_status_count",
+        "selected_subject_check_pages_sha256",
+        "selected_subject_page_relation",
+        "trustworthy_terminal_count"
+      ],
+      "terminal_selection": [
+        "classification",
+        "evidence"
+      ],
+      "basis_selection": [
+        "kind",
+        "terminal_evidence",
+        "reaction",
+        "merge_status"
+      ],
+      "reaction_basis_selection": [
+        "request_kind",
+        "request_id",
+        "request_url",
+        "request_command",
+        "request_server_time",
+        "reaction_id",
+        "reaction_url",
+        "reaction_content",
+        "reaction_actor_login",
+        "reaction_actor_type",
+        "reaction_server_time"
+      ],
+      "merge_status_basis_selection": [
+        "id",
+        "url",
+        "check_name",
+        "status",
+        "conclusion",
+        "feature_head_sha",
+        "check_subject_sha",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "app",
+        "server_time",
+        "server_time_field",
+        "scope",
+        "contract",
+        "provider_clean_assertion"
+      ],
+      "merge_status_scope": [
+        "repository",
+        "pull_request",
+        "feature_head_sha",
+        "base_ref",
+        "base_tip_sha",
+        "merge_base_sha",
+        "check_subject_kind",
+        "check_subject_sha"
+      ],
+      "merge_status_parent_contract": [
+        "owner",
+        "status",
+        "contract_descriptor",
+        "app_id",
+        "app_slug",
+        "workflow_id",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "check_name",
+        "check_run_id",
+        "check_run_url",
+        "provider_clean_assertion"
+      ],
+      "reaction_clean_epoch": [
+        "owner",
+        "status",
+        "pre_request_scope",
+        "post_request_scope",
+        "reaction_read_scope",
+        "final_scope",
+        "request_kind",
+        "request_id",
+        "request_url",
+        "request_command",
+        "request_server_time",
+        "reaction_id",
+        "reaction_url",
+        "reaction_content",
+        "reaction_actor_login",
+        "reaction_actor_type",
+        "reaction_server_time",
+        "request_pages_complete",
+        "reaction_pages_complete",
+        "provider_pages_complete",
+        "thread_pages_complete",
+        "no_later_request",
+        "no_conflicting_provider_reaction",
+        "no_provider_eyes_at_or_after_reaction",
+        "no_terminal_provider_artifact",
+        "no_malformed_terminal_looking_provider_artifact",
+        "unresolved_provider_findings"
+      ],
+      "resolved_inline_snapshot": [
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "initial_head_sha",
+        "final_head_sha",
+        "evidence_kind",
+        "evidence_id",
+        "evidence_url",
+        "evidence_channel",
+        "artifact_commit",
+        "grammar_branch",
+        "provider_target_children",
+        "unresolved_provider_findings",
+        "children_pages_complete",
+        "threads_pages_complete",
+        "initial_snapshot_sha256",
+        "final_snapshot_sha256"
+      ],
+      "finding_carrier_snapshot": [
+        "owner",
+        "status",
+        "complete_observation",
+        "complete_observation_sha256",
+        "raw_carrier",
+        "raw_carrier_sha256",
+        "evidence",
+        "unresolved_provider_findings"
+      ],
+      "finding_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count",
+        "terminal_candidate_count"
+      ],
+      "finding_page_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "scope",
+        "page_inventory",
+        "records_sha256"
+      ],
+      "finding_acquisition_scope": [
+        "repository",
+        "pull_request",
+        "base_sha",
+        "head_sha",
+        "ancestor_shas_sha256"
+      ],
+      "finding_acquisition_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count"
+      ],
+      "finding_complete_observation": [
+        "scope",
+        "page_inventory",
+        "issue_comments",
+        "reviews",
+        "selected_carrier_sha256",
+        "selection_status"
+      ],
+      "finding_range_receipt": [
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "base_sha",
+        "head_sha",
+        "history_mode",
+        "base_is_unique_merge_base",
+        "base_is_ancestor_of_head",
+        "ancestor_shas",
+        "ancestor_count",
+        "ancestor_shas_sha256"
+      ]
+    },
+    "parent_input_rules": {
+      "complete_pr_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from complete raw selected-PR observations before report validation; read-only to the consumer and never derived from report, evidence, association, or merge-status fields",
+        "scope_binding": "initial_scope and final_scope are type-preserving equal closed selected_pr_scope values exactly equal to the independently selected report repository, pull request, and current head",
+        "page_state": "initial_page_inventory and final_page_inventory are type-preserving equal closed complete_page_inventory values; issue comments, reviews, associated inline comments, GraphQL review threads, every nested thread-comment page, and reactions on every candidate review request each have an exact true completion flag and a typed non-negative integer count; feature-head check runs/statuses and selected-subject check runs/statuses independently bind their exact query subject, exact true completion flags, typed non-negative counts, and lowercase SHA-256 identity of the subject-bound raw pagination envelopes and records",
+        "check_subject_page_state": "feature_head_check_subject_sha always equals the selected PR head; selected_subject_sha equals the merge-status check subject when that basis is selected and otherwise equals the feature head; selected_subject_kind feature-head requires same-feature-head-page-set plus exact type-preserving equality of both subject-bound check/status page identities and counts, while github-synthetic-merge requires independent-synthetic-subject-page-set, a distinct selected subject, and a distinct second subject-bound page identity",
+        "terminal_selection": "initial_terminal_selection and final_terminal_selection are type-preserving equal closed terminal_selection values selected under version-1 precedence; terminal-clean requires classification clean with the exact terminal artifact, merge-status requires classification clean with the exact independently contract-verified producer check evidence and does not require a separate terminal comment or review, while reaction-clean requires classification absent and null evidence",
+        "basis_selection": "initial_basis_selection and final_basis_selection are type-preserving equal closed basis_selection values frozen from the complete raw snapshot and selected independently before report validation; terminal-clean binds the exact terminal evidence, reaction-clean binds the exact request and provider reaction actor/IDs/URLs/times from reaction_clean_epoch, and merge-status binds the exact feature head, current base and merge scope, check subject, App/workflow/run/check identity, producer-contract descriptor, and provider-clean assertion from the report and merge_status_parent_contract; report, epoch, association, and contract fields cannot self-prove or repair this selection",
+        "finding_state": "unresolved_provider_findings is integer zero for every pass basis",
+        "merge_status_scope": "initial_merge_status_scope and final_merge_status_scope are null for non-merge-status bases; for merge-status they are type-preserving equal closed merge_status_scope values that equal the separately frozen parent scope and bind the exact feature head, base ref/tip, unique merge base, subject kind, and check-subject SHA",
+        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, merge-status scope when selected, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal or producer result, the independently selected pass-basis projection, unresolved applicable findings, and both subject-discriminated check/status page sets; they are not digests of report summaries"
+      },
+      "reaction_clean_epoch": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted by the parent from raw observations before report validation; read-only to the consumer and never derived from report or evidence fields",
+        "scope_binding": "pre_request_scope, post_request_scope, reaction_read_scope, and final_scope are each closed selected_pr_scope values exactly equal to the report repository, pull request, and head",
+        "request_identity": "issue-comment kind; positive request ID; exact selected-PR issuecomment URL; exact @codex review command; canonical request server time",
+        "reaction_identity": "positive reaction ID; same exact request URL; exact +1 content; exact provider login and Bot type; canonical reaction server time strictly later than request server time",
+        "page_state": "request_pages_complete, reaction_pages_complete, provider_pages_complete, and thread_pages_complete are exact true",
+        "exclusions": "no_later_request, no_conflicting_provider_reaction, no_provider_eyes_at_or_after_reaction, no_terminal_provider_artifact, and no_malformed_terminal_looking_provider_artifact are exact true; unresolved_provider_findings is integer zero",
+        "report_binding": "request ID, reaction ID, reaction URL, reaction server time, and stable-request-epoch evidence fields exactly equal the epoch"
+      },
+      "resolved_inline_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted by the parent from two complete raw current-head snapshots before report validation; read-only to the consumer and never derived from report fields",
+        "scope_binding": "repository, pull request, head_sha, initial_head_sha, final_head_sha, and artifact_commit all equal the selected report scope and exact current head",
+        "evidence_binding": "terminal-artifact kind; exact report evidence ID, URL, review channel, and inline-parent-v1 branch",
+        "finding_state": "provider_target_children is a positive integer and unresolved_provider_findings is integer zero",
+        "page_state": "children_pages_complete and threads_pages_complete are exact true",
+        "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the closed parent review, complete provider-target child pages, and exact joined GraphQL thread state sorted by child ID"
+      },
+      "finding_carrier_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from the complete raw selected finding carrier before report validation; read-only to the consumer and never derived from report or report evidence fields",
+        "complete_observation": "a closed finding_complete_observation used as the consumer replay source, containing a closed selected_pr_scope equal to the report, a closed finding_page_inventory, canonically ordered issue_comments and reviews arrays type-preserving equal to the independently frozen finding_page_receipt projection, the independently derived selected carrier digest, and selection_status selected-findings; issue_comment_count and review_count exactly equal their array lengths, inline_comment_count exactly equals the sum of every review children length, terminal_candidate_count exactly equals the consumer-derived terminal-looking candidate count, all page completion flags are exact true, counts are typed non-negative integers, raw digests and kind/ID identities are unique, and every record has the same exact scope and complete current ancestry projection",
+        "observation_digest": "complete_observation_sha256 is recomputed as the lowercase SHA-256 digest of RFC 8785 canonical JSON for complete_observation before page, candidate, ordering, or selection fields are trusted; arbitrary or stale digests and any observation-byte mutation without a matching digest fail closed",
+        "terminal_selection": "the consumer derives terminal candidates from every issue_comments and reviews record, runs the existing version-1 classifier over each, and independently applies authority precedence to derive selected_carrier_sha256; because the version-1 evidence and finding projection binds exactly one raw carrier, more than one active finding carrier fails closed instead of selecting only the newest and omitting older unresolved findings; each channel array is canonically ordered by semantic server time and within-channel ID only for inventory identity, never to decide cross-channel precedence; within each GitHub channel's globally latest semantic-time bucket, findings take precedence over clean and resolved-inline-only, while multiple remaining same-priority candidates in one channel fail closed; only a strictly later trustworthy clean supersedes an older top-level finding, resolved-inline-only clears only that carrier's typed resolved inline findings, and an unresolved applicable inline child is not superseded by a later clean even when its parent also has a top-level finding; a globally latest malformed or inconclusive candidate, contradictory classification or commit results across channel winners, or multiple channels competing at the selected finding time also fails closed",
+        "raw_carrier": "the exact parent-enriched closed issue-comment or review carrier admitted by this version-1 grammar, including its closed scope and parent-owned ancestor projection, exact provider actor and App identity when applicable, state and body, complete child pagination, and exact parent-derived GraphQL thread joins; an issue-comment full-SHA finding has null commit_resolution",
+        "raw_digest": "raw_carrier_sha256 is the lowercase SHA-256 digest of RFC 8785 canonical JSON for raw_carrier and is recomputed before any projection is trusted",
+        "classification": "the existing version-1 carrier classifier must classify raw_carrier as findings; stale, inconclusive, malformed, irrelevant, clean, resolved-inline-only, and nonterminal carriers cannot support a findings report",
+        "scope_binding": "raw_carrier.scope is only an exact join projection, never independent ancestry authority: repository, pull_request, base_sha, head_sha, ancestor_shas, and its embedded ancestor_shas_projection are type-preserving equal to the separate parent-owned finding_range_receipt; only membership in that independently frozen complete full-DAG receipt makes a non-head artifact commit applicable",
+        "evidence_binding": "evidence is a closed parent-derived projection whose kind, ID, exact scope URL, channel, grammar, branch, accepted status, artifact commit, semantic server time and field, and explicit-commit binding are deterministically derived from raw_carrier and classifier output; request_id is the parent-owned request association retained in that exact projection",
+        "finding_projection": "unresolved_provider_findings is the exact ordered closed projection derived from raw_carrier: one top-level carrier entry when the selected branch is top-level-finding-v1 and that top-level component has not been superseded by a strictly later trustworthy clean, followed by every exact-provider child whose complete unique thread join has typed isResolved false; a selected top-level carrier whose top-level component was superseded projects only its still-unresolved inline children, while inline-parent-v1 always contains only those unresolved child entries; IDs, URLs, artifact commit, evidence ID, thread state, and report head are derived from the raw record; if complete_observation contains more than one active finding carrier, this single-carrier projection cannot close and selection fails",
+        "report_binding": "the separate page/acquisition receipt and full-DAG range receipt are validated and exactly joined to complete_observation before authority selection and selected-carrier classification; selected_carrier_sha256 equals raw_carrier_sha256, raw_carrier is type-preserving equal to that unique active candidate, and snapshot evidence and unresolved_provider_findings are each type-preserving equal to their deterministic raw-carrier derivation and to the report fields; changing report, snapshot summaries, observation bytes, and digests together cannot make an omitted, independently superseded, or range-invalid carrier selectable while either independent receipt remains unchanged"
+      },
+      "finding_range_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from the exact current selected-PR range before carrier observation or report validation; read-only to the consumer and never derived from raw_carrier, complete_observation, report, or evidence fields",
+        "scope": "repository and pull_request equal the selected report and complete-observation scope; base_sha is the locally proved unique PR merge base, head_sha is the exact current head, base_is_unique_merge_base and base_is_ancestor_of_head are exact true, and history_mode is exact full-dag",
+        "ancestor_set": "ancestor_shas is the complete lowercase full-SHA set from base_sha..head_sha excluding both endpoints, ordered by ascending ASCII SHA with no duplicates; ancestor_count is a typed non-negative integer equal to its length and ancestor_shas_sha256 is recomputed over each ordered ASCII SHA followed by LF",
+        "carrier_join": "every complete-observation candidate and selected raw_carrier has a type-preserving exact scope equal to the receipt projection, including base_sha, head_sha, ancestor_shas, and a closed parent-orchestrator complete ancestor_shas_projection with the receipt count and digest; only head_sha or membership in this independent receipt can make a finding applicable",
+        "invalidation": "a repository, PR, head, unique merge base, or full-DAG ancestor-set change requires a new receipt and observation; same-head base movement, a coupled raw ancestry rewrite, first-parent projection, or ancestry-path omission cannot repair an old receipt"
+      },
+      "finding_page_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-finding-acquisition-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from the complete current-scope issue-comment, review, associated inline-comment, GraphQL review-thread, and nested thread-comment page acquisition before finding_carrier_snapshot construction or report validation; read-only to the consumer and never derived from complete_observation, raw_carrier, report, or report evidence fields",
+        "scope_binding": "scope is a closed finding_acquisition_scope whose repository, pull_request, base_sha, head_sha, and ancestor_shas_sha256 are type-preserving equal to the independent finding_range_receipt",
+        "page_inventory": "page_inventory is a closed finding_acquisition_page_inventory containing only the five acquisition completion booleans and their five typed non-negative counts; every completion flag is exact true and every field is type-preserving equal to its complete_observation.page_inventory counterpart before candidate selection; derived terminal_candidate_count remains outside this acquisition receipt",
+        "page_records_digest": "records_sha256 is recomputed as the lowercase SHA-256 digest of RFC 8785 canonical JSON for the closed object whose only fields are issue_comments and reviews, preserving each complete ordered parent-enriched record and every embedded provider child and exact GraphQL thread join; it exactly equals the complete_observation page-record projection before those replay bytes are trusted",
+        "mutation_resistance": "deleting or altering a page record, child, or thread join, or changing any page count or completion flag, while coupling complete_observation_sha256 and snapshot summaries cannot satisfy an unchanged independent receipt"
+      }
+    },
+    "selection_outcome_rules": {
+      "owner": "parent-orchestrator",
+      "application": "required exact match before every report variant, including pass, findings, pending, inconclusive, and not-applicable",
+      "outcomes": {
+        "selected-pr": {
+          "repository": "required-owner-and-repository-name",
+          "pull_request": "required-positive-integer",
+          "head_sha": "required-full-sha",
+          "report_binding": "repository, pull_request, and head_sha all equal the parent-owned selection outcome"
+        },
+        "proved-no-selected-supported-pr": {
+          "repository": "required-owner-and-repository-name",
+          "pull_request": null,
+          "head_sha": null,
+          "report_binding": "repository, null pull_request, and null head_sha all equal the parent-owned selection outcome"
+        }
+      }
+    },
+    "status_values": [
+      "pass",
+      "findings",
+      "pending",
+      "inconclusive",
+      "not-applicable"
+    ],
+    "request_policy_status_values": [
+      "compliant",
+      "warning",
+      "unknown",
+      "not-applicable"
+    ],
+    "terminal_selection_classification_values": [
+      "clean",
+      "findings",
+      "resolved-inline",
+      "malformed",
+      "absent"
+    ],
+    "basis_selection_kind_values": [
+      "terminal-clean",
+      "reaction-clean",
+      "merge-status"
+    ],
+    "unresolved_provider_findings_rules": {
+      "entry_profile": "unresolved_provider_finding",
+      "status_cardinality": {
+        "pass": "exactly-zero",
+        "findings": "one-or-more",
+        "pending": "exactly-zero",
+        "inconclusive": "exactly-zero",
+        "not-applicable": "exactly-zero"
+      },
+      "entry_binding": {
+        "id": "required-positive-integer; the stable GitHub artifact or inline-comment ID",
+        "url": "top-level-finding-v1 equals selected evidence URL; inline-parent-v1 is the exact current-repository-and-PR discussion URL for id",
+        "artifact_commit": "required-full-sha-equals-selected-evidence-artifact-commit",
+        "grammar_branch": "top-level-finding-v1 or inline-parent-v1",
+        "thread_is_resolved": "null for top-level-finding-v1; exact false for inline-parent-v1",
+        "evidence_id": "required-positive-integer-equals-selected-evidence-id",
+        "report_head_sha": "required-full-sha-equals-report-head-sha",
+        "carrier_relation": "inline-parent-v1 evidence permits only inline-parent-v1 entries; top-level-finding-v1 evidence permits top-level-finding-v1 and joined inline-parent-v1 entries and normally includes its top-level entry, but after the complete observation proves a strictly later trustworthy clean superseded only that top-level component it requires a non-empty inline-parent-v1-only projection derived from the same selected carrier",
+        "uniqueness": "IDs and URLs are each independently unique"
+      }
+    },
+    "scope_rules": {
+      "selected-pr": {
+        "status_values": [
+          "pass",
+          "findings",
+          "pending",
+          "inconclusive"
+        ],
+        "pull_request": "required-positive-integer",
+        "head_sha": "required-full-sha",
+        "scope_assurance_values": [
+          "latest-head-only",
+          "latest-feature-head",
+          "current-merge-scope"
+        ],
+        "base_assurance_values": [
+          "local-pr-readiness",
+          "producer-contract-current-scope-plus-local-pr-readiness"
+        ],
+        "parent_selection_outcome": "selected-pr"
+      },
+      "no-selected-supported-pr": {
+        "status": "not-applicable",
+        "pull_request": null,
+        "head_sha": null,
+        "scope_assurance": "proved-no-selected-supported-pr",
+        "base_assurance": "not-applicable",
+        "basis": null,
+        "evidence": null,
+        "request_policy_status": "not-applicable",
+        "request_policy_warnings": "required-empty",
+        "unresolved_provider_findings": "required-empty",
+        "last_reason": "no-selected-supported-pr",
+        "parent_selection_outcome": "proved-no-selected-supported-pr"
+      }
+    },
+    "basis_rules": {
+      "terminal-clean": {
+        "status": "pass",
+        "evidence_kind": "terminal-artifact",
+        "branches": [
+          "clean-issue-v1",
+          "clean-review-v1"
+        ],
+        "channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
+        "stable_identity": "positive evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<evidence-ID> for issue-comment or pullrequestreview-<evidence-ID> for review",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_identity_input": "separate closed parent-owned terminal identity whose kind, evidence ID, URL, and channel equal the report evidence",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, unique latest trustworthy clean terminal selection, exact stable terminal-clean basis selection, and zero unresolved applicable findings; report fields cannot supply or repair this input",
+        "artifact_commit": "required-full-sha-equals-report-head",
+        "head_binding": "explicit-commit"
+      },
+      "reaction-clean": {
+        "status": "pass",
+        "evidence_kind": "reaction",
+        "stable_identity": "positive reaction evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<request-ID>",
+        "request_relation": "positive request_id equals the parent request comment ID encoded by the URL fragment",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_identity_input": "separate closed parent-owned reaction_clean_epoch whose four selected-PR scope snapshots equal the report scope and whose exact request, reaction, actor, semantic times, complete pages, exclusion flags, and zero-unresolved count bind the report evidence",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds the exact current scope, complete typed initial/final page state, stable canonical pre/final snapshot digests, stable absence of a trustworthy terminal artifact, exact stable reaction-clean request/reaction/actor/time basis selection, and zero unresolved applicable findings; epoch or report fields cannot supply or repair this input",
+        "artifact_commit": null,
+        "head_binding": "stable-request-epoch"
+      },
+      "resolved-inline-awaiting-clean": {
+        "status": "pending",
+        "completion": "forbidden-until-later-accepted-current-head-terminal-clean",
+        "recovery": "same-head idempotent repository-Action reconcile under github-pr-probes retry policy",
+        "last_reason": "resolved-inline-awaiting-current-head-clean",
+        "evidence_kind": "terminal-artifact",
+        "branch": "inline-parent-v1",
+        "channel": "review",
+        "stable_identity": "positive review evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR>#pullrequestreview-<evidence-ID> URL",
+        "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
+        "parent_snapshot_input": "separate closed parent-owned resolved_inline_snapshot binds the exact current-head evidence, positive child count, complete child/thread pages, two equal canonical snapshot digests, and zero unresolved provider findings; this remains non-positive until a later accepted current-head clean artifact exists",
+        "artifact_commit": "required-full-sha-equals-report-head",
+        "head_binding": "explicit-commit"
+      },
+      "merge-status": {
+        "status": "pass",
+        "evidence_kind": "merge-status",
+        "evidence_profile": "merge_status_evidence",
+        "channel": "check-run",
+        "check_status": "completed",
+        "conclusion": "success",
+        "feature_head_binding": "feature_head_sha equals the report head and the separately supplied merge_status_scope",
+        "check_subject_binding": "feature-head contract requires check_subject_sha equal feature_head_sha; github-synthetic-merge contract requires the exact independently read synthetic merge commit/check subject and binds the current base ref/tip and unique merge base",
+        "parent_scope_binding": "report repository, pull request, and head plus the current base/merge/check-subject scope equal independently supplied parent inputs",
+        "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
+        "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
+        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and exact provider-clean assertion equal the report association",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds equal initial/final current feature-head/base/merge/check-subject scope, complete typed page state, stable canonical snapshot digests, exact stable contract-verified producer-clean selection, exact App/workflow/run/check/producer-contract basis, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
+        "provider_clean_assertion": "exact github-codex-provider-clean semantics with scope latest-feature-head for a feature-head subject or current-merge-scope for a github-synthetic-merge subject, and exact true unresolved_findings_required_zero",
+        "association": "complete parent-owned binding of this exact check subject and App/workflow/run/check to independently verified producer-contract bytes whose success conclusion itself means GitHub Codex provider clean for the declared scope; a generic successful check or service-start marker is invalid"
+      },
+      "null": {
+        "null_evidence_statuses": [
+          "pending",
+          "inconclusive"
+        ],
+        "finding_evidence_kind": "terminal-artifact",
+        "finding_branches": [
+          "top-level-finding-v1",
+          "inline-parent-v1"
+        ],
+        "parent_finding_snapshot_input": "findings require three separate closed parent-owned inputs: finding_page_receipt independently freezes complete current-scope acquisition counts and page-record bytes, finding_range_receipt independently freezes the current unique-merge-base full-DAG range, and finding_carrier_snapshot supplies the consumer replay observation, canonical observation digest, authority-precedence selection across every later correction or supersession, exact selected parent-enriched raw carrier and canonical digest, and deterministic evidence/unresolved-finding projections; embedded page counts and ancestry projections are exact joins only, and report fields cannot supply or repair any input",
+        "finding_artifact_commit": "required-full-sha",
+        "finding_head_binding": "explicit-commit"
+      }
+    }
+  },
+  "report_bases": {
+    "terminal_clean": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "terminal-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 101,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+        "channel": "issue-comment",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "clean-issue-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "server_time": "2026-08-23T09:00:00Z",
+        "server_time_field": "created_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "terminal-clean-current-head"
+    },
+    "terminal_clean_null_commit": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "terminal-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 101,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+        "channel": "issue-comment",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "clean-issue-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": null,
+        "server_time": "2026-08-23T09:00:00Z",
+        "server_time_field": "created_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "invalid-null-terminal-commit"
+    },
+    "resolved_inline_awaiting_clean": {
+      "status": "pending",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "resolved-inline-awaiting-clean",
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 401,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-401",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "inline-parent-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+        "server_time": "2026-08-23T09:03:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "resolved-inline-awaiting-current-head-clean"
+    },
+    "reaction_clean": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": "reaction-clean",
+      "evidence": {
+        "kind": "reaction",
+        "id": 601,
+        "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-91",
+        "channel": "reaction",
+        "grammar": null,
+        "grammar_branch": null,
+        "grammar_status": null,
+        "artifact_commit": null,
+        "server_time": "2026-08-23T09:06:00Z",
+        "server_time_field": "reaction-time",
+        "head_binding": "stable-request-epoch",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "reaction-fallback-current-head"
+    },
+    "merge_status": {
+      "status": "pass",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "current-merge-scope",
+      "base_assurance": "producer-contract-current-scope-plus-local-pr-readiness",
+      "basis": "merge-status",
+      "evidence": {
+        "kind": "merge-status",
+        "id": 701,
+        "url": "https://github.com/octo/review-fixture/runs/701",
+        "channel": "check-run",
+        "check_name": "Codex Review Merge Gate",
+        "status": "completed",
+        "conclusion": "success",
+        "feature_head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "check_subject_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "workflow_id": 901,
+        "run_id": 801,
+        "run_attempt": 1,
+        "check_suite_id": 601,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "server_time": "2026-08-23T09:07:00Z",
+        "server_time_field": "completed_at",
+        "association": {
+          "kind": "parent-verified-repository-contract",
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "feature_head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "base_ref": "refs/heads/master",
+          "base_tip_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "check_subject_kind": "github-synthetic-merge",
+          "check_subject_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "workflow_id": 901,
+          "run_id": 801,
+          "run_attempt": 1,
+          "check_suite_id": 601,
+          "check_run_id": 701,
+          "check_run_url": "https://github.com/octo/review-fixture/runs/701",
+          "check_name": "Codex Review Merge Gate",
+          "app_id": 15368,
+          "app_slug": "github-actions",
+          "contract": {
+            "source_repository": "octo/review-gate",
+            "source_commit": "2222222222222222222222222222222222222222",
+            "source_path": "contracts/github-codex-merge-status-v1.json",
+            "source_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "provider_clean_assertion": {
+            "kind": "verified-producer-contract",
+            "semantics": "github-codex-provider-clean",
+            "scope": "current-merge-scope",
+            "unresolved_findings_required_zero": true
+          }
+        }
+      },
+      "request_policy": {
+        "status": "not-applicable",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "associated-current-head-status"
+    },
+    "finding": {
+      "status": "findings",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 301,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "top-level-finding-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "server_time": "2026-08-23T09:02:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [
+        {
+          "id": 301,
+          "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+          "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "grammar_branch": "top-level-finding-v1",
+          "thread_is_resolved": null,
+          "evidence_id": 301,
+          "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+        }
+      ],
+      "last_reason": "applicable-provider-finding"
+    },
+    "inline_finding": {
+      "status": "findings",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": {
+        "kind": "terminal-artifact",
+        "id": 402,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-402",
+        "channel": "review",
+        "grammar": "github-codex-terminal-carriers-v1",
+        "grammar_branch": "inline-parent-v1",
+        "grammar_status": "accepted",
+        "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "server_time": "2026-08-23T09:05:00Z",
+        "server_time_field": "submitted_at",
+        "head_binding": "explicit-commit",
+        "request_id": 91
+      },
+      "request_policy": {
+        "status": "compliant",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [
+        {
+          "id": 503,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+          "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "grammar_branch": "inline-parent-v1",
+          "thread_is_resolved": false,
+          "evidence_id": 402,
+          "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+        }
+      ],
+      "last_reason": "applicable-unresolved-provider-inline-finding"
+    },
+    "selected_pending": {
+      "status": "pending",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567",
+      "scope_assurance": "latest-head-only",
+      "base_assurance": "local-pr-readiness",
+      "basis": null,
+      "evidence": null,
+      "request_policy": {
+        "status": "unknown",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "provider-work-retryable"
+    },
+    "no_selected_supported_pr": {
+      "status": "not-applicable",
+      "repository": "octo/review-fixture",
+      "pull_request": null,
+      "head_sha": null,
+      "scope_assurance": "proved-no-selected-supported-pr",
+      "base_assurance": "not-applicable",
+      "basis": null,
+      "evidence": null,
+      "request_policy": {
+        "status": "not-applicable",
+        "warnings": []
+      },
+      "unresolved_provider_findings": [],
+      "last_reason": "no-selected-supported-pr"
+    }
+  },
+  "report_parent_selection_outcomes": {
+    "selected_pr": {
+      "owner": "parent-orchestrator",
+      "outcome": "selected-pr",
+      "repository": "octo/review-fixture",
+      "pull_request": 7,
+      "head_sha": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "proved_no_selected_supported_pr": {
+      "owner": "parent-orchestrator",
+      "outcome": "proved-no-selected-supported-pr",
+      "repository": "octo/review-fixture",
+      "pull_request": null,
+      "head_sha": null
+    }
+  },
+  "report_base_parent_selection_outcomes": {
+    "terminal_clean": "selected_pr",
+    "terminal_clean_null_commit": "selected_pr",
+    "resolved_inline_awaiting_clean": "selected_pr",
+    "reaction_clean": "selected_pr",
+    "merge_status": "selected_pr",
+    "finding": "selected_pr",
+    "inline_finding": "selected_pr",
+    "selected_pending": "selected_pr",
+    "no_selected_supported_pr": "proved_no_selected_supported_pr"
+  },
+  "report_fixtures": [
+    {
+      "id": "terminal-clean-report-positive",
+      "base": "terminal_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "terminal-clean-cross-repository-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/other/pull/7#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-cross-pr-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-cross-evidence-id",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "id": 102
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-coupled-evidence-id-url-mutation",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "id": 102,
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-102"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-coupled-scope-and-id-mutation",
+      "base": "terminal_clean",
+      "patch": {
+        "repository": "octo/other",
+        "pull_request": 8,
+        "evidence": {
+          "id": 102,
+          "url": "https://github.com/octo/other/pull/8#issuecomment-102"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-non-https-url",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "url": "http://github.com/octo/review-fixture/pull/7#issuecomment-101"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-review-wrong-channel-fragment",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "channel": "review",
+          "grammar_branch": "clean-review-v1",
+          "server_time_field": "submitted_at"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-null-artifact-commit",
+      "base": "terminal_clean_null_commit",
+      "patch": {},
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-stable-request-epoch",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "head_binding": "stable-request-epoch"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-artifact-commit-mismatch",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-reaction-kind-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "terminal-clean-open-evidence",
+      "base": "terminal_clean",
+      "patch": {
+        "evidence": {
+          "provider_epoch": "opaque"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-report-valid-pending",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-pass",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "status": "pass"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-claim-pass-reason",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "last_reason": "terminal-clean-current-head"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-claim-terminal-clean",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "status": "pass",
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-old-head",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-top-level-branch",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "grammar_branch": "top-level-finding-v1"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-clean-review-branch",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "grammar_branch": "clean-review-v1"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-wrong-channel",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "channel": "issue-comment",
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-401",
+          "server_time_field": "created_at"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-coupled-identity-mutation",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "evidence": {
+          "id": 402,
+          "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-402"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "resolved-inline-awaiting-clean-cannot-carry-unresolved-finding",
+      "base": "resolved_inline_awaiting_clean",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": false,
+            "evidence_id": 401,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-report-positive",
+      "base": "reaction_clean",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "reaction-clean-cross-repository-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/other/pull/7#issuecomment-91"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-cross-pr-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/8#issuecomment-91"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-request-fragment-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-request-id-mismatch",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-reaction-id-only-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "id": 602
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-coupled-identity-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "id": 602,
+          "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-92",
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-coupled-scope-and-identity-mutation",
+      "base": "reaction_clean",
+      "patch": {
+        "repository": "octo/other",
+        "pull_request": 8,
+        "evidence": {
+          "id": 602,
+          "url": "https://github.com/octo/other/pull/8#issuecomment-92",
+          "request_id": 92
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-non-https-url",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "url": "http://github.com/octo/review-fixture/pull/7#issuecomment-91"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "reaction-clean-explicit-commit",
+      "base": "reaction_clean",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "0123456789abcdef0123456789abcdef01234567",
+          "head_binding": "explicit-commit"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-report-positive",
+      "base": "merge_status",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "merge-status-null-check-subject",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_subject_sha": null
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-old-feature-head",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "feature_head_sha": "1111111111111111111111111111111111111111"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-not-completed",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "status": "in_progress"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-unsuccessful-conclusion",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "conclusion": "neutral"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-untrusted-app-id",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "id": 99999
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-untrusted-app-slug",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "slug": "chatgpt-codex-connector"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-app-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "app": {
+            "id": 99999,
+            "slug": "other-actions"
+          },
+          "association": {
+            "app_id": 99999,
+            "app_slug": "other-actions"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-check-run-id-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "check_run_id": 702
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-run-url-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "url": "https://github.com/octo/review-fixture/runs/702"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-run-identity-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "id": 702,
+          "url": "https://github.com/octo/review-fixture/runs/702",
+          "association": {
+            "check_run_id": 702,
+            "check_run_url": "https://github.com/octo/review-fixture/runs/702"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-check-name-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_name": "Unrelated Successful Check"
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-name-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_name": "Other Review Gate",
+          "association": {
+            "check_name": "Other Review Gate"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-missing-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": null
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-incomplete-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "status": "incomplete"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-head-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "head_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-repository-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "repository": "octo/other"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-association-pr-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "pull_request": 8
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-service-start-not-association",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "kind": "provider-service-start"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-synthetic-base-tip-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "base_tip_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-check-subject-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "check_subject_sha": "dddddddddddddddddddddddddddddddddddddddd",
+          "association": {
+            "check_subject_sha": "dddddddddddddddddddddddddddddddddddddddd"
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-missing-provider-clean-assertion",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": null
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-scope-mismatch",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": {
+              "scope": "latest-feature-head"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-generic-semantics",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": {
+              "semantics": "generic-success"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-generic-kind",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": {
+              "kind": "service-start"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-provider-clean-does-not-require-zero-findings",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "provider_clean_assertion": {
+              "unresolved_findings_required_zero": false
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-invalid-contract-digest",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "contract": {
+              "source_sha256": "not-a-digest"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "merge-status-coupled-contract-descriptor-mutation",
+      "base": "merge_status",
+      "patch": {
+        "evidence": {
+          "association": {
+            "contract": {
+              "source_repository": "octo/other-gate",
+              "source_commit": "4444444444444444444444444444444444444444",
+              "source_path": "contracts/other-status-v1.json",
+              "source_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+            }
+          }
+        }
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-report-positive",
+      "base": "finding",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "finding-report-coupled-nonancestor-commit-mutation",
+      "base": "finding",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        },
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "inline-finding-report-positive",
+      "base": "inline_finding",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "finding-report-empty-unresolved-list",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": []
+      },
+      "valid": false
+    },
+    {
+      "id": "pending-report-with-unresolved-finding",
+      "base": "selected_pending",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "inconclusive-report-with-unresolved-finding",
+      "base": "selected_pending",
+      "patch": {
+        "status": "inconclusive",
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ],
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-open-field",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567",
+            "provider_body": "unexpected"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-evidence-id-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 999,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-artifact-commit-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-report-head-mismatch",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "1111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-cross-repository-url",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/other/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "inline-finding-entry-resolved",
+      "base": "inline_finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": true,
+            "evidence_id": 402,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-duplicate-id",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "inline-parent-v1",
+            "thread_is_resolved": false,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "finding-entry-duplicate-url",
+      "base": "finding",
+      "patch": {
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
+      "id": "selected-pending-report-positive",
+      "base": "selected_pending",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "selected-inconclusive-report-positive",
+      "base": "selected_pending",
+      "patch": {
+        "status": "inconclusive",
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": true
+    },
+    {
+      "id": "no-selected-supported-pr-positive",
+      "base": "no_selected_supported_pr",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "id": "no-pr-null-scope-cannot-pass",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "pass"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-findings",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "findings"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-pending",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "pending",
+        "scope_assurance": "latest-head-only",
+        "base_assurance": "local-pr-readiness",
+        "request_policy": {
+          "status": "unknown"
+        },
+        "last_reason": "provider-work-retryable"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-null-scope-cannot-inconclusive",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "status": "inconclusive",
+        "scope_assurance": "latest-head-only",
+        "base_assurance": "local-pr-readiness",
+        "request_policy": {
+          "status": "unknown"
+        },
+        "last_reason": "provider-evidence-inconclusive"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-non-null-pr",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "pull_request": 7
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-non-null-head",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "head_sha": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-selected-scope-assurance",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "scope_assurance": "latest-head-only"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-basis-leak",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "basis": "terminal-clean"
+      },
+      "valid": false
+    },
+    {
+      "id": "no-pr-rejects-evidence-leak",
+      "base": "no_selected_supported_pr",
+      "patch": {
+        "evidence": {}
+      },
+      "valid": false
+    },
+    {
+      "id": "selected-pr-rejects-not-applicable",
+      "base": "selected_pending",
+      "patch": {
+        "status": "not-applicable",
+        "request_policy": {
+          "status": "not-applicable"
+        },
+        "last_reason": "no-selected-supported-pr"
+      },
+      "valid": false
+    }
+  ],
+  "bases": {
+    "clean_issue": {
+      "kind": "issue_comment",
+      "id": 101,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "performed_via_github_app": {
+        "slug": "chatgpt-codex-connector"
+      },
+      "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`",
+      "created_at": "2026-08-23T09:00:00Z",
+      "updated_at": "2026-08-23T09:00:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "commit_resolution": null
+    },
+    "clean_review": {
+      "kind": "review",
+      "id": 201,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "APPROVED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "No findings.",
+      "submitted_at": "2026-08-23T09:01:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": []
+    },
+    "top_level_finding": {
+      "kind": "review",
+      "id": 301,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12",
+      "submitted_at": "2026-08-23T09:02:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": []
+    },
+    "inline_finding": {
+      "kind": "review",
+      "id": 401,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "",
+      "submitted_at": "2026-08-23T09:03:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 501,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 401,
+          "commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "body": "[P1] Preserve the selected object identity",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 401,
+            "child_comment_id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "isResolved": false
+          }
+        }
+      ]
+    },
+    "top_level_with_inline": {
+      "kind": "review",
+      "id": 302,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "COMMENTED",
+      "commit_id": "0123456789abcdef0123456789abcdef01234567",
+      "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12",
+      "submitted_at": "2026-08-23T09:04:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 502,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 302,
+          "commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+          "body": "[P2] Keep the thread finding visible",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 302,
+            "child_comment_id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "isResolved": false
+          }
+        }
+      ]
+    },
+    "approved_ancestor_inline": {
+      "kind": "review",
+      "id": 402,
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "type": "Bot"
+      },
+      "state": "APPROVED",
+      "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "body": "No findings.",
+      "submitted_at": "2026-08-23T09:05:00Z",
+      "scope": {
+        "repository": "octo/review-fixture",
+        "pull_request": 7,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "ancestor_shas": [
+          "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        ],
+        "ancestor_shas_projection": {
+          "owner": "parent-orchestrator",
+          "status": "complete",
+          "repository": "octo/review-fixture",
+          "pull_request": 7,
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_sha": "0123456789abcdef0123456789abcdef01234567",
+          "ancestor_count": 1,
+          "ancestor_shas_sha256": "207800411c2b59ff8c80652c5c45a216739df2104054d389b67901ebcef5401a"
+        }
+      },
+      "children_complete": true,
+      "threads_complete": true,
+      "children": [
+        {
+          "id": 503,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+          "user": {
+            "login": "chatgpt-codex-connector[bot]",
+            "type": "Bot"
+          },
+          "pull_request_review_id": 402,
+          "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "body": "[P1] Preserve the ancestor finding",
+          "thread_join": {
+            "match_count": 1,
+            "parent_review_id": 402,
+            "child_comment_id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "isResolved": false
+          }
+        }
+      ]
+    }
+  },
+  "fixtures": [
+    {
+      "id": "clean-issue-positive",
+      "base": "clean_issue",
+      "patch": {},
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-crlf-normalized",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\r\n\r\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`"
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-short-sha-resolved",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789`",
+        "commit_resolution": {
+          "repository": "octo/review-fixture",
+          "commit_ref": "0123456789",
+          "initial_resolved_commit": "0123456789abcdef0123456789abcdef01234567",
+          "final_resolved_commit": "0123456789abcdef0123456789abcdef01234567"
+        }
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-positive",
+      "base": "clean_review",
+      "patch": {},
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-review-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-finding-positive",
+      "base": "top_level_finding",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "issue-top-level-ancestor-finding-positive",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "issue-finding-rejects-commit-resolution",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12",
+        "commit_resolution": {
+          "repository": "octo/review-fixture",
+          "commit_ref": "abcdefabcd",
+          "initial_resolved_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "final_resolved_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-ancestor-finding-positive",
+      "base": "top_level_finding",
+      "patch": {
+        "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "top-level-multiple-findings",
+      "base": "top_level_finding",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10-L12\n- [P2] Preserve the selected identity — https://github.com/octo/review-fixture/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L30"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "inline-finding-unresolved",
+      "base": "inline_finding",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "inline-finding-resolved",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r501",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "resolved-inline-only",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-with-inline-finding",
+      "base": "inline_finding",
+      "patch": {
+        "state": "APPROVED",
+        "body": "No findings."
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-finding",
+      "base": "approved_ancestor_inline",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-resolved-is-not-current-head-clean",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 503,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "approved-ancestor-inline-incomplete-projection",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "status": "incomplete"
+          }
+        }
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "approved-nonancestor-inline-finding",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "commit_id": "1111111111111111111111111111111111111111",
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "1111111111111111111111111111111111111111",
+            "original_commit_id": "1111111111111111111111111111111111111111",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 503,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-count-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "ancestor_count": 2
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-digest-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "ancestor_shas_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-head-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "head_sha": "1111111111111111111111111111111111111111"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-base-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-unknown-status",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "status": "unknown"
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-projection-open-field",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "scope": {
+          "ancestor_shas_projection": {
+            "provider_claim": true
+          }
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "ancestor-inline-child-id-mismatch",
+      "base": "approved_ancestor_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 402,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P1] Preserve the ancestor finding",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 402,
+              "child_comment_id": 999,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-child-url-id-mismatch",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r999",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r999",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-child-url-cross-scope",
+      "base": "inline_finding",
+      "patch": {
+        "children": [
+          {
+            "id": 501,
+            "url": "https://github.com/other/repository/pull/99#discussion_r501",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 401,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P1] Preserve the selected object identity",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 401,
+              "child_comment_id": 501,
+              "url": "https://github.com/other/repository/pull/99#discussion_r501",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-with-inline-unresolved",
+      "base": "top_level_with_inline",
+      "patch": {},
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "top-level-ancestor-with-inline-unresolved",
+      "base": "top_level_with_inline",
+      "patch": {
+        "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12",
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "original_commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 502,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 2
+      }
+    },
+    {
+      "id": "top-level-with-inline-resolved",
+      "base": "top_level_with_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 502,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "top-level-inline-child-id-mismatch",
+      "base": "top_level_with_inline",
+      "patch": {
+        "children": [
+          {
+            "id": 502,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+            "user": {
+              "login": "chatgpt-codex-connector[bot]",
+              "type": "Bot"
+            },
+            "pull_request_review_id": 302,
+            "commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "original_commit_id": "0123456789abcdef0123456789abcdef01234567",
+            "body": "[P2] Keep the thread finding visible",
+            "thread_join": {
+              "match_count": 1,
+              "parent_review_id": 302,
+              "child_comment_id": 999,
+              "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+              "isResolved": false
+            }
+          }
+        ]
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-with-inline-incomplete-join",
+      "base": "top_level_with_inline",
+      "patch": {
+        "threads_complete": false
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:04:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "edited-clean-issue",
+      "base": "clean_issue",
+      "patch": {
+        "updated_at": "2026-08-23T09:05:00Z"
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v1",
+        "semantic_time_field": "updated_at",
+        "semantic_time": "2026-08-23T09:05:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "progress-issue",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### Codex Review in progress: inspecting tests"
+      },
+      "expected": {
+        "classification": "nonterminal",
+        "branch": "progress",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "provider-failure-terminal-looking",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review failed: provider timed out"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "hashless-clean-issue-near-miss",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues."
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-review-near-miss",
+      "base": "clean_review",
+      "patch": {
+        "body": "No findings!"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "wrong-actor-copy",
+      "base": "clean_issue",
+      "patch": {
+        "user": {
+          "login": "octocat",
+          "type": "User"
+        }
+      },
+      "expected": {
+        "classification": "irrelevant",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "old-head-clean-review",
+      "base": "clean_review",
+      "patch": {
+        "commit_id": "1111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "clean-review-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "inline-incomplete-join",
+      "base": "inline_finding",
+      "patch": {
+        "threads_complete": false
+      },
+      "expected": {
+        "classification": "inconclusive",
+        "branch": "inline-parent-v1",
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:03:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "dismissed-terminal-review",
+      "base": "clean_review",
+      "patch": {
+        "state": "DISMISSED"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "missing-state-terminal-review",
+      "base": "clean_review",
+      "patch": {
+        "state": null
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:01:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "issue-nul-control",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review:\u0000 Didn't find any major issues."
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-short-sha-without-resolution",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `0123456789`"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "top-level-finding-cross-repository",
+      "base": "top_level_finding",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/other/repository/blob/0123456789abcdef0123456789abcdef01234567/src/cache.py#L10"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "submitted_at",
+        "semantic_time": "2026-08-23T09:02:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "unknown-field-near-miss",
+      "base": "clean_issue",
+      "patch": {
+        "provider_run_id": "opaque"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    }
+  ]
+}

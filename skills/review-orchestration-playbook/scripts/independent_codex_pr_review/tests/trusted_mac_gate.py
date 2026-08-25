@@ -956,12 +956,16 @@ class _ClosedSourceFinder(importlib.abc.MetaPathFinder):
         if source is None:
             raise ImportError(f"source-only module is absent: {fullname}")
         loader = _SourceOnlyLoader(fullname, source)
-        return importlib.util.spec_from_loader(
+        spec = importlib.util.spec_from_loader(
             fullname,
             loader,
             origin=str(source.path),
             is_package=source.is_package,
         )
+        if spec is None:
+            raise ImportError(f"source-only module spec is unavailable: {fullname}")
+        spec.has_location = True
+        return spec
 
 
 @dataclass

@@ -67,6 +67,7 @@ from review_supervisor.signal_relay import (
 )
 
 from tests.support import (
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     _remove_exact_test_entry,
     _test_entry_object_identity,
     bind_attempt_state,
@@ -74,9 +75,7 @@ from tests.support import (
 )
 from tests.test_git_checkout import GIT, _build_repository
 
-ENTRYPOINT = (
-    pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
-)
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 
 
 class _DeferredLeafSignal(BaseException):

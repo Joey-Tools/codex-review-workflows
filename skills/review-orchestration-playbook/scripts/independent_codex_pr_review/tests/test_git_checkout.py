@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -9,7 +11,6 @@ import selectors
 import signal
 import stat
 import subprocess
-import sys
 import threading
 import time
 import unittest
@@ -19,6 +20,7 @@ from typing import Any
 from unittest import mock
 
 import review_supervisor.gitraw as gitraw
+from review_supervisor import cli as cli_module
 
 from review_supervisor.checkout import (
     RawMaterializer,
@@ -82,8 +84,10 @@ from review_supervisor.secureio import (
 )
 
 from tests.support import (
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
     bind_attempt_state,
     build_helper_fixture,
+    invoke_cli_main_preserving_sigpipe,
     owned_temporary_directory,
 )
 
@@ -109,6 +113,23 @@ def _run_fixture_process(
         stderr_limit=FIXTURE_PROCESS_STDERR_LIMIT_BYTES,
     )
     return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
+def _invoke_public_cli(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = invoke_cli_main_preserving_sigpipe(
+            cli_module.main,
+            arguments,
+            entrypoint=SUPERVISOR_INTERNAL_CHILD_FIXTURE,
+        )
+    return subprocess.CompletedProcess(
+        ("review_supervisor.cli.main", *arguments),
+        returncode,
+        stdout.getvalue().encode("utf-8"),
+        stderr.getvalue().encode("utf-8"),
+    )
 
 
 def _git(repo: pathlib.Path, *arguments: str) -> bytes:
@@ -2460,8 +2481,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                     with open_attempt_lease(lease, attempt) as attempt_lease:
                         state, _, digest = read_bound_attempt_state(attempt_lease)
                         state, _ = _cleanup_worktree(
-                            entrypoint=pathlib.Path(__file__).resolve().parent.parent
-                            / "independent-codex-pr-review",
+                            entrypoint=SUPERVISOR_INTERNAL_CHILD_FIXTURE,
                             attempt=attempt_lease,
                             state=state,
                             state_digest=digest,
@@ -2494,35 +2514,24 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
-            completed = _run_fixture_process(
-                (
-                    sys.executable,
-                    str(entrypoint),
-                    "preflight",
-                    "--helper-state",
-                    str(fixture["state_dir"]),
-                    "--repo",
-                    str(repo),
-                    "--base",
-                    base_sha,
-                    "--head",
-                    head_sha,
-                    "--pr-url",
-                    "https://github.example/owner/repo/pull/1",
-                    "--retention-root",
-                    str(retention),
-                    "--checkout-parent",
-                    str(checkouts),
-                    "--codex",
-                    "/usr/bin/true",
-                ),
-                cwd=pathlib.Path(__file__).resolve().parent.parent,
-                timeout=30,
-                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            completed = _invoke_public_cli(
+                "preflight",
+                "--helper-state",
+                str(fixture["state_dir"]),
+                "--repo",
+                str(repo),
+                "--base",
+                base_sha,
+                "--head",
+                head_sha,
+                "--pr-url",
+                "https://github.example/owner/repo/pull/1",
+                "--retention-root",
+                str(retention),
+                "--checkout-parent",
+                str(checkouts),
+                "--codex",
+                "/usr/bin/true",
             )
             self.assertEqual(
                 completed.returncode, 0, completed.stdout + completed.stderr
@@ -2556,35 +2565,24 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
-            completed = _run_fixture_process(
-                (
-                    sys.executable,
-                    str(entrypoint),
-                    "preflight",
-                    "--helper-state",
-                    str(fixture["state_dir"]),
-                    "--repo",
-                    str(repo),
-                    "--base",
-                    base_sha,
-                    "--head",
-                    head_sha,
-                    "--pr-url",
-                    "https://github.example/owner/repo/pull/1",
-                    "--retention-root",
-                    str(retention),
-                    "--checkout-parent",
-                    str(checkouts),
-                    "--codex",
-                    "/usr/bin/true",
-                ),
-                cwd=pathlib.Path(__file__).resolve().parent.parent,
-                timeout=30,
-                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            completed = _invoke_public_cli(
+                "preflight",
+                "--helper-state",
+                str(fixture["state_dir"]),
+                "--repo",
+                str(repo),
+                "--base",
+                base_sha,
+                "--head",
+                head_sha,
+                "--pr-url",
+                "https://github.example/owner/repo/pull/1",
+                "--retention-root",
+                str(retention),
+                "--checkout-parent",
+                str(checkouts),
+                "--codex",
+                "/usr/bin/true",
             )
             self.assertEqual(completed.returncode, 2, completed.stderr)
             payload = json.loads(completed.stdout)
@@ -2614,35 +2612,24 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             retention = root / "retention"
             checkouts = root / "checkouts"
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
-            completed = _run_fixture_process(
-                (
-                    sys.executable,
-                    str(entrypoint),
-                    "preflight",
-                    "--helper-state",
-                    str(fixture["state_dir"]),
-                    "--repo",
-                    str(repo),
-                    "--base",
-                    base_sha,
-                    "--head",
-                    head_sha,
-                    "--pr-url",
-                    "https://github.example/owner/repo/pull/1",
-                    "--retention-root",
-                    str(retention),
-                    "--checkout-parent",
-                    str(checkouts),
-                    "--codex",
-                    "/usr/bin/true",
-                ),
-                cwd=pathlib.Path(__file__).resolve().parent.parent,
-                timeout=30,
-                environment={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            completed = _invoke_public_cli(
+                "preflight",
+                "--helper-state",
+                str(fixture["state_dir"]),
+                "--repo",
+                str(repo),
+                "--base",
+                base_sha,
+                "--head",
+                head_sha,
+                "--pr-url",
+                "https://github.example/owner/repo/pull/1",
+                "--retention-root",
+                str(retention),
+                "--checkout-parent",
+                str(checkouts),
+                "--codex",
+                "/usr/bin/true",
             )
             self.assertEqual(completed.returncode, 2, completed.stderr)
             payload = json.loads(completed.stdout)

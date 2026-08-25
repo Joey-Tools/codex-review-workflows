@@ -37,6 +37,11 @@ _DEFAULT_RUNTIME_SOURCES = (
         "claude_version_policy.py",
         False,
     ),
+    (
+        "review_runtime.review_workspace",
+        "review_workspace.py",
+        False,
+    ),
     ("review_runtime.named_lane", "named_lane.py", False),
 )
 _CLAUDE_PREFLIGHT_SOURCES = (

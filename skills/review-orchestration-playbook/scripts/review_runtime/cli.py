@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import signal
 import sys
@@ -18,7 +17,7 @@ from .common import (
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
 from .state import cleanup as cleanup_state
-from .state import admission, final, run_state, start, status, wait
+from .state import final, status
 from .synthetic_tokens import (
     authoring_metadata,
     legacy_metadata,
@@ -34,6 +33,7 @@ from .workspace import (
 )
 
 
+# Kept as non-dispatched compatibility code while old retained artifacts age out.
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".", help="Source Git repository.")
     parser.add_argument(
@@ -97,19 +97,44 @@ def _validate_review_arguments(args: argparse.Namespace) -> None:
         raise ReviewError("--egress-consent is valid only with --reviewer claude")
 
 
+PUBLIC_COMMANDS = ("synthetic-tokens", "secret-admission", "stateful")
+RECOVERY_ONLY_STATEFUL_ACTIONS = ("status", "final", "cleanup")
+RETIRED_STATEFUL_ACTIONS = ("start", "wait", "admission")
+RETIRED_REVIEW_MESSAGE = (
+    "the supplied-diff foreground and stateful review entrypoints were retired; "
+    "use the review-orchestration-playbook named local lane and its clean-workspace "
+    "helper instead. Only stateful status/final/cleanup remain as recovery-only "
+    "migration routes for compatible pre-upgrade artifacts. Retained "
+    "isolated_review commands: " + ", ".join(PUBLIC_COMMANDS)
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="isolated_review",
         description=(
-            "Run a pinned Codex or low-level Claude helper against one clean frozen "
-            "Git range or explicitly authorized digest-bound WIP snapshot inside a "
-            "detached read-only review workspace. Results are diagnostic and "
-            "ineligible for named review lanes; the foreground command prints only the "
-            "raw helper artifact, so automation that needs machine metadata must use "
-            "the stateful interface."
+            "Retained low-level utilities for exact-secret admission and approved "
+            "synthetic-token fixtures, plus recovery-only inspection and cleanup "
+            "of compatible pre-upgrade state. Review execution moved to the "
+            "review-orchestration-playbook named local lanes."
         ),
     )
-    _add_review_arguments(parser)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser(
+        "synthetic-tokens",
+        add_help=False,
+        help="Validate, list, or audit approved synthetic-token fixtures.",
+    )
+    commands.add_parser(
+        "secret-admission",
+        add_help=False,
+        help="Run exact-secret admission without starting a reviewer.",
+    )
+    commands.add_parser(
+        "stateful",
+        add_help=False,
+        help="Recover compatible pre-upgrade helper state; cannot start a review.",
+    )
     return parser
 
 
@@ -117,19 +142,15 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="isolated_review stateful",
         description=(
-            "Manage a low-level supplied-diff helper run; its status is always "
-            "named_lane_eligible=false."
+            "Recovery-only migration routes for compatible pre-upgrade helper "
+            "state. These commands cannot start, resume, or wait on a reviewer "
+            "and never satisfy a named lane."
         ),
     )
     actions = parser.add_subparsers(dest="action", required=True)
-    start_parser = actions.add_parser("start")
-    _add_review_arguments(start_parser)
-    for action in ("status", "final", "cleanup", "admission"):
+    for action in RECOVERY_ONLY_STATEFUL_ACTIONS:
         action_parser = actions.add_parser(action)
         action_parser.add_argument("--state-dir", required=True)
-    wait_parser = actions.add_parser("wait")
-    wait_parser.add_argument("--state-dir", required=True)
-    wait_parser.add_argument("--timeout-seconds", type=float)
     return parser
 
 
@@ -156,6 +177,16 @@ def _build_secret_admission_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".", help="Source Git repository.")
     parser.add_argument("--base-ref", required=True, help="Frozen base commit-ish.")
     parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
+    parser.add_argument(
+        "--synthetic-secret-exemption",
+        action="append",
+        default=[],
+        help=(
+            "Deprecated repeatable compatibility option. Every ID must name a "
+            "catalog legacy exemption, but selection does not change exact-secret "
+            "admission."
+        ),
+    )
     return parser
 
 
@@ -165,6 +196,7 @@ def _run_secret_admission(argv: list[str]) -> int:
         repo=pathlib.Path(args.repo),
         base_ref=args.base_ref,
         head_ref=args.head_ref,
+        synthetic_secret_exemptions=tuple(args.synthetic_secret_exemption),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return exit_code
@@ -340,36 +372,12 @@ def _run_foreground(args: argparse.Namespace) -> int:
     return 1 if cleanup_error and returncode == 0 else returncode
 
 
-def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
+def _run_stateful(argv: list[str]) -> int:
     args = _build_stateful_parser().parse_args(argv)
-    state_dir = pathlib.Path(getattr(args, "state_dir", "."))
-    if args.action == "start":
-        _validate_review_arguments(args)
-        start(
-            script_path=script_path,
-            repo=pathlib.Path(args.repo),
-            reviewer=args.reviewer,
-            base_ref=args.base_ref,
-            head_ref=args.head_ref,
-            prompt_file=pathlib.Path(args.prompt_file) if args.prompt_file else None,
-            keep_workspace=args.keep_workspace,
-            egress_consent=args.egress_consent,
-            synthetic_secret_exemptions=tuple(
-                getattr(args, "synthetic_secret_exemption", ())
-            ),
-            include_source_wip=bool(getattr(args, "include_source_wip", False)),
-            publisher=lambda created: print(created, flush=True),
-        )
-        return 0
+    state_dir = pathlib.Path(args.state_dir)
     if args.action == "status":
         print(json.dumps(status(state_dir), indent=2, sort_keys=True))
         return 0
-    if args.action == "admission":
-        exit_code, summary = admission(state_dir)
-        print(json.dumps(summary, indent=2, sort_keys=True))
-        return exit_code
-    if args.action == "wait":
-        return wait(state_dir, timeout_seconds=args.timeout_seconds)
     if args.action == "final":
         exit_code, text = final(state_dir)
         print(text, file=sys.stdout if exit_code == 0 else sys.stderr)
@@ -384,39 +392,22 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    script_path = pathlib.Path(sys.argv[0]).resolve()
     try:
-        if arguments and arguments[0] == "_run-state":
-            internal = argparse.ArgumentParser(add_help=False)
-            internal.add_argument("action")
-            internal.add_argument("--state-dir", required=True)
-            internal.add_argument("--lock-fd", required=True, type=int)
-            internal.add_argument(
-                "--reviewer",
-                required=True,
-                choices=("codex", "claude"),
-            )
-            internal.add_argument(
-                "--egress-consent",
-                choices=CLAUDE_EGRESS_CONSENTS,
-            )
-            parsed = internal.parse_args(arguments)
-            _validate_review_arguments(parsed)
-            exit_code = run_state(
-                state_dir=pathlib.Path(parsed.state_dir),
-                lock_fd=parsed.lock_fd,
-                terminal_process=True,
-                expected_reviewer=parsed.reviewer,
-                expected_egress_consent=parsed.egress_consent,
-            )
-            os._exit(exit_code)
-        if arguments and arguments[0] == "stateful":
-            return _run_stateful(arguments[1:], script_path=script_path)
         if arguments and arguments[0] == "synthetic-tokens":
             return _run_synthetic_tokens(arguments[1:])
         if arguments and arguments[0] == "secret-admission":
             return _run_secret_admission(arguments[1:])
-        return _run_foreground(_build_parser().parse_args(arguments))
+        if arguments and arguments[0] == "stateful":
+            if len(arguments) > 1 and arguments[1] in RETIRED_STATEFUL_ACTIONS:
+                raise ReviewError(RETIRED_REVIEW_MESSAGE)
+            return _run_stateful(arguments[1:])
+        if arguments and (
+            arguments[0] == "_run-state"
+            or (arguments[0].startswith("-") and arguments[0] not in {"-h", "--help"})
+        ):
+            raise ReviewError(RETIRED_REVIEW_MESSAGE)
+        _build_parser().parse_args(arguments)
+        raise AssertionError("top-level parser unexpectedly returned")
     except ForwardedSignal as error:
         if error.detail:
             print(f"error: {error.detail}", file=sys.stderr)

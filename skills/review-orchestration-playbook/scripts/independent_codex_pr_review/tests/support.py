@@ -11,12 +11,13 @@ import pathlib
 import pwd
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import FrameType
@@ -60,6 +61,26 @@ _DARWIN_MAXPATHLEN = 1024
 _OWNED_TEMPORARY_CLEANUP_ENTRY_CAP = 8192
 _OWNED_TEMPORARY_CLEANUP_MANIFEST_BYTES = 4 * 1024 * 1024
 _OWNED_TEMPORARY_CLEANUP_SECONDS = 60.0
+SUPERVISOR_INTERNAL_CHILD_FIXTURE = (
+    pathlib.Path(__file__)
+    .with_name("internal_supervisor_child_fixture.py")
+    .resolve(strict=True)
+)
+
+
+def invoke_cli_main_preserving_sigpipe(
+    cli_main: Callable[..., int],
+    arguments: Sequence[str],
+    *,
+    entrypoint: pathlib.Path,
+) -> int:
+    """Invoke the process-oriented CLI without leaking SIGPIPE state into tests."""
+
+    previous_sigpipe = signal.getsignal(signal.SIGPIPE)
+    try:
+        return cli_main(arguments, entrypoint=entrypoint)
+    finally:
+        signal.signal(signal.SIGPIPE, previous_sigpipe)
 
 
 def _canonical_ascii_directory(raw_path: str | pathlib.Path) -> pathlib.Path:

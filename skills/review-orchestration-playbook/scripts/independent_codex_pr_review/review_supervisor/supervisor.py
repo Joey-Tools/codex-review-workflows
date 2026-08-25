@@ -440,12 +440,6 @@ def prepare_run(
     )
 
 
-def _default_entrypoint() -> pathlib.Path:
-    return (
-        pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
-    ).resolve(strict=True)
-
-
 def _prepare_with_reclamation(
     *,
     entrypoint: pathlib.Path,
@@ -508,6 +502,7 @@ def _prepare_with_reclamation(
 
 def preflight(
     *,
+    entrypoint: pathlib.Path,
     helper_state: pathlib.Path,
     repo: pathlib.Path,
     base_sha: str,
@@ -525,7 +520,7 @@ def preflight(
         retention_root, deadline=time.monotonic() + 30
     ) as lease:
         prepared = _prepare_with_reclamation(
-            entrypoint=_default_entrypoint(),
+            entrypoint=entrypoint,
             lease=lease,
             helper_state=helper_state,
             repo=repo,

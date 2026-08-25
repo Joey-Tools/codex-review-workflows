@@ -72,6 +72,23 @@ class ForwardedSignal(RuntimeError):
         super().__init__(message)
 
 
+_PROCESS_QUIESCENCE_UNPROVEN_ATTRIBUTE = "_review_process_quiescence_unproven"
+
+
+def mark_process_quiescence_unproven(error: BaseException) -> None:
+    """Bind an unsafe-to-clean process outcome to the selected exception."""
+
+    setattr(error, _PROCESS_QUIESCENCE_UNPROVEN_ATTRIBUTE, True)
+
+
+def process_quiescence_unproven(error: BaseException) -> bool:
+    """Return whether process-group quiescence was not proved for an outcome."""
+
+    return isinstance(error, ReviewProcessLeakError) or bool(
+        getattr(error, _PROCESS_QUIESCENCE_UNPROVEN_ATTRIBUTE, False)
+    )
+
+
 class ProcessStartState(enum.Enum):
     NOT_STARTED = "not-started"
     UNKNOWN = "unknown"
@@ -1278,6 +1295,10 @@ def run_bounded_capture(
     stderr_limit_bytes: int,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
+    prepare_process_spawned: Callable[[int], object] | None = None,
+    on_process_spawned: Callable[[object], None] | None = None,
+    on_process_starting: Callable[[], None] | None = None,
+    on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
@@ -1326,6 +1347,10 @@ def run_bounded_capture(
             stderr_file_limit_bytes=stderr_limit_bytes,
             regular_file_limit_bytes=regular_file_limit_bytes,
             regular_file_limit_path=regular_file_limit_path,
+            prepare_process_spawned=prepare_process_spawned,
+            on_process_spawned=on_process_spawned,
+            on_process_starting=on_process_starting,
+            on_process_started=on_process_started,
             on_process_quiescent=on_process_quiescent,
         )
         if deadline is not None and deadline - time.monotonic() <= 0:
@@ -1834,6 +1859,332 @@ def _await_owned_process_spawn(
     if thread.is_alive():
         raise ReviewProcessLeakError("reviewer process spawn worker did not quiesce")
     return process
+
+
+@dataclass
+class OwnedProcessLease:
+    """Keep worker-owned fallback custody through process-group quiescence."""
+
+    _process: subprocess.Popen[bytes] | None = None
+    _spawn_error: BaseException | None = None
+    _cleanup_errors: list[BaseException] = field(default_factory=list)
+    _ready: threading.Event = field(default_factory=threading.Event)
+    _requested: threading.Event = field(default_factory=threading.Event)
+    _published: threading.Event = field(default_factory=threading.Event)
+    _settle_requested: threading.Event = field(default_factory=threading.Event)
+    _settled: threading.Event = field(default_factory=threading.Event)
+    _quiescence_proven: bool = False
+    _cleanup_signal: signal.Signals = signal.SIGKILL
+    _thread: threading.Thread | None = None
+    _thread_start_attempted: bool = False
+    _thread_start_confirmed: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def process(self) -> subprocess.Popen[bytes] | None:
+        with self._lock:
+            return self._process
+
+    def _process_is_quiescent(
+        self,
+        process: subprocess.Popen[bytes],
+        process_group_exists: Callable[[int], bool],
+    ) -> bool:
+        return process.poll() is not None and not process_group_exists(process.pid)
+
+    def _worker(
+        self,
+        factory: Callable[[], subprocess.Popen[bytes]],
+        terminate: Callable[..., None],
+        process_group_exists: Callable[[int], bool],
+        grace_seconds: float,
+    ) -> None:
+        candidate: subprocess.Popen[bytes] | None = None
+        try:
+            self._ready.set()
+            self._requested.wait()
+            if self._settle_requested.is_set():
+                self._quiescence_proven = True
+                return
+            candidate = factory()
+            with self._lock:
+                self._process = candidate
+            self._published.set()
+            self._settle_requested.wait()
+            quiescent = False
+            try:
+                quiescent = self._process_is_quiescent(
+                    candidate,
+                    process_group_exists,
+                )
+            except BaseException as error:
+                self._cleanup_errors.append(error)
+            if not quiescent:
+                for _attempt in range(2):
+                    try:
+                        terminate(
+                            candidate,
+                            initial_signal=self._cleanup_signal,
+                            grace_seconds=grace_seconds,
+                        )
+                    except BaseException as error:
+                        self._cleanup_errors.append(error)
+                    try:
+                        quiescent = self._process_is_quiescent(
+                            candidate,
+                            process_group_exists,
+                        )
+                    except BaseException as error:
+                        self._cleanup_errors.append(error)
+                        quiescent = False
+                    if quiescent:
+                        break
+            for stream in (candidate.stdin, candidate.stdout, candidate.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            try:
+                self._quiescence_proven = self._process_is_quiescent(
+                    candidate,
+                    process_group_exists,
+                )
+            except BaseException as error:
+                self._cleanup_errors.append(error)
+                self._quiescence_proven = False
+        except BaseException as error:
+            with self._lock:
+                self._spawn_error = error
+            if candidate is None:
+                # subprocess.Popen owns cleanup for its own failed construction.
+                self._quiescence_proven = True
+        finally:
+            self._published.set()
+            self._settled.set()
+
+    def _start_worker_with_child_mask(
+        self,
+        thread: threading.Thread,
+        unblock_signals: tuple[signal.Signals, ...],
+    ) -> None:
+        mask_owner = ForwardedSignalMaskOwner()
+        start_error: BaseException | None = None
+        try:
+            if os.name == "posix" and hasattr(signal, "pthread_sigmask"):
+                current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                mask_owner.publish(current_mask)
+                child_mask = set(current_mask).difference(unblock_signals)
+                signal.pthread_sigmask(signal.SIG_SETMASK, child_mask)
+            thread.start()
+            self._thread_start_confirmed = True
+        except BaseException as error:
+            start_error = error
+            raise
+        finally:
+            restore_failures = _restore_forwarded_signal_mask_owner_bounded(mask_owner)
+            _propagate_signal_mask_restore_failures(
+                start_error,
+                restore_failures,
+            )
+
+    def spawn(
+        self,
+        factory: Callable[[], subprocess.Popen[bytes]],
+        *,
+        command: tuple[str, ...],
+        deadline: float,
+        terminate: Callable[..., None] = terminate_process_group,
+        process_group_exists: Callable[[int], bool] = _process_group_exists,
+        grace_seconds: float = PROCESS_GROUP_TERM_GRACE_SECONDS,
+        check_interruption: Callable[[], None] | None = None,
+        unblock_signals: tuple[signal.Signals, ...] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        """Spawn while a worker retains cleanup ownership after handoff."""
+
+        if self._thread is not None:
+            raise ReviewError("owned process lease can spawn only once")
+        if check_interruption is None:
+
+            def check_interruption() -> None:
+                return None
+
+        if unblock_signals is None:
+            unblock_signals = forwarded_signals()
+        thread = _PROCESS_SPAWN_THREAD(
+            target=self._worker,
+            args=(factory, terminate, process_group_exists, grace_seconds),
+            name="review-owned-process-lease",
+            daemon=True,
+        )
+        self._thread = thread
+        self._thread_start_attempted = True
+        self._start_worker_with_child_mask(thread, unblock_signals)
+        for event in (self._ready, self._published):
+            if event is self._published:
+                self._requested.set()
+            while not event.wait(PROCESS_GROUP_POLL_SECONDS):
+                check_interruption()
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, 0.0)
+        check_interruption()
+        with self._lock:
+            if self._spawn_error is not None:
+                raise self._spawn_error
+            if self._process is None:
+                raise ReviewError("owned process lease published no process handle")
+            return self._process
+
+    def _worker_started(self) -> bool:
+        thread = self._thread
+        if thread is None or not self._thread_start_attempted:
+            return False
+        started = self._thread_start_confirmed
+        started_event = getattr(thread, "_started", None)
+        if isinstance(started_event, threading.Event):
+            started = started or started_event.is_set()
+        else:
+            started = started or thread.ident is not None
+        return started
+
+    def settle(
+        self,
+        *,
+        primary_error: BaseException | None,
+        cleanup_signal: signal.Signals = signal.SIGKILL,
+        grace_seconds: float = PROCESS_GROUP_TERM_GRACE_SECONDS,
+    ) -> None:
+        """Settle the lease without allowing main-thread control flow to orphan it."""
+
+        pending_errors: list[BaseException] = []
+        cleanup_deadline: float | None = None
+        cleanup_errors: tuple[BaseException, ...] = ()
+        quiescence_proven = False
+        while True:
+            try:
+                with self._lock:
+                    self._cleanup_signal = cleanup_signal
+                self._settle_requested.set()
+                self._requested.set()
+                thread = self._thread
+                worker_started = False
+                try:
+                    worker_started = self._worker_started()
+                except BaseException as error:
+                    pending_errors.append(error)
+                    worker_started = True
+                if cleanup_deadline is None:
+                    cleanup_deadline = time.monotonic() + max(
+                        PROCESS_SPAWN_CLEANUP_GRACE_SECONDS,
+                        (3 * grace_seconds) + (2 * PROCESS_GROUP_POLL_SECONDS),
+                    )
+                if thread is not None and worker_started:
+                    while (
+                        not self._settled.is_set()
+                        and time.monotonic() < cleanup_deadline
+                    ):
+                        try:
+                            self._settled.wait(PROCESS_GROUP_POLL_SECONDS)
+                        except BaseException as error:
+                            pending_errors.append(error)
+                    remaining = max(0.0, cleanup_deadline - time.monotonic())
+                    try:
+                        thread.join(timeout=remaining)
+                    except BaseException as error:
+                        pending_errors.append(error)
+                worker_alive = False
+                if thread is not None and worker_started:
+                    try:
+                        worker_alive = thread.is_alive()
+                    except BaseException as error:
+                        pending_errors.append(error)
+                        worker_alive = True
+                cleanup_errors = tuple(self._cleanup_errors)
+                quiescence_proven = not worker_started or (
+                    self._settled.is_set()
+                    and not worker_alive
+                    and self._quiescence_proven
+                )
+                break
+            except BaseException as error:
+                if not _is_process_control_flow_error(error):
+                    pending_errors.append(error)
+                    break
+                # A Python signal handler runs only on the main thread. The
+                # worker retains the process lease, so keep waiting for its
+                # quiescence proof before the control-flow error propagates.
+                pending_errors.append(error)
+        if not quiescence_proven:
+            leak = ReviewProcessLeakError(
+                "owned process lease did not prove process-group quiescence"
+            )
+            mark_process_quiescence_unproven(leak)
+            if primary_error is not None:
+                mark_process_quiescence_unproven(primary_error)
+                _attach_process_secondary_failure(
+                    primary_error,
+                    leak,
+                    context="settling worker-owned process custody",
+                )
+                for error in (*pending_errors, *cleanup_errors):
+                    _attach_process_secondary_failure(
+                        primary_error,
+                        error,
+                        context="settling worker-owned process custody",
+                    )
+                return
+            selected = next(
+                (
+                    error
+                    for error in (*pending_errors, *cleanup_errors)
+                    if _is_process_control_flow_error(error)
+                ),
+                leak,
+            )
+            mark_process_quiescence_unproven(selected)
+            if selected is not leak:
+                _attach_process_secondary_failure(
+                    selected,
+                    leak,
+                    context="settling worker-owned process custody",
+                )
+            for error in (*pending_errors, *cleanup_errors):
+                if error is selected:
+                    continue
+                _attach_process_secondary_failure(
+                    selected,
+                    error,
+                    context="settling worker-owned process custody",
+                )
+            raise selected
+        secondary_errors = (*pending_errors, *cleanup_errors)
+        if primary_error is not None:
+            for error in secondary_errors:
+                _attach_process_secondary_failure(
+                    primary_error,
+                    error,
+                    context="settling worker-owned process custody",
+                )
+            return
+        selected = next(
+            (
+                error
+                for error in secondary_errors
+                if _is_process_control_flow_error(error)
+            ),
+            None,
+        )
+        if selected is not None:
+            for error in secondary_errors:
+                if error is selected:
+                    continue
+                _attach_process_secondary_failure(
+                    selected,
+                    error,
+                    context="settling worker-owned process custody",
+                )
+            raise selected
 
 
 def _write_exec_control(
@@ -3033,6 +3384,10 @@ def _run_logged_process(
             selected_error = None
 
         if selected_error is not None:
+            if process_cleanup_inconclusive or any(
+                process_quiescence_unproven(error) for _, error in cleanup_failures
+            ):
+                mark_process_quiescence_unproven(selected_error)
             if primary_error is not None and primary_error is not selected_error:
                 assert primary_context is not None
                 _attach_process_secondary_failure(
@@ -3060,6 +3415,8 @@ def _attach_process_secondary_failure(
 ) -> None:
     if primary is secondary:
         return
+    if process_quiescence_unproven(secondary):
+        mark_process_quiescence_unproven(primary)
     detail = str(secondary).strip()
     diagnostic = f"{context} ({type(secondary).__name__})"
     if detail:

@@ -9432,6 +9432,14 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 encoding="ascii",
             )
             (tests / "__init__.py").write_text("", encoding="ascii")
+            (tests / "support.py").write_text(
+                "from __future__ import annotations\n"
+                "import pathlib\n"
+                "SOURCE_FILE = pathlib.Path(__file__)\n"
+                "SOURCE_ORIGIN = __spec__.origin\n"
+                "SOURCE_HAS_LOCATION = __spec__.has_location\n",
+                encoding="ascii",
+            )
             (tests / "trusted_mac_gate.py").write_text(
                 TrustedMacGateBootstrapTests.GATE_SOURCE,
                 encoding="utf-8",
@@ -9439,6 +9447,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
             marker = root / "ambient-marker"
             payload = (
                 "import json, os, pathlib, sys\n"
+                "from . import support\n"
                 f"marker = pathlib.Path({str(marker)!r})\n"
                 "print(json.dumps({\n"
                 "    'environment': dict(sorted(os.environ.items())),\n"
@@ -9451,7 +9460,11 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 "        'dont_write_bytecode': sys.dont_write_bytecode,\n"
                 "    },\n"
                 "    'marker_exists': marker.exists(),\n"
+                "    'support_file': str(support.SOURCE_FILE),\n"
+                "    'support_has_location': support.SOURCE_HAS_LOCATION,\n"
+                "    'support_origin': support.SOURCE_ORIGIN,\n"
                 "    'sys_path': sys.path,\n"
+                "    'tests_package_path': list(sys.modules['tests'].__path__),\n"
                 "}, sort_keys=True))\n"
             )
             (tests / "run_required_no_child_profile.py").write_text(
@@ -9563,6 +9576,11 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                     self.assertNotIn(str(hostile), result["sys_path"])
                     self.assertNotIn(str(root), result["sys_path"])
                     self.assertIs(result["marker_exists"], False)
+                    support_path = root / "tests" / "support.py"
+                    self.assertEqual(result["support_file"], str(support_path))
+                    self.assertIs(result["support_has_location"], True)
+                    self.assertEqual(result["support_origin"], str(support_path))
+                    self.assertEqual(result["tests_package_path"], [])
                     self.assertFalse(marker.exists())
                     self.assertFalse(tuple(root.rglob("__pycache__")))
 
@@ -10406,9 +10424,19 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 "VALUE = 'mutated-after-snapshot'\n",
                 encoding="ascii",
             )
-            namespace: dict[str, object] = {}
-            exec(sources["review_supervisor.captured"].code, namespace)
-            self.assertEqual(namespace["VALUE"], "captured")
+            spec = gate._ClosedSourceFinder(sources).find_spec(
+                "review_supervisor.captured"
+            )
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertEqual(module.VALUE, "captured")
+            self.assertEqual(
+                module.__file__,
+                str(root / "review_supervisor" / "captured.py"),
+            )
+            self.assertIs(module.__spec__.has_location, True)
 
     def test_gate_file_budget_uses_opened_size_and_link_count(self) -> None:
         gate = self._load_gate_module()

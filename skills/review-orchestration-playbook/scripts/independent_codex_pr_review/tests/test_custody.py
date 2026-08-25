@@ -3,7 +3,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import pathlib
 import time
 import unittest
 from types import SimpleNamespace
@@ -12,7 +11,11 @@ from review_supervisor.custody import acquire_source_custody, authenticate_helpe
 from review_supervisor.errors import SupervisorError
 from review_supervisor.supervisor import _acquire_source_custody_via_helper
 
-from tests.support import build_helper_fixture, owned_temporary_directory
+from tests.support import (
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
+    build_helper_fixture,
+    owned_temporary_directory,
+)
 
 
 class HelperCustodyTests(unittest.TestCase):
@@ -32,10 +35,7 @@ class HelperCustodyTests(unittest.TestCase):
                 repository=SimpleNamespace(repo=fixture["repo"]),
                 attempt_dir=attempt,
             )
-            entrypoint = (
-                pathlib.Path(__file__).resolve().parent.parent
-                / "independent-codex-pr-review"
-            )
+            entrypoint = SUPERVISOR_INTERNAL_CHILD_FIXTURE
             transient = fixture["state_dir"] / "benign-transient-child"
             transient.mkdir(mode=0o700)
             handles = None

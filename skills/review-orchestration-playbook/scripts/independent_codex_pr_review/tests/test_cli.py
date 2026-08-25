@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import pwd
+import signal
 import stat
 import subprocess
 import sys
@@ -39,11 +40,16 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 
-from tests.support import bind_attempt_state, owned_temporary_directory
+from tests.support import (
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
+    bind_attempt_state,
+    invoke_cli_main_preserving_sigpipe,
+    owned_temporary_directory,
+)
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
-ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 RELATIVE_TOOL = pathlib.Path(
     "personal_codex/skills/review-orchestration-playbook/"
     "scripts/independent_codex_pr_review"
@@ -51,22 +57,20 @@ RELATIVE_TOOL = pathlib.Path(
 
 
 def _invoke(*arguments: str) -> tuple[int, dict[str, object]]:
-    completed = subprocess.run(
-        (sys.executable, str(ENTRYPOINT), *arguments),
-        cwd=TOOL_ROOT,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=20,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-    )
-    if completed.stderr:
-        raise AssertionError(completed.stderr.decode("utf-8", "replace"))
-    lines = completed.stdout.splitlines()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = invoke_cli_main_preserving_sigpipe(
+            cli_module.main,
+            arguments,
+            entrypoint=ENTRYPOINT,
+        )
+    if stderr.getvalue():
+        raise AssertionError(stderr.getvalue())
+    lines = stdout.getvalue().splitlines()
     if len(lines) != 1:
         raise AssertionError(f"expected one JSON line, got {lines!r}")
-    return completed.returncode, json.loads(lines[0])
+    return returncode, json.loads(lines[0])
 
 
 def _assert_low_level_contract(
@@ -332,27 +336,83 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
-    def test_readme_self_contained_examples_pin_distinct_runtime_roots(self) -> None:
-        readme = (TOOL_ROOT / "README.md").read_text()
+    def test_in_process_cli_wrapper_restores_sigpipe_on_return_and_error(self) -> None:
+        original_sigpipe = signal.getsignal(signal.SIGPIPE)
 
-        self.assertIn('RETENTION="$TOOL_DIR/runtime/retention"', readme)
-        self.assertIn('CHECKOUTS="$TOOL_DIR/runtime/checkouts"', readme)
-        self.assertEqual(readme.count('--retention-root "$RETENTION"'), 9)
-        self.assertEqual(readme.count('--checkout-parent "$CHECKOUTS"'), 2)
-        self.assertNotIn('RETENTION="$STATE_ROOT/retention"', readme)
-        self.assertIn(
-            "account-local defaults 只用于标准 installed overlay catalog",
-            readme,
-        )
-        self.assertIn("### Standard Installed Overlay Defaults", readme)
-        self.assertEqual(
-            readme.count('python3.13 -B "$SUPERVISOR" preflight \\'),
-            2,
-        )
-        self.assertEqual(
-            readme.count('python3.13 -B "$SUPERVISOR" run \\'),
-            2,
-        )
+        def sentinel_handler(_signum: int, _frame: object) -> None:
+            return None
+
+        signal.signal(signal.SIGPIPE, sentinel_handler)
+        try:
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "_resolve_public_default_roots",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    return_value={"overall_status": "clean"},
+                ),
+            ):
+                returncode, payload = _invoke(
+                    "status",
+                    "--retention-root",
+                    "/tmp/retention",
+                    "--attempt-dir",
+                    "/tmp/attempt",
+                )
+            self.assertEqual(returncode, 0)
+            self.assertEqual(payload["overall_status"], "clean")
+            self.assertIs(signal.getsignal(signal.SIGPIPE), sentinel_handler)
+
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "_public_parser",
+                    side_effect=RuntimeError("parser failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "parser failed"),
+            ):
+                _invoke("status")
+            self.assertIs(signal.getsignal(signal.SIGPIPE), sentinel_handler)
+        finally:
+            signal.signal(signal.SIGPIPE, original_sigpipe)
+
+    def test_internal_harness_and_runtime_root_parser_contract(self) -> None:
+        self.assertTrue(ENTRYPOINT.is_file())
+        self.assertTrue(ENTRYPOINT.is_relative_to(TOOL_ROOT / "tests"))
+        self.assertFalse((TOOL_ROOT / "independent-codex-pr-review").exists())
+        self.assertFalse((TOOL_ROOT / "README.md").exists())
+        self.assertFalse(ENTRYPOINT.read_bytes().startswith(b"#!"))
+
+        for command in (
+            "preflight",
+            "run",
+            "status",
+            "final",
+            "recover",
+            "release",
+            "cleanup",
+        ):
+            with self.subTest(command=command, fixture="internal-only"):
+                completed = subprocess.run(
+                    (sys.executable, str(ENTRYPOINT), command),
+                    cwd=TOOL_ROOT,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=20,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                self.assertEqual(completed.returncode, 64)
+                self.assertEqual(completed.stdout, b"")
+                self.assertEqual(
+                    completed.stderr,
+                    b"internal supervisor child fixture rejects public commands\n",
+                )
 
         source_arguments = (
             "--helper-state",

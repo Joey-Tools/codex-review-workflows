@@ -19,16 +19,19 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import BinaryIO, Callable, Iterable, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterable, Mapping, NoReturn, Sequence
 
 from .common import (
     ForwardedSignal,
+    ForwardedSignalMaskOwner,
     ReviewError,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
     TRUSTED_PATH,
+    _executable_candidate_identity,
+    _is_process_control_flow_error,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
     forwarded_signals,
@@ -36,17 +39,44 @@ from .common import (
     resolve_git,
     restore_signal_mask,
     run_bounded_capture,
+    strict_json_loads,
 )
 from .claude_version_policy import (
     CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
 )
+from .review_workspace import (
+    PreparedWorkspace,
+    RangeIncomplete,
+    ReviewWorkspaceError,
+    SourceAuthorityBindingError,
+    WORKSPACE_SCHEMA_VERSION,
+    _attach_workspace_teardown_failures,
+    _attempt_workspace_descriptor_closes,
+    _finish_forwarded_signal_mask,
+    _partial_workspace_recovery_payload,
+    _select_workspace_teardown_failure,
+    build_source_authority_binding,
+    canonical_source_authority_binding_bytes,
+    cleanup_workspace,
+    parse_canonical_source_authority_binding_bytes,
+    prepare_workspace,
+    recover_partial_workspace,
+    retain_workspace_for_owner_exit_recovery,
+    source_authority_common_marker_record,
+    source_authority_control_record,
+    source_authority_directory_record,
+    source_authority_marker_record,
+    validate_source_authority_binding,
+    validate_workspace,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 1_800.0
 DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
 CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES = 16 * 1024
+CLAUDE_SOURCE_AUTHORITY_BINDING_LIMIT_BYTES = 32 * 1024
 CLAUDE_BINARY_LIMIT_BYTES = 1024 * 1024 * 1024
 CLAUDE_SESSION_ENV_IDENTITY_BINDING = "first-no-follow-open-after-exclusive-mkdir"
 CLAUDE_SESSION_ENV_CREATION_ORIGIN_GUARANTEE = (
@@ -61,6 +91,164 @@ CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
     "cooperative-claude-control-directory-flock-same-uid-host-tcb"
 )
 CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
+CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v3"
+CLAUDE_DIRECT_ARGV_CONFORMANCE = "guard-constructed-exact-token-sequence"
+CLAUDE_DIRECT_SETTINGS_SCHEMA = "named-direct-claude-settings-v1"
+CLAUDE_DIRECT_ENVIRONMENT_PROFILE = "named-direct-claude-environment-v1"
+CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION = pathlib.Path("/dev/null")
+CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS = frozenset(
+    ((CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION, pathlib.Path("/dev")),)
+)
+CLAUDE_DIRECT_MODELS = ("claude-opus-4-8",)
+CLAUDE_DIRECT_REQUIRED_OPTIONS = (
+    "--print",
+    "--input-format",
+    "--model",
+    "--effort",
+    "--permission-mode",
+    "--output-format",
+    "--verbose",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--no-chrome",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--setting-sources",
+    "--settings",
+    "--tools",
+    "--allowedTools",
+    "--disallowedTools",
+)
+CLAUDE_DIRECT_EFFORT = "max"
+CLAUDE_DIRECT_PERMISSION_MODE = "dontAsk"
+CLAUDE_DIRECT_VISIBLE_TOOLS = "Read,Grep,Glob,Bash"
+CLAUDE_DIRECT_ALLOWED_TOOLS = "Read(./**),Grep,Glob,Bash"
+CLAUDE_DIRECT_DISALLOWED_TOOLS = "Edit,Write,NotebookEdit,WebFetch,WebSearch"
+CLAUDE_DIRECT_PERMISSION_DENY_RULES = (
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+)
+CLAUDE_DIRECT_PRIVATE_HOME_PATHS = (
+    ".aws",
+    ".claude",
+    ".codex",
+    ".config",
+    ".copilot",
+    ".gnupg",
+    ".kube",
+    ".ssh",
+    ".git-credentials",
+    ".netrc",
+)
+CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ALL_PROXY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CURL_CA_BUNDLE",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_SSL_CAINFO",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "NO_PROXY",
+    "OPENAI_API_KEY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+SANITIZED_GIT_ARGV_PREFIX_PROFILE = "sanitized-git-argv-prefix-v2"
+SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE = "exact-token-sequence"
+SANITIZED_GIT_ARGV_PREFIX_ENCODING = "canonical-json-utf8-v1"
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION = (
+    "sanitized-git-argv-prefix-receipt-v2"
+)
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM = (
+    "sha256-canonical-json-utf8-v1-without-receipt-sha256"
+)
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES = 64 * 1024
+_SANITIZED_GIT_VERSION_OUTPUT = re.compile(
+    rb"git version ([0-9]+)\.([0-9]+)\.([0-9]+)"
+    rb"(?: \(Apple Git-[0-9]+(?:\.[0-9]+)*\))?\n?\Z"
+)
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_EXECUTABLE_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "file_type",
+    "mode",
+    "uid",
+    "gid",
+    "nlink",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+)
+_WORKSPACE_VALIDATION_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "command",
+        "worktree",
+        "base",
+        "head",
+        "object_format",
+        "strategy",
+        "source_shallow",
+        "commit_count",
+        "range_object_count",
+        "range_object_sha256",
+        "parent_support_object_count",
+        "parent_support_object_sha256",
+        "config_sha256",
+        "shallow_bytes",
+        "shallow_sha256",
+        "symlink_count",
+        "parent_identity",
+        "workspace_identity",
+        "git_identity",
+        "objects_identity",
+        "marker_sha256",
+        "cleanup_token_sha256",
+    }
+)
+_SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST = frozenset(
+    {
+        "schema_version",
+        "status",
+        "command",
+        "prefix_profile",
+        "sanitized_git_argv_prefix_conformance",
+        "sanitized_git_argv_prefix",
+        "sanitized_git_argv_prefix_encoding",
+        "sanitized_git_argv_prefix_sha256",
+        "git_executable",
+        "git_executable_identity",
+        "git_version",
+        "git_version_stdout",
+        "git_version_stdout_sha256",
+        "worktree",
+        "base",
+        "head",
+        "workspace_validation_receipt",
+        "workspace_validation_receipt_encoding",
+        "workspace_validation_receipt_sha256",
+        "no_lazy_fetch_control",
+        "receipt_identity_encoding",
+        "receipt_identity_algorithm",
+    }
+)
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
@@ -111,6 +299,1091 @@ CLAUDE_ENV_PASSTHROUGH_KEYS = (
 
 class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
+
+
+def _validate_prefix_path(path: pathlib.Path, label: str) -> str:
+    rendered = os.fspath(path)
+    if not path.is_absolute():
+        raise NamedLaneGuardError(f"{label} must be absolute")
+    if any(character in rendered for character in ("\x00", "\n", "\r")):
+        raise NamedLaneGuardError(f"{label} contains an unsupported control character")
+    return rendered
+
+
+def build_sanitized_git_argv_prefix(
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> tuple[str, ...]:
+    """Build the exact local-Codex Git argv prefix profile."""
+
+    rendered_worktree = _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    rendered_ceiling = os.fspath(worktree.parent)
+    if os.pathsep in rendered_ceiling:
+        raise NamedLaneGuardError(
+            "Codex review worktree parent cannot be encoded as a discovery ceiling"
+        )
+    return (
+        "/usr/bin/env",
+        "-i",
+        f"PATH={TRUSTED_PATH}",
+        "LANG=C",
+        "LC_ALL=C",
+        "GIT_ASKPASS=/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM=1",
+        f"GIT_CEILING_DIRECTORIES={rendered_ceiling}",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_GRAFT_FILE=/dev/null",
+        "GIT_LITERAL_PATHSPECS=1",
+        "GIT_NO_LAZY_FETCH=1",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_NO_REPLACE_OBJECTS=1",
+        "GIT_OPTIONAL_LOCKS=0",
+        "PAGER=cat",
+        "GIT_PAGER=cat",
+        rendered_git,
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.checkStat=default",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.ignoreStat=false",
+        "-c",
+        "core.trustCtime=true",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "diff.external=",
+        "-c",
+        "color.ui=false",
+        "-C",
+        rendered_worktree,
+    )
+
+
+def validate_sanitized_git_argv_prefix(
+    tokens: Sequence[str],
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> tuple[str, ...]:
+    """Reject any token array that is not the exact selected v1 profile."""
+
+    if isinstance(tokens, (str, bytes)):
+        raise NamedLaneGuardError("sanitized Git argv prefix must be a token sequence")
+    try:
+        observed = tuple(tokens)
+    except (TypeError, ValueError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix could not be read as a token sequence"
+        ) from error
+    if not all(type(token) is str for token in observed):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix contains a non-string token"
+        )
+    expected = build_sanitized_git_argv_prefix(
+        worktree=worktree,
+        git_executable=git_executable,
+    )
+    if observed != expected:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix does not conform to "
+            f"{SANITIZED_GIT_ARGV_PREFIX_PROFILE}"
+        )
+    return observed
+
+
+def _require_closed_mapping(
+    value: object,
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise NamedLaneGuardError(f"{label} must be an exact JSON object")
+    if frozenset(value) != expected_keys:
+        raise NamedLaneGuardError(f"{label} does not match its closed schema")
+    return value
+
+
+def _require_nonnegative_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise NamedLaneGuardError(f"{label} must be a nonnegative JSON integer")
+    return value
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if type(value) is not str or _LOWER_SHA256.fullmatch(value) is None:
+        raise NamedLaneGuardError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _executable_identity_record(metadata: os.stat_result) -> dict[str, int]:
+    return dict(
+        zip(
+            _EXECUTABLE_IDENTITY_FIELDS,
+            _executable_candidate_identity(metadata),
+            strict=True,
+        )
+    )
+
+
+def _capture_prefix_git_executable_identity(
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    try:
+        lexical = git_executable.lstat()
+        resolved_path = git_executable.resolve(strict=True)
+        target = git_executable.stat()
+        resolved_target = resolved_path.stat()
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Codex review Git executable identity cannot be inspected"
+        ) from error
+    if (
+        _executable_candidate_identity(target)
+        != _executable_candidate_identity(resolved_target)
+        or not stat.S_ISREG(target.st_mode)
+        or not bool(target.st_mode & 0o111)
+        or not os.access(git_executable, os.X_OK)
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git executable identity is not a stable executable"
+        )
+    return {
+        "lexical": _executable_identity_record(lexical),
+        "resolved_path": str(resolved_path),
+        "target": _executable_identity_record(target),
+    }
+
+
+def _validate_executable_identity_record(value: object) -> dict[str, object]:
+    record = _require_closed_mapping(
+        value,
+        frozenset({"lexical", "resolved_path", "target"}),
+        "Codex review Git executable identity",
+    )
+    resolved_path = record["resolved_path"]
+    if (
+        type(resolved_path) is not str
+        or not pathlib.Path(resolved_path).is_absolute()
+        or any(character in resolved_path for character in ("\x00", "\n", "\r"))
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git resolved executable path is invalid"
+        )
+    for key in ("lexical", "target"):
+        identity = _require_closed_mapping(
+            record[key],
+            frozenset(_EXECUTABLE_IDENTITY_FIELDS),
+            f"Codex review Git executable {key} identity",
+        )
+        for field in _EXECUTABLE_IDENTITY_FIELDS:
+            _require_nonnegative_integer(
+                identity[field],
+                f"Codex review Git executable {key}.{field}",
+            )
+        if identity["file_type"] != stat.S_IFMT(identity["mode"]):
+            raise NamedLaneGuardError(
+                f"Codex review Git executable {key} mode/type binding is invalid"
+            )
+    lexical = record["lexical"]
+    target = record["target"]
+    assert isinstance(lexical, dict)
+    assert isinstance(target, dict)
+    if lexical["file_type"] not in {stat.S_IFREG, stat.S_IFLNK}:
+        raise NamedLaneGuardError("Codex review Git lexical executable type is invalid")
+    if target["file_type"] != stat.S_IFREG or not bool(target["mode"] & 0o111):
+        raise NamedLaneGuardError("Codex review Git target identity is not executable")
+    return record
+
+
+def _validate_workspace_validation_receipt(
+    value: object,
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+) -> dict[str, object]:
+    receipt = _require_closed_mapping(
+        value,
+        _WORKSPACE_VALIDATION_RECEIPT_FIELDS,
+        "workspace validation receipt",
+    )
+    exact_values = {
+        "schema_version": WORKSPACE_SCHEMA_VERSION,
+        "status": "ok",
+        "command": "validate-workspace",
+        "worktree": str(worktree),
+        "base": base,
+        "head": head,
+        "strategy": "exact-pack",
+    }
+    for key, expected in exact_values.items():
+        if type(receipt[key]) is not type(expected) or receipt[key] != expected:
+            raise NamedLaneGuardError(
+                f"workspace validation receipt {key} does not match the frozen lane"
+            )
+    object_format = receipt["object_format"]
+    if type(object_format) is not str or object_format not in {"sha1", "sha256"}:
+        raise NamedLaneGuardError(
+            "workspace validation receipt object_format is invalid"
+        )
+    expected_oid_length = 40 if object_format == "sha1" else 64
+    if len(base) != expected_oid_length or len(head) != expected_oid_length:
+        raise NamedLaneGuardError(
+            "workspace validation receipt object format conflicts with its endpoints"
+        )
+    if type(receipt["source_shallow"]) is not bool:
+        raise NamedLaneGuardError(
+            "workspace validation receipt source_shallow must be a JSON boolean"
+        )
+    for key in (
+        "commit_count",
+        "range_object_count",
+        "parent_support_object_count",
+        "symlink_count",
+    ):
+        _require_nonnegative_integer(receipt[key], f"workspace receipt {key}")
+    if receipt["commit_count"] == 0 or receipt["range_object_count"] == 0:
+        raise NamedLaneGuardError(
+            "workspace validation receipt cannot describe an empty frozen range closure"
+        )
+    for key in (
+        "range_object_sha256",
+        "parent_support_object_sha256",
+        "config_sha256",
+        "shallow_sha256",
+        "marker_sha256",
+        "cleanup_token_sha256",
+    ):
+        _require_sha256(receipt[key], f"workspace receipt {key}")
+    if type(receipt["shallow_bytes"]) is not str:
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow_bytes must be a JSON string"
+        )
+    try:
+        shallow_bytes = receipt["shallow_bytes"].encode("ascii", "strict")
+    except UnicodeEncodeError as error:
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow_bytes must be ASCII"
+        ) from error
+    if receipt["shallow_sha256"] != hashlib.sha256(shallow_bytes).hexdigest():
+        raise NamedLaneGuardError(
+            "workspace validation receipt shallow digest is invalid"
+        )
+    for key in (
+        "parent_identity",
+        "workspace_identity",
+        "git_identity",
+        "objects_identity",
+    ):
+        identity = _require_closed_mapping(
+            receipt[key],
+            frozenset({"device", "inode", "uid"}),
+            f"workspace receipt {key}",
+        )
+        for field in ("device", "inode", "uid"):
+            _require_nonnegative_integer(
+                identity[field], f"workspace receipt {key}.{field}"
+            )
+    return receipt
+
+
+def _validated_prefix_git_version(
+    git_executable: pathlib.Path,
+    worktree: pathlib.Path,
+    expected_identity: Mapping[str, object],
+) -> tuple[str, str, str]:
+    before = _capture_prefix_git_executable_identity(git_executable)
+    if before != expected_identity:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed after workspace validation"
+        )
+    capture = None
+    try:
+        try:
+            capture = run_bounded_capture(
+                (str(git_executable), "--version"),
+                cwd=worktree,
+                env=_git_environment(),
+                timeout_seconds=30.0,
+                stdout_limit_bytes=1024,
+                stderr_limit_bytes=1024,
+            )
+        except (
+            ForwardedSignal,
+            ReviewTimeoutError,
+            ReviewOutputLimitError,
+            ReviewOutputDrainError,
+            ReviewProcessLeakError,
+        ):
+            raise
+        except BaseException as error:
+            if _is_process_control_flow_error(error):
+                raise
+            raise NamedLaneGuardError(
+                "Codex review Git executable version could not be validated"
+            ) from error
+        stdout = bytes(capture.stdout)
+        if capture.returncode != 0 or capture.stderr:
+            raise NamedLaneGuardError(
+                "Codex review Git executable version could not be validated"
+            )
+        match = _SANITIZED_GIT_VERSION_OUTPUT.fullmatch(stdout)
+        if match is None:
+            raise NamedLaneGuardError(
+                "Codex review Git executable returned a malformed version"
+            )
+        version = tuple(int(component) for component in match.groups())
+        if version < MATERIALIZER_MINIMUM_GIT_VERSION:
+            raise NamedLaneGuardError(
+                "Codex review workspace requires Git 2.45.0 or newer"
+            )
+        try:
+            exact_stdout = stdout.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise NamedLaneGuardError(
+                "Codex review Git executable returned a non-ASCII version"
+            ) from error
+        normalized = exact_stdout.removesuffix("\n")
+        stdout_sha256 = hashlib.sha256(stdout).hexdigest()
+    finally:
+        if capture is not None:
+            capture.stdout[:] = b"\x00" * len(capture.stdout)
+            capture.stderr[:] = b"\x00" * len(capture.stderr)
+    after = _capture_prefix_git_executable_identity(git_executable)
+    if after != before:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed during version validation"
+        )
+    return normalized, exact_stdout, stdout_sha256
+
+
+def validate_sanitized_git_argv_prefix_receipt(
+    value: object,
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Validate the closed composite prefix receipt without trusting prose."""
+
+    rendered_worktree = _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    if (
+        LOWER_FULL_OBJECT_ID.fullmatch(base) is None
+        or LOWER_FULL_OBJECT_ID.fullmatch(head) is None
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git prefix endpoints must be full lowercase object IDs"
+        )
+    receipt = _require_closed_mapping(
+        value,
+        _SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST | {"receipt_sha256"},
+        "sanitized Git argv prefix receipt",
+    )
+    exact_values = {
+        "schema_version": SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        "command": "codex-git-prefix",
+        "prefix_profile": SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+        "sanitized_git_argv_prefix_conformance": (
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE
+        ),
+        "sanitized_git_argv_prefix_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "git_executable": rendered_git,
+        "worktree": rendered_worktree,
+        "base": base,
+        "head": head,
+        "workspace_validation_receipt_encoding": (SANITIZED_GIT_ARGV_PREFIX_ENCODING),
+        "no_lazy_fetch_control": "GIT_NO_LAZY_FETCH=1",
+        "receipt_identity_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "receipt_identity_algorithm": (
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM
+        ),
+    }
+    for key, expected in exact_values.items():
+        if type(receipt[key]) is not type(expected) or receipt[key] != expected:
+            raise NamedLaneGuardError(
+                f"sanitized Git argv prefix receipt {key} is invalid"
+            )
+    tokens = receipt["sanitized_git_argv_prefix"]
+    if type(tokens) is not list:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt tokens must be a JSON array"
+        )
+    validated_tokens = validate_sanitized_git_argv_prefix(
+        tokens,
+        worktree=worktree,
+        git_executable=git_executable,
+    )
+    token_sha256 = hashlib.sha256(
+        _canonical_json_bytes(list(validated_tokens))
+    ).hexdigest()
+    if receipt["sanitized_git_argv_prefix_sha256"] != token_sha256:
+        raise NamedLaneGuardError("sanitized Git argv prefix digest is invalid")
+    _validate_executable_identity_record(receipt["git_executable_identity"])
+    git_version = receipt["git_version"]
+    git_version_stdout = receipt["git_version_stdout"]
+    if type(git_version) is not str or type(git_version_stdout) is not str:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version fields must be JSON strings"
+        )
+    try:
+        version_stdout_bytes = git_version_stdout.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version output must be ASCII"
+        ) from error
+    match = _SANITIZED_GIT_VERSION_OUTPUT.fullmatch(version_stdout_bytes)
+    if (
+        match is None
+        or git_version != git_version_stdout.removesuffix("\n")
+        or tuple(int(component) for component in match.groups())
+        < MATERIALIZER_MINIMUM_GIT_VERSION
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version binding is invalid"
+        )
+    if (
+        receipt["git_version_stdout_sha256"]
+        != hashlib.sha256(version_stdout_bytes).hexdigest()
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git version digest is invalid"
+        )
+    workspace_receipt = _validate_workspace_validation_receipt(
+        receipt["workspace_validation_receipt"],
+        worktree=worktree,
+        base=base,
+        head=head,
+    )
+    if (
+        receipt["workspace_validation_receipt_sha256"]
+        != hashlib.sha256(_canonical_json_bytes(workspace_receipt)).hexdigest()
+    ):
+        raise NamedLaneGuardError("workspace validation receipt digest is invalid")
+    _require_sha256(
+        receipt["receipt_sha256"], "sanitized Git argv prefix receipt identity"
+    )
+    receipt_without_digest = {
+        key: receipt[key]
+        for key in _SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FIELDS_WITHOUT_DIGEST
+    }
+    if (
+        receipt["receipt_sha256"]
+        != hashlib.sha256(_canonical_json_bytes(receipt_without_digest)).hexdigest()
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt identity is invalid"
+        )
+    selected_git = resolve_git()
+    if selected_git != git_executable:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git path is no longer selected"
+        )
+    current_git_identity = _capture_prefix_git_executable_identity(selected_git)
+    if receipt["git_executable_identity"] != current_git_identity:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git executable identity is stale"
+        )
+    current_version, current_stdout, current_stdout_sha256 = (
+        _validated_prefix_git_version(
+            selected_git,
+            selected_git.parent,
+            current_git_identity,
+        )
+    )
+    if (
+        receipt["git_version"] != current_version
+        or receipt["git_version_stdout"] != current_stdout
+        or receipt["git_version_stdout_sha256"] != current_stdout_sha256
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt Git version evidence is stale"
+        )
+    current_workspace_receipt = _validate_workspace_validation_receipt(
+        validate_workspace(worktree, base, head).receipt(),
+        worktree=worktree,
+        base=base,
+        head=head,
+    )
+    if current_workspace_receipt != workspace_receipt:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix workspace validation receipt is stale"
+        )
+    if (
+        resolve_git() != selected_git
+        or _capture_prefix_git_executable_identity(selected_git) != current_git_identity
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix Git executable changed during receipt validation"
+        )
+    return receipt
+
+
+def _revalidate_prefix_receipt_publication_identities(
+    receipt: Mapping[str, object],
+    *,
+    worktree: pathlib.Path,
+    git_executable: pathlib.Path,
+) -> None:
+    if (
+        resolve_git() != git_executable
+        or _capture_prefix_git_executable_identity(git_executable)
+        != receipt["git_executable_identity"]
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed before prefix receipt publication"
+        )
+    workspace_receipt = receipt["workspace_validation_receipt"]
+    assert isinstance(workspace_receipt, dict)
+    try:
+        parent = worktree.parent.lstat()
+        root = worktree.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Codex review workspace changed before prefix receipt publication"
+        ) from error
+    expected_parent = workspace_receipt["parent_identity"]
+    expected_root = workspace_receipt["workspace_identity"]
+    assert isinstance(expected_parent, dict)
+    assert isinstance(expected_root, dict)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or (parent.st_dev, parent.st_ino, parent.st_uid)
+        != (
+            expected_parent["device"],
+            expected_parent["inode"],
+            expected_parent["uid"],
+        )
+        or (root.st_dev, root.st_ino, root.st_uid)
+        != (
+            expected_root["device"],
+            expected_root["inode"],
+            expected_root["uid"],
+        )
+    ):
+        raise NamedLaneGuardError(
+            "Codex review workspace identity changed before prefix receipt publication"
+        )
+
+
+def _prefix_receipt_parent_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _prefix_receipt_parent_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int]:
+    return metadata.st_uid, stat.S_IMODE(metadata.st_mode)
+
+
+def _prefix_receipt_object_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _prefix_receipt_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+    )
+
+
+def _prefix_receipt_content_signals(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+
+
+def _read_prefix_receipt_descriptor(descriptor: int) -> bytes:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt cannot be rewound"
+        ) from error
+    payload = bytearray()
+    try:
+        while len(payload) <= SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    64 * 1024,
+                    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES
+                    + 1
+                    - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt cannot be read"
+        ) from error
+    if not payload or len(payload) > SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt exceeded its byte limit"
+        )
+    return bytes(payload)
+
+
+def _require_prefix_receipt_parent_policy(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent must be an owner-private directory"
+        )
+
+
+def _require_prefix_receipt_file_policy(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
+        or metadata.st_size <= 0
+        or metadata.st_size > SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt must be a bounded owner-controlled single-link regular file"
+        )
+
+
+def _revalidate_open_prefix_receipt(
+    *,
+    receipt_path: pathlib.Path,
+    parent_descriptor: int,
+    receipt_descriptor: int,
+    parent_identity: tuple[int, int, int],
+    parent_policy: tuple[int, int],
+    receipt_identity: tuple[int, int, int],
+    receipt_policy: tuple[int, int, int, int],
+    initial_signals: tuple[int, int, int],
+    expected_payload: bytes,
+) -> None:
+    try:
+        parent_descriptor_metadata = os.fstat(parent_descriptor)
+        parent_path_metadata = receipt_path.parent.lstat()
+        resolved_parent = receipt_path.parent.resolve(strict=True)
+        receipt_descriptor_metadata = os.fstat(receipt_descriptor)
+        receipt_path_metadata = os.stat(
+            receipt_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt custody cannot be revalidated"
+        ) from error
+    for metadata in (parent_descriptor_metadata, parent_path_metadata):
+        try:
+            _require_prefix_receipt_parent_policy(metadata)
+        except NamedLaneGuardError as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent identity or access policy changed"
+            ) from error
+        if (
+            _prefix_receipt_parent_object_identity(metadata) != parent_identity
+            or _prefix_receipt_parent_access_policy(metadata) != parent_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent identity or access policy changed"
+            )
+    if resolved_parent != receipt_path.parent:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent path changed"
+        )
+    for metadata in (receipt_descriptor_metadata, receipt_path_metadata):
+        try:
+            _require_prefix_receipt_file_policy(metadata)
+        except NamedLaneGuardError as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt identity or access policy changed"
+            ) from error
+        if (
+            _prefix_receipt_object_identity(metadata) != receipt_identity
+            or _prefix_receipt_access_policy(metadata) != receipt_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt identity or access policy changed"
+            )
+    final_signals = _prefix_receipt_content_signals(receipt_descriptor_metadata)
+    if (
+        final_signals != initial_signals
+        or _prefix_receipt_content_signals(receipt_path_metadata) != initial_signals
+    ):
+        # Metadata churn is only a re-read trigger. Exact bytes select whether
+        # the protected content-stability property actually changed.
+        if _read_prefix_receipt_descriptor(receipt_descriptor) != expected_payload:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt content changed during validation"
+            )
+    elif _read_prefix_receipt_descriptor(receipt_descriptor) != expected_payload:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt content changed during validation"
+        )
+
+
+def validate_published_sanitized_git_argv_prefix_receipt(
+    *,
+    receipt_file: pathlib.Path,
+    expected_receipt_sha256: str,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Consume one published prefix receipt while retaining descriptor custody."""
+
+    _validate_prefix_path(receipt_file, "sanitized Git argv prefix receipt file")
+    _require_sha256(
+        expected_receipt_sha256,
+        "expected sanitized Git argv prefix receipt identity",
+    )
+    if is_relative_to(receipt_file, worktree):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt file must stay outside the worktree"
+        )
+    if receipt_file.name in {"", ".", ".."}:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt file has no ordinary leaf name"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or directory_only is None or nonblocking is None:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt validation requires no-follow opens"
+        )
+    try:
+        parent_before = receipt_file.parent.lstat()
+        resolved_parent = receipt_file.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent cannot be inspected"
+        ) from error
+    _require_prefix_receipt_parent_policy(parent_before)
+    if resolved_parent != receipt_file.parent:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent path traverses a symlink"
+        )
+    parent_identity = _prefix_receipt_parent_object_identity(parent_before)
+    parent_policy = _prefix_receipt_parent_access_policy(parent_before)
+
+    parent_descriptor: int | None = None
+    receipt_descriptor: int | None = None
+    result: dict[str, object] | None = None
+    operation_error: BaseException | None = None
+    try:
+        parent_descriptor = os.open(
+            receipt_file.parent,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | directory_only | nofollow,
+        )
+        parent_opened = os.fstat(parent_descriptor)
+        _require_prefix_receipt_parent_policy(parent_opened)
+        if (
+            _prefix_receipt_parent_object_identity(parent_opened) != parent_identity
+            or _prefix_receipt_parent_access_policy(parent_opened) != parent_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent changed before opening"
+            )
+        lexical = os.stat(
+            receipt_file.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _require_prefix_receipt_file_policy(lexical)
+        receipt_descriptor = os.open(
+            receipt_file.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(receipt_descriptor)
+        _require_prefix_receipt_file_policy(opened)
+        receipt_identity = _prefix_receipt_object_identity(opened)
+        receipt_policy = _prefix_receipt_access_policy(opened)
+        initial_signals = _prefix_receipt_content_signals(opened)
+        if (
+            _prefix_receipt_object_identity(lexical) != receipt_identity
+            or _prefix_receipt_access_policy(lexical) != receipt_policy
+            or _prefix_receipt_content_signals(lexical) != initial_signals
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt changed before reading"
+            )
+        payload = _read_prefix_receipt_descriptor(receipt_descriptor)
+        if len(payload) != opened.st_size:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt changed while reading"
+            )
+        try:
+            receipt = strict_json_loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt is not strict UTF-8 JSON"
+            ) from error
+        if (
+            type(receipt) is not dict
+            or receipt.get("receipt_sha256") != expected_receipt_sha256
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt does not match the retained expected identity"
+            )
+        validated = validate_sanitized_git_argv_prefix_receipt(
+            receipt,
+            worktree=worktree,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+        _revalidate_open_prefix_receipt(
+            receipt_path=receipt_file,
+            parent_descriptor=parent_descriptor,
+            receipt_descriptor=receipt_descriptor,
+            parent_identity=parent_identity,
+            parent_policy=parent_policy,
+            receipt_identity=receipt_identity,
+            receipt_policy=receipt_policy,
+            initial_signals=initial_signals,
+            expected_payload=payload,
+        )
+        _revalidate_prefix_receipt_publication_identities(
+            validated,
+            worktree=worktree,
+            git_executable=git_executable,
+        )
+        _revalidate_open_prefix_receipt(
+            receipt_path=receipt_file,
+            parent_descriptor=parent_descriptor,
+            receipt_descriptor=receipt_descriptor,
+            parent_identity=parent_identity,
+            parent_policy=parent_policy,
+            receipt_identity=receipt_identity,
+            receipt_policy=receipt_policy,
+            initial_signals=initial_signals,
+            expected_payload=payload,
+        )
+        result = validated
+    except BaseException as error:
+        if isinstance(error, OSError):
+            operation_error = NamedLaneGuardError(
+                "sanitized Git argv prefix receipt cannot be opened safely"
+            )
+            operation_error.__cause__ = error
+            operation_error.__suppress_context__ = True
+        else:
+            operation_error = error
+    receipt_to_close = receipt_descriptor if receipt_descriptor is not None else -1
+    parent_to_close = parent_descriptor if parent_descriptor is not None else -1
+    receipt_descriptor = None
+    parent_descriptor = None
+    close_failures = _attempt_workspace_descriptor_closes(
+        (
+            (
+                "sanitized Git argv prefix receipt descriptor close failed",
+                receipt_to_close,
+            ),
+            (
+                "sanitized Git argv prefix receipt parent descriptor close failed",
+                parent_to_close,
+            ),
+        )
+    )
+    selected_error = operation_error
+    if selected_error is not None:
+        _attach_workspace_teardown_failures(selected_error, close_failures)
+    else:
+        selected_error = _select_workspace_teardown_failure(close_failures)
+    if selected_error is not None:
+        raise selected_error
+    assert result is not None
+    return result
+
+
+def sanitized_git_argv_prefix_receipt(
+    *,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Revalidate a frozen workspace and return its composite prefix record."""
+
+    _validate_prefix_path(worktree, "Codex review worktree")
+    rendered_git = _validate_prefix_path(git_executable, "Codex review Git executable")
+    if (
+        LOWER_FULL_OBJECT_ID.fullmatch(base) is None
+        or LOWER_FULL_OBJECT_ID.fullmatch(head) is None
+    ):
+        raise NamedLaneGuardError(
+            "Codex review Git prefix endpoints must be full lowercase object IDs"
+        )
+    selected_git = resolve_git()
+    if str(selected_git) != rendered_git:
+        raise NamedLaneGuardError(
+            "Codex review Git executable differs from the fixed trusted Git path"
+        )
+    git_identity = _capture_prefix_git_executable_identity(selected_git)
+    git_version, git_version_stdout, git_version_stdout_sha256 = (
+        _validated_prefix_git_version(
+            selected_git,
+            selected_git.parent,
+            git_identity,
+        )
+    )
+    validated = validate_workspace(worktree, base, head)
+    canonical_worktree = validated.root
+    workspace_receipt = _validate_workspace_validation_receipt(
+        validated.receipt(),
+        worktree=canonical_worktree,
+        base=base,
+        head=head,
+    )
+    if resolve_git() != selected_git:
+        raise NamedLaneGuardError(
+            "fixed trusted Git path changed during workspace validation"
+        )
+    if _capture_prefix_git_executable_identity(selected_git) != git_identity:
+        raise NamedLaneGuardError(
+            "Codex review Git executable changed during workspace validation"
+        )
+    tokens = validate_sanitized_git_argv_prefix(
+        build_sanitized_git_argv_prefix(
+            worktree=canonical_worktree,
+            git_executable=selected_git,
+        ),
+        worktree=canonical_worktree,
+        git_executable=selected_git,
+    )
+    encoded = _canonical_json_bytes(list(tokens))
+    receipt: dict[str, object] = {
+        "schema_version": SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        "command": "codex-git-prefix",
+        "prefix_profile": SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+        "sanitized_git_argv_prefix_conformance": (
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE
+        ),
+        "sanitized_git_argv_prefix": list(tokens),
+        "sanitized_git_argv_prefix_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "sanitized_git_argv_prefix_sha256": hashlib.sha256(encoded).hexdigest(),
+        "git_executable": str(selected_git),
+        "git_executable_identity": git_identity,
+        "git_version": git_version,
+        "git_version_stdout": git_version_stdout,
+        "git_version_stdout_sha256": git_version_stdout_sha256,
+        "worktree": str(canonical_worktree),
+        "base": base,
+        "head": head,
+        "workspace_validation_receipt": workspace_receipt,
+        "workspace_validation_receipt_encoding": (SANITIZED_GIT_ARGV_PREFIX_ENCODING),
+        "workspace_validation_receipt_sha256": hashlib.sha256(
+            _canonical_json_bytes(workspace_receipt)
+        ).hexdigest(),
+        "no_lazy_fetch_control": "GIT_NO_LAZY_FETCH=1",
+        "receipt_identity_encoding": SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        "receipt_identity_algorithm": (
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM
+        ),
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(receipt)
+    ).hexdigest()
+    return validate_sanitized_git_argv_prefix_receipt(
+        receipt,
+        worktree=canonical_worktree,
+        base=base,
+        head=head,
+        git_executable=selected_git,
+    )
+
+
+@dataclass(frozen=True)
+class _SignalMaskRestoreOutcome:
+    """Result of bounded terminal signal-mask restoration."""
+
+    restored: bool
+    failure_types: tuple[str, ...]
+    direct_exact_mask_fallback: str
+
+
+class _WorkspacePublicationRollbackError(ReviewWorkspaceError):
+    """An unpublished workspace could not be removed after receipt failure."""
+
+    def __init__(
+        self,
+        prepared: PreparedWorkspace,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+        recovery_payload: Mapping[str, object],
+    ) -> None:
+        expected_parent = {
+            "device": prepared.parent_identity[0],
+            "inode": prepared.parent_identity[1],
+            "uid": prepared.parent_identity[2],
+        }
+        expected_workspace = {
+            "device": prepared.workspace_identity[0],
+            "inode": prepared.workspace_identity[1],
+            "uid": prepared.workspace_identity[2],
+        }
+        details: dict[str, object] = {
+            "primary_reason": _workspace_publication_failure_reason(primary_error),
+            "cleanup_reason": _workspace_publication_failure_reason(cleanup_error),
+            "cleanup_token_sha256": prepared.cleanup_token_sha256,
+            "parent_identity": expected_parent,
+            "workspace_identity": expected_workspace,
+            **dict(recovery_payload),
+        }
+        retained_path = _prepared_workspace_retained_path(
+            prepared,
+            cleanup_error,
+        )
+        if retained_path is not None:
+            details["retained_path"] = retained_path
+        else:
+            details["expected_locator"] = {
+                "parent": str(prepared.root.parent),
+                "parent_identity": expected_parent,
+                "leaf": prepared.root.name,
+                "workspace_identity": expected_workspace,
+            }
+        super().__init__(
+            "workspace-publication-rollback-incomplete",
+            "workspace receipt publication failed and identity-bound cleanup did "
+            "not complete",
+            details=details,
+        )
 
 
 class _ControlObjectGuardError(NamedLaneGuardError):
@@ -463,6 +1736,53 @@ class _ClaudeExecutableBinding:
     artifact_size: int
     artifact_checksum: str
     preflight_checksum: str
+
+
+@dataclass(frozen=True)
+class _ClaudeSourceControlFileBinding:
+    path: pathlib.Path
+    identity: _DirectoryIdentity
+    file_type: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _ClaudeSourceReadBoundaryBinding:
+    source_worktree: pathlib.Path
+    source_identity: _DirectoryIdentity
+    marker: _MaterializerSourceMarkerBinding
+    marker_content: _ClaudeSourceControlFileBinding | None
+    back_pointer: _ClaudeSourceControlFileBinding | None
+    admin: pathlib.Path
+    admin_identity: _DirectoryIdentity
+    commondir: _ClaudeSourceControlFileBinding | None
+    common: pathlib.Path
+    common_identity: _DirectoryIdentity
+    objects: pathlib.Path
+    objects_identity: _DirectoryIdentity
+    object_info_identity: _DirectoryIdentity | None
+    deny_roots: tuple[pathlib.Path, ...]
+
+
+@dataclass(frozen=True)
+class _ClaudeDirectArgvProfile:
+    model: str
+    worktree: pathlib.Path
+    git_metadata: pathlib.Path
+    account_home: pathlib.Path
+    source_worktree: pathlib.Path
+    source_read_deny_roots: tuple[pathlib.Path, ...]
+    source_read_boundary: _ClaudeSourceReadBoundaryBinding
+    source_authority_binding: Mapping[str, object]
+    source_authority_binding_sha256: str
+    preflight_result: pathlib.Path
+    output_bindings: Mapping[str, object]
+    environment_binding: Mapping[str, object]
+    git_null_read_exception: Mapping[str, object]
+    settings: Mapping[str, object]
+    settings_json: str
+    arguments: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -6736,10 +8056,10 @@ def _read_control_prompt(
 
 @dataclass
 class _StructuredSignalState:
-    committed: bool = False
+    committed_returncode: int | None = None
 
-    def commit(self) -> None:
-        self.committed = True
+    def commit(self, returncode: int) -> None:
+        self.committed_returncode = returncode
 
 
 @contextlib.contextmanager
@@ -6765,17 +8085,22 @@ def _structured_forwarded_signals() -> Iterable[_StructuredSignalState]:
             raise ForwardedSignal(pending_signal)
         yield state
     finally:
-        cleanup_mask = block_forwarded_signals()
-        pending_cleanup_signal: signal.Signals | None = None
-        if state.committed:
-            if cleanup_mask is not None:
-                consume_pending_forwarded_signal()
-            restore_signal_mask(
-                cleanup_mask if initial_mask_restored else previous_mask
-            )
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+        committed_returncode = state.committed_returncode
+        if committed_returncode is not None:
+            try:
+                cleanup_mask = block_forwarded_signals()
+                if cleanup_mask is not None:
+                    consume_pending_forwarded_signal()
+                restore_signal_mask(
+                    cleanup_mask if initial_mask_restored else previous_mask
+                )
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
+            except BaseException:
+                _terminal_process_exit(committed_returncode)
         else:
+            cleanup_mask = block_forwarded_signals()
+            pending_cleanup_signal: signal.Signals | None = None
             try:
                 for forwarded, previous in previous_handlers.items():
                     signal.signal(forwarded, previous)
@@ -6785,8 +8110,8 @@ def _structured_forwarded_signals() -> Iterable[_StructuredSignalState]:
                 restore_signal_mask(
                     cleanup_mask if initial_mask_restored else previous_mask
                 )
-        if pending_cleanup_signal is not None:
-            raise ForwardedSignal(pending_cleanup_signal)
+            if pending_cleanup_signal is not None:
+                raise ForwardedSignal(pending_cleanup_signal)
 
 
 def _revalidate_output_parent(target: _OutputTarget) -> None:
@@ -6992,6 +8317,7 @@ def _claude_environment(
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_CEILING_DIRECTORIES": str(worktree.parent),
         "GIT_GRAFT_FILE": os.devnull,
+        "GIT_LITERAL_PATHSPECS": "1",
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
@@ -7018,6 +8344,900 @@ def _claude_environment(
             pathlib.Path(node_extra_ca_certs)
         )
     return environment
+
+
+def _resolve_claude_isolation_directory(
+    path: pathlib.Path,
+    *,
+    label: str,
+) -> pathlib.Path:
+    if not path.is_absolute():
+        raise NamedLaneGuardError(f"{label} must be absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(f"{label} cannot be resolved safely") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != path
+    ):
+        raise NamedLaneGuardError(f"{label} must be a canonical real directory")
+    return resolved
+
+
+def _claude_direct_primary_source_guidance() -> str:
+    return (
+        "use an ordinary or linked worktree with canonical <common>/objects, "
+        "a filesystem reflink/COW copy, or a clone made independent with "
+        "--dissociate"
+    )
+
+
+def _claude_source_control_file_binding(
+    path: pathlib.Path,
+    *,
+    label: str,
+) -> tuple[_ClaudeSourceControlFileBinding, bytearray]:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            f"Claude source {label} cannot be inspected"
+        ) from error
+    payload = _read_materializer_control_file(path, label=label)
+    try:
+        after = path.lstat()
+    except OSError as error:
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError(
+            f"Claude source {label} cannot be revalidated"
+        ) from error
+
+    def signature(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_size,
+        )
+
+    if signature(before) != signature(after):
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError(
+            f"Claude source {label} changed during exact-content binding"
+        )
+    return (
+        _ClaudeSourceControlFileBinding(
+            path=path,
+            identity=_directory_identity(after),
+            file_type=stat.S_IFMT(after.st_mode),
+            size=after.st_size,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+        payload,
+    )
+
+
+def _claude_linked_marker_content_bindings(
+    marker: _MaterializerSourceMarkerBinding,
+    source: pathlib.Path,
+    admin: pathlib.Path,
+) -> tuple[_ClaudeSourceControlFileBinding, _ClaudeSourceControlFileBinding]:
+    marker_binding, marker_payload = _claude_source_control_file_binding(
+        marker.path,
+        label="Git admin marker",
+    )
+    try:
+        stripped = bytes(marker_payload).rstrip(b"\r\n")
+        prefix = b"gitdir: "
+        if not stripped.startswith(prefix) or not stripped[len(prefix) :]:
+            raise NamedLaneGuardError("Claude source Git admin marker is malformed")
+        if (
+            _materializer_control_path(
+                stripped[len(prefix) :],
+                relative_to=source,
+                label="Git admin marker",
+            )
+            != admin
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git admin marker does not match its bound admin"
+            )
+    finally:
+        marker_payload[:] = b"\x00" * len(marker_payload)
+    back_pointer, back_pointer_payload = _claude_source_control_file_binding(
+        admin / "gitdir",
+        label="Git admin back-pointer",
+    )
+    try:
+        if (
+            _materializer_control_path(
+                back_pointer_payload,
+                relative_to=admin,
+                label="Git admin back-pointer",
+            )
+            != marker.path
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git admin back-pointer does not match its marker"
+            )
+    finally:
+        back_pointer_payload[:] = b"\x00" * len(back_pointer_payload)
+    return marker_binding, back_pointer
+
+
+def _claude_common_directory_binding(
+    admin: pathlib.Path,
+) -> tuple[_ClaudeSourceControlFileBinding | None, pathlib.Path]:
+    marker_path = admin / "commondir"
+    try:
+        marker_path.lstat()
+    except FileNotFoundError:
+        return None, admin
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude source Git common-directory marker cannot be inspected"
+        ) from error
+    binding, payload = _claude_source_control_file_binding(
+        marker_path,
+        label="Git common-directory marker",
+    )
+    try:
+        common = _materializer_control_path(
+            payload,
+            relative_to=admin,
+            label="Git common-directory marker",
+        )
+    finally:
+        payload[:] = b"\x00" * len(payload)
+    return binding, common
+
+
+def _claude_source_object_info_identity(
+    objects: pathlib.Path,
+) -> _DirectoryIdentity | None:
+    info = objects / "info"
+    try:
+        metadata = info.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage cannot be inspected; "
+            + _claude_direct_primary_source_guidance()
+        ) from error
+    try:
+        resolved = info.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage must be a canonical real "
+            "current-user directory; " + _claude_direct_primary_source_guidance()
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+        or resolved != info
+    ):
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage must be a canonical real "
+            "current-user directory; " + _claude_direct_primary_source_guidance()
+        )
+    return _directory_identity(metadata)
+
+
+def _reject_claude_source_alternate_entries(objects: pathlib.Path) -> None:
+    info = objects / "info"
+    for candidate, label in (
+        (info / "alternates", "local alternates"),
+        (info / "http-alternates", "HTTP alternates"),
+    ):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise NamedLaneGuardError(
+                f"Claude source Git {label} state cannot be inspected; "
+                + _claude_direct_primary_source_guidance()
+            ) from error
+        raise NamedLaneGuardError(
+            f"Claude source Git {label} entry must be absent, regardless of "
+            "its contents or file type; " + _claude_direct_primary_source_guidance()
+        )
+
+
+def _bind_claude_source_read_boundary(
+    source_worktree: pathlib.Path,
+) -> _ClaudeSourceReadBoundaryBinding:
+    source = _resolve_claude_isolation_directory(
+        source_worktree,
+        label="Claude source worktree",
+    )
+    resolved_source, marker = _resolve_materializer_source(source)
+    if resolved_source != source:
+        raise NamedLaneGuardError(
+            "Claude source worktree must be a canonical Git worktree root"
+        )
+    _verify_materializer_source_marker(marker, source)
+    admin = marker.expected_admin
+    _verify_materializer_source_back_pointer(marker, admin)
+    commondir, common = _claude_common_directory_binding(admin)
+    objects = common / "objects"
+    path_metadata: dict[pathlib.Path, os.stat_result] = {}
+    for path, label in (
+        (source, "Claude source worktree"),
+        (admin, "Claude source Git admin directory"),
+        (common, "Claude source Git common directory"),
+        (objects, "Claude source primary Git object directory"),
+    ):
+        resolved = _resolve_claude_isolation_directory(path, label=label)
+        try:
+            metadata = resolved.lstat()
+        except OSError as error:
+            raise NamedLaneGuardError(f"{label} cannot be inspected") from error
+        if metadata.st_uid != _current_user_id():
+            raise NamedLaneGuardError(f"{label} must be current-user-owned")
+        path_metadata[path] = metadata
+    marker_content: _ClaudeSourceControlFileBinding | None = None
+    back_pointer: _ClaudeSourceControlFileBinding | None = None
+    if marker.is_gitfile:
+        marker_content, back_pointer = _claude_linked_marker_content_bindings(
+            marker,
+            source,
+            admin,
+        )
+        if (
+            marker_content.path != marker.path
+            or marker_content.identity.device != marker.device
+            or marker_content.identity.inode != marker.inode
+            or marker_content.identity.owner != marker.owner
+            or marker_content.file_type != marker.file_type
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git marker identity changed during exact-content binding"
+            )
+    object_info_identity = _claude_source_object_info_identity(objects)
+    _reject_claude_source_alternate_entries(objects)
+
+    _verify_materializer_source_marker(marker, source)
+    _verify_materializer_source_back_pointer(marker, admin)
+    final_commondir, final_common = _claude_common_directory_binding(admin)
+    if final_commondir != commondir or final_common != common:
+        raise NamedLaneGuardError(
+            "Claude source Git common-directory marker or authority changed during "
+            "direct-primary source validation"
+        )
+    if marker.is_gitfile:
+        final_marker_content, final_back_pointer = (
+            _claude_linked_marker_content_bindings(marker, source, admin)
+        )
+        if final_marker_content != marker_content or final_back_pointer != back_pointer:
+            raise NamedLaneGuardError(
+                "Claude source Git marker or back-pointer content changed during "
+                "direct-primary source validation"
+            )
+    for path, label in (
+        (source, "Claude source worktree"),
+        (admin, "Claude source Git admin directory"),
+        (common, "Claude source Git common directory"),
+        (objects, "Claude source primary Git object directory"),
+    ):
+        resolved = _resolve_claude_isolation_directory(path, label=label)
+        try:
+            final_metadata = resolved.lstat()
+        except OSError as error:
+            raise NamedLaneGuardError(f"{label} cannot be revalidated") from error
+        if _directory_identity(final_metadata) != _directory_identity(
+            path_metadata[path]
+        ):
+            raise NamedLaneGuardError(
+                f"{label} changed during direct-primary source validation"
+            )
+    final_object_info_identity = _claude_source_object_info_identity(objects)
+    _reject_claude_source_alternate_entries(objects)
+    if final_object_info_identity != object_info_identity:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage changed during direct-primary "
+            "source validation"
+        )
+    roots = tuple(dict.fromkeys((source, admin, common)))
+    return _ClaudeSourceReadBoundaryBinding(
+        source_worktree=source,
+        source_identity=_directory_identity(path_metadata[source]),
+        marker=marker,
+        marker_content=marker_content,
+        back_pointer=back_pointer,
+        admin=admin,
+        admin_identity=_directory_identity(path_metadata[admin]),
+        commondir=commondir,
+        common=common,
+        common_identity=_directory_identity(path_metadata[common]),
+        objects=objects,
+        objects_identity=_directory_identity(path_metadata[objects]),
+        object_info_identity=object_info_identity,
+        deny_roots=roots,
+    )
+
+
+def _resolve_claude_source_read_deny_roots(
+    source_worktree: pathlib.Path,
+) -> tuple[pathlib.Path, tuple[pathlib.Path, ...]]:
+    binding = _bind_claude_source_read_boundary(source_worktree)
+    return binding.source_worktree, binding.deny_roots
+
+
+def _claude_source_identity_tuple(
+    identity: _DirectoryIdentity,
+) -> tuple[int, int, int]:
+    return (identity.device, identity.inode, identity.owner)
+
+
+def _claude_source_authority_binding_payload(
+    binding: _ClaudeSourceReadBoundaryBinding,
+) -> dict[str, object]:
+    marker_content = binding.marker_content
+    back_pointer = binding.back_pointer
+    return build_source_authority_binding(
+        source_worktree=source_authority_directory_record(
+            binding.source_worktree,
+            _claude_source_identity_tuple(binding.source_identity),
+        ),
+        git_marker=source_authority_marker_record(
+            binding.marker.path,
+            binding.marker.expected_admin,
+            (
+                binding.marker.device,
+                binding.marker.inode,
+                binding.marker.owner,
+            ),
+            file_type=binding.marker.file_type,
+            kind="gitfile" if binding.marker.is_gitfile else "directory",
+            size=None if marker_content is None else marker_content.size,
+            sha256=None if marker_content is None else marker_content.sha256,
+        ),
+        linked_worktree_back_pointer=(
+            None
+            if back_pointer is None
+            else source_authority_control_record(
+                back_pointer.path,
+                _claude_source_identity_tuple(back_pointer.identity),
+                file_type=back_pointer.file_type,
+                size=back_pointer.size,
+                sha256=back_pointer.sha256,
+            )
+        ),
+        git_common_directory_marker=(
+            None
+            if binding.commondir is None
+            else source_authority_common_marker_record(
+                source_authority_control_record(
+                    binding.commondir.path,
+                    _claude_source_identity_tuple(binding.commondir.identity),
+                    file_type=binding.commondir.file_type,
+                    size=binding.commondir.size,
+                    sha256=binding.commondir.sha256,
+                ),
+                binding.common,
+            )
+        ),
+        git_admin=source_authority_directory_record(
+            binding.admin,
+            _claude_source_identity_tuple(binding.admin_identity),
+        ),
+        git_common=source_authority_directory_record(
+            binding.common,
+            _claude_source_identity_tuple(binding.common_identity),
+        ),
+        primary_object_store=source_authority_directory_record(
+            binding.objects,
+            _claude_source_identity_tuple(binding.objects_identity),
+        ),
+        object_info_path=binding.objects / "info",
+        object_info_identity=(
+            None
+            if binding.object_info_identity is None
+            else _claude_source_identity_tuple(binding.object_info_identity)
+        ),
+    )
+
+
+def _validate_parent_source_authority_binding(
+    value: object,
+    expected_sha256: object,
+) -> tuple[dict[str, object], str]:
+    try:
+        return validate_source_authority_binding(value, expected_sha256)
+    except SourceAuthorityBindingError as error:
+        raise NamedLaneGuardError(str(error)) from error
+
+
+def _parse_parent_source_authority_binding_json(
+    value: str,
+    expected_sha256: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise NamedLaneGuardError(
+            "parent source-authority binding JSON is not valid UTF-8"
+        ) from error
+    if len(encoded) > CLAUDE_SOURCE_AUTHORITY_BINDING_LIMIT_BYTES:
+        raise NamedLaneGuardError(
+            "parent source-authority binding JSON exceeds its size bound"
+        )
+    try:
+        return parse_canonical_source_authority_binding_bytes(
+            encoded,
+            expected_sha256,
+        )
+    except SourceAuthorityBindingError as error:
+        raise NamedLaneGuardError(str(error)) from error
+
+
+def _revalidate_claude_source_read_boundary(
+    expected: _ClaudeSourceReadBoundaryBinding,
+    parent_binding: Mapping[str, object],
+    parent_binding_sha256: str,
+) -> None:
+    observed = _bind_claude_source_read_boundary(expected.source_worktree)
+    observed_payload = _claude_source_authority_binding_payload(observed)
+    if (
+        observed != expected
+        or observed_payload != parent_binding
+        or not secrets.compare_digest(
+            hashlib.sha256(
+                canonical_source_authority_binding_bytes(observed_payload)
+            ).hexdigest(),
+            parent_binding_sha256,
+        )
+    ):
+        raise NamedLaneGuardError(
+            "Claude source direct-primary authority changed after initial "
+            "binding; " + _claude_direct_primary_source_guidance()
+        )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _unique_rendered_paths(paths: Iterable[pathlib.Path]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        rendered = str(path)
+        if rendered not in seen:
+            result.append(rendered)
+            seen.add(rendered)
+    return result
+
+
+def _claude_git_null_read_exception_binding(
+    path: pathlib.Path = CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION,
+) -> dict[str, object]:
+    if (
+        os.name != "posix"
+        or pathlib.Path(os.devnull) != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+        or path != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be exact canonical /dev/null"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblocking is None:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception requires no-follow nonblocking open"
+        )
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception cannot be resolved safely"
+        ) from error
+    if (
+        resolved != CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISCHR(before.st_mode)
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be exact canonical /dev/null"
+        )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
+        )
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception must be a readable character device"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed during validation"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+    def identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_rdev,
+        )
+
+    if (
+        not stat.S_ISCHR(opened.st_mode)
+        or identity(before) != identity(opened)
+        or identity(opened) != identity(after)
+    ):
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed during validation"
+        )
+    return {
+        "path": str(path),
+        "identity_binding": "canonical-no-follow-character-device",
+        "identity": {
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "file_type": stat.S_IFMT(opened.st_mode),
+            "mode": stat.S_IMODE(opened.st_mode),
+            "uid": opened.st_uid,
+            "gid": opened.st_gid,
+            "rdev": opened.st_rdev,
+        },
+    }
+
+
+def _claude_output_profile_binding(target: _OutputTarget) -> dict[str, object]:
+    _revalidate_output_parent(target)
+    try:
+        metadata = os.fstat(target.parent_fd)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude output parent cannot be inspected for the argv profile"
+        ) from error
+    return {
+        "path": str(target.path),
+        "parent": str(target.path.parent),
+        "parent_identity": {
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "file_type": stat.S_IFMT(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "mode": stat.S_IMODE(metadata.st_mode),
+        },
+    }
+
+
+def _claude_environment_profile_binding(
+    child_environment: Mapping[str, str],
+) -> dict[str, object]:
+    environment = dict(child_environment)
+    return {
+        "profile": CLAUDE_DIRECT_ENVIRONMENT_PROFILE,
+        "assurance": "guard-supplied-process-environment",
+        "requested_keys": sorted(environment),
+        "requested_environment_sha256": hashlib.sha256(
+            _canonical_json_bytes(environment)
+        ).hexdigest(),
+        "present_passthrough_keys": sorted(
+            set(environment).intersection(CLAUDE_ENV_PASSTHROUGH_KEYS)
+        ),
+        "node_extra_ca_certs_inherited": "NODE_EXTRA_CA_CERTS" in environment,
+    }
+
+
+def _claude_direct_required_options(
+    version: tuple[int, int, int],
+) -> tuple[str, ...]:
+    if version < CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION:
+        return CLAUDE_DIRECT_REQUIRED_OPTIONS
+    insertion = CLAUDE_DIRECT_REQUIRED_OPTIONS.index("--safe-mode")
+    return (
+        *CLAUDE_DIRECT_REQUIRED_OPTIONS[:insertion],
+        "--session-id",
+        *CLAUDE_DIRECT_REQUIRED_OPTIONS[insertion:],
+    )
+
+
+def _validate_claude_read_boundary_nonoverlap(
+    *,
+    allow_read: Sequence[pathlib.Path],
+    deny_read: Sequence[pathlib.Path],
+) -> None:
+    for allowed in allow_read:
+        for denied in deny_read:
+            if (allowed, denied) in CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS:
+                continue
+            if (
+                allowed == denied
+                or is_relative_to(allowed, denied)
+                or is_relative_to(denied, allowed)
+            ):
+                raise NamedLaneGuardError(
+                    "Claude allowRead and denyRead roots must not overlap"
+                )
+
+
+def _build_claude_direct_argv_profile(
+    *,
+    worktree: pathlib.Path,
+    source_worktree: pathlib.Path,
+    source_authority_binding: Mapping[str, object],
+    source_authority_binding_sha256: str,
+    preflight_result: pathlib.Path,
+    stdout: _OutputTarget,
+    stderr: _OutputTarget,
+    child_environment: Mapping[str, str],
+    model: str,
+) -> _ClaudeDirectArgvProfile:
+    if model not in CLAUDE_DIRECT_MODELS:
+        raise NamedLaneGuardError(
+            "Claude model must match the canonical named-direct model profile"
+        )
+    source_read_boundary = _bind_claude_source_read_boundary(source_worktree)
+    observed_source_authority = _claude_source_authority_binding_payload(
+        source_read_boundary
+    )
+    if (
+        observed_source_authority != source_authority_binding
+        or not secrets.compare_digest(
+            hashlib.sha256(
+                canonical_source_authority_binding_bytes(observed_source_authority)
+            ).hexdigest(),
+            source_authority_binding_sha256,
+        )
+    ):
+        raise NamedLaneGuardError(
+            "Claude source authority does not match the parent-owned "
+            "prepare-workspace binding"
+        )
+    source = source_read_boundary.source_worktree
+    source_read_deny_roots = source_read_boundary.deny_roots
+    if (
+        source == worktree
+        or is_relative_to(source, worktree)
+        or is_relative_to(worktree, source)
+    ):
+        raise NamedLaneGuardError(
+            "Claude source and review worktrees must be independent"
+        )
+    git_metadata = _resolve_claude_isolation_directory(
+        worktree / ".git",
+        label="Claude review Git metadata",
+    )
+    if not is_relative_to(git_metadata, worktree):
+        raise NamedLaneGuardError(
+            "Claude review Git metadata must stay inside the review worktree"
+        )
+    home_value = child_environment.get("HOME")
+    if type(home_value) is not str or not home_value:
+        raise NamedLaneGuardError(
+            "Claude account home is missing from the child profile"
+        )
+    home = _resolve_claude_isolation_directory(
+        pathlib.Path(home_value),
+        label="Claude account home",
+    )
+    private_home_paths = tuple(
+        home / relative for relative in CLAUDE_DIRECT_PRIVATE_HOME_PATHS
+    )
+    git_null_read_exception = _claude_git_null_read_exception_binding()
+    git_null_path = pathlib.Path(str(git_null_read_exception["path"]))
+    deny_read = _unique_rendered_paths(
+        (
+            *private_home_paths,
+            *source_read_deny_roots,
+            preflight_result,
+            stdout.path,
+            stderr.path,
+            pathlib.Path("/proc"),
+            pathlib.Path("/dev"),
+        )
+    )
+    allow_read_paths = (worktree, git_metadata, git_null_path)
+    deny_read_paths = tuple(pathlib.Path(path) for path in deny_read)
+    _validate_claude_read_boundary_nonoverlap(
+        allow_read=allow_read_paths,
+        deny_read=deny_read_paths,
+    )
+    settings: dict[str, object] = {
+        "disableAllHooks": True,
+        "disableBundledSkills": True,
+        "permissions": {"deny": list(CLAUDE_DIRECT_PERMISSION_DENY_RULES)},
+        "sandbox": {
+            "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": False,
+            "credentials": {
+                "envVars": [
+                    {"mode": "deny", "name": key}
+                    for key in CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS
+                ],
+                "files": [
+                    {"mode": "deny", "path": str(path)} for path in private_home_paths
+                ],
+            },
+            "enabled": True,
+            "enableWeakerNestedSandbox": False,
+            "enableWeakerNetworkIsolation": False,
+            "excludedCommands": [],
+            "failIfUnavailable": True,
+            "filesystem": {
+                "allowRead": [str(path) for path in allow_read_paths],
+                "denyRead": deny_read,
+                "denyWrite": ["/"],
+            },
+            "network": {
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
+                "allowUnixSockets": [],
+                "allowedDomains": [],
+            },
+        },
+    }
+    settings_json = _canonical_json_bytes(settings).decode("utf-8")
+    arguments = (
+        "--print",
+        "--input-format",
+        "text",
+        "--model",
+        model,
+        "--effort",
+        CLAUDE_DIRECT_EFFORT,
+        "--permission-mode",
+        CLAUDE_DIRECT_PERMISSION_MODE,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--safe-mode",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--setting-sources",
+        "",
+        "--settings",
+        settings_json,
+        "--tools",
+        CLAUDE_DIRECT_VISIBLE_TOOLS,
+        "--allowedTools",
+        CLAUDE_DIRECT_ALLOWED_TOOLS,
+        "--disallowedTools",
+        CLAUDE_DIRECT_DISALLOWED_TOOLS,
+    )
+    if (
+        tuple(
+            argument
+            for argument in arguments
+            if argument in CLAUDE_DIRECT_REQUIRED_OPTIONS
+        )
+        != CLAUDE_DIRECT_REQUIRED_OPTIONS
+    ):
+        raise NamedLaneGuardError(
+            "Claude guard-owned argv does not match its capability contract"
+        )
+    return _ClaudeDirectArgvProfile(
+        model=model,
+        worktree=worktree,
+        git_metadata=git_metadata,
+        account_home=home,
+        source_worktree=source,
+        source_read_deny_roots=source_read_deny_roots,
+        source_read_boundary=source_read_boundary,
+        source_authority_binding=source_authority_binding,
+        source_authority_binding_sha256=source_authority_binding_sha256,
+        preflight_result=preflight_result,
+        output_bindings={
+            "stdout": _claude_output_profile_binding(stdout),
+            "stderr": _claude_output_profile_binding(stderr),
+        },
+        environment_binding=_claude_environment_profile_binding(child_environment),
+        git_null_read_exception=git_null_read_exception,
+        settings=settings,
+        settings_json=settings_json,
+        arguments=arguments,
+    )
+
+
+def _claude_direct_argv_profile_receipt(
+    profile: _ClaudeDirectArgvProfile,
+    *,
+    effective_arguments: Sequence[str],
+) -> dict[str, object]:
+    _revalidate_claude_source_read_boundary(
+        profile.source_read_boundary,
+        profile.source_authority_binding,
+        profile.source_authority_binding_sha256,
+    )
+    if _claude_git_null_read_exception_binding() != profile.git_null_read_exception:
+        raise NamedLaneGuardError(
+            "Claude Git null read exception changed before receipt generation"
+        )
+    payload: dict[str, object] = {
+        "profile": CLAUDE_DIRECT_ARGV_PROFILE,
+        "conformance": CLAUDE_DIRECT_ARGV_CONFORMANCE,
+        "settings_schema": CLAUDE_DIRECT_SETTINGS_SCHEMA,
+        "settings_assurance": "requested-configuration-only",
+        "settings_parser_acceptance_attested": False,
+        "managed_policy_residual": True,
+        "native_sandbox_effectiveness_attested": False,
+        "model": profile.model,
+        "effort": CLAUDE_DIRECT_EFFORT,
+        "worktree": str(profile.worktree),
+        "review_git_metadata": str(profile.git_metadata),
+        "account_home": str(profile.account_home),
+        "source_worktree": str(profile.source_worktree),
+        "source_worktree_binding": (
+            "prepare-workspace-receipt-exact-digest-bound-authority-v1"
+        ),
+        "source_read_deny_roots": [
+            str(path) for path in profile.source_read_deny_roots
+        ],
+        "source_authority_policy": "direct-primary-only",
+        "source_authority_binding": json.loads(
+            canonical_source_authority_binding_bytes(profile.source_authority_binding)
+        ),
+        "source_authority_binding_sha256": (profile.source_authority_binding_sha256),
+        "source_primary_object_store": str(profile.source_read_boundary.objects),
+        "source_primary_object_store_identity": {
+            "device": profile.source_read_boundary.objects_identity.device,
+            "inode": profile.source_read_boundary.objects_identity.inode,
+            "uid": profile.source_read_boundary.objects_identity.owner,
+        },
+        "source_object_info_identity": (
+            None
+            if profile.source_read_boundary.object_info_identity is None
+            else {
+                "device": profile.source_read_boundary.object_info_identity.device,
+                "inode": profile.source_read_boundary.object_info_identity.inode,
+                "uid": profile.source_read_boundary.object_info_identity.owner,
+            }
+        ),
+        "source_authority_revalidation": [
+            "pre-spawn",
+            "pre-terminal-acceptance",
+        ],
+        "preflight_result": str(profile.preflight_result),
+        "output_bindings": profile.output_bindings,
+        "environment_binding": profile.environment_binding,
+        "git_null_read_exception": profile.git_null_read_exception,
+        "settings": profile.settings,
+        "settings_sha256": hashlib.sha256(
+            profile.settings_json.encode("utf-8")
+        ).hexdigest(),
+        "guard_constructed_arguments": list(profile.arguments),
+        "guard_constructed_arguments_sha256": hashlib.sha256(
+            _canonical_json_bytes(list(profile.arguments))
+        ).hexdigest(),
+        "effective_arguments": list(effective_arguments),
+        "effective_arguments_sha256": hashlib.sha256(
+            _canonical_json_bytes(list(effective_arguments))
+        ).hexdigest(),
+    }
+    payload["profile_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(payload)
+    ).hexdigest()
+    return payload
 
 
 def _claude_directory_stat_identity(
@@ -7558,51 +9778,6 @@ def _claude_session_env_custody_error(
     )
 
 
-def _command_has_claude_session_selector(command: Sequence[str]) -> bool:
-    exact = {
-        "--session-id",
-        "--resume",
-        "-r",
-        "--continue",
-        "-c",
-        "--fork-session",
-        "--from-pr",
-        "--teleport",
-        "--cloud",
-        "--environment",
-        "--remote-control",
-        "--background",
-        "--bg",
-        "--worktree",
-        "-w",
-        "--tmux",
-    }
-    prefixes = (
-        "--session-id=",
-        "--resume=",
-        "--continue=",
-        "--fork-session=",
-        "--from-pr=",
-        "--teleport=",
-        "--cloud=",
-        "--environment=",
-        "--remote-control=",
-        "--background=",
-        "--worktree=",
-        "--tmux=",
-        "-r=",
-        "-w=",
-    )
-    return any(
-        argument in exact
-        or argument.startswith(prefixes)
-        or (argument.startswith("-r") and len(argument) > 2)
-        or (argument.startswith("-c") and len(argument) > 2)
-        or (argument.startswith("-w") and len(argument) > 2)
-        for argument in command
-    )
-
-
 def _open_private_temporary(
     target: _OutputTarget,
     *,
@@ -7898,6 +10073,17 @@ def _load_claude_executable_binding(
         raise NamedLaneGuardError(
             "Claude preflight version binding is invalid"
         ) from error
+    capability_contract = evidence.get("capability_contract")
+    if (
+        type(capability_contract) is not dict
+        or frozenset(capability_contract) != {"required_options", "status"}
+        or capability_contract.get("status") != "accepted"
+        or capability_contract.get("required_options")
+        != list(_claude_direct_required_options(parsed_version))
+    ):
+        raise NamedLaneGuardError(
+            "Claude preflight capability contract does not match the closed argv profile"
+        )
     identity = evidence.get("identity")
     if (
         type(identity) is not dict
@@ -8323,17 +10509,28 @@ def _write_private_bytes(
 def run_claude(
     *,
     worktree: pathlib.Path,
+    source_worktree: pathlib.Path,
+    source_authority_binding: Mapping[str, object],
+    source_authority_binding_sha256: str,
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     command: Sequence[str],
     preflight_result: pathlib.Path,
     prompt: bytes,
+    model: str = CLAUDE_DIRECT_MODELS[0],
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
     inherit_node_extra_ca_certs: bool = False,
     deadline_monotonic: float | None = None,
     _receipt_emitter: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
+    (
+        parent_source_authority_binding,
+        parent_source_authority_binding_sha256,
+    ) = _validate_parent_source_authority_binding(
+        source_authority_binding,
+        source_authority_binding_sha256,
+    )
     deadline = _bounded_deadline(timeout_seconds, deadline_monotonic)
     _remaining_deadline_seconds(deadline, "Claude named lane")
     stream_limit = _validate_byte_limit(
@@ -8351,6 +10548,11 @@ def run_claude(
     )
     if not command:
         raise NamedLaneGuardError("Claude command is required")
+    if len(command) != 1:
+        raise NamedLaneGuardError(
+            "Claude arguments are owned by the named-lane guard; only the "
+            "preflight-bound executable may follow --"
+        )
     executable = pathlib.Path(command[0])
     if not executable.is_absolute():
         raise NamedLaneGuardError("Claude executable path must be absolute")
@@ -8362,10 +10564,6 @@ def run_claude(
     session_env_required = (
         binding.selected_version >= CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION
     )
-    if session_env_required and _command_has_claude_session_selector(command[1:]):
-        raise NamedLaneGuardError(
-            "Claude session selection is owned by the named-lane guard"
-        )
     child_environment = _claude_environment(
         root,
         inherit_node_extra_ca_certs,
@@ -8376,6 +10574,19 @@ def run_claude(
         try:
             if stdout.path == stderr.path:
                 raise NamedLaneGuardError("stdout and stderr paths must differ")
+            argv_profile = _build_claude_direct_argv_profile(
+                worktree=root,
+                source_worktree=source_worktree,
+                source_authority_binding=parent_source_authority_binding,
+                source_authority_binding_sha256=(
+                    parent_source_authority_binding_sha256
+                ),
+                preflight_result=preflight_result,
+                stdout=stdout,
+                stderr=stderr,
+                child_environment=child_environment,
+                model=model,
+            )
             snapshot_mask = block_forwarded_signals()
             if snapshot_mask is None:
                 raise NamedLaneGuardError(
@@ -8433,7 +10644,7 @@ def run_claude(
                     stdout,
                     deadline_monotonic=deadline,
                 )
-                snapshot_arguments = tuple(command[1:])
+                snapshot_arguments = argv_profile.arguments
                 if session_env is not None:
                     snapshot_arguments = (
                         "--session-id",
@@ -8447,6 +10658,11 @@ def run_claude(
                         require_exact_mode=True,
                         require_lexical_parent=True,
                     )
+                _revalidate_claude_source_read_boundary(
+                    argv_profile.source_read_boundary,
+                    argv_profile.source_authority_binding,
+                    argv_profile.source_authority_binding_sha256,
+                )
                 restore_signal_mask(snapshot_mask)
                 try:
                     process_timeout = _remaining_deadline_seconds(
@@ -8727,6 +10943,11 @@ def run_claude(
                     for forwarded in forwarded_signals():
                         previous_handlers[forwarded] = signal.getsignal(forwarded)
                         signal.signal(forwarded, defer_publication_signal)
+                    _revalidate_claude_source_read_boundary(
+                        argv_profile.source_read_boundary,
+                        argv_profile.source_authority_binding,
+                        argv_profile.source_authority_binding_sha256,
+                    )
                     _revalidate_output_parent(stdout)
                     _revalidate_output_parent(stderr)
                     published_outputs.append(
@@ -8746,6 +10967,10 @@ def run_claude(
                         "identity": dict(_expected_executable_identity(binding)),
                         "artifact_sha256": binding.artifact_checksum,
                         "artifact_size": binding.artifact_size,
+                        "argv_profile": _claude_direct_argv_profile_receipt(
+                            argv_profile,
+                            effective_arguments=snapshot_arguments,
+                        ),
                     }
                     if session_env is not None:
                         launch_binding["session_id"] = session_env.session_id
@@ -8880,47 +11105,68 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
-    materialize = subparsers.add_parser(
-        "materialize-worktree",
-        help="Create a private repository from a bounded frozen object closure.",
+    prepare = subparsers.add_parser(
+        "prepare-workspace",
+        help="Create an independent clean workspace for a frozen committed range.",
     )
-    materialize.add_argument("--source", required=True)
-    materialize.add_argument("--worktree", required=True)
-    materialize.add_argument("--base", required=True)
-    materialize.add_argument("--head", required=True)
+    prepare.add_argument("--source", required=True)
+    prepare.add_argument("--worktree", required=True)
+    prepare.add_argument("--base", required=True)
+    prepare.add_argument("--head", required=True)
 
     validate = subparsers.add_parser(
-        "validate-worktree",
-        help="Validate tracked symlink containment for a frozen named-lane worktree.",
+        "validate-workspace",
+        help="Revalidate an independent clean review workspace.",
     )
     validate.add_argument("--worktree", required=True)
     validate.add_argument("--base", required=True)
     validate.add_argument("--head", required=True)
-    validate.add_argument("--guidance", action="append", default=[])
 
-    legacy_prefixes = subparsers.add_parser(
-        "legacy-short-prefix-receipts",
-        help="Resolve legacy short commit prefixes in a private sanitized Git view.",
+    cleanup = subparsers.add_parser(
+        "cleanup-workspace",
+        help="Remove the exact identity-bound review workspace.",
     )
-    legacy_prefixes.add_argument("--source", required=True)
-    legacy_prefixes.add_argument("--temporary-path", required=True)
-    legacy_prefixes.add_argument("--head", required=True)
-    legacy_prefixes.add_argument(
-        "--phase",
-        required=True,
-        choices=("initial", "final"),
+    cleanup.add_argument("--worktree", required=True)
+    cleanup.add_argument("--token", required=True)
+
+    recover = subparsers.add_parser(
+        "recover-partial-workspace",
+        help=(
+            "Remove an identity-bound retained workspace after its exact process "
+            "identity is absent."
+        ),
     )
-    legacy_prefixes.add_argument(
-        "--prefix",
-        action="append",
-        default=[],
+    recover.add_argument("--control-file", required=True)
+    recover.add_argument("--control-sha256", required=True)
+
+    codex_prefix = subparsers.add_parser(
+        "codex-git-prefix",
+        help="Generate the exact machine-validated local-Codex Git argv prefix.",
     )
+    codex_prefix.add_argument("--worktree", required=True)
+    codex_prefix.add_argument("--base", required=True)
+    codex_prefix.add_argument("--head", required=True)
+    codex_prefix.add_argument("--git-executable", required=True)
+
+    validate_codex_prefix = subparsers.add_parser(
+        "validate-codex-git-prefix-receipt",
+        help=("Live-validate one already-published local-Codex Git prefix receipt."),
+    )
+    validate_codex_prefix.add_argument("--receipt-file", required=True)
+    validate_codex_prefix.add_argument("--expected-receipt-sha256", required=True)
+    validate_codex_prefix.add_argument("--worktree", required=True)
+    validate_codex_prefix.add_argument("--base", required=True)
+    validate_codex_prefix.add_argument("--head", required=True)
+    validate_codex_prefix.add_argument("--git-executable", required=True)
 
     claude = subparsers.add_parser(
         "run-claude",
         help="Run an exact Claude executable under bounded process supervision.",
     )
     claude.add_argument("--worktree", required=True)
+    claude.add_argument("--source-worktree", required=True)
+    claude.add_argument("--source-authority-binding-json", required=True)
+    claude.add_argument("--source-authority-binding-sha256", required=True)
     claude.add_argument("--preflight-result", required=True)
     claude.add_argument("--stdout-path", required=True)
     claude.add_argument("--stderr-path", required=True)
@@ -8938,6 +11184,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROMPT_LIMIT_BYTES,
     )
     claude.add_argument("--inherit-node-extra-ca-certs", action="store_true")
+    claude.add_argument(
+        "--model",
+        choices=CLAUDE_DIRECT_MODELS,
+        default=CLAUDE_DIRECT_MODELS[0],
+    )
     claude.add_argument("claude_argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -8946,6 +11197,421 @@ def _emit(payload: dict[str, object], *, stream: object | None = None) -> None:
     if stream is None:
         stream = sys.stdout
     print(json.dumps(payload, sort_keys=True), file=stream)
+
+
+def _workspace_publication_failure_reason(error: BaseException) -> str:
+    if isinstance(error, ForwardedSignal):
+        return "forwarded-signal"
+    if isinstance(error, ReviewWorkspaceError):
+        return error.reason
+    reason = str(error)
+    return reason if reason else type(error).__name__
+
+
+def _prepared_workspace_retained_path(
+    prepared: PreparedWorkspace,
+    cleanup_error: BaseException,
+) -> str | None:
+    candidates = [prepared.root]
+    if isinstance(cleanup_error, ReviewWorkspaceError):
+        retained = cleanup_error.details.get("retained_path")
+        if isinstance(retained, str):
+            candidate = pathlib.Path(retained)
+            if candidate.is_absolute() and candidate.parent == prepared.root.parent:
+                candidates.append(candidate)
+    try:
+        with os.scandir(prepared.root.parent) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 4096:
+                    break
+                candidate = prepared.root.parent / entry.name
+                if candidate not in candidates:
+                    candidates.append(candidate)
+    except OSError:
+        pass
+    for candidate in candidates:
+        parent_descriptor: int | None = None
+        workspace_descriptor: int | None = None
+        try:
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            parent_descriptor = os.open(candidate.parent, directory_flags)
+            parent = os.fstat(parent_descriptor)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or stat.S_IMODE(parent.st_mode) != 0o700
+                or (parent.st_dev, parent.st_ino, parent.st_uid)
+                != prepared.parent_identity
+            ):
+                continue
+            workspace_descriptor = os.open(
+                candidate.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            workspace = os.fstat(workspace_descriptor)
+            workspace_path = os.stat(
+                candidate.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            parent_path = candidate.parent.stat(follow_symlinks=False)
+            parent_final = os.fstat(parent_descriptor)
+            workspace_final = os.fstat(workspace_descriptor)
+            workspace_path_final = os.stat(
+                candidate.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            parent_path_final = candidate.parent.stat(follow_symlinks=False)
+            if (
+                stat.S_ISDIR(workspace.st_mode)
+                and stat.S_IMODE(workspace.st_mode) == 0o700
+                and (workspace.st_dev, workspace.st_ino, workspace.st_uid)
+                == prepared.workspace_identity
+                and (workspace_path.st_dev, workspace_path.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and stat.S_IMODE(workspace_path.st_mode) == 0o700
+                and (parent_path.st_dev, parent_path.st_ino, parent_path.st_uid)
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_path.st_mode) == 0o700
+                and (parent_final.st_dev, parent_final.st_ino, parent_final.st_uid)
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_final.st_mode) == 0o700
+                and (workspace_final.st_dev, workspace_final.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and (workspace_path_final.st_dev, workspace_path_final.st_ino)
+                == (workspace.st_dev, workspace.st_ino)
+                and workspace_path_final.st_uid == prepared.workspace_identity[2]
+                and stat.S_IMODE(workspace_path_final.st_mode) == 0o700
+                and (
+                    parent_path_final.st_dev,
+                    parent_path_final.st_ino,
+                    parent_path_final.st_uid,
+                )
+                == prepared.parent_identity
+                and stat.S_IMODE(parent_path_final.st_mode) == 0o700
+            ):
+                return str(candidate)
+        except (OSError, ValueError):
+            continue
+        finally:
+            if workspace_descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(workspace_descriptor)
+            if parent_descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(parent_descriptor)
+    return None
+
+
+def _rollback_unpublished_workspace(
+    prepared: PreparedWorkspace,
+    primary_error: BaseException,
+    handoff_owner: ForwardedSignalMaskOwner | None,
+) -> None:
+    try:
+        cleaned = cleanup_workspace(
+            prepared.root,
+            prepared.cleanup_token,
+            defer_signal_handoff=True,
+        )
+        nested_owner = cleaned._handoff_signal_mask
+        if nested_owner is None or not nested_owner.active:
+            raise NamedLaneGuardError(
+                "workspace rollback cleanup did not retain signal-mask custody"
+            )
+        _finish_forwarded_signal_mask(
+            nested_owner,
+            primary_error=primary_error,
+        )
+    except BaseException as cleanup_error:
+        retained_path = _prepared_workspace_retained_path(
+            prepared,
+            cleanup_error,
+        )
+        if retained_path is None:
+            raise ReviewWorkspaceError(
+                "workspace-publication-rollback-state-unavailable",
+                "workspace receipt publication failed and rollback state could not be bound",
+                details={
+                    "primary_reason": _workspace_publication_failure_reason(
+                        primary_error
+                    ),
+                    "cleanup_reason": _workspace_publication_failure_reason(
+                        cleanup_error
+                    ),
+                    "parent_identity": {
+                        "device": prepared.parent_identity[0],
+                        "inode": prepared.parent_identity[1],
+                        "uid": prepared.parent_identity[2],
+                    },
+                    "workspace_identity": {
+                        "device": prepared.workspace_identity[0],
+                        "inode": prepared.workspace_identity[1],
+                        "uid": prepared.workspace_identity[2],
+                    },
+                },
+            ) from cleanup_error
+        try:
+            recovery_payload = retain_workspace_for_owner_exit_recovery(
+                pathlib.Path(retained_path),
+                prepared.parent_identity,
+                prepared.workspace_identity,
+                primary_error=primary_error,
+                signal_owner=handoff_owner,
+            )
+        except BaseException as recovery_error:
+            recovery_payload = _partial_workspace_recovery_payload(recovery_error)
+            if recovery_payload is not None:
+                terminal_error = _WorkspacePublicationRollbackError(
+                    prepared,
+                    primary_error,
+                    cleanup_error,
+                    recovery_payload,
+                )
+                terminal_error.details["recovery_capability_reason"] = (
+                    _workspace_publication_failure_reason(recovery_error)
+                )
+            else:
+                terminal_error = ReviewWorkspaceError(
+                    "workspace-publication-recovery-capability-unavailable",
+                    "workspace rollback failed and an executable recovery capability could not be sealed",
+                    details={
+                        "primary_reason": _workspace_publication_failure_reason(
+                            primary_error
+                        ),
+                        "cleanup_reason": _workspace_publication_failure_reason(
+                            cleanup_error
+                        ),
+                        "recovery_reason": _workspace_publication_failure_reason(
+                            recovery_error
+                        ),
+                        "retained_path": retained_path,
+                        "parent_identity": {
+                            "device": prepared.parent_identity[0],
+                            "inode": prepared.parent_identity[1],
+                            "uid": prepared.parent_identity[2],
+                        },
+                        "workspace_identity": {
+                            "device": prepared.workspace_identity[0],
+                            "inode": prepared.workspace_identity[1],
+                            "uid": prepared.workspace_identity[2],
+                        },
+                    },
+                )
+            _attach_workspace_publication_owner(terminal_error, handoff_owner)
+            raise terminal_error from recovery_error
+        terminal_error = _WorkspacePublicationRollbackError(
+            prepared,
+            primary_error,
+            cleanup_error,
+            recovery_payload,
+        )
+        _attach_workspace_publication_owner(terminal_error, handoff_owner)
+        raise terminal_error from cleanup_error
+    if isinstance(primary_error, ForwardedSignal):
+        terminal_error = primary_error
+    else:
+        terminal_error = ReviewWorkspaceError(
+            "workspace-receipt-publication-failed",
+            "workspace receipt publication failed after rollback completed",
+            details={
+                "publication_reason": _workspace_publication_failure_reason(
+                    primary_error
+                ),
+                "rollback_status": "complete",
+            },
+        )
+        terminal_error.__cause__ = primary_error
+    _attach_workspace_publication_owner(terminal_error, handoff_owner)
+    raise terminal_error
+
+
+def _attach_workspace_publication_owner(
+    error: BaseException,
+    owner: ForwardedSignalMaskOwner | None,
+) -> None:
+    if owner is not None and owner.active:
+        setattr(error, "_workspace_publication_signal_owner", owner)
+
+
+def _workspace_publication_owner(
+    error: BaseException,
+) -> ForwardedSignalMaskOwner | None:
+    owner = getattr(error, "_workspace_publication_signal_owner", None)
+    if isinstance(owner, ForwardedSignalMaskOwner) and owner.active:
+        return owner
+    return None
+
+
+def _acquire_workspace_publication_owner() -> tuple[
+    ForwardedSignalMaskOwner,
+    ForwardedSignal | None,
+]:
+    owner = ForwardedSignalMaskOwner()
+    deferred: ForwardedSignal | None = None
+    while True:
+        try:
+            block_forwarded_signals(signal_mask_owner=owner)
+            return owner, deferred
+        except ForwardedSignal as error:
+            if deferred is None:
+                deferred = error
+
+
+def _direct_restore_workspace_signal_mask(
+    previous_mask: set[signal.Signals] | None,
+) -> None:
+    if previous_mask is None:
+        raise NamedLaneGuardError(
+            "active workspace signal-mask owner has no exact previous mask"
+        )
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _restore_workspace_publication_owner(
+    owner: ForwardedSignalMaskOwner,
+) -> _SignalMaskRestoreOutcome:
+    failures: list[BaseException] = []
+    for _attempt in range(2):
+        if not owner.active:
+            break
+        try:
+            owner.restore()
+        except BaseException as error:
+            failures.append(error)
+    direct_fallback = "not-needed"
+    if owner.active:
+        try:
+            _direct_restore_workspace_signal_mask(owner.previous_mask)
+        except BaseException as error:
+            failures.append(error)
+            direct_fallback = "failed"
+        else:
+            owner.restore_attempted = True
+            owner.active = False
+            direct_fallback = "succeeded"
+    return _SignalMaskRestoreOutcome(
+        restored=not owner.active,
+        failure_types=tuple(type(error).__name__ for error in failures),
+        direct_exact_mask_fallback=direct_fallback,
+    )
+
+
+def _terminal_process_exit(returncode: int) -> NoReturn:
+    os._exit(returncode)
+
+
+def _finish_workspace_terminal_publication(
+    owner: ForwardedSignalMaskOwner,
+    signal_state: _StructuredSignalState,
+    *,
+    returncode: int,
+) -> None:
+    terminal_failure = False
+    try:
+        consume_pending_forwarded_signal()
+        signal_state.commit(returncode)
+    except BaseException:
+        terminal_failure = True
+    try:
+        outcome = _restore_workspace_publication_owner(owner)
+    except BaseException:
+        terminal_failure = True
+        outcome = _SignalMaskRestoreOutcome(
+            restored=False,
+            failure_types=("terminal-restore-internal-failure",),
+            direct_exact_mask_fallback="failed",
+        )
+    if terminal_failure or not outcome.restored:
+        _terminal_process_exit(returncode)
+
+
+def _emit_prepared_workspace_receipt(
+    prepared: PreparedWorkspace,
+    signal_state: _StructuredSignalState,
+) -> None:
+    handoff_owner = prepared._handoff_signal_mask
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, acquisition_signal = _acquire_workspace_publication_owner()
+        primary_error: BaseException
+        if acquisition_signal is not None:
+            primary_error = acquisition_signal
+        else:
+            primary_error = NamedLaneGuardError(
+                "workspace receipt handoff does not own a signal mask"
+            )
+        _rollback_unpublished_workspace(
+            prepared,
+            primary_error,
+            handoff_owner,
+        )
+    pending_before_receipt = consume_pending_forwarded_signal()
+    if pending_before_receipt is not None:
+        _rollback_unpublished_workspace(
+            prepared,
+            ForwardedSignal(pending_before_receipt),
+            handoff_owner,
+        )
+    try:
+        _install_post_terminal_signal_handlers()
+        _emit(prepared.receipt())
+        sys.stdout.flush()
+    except BaseException as publication_error:
+        _rollback_unpublished_workspace(
+            prepared,
+            publication_error,
+            handoff_owner,
+        )
+    # A complete flush transfers cleanup-token custody to the caller. Signals
+    # that arrived during publication are post-terminal and must not turn the
+    # delivered success receipt into a false failure.
+    _finish_workspace_terminal_publication(
+        handoff_owner,
+        signal_state,
+        returncode=0,
+    )
+
+
+def _emit_workspace_terminal_receipt(
+    payload: dict[str, object],
+    signal_state: _StructuredSignalState,
+    *,
+    handoff_owner: ForwardedSignalMaskOwner | None = None,
+) -> None:
+    acquisition_signal: ForwardedSignal | None = None
+    acquired_for_publication = False
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, acquisition_signal = _acquire_workspace_publication_owner()
+        acquired_for_publication = True
+        if not handoff_owner.active:
+            raise NamedLaneGuardError(
+                "workspace receipt publication requires main-thread signal masking"
+            )
+        if acquisition_signal is not None:
+            _attach_workspace_publication_owner(acquisition_signal, handoff_owner)
+            raise acquisition_signal
+    try:
+        if acquired_for_publication:
+            pending_before_receipt = consume_pending_forwarded_signal()
+            if pending_before_receipt is not None:
+                raise ForwardedSignal(pending_before_receipt)
+        _install_post_terminal_signal_handlers()
+        _emit(payload)
+        sys.stdout.flush()
+    except BaseException as publication_error:
+        _attach_workspace_publication_owner(publication_error, handoff_owner)
+        raise
+    _finish_workspace_terminal_publication(
+        handoff_owner,
+        signal_state,
+        returncode=0,
+    )
 
 
 def _emit_claude_receipt(payload: dict[str, object]) -> None:
@@ -8967,18 +11633,173 @@ def _install_post_terminal_signal_handlers() -> list[signal.Signals]:
 def _emit_structured_terminal_failure(
     payload: dict[str, object],
     signal_state: _StructuredSignalState,
+    *,
+    returncode: int,
+    handoff_owner: ForwardedSignalMaskOwner | None = None,
 ) -> None:
-    terminal_mask, _deferred_signal = _block_materializer_cleanup_signals()
-    if terminal_mask is None:
+    if handoff_owner is None or not handoff_owner.active:
+        handoff_owner, _deferred_signal = _acquire_workspace_publication_owner()
+    if not handoff_owner.active:
         raise NamedLaneGuardError(
             "terminal failure publication requires main-thread signal masking"
         )
-    _emit(payload, stream=sys.stderr)
-    sys.stderr.flush()
-    _install_post_terminal_signal_handlers()
-    consume_pending_forwarded_signal()
-    signal_state.commit()
-    restore_signal_mask(terminal_mask)
+    publication_error: BaseException | None = None
+    try:
+        _install_post_terminal_signal_handlers()
+        _emit(payload, stream=sys.stderr)
+        sys.stderr.flush()
+        consume_pending_forwarded_signal()
+        signal_state.commit(returncode)
+    except BaseException as error:
+        publication_error = error
+    finally:
+        outcome = _restore_workspace_publication_owner(handoff_owner)
+        if not outcome.restored:
+            _terminal_process_exit(returncode)
+    if publication_error is not None:
+        _terminal_process_exit(returncode)
+
+
+def _workspace_command_failure(
+    error: BaseException,
+) -> tuple[int, dict[str, object]]:
+    partial_recovery = _partial_workspace_recovery_payload(error) or {}
+    if isinstance(error, RangeIncomplete):
+        return 75, {**error.payload(), **partial_recovery}
+    if isinstance(error, ReviewWorkspaceError):
+        return 2, {**error.payload(), **partial_recovery}
+    if isinstance(error, ForwardedSignal):
+        return (
+            128 + int(error.signum),
+            {
+                "status": "blocked-safety",
+                "reason": "forwarded-signal",
+                **partial_recovery,
+            },
+        )
+    if isinstance(error, ReviewTimeoutError):
+        reason = "deadline"
+    elif isinstance(error, ReviewOutputLimitError):
+        reason = "output-limit"
+    elif isinstance(error, ReviewOutputDrainError):
+        reason = "output-drain"
+    elif isinstance(error, ReviewProcessLeakError):
+        reason = "process-leak"
+    else:
+        reason = _machine_reason(error)
+    return 2, {
+        "status": "blocked-safety",
+        "reason": reason,
+        **partial_recovery,
+    }
+
+
+def _workspace_command_main(args: argparse.Namespace) -> int:
+    with _structured_forwarded_signals() as signal_state:
+        try:
+            if args.command_name == "codex-git-prefix":
+                worktree = pathlib.Path(args.worktree)
+                git_executable = pathlib.Path(args.git_executable)
+                receipt = sanitized_git_argv_prefix_receipt(
+                    worktree=worktree,
+                    base=args.base,
+                    head=args.head,
+                    git_executable=git_executable,
+                )
+                _revalidate_prefix_receipt_publication_identities(
+                    receipt,
+                    worktree=pathlib.Path(receipt["worktree"]),
+                    git_executable=git_executable,
+                )
+                _emit_workspace_terminal_receipt(receipt, signal_state)
+                return 0
+            if args.command_name == "validate-codex-git-prefix-receipt":
+                validation = validate_published_sanitized_git_argv_prefix_receipt(
+                    receipt_file=pathlib.Path(args.receipt_file),
+                    expected_receipt_sha256=args.expected_receipt_sha256,
+                    worktree=pathlib.Path(args.worktree),
+                    base=args.base,
+                    head=args.head,
+                    git_executable=pathlib.Path(args.git_executable),
+                )
+                _emit_workspace_terminal_receipt(validation, signal_state)
+                return 0
+            if args.command_name == "prepare-workspace":
+                prepared = prepare_workspace(
+                    pathlib.Path(args.source),
+                    pathlib.Path(args.worktree),
+                    args.base,
+                    args.head,
+                    defer_signal_handoff=True,
+                )
+                _emit_prepared_workspace_receipt(prepared, signal_state)
+                return 0
+            if args.command_name == "validate-workspace":
+                validated = validate_workspace(
+                    pathlib.Path(args.worktree),
+                    args.base,
+                    args.head,
+                )
+                _emit_workspace_terminal_receipt(
+                    validated.receipt(),
+                    signal_state,
+                )
+                return 0
+            if args.command_name == "cleanup-workspace":
+                cleaned = cleanup_workspace(
+                    pathlib.Path(args.worktree),
+                    args.token,
+                    defer_signal_handoff=True,
+                )
+                if (
+                    cleaned._handoff_signal_mask is None
+                    or not cleaned._handoff_signal_mask.active
+                ):
+                    raise NamedLaneGuardError(
+                        "cleanup workspace receipt handoff does not own a signal mask"
+                    )
+                _emit_workspace_terminal_receipt(
+                    cleaned.receipt(),
+                    signal_state,
+                    handoff_owner=cleaned._handoff_signal_mask,
+                )
+                return 0
+            if args.command_name == "recover-partial-workspace":
+                cleaned = recover_partial_workspace(
+                    pathlib.Path(args.control_file),
+                    args.control_sha256,
+                    defer_signal_handoff=True,
+                )
+                if (
+                    cleaned._handoff_signal_mask is None
+                    or not cleaned._handoff_signal_mask.active
+                ):
+                    raise NamedLaneGuardError(
+                        "partial recovery receipt handoff does not own a signal mask"
+                    )
+                _emit_workspace_terminal_receipt(
+                    cleaned.receipt(),
+                    signal_state,
+                    handoff_owner=cleaned._handoff_signal_mask,
+                )
+                return 0
+            raise NamedLaneGuardError("unknown workspace command")
+        except (
+            ForwardedSignal,
+            NamedLaneGuardError,
+            RangeIncomplete,
+            ReviewError,
+            OSError,
+            ValueError,
+        ) as error:
+            returncode, payload = _workspace_command_failure(error)
+            _emit_structured_terminal_failure(
+                payload,
+                signal_state,
+                returncode=returncode,
+                handoff_owner=_workspace_publication_owner(error),
+            )
+            return returncode
 
 
 def _machine_reason(error: BaseException) -> str:
@@ -9088,81 +11909,71 @@ def _emit_legacy_prefix_receipt(result: LegacyPrefixReceiptResult) -> None:
     restore_signal_mask(handoff_mask)
 
 
+def legacy_short_prefix_compatibility_main(
+    source: pathlib.Path,
+    temporary_path: pathlib.Path,
+    head: str,
+    phase: str,
+    prefixes: Sequence[str],
+) -> int:
+    """Exercise the retained low-level receipt implementation without a CLI route."""
+    try:
+        with _structured_forwarded_signals() as signal_state:
+            result = legacy_short_prefix_receipts(
+                source,
+                temporary_path,
+                head,
+                phase,
+                prefixes,
+                defer_signal_handoff=True,
+            )
+            _emit_legacy_prefix_receipt(result)
+            signal_state.commit(0)
+        return 0
+    except LegacyPrefixReceiptInconclusive as error:
+        _emit(
+            {"status": "inconclusive", "reason": error.reason},
+            stream=sys.stderr,
+        )
+        return 75
+    except ForwardedSignal as error:
+        _emit(
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+            stream=sys.stderr,
+        )
+        return 128 + int(error.signum)
+    except ReviewTimeoutError:
+        reason = "deadline"
+    except ReviewOutputLimitError:
+        reason = "output-limit"
+    except ReviewOutputDrainError:
+        reason = "output-drain"
+    except ReviewProcessLeakError:
+        reason = "process-leak"
+    except (NamedLaneGuardError, ReviewError, OSError, ValueError) as error:
+        reason = _machine_reason(error)
+    _emit(
+        {"status": "blocked-safety", "reason": reason},
+        stream=sys.stderr,
+    )
+    return 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    safety_command = args.command_name in {
-        "legacy-short-prefix-receipts",
-        "materialize-worktree",
-        "validate-worktree",
+    workspace_command = args.command_name in {
+        "cleanup-workspace",
+        "codex-git-prefix",
+        "prepare-workspace",
+        "recover-partial-workspace",
+        "validate-codex-git-prefix-receipt",
+        "validate-workspace",
     }
+    safety_command = workspace_command
+    if workspace_command:
+        return _workspace_command_main(args)
     try:
-        if args.command_name == "materialize-worktree":
-            with _structured_forwarded_signals() as signal_state:
-                try:
-                    result = materialize_worktree(
-                        pathlib.Path(args.source),
-                        pathlib.Path(args.worktree),
-                        args.base,
-                        args.head,
-                        defer_signal_handoff=True,
-                    )
-                    _emit_materialized_receipt(result)
-                except (
-                    ForwardedSignal,
-                    ReviewTimeoutError,
-                    ReviewOutputLimitError,
-                    ReviewOutputDrainError,
-                    ReviewProcessLeakError,
-                    NamedLaneGuardError,
-                    ReviewError,
-                    OSError,
-                    ValueError,
-                ) as error:
-                    returncode, payload = _materializer_failure_payload(error)
-                    _emit_structured_terminal_failure(payload, signal_state)
-                    return returncode
-                signal_state.commit()
-                return 0
-
-        if args.command_name == "validate-worktree":
-            with _structured_forwarded_signals():
-                result = validate_worktree(
-                    pathlib.Path(args.worktree),
-                    args.base,
-                    args.head,
-                    args.guidance,
-                )
-                _emit(
-                    {
-                        "status": "ok",
-                        "worktree": str(result.root),
-                        "base": result.base_sha,
-                        "head": result.head_sha,
-                        "commit_count": result.commit_count,
-                        "parent_edge_count": result.parent_edge_count,
-                        "parent_graph_sha256": result.parent_graph_sha256,
-                        "local_config_sha256": result.local_config_sha256,
-                        "symlink_count": result.symlink_count,
-                        "guidance_count": result.guidance_count,
-                    }
-                )
-            return 0
-
-        if args.command_name == "legacy-short-prefix-receipts":
-            with _structured_forwarded_signals() as signal_state:
-                result = legacy_short_prefix_receipts(
-                    pathlib.Path(args.source),
-                    pathlib.Path(args.temporary_path),
-                    args.head,
-                    args.phase,
-                    args.prefix,
-                    defer_signal_handoff=True,
-                )
-                _emit_legacy_prefix_receipt(result)
-                signal_state.commit()
-            return 0
-
         command = list(args.claude_argv)
         if command and command[0] == "--":
             command.pop(0)
@@ -9177,6 +11988,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stream limit",
         )
         with _structured_forwarded_signals() as signal_state:
+            (
+                source_authority_binding,
+                source_authority_binding_sha256,
+            ) = _parse_parent_source_authority_binding_json(
+                args.source_authority_binding_json,
+                args.source_authority_binding_sha256,
+            )
             timeout = _validate_timeout_limit(args.timeout_seconds)
             deadline = time.monotonic() + timeout
             prompt = _read_control_prompt(
@@ -9190,11 +12008,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             result = run_claude(
                 worktree=pathlib.Path(args.worktree),
+                source_worktree=pathlib.Path(args.source_worktree),
+                source_authority_binding=source_authority_binding,
+                source_authority_binding_sha256=(source_authority_binding_sha256),
                 stdout_path=pathlib.Path(args.stdout_path),
                 stderr_path=pathlib.Path(args.stderr_path),
                 command=command,
                 preflight_result=pathlib.Path(args.preflight_result),
                 prompt=prompt,
+                model=args.model,
                 timeout_seconds=_remaining_deadline_seconds(
                     deadline,
                     "Claude named lane",
@@ -9204,8 +12026,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 deadline_monotonic=deadline,
                 _receipt_emitter=_emit_claude_receipt,
             )
-            signal_state.commit()
-            return 0 if result["status"] == "complete" else 1
+            returncode = 0 if result["status"] == "complete" else 1
+            signal_state.commit(returncode)
+            return returncode
     except _ClaudeControlCleanupError as error:
         snapshot = error.snapshot
         session_env = error.session_env
@@ -9360,6 +12183,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream=sys.stderr,
         )
         return 75
+    except RangeIncomplete as error:
+        _emit(error.payload(), stream=sys.stderr)
+        return 75
+    except ReviewWorkspaceError as error:
+        _emit(error.payload(), stream=sys.stderr)
+        return 2
     except ForwardedSignal as error:
         status = "blocked-safety" if safety_command else "inconclusive"
         _emit(

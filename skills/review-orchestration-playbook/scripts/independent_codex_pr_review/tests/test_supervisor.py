@@ -79,11 +79,15 @@ from review_supervisor.supervisor import (
     status,
 )
 
-from tests.support import bind_attempt_state, owned_temporary_directory
+from tests.support import (
+    SUPERVISOR_INTERNAL_CHILD_FIXTURE,
+    bind_attempt_state,
+    owned_temporary_directory,
+)
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
-ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
+ENTRYPOINT = SUPERVISOR_INTERNAL_CHILD_FIXTURE
 
 
 class ReviewContractEnvelopeTests(unittest.TestCase):

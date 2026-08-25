@@ -54,32 +54,114 @@ def private_cleanup_evidence(container: pathlib.Path) -> PrivateCleanupEvidence:
 
 
 class ForegroundCleanupTest(unittest.TestCase):
-    def test_help_distinguishes_clean_range_from_review_only_wip(self) -> None:
+    def test_help_exposes_only_retained_utility_commands(self) -> None:
         help_text = " ".join(cli._build_parser().format_help().split())
 
-        self.assertIn("one clean frozen Git range", help_text)
-        self.assertIn("digest-bound WIP snapshot", help_text)
-        self.assertIn("Review-only", help_text)
-        self.assertIn("not formal PR-readiness", help_text)
+        self.assertIn("synthetic-tokens", help_text)
+        self.assertIn("secret-admission", help_text)
+        self.assertIn("stateful", help_text)
+        self.assertNotIn("--reviewer", help_text)
+        self.assertNotIn("--base-ref", help_text)
 
-    def test_stateful_start_passes_include_source_wip(self) -> None:
-        with mock.patch.object(
-            cli, "start", return_value=pathlib.Path("/tmp/state")
-        ) as start:
-            returncode = cli.main(
-                [
-                    "stateful",
-                    "start",
-                    "--base-ref",
-                    "a" * 40,
-                    "--head-ref",
-                    "b" * 40,
-                    "--include-source-wip",
-                ]
-            )
+    def test_no_arguments_is_a_usage_error_without_starting_a_reviewer(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
+            mock.patch.object(cli, "_run_foreground") as run_foreground,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main([])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("usage:", stderr.getvalue())
+        run_review.assert_not_called()
+        prepare_workspace.assert_not_called()
+        run_foreground.assert_not_called()
+
+    def test_foreground_review_arguments_report_retirement(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
+            mock.patch.object(cli, "_run_foreground") as run_foreground,
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = cli.main(["--base-ref", "a" * 40, "--head-ref", "b" * 40])
+
+        self.assertEqual(returncode, 2)
+        self.assertIn("supplied-diff foreground", stderr.getvalue())
+        self.assertIn("clean-workspace helper", stderr.getvalue())
+        run_review.assert_not_called()
+        prepare_workspace.assert_not_called()
+        run_foreground.assert_not_called()
+
+    def test_stateful_status_is_recovery_only_and_does_not_start_review(self) -> None:
+        stdout = io.StringIO()
+        summary = {
+            "status": "finished",
+            "named_lane_eligible": False,
+            "state_dir": "/tmp/x",
+        }
+        with (
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
+            mock.patch.object(cli, "status", return_value=summary) as inspect_status,
+            mock.patch.object(cli, "_run_foreground") as run_foreground,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(["stateful", "status", "--state-dir", "/tmp/x"])
 
         self.assertEqual(returncode, 0)
-        self.assertTrue(start.call_args.kwargs["include_source_wip"])
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+        inspect_status.assert_called_once_with(pathlib.Path("/tmp/x"))
+        run_review.assert_not_called()
+        prepare_workspace.assert_not_called()
+        run_foreground.assert_not_called()
+
+    def test_stateful_launch_and_wait_routes_remain_retired(self) -> None:
+        for action in ("start", "wait", "admission"):
+            with self.subTest(action=action):
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(cli, "run_review") as run_review,
+                    mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
+                    mock.patch.object(cli, "status") as inspect_status,
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = cli.main(["stateful", action])
+                self.assertEqual(returncode, 2)
+                self.assertIn("recovery-only", stderr.getvalue())
+                run_review.assert_not_called()
+                prepare_workspace.assert_not_called()
+                inspect_status.assert_not_called()
+
+    def test_stateful_final_harvests_pre_upgrade_artifact(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                cli, "final", return_value=(0, "legacy finding\n")
+            ) as final,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(
+                ["stateful", "final", "--state-dir", "/tmp/legacy-state"]
+            )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "legacy finding\n\n")
+        final.assert_called_once_with(pathlib.Path("/tmp/legacy-state"))
+
+    def test_stateful_cleanup_removes_pre_upgrade_artifact_only(self) -> None:
+        with mock.patch.object(cli, "cleanup_state", return_value=0) as cleanup:
+            returncode = cli.main(
+                ["stateful", "cleanup", "--state-dir", "/tmp/legacy-state"]
+            )
+        self.assertEqual(returncode, 0)
+        cleanup.assert_called_once_with(
+            pathlib.Path("/tmp/legacy-state"),
+            timeout_seconds=cli.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
 
     def test_secret_admission_dispatches_without_starting_a_reviewer(self) -> None:
         summary = {
@@ -108,8 +190,6 @@ class ForegroundCleanupTest(unittest.TestCase):
             ) as scan,
             mock.patch.object(cli, "run_review") as run_review,
             mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
-            mock.patch.object(cli, "start") as start,
-            mock.patch.object(cli, "run_state") as run_state,
             mock.patch.object(cli, "_run_foreground") as run_foreground,
             contextlib.redirect_stdout(stdout),
         ):
@@ -131,12 +211,47 @@ class ForegroundCleanupTest(unittest.TestCase):
             repo=pathlib.Path("/tmp/repository"),
             base_ref="base",
             head_ref="head",
+            synthetic_secret_exemptions=(),
         )
         run_review.assert_not_called()
         prepare_workspace.assert_not_called()
-        start.assert_not_called()
-        run_state.assert_not_called()
         run_foreground.assert_not_called()
+
+    def test_secret_admission_accepts_repeatable_legacy_exemption_options(
+        self,
+    ) -> None:
+        stdout = io.StringIO()
+        summary = {"exit_code": 0, "status": "clean"}
+        with (
+            mock.patch.object(
+                cli, "secret_admission", return_value=(0, summary)
+            ) as scan,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(
+                [
+                    "secret-admission",
+                    "--repo",
+                    "/tmp/repository",
+                    "--base-ref",
+                    "base",
+                    "--head-ref",
+                    "head",
+                    "--synthetic-secret-exemption",
+                    "historical-one",
+                    "--synthetic-secret-exemption",
+                    "historical-two",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+        scan.assert_called_once_with(
+            repo=pathlib.Path("/tmp/repository"),
+            base_ref="base",
+            head_ref="head",
+            synthetic_secret_exemptions=("historical-one", "historical-two"),
+        )
 
     def test_secret_admission_preserves_terminal_exit_mapping(self) -> None:
         arguments = [
@@ -199,52 +314,14 @@ class ForegroundCleanupTest(unittest.TestCase):
 
         self.assertEqual(error.exception.code, 2)
 
-    def test_stateful_admission_always_prints_json_and_returns_embedded_code(
-        self,
-    ) -> None:
+    def test_internal_state_runner_route_is_not_publicly_reachable(self) -> None:
         state_dir = pathlib.Path("/tmp/isolated-review-state")
-        summary = {
-            "schema_version": 1,
-            "status": "inconclusive",
-            "exit_code": 75,
-            "review_range": f"{'a' * 40}..{'b' * 40}",
-            "evidence_path": str(state_dir / "preflight.json"),
-            "failure_class": "secret-count-incomplete",
-            "secret_delta": None,
-        }
-        stdout = io.StringIO()
+        stderr = io.StringIO()
         with (
-            mock.patch.object(cli, "admission", return_value=(75, summary)),
-            contextlib.redirect_stdout(stdout),
+            mock.patch.object(state, "run_state") as run_state,
+            contextlib.redirect_stderr(stderr),
         ):
             returncode = cli.main(
-                ["stateful", "admission", "--state-dir", str(state_dir)]
-            )
-
-        self.assertEqual(returncode, 75)
-        self.assertEqual(json.loads(stdout.getvalue()), summary)
-
-    def test_stateful_status_stays_success_when_admission_is_blocked(self) -> None:
-        state_dir = pathlib.Path("/tmp/isolated-review-state")
-        summary = {"admission": {"status": "blocked", "exit_code": 1}}
-        stdout = io.StringIO()
-        with (
-            mock.patch.object(cli, "status", return_value=summary),
-            contextlib.redirect_stdout(stdout),
-        ):
-            returncode = cli.main(["stateful", "status", "--state-dir", str(state_dir)])
-
-        self.assertEqual(returncode, 0)
-        self.assertEqual(json.loads(stdout.getvalue()), summary)
-
-    def test_internal_runner_forwards_inherited_lock_fd(self) -> None:
-        state_dir = pathlib.Path("/tmp/isolated-review-state")
-        with (
-            mock.patch.object(cli, "run_state", return_value=17) as run_state,
-            mock.patch.object(cli.os, "_exit", side_effect=SystemExit(17)),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            cli.main(
                 [
                     "_run-state",
                     "--state-dir",
@@ -258,62 +335,9 @@ class ForegroundCleanupTest(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual(raised.exception.code, 17)
-        run_state.assert_called_once_with(
-            state_dir=state_dir,
-            lock_fd=41,
-            terminal_process=True,
-            expected_reviewer="claude",
-            expected_egress_consent="explicit-claude-with-copilot-fallback",
-        )
-
-    def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:
-        state_dir = pathlib.Path("/tmp/isolated-review-state")
-        with mock.patch.object(cli, "cleanup_state", return_value=0) as cleanup:
-            returncode = cli.main(
-                ["stateful", "cleanup", "--state-dir", str(state_dir)]
-            )
-
-        self.assertEqual(returncode, 0)
-        cleanup.assert_called_once_with(
-            state_dir,
-            timeout_seconds=cli.FINAL_CLEANUP_TIMEOUT_SECONDS,
-        )
-
-    def test_stateful_wait_rejects_nan_timeout(self) -> None:
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            returncode = cli.main(
-                [
-                    "stateful",
-                    "wait",
-                    "--state-dir",
-                    "/does-not-need-to-exist",
-                    "--timeout-seconds",
-                    "nan",
-                ]
-            )
-
         self.assertEqual(returncode, 2)
-        self.assertIn("non-negative finite number", stderr.getvalue())
-
-    def test_main_reports_signal_cleanup_detail(self) -> None:
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                cli,
-                "_run_foreground",
-                side_effect=cli.ForwardedSignal(
-                    signal.SIGTERM,
-                    detail="evidence retained at /tmp/review: permission denied",
-                ),
-            ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            returncode = cli.main(["--base-ref", "a" * 40, "--head-ref", "b" * 40])
-
-        self.assertEqual(returncode, 128 + signal.SIGTERM)
-        self.assertIn("evidence retained at /tmp/review", stderr.getvalue())
+        self.assertIn("stateful review entrypoints were retired", stderr.getvalue())
+        run_state.assert_not_called()
 
     def test_signal_handler_covers_workspace_preparation(self) -> None:
         args = argparse.Namespace(

@@ -318,9 +318,8 @@ MAX_FROZEN_TREE_SECRET_SCAN_BYTES = 2 * 1024 * 1024 * 1024
 # raw paths. MAX_TREE_METADATA_BYTES conservatively bounds aggregate raw paths
 # because every path is contained in that already bounded metadata stream.
 MAX_FROZEN_TREE_EXACT_SEARCH_PASSES = 32
-MAX_FROZEN_TREE_EXACT_SEARCH_BYTES = (
-    MAX_FROZEN_TREE_EXACT_SEARCH_PASSES
-    * (MAX_FROZEN_TREE_SECRET_SCAN_BYTES + MAX_TREE_METADATA_BYTES)
+MAX_FROZEN_TREE_EXACT_SEARCH_BYTES = MAX_FROZEN_TREE_EXACT_SEARCH_PASSES * (
+    MAX_FROZEN_TREE_SECRET_SCAN_BYTES + MAX_TREE_METADATA_BYTES
 )
 MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES = 128 * 1024 * 1024
 MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES = 8_192
@@ -988,8 +987,7 @@ class _UnextractableContainerBudget:
             path_identity_bytes = len(identity)
         elif (
             surface == "blob"
-            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
-            is not None
+            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity) is not None
         ):
             path_identity_bytes = 0
         else:
@@ -6042,9 +6040,7 @@ def _scan_batch_blob(
     if size > MAX_SNAPSHOT_BLOB_BYTES:
         raise ReviewError("changed Git blob exceeds the per-file review scan limit")
     if size > total_scan_byte_limit - scanned_bytes:
-        raise ReviewError(
-            f"{total_scan_label} exceed the total review scan limit"
-        )
+        raise ReviewError(f"{total_scan_label} exceed the total review scan limit")
     if complete_blob_context:
         value = _read_exact(cat_output, size)
         scan = _scan_secret_value(
@@ -6158,10 +6154,7 @@ def _scan_frozen_tree_values(
     _unextractable_container_budget: _UnextractableContainerBudget | None = None,
 ) -> SecretScanResult:
     maximum_header_bytes = (
-        64
-        + len(b" blob ")
-        + len(str(MAX_SNAPSHOT_BLOB_BYTES).encode("ascii"))
-        + 1
+        64 + len(b" blob ") + len(str(MAX_SNAPSHOT_BLOB_BYTES).encode("ascii")) + 1
     )
     if (
         MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES < MAX_SNAPSHOT_BLOB_BYTES
@@ -6286,7 +6279,10 @@ def _scan_frozen_tree_values(
                         identity=object_id.encode("ascii"),
                     )
                 if capture_reduction_identities:
-                    for descriptor, offsets in scan.reduction_occurrence_offsets.items():
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_occurrence_offsets.items():
                         identities = scan.reduction_occurrence_identities.setdefault(
                             descriptor,
                             set(),
@@ -6299,7 +6295,10 @@ def _scan_frozen_tree_values(
                             )
                             for offset in offsets
                         )
-                    for descriptor, offsets in scan.reduction_unembedded_offsets.items():
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_unembedded_offsets.items():
                         identities = scan.reduction_unembedded_identities.setdefault(
                             descriptor,
                             set(),
@@ -6329,8 +6328,8 @@ def _scan_frozen_tree_values(
             record_limit=MAX_SNAPSHOT_ENTRIES,
             label="frozen Git tree scan metadata",
         ):
-            mode, object_type, object_id, _relative, size = (
-                _parse_sized_tree_record(record)
+            mode, object_type, object_id, _relative, size = _parse_sized_tree_record(
+                record
             )
             _metadata, raw_path = record.split(b"\t", 1)
             path_scan = _scan_secret_value(
@@ -6365,17 +6364,14 @@ def _scan_frozen_tree_values(
                     "changed Git blob exceeds the per-file review scan limit"
                 )
             if size > (
-                MAX_FROZEN_TREE_SECRET_SCAN_BYTES
-                - scanned_bytes
-                - batch_payload_bytes
+                MAX_FROZEN_TREE_SECRET_SCAN_BYTES - scanned_bytes - batch_payload_bytes
             ):
                 raise ReviewError(
                     "frozen Git tree blobs exceed the total review scan limit"
                 )
             if blob_batch and (
                 len(blob_batch) >= MAX_FROZEN_TREE_SCAN_BATCH_ENTRIES
-                or size
-                > MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES - batch_payload_bytes
+                or size > MAX_FROZEN_TREE_SCAN_BATCH_PAYLOAD_BYTES - batch_payload_bytes
             ):
                 scan_blob_batch()
             blob_batch.append((mode, object_id, raw_path, size))
@@ -7109,9 +7105,10 @@ def _unextractable_container_nonincrease(
             raise ReviewError(
                 "an unextractable exact secret candidate lost its container identity"
             )
-        for (surface, identity), count in (
-            discovery.unextractable_container_counts.items()
-        ):
+        for (
+            surface,
+            identity,
+        ), count in discovery.unextractable_container_counts.items():
             if not identity or count <= 0:
                 raise ReviewError(
                     "an unextractable exact secret container identity is invalid"
@@ -7197,15 +7194,12 @@ def _secret_count_manifests(
             _continue_after_blocking=True,
             _unextractable_container_budget=unextractable_container_budget,
         )
-        source_opaque_containers_nonincreasing = (
-            _unextractable_container_nonincrease(
-                base_discovery=base_discovery,
-                head_discovery=source_head_discovery,
-            )
+        source_opaque_containers_nonincreasing = _unextractable_container_nonincrease(
+            base_discovery=base_discovery,
+            head_discovery=source_head_discovery,
         )
         opaque_containers_nonincreasing = (
-            opaque_containers_nonincreasing
-            and source_opaque_containers_nonincreasing
+            opaque_containers_nonincreasing and source_opaque_containers_nonincreasing
         )
         source_head_discovery.discard_unextractable_container_evidence()
     base_discovery.discard_unextractable_container_evidence()
@@ -7454,9 +7448,7 @@ def _secret_count_manifests(
             evidence_head_ref=evidence_head_ref,
         )
     if not opaque_containers_nonincreasing and not violation_entries:
-        raise ReviewError(
-            "an exact secret candidate could not be extracted completely"
-        )
+        raise ReviewError("an exact secret candidate could not be extracted completely")
     return public_manifest, private_manifest, reduction_descriptors
 
 
@@ -9347,6 +9339,7 @@ def secret_admission(
     repo: pathlib.Path,
     base_ref: str,
     head_ref: str,
+    synthetic_secret_exemptions: tuple[str, ...] = (),
 ) -> tuple[int, dict[str, Any]]:
     """Evaluate exact-secret growth for one frozen range without a reviewer run."""
 
@@ -9365,6 +9358,10 @@ def secret_admission(
             )
         catalog = load_catalog()
         validate_authoring_catalog_scanner_contract(catalog)
+        # This deprecated option remains a strict typo/duplicate detector for old
+        # callers. The selected IDs do not alter policy: every catalog legacy value
+        # still participates in the unified non-increasing exact-count admission.
+        resolve_legacy_exemptions(catalog, synthetic_secret_exemptions)
     except OSError as error:
         raise ReviewError(
             "direct secret-admission input or policy could not be read"
@@ -14702,13 +14699,10 @@ def _stream_secret_scan(
             while safe_local_maximum > local_minimum:
                 if retreat_steps >= MAX_SECRET_PREFIX_RETREAT_STEPS:
                     raise ReviewError(
-                        "sensitive scanner exceeds the incomplete-prefix "
-                        "retreat limit"
+                        "sensitive scanner exceeds the incomplete-prefix retreat limit"
                     )
                 retreat_steps += 1
-                committed_budget = event_budget.clone(
-                    allow_prefix_proof_overdraft=True
-                )
+                committed_budget = event_budget.clone(allow_prefix_proof_overdraft=True)
                 committed_proof_tracker = prefix_proof_tracker.clone(
                     committed_budget,
                     coordinate_offset=pending_offset,

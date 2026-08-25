@@ -117,7 +117,7 @@ jobs:
       - name: Check independent review supervisor syntax without bytecode
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
-          python3 -B -c 'import pathlib; paths = [pathlib.Path("independent-codex-pr-review"), *sorted(pathlib.Path("review_supervisor").rglob("*.py"))]; [compile(path.read_bytes(), str(path), "exec") for path in paths]'
+          python3 -B -c 'import pathlib; paths = sorted(pathlib.Path("review_supervisor").rglob("*.py")); [compile(path.read_bytes(), str(path), "exec") for path in paths]'
       - name: Report hosted no-child runtime fingerprint
         run: |
           /usr/bin/sw_vers -productVersion
@@ -139,14 +139,6 @@ jobs:
           CODEX_REVIEW_TEST_RUNTIME_PARENT: ${{ runner.temp }}
         run: |
           python3 -m tests.run_required_deterministic_supervisor
-      - name: Verify installed release tree remains immutable
-        working-directory: personal_codex/skills/review-orchestration-playbook/tests
-        run: |
-          python3 -m unittest -v test_contracts.RepositoryContractTest.test_installed_supervisor_preflight_keeps_release_tree_immutable
-      - name: Verify independent review supervisor CLI
-        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
-        run: |
-          python3 independent-codex-pr-review --help
       - uses: actions/setup-python@v5
         id: setup_latest_python
         if: always()

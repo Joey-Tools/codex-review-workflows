@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import hashlib
 import io
 import importlib.machinery
@@ -19,8 +20,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 import venv
+from collections.abc import Callable
 from unittest import mock
 
 
@@ -28,6 +31,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
+from review_runtime import review_workspace as review_workspace_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
     BoundedCapture,
     ForwardedSignal,
@@ -41,6 +45,11 @@ from review_runtime.named_lane import (  # noqa: E402
     LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
     MATERIALIZER_BASE_REF,
     MATERIALIZER_HEAD_REF,
+    SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE,
+    SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+    SANITIZED_GIT_ARGV_PREFIX_PROFILE,
+    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM,
+    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
     SYMLINK_COUNT_LIMIT,
     LegacyPrefixReceiptInconclusive,
     NamedLaneGuardError,
@@ -48,9 +57,14 @@ from review_runtime.named_lane import (  # noqa: E402
     _validate_materializer_git_version,
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
-    main as named_lane_main,
+    build_sanitized_git_argv_prefix,
+    main as _named_lane_main,
     materialize_worktree,
     run_claude as _run_claude,
+    sanitized_git_argv_prefix_receipt,
+    validate_sanitized_git_argv_prefix,
+    validate_sanitized_git_argv_prefix_receipt,
+    validate_published_sanitized_git_argv_prefix_receipt,
     validate_worktree,
 )
 
@@ -75,14 +89,59 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def run_claude(**kwargs: object) -> dict[str, object]:
+def visible_exception_text(error: BaseException) -> str:
+    """Render notes or the Python 3.10 fallback cause chain alike."""
+
+    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+
+def call_run_claude(**kwargs: object) -> dict[str, object]:
+    """Call the production API only with an explicit parent binding."""
+
+    if "source_worktree" not in kwargs:
+        worktree = pathlib.Path(kwargs["worktree"])
+        kwargs["source_worktree"] = worktree.parent / "source-control"
     if "preflight_result" not in kwargs:
         command = kwargs["command"]
         executable = pathlib.Path(command[0])
         kwargs["preflight_result"] = executable.with_name(
             f"{executable.name}.preflight.json"
         )
+    binding_fields = {
+        "source_authority_binding",
+        "source_authority_binding_sha256",
+    }
+    if not binding_fields.issubset(kwargs):
+        raise AssertionError(
+            "run_claude tests must supply both values from a prepared source receipt"
+        )
     return _run_claude(**kwargs)
+
+
+def call_named_lane_main(argv: object) -> int:
+    """Call the production CLI entrypoint without synthesizing guard input."""
+
+    return _named_lane_main(tuple(argv))
+
+
+def retired_public_commands(*commands: str) -> object:
+    """Convert a legacy CLI test into an assertion that its route is absent."""
+
+    def decorate(legacy_test: object) -> object:
+        @functools.wraps(legacy_test)
+        def assert_retired(self: unittest.TestCase) -> None:
+            for command in commands:
+                with (
+                    self.subTest(command=command),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    self.named_lane_main((command,))
+                self.assertEqual(caught.exception.code, 2)
+
+        return assert_retired
+
+    return decorate
 
 
 class NamedLaneGuardTest(unittest.TestCase):
@@ -93,20 +152,2931 @@ class NamedLaneGuardTest(unittest.TestCase):
             dir=temp_root,
         )
         self.root = pathlib.Path(self.temporary.name)
+        self._prefix_test_workspaces: list[
+            review_workspace_runtime.PreparedWorkspace
+        ] = []
+        self._prepared_source_authority_receipts: dict[
+            pathlib.Path, dict[str, object]
+        ] = {}
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.source_control = self.root / "source-control"
+        self.source_control.mkdir(mode=0o700)
+        git(self.source_control, "init", "-b", "master")
         git(self.repo, "init", "-b", "master")
         git(self.repo, "config", "user.name", "Named Lane Test")
         git(self.repo, "config", "user.email", "named-lane@example.invalid")
         git(self.repo, "config", "commit.gpgsign", "false")
+        method_names = set(getattr(type(self), self._testMethodName).__code__.co_names)
+        if method_names.intersection(
+            {"run_claude", "named_lane_main", "isolated_guard_command"}
+        ):
+            # Prepare before the test installs time, signal, filesystem, or
+            # process mocks. The cached receipt is the explicit parent input.
+            self.prepared_source_authority_receipt(self.source_control)
 
     def tearDown(self) -> None:
+        for prepared in reversed(self._prefix_test_workspaces):
+            if prepared.root.exists():
+                review_workspace_runtime.cleanup_workspace(
+                    prepared.root,
+                    prepared.cleanup_token,
+                )
         self.temporary.cleanup()
 
     def commit(self, message: str = "fixture") -> str:
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", message)
         return git(self.repo, "rev-parse", "HEAD")
+
+    def workspace_range(self) -> tuple[str, str]:
+        (self.repo / "AGENTS.md").write_text("base guidance\n", encoding="utf-8")
+        base = self.commit("workspace base")
+        (self.repo / "tracked.txt").write_text("workspace head\n", encoding="utf-8")
+        head = self.commit("workspace head")
+        return base, head
+
+    def prepared_review_workspace(
+        self,
+        name: str,
+    ) -> tuple[review_workspace_runtime.PreparedWorkspace, str, str]:
+        base, head = self.workspace_range()
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / name,
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        return prepared, base, head
+
+    def source_control_range(self) -> tuple[str, str]:
+        git(self.source_control, "config", "user.name", "Named Lane Source Test")
+        git(
+            self.source_control,
+            "config",
+            "user.email",
+            "named-lane-source@example.invalid",
+        )
+        git(self.source_control, "config", "commit.gpgsign", "false")
+        tracked = self.source_control / "tracked.txt"
+        tracked.write_text("source base\n", encoding="utf-8")
+        git(self.source_control, "add", "tracked.txt")
+        git(self.source_control, "commit", "-m", "source base")
+        base = git(self.source_control, "rev-parse", "HEAD")
+        tracked.write_text("source head\n", encoding="utf-8")
+        git(self.source_control, "commit", "-am", "source head")
+        return base, git(self.source_control, "rev-parse", "HEAD")
+
+    def prepare_source_authority_receipt(
+        self,
+        source: pathlib.Path,
+        *,
+        base: str,
+        head: str,
+        name: str,
+    ) -> dict[str, object]:
+        prepared = review_workspace_runtime.prepare_workspace(
+            source,
+            self.root / f"{name}-prepared-workspace",
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        return prepared.receipt()
+
+    def prepared_source_authority_receipt(
+        self,
+        source: pathlib.Path,
+    ) -> dict[str, object]:
+        """Prepare and cache exact parent input for unrelated Claude unit tests."""
+
+        source = source.resolve()
+        cached = self._prepared_source_authority_receipts.get(source)
+        if cached is not None:
+            return cached
+        try:
+            head = git(source, "rev-parse", "HEAD")
+        except subprocess.CalledProcessError:
+            git(source, "config", "user.name", "Named Lane Source Test")
+            git(
+                source,
+                "config",
+                "user.email",
+                "named-lane-source@example.invalid",
+            )
+            git(source, "config", "commit.gpgsign", "false")
+            git(source, "commit", "--allow-empty", "-m", "source authority fixture")
+            head = git(source, "rev-parse", "HEAD")
+        receipt = self.prepare_source_authority_receipt(
+            source,
+            base=head,
+            head=head,
+            name=f"source-authority-{len(self._prepared_source_authority_receipts)}",
+        )
+        self._prepared_source_authority_receipts[source] = receipt
+        return receipt
+
+    def run_claude(self, **kwargs: object) -> dict[str, object]:
+        """Call Claude with exact cached prepare-receipt authority by default."""
+
+        binding_fields = {
+            "source_authority_binding",
+            "source_authority_binding_sha256",
+        }
+        supplied = binding_fields.intersection(kwargs)
+        if supplied and supplied != binding_fields:
+            raise AssertionError(
+                "Claude parent binding fields must be supplied together"
+            )
+        if not supplied:
+            source = pathlib.Path(
+                kwargs.get(
+                    "source_worktree",
+                    pathlib.Path(kwargs["worktree"]).parent / "source-control",
+                )
+            )
+            receipt = self.prepared_source_authority_receipt(source)
+            kwargs["source_authority_binding"] = receipt["source_authority_binding"]
+            kwargs["source_authority_binding_sha256"] = receipt[
+                "source_authority_binding_sha256"
+            ]
+        return call_run_claude(**kwargs)
+
+    def named_lane_main(self, argv: object) -> int:
+        """Call the CLI with exact cached prepare-receipt authority input."""
+
+        arguments = list(argv)
+        if (
+            arguments
+            and arguments[0] == "run-claude"
+            and "--source-authority-binding-json" not in arguments
+        ):
+            if "--source-worktree" not in arguments:
+                raise AssertionError("run-claude test argv lacks --source-worktree")
+            source = pathlib.Path(arguments[arguments.index("--source-worktree") + 1])
+            receipt = self.prepared_source_authority_receipt(source)
+            canonical = (
+                review_workspace_runtime.canonical_source_authority_binding_bytes(
+                    receipt["source_authority_binding"]
+                )
+            )
+            self.assertEqual(
+                hashlib.sha256(canonical).hexdigest(),
+                receipt["source_authority_binding_sha256"],
+            )
+            arguments[1:1] = (
+                "--source-authority-binding-json",
+                canonical.decode("utf-8"),
+                "--source-authority-binding-sha256",
+                receipt["source_authority_binding_sha256"],
+            )
+        return call_named_lane_main(tuple(arguments))
+
+    def run_codex_git_prefix_committed_cleanup_fault(
+        self,
+        *,
+        mode: str,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+    ) -> subprocess.CompletedProcess[str]:
+        probe = """
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from review_runtime import named_lane
+from review_runtime.common import ForwardedSignal
+
+real_restore = named_lane.restore_signal_mask
+restore_calls = 0
+
+def fail_committed_cleanup_restore(previous):
+    global restore_calls
+    restore_calls += 1
+    real_restore(previous)
+    if restore_calls == 2:
+        raise OSError("synthetic committed context cleanup restore failure")
+
+named_lane.restore_signal_mask = fail_committed_cleanup_restore
+if sys.argv[2] == "failure":
+    def fail_prefix_receipt(**_kwargs):
+        raise ForwardedSignal(signal.SIGTERM)
+
+    named_lane.sanitized_git_argv_prefix_receipt = fail_prefix_receipt
+
+returncode = named_lane.main(
+    (
+        "codex-git-prefix",
+        "--worktree",
+        sys.argv[3],
+        "--base",
+        sys.argv[4],
+        "--head",
+        sys.argv[5],
+        "--git-executable",
+        sys.argv[6],
+    )
+)
+raise SystemExit(returncode)
+"""
+        return subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                probe,
+                str(SCRIPTS),
+                mode,
+                str(prepared.root),
+                base,
+                head,
+                str(named_lane_runtime.resolve_git()),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def publish_prefix_receipt(
+        self,
+        *,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        name: str,
+    ) -> tuple[pathlib.Path, dict[str, object]]:
+        issued = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                "codex-git-prefix",
+                "--worktree",
+                str(prepared.root),
+                "--base",
+                base,
+                "--head",
+                head,
+                "--git-executable",
+                str(named_lane_runtime.resolve_git()),
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        self.assertEqual(issued.returncode, 0, issued.stderr.decode("utf-8", "replace"))
+        self.assertEqual(issued.stderr, b"")
+        receipt = json.loads(issued.stdout)
+        receipt_directory = self.root / f"{name}-control"
+        receipt_directory.mkdir(mode=0o700)
+        receipt_path = receipt_directory / "codex-git-prefix-receipt.json"
+        receipt_path.write_bytes(issued.stdout)
+        receipt_path.chmod(0o600)
+        return receipt_path, receipt
+
+    def run_published_prefix_receipt_validation(
+        self,
+        *,
+        receipt_path: pathlib.Path,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        expected_receipt_sha256: str,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected_receipt_sha256,
+        )
+        return subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                *arguments,
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+
+    def published_prefix_receipt_validation_argv(
+        self,
+        *,
+        receipt_path: pathlib.Path,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        expected_receipt_sha256: str,
+    ) -> tuple[str, ...]:
+        return (
+            "validate-codex-git-prefix-receipt",
+            "--receipt-file",
+            str(receipt_path),
+            "--expected-receipt-sha256",
+            expected_receipt_sha256,
+            "--worktree",
+            str(prepared.root),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--git-executable",
+            str(named_lane_runtime.resolve_git()),
+        )
+
+    def descriptor_close_fault_injector(
+        self,
+        faults: tuple[BaseException | None, ...],
+        attempts: list[int],
+    ) -> Callable[
+        [tuple[tuple[str, int], ...]],
+        list[tuple[str, BaseException]],
+    ]:
+        real_attempt = review_workspace_runtime._attempt_workspace_descriptor_closes
+        real_close = os.close
+
+        def inject(
+            descriptors: tuple[tuple[str, int], ...],
+        ) -> list[tuple[str, BaseException]]:
+            fault_index = 0
+
+            def close_then_fault(descriptor: int) -> None:
+                nonlocal fault_index
+                attempts.append(descriptor)
+                real_close(descriptor)
+                if fault_index >= len(faults):
+                    raise AssertionError("unexpected descriptor close attempt")
+                fault = faults[fault_index]
+                fault_index += 1
+                if fault is not None:
+                    raise fault
+
+            with mock.patch.object(
+                review_workspace_runtime.os,
+                "close",
+                side_effect=close_then_fault,
+            ):
+                failures = real_attempt(descriptors)
+            self.assertEqual(fault_index, len(faults))
+            return failures
+
+        return inject
+
+    def test_codex_git_prefix_v2_matches_exact_accepted_adapter_sequence(
+        self,
+    ) -> None:
+        worktree = self.root / "review-workspace"
+        git_executable = pathlib.Path("/usr/bin/git")
+        expected = (
+            "/usr/bin/env",
+            "-i",
+            f"PATH={TRUSTED_PATH}",
+            "LANG=C",
+            "LC_ALL=C",
+            "GIT_ASKPASS=/usr/bin/false",
+            "GIT_ATTR_NOSYSTEM=1",
+            f"GIT_CEILING_DIRECTORIES={self.root}",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_GRAFT_FILE=/dev/null",
+            "GIT_LITERAL_PATHSPECS=1",
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_OPTIONAL_LOCKS=0",
+            "PAGER=cat",
+            "GIT_PAGER=cat",
+            "/usr/bin/git",
+            "--no-pager",
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.checkStat=default",
+            "-c",
+            "core.multiPackIndex=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.fileMode=true",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+            "core.trustCtime=true",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "color.ui=false",
+            "-C",
+            str(worktree),
+        )
+
+        actual = build_sanitized_git_argv_prefix(
+            worktree=worktree,
+            git_executable=git_executable,
+        )
+        self.assertEqual(actual, expected)
+        self.assertNotIn("--no-lazy-fetch", actual)
+        self.assertEqual(actual[actual.index("--no-pager") + 1], "-c")
+        self.assertEqual(actual.count("GIT_NO_LAZY_FETCH=1"), 1)
+        self.assertEqual(actual.count("GIT_LITERAL_PATHSPECS=1"), 1)
+        self.assertEqual(
+            validate_sanitized_git_argv_prefix(
+                actual,
+                worktree=worktree,
+                git_executable=git_executable,
+            ),
+            expected,
+        )
+
+    def test_codex_git_prefix_rejects_recomputed_digest_for_nonprofile_tokens(
+        self,
+    ) -> None:
+        worktree = self.root / "review-workspace"
+        git_executable = pathlib.Path("/usr/bin/git")
+        generated = list(
+            build_sanitized_git_argv_prefix(
+                worktree=worktree,
+                git_executable=git_executable,
+            )
+        )
+        generated.insert(generated.index("--no-pager") + 1, "--no-lazy-fetch")
+        recomputed_digest = hashlib.sha256(
+            json.dumps(
+                generated,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertRegex(recomputed_digest, r"\A[0-9a-f]{64}\Z")
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "does not conform to sanitized-git-argv-prefix-v2",
+        ):
+            validate_sanitized_git_argv_prefix(
+                generated,
+                worktree=worktree,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_command_emits_closed_machine_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace("review-workspace")
+        worktree = prepared.root
+        git_executable = named_lane_runtime.resolve_git()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.named_lane_main(
+                (
+                    "codex-git-prefix",
+                    "--worktree",
+                    str(worktree),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                    "--git-executable",
+                    str(git_executable),
+                )
+            )
+        self.assertEqual(result, 0)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(
+            receipt,
+            validate_sanitized_git_argv_prefix_receipt(
+                receipt,
+                worktree=worktree,
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            ),
+        )
+        self.assertEqual(
+            receipt["schema_version"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertEqual(receipt["prefix_profile"], SANITIZED_GIT_ARGV_PREFIX_PROFILE)
+        self.assertEqual(
+            receipt["sanitized_git_argv_prefix_conformance"],
+            SANITIZED_GIT_ARGV_PREFIX_CONFORMANCE,
+        )
+        self.assertEqual(
+            receipt["sanitized_git_argv_prefix_encoding"],
+            SANITIZED_GIT_ARGV_PREFIX_ENCODING,
+        )
+        self.assertEqual(receipt["no_lazy_fetch_control"], "GIT_NO_LAZY_FETCH=1")
+        self.assertNotIn("--no-lazy-fetch", receipt["sanitized_git_argv_prefix"])
+        self.assertEqual(receipt["base"], base)
+        self.assertEqual(receipt["head"], head)
+        self.assertEqual(receipt["worktree"], str(worktree))
+        self.assertEqual(receipt["git_executable"], str(git_executable))
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["command"],
+            "validate-workspace",
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["base"],
+            receipt["base"],
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["head"],
+            receipt["head"],
+        )
+        self.assertEqual(
+            receipt["workspace_validation_receipt"]["worktree"],
+            receipt["worktree"],
+        )
+        self.assertEqual(
+            receipt["receipt_identity_algorithm"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM,
+        )
+        receipt_without_digest = dict(receipt)
+        receipt_without_digest.pop("receipt_sha256")
+        self.assertEqual(
+            receipt["receipt_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    receipt_without_digest,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_committed_success_cleanup_fault_keeps_success(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-committed-success-cleanup-fault"
+        )
+
+        completed = self.run_codex_git_prefix_committed_cleanup_fault(
+            mode="success",
+            prepared=prepared,
+            base=base,
+            head=head,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(len(completed.stdout.splitlines()), 1)
+        self.assertEqual(json.loads(completed.stdout)["command"], "codex-git-prefix")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_committed_failure_cleanup_fault_keeps_failure(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-committed-failure-cleanup-fault"
+        )
+
+        completed = self.run_codex_git_prefix_committed_cleanup_fault(
+            mode="failure",
+            prepared=prepared,
+            base=base,
+            head=head,
+        )
+
+        self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(len(completed.stderr.splitlines()), 1)
+        self.assertEqual(
+            json.loads(completed.stderr),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_signal_during_validation_uses_structured_handoff(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-validation-signal-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        original_validate = named_lane_runtime.validate_workspace
+        structured_handler_observed = False
+        signal_queued = False
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            raise ForwardedSignal(signal.Signals(signum))
+
+        def validate_then_signal(*args: object, **kwargs: object) -> object:
+            nonlocal structured_handler_observed, signal_queued
+            result = original_validate(*args, **kwargs)
+            structured_handler_observed = (
+                signal.getsignal(signal.SIGTERM) is not raise_forwarded_signal
+            )
+            signal_queued = True
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "validate_workspace",
+                    side_effect=validate_then_signal,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                returncode = self.named_lane_main(
+                    (
+                        "codex-git-prefix",
+                        "--worktree",
+                        str(prepared.root),
+                        "--base",
+                        base,
+                        "--head",
+                        head,
+                        "--git-executable",
+                        str(git_executable),
+                    )
+                )
+            self.assertEqual(returncode, 128 + signal.SIGTERM)
+            self.assertTrue(signal_queued)
+            self.assertTrue(structured_handler_observed)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(
+                json.loads(stderr.getvalue()),
+                {"status": "blocked-safety", "reason": "forwarded-signal"},
+            )
+            self.assertIs(signal.getsignal(signal.SIGTERM), raise_forwarded_signal)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                set(previous_mask) - {signal.SIGTERM},
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    def test_codex_git_prefix_guard_entrypoint_issues_composite_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "guard-entrypoint-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                "codex-git-prefix",
+                "--worktree",
+                str(prepared.root),
+                "--base",
+                base,
+                "--head",
+                head,
+                "--git-executable",
+                str(git_executable),
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(receipt["base"], base)
+        self.assertEqual(receipt["head"], head)
+        self.assertEqual(receipt["worktree"], str(prepared.root))
+        self.assertEqual(
+            receipt["schema_version"],
+            SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION,
+        )
+        validate_sanitized_git_argv_prefix_receipt(
+            receipt,
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+
+    def test_guard_live_consumer_accepts_same_published_prefix_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="valid-prefix-receipt",
+        )
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(json.loads(completed.stdout), receipt)
+        self.assertEqual(completed.stdout.encode("utf-8"), receipt_path.read_bytes())
+
+    def test_guard_live_consumer_rejects_stale_published_prefix_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="stale-prefix-receipt",
+        )
+        (prepared.root / "tracked.txt").write_text(
+            "changed after prefix publication\n",
+            encoding="utf-8",
+        )
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        failure = json.loads(completed.stderr)
+        self.assertEqual(failure["status"], "blocked-safety")
+        self.assertTrue(failure["reason"])
+
+    def test_guard_live_consumer_rejects_tampered_published_prefix_receipt(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "tampered-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="tampered-prefix-receipt",
+        )
+        expected_receipt_sha256 = str(receipt["receipt_sha256"])
+        receipt["git_version"] = "git version 99.0.0"
+        receipt_path.write_text(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        receipt_path.chmod(0o600)
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected_receipt_sha256,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(
+            json.loads(completed.stderr),
+            {
+                "status": "blocked-safety",
+                "reason": "sanitized Git argv prefix Git version binding is invalid",
+            },
+        )
+
+    def test_guard_live_consumer_does_not_reinvoke_prefix_issuer(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "issuer-independence-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="issuer-independence-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "sanitized_git_argv_prefix_receipt",
+                side_effect=AssertionError("consumer must not invoke issuer"),
+            ) as issuer,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(arguments)
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue()), receipt)
+        issuer.assert_not_called()
+
+    def test_guard_live_consumer_rejects_wrong_scope_and_expected_identity(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "wrong-scope-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="wrong-scope-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+
+        wrong_identity = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256="0" * 64,
+        )
+        wrong_scope = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=base,
+            expected_receipt_sha256=expected,
+        )
+
+        for completed in (wrong_identity, wrong_scope):
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(json.loads(completed.stderr)["status"], "blocked-safety")
+        self.assertIn("retained expected identity", wrong_identity.stderr)
+        self.assertIn("receipt head is invalid", wrong_scope.stderr)
+
+    def test_guard_live_consumer_rejects_hardlink_and_inside_worktree(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "path-policy-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="path-policy-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        hardlink = receipt_path.with_name("receipt-hardlink.json")
+        os.link(receipt_path, hardlink)
+
+        linked = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected,
+        )
+        inside = self.run_published_prefix_receipt_validation(
+            receipt_path=prepared.root / "tracked.txt",
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected,
+        )
+
+        self.assertEqual(linked.returncode, 2)
+        self.assertIn("single-link regular file", linked.stderr)
+        self.assertEqual(inside.returncode, 2)
+        self.assertIn("must stay outside the worktree", inside.stderr)
+
+    def test_guard_live_consumer_rejects_unsafe_receipt_path_types_and_modes(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "unsafe-path-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="unsafe-path-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        symlink_path = receipt_path.with_name("symlink.json")
+        symlink_path.symlink_to(receipt_path.name)
+        fifo_path = receipt_path.with_name("receipt.fifo")
+        os.mkfifo(fifo_path, mode=0o600)
+        unsafe_mode_path = receipt_path.with_name("unsafe-mode.json")
+        unsafe_mode_path.write_bytes(receipt_path.read_bytes())
+        unsafe_mode_path.chmod(0o666)
+        unsafe_parent = self.root / "unsafe-receipt-parent"
+        unsafe_parent.mkdir(mode=0o755)
+        unsafe_parent_path = unsafe_parent / "receipt.json"
+        unsafe_parent_path.write_bytes(receipt_path.read_bytes())
+        unsafe_parent_path.chmod(0o600)
+
+        for label, candidate in (
+            ("symlink", symlink_path),
+            ("fifo", fifo_path),
+            ("group-world-writable", unsafe_mode_path),
+            ("non-private-parent", unsafe_parent_path),
+        ):
+            with self.subTest(label=label):
+                completed = self.run_published_prefix_receipt_validation(
+                    receipt_path=candidate,
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    expected_receipt_sha256=expected,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    json.loads(completed.stderr)["status"],
+                    "blocked-safety",
+                )
+
+    def test_guard_live_consumer_rejects_malformed_or_oversized_receipt_bytes(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "malformed-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="malformed-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        malformed_payloads = {
+            "deep": b"[" * 300 + b"0" + b"]" * 300,
+            "huge-integer": b'{"value":' + b"9" * 5_000 + b"}",
+            "duplicate": b'{"value":1,"value":2}',
+            "second-document": b"{}\n{}\n",
+            "invalid-utf8": b'{"value":"\xff"}',
+            "oversized": b" " * (64 * 1024 + 1),
+        }
+        for label, payload in malformed_payloads.items():
+            with self.subTest(label=label):
+                receipt_path.write_bytes(payload)
+                receipt_path.chmod(0o600)
+                completed = self.run_published_prefix_receipt_validation(
+                    receipt_path=receipt_path,
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    expected_receipt_sha256=expected,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    json.loads(completed.stderr)["status"],
+                    "blocked-safety",
+                )
+
+    def test_live_consumer_retains_receipt_descriptor_across_validation(self) -> None:
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+        base, head = self.workspace_range()
+        for replacement_mode in ("in-place", "name-replacement"):
+            with self.subTest(replacement_mode=replacement_mode):
+                prepared = review_workspace_runtime.prepare_workspace(
+                    self.repo.resolve(),
+                    self.root / f"{replacement_mode}-custody-review-workspace",
+                    base,
+                    head,
+                )
+                self._prefix_test_workspaces.append(prepared)
+                receipt_path, receipt = self.publish_prefix_receipt(
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    name=f"{replacement_mode}-custody-prefix-receipt",
+                )
+
+                def mutate_after_validation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    validated = real_validator(*args, **kwargs)
+                    if replacement_mode == "in-place":
+                        receipt_path.write_bytes(b"{}\n")
+                        receipt_path.chmod(0o600)
+                    else:
+                        replacement = receipt_path.with_name("replacement.json")
+                        replacement.write_bytes(b"{}\n")
+                        replacement.chmod(0o600)
+                        os.replace(replacement, receipt_path)
+                    return validated
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "validate_sanitized_git_argv_prefix_receipt",
+                        side_effect=mutate_after_validation,
+                    ),
+                    self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "receipt (?:content|identity or access policy) changed",
+                    ),
+                ):
+                    validate_published_sanitized_git_argv_prefix_receipt(
+                        receipt_file=receipt_path,
+                        expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                        worktree=prepared.root,
+                        base=base,
+                        head=head,
+                        git_executable=named_lane_runtime.resolve_git(),
+                    )
+
+    def test_live_consumer_accepts_benign_receipt_parent_entry_churn(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "parent-churn-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="parent-churn-prefix-receipt",
+        )
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+
+        def churn_sibling(*args: object, **kwargs: object) -> dict[str, object]:
+            validated = real_validator(*args, **kwargs)
+            sibling = receipt_path.with_name("benign-sibling")
+            sibling.write_text("churn\n", encoding="utf-8")
+            sibling.unlink()
+            return validated
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "validate_sanitized_git_argv_prefix_receipt",
+            side_effect=churn_sibling,
+        ):
+            validated = validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+        self.assertEqual(validated, receipt)
+
+    def test_guard_live_consumer_signal_is_structured_and_does_not_issue(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "signal-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="signal-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "validate_sanitized_git_argv_prefix_receipt",
+                side_effect=ForwardedSignal(signal.SIGTERM),
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "sanitized_git_argv_prefix_receipt",
+                side_effect=AssertionError("consumer must not invoke issuer"),
+            ) as issuer,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(arguments)
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        issuer.assert_not_called()
+
+    def test_live_consumer_close_failures_preserve_active_primary_and_cause(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "primary-close-failure-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="primary-close-failure-prefix-receipt",
+        )
+        primary_cause = ValueError("synthetic active primary cause")
+        primary = NamedLaneGuardError("synthetic active primary")
+        primary.__cause__ = primary_cause
+        primary.__suppress_context__ = True
+        receipt_close = OSError("receipt real-close-then-error")
+        parent_close = OSError("parent real-close-then-error")
+        close_attempts: list[int] = []
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "validate_sanitized_git_argv_prefix_receipt",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (receipt_close, parent_close),
+                    close_attempts,
+                ),
+            ),
+            self.assertRaises(NamedLaneGuardError) as caught,
+        ):
+            validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, primary_cause)
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(len(set(close_attempts)), 2)
+        for descriptor in close_attempts:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+        diagnostics = visible_exception_text(primary)
+        self.assertIn("receipt descriptor close failed", diagnostics)
+        self.assertIn("receipt real-close-then-error", diagnostics)
+        self.assertIn("parent descriptor close failed", diagnostics)
+        self.assertIn("parent real-close-then-error", diagnostics)
+
+    def test_guard_live_consumer_close_failures_select_first_without_stdout(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "standalone-close-failure-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="standalone-close-failure-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        close_attempts: list[int] = []
+        receipt_close = OSError("receipt real-close-then-error")
+        parent_close = OSError("parent real-close-then-error")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (receipt_close, parent_close),
+                    close_attempts,
+                ),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(arguments)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "blocked-safety",
+                "reason": "receipt real-close-then-error",
+            },
+        )
+        diagnostics = visible_exception_text(receipt_close)
+        self.assertEqual(str(receipt_close), "receipt real-close-then-error")
+        self.assertIn("receipt descriptor close failed", diagnostics)
+        self.assertIn("parent descriptor close failed", diagnostics)
+        self.assertIn("parent real-close-then-error", diagnostics)
+
+    def test_guard_live_consumer_close_signal_attempts_parent_and_exits_143(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "close-signal-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="close-signal-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        close_attempts: list[int] = []
+        close_signal = ForwardedSignal(signal.SIGTERM)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (close_signal, None),
+                    close_attempts,
+                ),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(arguments)
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+
+    def test_codex_git_prefix_rejects_absent_or_wrong_range_workspace(self) -> None:
+        base, head = self.workspace_range()
+        git_executable = named_lane_runtime.resolve_git()
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError) as absent:
+            sanitized_git_argv_prefix_receipt(
+                worktree=self.root / "absent-review-workspace",
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+        self.assertEqual(absent.exception.reason, "invalid-path")
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            sanitized_git_argv_prefix_receipt(
+                worktree=self.repo.resolve(),
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / "wrong-range-review-workspace",
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=head,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_rejects_nonselected_git_path(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "wrong-git-review-workspace"
+        )
+        selected_git = named_lane_runtime.resolve_git()
+        other_git = pathlib.Path("/usr/bin/git")
+        if other_git == selected_git:
+            other_git = pathlib.Path("/bin/false")
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "differs from the fixed trusted Git path",
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=other_git,
+            )
+
+    def test_codex_git_prefix_rejects_malformed_git_version(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "malformed-version-review-workspace"
+        )
+        fake_git = self.root / "malformed-git"
+        fake_git.write_text("#!/bin/sh\nprintf 'not git\\n'\n", encoding="utf-8")
+        fake_git.chmod(0o700)
+        with (
+            mock.patch.object(named_lane_runtime, "resolve_git", return_value=fake_git),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "returned a malformed version",
+            ),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+
+    def test_codex_git_prefix_rejects_git_replacement_during_version_probe(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "git-replacement-review-workspace"
+        )
+        fake_git = self.root / "selected-git"
+        replacement = self.root / "replacement-git"
+        script = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
+        fake_git.write_text(script, encoding="utf-8")
+        replacement.write_text(script, encoding="utf-8")
+        fake_git.chmod(0o700)
+        replacement.chmod(0o700)
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        def replace_after_capture(*args: object, **kwargs: object) -> object:
+            captured = real_capture(*args, **kwargs)
+            os.replace(replacement, fake_git)
+            return captured
+
+        with (
+            mock.patch.object(named_lane_runtime, "resolve_git", return_value=fake_git),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=replace_after_capture,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed during version validation",
+            ),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+
+    def test_codex_git_prefix_version_probe_precedes_final_workspace_validation(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "version-workspace-race-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        real_capture = named_lane_runtime.run_bounded_capture
+
+        def mutate_workspace_after_version(*args: object, **kwargs: object) -> object:
+            captured = real_capture(*args, **kwargs)
+            (prepared.root / "tracked.txt").write_text(
+                "mutated during version probe\n",
+                encoding="utf-8",
+            )
+            return captured
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=mutate_workspace_after_version,
+            ),
+            self.assertRaises(review_workspace_runtime.ReviewWorkspaceError),
+        ):
+            sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_version_probe_preserves_process_leak_error(self) -> None:
+        git_executable = named_lane_runtime.resolve_git()
+        identity = named_lane_runtime._capture_prefix_git_executable_identity(
+            git_executable
+        )
+        process_error = ReviewProcessLeakError("synthetic version-probe leak")
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=process_error,
+            ),
+            self.assertRaises(ReviewProcessLeakError) as caught,
+        ):
+            named_lane_runtime._validated_prefix_git_version(
+                git_executable,
+                git_executable.parent,
+                identity,
+            )
+        self.assertIs(caught.exception, process_error)
+
+    def test_codex_git_prefix_receipt_validator_rejects_closed_schema_and_type_drift(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "receipt-schema-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        receipt = sanitized_git_argv_prefix_receipt(
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+
+        def clone() -> dict[str, object]:
+            return json.loads(json.dumps(receipt))
+
+        def resign(value: dict[str, object]) -> None:
+            value.pop("receipt_sha256", None)
+            value["receipt_sha256"] = hashlib.sha256(
+                json.dumps(
+                    value,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        extra = clone()
+        extra["unexpected"] = "value"
+        resign(extra)
+
+        wrong_workspace_base = clone()
+        workspace_receipt = wrong_workspace_base["workspace_validation_receipt"]
+        assert isinstance(workspace_receipt, dict)
+        workspace_receipt["base"] = head
+        wrong_workspace_base["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(wrong_workspace_base)
+
+        coupled_resign = clone()
+        coupled_workspace_receipt = coupled_resign["workspace_validation_receipt"]
+        assert isinstance(coupled_workspace_receipt, dict)
+        coupled_commit_count = coupled_workspace_receipt["commit_count"]
+        assert isinstance(coupled_commit_count, int)
+        coupled_workspace_receipt["commit_count"] = coupled_commit_count + 1
+        coupled_resign["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                coupled_workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(coupled_resign)
+
+        integer_executable = clone()
+        integer_executable["git_executable"] = 7
+        resign(integer_executable)
+
+        identity_type_drift = clone()
+        executable_identity = identity_type_drift["git_executable_identity"]
+        assert isinstance(executable_identity, dict)
+        target_identity = executable_identity["target"]
+        assert isinstance(target_identity, dict)
+        target_identity["inode"] = str(target_identity["inode"])
+        resign(identity_type_drift)
+
+        coupled_git_identity = clone()
+        coupled_executable_identity = coupled_git_identity["git_executable_identity"]
+        assert isinstance(coupled_executable_identity, dict)
+        coupled_target_identity = coupled_executable_identity["target"]
+        assert isinstance(coupled_target_identity, dict)
+        coupled_inode = coupled_target_identity["inode"]
+        assert isinstance(coupled_inode, int)
+        coupled_target_identity["inode"] = coupled_inode + 1
+        resign(coupled_git_identity)
+
+        boolean_as_integer = clone()
+        boolean_workspace_receipt = boolean_as_integer["workspace_validation_receipt"]
+        assert isinstance(boolean_workspace_receipt, dict)
+        boolean_workspace_receipt["commit_count"] = True
+        boolean_as_integer["workspace_validation_receipt_sha256"] = hashlib.sha256(
+            json.dumps(
+                boolean_workspace_receipt,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        resign(boolean_as_integer)
+
+        malformed_version = clone()
+        malformed_version["git_version"] = "not git"
+        malformed_version["git_version_stdout"] = "not git\n"
+        malformed_version["git_version_stdout_sha256"] = hashlib.sha256(
+            b"not git\n"
+        ).hexdigest()
+        resign(malformed_version)
+
+        coupled_version = clone()
+        coupled_version["git_version"] = "git version 99.0.0"
+        coupled_version["git_version_stdout"] = "git version 99.0.0\n"
+        coupled_version["git_version_stdout_sha256"] = hashlib.sha256(
+            b"git version 99.0.0\n"
+        ).hexdigest()
+        resign(coupled_version)
+
+        for label, candidate in (
+            ("extra-key", extra),
+            ("workspace-cross-field", wrong_workspace_base),
+            ("coupled-resign", coupled_resign),
+            ("executable-type", integer_executable),
+            ("identity-type", identity_type_drift),
+            ("coupled-git-identity", coupled_git_identity),
+            ("bool-as-int", boolean_as_integer),
+            ("version-grammar", malformed_version),
+            ("coupled-version", coupled_version),
+        ):
+            with self.subTest(label=label), self.assertRaises(NamedLaneGuardError):
+                validate_sanitized_git_argv_prefix_receipt(
+                    candidate,
+                    worktree=prepared.root,
+                    base=base,
+                    head=head,
+                    git_executable=git_executable,
+                )
+
+    def test_codex_git_prefix_receipt_validator_rejects_stale_workspace(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-receipt-review-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        receipt = sanitized_git_argv_prefix_receipt(
+            worktree=prepared.root,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+        (prepared.root / "tracked.txt").write_text(
+            "stale receipt mutation\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(review_workspace_runtime.ReviewWorkspaceError):
+            validate_sanitized_git_argv_prefix_receipt(
+                receipt,
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=git_executable,
+            )
+
+    def test_codex_git_prefix_receipt_validator_rejects_stale_git_identity(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-git-receipt-review-workspace"
+        )
+        fake_git = self.root / "receipt-selected-git"
+        replacement = self.root / "receipt-replacement-git"
+        script = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
+        fake_git.write_text(script, encoding="utf-8")
+        replacement.write_text(script, encoding="utf-8")
+        fake_git.chmod(0o700)
+        replacement.chmod(0o700)
+        with mock.patch.object(
+            named_lane_runtime,
+            "resolve_git",
+            return_value=fake_git,
+        ):
+            receipt = sanitized_git_argv_prefix_receipt(
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=fake_git,
+            )
+            os.replace(replacement, fake_git)
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "identity is stale",
+            ):
+                validate_sanitized_git_argv_prefix_receipt(
+                    receipt,
+                    worktree=prepared.root,
+                    base=base,
+                    head=head,
+                    git_executable=fake_git,
+                )
+
+    def prepare_workspace_argv(
+        self,
+        destination: pathlib.Path,
+        base: str,
+        head: str,
+    ) -> tuple[str, ...]:
+        return (
+            "prepare-workspace",
+            "--source",
+            str(self.repo.resolve()),
+            "--worktree",
+            str(destination),
+            "--base",
+            base,
+            "--head",
+            head,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_flushes_receipt_before_transferring_cleanup(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "flushed-workspace"
+
+        class CountingStdout(io.StringIO):
+            flush_calls = 0
+
+            def flush(inner_self) -> None:
+                super().flush()
+                inner_self.flush_calls += 1
+
+        stdout = CountingStdout()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stdout.flush_calls, 1)
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(receipt["command"], "prepare-workspace")
+        self.assertEqual(receipt["worktree"], str(destination))
+        self.assertGreater(receipt["range_object_count"], 0)
+        self.assertRegex(receipt["range_object_sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertGreaterEqual(receipt["parent_support_object_count"], 0)
+        self.assertRegex(
+            receipt["parent_support_object_sha256"],
+            r"\A[0-9a-f]{64}\Z",
+        )
+        self.assertEqual(receipt["shallow_bytes"], "")
+        self.assertFalse((destination / ".git/shallow").exists())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace terminal failures require POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_reports_direct_primary_remediation(self) -> None:
+        base, head = self.workspace_range()
+        source = self.root / "alternate-backed-cli-source"
+        subprocess.run(
+            (
+                "git",
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                str(self.repo),
+                str(source),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        destination = self.root / "alternate-backed-cli-workspace"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                (
+                    "prepare-workspace",
+                    "--source",
+                    str(source.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        failure = json.loads(stderr.getvalue())
+        self.assertEqual(failure["status"], "blocked-safety")
+        self.assertEqual(failure["reason"], "source-alternates-forbidden")
+        self.assertEqual(failure["source_authority_policy"], "direct-primary-only")
+        self.assertEqual(
+            failure["remediation"],
+            {
+                "action": "use-independent-primary-object-store",
+                "accepted_source_layouts": [
+                    "ordinary-clone",
+                    "linked-worktree",
+                    "filesystem-reflink-or-cow-copy",
+                ],
+                "alternate_backed_clone": (
+                    "recreate the source as an independent clone with --dissociate"
+                ),
+            },
+        )
+        self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_publication_failures_roll_back_workspace(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        real_emit = named_lane_runtime._emit
+
+        class PartialBrokenPipe(io.StringIO):
+            committed = False
+            failed = False
+
+            def write(inner_self, payload: str) -> int:
+                if not inner_self.failed:
+                    inner_self.failed = True
+                    super().write(payload[: max(1, len(payload) // 2)])
+                    raise BrokenPipeError("simulated partial receipt write")
+                return super().write(payload)
+
+        class FlushBrokenPipe(io.StringIO):
+            committed = False
+
+            def flush(inner_self) -> None:
+                raise BrokenPipeError("simulated receipt flush failure")
+
+        cases: tuple[tuple[str, io.StringIO, str], ...] = (
+            ("before-write", io.StringIO(), "simulated receipt write failure"),
+            ("partial-write", PartialBrokenPipe(), "simulated partial receipt write"),
+            ("flush", FlushBrokenPipe(), "simulated receipt flush failure"),
+        )
+        for label, stdout, expected_reason in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"{label}-workspace"
+                stderr = io.StringIO()
+
+                def fail_before_write(
+                    payload: dict[str, object],
+                    *,
+                    stream: object | None = None,
+                ) -> None:
+                    if (
+                        label == "before-write"
+                        and stream is None
+                        and payload.get("command") == "prepare-workspace"
+                    ):
+                        raise BrokenPipeError("simulated receipt write failure")
+                    real_emit(payload, stream=stream)
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_emit",
+                        side_effect=fail_before_write,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = self.named_lane_main(
+                        self.prepare_workspace_argv(destination, base, head)
+                    )
+
+                self.assertEqual(returncode, 2)
+                failure = json.loads(stderr.getvalue())
+                self.assertEqual(failure["status"], "blocked-safety")
+                self.assertEqual(
+                    failure["reason"], "workspace-receipt-publication-failed"
+                )
+                self.assertIn(expected_reason, failure["publication_reason"])
+                self.assertEqual(failure["rollback_status"], "complete")
+                self.assertFalse(destination.exists())
+                if hasattr(stdout, "committed"):
+                    self.assertFalse(stdout.committed)
+                if label == "before-write":
+                    self.assertEqual(stdout.getvalue(), "")
+                elif label == "partial-write":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(stdout.getvalue())
+                else:
+                    self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
+                    self.assertNotEqual(returncode, 0)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_pending_return_signal_rolls_back_before_receipt(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "return-signal-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def prepare_then_signal(*args: object, **kwargs: object) -> object:
+            result = real_prepare(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=prepare_then_signal,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(destination.exists())
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_unquiesced_pack_signal_reports_retained_partial(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "unquiesced-pack-signal-workspace"
+
+        def interrupt_after_process_start(
+            *_args: object,
+            **kwargs: object,
+        ) -> object:
+            for callback_name in ("on_process_starting", "on_process_started"):
+                callback = kwargs[callback_name]
+                assert callable(callback)
+                callback()
+            raise ForwardedSignal(signal.SIGTERM)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                review_workspace_runtime,
+                "run_process",
+                side_effect=interrupt_after_process_start,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        payload_text = stderr.getvalue()
+        payload = json.loads(payload_text)
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertEqual(payload["reason"], "forwarded-signal")
+        self.assertIs(payload["cleanup_unavailable_until_quiescent"], True)
+        self.assertEqual(payload["retained_path"], str(destination))
+        parent_metadata = destination.parent.stat()
+        workspace_metadata = destination.stat(follow_symlinks=False)
+        self.assertEqual(
+            payload["parent_identity"],
+            {
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+            },
+        )
+        self.assertEqual(
+            payload["workspace_identity"],
+            {
+                "device": workspace_metadata.st_dev,
+                "inode": workspace_metadata.st_ino,
+                "uid": workspace_metadata.st_uid,
+            },
+        )
+        self.assertEqual(
+            payload["recovery"],
+            {
+                "command": None,
+                "argv": None,
+                "argv_ready": False,
+                "requires_quiescence_proof": True,
+                "ordinary_cleanup_available": False,
+                "instruction": payload["recovery"]["instruction"],
+                "unavailable_reason": ("partial-recovery-process-identity-unavailable"),
+            },
+        )
+        self.assertIn("do not invoke cleanup-workspace", payload_text.lower())
+        self.assertNotIn("cleanup_token", payload_text)
+        self.assertNotIn("--token", payload_text)
+        self.assertFalse(
+            (destination / ".git" / review_workspace_runtime.WORKSPACE_MARKER).exists()
+        )
+        self.assertEqual(
+            len(tuple((destination / ".git/objects/pack").glob(".review-*.pack"))),
+            1,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_signal_after_flush_keeps_delivered_workspace(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "post-flush-signal-workspace"
+
+        class SignalAfterFlush(io.StringIO):
+            injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                if not inner_self.injected:
+                    inner_self.injected = True
+                    signal.raise_signal(signal.SIGTERM)
+
+        stdout = SignalAfterFlush()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertTrue(stdout.injected)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(destination.is_dir())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_transient_restore_failure_keeps_success(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "transient-restore-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        restore_attempts: list[int] = []
+        captured_owner: list[object] = []
+
+        def prepare_with_flaky_restore(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            owner = result._handoff_signal_mask
+            assert owner is not None
+            real_restore = owner.restore
+
+            def flaky_restore(restore: object | None = None) -> None:
+                restore_attempts.append(1)
+                if len(restore_attempts) == 1:
+                    raise OSError("simulated transient signal-mask restore failure")
+                real_restore(restore)  # type: ignore[arg-type]
+
+            owner.restore = flaky_restore  # type: ignore[method-assign]
+            captured_owner.append(owner)
+            return result
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=prepare_with_flaky_restore,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(restore_attempts), 2)
+        owner = captured_owner[0]
+        self.assertFalse(owner.active)  # type: ignore[attr-defined]
+        receipt = json.loads(stdout.getvalue())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_post_flush_drain_failure_exits_success_only(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "post-flush-drain-failure-workspace"
+        consume_calls = 0
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        def consume_with_post_flush_failure() -> signal.Signals | None:
+            nonlocal consume_calls
+            consume_calls += 1
+            if consume_calls == 3:
+                raise OSError("simulated post-flush pending-signal drain failure")
+            return None
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "consume_pending_forwarded_signal",
+                side_effect=consume_with_post_flush_failure,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_terminal_process_exit",
+                side_effect=terminal_exit,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(TerminalExit) as caught,
+        ):
+            self.named_lane_main(self.prepare_workspace_argv(destination, base, head))
+
+        self.assertEqual(caught.exception.returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(destination.is_dir())
+        review_workspace_runtime.cleanup_workspace(
+            destination,
+            receipt["cleanup_token"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_cleanup_failure_reports_bound_recovery(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "retained-publication-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        real_emit = named_lane_runtime._emit
+        prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+        restore_attempts: list[int] = []
+
+        def capture_prepare(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            owner = result._handoff_signal_mask
+            assert owner is not None
+
+            def fail_restore(_restore: object | None = None) -> None:
+                restore_attempts.append(1)
+                raise OSError("simulated signal-mask restore failure")
+
+            owner.restore = fail_restore  # type: ignore[method-assign]
+            prepared_results.append(result)
+            return result
+
+        def fail_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            if stream is None and payload.get("command") == "prepare-workspace":
+                raise BrokenPipeError("simulated publication failure")
+            real_emit(payload, stream=stream)
+
+        def fail_cleanup(*_args: object, **_kwargs: object) -> object:
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "synthetic-cleanup-failure",
+                "simulated identity-bound cleanup failure",
+            )
+
+        class CountingStderr(io.StringIO):
+            flush_calls = 0
+            signal_injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                inner_self.flush_calls += 1
+                if not inner_self.signal_injected:
+                    inner_self.signal_injected = True
+                    signal.raise_signal(signal.SIGTERM)
+
+        stdout = io.StringIO()
+        stderr = CountingStderr()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=capture_prepare,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "cleanup_workspace",
+                side_effect=fail_cleanup,
+            ),
+            mock.patch.object(named_lane_runtime, "_emit", side_effect=fail_receipt),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.flush_calls, 1)
+        self.assertTrue(stderr.signal_injected)
+        self.assertEqual(len(restore_attempts), 2)
+        failure = json.loads(stderr.getvalue())
+        prepared = prepared_results[0]
+        assert prepared._handoff_signal_mask is not None
+        self.assertFalse(prepared._handoff_signal_mask.active)
+        self.assertEqual(
+            set(failure),
+            {
+                "status",
+                "reason",
+                "primary_reason",
+                "cleanup_reason",
+                "cleanup_token_sha256",
+                "parent_identity",
+                "workspace_identity",
+                "partial_recovery_control",
+                "workspace_state",
+                "owner_process",
+                "active_process",
+                "cleanup_unavailable_until_quiescent",
+                "recovery",
+                "retained_path",
+            },
+        )
+        self.assertEqual(failure["reason"], "workspace-publication-rollback-incomplete")
+        self.assertEqual(failure["primary_reason"], "simulated publication failure")
+        self.assertEqual(failure["cleanup_reason"], "synthetic-cleanup-failure")
+        self.assertEqual(failure["retained_path"], str(destination))
+        self.assertEqual(
+            failure["cleanup_token_sha256"],
+            prepared.cleanup_token_sha256,
+        )
+        self.assertNotIn(prepared.cleanup_token, stderr.getvalue())
+        self.assertEqual(
+            failure["recovery"]["argv"],
+            [
+                "recover-partial-workspace",
+                "--control-file",
+                failure["partial_recovery_control"]["path"],
+                "--control-sha256",
+                failure["partial_recovery_control"]["sha256"],
+            ],
+        )
+        self.assertTrue(failure["recovery"]["argv_ready"])
+        self.assertNotIn("<", " ".join(failure["recovery"]["argv"]))
+        with mock.patch.object(
+            review_workspace_runtime,
+            "_process_start_identity",
+            side_effect=ProcessLookupError,
+        ):
+            recovered = review_workspace_runtime.recover_partial_workspace(
+                pathlib.Path(failure["partial_recovery_control"]["path"]),
+                failure["partial_recovery_control"]["sha256"],
+            )
+        self.assertEqual(recovered.cleanup_status, "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_publication_rollback_recovery_roundtrips_from_serialized_child_result(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "serialized-publication-recovery"
+        child_script = self.root / "publication_failure_child.py"
+        child_script.write_text(
+            "\n".join(
+                (
+                    "import pathlib",
+                    "import sys",
+                    f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                    "from review_runtime import named_lane as runtime",
+                    "from review_runtime.review_workspace import ReviewWorkspaceError",
+                    "real_emit = runtime._emit",
+                    "def fail_emit(payload, *, stream=None):",
+                    "    if stream is None and payload.get('command') == 'prepare-workspace':",
+                    "        raise BrokenPipeError('fixture serialized publication failure')",
+                    "    return real_emit(payload, stream=stream)",
+                    "def fail_cleanup(*args, **kwargs):",
+                    "    raise ReviewWorkspaceError('fixture-rollback-failure', 'fixture rollback failure')",
+                    "runtime._emit = fail_emit",
+                    "runtime.cleanup_workspace = fail_cleanup",
+                    "raise SystemExit(runtime.main((",
+                    "    'prepare-workspace',",
+                    f"    '--source', {str(self.repo)!r},",
+                    f"    '--worktree', {str(destination)!r},",
+                    f"    '--base', {base!r},",
+                    f"    '--head', {head!r},",
+                    ")))",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        child = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(child_script),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(child.returncode, 2, child.stderr)
+        self.assertEqual(child.stdout, "")
+        failure = json.loads(child.stderr)
+        self.assertEqual(
+            failure["reason"],
+            "workspace-publication-rollback-incomplete",
+        )
+        recovery = failure["recovery"]
+        self.assertTrue(recovery["argv_ready"])
+        self.assertNotIn("<cleanup-token", child.stderr)
+        control_path = pathlib.Path(failure["partial_recovery_control"]["path"])
+        control_metadata = control_path.stat(follow_symlinks=False)
+        self.assertEqual(stat.S_IMODE(control_metadata.st_mode), 0o600)
+        self.assertEqual(control_metadata.st_nlink, 1)
+
+        guard = SCRIPTS / "named_lane_guard"
+        recovered = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(guard),
+                *recovery["argv"],
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        receipt = json.loads(recovered.stdout)
+        self.assertEqual(receipt["command"], "recover-partial-workspace")
+        self.assertEqual(receipt["cleanup_status"], "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_cleanup_failure_does_not_claim_replaced_path(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "replaced-publication-workspace"
+        retained = self.root / "identity-bound-original-workspace"
+        real_prepare = review_workspace_runtime.prepare_workspace
+        real_emit = named_lane_runtime._emit
+        prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+
+        def capture_prepare(
+            *args: object,
+            **kwargs: object,
+        ) -> review_workspace_runtime.PreparedWorkspace:
+            result = real_prepare(*args, **kwargs)
+            prepared_results.append(result)
+            return result
+
+        def fail_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            if stream is None and payload.get("command") == "prepare-workspace":
+                raise BrokenPipeError("simulated publication failure")
+            real_emit(payload, stream=stream)
+
+        def replace_before_cleanup(*_args: object, **_kwargs: object) -> object:
+            destination.rename(retained)
+            destination.mkdir(mode=0o700)
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-identity-mismatch",
+                "simulated replacement before cleanup",
+            )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "prepare_workspace",
+                side_effect=capture_prepare,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "cleanup_workspace",
+                side_effect=replace_before_cleanup,
+            ),
+            mock.patch.object(named_lane_runtime, "_emit", side_effect=fail_receipt),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.named_lane_main(
+                self.prepare_workspace_argv(destination, base, head)
+            )
+
+        self.assertEqual(returncode, 2)
+        failure = json.loads(stderr.getvalue())
+        self.assertEqual(failure["retained_path"], str(retained))
+        self.assertEqual(
+            failure["workspace_identity"]["inode"],
+            prepared_results[0].workspace_identity[1],
+        )
+        self.assertTrue(failure["recovery"]["argv_ready"])
+        self.assertEqual(
+            failure["recovery"]["argv"][0],
+            "recover-partial-workspace",
+        )
+        with mock.patch.object(
+            review_workspace_runtime,
+            "_process_start_identity",
+            side_effect=ProcessLookupError,
+        ):
+            recovered = review_workspace_runtime.recover_partial_workspace(
+                pathlib.Path(failure["partial_recovery_control"]["path"]),
+                failure["partial_recovery_control"]["sha256"],
+            )
+        self.assertEqual(recovered.root, retained)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_failure_envelope_write_failures_exit_without_mask_leak(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        real_prepare = review_workspace_runtime.prepare_workspace
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        class ReceiptBrokenPipe(io.StringIO):
+            def write(inner_self, _payload: str) -> int:
+                raise BrokenPipeError("simulated stdout receipt failure")
+
+        class PartialStderr(io.StringIO):
+            failed = False
+
+            def write(inner_self, payload: str) -> int:
+                if not inner_self.failed:
+                    inner_self.failed = True
+                    super().write(payload[: max(1, len(payload) // 2)])
+                    raise BrokenPipeError("simulated partial stderr write failure")
+                return super().write(payload)
+
+        class FlushStderr(io.StringIO):
+            def flush(inner_self) -> None:
+                raise BrokenPipeError("simulated stderr flush failure")
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        def fail_cleanup(*_args: object, **_kwargs: object) -> object:
+            raise review_workspace_runtime.ReviewWorkspaceError(
+                "synthetic-cleanup-failure",
+                "simulated retained rollback target",
+            )
+
+        for label, stderr in (
+            ("partial", PartialStderr()),
+            ("flush", FlushStderr()),
+        ):
+            with self.subTest(label=label):
+                destination = self.root / f"stderr-{label}-workspace"
+                stdout = ReceiptBrokenPipe()
+                prepared_results: list[review_workspace_runtime.PreparedWorkspace] = []
+
+                def capture_prepare(
+                    *args: object,
+                    **kwargs: object,
+                ) -> review_workspace_runtime.PreparedWorkspace:
+                    result = real_prepare(*args, **kwargs)
+                    prepared_results.append(result)
+                    return result
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "prepare_workspace",
+                        side_effect=capture_prepare,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "cleanup_workspace",
+                        side_effect=fail_cleanup,
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_terminal_process_exit",
+                        side_effect=terminal_exit,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(TerminalExit) as caught,
+                ):
+                    self.named_lane_main(
+                        self.prepare_workspace_argv(destination, base, head)
+                    )
+
+                self.assertEqual(caught.exception.returncode, 2)
+                self.assertTrue(destination.is_dir())
+                if label == "partial":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(stderr.getvalue())
+                    self.assertEqual(stderr.getvalue().count("\n"), 0)
+                else:
+                    self.assertEqual(
+                        json.loads(stderr.getvalue())["reason"],
+                        "workspace-publication-rollback-incomplete",
+                    )
+                    self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                for forwarded, previous in previous_handlers.items():
+                    self.assertEqual(signal.getsignal(forwarded), previous)
+                self.assertEqual(
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                    previous_mask,
+                )
+                matching_controls = []
+                for candidate in destination.parent.glob(
+                    f"{review_workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                ):
+                    payload = json.loads(candidate.read_bytes())
+                    if payload.get("worktree") == str(destination):
+                        matching_controls.append(candidate)
+                self.assertEqual(len(matching_controls), 1)
+                control_path = matching_controls[0]
+                control_digest = hashlib.sha256(control_path.read_bytes()).hexdigest()
+                with mock.patch.object(
+                    review_workspace_runtime,
+                    "_process_start_identity",
+                    side_effect=ProcessLookupError,
+                ):
+                    recovered = review_workspace_runtime.recover_partial_workspace(
+                        control_path,
+                        control_digest,
+                    )
+                self.assertEqual(recovered.cleanup_status, "payload-removed")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_terminal_persistent_restore_failure_exits_with_published_rc(
+        self,
+    ) -> None:
+        probe = """
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from review_runtime import named_lane
+from review_runtime.common import ForwardedSignalMaskOwner
+
+previous = signal.pthread_sigmask(
+    signal.SIG_BLOCK,
+    set(named_lane.forwarded_signals()),
+)
+owner = ForwardedSignalMaskOwner(previous_mask=previous, active=True)
+
+def fail_restore(_restore=None):
+    raise OSError("persistent owner restore failure")
+
+def fail_direct(_previous_mask):
+    raise OSError("persistent direct restore failure")
+
+owner.restore = fail_restore
+named_lane._direct_restore_workspace_signal_mask = fail_direct
+state = named_lane._StructuredSignalState()
+if sys.argv[2] == "success":
+    named_lane._emit_workspace_terminal_receipt(
+        {"status": "ok", "command": "fixture", "cleanup_token": "fixture-token"},
+        state,
+        handoff_owner=owner,
+    )
+else:
+    named_lane._emit_structured_terminal_failure(
+        {"status": "blocked-safety", "reason": "fixture"},
+        state,
+        returncode=7,
+        handoff_owner=owner,
+    )
+raise AssertionError("terminal publisher returned with an active mask owner")
+"""
+        for mode, expected_returncode in (("success", 0), ("failure", 7)):
+            with self.subTest(mode=mode):
+                completed = subprocess.run(
+                    (
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        probe,
+                        str(SCRIPTS),
+                        mode,
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, expected_returncode)
+                if mode == "success":
+                    self.assertEqual(completed.stderr, "")
+                    self.assertEqual(
+                        json.loads(completed.stdout),
+                        {
+                            "status": "ok",
+                            "command": "fixture",
+                            "cleanup_token": "fixture-token",
+                        },
+                    )
+                else:
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(
+                        json.loads(completed.stderr),
+                        {"status": "blocked-safety", "reason": "fixture"},
+                    )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_workspace_failure_handler_install_failure_restores_before_exit(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        destination = self.root / "stderr-handler-install-workspace"
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_install = named_lane_runtime._install_post_terminal_signal_handlers
+        install_calls = 0
+
+        class TerminalExit(BaseException):
+            def __init__(inner_self, returncode: int) -> None:
+                inner_self.returncode = returncode
+
+        class ReceiptBrokenPipe(io.StringIO):
+            def write(inner_self, _payload: str) -> int:
+                raise BrokenPipeError("simulated stdout receipt failure")
+
+        def install_then_fail() -> list[signal.Signals]:
+            nonlocal install_calls
+            install_calls += 1
+            if install_calls == 2:
+                raise OSError("simulated terminal handler installation failure")
+            return real_install()
+
+        def terminal_exit(returncode: int) -> None:
+            raise TerminalExit(returncode)
+
+        stdout = ReceiptBrokenPipe()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_install_post_terminal_signal_handlers",
+                side_effect=install_then_fail,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_terminal_process_exit",
+                side_effect=terminal_exit,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(TerminalExit) as caught,
+        ):
+            self.named_lane_main(self.prepare_workspace_argv(destination, base, head))
+
+        self.assertEqual(caught.exception.returncode, 2)
+        self.assertEqual(install_calls, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(destination.exists())
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    def test_workspace_publication_recovery_accepts_only_identity_bound_quarantine(
+        self,
+    ) -> None:
+        base, head = self.workspace_range()
+        recovery_parent = self.root / "recovery-parent"
+        recovery_parent.mkdir(mode=0o700)
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            recovery_parent / "quarantine-recovery-workspace",
+            base,
+            head,
+        )
+        quarantine = recovery_parent / ".quarantine-recovery-workspace.cleanup-fixture"
+        prepared.root.rename(quarantine)
+        try:
+            cleanup_error = review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-cleanup-incomplete",
+                "fixture retained quarantine",
+                details={"retained_path": str(quarantine)},
+            )
+            self.assertEqual(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                ),
+                str(quarantine),
+            )
+
+            replacement = prepared.root
+            replacement.mkdir(mode=0o700)
+            replaced_error = review_workspace_runtime.ReviewWorkspaceError(
+                "workspace-cleanup-incomplete",
+                "fixture unverified replacement",
+                details={"retained_path": str(replacement)},
+            )
+            self.assertEqual(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    replaced_error,
+                ),
+                str(quarantine),
+            )
+            replacement.rmdir()
+
+            quarantine.chmod(0o755)
+            self.assertIsNone(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                )
+            )
+            quarantine.chmod(0o700)
+
+            recovery_parent.chmod(0o755)
+            self.assertIsNone(
+                named_lane_runtime._prepared_workspace_retained_path(
+                    prepared,
+                    cleanup_error,
+                )
+            )
+            recovery_parent.chmod(0o700)
+
+            original_parent = recovery_parent.with_name("recovery-parent-original")
+            recovery_parent.rename(original_parent)
+            recovery_parent.mkdir(mode=0o700)
+            moved_quarantine = recovery_parent / quarantine.name
+            (original_parent / quarantine.name).rename(moved_quarantine)
+            try:
+                parent_swap_error = review_workspace_runtime.ReviewWorkspaceError(
+                    "workspace-cleanup-incomplete",
+                    "fixture parent replacement",
+                    details={"retained_path": str(moved_quarantine)},
+                )
+                self.assertIsNone(
+                    named_lane_runtime._prepared_workspace_retained_path(
+                        prepared,
+                        parent_swap_error,
+                    )
+                )
+            finally:
+                moved_quarantine.rename(original_parent / quarantine.name)
+                recovery_parent.rmdir()
+                original_parent.rename(recovery_parent)
+        finally:
+            quarantine.rename(prepared.root)
+            review_workspace_runtime.cleanup_workspace(
+                prepared.root,
+                prepared.cleanup_token,
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace receipt handoff requires POSIX signal masks",
+    )
+    def test_validate_and_cleanup_cli_keep_flushed_terminal_receipts(self) -> None:
+        base, head = self.workspace_range()
+        prepared = review_workspace_runtime.prepare_workspace(
+            self.repo.resolve(),
+            self.root / "terminal-receipt-workspace",
+            base,
+            head,
+        )
+        real_cleanup = review_workspace_runtime.cleanup_workspace
+
+        def cleanup_then_signal(*args: object, **kwargs: object) -> object:
+            result = real_cleanup(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        class SignalAfterFlush(io.StringIO):
+            injected = False
+
+            def flush(inner_self) -> None:
+                super().flush()
+                if not inner_self.injected:
+                    inner_self.injected = True
+                    signal.raise_signal(signal.SIGINT)
+
+        commands = (
+            (
+                "validate-workspace",
+                (
+                    "validate-workspace",
+                    "--worktree",
+                    str(prepared.root),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                ),
+            ),
+            (
+                "cleanup-workspace",
+                (
+                    "cleanup-workspace",
+                    "--worktree",
+                    str(prepared.root),
+                    "--token",
+                    prepared.cleanup_token,
+                ),
+            ),
+        )
+        for command, argv in commands:
+            with self.subTest(command=command):
+                stdout = SignalAfterFlush()
+                stderr = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    if command == "cleanup-workspace":
+                        stack.enter_context(
+                            mock.patch.object(
+                                named_lane_runtime,
+                                "cleanup_workspace",
+                                side_effect=cleanup_then_signal,
+                            )
+                        )
+                    stack.enter_context(contextlib.redirect_stdout(stdout))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    returncode = self.named_lane_main(argv)
+                self.assertTrue(stdout.injected)
+                self.assertEqual(returncode, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(json.loads(stdout.getvalue())["command"], command)
+        self.assertFalse(prepared.root.exists())
 
     def bind_formal_validator_range(self, base: str, head: str) -> None:
         info = self.repo / ".git" / "info"
@@ -184,7 +3154,11 @@ class NamedLaneGuardTest(unittest.TestCase):
         checksum = hashlib.sha256(executable.read_bytes()).hexdigest()
         evidence = {
             "capability_contract": {
-                "required_options": [],
+                "required_options": list(
+                    named_lane_runtime._claude_direct_required_options(
+                        named_lane_runtime.parse_compatible_release_version(version)
+                    )
+                ),
                 "status": "accepted",
             },
             "classification": "accepted",
@@ -267,18 +3241,45 @@ class NamedLaneGuardTest(unittest.TestCase):
         guard: pathlib.Path,
         *arguments: str,
         python_executable: pathlib.Path | None = None,
+        include_prepared_source_authority: bool = True,
     ) -> tuple[str, ...]:
         if python_executable is None:
             python_executable = pathlib.Path(sys.executable).resolve()
         self.assertTrue(python_executable.is_absolute())
         self.assertTrue(python_executable.is_file())
+        guarded_arguments = list(arguments)
+        if (
+            include_prepared_source_authority
+            and guarded_arguments
+            and guarded_arguments[0] == "run-claude"
+            and "--source-authority-binding-json" not in guarded_arguments
+            and "--source-worktree" in guarded_arguments
+        ):
+            source_index = guarded_arguments.index("--source-worktree") + 1
+            source = pathlib.Path(guarded_arguments[source_index])
+            receipt = self.prepared_source_authority_receipt(source)
+            canonical_binding = (
+                review_workspace_runtime.canonical_source_authority_binding_bytes(
+                    receipt["source_authority_binding"]
+                )
+            )
+            self.assertEqual(
+                hashlib.sha256(canonical_binding).hexdigest(),
+                receipt["source_authority_binding_sha256"],
+            )
+            guarded_arguments[1:1] = (
+                "--source-authority-binding-json",
+                canonical_binding.decode("utf-8"),
+                "--source-authority-binding-sha256",
+                receipt["source_authority_binding_sha256"],
+            )
         return (
             str(python_executable),
             "-I",
             "-B",
             "-S",
             str(guard),
-            *arguments,
+            *guarded_arguments,
         )
 
     def install_unchecked_pyc(
@@ -559,6 +3560,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "review_runtime.claude_version_policy": str(
                 runtime / "claude_version_policy.py"
             ),
+            "review_runtime.review_workspace": str(runtime / "review_workspace.py"),
             "review_runtime.named_lane": str(runtime / "named_lane.py"),
         }
         expected_fd_exec = str(runtime / "fd_exec.py")
@@ -1811,26 +4813,19 @@ class NamedLaneGuardTest(unittest.TestCase):
         prefixes: tuple[str, ...] = (),
         phase: str = "initial",
     ) -> tuple[int, str, str]:
-        argv = [
-            "legacy-short-prefix-receipts",
-            "--source",
-            str(source),
-            "--temporary-path",
-            str(temporary_path),
-            "--head",
-            head,
-            "--phase",
-            phase,
-        ]
-        for prefix in prefixes:
-            argv.extend(("--prefix", prefix))
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(tuple(argv))
+            returncode = named_lane_runtime.legacy_short_prefix_compatibility_main(
+                source,
+                temporary_path,
+                head,
+                phase,
+                prefixes,
+            )
         return returncode, stdout.getvalue(), stderr.getvalue()
 
     def test_legacy_short_prefix_receipts_emit_sorted_closed_schema_and_fixed_git_queries(
@@ -2044,51 +5039,17 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(receipt["object_type"], "commit")
         self.assertFalse(temporary_path.exists())
 
-    def test_guard_isolated_cli_binds_legacy_short_prefix_receipt_runtime(
-        self,
-    ) -> None:
-        base, _middle, head = self.legacy_prefix_history()
-        scripts, guard = self.copy_guard_bundle()
-        workspace_marker = self.root / "workspace-module-loaded.marker"
-        (scripts / "review_runtime/workspace.py").write_text(
-            "import pathlib\n"
-            f"pathlib.Path({str(workspace_marker)!r}).write_text('loaded')\n",
-            encoding="utf-8",
-        )
-        temporary_path = self.root / "guard-legacy-prefix-view"
-
+    def test_guard_help_omits_legacy_short_prefix_receipt_route(self) -> None:
+        _scripts, guard = self.copy_guard_bundle()
         completed = subprocess.run(
-            self.isolated_guard_command(
-                guard,
-                "legacy-short-prefix-receipts",
-                "--source",
-                str(self.repo.resolve()),
-                "--temporary-path",
-                str(temporary_path),
-                "--head",
-                head,
-                "--phase",
-                "initial",
-                "--prefix",
-                base[:10],
-            ),
-            check=False,
+            self.isolated_guard_command(guard, "--help"),
+            check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stderr, "")
-        payload = json.loads(completed.stdout)
-        self.assertEqual(
-            payload["schema_version"],
-            LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
-        )
-        self.assertEqual(payload["receipts"][0]["raw_prefix"], base[:10])
-        self.assertFalse(workspace_marker.exists())
-        self.assertFalse(temporary_path.exists())
-        self.assertEqual(list(scripts.rglob("__pycache__")), [])
+        self.assertNotIn("legacy-short-prefix-receipts", completed.stdout)
 
     def test_legacy_short_prefix_receipts_reject_current_head_prefix_without_receipts(
         self,
@@ -5001,6 +7962,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             validate_worktree(self.repo.resolve(), base, head)
 
+    @retired_public_commands("validate-worktree")
     def test_validate_worktree_cli_requires_base_and_receipts_frozen_range(
         self,
     ) -> None:
@@ -5021,7 +7983,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stderr(missing_base_stderr),
             self.assertRaises(SystemExit) as missing_base,
         ):
-            named_lane_main(
+            self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -5035,7 +7997,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -5404,6 +8366,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertTrue(replaced)
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_distinct_local_config_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5471,7 +8434,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -5491,6 +8454,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     {"status": "blocked-safety", "reason": expected_reason},
                 )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_config_input_inspection_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5515,7 +8479,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -5537,6 +8501,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     },
                 )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_config_record_inspection_failure(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5554,7 +8519,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -5576,6 +8541,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             },
         )
 
+    @retired_public_commands("validate-worktree")
     def test_validator_reports_distinct_git_info_failures(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         head = self.commit("base")
@@ -5637,7 +8603,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -6644,6 +9610,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                             expected_identity,
                         )
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_structures_signal_during_python_cleanup_window(
         self,
     ) -> None:
@@ -6674,7 +9641,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -6698,6 +9665,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_preserves_retained_control_path_at_terminal_restore(
         self,
     ) -> None:
@@ -6756,7 +9724,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -6784,6 +9752,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertNotEqual(payload["reason"], "forwarded-signal")
         self.assertFalse(destination.exists())
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_defers_signal_during_control_cleanup(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6818,7 +9787,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -6842,6 +9811,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_retries_signal_block_before_cleanup(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6869,7 +9839,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -6893,6 +9863,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_a_signal_during_emit(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -6924,7 +9895,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -6956,6 +9927,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_signal_while_unblocking(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
@@ -7000,7 +9972,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -7020,6 +9992,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_receipt_commits_signal_during_outer_teardown(
         self,
     ) -> None:
@@ -7067,7 +10040,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -7087,6 +10060,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
         self.assertEqual(validate_worktree(destination, base, head).head_sha, head)
 
+    @retired_public_commands("materialize-worktree")
     def test_materializer_cli_retains_terminal_failure_when_signal_arrives_during_receipt_rollback(
         self,
     ) -> None:
@@ -7149,7 +10123,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -7650,6 +10624,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             self.validate_repo(head)
 
+    @retired_public_commands("validate-worktree")
     def test_valueless_frozen_submodule_path_is_structured_blocked_safety(
         self,
     ) -> None:
@@ -7688,7 +10663,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -7870,6 +10845,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertFalse(marker.exists())
                 git(self.repo, "config", "--unset-all", key)
 
+    @retired_public_commands("validate-worktree")
     def test_git_alias_is_blocked_before_reviewer_launch(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit()
@@ -7892,7 +10868,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 git(self.repo, "config", *scope, "alias.foo", f"!{probe}")
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -8129,7 +11105,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         stdout = self.root / "stdout.bin"
         stderr = self.root / "stderr.bin"
 
-        result = run_claude(
+        result = self.run_claude(
             worktree=self.repo.resolve(),
             stdout_path=stdout,
             stderr_path=stderr,
@@ -8162,6 +11138,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
                 "--preflight-result",
                 str(self.preflight_result_path(executable)),
                 "--stdout-path",
@@ -8187,6 +11165,53 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(stderr_path.read_bytes(), b"")
         self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
 
+    def test_cli_run_claude_rejects_caller_owned_arguments(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        marker = self.root / "caller-argv-cli.marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+        )
+        stdout_path = self.root / "caller-argv-cli.stdout"
+        stderr_path = self.root / "caller-argv-cli.stderr"
+
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
+                "--stdout-path",
+                str(stdout_path),
+                "--stderr-path",
+                str(stderr_path),
+                "--timeout-seconds",
+                "5",
+                "--",
+                str(executable),
+                "--safe-mode",
+            ),
+            check=False,
+            input=b"review",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(
+            "arguments are owned by the named-lane guard",
+            json.loads(completed.stderr)["reason"],
+        )
+        self.assertFalse(marker.exists())
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
+
     def test_process_rejects_a_command_that_differs_from_preflight(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
@@ -8199,7 +11224,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             NamedLaneGuardError,
             "does not match the accepted preflight executable",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -8228,7 +11253,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             NamedLaneGuardError,
             "changed after accepted preflight",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "replacement-before.out",
                 stderr_path=self.root / "replacement-before.err",
@@ -8283,7 +11308,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run_bounded_capture",
             side_effect=replace_at_handoff,
         ):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -8320,7 +11345,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         extra_link = self.root / "benign-executable-hardlink"
         os.link(executable, extra_link)
         try:
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "benign-metadata.out",
                 stderr_path=self.root / "benign-metadata.err",
@@ -8350,7 +11375,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             NamedLaneGuardError,
             "changed during launch binding",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "forged-checksum.out",
                 stderr_path=self.root / "forged-checksum.err",
@@ -8378,7 +11403,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             NamedLaneGuardError,
             "changed during launch binding",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "same-inode-drift.out",
                 stderr_path=self.root / "same-inode-drift.err",
@@ -8408,7 +11433,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ):
                 with self.subTest(label=label):
                     with self.assertRaisesRegex(NamedLaneGuardError, expected):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"{label}-preflight.out",
                             stderr_path=self.root / f"{label}-preflight.err",
@@ -8427,7 +11452,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "private single-link regular file",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "permissive-preflight.out",
                     stderr_path=self.root / "permissive-preflight.err",
@@ -8466,7 +11491,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "launch snapshot cannot be inspected safely",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-fstat.out",
                 stderr_path=self.root / "snapshot-fstat.err",
@@ -8506,7 +11531,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "cleanup cannot bind the retained path",
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "persistent-snapshot-fstat.out",
                     stderr_path=self.root / "persistent-snapshot-fstat.err",
@@ -8547,7 +11572,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(ReviewTimeoutError, "rehash deadline"),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "rehash-deadline.out",
                 stderr_path=self.root / "rehash-deadline.err",
@@ -8587,7 +11612,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             self.assertRaises(ForwardedSignal),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-handoff.out",
                 stderr_path=self.root / "snapshot-handoff.err",
@@ -8629,7 +11654,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             self.assertRaises(ForwardedSignal) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "cleanup-signal.out",
                 stderr_path=self.root / "cleanup-signal.err",
@@ -8688,7 +11713,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-signal-failure.out",
                     stderr_path=self.root / "cleanup-signal-failure.err",
@@ -8755,7 +11780,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "signal mask could not be restored",
                 ),
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-mask.out",
                     stderr_path=self.root / "cleanup-mask.err",
@@ -8808,7 +11833,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "restore_signal_mask",
             side_effect=fail_first_cleanup_restore,
         ):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "cleanup-mask-retry.out",
                 stderr_path=self.root / "cleanup-mask-retry.err",
@@ -8859,7 +11884,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     ),
                     self.assertRaises(type(control_error)) as context,
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"cleanup-{label}.out",
                         stderr_path=self.root / f"cleanup-{label}.err",
@@ -8903,7 +11928,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-complete.out",
                     stderr_path=self.root / "cleanup-complete.err",
@@ -8964,7 +11989,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-deadline.out",
                     stderr_path=self.root / "cleanup-deadline.err",
@@ -9008,6 +12033,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "ANTHROPIC_API_KEY": "secret",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
             "CLAUDE_CONFIG_DIR": "/private/claude",
             "GITHUB_TOKEN": "secret",
             "GH_TOKEN": "secret",
@@ -9026,7 +12052,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         denied["NODE_EXTRA_CA_CERTS"] = str(node_extra_ca)
         with mock.patch.dict(os.environ, {**allowed, **denied}, clear=True):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=default_stdout,
                 stderr_path=default_stderr,
@@ -9035,7 +12061,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
             )
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -9064,6 +12090,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             default_child["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
             "1",
         )
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", child)
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", default_child)
         for key in denied.keys() - {
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
             "NODE_EXTRA_CA_CERTS",
@@ -9071,6 +12099,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             self.assertNotIn(key, child)
         self.assertNotIn("NODE_EXTRA_CA_CERTS", default_child)
         self.assertEqual(child["NODE_EXTRA_CA_CERTS"], str(node_extra_ca))
+        self.assertEqual(child["GIT_LITERAL_PATHSPECS"], "1")
         self.assertEqual(child["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(child["GIT_NO_REPLACE_OBJECTS"], "1")
@@ -9112,7 +12141,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "    fcntl.flock(anchor_fd, fcntl.LOCK_UN)\n"
             "finally:\n"
             "    os.close(anchor_fd)\n"
-            "json.dump({'session_id': session_id, 'mode': "
+            "json.dump({'arguments': arguments, 'session_id': session_id, 'mode': "
             "leaf.stat().st_mode & 0o777, 'namespace_lock_blocked': "
             "namespace_lock_blocked}, sys.stdout)\n",
             version="2.1.226",
@@ -9120,11 +12149,11 @@ class NamedLaneGuardTest(unittest.TestCase):
         stdout = self.root / "session-env.json"
         stderr = self.root / "session-env.err"
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
-                command=(str(executable), "--print"),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
@@ -9176,6 +12205,25 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(observed["mode"], 0o700)
         self.assertTrue(observed["namespace_lock_blocked"])
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+        profile = result["launch_binding"]["argv_profile"]
+        self.assertEqual(
+            observed["arguments"],
+            [
+                "--session-id",
+                observed["session_id"],
+                *profile["guard_constructed_arguments"],
+            ],
+        )
+        self.assertEqual(profile["effective_arguments"], observed["arguments"])
+        self.assertNotIn("--session-id", profile["guard_constructed_arguments"])
+        canonical = named_lane_runtime._canonical_json_bytes
+        self.assertEqual(
+            profile["effective_arguments_sha256"],
+            hashlib.sha256(canonical(observed["arguments"])).hexdigest(),
+        )
+        payload = dict(profile)
+        digest = payload.pop("profile_sha256")
+        self.assertEqual(digest, hashlib.sha256(canonical(payload)).hexdigest())
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
     def test_claude_session_namespace_lease_failure_blocks_launch(self) -> None:
@@ -9200,7 +12248,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "namespace lease is already held",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "namespace-lease.out",
                 stderr_path=self.root / "namespace-lease.err",
@@ -9280,7 +12328,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     side_effect=replace_after_leaf_mkdir,
                 ),
             ):
-                result = run_claude(
+                result = self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "mkdir-origin.out",
                     stderr_path=self.root / "mkdir-origin.err",
@@ -9373,7 +12421,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-replacement.out",
                     stderr_path=self.root / "snapshot-replacement.err",
@@ -9449,7 +12497,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "leaf handoff mode changed",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-mode.out",
                 stderr_path=self.root / "snapshot-mode.err",
@@ -9524,7 +12572,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-content.out",
                     stderr_path=self.root / "snapshot-content.err",
@@ -9607,7 +12655,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCustodyError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-parent.out",
                     stderr_path=self.root / "snapshot-parent.err",
@@ -9717,7 +12765,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                             named_lane_runtime._ClaudeSessionEnvCleanupError
                         ) as context,
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"prelaunch-{label}.out",
                             stderr_path=self.root / f"prelaunch-{label}.err",
@@ -9807,7 +12855,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                             named_lane_runtime._ClaudeSessionEnvCleanupError
                         ) as context,
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"unquiescent-{label}.out",
                             stderr_path=self.root / f"unquiescent-{label}.err",
@@ -9878,7 +12926,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "capture-without-proof.out",
                     stderr_path=self.root / "capture-without-proof.err",
@@ -9967,7 +13015,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeControlCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-mask-acquire.out",
                     stderr_path=self.root / "unquiescent-mask-acquire.err",
@@ -10039,7 +13087,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeControlCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "quiescent-mask-acquire.out",
                     stderr_path=self.root / "quiescent-mask-acquire.err",
@@ -10133,7 +13181,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-mask-restore.out",
                     stderr_path=self.root / "unquiescent-mask-restore.err",
@@ -10217,7 +13265,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-deferred-signal.out",
                     stderr_path=self.root / "unquiescent-deferred-signal.err",
@@ -10286,7 +13334,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     ),
                     self.assertRaises(type(process_error)) as context,
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"quiescent-{label}.out",
                         stderr_path=self.root / f"quiescent-{label}.err",
@@ -10303,22 +13351,40 @@ class NamedLaneGuardTest(unittest.TestCase):
                 )
 
     @unittest.skipUnless(os.name == "posix", "session environment requires POSIX")
-    def test_claude_2_1_225_does_not_receive_a_guard_managed_session(self) -> None:
+    def test_claude_2_1_225_receives_the_exact_guard_owned_profile(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
+        source_base, source_head = self.source_control_range()
+        source_receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="exact-profile-source",
+        )
+        source_binding = source_receipt["source_authority_binding"]
+        source_binding_sha256 = source_receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(source_binding, dict)
+        self.assertIsInstance(source_binding_sha256, str)
         home = self.make_claude_home()
         executable = self.make_executable(
-            "import json, sys\njson.dump({'arguments': sys.argv[1:]}, sys.stdout)\n",
+            "import json, os, sys\n"
+            "json.dump({'arguments': sys.argv[1:], "
+            "'environment': dict(os.environ)}, sys.stdout)\n",
             version="2.1.225",
         )
         stdout = self.root / "pre-session-env.json"
         stderr = self.root / "pre-session-env.err"
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            requested_environment = named_lane_runtime._claude_environment(
+                self.repo.resolve()
+            )
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
-                command=(str(executable), "--print"),
+                command=(str(executable),),
+                source_authority_binding=source_binding,
+                source_authority_binding_sha256=source_binding_sha256,
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
@@ -10330,6 +13396,1231 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertNotIn("session_id", result["launch_binding"])
         self.assertNotIn("session_env", result["launch_binding"])
         self.assertEqual(list((home / ".claude" / "session-env").iterdir()), [])
+
+        profile = result["launch_binding"]["argv_profile"]
+        settings = profile["settings"]
+        settings_json = json.dumps(
+            settings,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_arguments = [
+            "--print",
+            "--input-format",
+            "text",
+            "--model",
+            "claude-opus-4-8",
+            "--effort",
+            "max",
+            "--permission-mode",
+            "dontAsk",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--setting-sources",
+            "",
+            "--settings",
+            settings_json,
+            "--tools",
+            "Read,Grep,Glob,Bash",
+            "--allowedTools",
+            "Read(./**),Grep,Glob,Bash",
+            "--disallowedTools",
+            "Edit,Write,NotebookEdit,WebFetch,WebSearch",
+        ]
+        self.assertEqual(observed["arguments"], expected_arguments)
+        self.assertEqual(profile["guard_constructed_arguments"], expected_arguments)
+        self.assertEqual(profile["effective_arguments"], expected_arguments)
+        self.assertEqual(profile["profile"], "named-direct-claude-argv-v3")
+        self.assertEqual(
+            profile["conformance"], "guard-constructed-exact-token-sequence"
+        )
+        self.assertEqual(profile["settings_schema"], "named-direct-claude-settings-v1")
+        self.assertEqual(profile["settings_assurance"], "requested-configuration-only")
+        self.assertIs(profile["settings_parser_acceptance_attested"], False)
+        self.assertIs(profile["managed_policy_residual"], True)
+        self.assertIs(profile["native_sandbox_effectiveness_attested"], False)
+        self.assertEqual(profile["model"], "claude-opus-4-8")
+        self.assertEqual(profile["effort"], "max")
+        self.assertEqual(profile["worktree"], str(self.repo.resolve()))
+        self.assertEqual(
+            profile["review_git_metadata"], str((self.repo / ".git").resolve())
+        )
+        self.assertEqual(profile["account_home"], str(home))
+        self.assertEqual(profile["source_worktree"], str(self.source_control))
+        self.assertEqual(
+            profile["source_worktree_binding"],
+            "prepare-workspace-receipt-exact-digest-bound-authority-v1",
+        )
+        self.assertEqual(profile["source_authority_binding"], source_binding)
+        self.assertEqual(
+            profile["source_authority_binding_sha256"],
+            source_binding_sha256,
+        )
+        self.assertNotIn("--source-authority-binding-json", observed["arguments"])
+        self.assertNotIn("--source-authority-binding-sha256", observed["arguments"])
+        self.assertEqual(
+            profile["source_read_deny_roots"],
+            [str(self.source_control), str(self.source_control / ".git")],
+        )
+        self.assertEqual(profile["source_authority_policy"], "direct-primary-only")
+        self.assertEqual(
+            profile["source_primary_object_store"],
+            str(self.source_control / ".git/objects"),
+        )
+        self.assertEqual(
+            profile["source_primary_object_store_identity"]["uid"],
+            os.getuid(),
+        )
+        self.assertEqual(
+            profile["source_authority_revalidation"],
+            ["pre-spawn", "pre-terminal-acceptance"],
+        )
+        self.assertEqual(
+            profile["preflight_result"], str(self.preflight_result_path(executable))
+        )
+        self.assertEqual(set(profile["output_bindings"]), {"stdout", "stderr"})
+        for label, path in (("stdout", stdout), ("stderr", stderr)):
+            binding = profile["output_bindings"][label]
+            self.assertEqual(binding["path"], str(path))
+            self.assertEqual(binding["parent"], str(path.parent))
+            self.assertEqual(binding["parent_identity"]["uid"], os.getuid())
+            self.assertEqual(binding["parent_identity"]["mode"], 0o700)
+
+        self.assertEqual(
+            set(settings),
+            {
+                "disableAllHooks",
+                "disableBundledSkills",
+                "permissions",
+                "sandbox",
+            },
+        )
+        self.assertIs(settings["disableAllHooks"], True)
+        self.assertIs(settings["disableBundledSkills"], True)
+        self.assertEqual(
+            settings["permissions"],
+            {
+                "deny": [
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                    "WebFetch",
+                    "WebSearch",
+                ]
+            },
+        )
+        sandbox = settings["sandbox"]
+        self.assertEqual(
+            set(sandbox),
+            {
+                "allowUnsandboxedCommands",
+                "autoAllowBashIfSandboxed",
+                "credentials",
+                "enabled",
+                "enableWeakerNestedSandbox",
+                "enableWeakerNetworkIsolation",
+                "excludedCommands",
+                "failIfUnavailable",
+                "filesystem",
+                "network",
+            },
+        )
+        self.assertIs(sandbox["allowUnsandboxedCommands"], False)
+        self.assertIs(sandbox["autoAllowBashIfSandboxed"], False)
+        self.assertIs(sandbox["enabled"], True)
+        self.assertIs(sandbox["enableWeakerNestedSandbox"], False)
+        self.assertIs(sandbox["enableWeakerNetworkIsolation"], False)
+        self.assertEqual(sandbox["excludedCommands"], [])
+        self.assertIs(sandbox["failIfUnavailable"], True)
+        self.assertEqual(
+            sandbox["network"],
+            {
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
+                "allowUnixSockets": [],
+                "allowedDomains": [],
+            },
+        )
+        filesystem = sandbox["filesystem"]
+        self.assertEqual(
+            filesystem["allowRead"],
+            [
+                str(self.repo.resolve()),
+                str((self.repo / ".git").resolve()),
+                "/dev/null",
+            ],
+        )
+        self.assertEqual(filesystem["denyWrite"], ["/"])
+        self.assertNotIn("allowWrite", filesystem)
+        self.assertEqual(
+            set(filesystem["denyRead"]),
+            {
+                *(
+                    str(home / path)
+                    for path in (
+                        ".aws",
+                        ".claude",
+                        ".codex",
+                        ".config",
+                        ".copilot",
+                        ".gnupg",
+                        ".kube",
+                        ".ssh",
+                        ".git-credentials",
+                        ".netrc",
+                    )
+                ),
+                str(self.source_control),
+                str(self.source_control / ".git"),
+                str(self.preflight_result_path(executable)),
+                str(stdout),
+                str(stderr),
+                "/proc",
+                "/dev",
+            },
+        )
+        self.assertEqual(
+            sandbox["credentials"]["files"],
+            [
+                {"mode": "deny", "path": str(home / path)}
+                for path in (
+                    ".aws",
+                    ".claude",
+                    ".codex",
+                    ".config",
+                    ".copilot",
+                    ".gnupg",
+                    ".kube",
+                    ".ssh",
+                    ".git-credentials",
+                    ".netrc",
+                )
+            ],
+        )
+        self.assertEqual(
+            sandbox["credentials"]["envVars"],
+            [
+                {"mode": "deny", "name": name}
+                for name in named_lane_runtime.CLAUDE_DIRECT_SECRET_ENVIRONMENT_KEYS
+            ],
+        )
+
+        git_null_binding = profile["git_null_read_exception"]
+        self.assertEqual(
+            set(git_null_binding), {"path", "identity_binding", "identity"}
+        )
+        self.assertEqual(git_null_binding["path"], filesystem["allowRead"][-1])
+        self.assertEqual(
+            git_null_binding["identity_binding"],
+            "canonical-no-follow-character-device",
+        )
+        null_metadata = pathlib.Path("/dev/null").lstat()
+        self.assertEqual(
+            git_null_binding["identity"],
+            {
+                "device": null_metadata.st_dev,
+                "inode": null_metadata.st_ino,
+                "file_type": stat.S_IFMT(null_metadata.st_mode),
+                "mode": stat.S_IMODE(null_metadata.st_mode),
+                "uid": null_metadata.st_uid,
+                "gid": null_metadata.st_gid,
+                "rdev": null_metadata.st_rdev,
+            },
+        )
+
+        canonical = named_lane_runtime._canonical_json_bytes
+        self.assertEqual(
+            profile["settings_sha256"],
+            hashlib.sha256(settings_json.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            profile["guard_constructed_arguments_sha256"],
+            hashlib.sha256(canonical(expected_arguments)).hexdigest(),
+        )
+        self.assertEqual(
+            profile["effective_arguments_sha256"],
+            hashlib.sha256(canonical(expected_arguments)).hexdigest(),
+        )
+        profile_without_digest = dict(profile)
+        observed_profile_digest = profile_without_digest.pop("profile_sha256")
+        self.assertEqual(
+            observed_profile_digest,
+            hashlib.sha256(canonical(profile_without_digest)).hexdigest(),
+        )
+        environment_binding = profile["environment_binding"]
+        self.assertEqual(
+            environment_binding["profile"], "named-direct-claude-environment-v1"
+        )
+        self.assertEqual(
+            environment_binding["assurance"],
+            "guard-supplied-process-environment",
+        )
+        self.assertEqual(
+            environment_binding["requested_keys"], sorted(requested_environment)
+        )
+        self.assertEqual(
+            environment_binding["requested_environment_sha256"],
+            hashlib.sha256(canonical(requested_environment)).hexdigest(),
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in observed["environment"].items()
+                if key != "__CF_USER_TEXT_ENCODING"
+            },
+            requested_environment,
+        )
+        self.assertIs(environment_binding["node_extra_ca_certs_inherited"], False)
+        self.assertNotIn("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", requested_environment)
+        self.assertNotIn(
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+            environment_binding["requested_keys"],
+        )
+        permission_index = expected_arguments.index("--permission-mode")
+        self.assertEqual(expected_arguments[permission_index + 1], "dontAsk")
+
+    def test_claude_guard_owned_profile_is_primary_model_only(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        for model in ("claude-opus-4-7", "claude-opus-4-8-latest"):
+            with self.subTest(model=model):
+                marker = self.root / f"invalid-model-{model}.marker"
+                invalid = self.make_executable(
+                    f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+                )
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "model must match the canonical named-direct model profile",
+                ):
+                    self.run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"invalid-model-{model}.stdout",
+                        stderr_path=self.root / f"invalid-model-{model}.stderr",
+                        command=(str(invalid),),
+                        model=model,
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+                self.assertFalse(marker.exists())
+
+    def test_claude_preflight_options_match_the_guard_owned_argv(self) -> None:
+        from review_runtime.claude_capabilities import (
+            CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS,
+            named_direct_required_options,
+        )
+
+        self.assertEqual(
+            named_lane_runtime.CLAUDE_DIRECT_REQUIRED_OPTIONS,
+            CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS,
+        )
+        for version in ("2.1.211", "2.1.225", "2.1.226", "2.9.999"):
+            with self.subTest(version=version):
+                parsed = named_lane_runtime.parse_compatible_release_version(version)
+                self.assertEqual(
+                    named_lane_runtime._claude_direct_required_options(parsed),
+                    named_direct_required_options(version),
+                )
+
+    def test_claude_rejects_preflight_option_contract_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        cases = (
+            ("missing", lambda value: value["required_options"].pop()),
+            (
+                "duplicate",
+                lambda value: value["required_options"].append("--print"),
+            ),
+            (
+                "unknown",
+                lambda value: value["required_options"].append("--unsafe-fixture"),
+            ),
+            ("unaccepted", lambda value: value.__setitem__("status", "unaccepted")),
+            ("extra-field", lambda value: value.__setitem__("extra", True)),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                marker = self.root / f"preflight-{label}.marker"
+                executable = self.make_executable(
+                    f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+                )
+                preflight = self.preflight_result_path(executable)
+                evidence = json.loads(preflight.read_text(encoding="utf-8"))
+                mutate(evidence["capability_contract"])
+                preflight.write_text(
+                    json.dumps(evidence, sort_keys=True), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "capability contract does not match the closed argv profile",
+                ):
+                    self.run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"preflight-{label}.stdout",
+                        stderr_path=self.root / f"preflight-{label}.stderr",
+                        command=(str(executable),),
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=16 * 1024,
+                    )
+                self.assertFalse(marker.exists())
+
+    def test_cli_run_claude_requires_the_parent_source_binding(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        child_marker = self.root / "missing-source-binding-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
+                "--stdout-path",
+                str(self.root / "missing-binding.stdout"),
+                "--stderr-path",
+                str(self.root / "missing-binding.stderr"),
+                "--",
+                str(executable),
+                include_prepared_source_authority=False,
+            ),
+            check=False,
+            input=b"review",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"--source-authority-binding-json", completed.stderr)
+        self.assertIn(b"--source-authority-binding-sha256", completed.stderr)
+        self.assertFalse(child_marker.exists())
+        self.assertFalse((self.root / "missing-binding.stdout").exists())
+        self.assertFalse((self.root / "missing-binding.stderr").exists())
+
+    def test_parent_source_binding_parser_rejects_closed_schema_bypasses(
+        self,
+    ) -> None:
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="parser-matrix-source",
+        )
+        binding = receipt["source_authority_binding"]
+        digest = receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(binding, dict)
+        self.assertIsInstance(digest, str)
+        canonical = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            binding
+        ).decode("utf-8")
+
+        extra = json.loads(canonical)
+        extra["extra"] = True
+        extra_json = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            extra
+        ).decode("utf-8")
+        wrong_type = json.loads(canonical)
+        wrong_type["source_worktree"]["identity"]["device"] = True
+        wrong_type_json = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(
+                wrong_type
+            ).decode("utf-8")
+        )
+        non_utf8_path = json.loads(canonical)
+        non_utf8_path["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
+        non_utf8_json = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(
+                non_utf8_path
+            ).decode("utf-8")
+        )
+        noncanonical = json.dumps(binding, indent=2, sort_keys=True)
+        duplicate = canonical.replace(
+            "{",
+            '{"schema_version":"review-source-authority-binding-v1",',
+            1,
+        )
+        cases = (
+            ("digest", canonical, "0" * 64, "digest does not match"),
+            (
+                "extra",
+                extra_json,
+                hashlib.sha256(extra_json.encode("utf-8")).hexdigest(),
+                "closed schema",
+            ),
+            (
+                "type",
+                wrong_type_json,
+                hashlib.sha256(wrong_type_json.encode("utf-8")).hexdigest(),
+                "identity field device is invalid",
+            ),
+            (
+                "non-utf8-path",
+                non_utf8_json,
+                hashlib.sha256(non_utf8_json.encode("utf-8")).hexdigest(),
+                "path must be valid UTF-8",
+            ),
+            ("noncanonical", noncanonical, digest, "not canonical"),
+            ("duplicate", duplicate, digest, "duplicate key"),
+        )
+        for label, payload, expected_digest, message in cases:
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(NamedLaneGuardError, message),
+            ):
+                named_lane_runtime._parse_parent_source_authority_binding_json(
+                    payload,
+                    expected_digest,
+                )
+
+    def test_raw_cli_rejects_parent_binding_before_any_runtime_probe(self) -> None:
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="raw-parser-ordering-source",
+        )
+        binding = receipt["source_authority_binding"]
+        digest = receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(binding, dict)
+        self.assertIsInstance(digest, str)
+        canonical = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            binding
+        )
+        non_utf8 = json.loads(canonical)
+        non_utf8["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
+        non_utf8_bytes = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(non_utf8)
+        )
+        duplicate = canonical.decode("utf-8").replace(
+            "{",
+            '{"schema_version":"review-source-authority-binding-v1",',
+            1,
+        )
+        cases = (
+            ("digest-mismatch", canonical.decode("utf-8"), "0" * 64),
+            (
+                "duplicate-key",
+                duplicate,
+                hashlib.sha256(duplicate.encode("utf-8")).hexdigest(),
+            ),
+            ("noncanonical", json.dumps(binding, indent=2), digest),
+            (
+                "non-utf8-path",
+                non_utf8_bytes.decode("utf-8"),
+                hashlib.sha256(non_utf8_bytes).hexdigest(),
+            ),
+        )
+        for label, payload, expected_digest in cases:
+            with self.subTest(label=label):
+                stderr = io.StringIO()
+                probes = (
+                    "_resolve_worktree_root",
+                    "_load_claude_executable_binding",
+                    "_bind_claude_source_read_boundary",
+                    "_create_claude_launch_snapshot",
+                    "_read_control_prompt",
+                    "run_claude",
+                )
+                with contextlib.ExitStack() as stack:
+                    observed = [
+                        stack.enter_context(
+                            mock.patch.object(named_lane_runtime, probe)
+                        )
+                        for probe in probes
+                    ]
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    returncode = _named_lane_main(
+                        (
+                            "run-claude",
+                            "--source-authority-binding-json",
+                            payload,
+                            "--source-authority-binding-sha256",
+                            expected_digest,
+                            "--worktree",
+                            str(self.repo.resolve()),
+                            "--source-worktree",
+                            str(self.source_control),
+                            "--preflight-result",
+                            str(self.root / f"{label}.preflight.json"),
+                            "--stdout-path",
+                            str(self.root / f"{label}.stdout"),
+                            "--stderr-path",
+                            str(self.root / f"{label}.stderr"),
+                            "--",
+                            "/usr/bin/false",
+                        )
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue())["status"], "inconclusive"
+                )
+                for probe in observed:
+                    probe.assert_not_called()
+
+    def test_claude_tampered_parent_source_binding_fails_before_snapshot(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="tampered-source-binding",
+        )
+        tampered = json.loads(json.dumps(receipt["source_authority_binding"]))
+        tampered["source_worktree"]["identity"]["inode"] += 1
+        child_marker = self.root / "tampered-source-binding-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(NamedLaneGuardError, "digest does not match"),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.source_control,
+                source_authority_binding=tampered,
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "tampered-binding.stdout",
+                stderr_path=self.root / "tampered-binding.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_persistent_ordinary_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="ordinary-replacement-source",
+        )
+        displaced = self.root / "ordinary-source-outside-deny-read"
+        self.source_control.rename(displaced)
+        self.source_control.mkdir(mode=0o700)
+        git(self.source_control, "init", "-b", "master")
+        child_marker = self.root / "ordinary-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.source_control,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "ordinary-replacement.stdout",
+                stderr_path=self.root / "ordinary-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertTrue((displaced / ".git").is_dir())
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_persistent_linked_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        linked = self.root / "linked-authority-source"
+        git(
+            self.source_control,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            source_head,
+        )
+        receipt = self.prepare_source_authority_receipt(
+            linked,
+            base=source_base,
+            head=source_head,
+            name="linked-replacement-source",
+        )
+        marker_payload = (linked / ".git").read_bytes()
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        common = pathlib.Path(
+            git(linked, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve()
+        admin_identity = admin.stat().st_ino
+        common_identity = common.stat().st_ino
+        objects_identity = (common / "objects").stat().st_ino
+        displaced = self.root / "linked-source-outside-deny-read"
+        linked.rename(displaced)
+        linked.mkdir(mode=0o700)
+        (linked / ".git").write_bytes(marker_payload)
+        child_marker = self.root / "linked-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=linked,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "linked-replacement.stdout",
+                stderr_path=self.root / "linked-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertEqual(admin.stat().st_ino, admin_identity)
+        self.assertEqual(common.stat().st_ino, common_identity)
+        self.assertEqual((common / "objects").stat().st_ino, objects_identity)
+        self.assertTrue((displaced / ".git").is_file())
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_linked_commondir_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        linked = self.root / "linked-commondir-source"
+        git(
+            self.source_control,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            source_head,
+        )
+        receipt = self.prepare_source_authority_receipt(
+            linked,
+            base=source_base,
+            head=source_head,
+            name="linked-commondir-replacement",
+        )
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        commondir = admin / "commondir"
+        original = commondir.lstat()
+        replacement = admin / "commondir.replacement"
+        replacement.write_bytes(commondir.read_bytes())
+        replacement.chmod(stat.S_IMODE(original.st_mode))
+        os.replace(replacement, commondir)
+        self.assertNotEqual(commondir.stat().st_ino, original.st_ino)
+        child_marker = self.root / "linked-commondir-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=linked,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "linked-commondir-replacement.stdout",
+                stderr_path=self.root / "linked-commondir-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_source_deny_roots_include_linked_git_storage(self) -> None:
+        git(self.source_control, "config", "user.name", "Named Lane Source Test")
+        git(
+            self.source_control,
+            "config",
+            "user.email",
+            "named-lane-source@example.invalid",
+        )
+        (self.source_control / "tracked.txt").write_text("source\n", encoding="utf-8")
+        git(self.source_control, "add", "tracked.txt")
+        git(self.source_control, "commit", "-m", "source fixture")
+        linked = self.root / "linked-source"
+        git(self.source_control, "worktree", "add", "--detach", str(linked), "HEAD")
+
+        source, roots = named_lane_runtime._resolve_claude_source_read_deny_roots(
+            linked.resolve()
+        )
+
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        common = pathlib.Path(git(linked, "rev-parse", "--git-common-dir")).resolve()
+        self.assertEqual(source, linked.resolve())
+        self.assertEqual(roots, (linked.resolve(), admin, common))
+        binding = named_lane_runtime._bind_claude_source_read_boundary(linked.resolve())
+        self.assertEqual(binding.objects, common / "objects")
+        self.assertEqual(binding.objects_identity.owner, os.getuid())
+
+    def test_claude_source_rejects_every_lexical_alternate_entry(self) -> None:
+        info = self.source_control / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        regular_target = self.root / "claude-alternate-target"
+        regular_target.write_text("target\n", encoding="utf-8")
+        cases = (
+            ("empty-regular", lambda path: path.write_bytes(b"")),
+            (
+                "absolute-regular",
+                lambda path: path.write_text(
+                    str(self.source_control / ".git/objects") + "\n",
+                    encoding="utf-8",
+                ),
+            ),
+            (
+                "relative-regular",
+                lambda path: path.write_text("../../objects\n", encoding="utf-8"),
+            ),
+            ("symlink", lambda path: path.symlink_to(regular_target)),
+            (
+                "dangling-symlink",
+                lambda path: path.symlink_to(self.root / "missing-claude-alternate"),
+            ),
+            ("directory", lambda path: path.mkdir(mode=0o700)),
+        )
+        for control_name in ("alternates", "http-alternates"):
+            for variant, create in cases:
+                candidate = info / control_name
+                try:
+                    create(candidate)
+                    with (
+                        self.subTest(control=control_name, variant=variant),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            "entry must be absent",
+                        ),
+                    ):
+                        named_lane_runtime._resolve_claude_source_read_deny_roots(
+                            self.source_control
+                        )
+                finally:
+                    if candidate.is_symlink() or candidate.is_file():
+                        candidate.unlink()
+                    elif candidate.is_dir():
+                        candidate.rmdir()
+
+    def test_claude_source_object_info_indirection_is_rejected(self) -> None:
+        info = self.source_control / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        displaced = self.source_control / ".git/objects/info.direct"
+        external = self.root / "claude-external-object-info"
+        external.mkdir(mode=0o700)
+        info.rename(displaced)
+        cases = (
+            ("regular", lambda: info.write_bytes(b"")),
+            ("symlink", lambda: info.symlink_to(external, target_is_directory=True)),
+            (
+                "dangling-symlink",
+                lambda: info.symlink_to(
+                    self.root / "missing-claude-object-info",
+                    target_is_directory=True,
+                ),
+            ),
+        )
+        try:
+            for variant, create in cases:
+                try:
+                    create()
+                    with (
+                        self.subTest(variant=variant),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            "object-info storage must be a canonical real",
+                        ),
+                    ):
+                        named_lane_runtime._resolve_claude_source_read_deny_roots(
+                            self.source_control
+                        )
+                finally:
+                    if info.is_symlink() or info.is_file():
+                        info.unlink()
+        finally:
+            displaced.rename(info)
+
+    def test_claude_source_primary_objects_symlink_is_rejected(self) -> None:
+        objects = self.source_control / ".git/objects"
+        displaced = self.source_control / ".git/objects.direct"
+        external = self.root / "claude-external-objects"
+        external.mkdir(mode=0o700)
+        objects.rename(displaced)
+        objects.symlink_to(external, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "primary Git object directory must be a canonical real directory",
+            ):
+                named_lane_runtime._resolve_claude_source_read_deny_roots(
+                    self.source_control
+                )
+        finally:
+            objects.unlink()
+            displaced.rename(objects)
+
+    def test_claude_source_shallow_promisor_metadata_remains_eligible(self) -> None:
+        git(self.source_control, "config", "extensions.partialClone", "origin")
+        git(self.source_control, "config", "remote.origin.promisor", "true")
+        (self.source_control / ".git/shallow").write_text(
+            "0" * 40 + "\n",
+            encoding="ascii",
+        )
+        pack = self.source_control / ".git/objects/pack"
+        pack.mkdir(mode=0o700, exist_ok=True)
+        (pack / "fixture.promisor").write_text("fixture\n", encoding="utf-8")
+
+        source, roots = named_lane_runtime._resolve_claude_source_read_deny_roots(
+            self.source_control
+        )
+
+        self.assertEqual(source, self.source_control)
+        self.assertEqual(
+            roots,
+            (self.source_control, self.source_control / ".git"),
+        )
+
+    def test_claude_source_revalidation_blocks_alternate_before_spawn(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        child_marker = self.root / "alternate-pre-spawn-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n",
+            version="2.1.225",
+        )
+        alternate = self.source_control / ".git/objects/info/alternates"
+        real_snapshot = named_lane_runtime._create_claude_launch_snapshot
+
+        def snapshot_then_inject(*args: object, **kwargs: object) -> object:
+            snapshot = real_snapshot(*args, **kwargs)
+            alternate.parent.mkdir(mode=0o700, exist_ok=True)
+            alternate.write_bytes(b"")
+            return snapshot
+
+        stdout = self.root / "alternate-pre-spawn.out"
+        stderr = self.root / "alternate-pre-spawn.err"
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=snapshot_then_inject,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "entry must be absent",
+                ),
+            ):
+                self.run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            self.assertFalse(child_marker.exists())
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            alternate.unlink(missing_ok=True)
+
+    def test_claude_source_revalidation_blocks_alternate_at_terminal(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        alternate = self.source_control / ".git/objects/info/http-alternates"
+        executable = self.make_executable(
+            "import pathlib\n"
+            f"path = pathlib.Path({str(alternate)!r})\n"
+            "path.parent.mkdir(mode=0o700, exist_ok=True)\n"
+            "path.write_bytes(b'')\n"
+            "print('captured but not accepted')\n",
+            version="2.1.225",
+        )
+        stdout = self.root / "alternate-terminal.out"
+        stderr = self.root / "alternate-terminal.err"
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "entry must be absent",
+            ):
+                self.run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+        finally:
+            alternate.unlink(missing_ok=True)
+
+    def test_claude_source_revalidation_blocks_primary_replacement_at_terminal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        objects = self.source_control / ".git/objects"
+        displaced = self.source_control / ".git/objects.bound-original"
+        mode = stat.S_IMODE(objects.lstat().st_mode)
+        executable = self.make_executable(
+            "import os, pathlib\n"
+            f"objects = pathlib.Path({str(objects)!r})\n"
+            f"displaced = pathlib.Path({str(displaced)!r})\n"
+            "objects.rename(displaced)\n"
+            f"objects.mkdir(mode={mode})\n"
+            "print('captured but not accepted')\n",
+            version="2.1.225",
+        )
+        stdout = self.root / "objects-terminal.out"
+        stderr = self.root / "objects-terminal.err"
+        replaced = False
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "authority changed after initial binding",
+            ):
+                self.run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            replaced = displaced.is_dir()
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+        finally:
+            if displaced.is_dir():
+                objects.rmdir()
+                displaced.rename(objects)
+            self.assertTrue(replaced)
+
+    def test_claude_source_deny_root_rejects_non_git_alias_and_overlap(self) -> None:
+        plain = self.root / "plain-source"
+        plain.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "exact Git worktree root",
+        ):
+            named_lane_runtime._resolve_claude_source_read_deny_roots(plain)
+
+        alias = self.root / "source-alias"
+        alias.symlink_to(self.source_control, target_is_directory=True)
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "canonical real directory",
+        ):
+            named_lane_runtime._resolve_claude_source_read_deny_roots(alias)
+
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("raise SystemExit(97)\n")
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "source and review worktrees must be independent",
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.repo.resolve(),
+                stdout_path=self.root / "overlap-source.stdout",
+                stderr_path=self.root / "overlap-source.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+    def test_claude_read_boundary_rejects_every_cross_profile_overlap(self) -> None:
+        cases = (
+            (pathlib.Path("/review"), pathlib.Path("/review")),
+            (pathlib.Path("/review/worktree"), pathlib.Path("/review")),
+            (pathlib.Path("/review"), pathlib.Path("/review/control")),
+        )
+        for allowed, denied in cases:
+            with (
+                self.subTest(allowed=allowed, denied=denied),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "allowRead and denyRead roots must not overlap",
+                ),
+            ):
+                named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+                    allow_read=(allowed,),
+                    deny_read=(denied,),
+                )
+
+        named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+            allow_read=(pathlib.Path("/review/worktree"),),
+            deny_read=(pathlib.Path("/review-state"), pathlib.Path("/source")),
+        )
+        named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+            allow_read=(pathlib.Path("/dev/null"),),
+            deny_read=(pathlib.Path("/dev"),),
+        )
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "allowRead and denyRead roots must not overlap",
+        ):
+            named_lane_runtime._validate_claude_read_boundary_nonoverlap(
+                allow_read=(pathlib.Path("/dev/zero"),),
+                deny_read=(pathlib.Path("/dev"),),
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and pathlib.Path("/dev/zero").exists(),
+        "Git null exception validation requires POSIX device nodes",
+    )
+    def test_claude_git_null_read_exception_is_exact_and_identity_bound(
+        self,
+    ) -> None:
+        binding = named_lane_runtime._claude_git_null_read_exception_binding()
+        self.assertEqual(binding["path"], "/dev/null")
+        self.assertEqual(
+            binding["identity_binding"],
+            "canonical-no-follow-character-device",
+        )
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "must be exact canonical /dev/null",
+        ):
+            named_lane_runtime._claude_git_null_read_exception_binding(
+                pathlib.Path("/dev/zero")
+            )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime.os,
+                "fstat",
+                return_value=pathlib.Path("/dev/zero").stat(),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed during validation",
+            ),
+        ):
+            named_lane_runtime._claude_git_null_read_exception_binding()
+
+    @unittest.skipUnless(
+        os.name == "posix",
+        "Git null exception receipt binding requires POSIX",
+    )
+    def test_claude_git_null_identity_drift_blocks_receipt_publication(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        home = self.make_claude_home()
+        executable = self.make_executable("pass\n", version="2.1.225")
+        stdout = self.root / "null-drift.stdout"
+        stderr = self.root / "null-drift.stderr"
+        initial = named_lane_runtime._claude_git_null_read_exception_binding()
+        changed = json.loads(json.dumps(initial))
+        changed["identity"]["inode"] += 1
+
+        with (
+            mock.patch("pwd.getpwuid", return_value=self.claude_account(home)),
+            mock.patch.object(
+                named_lane_runtime,
+                "_claude_git_null_read_exception_binding",
+                side_effect=(initial, changed),
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed before receipt generation",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
 
     @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
     def test_claude_environment_rejects_mismatched_real_and_effective_users(
@@ -10361,7 +14652,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             version="2.1.226",
         )
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-parent.out",
                 stderr_path=self.root / "session-env-parent.err",
@@ -10396,7 +14687,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-nonempty.out",
                 stderr_path=self.root / "session-env-nonempty.err",
@@ -10434,7 +14725,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-replaced.out",
                 stderr_path=self.root / "session-env-replaced.err",
@@ -10472,7 +14763,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-mode.out",
                 stderr_path=self.root / "session-env-mode.err",
@@ -10503,7 +14794,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             version="2.1.226",
         )
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-tightening.out",
                 stderr_path=self.root / "session-env-tightening.err",
@@ -10538,7 +14829,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime._ClaudeSessionEnvCustodyError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-parent-drift.out",
                 stderr_path=self.root / "session-env-parent-drift.err",
@@ -10552,11 +14843,17 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse((displaced / context.exception.session_id).exists())
         self.assertTrue(displaced.is_dir())
 
-    def test_claude_session_selection_is_guard_owned(self) -> None:
+    def test_claude_rejects_every_caller_owned_argument(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
         executable = self.make_executable("raise SystemExit(97)\n", version="2.1.226")
         for selector in (
+            ("--print",),
+            ("--safe-mode",),
+            ("--settings", "{}"),
+            ("--settings={}",),
+            ("--allowedTools", "Read(./**),Grep,Glob,Bash"),
+            ("--unknown",),
             ("--session-id", "00000000-0000-4000-8000-000000000000"),
             ("--session-id=00000000-0000-4000-8000-000000000000",),
             ("--resume", "fixture"),
@@ -10579,10 +14876,10 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.subTest(selector=selector),
                 self.assertRaisesRegex(
                     NamedLaneGuardError,
-                    "session selection is owned",
+                    "arguments are owned by the named-lane guard",
                 ),
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / f"selector-{selector[0][2:]}.out",
                     stderr_path=self.root / f"selector-{selector[0][2:]}.err",
@@ -10613,7 +14910,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     clear=True,
                 ):
                     with self.assertRaisesRegex(NamedLaneGuardError, message):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"{label}.out",
                             stderr_path=self.root / f"{label}.err",
@@ -10678,7 +14975,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 stdout = self.root / f"stdout-{size}.bin"
                 stderr = self.root / f"stderr-{size}.bin"
                 if should_pass:
-                    result = run_claude(
+                    result = self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=stdout,
                         stderr_path=stderr,
@@ -10690,7 +14987,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     self.assertEqual(result["stdout_bytes"], 4)
                 else:
                     with self.assertRaises(ReviewOutputLimitError):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=stdout,
                             stderr_path=stderr,
@@ -10715,7 +15012,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         started = time.monotonic()
 
         with self.assertRaises(ReviewTimeoutError):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "timeout.out",
                 stderr_path=self.root / "timeout.err",
@@ -10736,7 +15033,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.commit()
         pid_path = self.root / "detached.pid"
         executable = self.make_executable(
-            "import os, pathlib, sys, time\n"
+            "import os, pathlib, time\n"
             "ready_read, ready_write = os.pipe()\n"
             "pid = os.fork()\n"
             "if pid == 0:\n"
@@ -10753,7 +15050,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "    time.sleep(30)\n"
             "    os._exit(0)\n"
             "os.close(ready_read)\n"
-            "pid_path = pathlib.Path(sys.argv[1])\n"
+            f"pid_path = pathlib.Path({str(pid_path)!r})\n"
             "temporary_path = pid_path.with_suffix('.tmp')\n"
             "temporary_path.write_text(str(pid), encoding='ascii')\n"
             "os.replace(temporary_path, pid_path)\n"
@@ -10763,11 +15060,11 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         detached_pid: int | None = None
         try:
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "detached.out",
                 stderr_path=self.root / "detached.err",
-                command=(str(executable), str(pid_path)),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=64,
@@ -10796,7 +15093,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         executable = self.make_executable("pass\n")
 
         with self.assertRaisesRegex(NamedLaneGuardError, "outside the worktree"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.repo / "stdout",
                 stderr_path=self.root / "stderr",
@@ -10806,7 +15103,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 stream_limit_bytes=64,
             )
         with self.assertRaisesRegex(NamedLaneGuardError, "must be absolute"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "stdout",
                 stderr_path=self.root / "stderr",
@@ -10824,7 +15121,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         dangling.symlink_to(self.root / "missing-target")
 
         with self.assertRaisesRegex(NamedLaneGuardError, "already exist"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=dangling,
                 stderr_path=self.root / "dangling.err",
@@ -10841,7 +15138,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(
             NamedLaneGuardError, "real directory|traverse a symlink"
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=linked_parent / "stdout",
                 stderr_path=self.root / "linked.err",
@@ -10857,7 +15154,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         linked_ancestor = self.root / "linked-ancestor"
         linked_ancestor.symlink_to(real_ancestor, target_is_directory=True)
         with self.assertRaisesRegex(NamedLaneGuardError, "traverse a symlink"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=linked_ancestor / "nested" / "stdout",
                 stderr_path=self.root / "ancestor.err",
@@ -10879,7 +15176,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             NamedLaneGuardError,
             "current-user-owned with mode 0700",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=output_parent / "stdout",
                 stderr_path=output_parent / "stderr",
@@ -10896,7 +15193,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         output_parent.mkdir(mode=0o700)
         output_parent.chmod(0o700)
         executable = self.make_executable(
-            "import os, pathlib, sys\nos.chmod(pathlib.Path(sys.argv[1]), 0o755)\n"
+            "import os, pathlib\n"
+            f"os.chmod(pathlib.Path({str(output_parent)!r}), 0o755)\n"
         )
 
         try:
@@ -10904,11 +15202,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "changed after validation",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout",
                     stderr_path=output_parent / "stderr",
-                    command=(str(executable), str(output_parent)),
+                    command=(str(executable),),
                     prompt=b"",
                     timeout_seconds=2.0,
                     stream_limit_bytes=64,
@@ -10931,9 +15229,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         output_parent.chmod(0o700)
         executable = self.make_executable(
             "import os, pathlib, sys\n"
-            "parent = pathlib.Path(sys.argv[1])\n"
-            "displaced = pathlib.Path(sys.argv[2])\n"
-            "redirect = pathlib.Path(sys.argv[3])\n"
+            f"parent = pathlib.Path({str(output_parent)!r})\n"
+            f"displaced = pathlib.Path({str(displaced_parent)!r})\n"
+            f"redirect = pathlib.Path({str(self.repo)!r})\n"
             "os.rename(parent, displaced)\n"
             "os.symlink(redirect, parent, target_is_directory=True)\n"
             "sys.stdout.write('captured stdout')\n"
@@ -10941,16 +15239,11 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(NamedLaneGuardError, "changed after validation"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=output_parent / "stdout.bin",
                 stderr_path=output_parent / "stderr.bin",
-                command=(
-                    str(executable),
-                    str(output_parent),
-                    str(displaced_parent),
-                    str(self.repo),
-                ),
+                command=(str(executable),),
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=64,
@@ -10976,10 +15269,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         output_parent.mkdir(mode=0o700)
         output_parent.chmod(0o700)
         executable = self.make_executable(
-            "import os, pathlib, sys\n"
-            "parent = pathlib.Path(sys.argv[1])\n"
-            "displaced = pathlib.Path(sys.argv[2])\n"
-            "redirect = pathlib.Path(sys.argv[3])\n"
+            "import os, pathlib\n"
+            f"parent = pathlib.Path({str(output_parent)!r})\n"
+            f"displaced = pathlib.Path({str(displaced_parent)!r})\n"
+            f"redirect = pathlib.Path({str(self.repo)!r})\n"
             "os.rename(parent, displaced)\n"
             "os.symlink(redirect, parent, target_is_directory=True)\n"
         )
@@ -11008,16 +15301,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout.bin",
                     stderr_path=output_parent / "stderr.bin",
-                    command=(
-                        str(executable),
-                        str(output_parent),
-                        str(displaced_parent),
-                        str(self.repo),
-                    ),
+                    command=(str(executable),),
                     prompt=b"",
                     timeout_seconds=2.0,
                     stream_limit_bytes=64,
@@ -11073,7 +15361,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 NamedLaneGuardError, "temporary cleanup failed"
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11118,7 +15406,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "temporary file cannot be inspected safely",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11162,7 +15450,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     NamedLaneGuardError,
                     "temporary cleanup remained incomplete",
                 ) as context:
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=stdout,
                         stderr_path=stderr,
@@ -11202,7 +15490,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "requires main-thread signal masking",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11254,7 +15542,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ) as restore,
         ):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11294,7 +15582,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             side_effect=interrupt_second_write,
         ):
             with self.assertRaises(KeyboardInterrupt):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11359,7 +15647,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
         ):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11414,7 +15702,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "rollback remained incomplete",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11466,7 +15754,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 NamedLaneGuardError,
                 "cleanup or rollback remained incomplete",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -11495,6 +15783,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
                 "--preflight-result",
                 str(self.preflight_result_path(executable)),
                 "--stdout-path",
@@ -11552,6 +15842,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-prompt-signal-preflight.json"),
             "--stdout-path",
@@ -11590,7 +15882,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 128 + int(forwarded))
                 self.assertEqual(stdout.getvalue(), "")
@@ -11635,11 +15927,13 @@ class NamedLaneGuardTest(unittest.TestCase):
             ) as run,
             mock.patch.object(named_lane_runtime, "_emit") as emit,
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-prompt-budget-preflight.json"),
                     "--stdout-path",
@@ -11722,11 +16016,13 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "run-claude",
                             "--worktree",
                             str(self.repo.resolve()),
+                            "--source-worktree",
+                            str(self.source_control),
                             "--preflight-result",
                             str(preflight),
                             "--stdout-path",
@@ -11787,7 +16083,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with contextlib.redirect_stdout(receipt_stdout):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
@@ -11861,11 +16157,13 @@ class NamedLaneGuardTest(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(preflight),
                     "--stdout-path",
@@ -11923,7 +16221,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 ReviewTimeoutError,
                 "synthetic slow Git resolution",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "git-deadline.stdout",
                     stderr_path=self.root / "git-deadline.stderr",
@@ -11976,6 +16274,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / f"unused-{label}-cap-preflight.json"),
                     "--stdout-path",
@@ -11995,7 +16295,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(stdout.getvalue(), "")
@@ -12035,7 +16335,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                         NamedLaneGuardError,
                         "must not exceed",
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / "direct-cap.stdout",
                             stderr_path=self.root / "direct-cap.stderr",
@@ -12092,6 +16392,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-cleanup-preflight.json"),
             "--stdout-path",
@@ -12115,7 +16417,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -12140,6 +16442,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-locator-preflight.json"),
             "--stdout-path",
@@ -12163,7 +16467,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -12193,6 +16497,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-session-cleanup-preflight.json"),
             "--stdout-path",
@@ -12216,7 +16522,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -12254,6 +16560,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-unquiescent-preflight.json"),
                     "--stdout-path",
@@ -12277,7 +16585,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     ),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(
@@ -12309,6 +16617,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-session-custody-preflight.json"),
             "--stdout-path",
@@ -12332,7 +16642,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -12369,6 +16679,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-control-cleanup-preflight.json"),
             "--stdout-path",
@@ -12392,7 +16704,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         payload = json.loads(stderr.getvalue())
@@ -12422,6 +16734,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--source-worktree",
+            str(self.source_control),
             "--preflight-result",
             str(self.root / "unused-process-leak-preflight.json"),
             "--stdout-path",
@@ -12445,7 +16759,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         payload = json.loads(stderr.getvalue())
@@ -12454,6 +16768,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(payload["session_env"]["retained_locator"]["leaf_inode"], 79)
         self.assertEqual(payload["snapshot"]["retained_locator"]["parent_inode"], 71)
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_control_object_reason_is_stable_across_safety_commands(self) -> None:
         reason = "materialized-git-config-content-mismatch"
         error = named_lane_runtime._ControlObjectGuardError(
@@ -12496,7 +16811,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     mock.patch(target, side_effect=error),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(
@@ -12504,6 +16819,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     {"status": "blocked-safety", "reason": reason},
                 )
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (
             ("deadline", lambda: ReviewTimeoutError("deadline"), 2),
@@ -12570,6 +16886,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.root / "unused-classification-preflight.json"),
                     "--stdout-path",
@@ -12600,7 +16918,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                                 )
                             )
                         stack.enter_context(contextlib.redirect_stderr(stderr))
-                        returncode = named_lane_main(argv)
+                        returncode = self.named_lane_main(argv)
 
                     self.assertEqual(returncode, expected_returncode)
                     self.assertEqual(
@@ -12608,6 +16926,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                         {"status": expected_status, "reason": reason},
                     )
 
+    @retired_public_commands("materialize-worktree", "validate-worktree")
     def test_cli_wraps_thread_start_failure_by_subcommand(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit()
@@ -12658,6 +16977,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--source-worktree",
+                    str(self.source_control),
                     "--preflight-result",
                     str(self.preflight_result_path(executable)),
                     "--stdout-path",
@@ -12690,7 +17011,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                             )
                         )
                     stack.enter_context(contextlib.redirect_stderr(stderr))
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(

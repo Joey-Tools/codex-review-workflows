@@ -419,6 +419,7 @@ def main(
             executable = (entrypoint or pathlib.Path(sys.argv[0])).resolve(strict=True)
             if arguments.command == "preflight":
                 result = preflight(
+                    entrypoint=executable,
                     helper_state=arguments.helper_state,
                     repo=arguments.repo,
                     base_sha=arguments.base_sha,

@@ -11,7 +11,11 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import claude_capabilities as capabilities  # noqa: E402
 
 
-def supported_help(*, safe_mode: str | None = None) -> str:
+def supported_help(
+    *,
+    safe_mode: str | None = None,
+    required_options: tuple[str, ...] = capabilities.CLAUDE_REQUIRED_OPTIONS,
+) -> str:
     safe_mode = safe_mode or (
         "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP "
         "servers, custom commands and agents, output styles, workflows, custom "
@@ -20,7 +24,7 @@ def supported_help(*, safe_mode: str | None = None) -> str:
         "normally. Sets CLAUDE_CODE_SAFE_MODE=1."
     )
     lines = ["Usage: claude [options]", "", "Options:"]
-    for option in capabilities.CLAUDE_REQUIRED_OPTIONS:
+    for option in required_options:
         if option == "--safe-mode":
             description = safe_mode
         elif option == "--permission-mode":
@@ -33,7 +37,7 @@ def supported_help(*, safe_mode: str | None = None) -> str:
 
 class ClaudeCapabilitiesTest(unittest.TestCase):
     def test_named_direct_session_capability_starts_at_2_1_226(self) -> None:
-        baseline = capabilities.CLAUDE_REQUIRED_OPTIONS
+        baseline = capabilities.CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS
         before = capabilities.named_direct_required_options("2.1.225")
         gated = capabilities.named_direct_required_options("2.1.226")
 
@@ -122,6 +126,48 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             "required review option",
         ):
             capabilities.validate_claude_help(help_text)
+
+    def test_help_requires_input_format_for_text_stdin(self) -> None:
+        required_options = capabilities.CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS
+        help_text = supported_help(required_options=required_options).replace(
+            "  --input-format <value>  Supported option.\n",
+            "",
+        )
+
+        with self.assertRaisesRegex(
+            capabilities.ClaudeCapabilityUnavailable,
+            "required review option",
+        ):
+            capabilities.validate_claude_help(
+                help_text,
+                required_options=required_options,
+            )
+
+    def test_helper_and_named_direct_required_options_remain_distinct(self) -> None:
+        self.assertNotIn("--input-format", capabilities.CLAUDE_REQUIRED_OPTIONS)
+        self.assertEqual(
+            capabilities.CLAUDE_NAMED_DIRECT_REQUIRED_OPTIONS,
+            (
+                "--print",
+                "--input-format",
+                "--model",
+                "--effort",
+                "--permission-mode",
+                "--output-format",
+                "--verbose",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--no-chrome",
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "--setting-sources",
+                "--settings",
+                "--tools",
+                "--allowedTools",
+                "--disallowedTools",
+            ),
+        )
 
     def test_help_requires_dont_ask_permission_mode_before_credentials(self) -> None:
         help_text = supported_help().replace("dontAsk, ", "")
