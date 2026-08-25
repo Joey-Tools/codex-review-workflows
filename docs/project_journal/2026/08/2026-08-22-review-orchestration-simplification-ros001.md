@@ -1926,6 +1926,21 @@ superseded_by:
   and `git diff --check` passed, and the original reviewer found no findings in
   its targeted recheck of the complete three-file repair.
 
+### Workspace no-lazy-fetch documentation correction after `713e296`
+
+- The final fresh-context whole-range reviewer found one P3 contract mismatch:
+  `review-workspace.md` said the workspace helper had no global Git
+  `--no-lazy-fetch` option even though every helper-owned Git argv and its
+  regression test already require that option.
+- The runtime remains unchanged. The contract now records its actual dual
+  control: workspace-helper subprocesses receive both
+  `GIT_NO_LAZY_FETCH=1` and `--no-lazy-fetch`, while the separate closed
+  `sanitized-git-argv-prefix-v2` for a local Codex reviewer intentionally uses
+  only the environment token. A contract regression preserves that distinction
+  without relaxing either exact token profile.
+- All `32` general contract tests passed. Ruff lint/format and
+  `git diff --check` also passed.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

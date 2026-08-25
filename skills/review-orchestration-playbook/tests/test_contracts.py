@@ -817,6 +817,18 @@ class RepositoryContractTest(unittest.TestCase):
         for document in (contracts, prompts, local, workspace, role):
             self.assertIn("sanitized_git_argv_prefix", document)
 
+        self.assertIn(
+            "workspace-helper subprocesses by both the exact\n"
+            "  `GIT_NO_LAZY_FETCH=1` environment token and Git's global "
+            "`--no-lazy-fetch`",
+            workspace,
+        )
+        self.assertIn(
+            "`sanitized-git-argv-prefix-v2` used by a local Codex reviewer\n"
+            "  deliberately omits that global option",
+            workspace,
+        )
+
         for fixed_token in (
             "/usr/bin/env",
             "-i",
