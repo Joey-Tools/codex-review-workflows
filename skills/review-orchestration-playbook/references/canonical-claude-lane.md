@@ -161,14 +161,31 @@ same character-device identity before/open/after, and revalidates it before
 receipt generation; `/dev/zero` and every other equal or ancestor/descendant
 overlap fail closed. This exception does not turn `allowRead` into a global
 host-read whitelist or attest the runtime's final merged path rules.
-The
-source-worktree input must be the parent-authoritative source used by workspace
-materialization, not merely another Git repository. The guard resolves its
-worktree, linked-worktree admin, and common Git directories and records all
-distinct roots as requested `denyRead` paths. The parent must compare those
-roots with its materialization authority; guard path validation alone does not
-prove source lineage or rule out an authority the materializer separately
-forbids, such as alternate object storage.
+The source-worktree input must be the parent-authoritative source used by
+workspace preparation, not merely another Git repository. `run-claude`
+independently resolves and identity-binds its worktree, linked-worktree admin,
+common Git directory, and exact canonical real `<common>/objects` primary
+store. It fails closed if either lexical `objects/info/alternates` or
+`objects/info/http-alternates` entry exists, regardless of content, relative
+spelling, file type, symlink target, or a dangling symlink. It never
+recursively adopts or merely adds an alternate authority to `denyRead`.
+
+The distinct worktree, admin, and common roots remain requested `denyRead`
+paths; the primary object store is already beneath the common root, but its
+exact path and directory identity are separately receipt-bound under the
+`direct-primary-only` policy. An ordinary clone, linked worktree, shallow or
+promisor source, and an independent filesystem reflink/COW copy remain eligible
+when they satisfy that direct-store rule. Use an independent clone or
+`--dissociate` for an alternate-backed source.
+
+The guard reruns the complete source resolver against the initial binding
+immediately before child spawn and again after child quiescence before any
+terminal output or receipt is accepted. A persistent alternate entry, path
+change, or identity replacement blocks launch or terminal acceptance and rolls
+back unpublished output. These point checks do not claim protection from a
+same-UID ABA replacement wholly contained between checks. The parent must still
+compare the receipt authority with its preparation authority; guard validation
+does not by itself prove source lineage.
 
 The process supervisor proves only the launch and process evidence it records. It does not prove compatible-version provenance by itself and is not a whole-process-tree sandbox.
 
@@ -208,8 +225,13 @@ A successful process receipt contains `launch_binding.argv_profile`. Before
 stream validation, the parent independently rebuilds the expected closed
 profile from its authoritative preflight, workspace/materialization receipts,
 source identity, output destinations, account identity, model choice, and
-environment decision. It must exact-check the profile/schema/conformance
+environment decision. The current closed profile identifier is
+`named-direct-claude-argv-v2`; version 2 adds the required direct-primary source
+authority and checkpoint bindings. It must exact-check the profile/schema/conformance
 identifiers; model and effort; worktree, private Git, account-home, source,
+the `direct-primary-only` source-authority policy, canonical primary-object
+path and identity, optional object-info identity, and the pre-spawn plus
+pre-terminal revalidation checkpoint declaration;
 preflight, output-parent, and environment bindings; canonical settings and its
 SHA-256; the exact Git-null exception path, identity binding, and device
 identity; all requested-only, parser-attestation, managed-policy, and sandbox-

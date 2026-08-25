@@ -81,7 +81,7 @@ CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
     "cooperative-claude-control-directory-flock-same-uid-host-tcb"
 )
 CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
-CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v1"
+CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v2"
 CLAUDE_DIRECT_ARGV_CONFORMANCE = "guard-constructed-exact-token-sequence"
 CLAUDE_DIRECT_SETTINGS_SCHEMA = "named-direct-claude-settings-v1"
 CLAUDE_DIRECT_ENVIRONMENT_PROFILE = "named-direct-claude-environment-v1"
@@ -1729,6 +1729,21 @@ class _ClaudeExecutableBinding:
 
 
 @dataclass(frozen=True)
+class _ClaudeSourceReadBoundaryBinding:
+    source_worktree: pathlib.Path
+    source_identity: _DirectoryIdentity
+    marker: _MaterializerSourceMarkerBinding
+    admin: pathlib.Path
+    admin_identity: _DirectoryIdentity
+    common: pathlib.Path
+    common_identity: _DirectoryIdentity
+    objects: pathlib.Path
+    objects_identity: _DirectoryIdentity
+    object_info_identity: _DirectoryIdentity | None
+    deny_roots: tuple[pathlib.Path, ...]
+
+
+@dataclass(frozen=True)
 class _ClaudeDirectArgvProfile:
     model: str
     worktree: pathlib.Path
@@ -1736,6 +1751,7 @@ class _ClaudeDirectArgvProfile:
     account_home: pathlib.Path
     source_worktree: pathlib.Path
     source_read_deny_roots: tuple[pathlib.Path, ...]
+    source_read_boundary: _ClaudeSourceReadBoundaryBinding
     preflight_result: pathlib.Path
     output_bindings: Mapping[str, object]
     environment_binding: Mapping[str, object]
@@ -8327,9 +8343,71 @@ def _resolve_claude_isolation_directory(
     return resolved
 
 
-def _resolve_claude_source_read_deny_roots(
+def _claude_direct_primary_source_guidance() -> str:
+    return (
+        "use an ordinary or linked worktree with canonical <common>/objects, "
+        "a filesystem reflink/COW copy, or a clone made independent with "
+        "--dissociate"
+    )
+
+
+def _claude_source_object_info_identity(
+    objects: pathlib.Path,
+) -> _DirectoryIdentity | None:
+    info = objects / "info"
+    try:
+        metadata = info.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage cannot be inspected; "
+            + _claude_direct_primary_source_guidance()
+        ) from error
+    try:
+        resolved = info.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage must be a canonical real "
+            "current-user directory; " + _claude_direct_primary_source_guidance()
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+        or resolved != info
+    ):
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage must be a canonical real "
+            "current-user directory; " + _claude_direct_primary_source_guidance()
+        )
+    return _directory_identity(metadata)
+
+
+def _reject_claude_source_alternate_entries(objects: pathlib.Path) -> None:
+    info = objects / "info"
+    for candidate, label in (
+        (info / "alternates", "local alternates"),
+        (info / "http-alternates", "HTTP alternates"),
+    ):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise NamedLaneGuardError(
+                f"Claude source Git {label} state cannot be inspected; "
+                + _claude_direct_primary_source_guidance()
+            ) from error
+        raise NamedLaneGuardError(
+            f"Claude source Git {label} entry must be absent, regardless of "
+            "its contents or file type; " + _claude_direct_primary_source_guidance()
+        )
+
+
+def _bind_claude_source_read_boundary(
     source_worktree: pathlib.Path,
-) -> tuple[pathlib.Path, tuple[pathlib.Path, ...]]:
+) -> _ClaudeSourceReadBoundaryBinding:
     source = _resolve_claude_isolation_directory(
         source_worktree,
         label="Claude source worktree",
@@ -8343,40 +8421,112 @@ def _resolve_claude_source_read_deny_roots(
     admin = marker.expected_admin
     _verify_materializer_source_back_pointer(marker, admin)
     commondir = admin / "commondir"
-    try:
-        commondir.lstat()
-    except FileNotFoundError:
-        common = admin
-    except OSError as error:
-        raise NamedLaneGuardError(
-            "Claude source Git common directory cannot be inspected"
-        ) from error
-    else:
+
+    def resolve_common_directory() -> pathlib.Path:
+        try:
+            commondir.lstat()
+        except FileNotFoundError:
+            return admin
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "Claude source Git common directory cannot be inspected"
+            ) from error
         payload = _read_materializer_control_file(
             commondir,
             label="Git common-directory marker",
         )
         try:
-            common = _materializer_control_path(
+            return _materializer_control_path(
                 payload,
                 relative_to=admin,
                 label="Git common-directory marker",
             )
         finally:
             payload[:] = b"\x00" * len(payload)
+
+    common = resolve_common_directory()
+    objects = common / "objects"
+    path_metadata: dict[pathlib.Path, os.stat_result] = {}
     for path, label in (
+        (source, "Claude source worktree"),
         (admin, "Claude source Git admin directory"),
         (common, "Claude source Git common directory"),
+        (objects, "Claude source primary Git object directory"),
     ):
         resolved = _resolve_claude_isolation_directory(path, label=label)
         try:
-            metadata = resolved.stat()
+            metadata = resolved.lstat()
         except OSError as error:
             raise NamedLaneGuardError(f"{label} cannot be inspected") from error
         if metadata.st_uid != _current_user_id():
             raise NamedLaneGuardError(f"{label} must be current-user-owned")
+        path_metadata[path] = metadata
+    object_info_identity = _claude_source_object_info_identity(objects)
+    _reject_claude_source_alternate_entries(objects)
+
+    _verify_materializer_source_marker(marker, source)
+    _verify_materializer_source_back_pointer(marker, admin)
+    if resolve_common_directory() != common:
+        raise NamedLaneGuardError(
+            "Claude source Git common-directory authority changed during "
+            "direct-primary source validation"
+        )
+    for path, label in (
+        (source, "Claude source worktree"),
+        (admin, "Claude source Git admin directory"),
+        (common, "Claude source Git common directory"),
+        (objects, "Claude source primary Git object directory"),
+    ):
+        resolved = _resolve_claude_isolation_directory(path, label=label)
+        try:
+            final_metadata = resolved.lstat()
+        except OSError as error:
+            raise NamedLaneGuardError(f"{label} cannot be revalidated") from error
+        if _directory_identity(final_metadata) != _directory_identity(
+            path_metadata[path]
+        ):
+            raise NamedLaneGuardError(
+                f"{label} changed during direct-primary source validation"
+            )
+    final_object_info_identity = _claude_source_object_info_identity(objects)
+    _reject_claude_source_alternate_entries(objects)
+    if final_object_info_identity != object_info_identity:
+        raise NamedLaneGuardError(
+            "Claude source Git object-info storage changed during direct-primary "
+            "source validation"
+        )
     roots = tuple(dict.fromkeys((source, admin, common)))
-    return source, roots
+    return _ClaudeSourceReadBoundaryBinding(
+        source_worktree=source,
+        source_identity=_directory_identity(path_metadata[source]),
+        marker=marker,
+        admin=admin,
+        admin_identity=_directory_identity(path_metadata[admin]),
+        common=common,
+        common_identity=_directory_identity(path_metadata[common]),
+        objects=objects,
+        objects_identity=_directory_identity(path_metadata[objects]),
+        object_info_identity=object_info_identity,
+        deny_roots=roots,
+    )
+
+
+def _resolve_claude_source_read_deny_roots(
+    source_worktree: pathlib.Path,
+) -> tuple[pathlib.Path, tuple[pathlib.Path, ...]]:
+    binding = _bind_claude_source_read_boundary(source_worktree)
+    return binding.source_worktree, binding.deny_roots
+
+
+def _revalidate_claude_source_read_boundary(
+    expected: _ClaudeSourceReadBoundaryBinding,
+) -> None:
+    observed = _bind_claude_source_read_boundary(expected.source_worktree)
+    if observed != expected:
+        raise NamedLaneGuardError(
+            "Claude source direct-primary authority changed after initial "
+            "binding; " + _claude_direct_primary_source_guidance()
+        )
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -8569,9 +8719,9 @@ def _build_claude_direct_argv_profile(
         raise NamedLaneGuardError(
             "Claude model must match the canonical named-direct model profile"
         )
-    source, source_read_deny_roots = _resolve_claude_source_read_deny_roots(
-        source_worktree
-    )
+    source_read_boundary = _bind_claude_source_read_boundary(source_worktree)
+    source = source_read_boundary.source_worktree
+    source_read_deny_roots = source_read_boundary.deny_roots
     if (
         source == worktree
         or is_relative_to(source, worktree)
@@ -8703,6 +8853,7 @@ def _build_claude_direct_argv_profile(
         account_home=home,
         source_worktree=source,
         source_read_deny_roots=source_read_deny_roots,
+        source_read_boundary=source_read_boundary,
         preflight_result=preflight_result,
         output_bindings={
             "stdout": _claude_output_profile_binding(stdout),
@@ -8721,6 +8872,7 @@ def _claude_direct_argv_profile_receipt(
     *,
     effective_arguments: Sequence[str],
 ) -> dict[str, object]:
+    _revalidate_claude_source_read_boundary(profile.source_read_boundary)
     if _claude_git_null_read_exception_binding() != profile.git_null_read_exception:
         raise NamedLaneGuardError(
             "Claude Git null read exception changed before receipt generation"
@@ -8739,9 +8891,29 @@ def _claude_direct_argv_profile_receipt(
         "review_git_metadata": str(profile.git_metadata),
         "account_home": str(profile.account_home),
         "source_worktree": str(profile.source_worktree),
-        "source_worktree_binding": "parent-supplied-deny-root",
+        "source_worktree_binding": "parent-supplied-direct-primary-only-deny-root",
         "source_read_deny_roots": [
             str(path) for path in profile.source_read_deny_roots
+        ],
+        "source_authority_policy": "direct-primary-only",
+        "source_primary_object_store": str(profile.source_read_boundary.objects),
+        "source_primary_object_store_identity": {
+            "device": profile.source_read_boundary.objects_identity.device,
+            "inode": profile.source_read_boundary.objects_identity.inode,
+            "uid": profile.source_read_boundary.objects_identity.owner,
+        },
+        "source_object_info_identity": (
+            None
+            if profile.source_read_boundary.object_info_identity is None
+            else {
+                "device": profile.source_read_boundary.object_info_identity.device,
+                "inode": profile.source_read_boundary.object_info_identity.inode,
+                "uid": profile.source_read_boundary.object_info_identity.owner,
+            }
+        ),
+        "source_authority_revalidation": [
+            "pre-spawn",
+            "pre-terminal-acceptance",
         ],
         "preflight_result": str(profile.preflight_result),
         "output_bindings": profile.output_bindings,
@@ -10171,6 +10343,9 @@ def run_claude(
                         require_exact_mode=True,
                         require_lexical_parent=True,
                     )
+                _revalidate_claude_source_read_boundary(
+                    argv_profile.source_read_boundary
+                )
                 restore_signal_mask(snapshot_mask)
                 try:
                     process_timeout = _remaining_deadline_seconds(
@@ -10451,6 +10626,9 @@ def run_claude(
                     for forwarded in forwarded_signals():
                         previous_handlers[forwarded] = signal.getsignal(forwarded)
                         signal.signal(forwarded, defer_publication_signal)
+                    _revalidate_claude_source_read_boundary(
+                        argv_profile.source_read_boundary
+                    )
                     _revalidate_output_parent(stdout)
                     _revalidate_output_parent(stderr)
                     published_outputs.append(

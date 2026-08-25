@@ -1043,12 +1043,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_BoundSourceLoader", guard_source)
         self.assertIn("sys.flags.dont_write_bytecode", guard_source)
 
-    def test_workspace_accepts_dependent_sources_but_builds_independent_destination(
+    def test_workspace_requires_direct_primary_source_and_independent_destination(
         self,
     ) -> None:
         workspace = _read("references/review-workspace.md")
         contracts = _read("references/review-lane-contracts.md")
+        claude = _read("references/canonical-claude-lane.md")
         runtime = (RUNTIME / "review_workspace.py").read_text(encoding="utf-8")
+        named_runtime = (RUNTIME / "named_lane.py").read_text(encoding="utf-8")
         normalized_workspace = _normalize(workspace)
         normalized_contracts = _normalize(contracts)
 
@@ -1057,7 +1059,21 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("source", normalized)
             self.assertIn("shallow", normalized)
             self.assertIn("promisor", normalized)
-            self.assertIn("alternate", normalized)
+        for document in (workspace, claude):
+            normalized = _normalize(document)
+            self.assertIn("canonical real `<common", normalized)
+            self.assertIn("direct-primary-only", normalized)
+            self.assertIn("objects/info/alternates", normalized)
+            self.assertIn("objects/info/http-alternates", normalized)
+            self.assertIn("dangling symlink", normalized)
+            self.assertIn("reflink/cow", normalized)
+            self.assertIn("--dissociate", normalized)
+            self.assertIn("same-uid aba", normalized)
+        self.assertNotIn("backed by alternates", normalized_workspace)
+        self.assertNotIn(
+            "every local object-store authority",
+            normalized_workspace,
+        )
         combined = _normalize(workspace + "\n" + contracts)
         self.assertIn("no hardlinks", combined)
         self.assertIn("no source back-pointer", combined)
@@ -1097,6 +1113,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('"workspace-object-hardlink"', runtime)
         self.assertIn('"workspace-promisor-state"', runtime)
         self.assertIn('objects / "info/alternates"', runtime)
+        self.assertIn('objects / "info/http-alternates"', runtime)
+        self.assertIn("_validate_direct_primary_object_store", runtime)
+        self.assertIn("_revalidate_source_repository", runtime)
+        self.assertNotIn("def _discover_object_stores", runtime)
+        self.assertIn("_bind_claude_source_read_boundary", named_runtime)
+        self.assertIn("_revalidate_claude_source_read_boundary", named_runtime)
+        self.assertIn('"source_authority_policy": "direct-primary-only"', named_runtime)
+        self.assertIn(
+            '"pre-terminal-acceptance"',
+            named_runtime,
+        )
         self.assertIn('shallow = b"".join(', runtime)
         self.assertIn("if shallow:", runtime)
         self.assertNotIn('shallow = f"{base}\\n".encode("ascii")', runtime)

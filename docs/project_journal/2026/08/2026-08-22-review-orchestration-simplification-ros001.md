@@ -1695,6 +1695,64 @@ superseded_by:
   1,265.683 seconds. Signed-head admission and another fresh whole-range Ultra
   review remain mandatory before this remediation can be called clean.
 
+### Formal whole-range findings after `64291d9`
+
+- Signed candidate `64291d9411af370d7577596e0f977ae1dc0d9632`
+  received a fresh-context GPT-5.6 Sol Ultra whole-range review over exact base
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51`. The independently materialized
+  workspace and repeated validation receipts agreed on 21 inclusive commits,
+  20 parent edges, parent-graph SHA-256
+  `31b53b786a6222d0de9c710852062f92c3c7e2de35e3be4a9fcc06b72c6c0572`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The parent-owned prompt was 7,050 bytes with SHA-256
+  `90b1bf8b6f7ab6ec41671f0be0a2a37f212fbbc649ed67913b23fc851c30df31`.
+  The reviewer inspected all 60 changed paths and returned three findings.
+- The P1 source-authority finding exposed a mismatch between the new workspace
+  helper and the Claude read boundary: local Git alternates were accepted and
+  imported, but an alternate object store outside source/admin/common was not
+  included in Claude `denyRead`. An external or symlinked primary objects
+  directory is the same class of bypass. The remediation intentionally chooses
+  direct primary storage instead of expanding the closed receipt and CLI:
+  `<common>/objects` must be canonical and real, and local/HTTP alternate
+  metadata is rejected. Ordinary clones, linked worktrees, shallow/promisor
+  sources, and filesystem reflink/COW clones remain supported; reference/shared
+  clones must be dissociated first. This is a point-in-time bind/revalidate
+  contract and does not claim resistance to an unobserved same-UID ABA.
+- The second P1 finding corrected a durable Q22 interpretation error. Repeating
+  the same authorized repository-Action tuple is idempotent, but GitHub's
+  create-issue-comment POST has no applicable idempotency key. Each exact
+  repository/PR/head epoch therefore permits at most one possibly delivered
+  `@codex review` comment POST. An ambiguous response consumes that mutation
+  budget; complete rereads may prove delivery, otherwise request policy remains
+  `unknown` and observation/retryable Action reconciliation continues until a
+  stable pending or `request-delivery-unproven` inconclusive result. A visible
+  duplicate is audit evidence and never authorizes another POST. This
+  supersedes the earlier journal text that incorrectly preserved comment-POST
+  replay as part of Q22.
+- The P2 finding established that self-policy Markdown inventory cardinality
+  may legitimately be zero when the range changes only non-Markdown control
+  files or deletes all changed Markdown. Exact `path_count: 0`, canonical JSON
+  `[]` digest, and exact empty parent/prompt/report inventory are accepted;
+  local Codex admission is likewise exact empty, while Claude admission remains
+  `not-applicable`. Empty records only the absence of candidate-head Markdown
+  bytes and never removes deleted Markdown, another hunk, a merge commit, or
+  side history from the complete frozen-range review. A nonempty required set
+  projected as empty and every stale, digest, type, subset/superset, or
+  projection mismatch remain inconclusive.
+- The integrated remediation passed the 82-test policy/carrier/recovery/
+  self-policy matrix, full `test_named_lane.py` (317 tests), full
+  `test_review_workspace.py` (198 tests), and full `test_contracts.py` (32
+  tests). The final direct-primary source/profile/remediation deltas also
+  received focused race, lexical-entry, CLI-payload, and exact-profile reruns,
+  Ruff lint/format, `git diff --check`, and a fresh follow-up review with
+  `No findings.` The authoritative host-side whole suite then passed all 3,205
+  tests with six conditional skips in 1,169.329 seconds with
+  `ResourceWarning` promoted to an error. The system quick skill validator was
+  unavailable because its interpreter lacked PyYAML; repository contract tests
+  plus a Ruby-standard-library YAML frontmatter fallback validated the skill
+  instead.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

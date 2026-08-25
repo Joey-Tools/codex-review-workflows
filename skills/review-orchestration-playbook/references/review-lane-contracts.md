@@ -57,8 +57,12 @@ The required properties are:
 - no reviewer fetch or credential prompt;
 - read-only reviewer execution.
 
-The source may itself be shallow, partial/promisor, or alternate-backed when the
-complete scoped snapshots and every required direct-parent snapshot are local.
+The source may itself be shallow or partial/promisor when the complete scoped
+snapshots and every required direct-parent snapshot are local. It must use a
+canonical real primary object directory at `<common Git directory>/objects`
+with no local or HTTP alternates. Ordinary clones, linked worktrees, and
+filesystem reflink/COW clones satisfy this direct-storage rule; a reference or
+shared clone must first be dissociated and have all alternate metadata removed.
 A missing pre-base parent frontier is representable only when marking its
 present child shallow suppresses no locally known edge; otherwise preparation is
 `range-incomplete`. The destination imports every required object and retains
@@ -232,8 +236,14 @@ required set and reproduce the required-set record's count and path digest. The
 parent record and prompt projection must be type-preserving
 equal before launch; the lane report repeats the same array after termination,
 and all three projections must remain type-preserving equal before result
-acceptance. Empty, subset, superset, duplicate, open-field, missing/invalid
-digest, or coupled multi-projection mutations are inconclusive.
+acceptance. An exact empty inventory is valid only when the independent
+required-set record has `path_count: 0`, its `paths_sha256` binds canonical JSON
+`[]`, and the parent, prompt, and report inventories are all exactly empty.
+Empty means no candidate-head Markdown byte record exists; deleted Markdown
+and every other changed hunk remain mandatory full-range review subject. A
+nonempty required set projected as empty, or any subset, superset, duplicate,
+open-field, missing/invalid digest, or coupled multi-projection mutation is
+inconclusive.
 
 For either local Codex adapter, self-policy isolation additionally uses the
 closed `candidate-markdown-admission-v2` array over exactly the same ordered
@@ -666,16 +676,19 @@ Each lane starts without another lane's output. The parent may aggregate only af
 - inspect untracked/private files or unrelated repositories;
 - fetch missing Git objects.
 
-The GitHub producer is the narrow exception for the authorized exact
-`@codex review` producer operation and any separately authorized repetition of
-the same frozen recovery tuple. Under
-the named lane's authorized ambiguous-delivery recovery, first reread the
-unchanged current head and complete visible request set. If delivery still
-cannot be proved, the same exact `@codex review` POST may be repeated after
-backoff as an idempotent delivery retry. A single recovery owner must reread
-before every repetition, never run concurrent POSTs, and stop POSTing as soon
-as delivery or another definite outcome is proved. Any visible duplicate is an
-audit warning within the same logical review lane, never an additional lane.
+The GitHub producer is the narrow exception for at most one possibly delivered
+exact `@codex review` issue-comment POST per repository/PR/head epoch and for a
+separately authorized repository-Action recovery tuple. Before the comment
+POST, reread the unchanged current head and complete visible request set; an
+existing exact request makes the producer observation-only. An ambiguous POST
+outcome consumes the comment-mutation budget. Reread to bind a uniquely proved
+delivery, otherwise record `request_policy.status: unknown`, continue bounded
+observation while recovery can make progress, and eventually report
+`inconclusive` / `request-delivery-unproven`; never repeat the comment POST in
+that epoch. A visible duplicate is an
+audit warning within the same logical lane and never authorizes another write.
+Only the separately authorized exact repository-Action tuple is idempotently
+repeatable under the recovery policy.
 
 ## Outcome Vocabulary
 

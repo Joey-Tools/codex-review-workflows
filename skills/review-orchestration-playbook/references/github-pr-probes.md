@@ -107,20 +107,34 @@ Post the exact body:
 @codex review
 ```
 
-Before posting, reread the PR head and enumerate visible exact requests for the
-current head epoch. Keep a single recovery owner and at most one POST in
-flight. After a successful response, store its stable comment ID, URL, actor,
-body, and server time.
+Define one comment-mutation epoch by the exact repository, PR, and feature
+head. In each epoch, permit at most one possibly delivered create-comment
+POST. Before that POST, reread the unchanged PR head and completely enumerate
+every page of the visible exact-request set for the current epoch. If an exact
+request already exists, bind the selected visible request under the evidence
+authority and do not POST. Keep one mutation owner and never run concurrent
+comment POSTs. After a successful response, store its stable comment ID, URL,
+actor, body, and server time.
 
-If the POST returns an ambiguous transport result, first reread the unchanged
-current head and its complete visible exact-request set. If delivery still
-cannot be proved, the same exact `@codex review` POST may be repeated after
-backoff as an idempotent delivery retry under the named lane's authorized
-ambiguous-delivery recovery. Before every repetition, the single recovery
-owner performs that reread again; stop POSTing as soon as delivery or another
-definite outcome is proved. Never run concurrent POSTs or issue an ordinary
-duplicate. Any visible duplicate remains part of the same logical review lane
-and is recorded as an audit warning; it never counts as an additional lane.
+Comment creation is not an idempotent operation. Once the create-comment call
+could have reached GitHub, it consumes the epoch's comment-mutation budget
+regardless of whether the client receives success, failure, or an ambiguous
+transport outcome. An ambiguous outcome never authorizes a repeat. Reread the
+unchanged head and the complete visible exact-request set. If the closed
+before/after observations unambiguously prove which request that single call
+created, bind its stable identity and continue. Otherwise set
+`request_policy.status: unknown` and keep only read-only observation pending
+while delayed visibility or typed retryable service state makes another read
+meaningful. If no independently accepted terminal basis appears and delivery
+remains unproved after that observation is exhausted, terminate the lane as
+`inconclusive` with `last_reason: request-delivery-unproven`. Never repeat the
+comment POST in that epoch.
+
+Any visible duplicate remains part of the same logical review lane and is
+recorded as an audit warning. An observed duplicate does not restore the
+comment-mutation budget, never authorizes another comment write, and never
+counts as an additional lane. Only a new feature head creates a new
+comment-mutation epoch.
 
 A base-only retarget, including one whose new ref has the same OID, or
 target-base-tip advance on the same head does not authorize or require another
@@ -253,6 +267,11 @@ that authorization is absent, keep the recovery owner in status-only mode,
 poll the scoped evidence on the schedule below, and report the missing
 authorization instead of triggering the workflow.
 
+This exact-tuple idempotence applies only to the Actions mutations in this
+section. It never applies to GitHub comment creation; the one-shot
+comment-mutation budget above remains consumed after any possibly delivered
+create-comment call.
+
 After the tuple and authorization are established, choose the smallest
 operation that can recover the machine-decidable retryable state:
 
@@ -338,6 +357,9 @@ authorized. A new scope, Action, workflow, operation, input set, branch or PR
 mutation, destination, or other materially different action requires ordinary
 confirmation.
 
+The schedule may repeat read-only probes and an authorized exact Actions tuple.
+It never repeats a create-comment POST.
+
 ## Active Thread And Automation
 
 For the first 60 minutes, keep recovery in the active Codex thread with bounded
@@ -377,3 +399,8 @@ machine-decidable classification remains retryable. Permission denial,
 unsupported host, malformed stable response, irreconcilable scope mismatch,
 or another non-retryable inconclusive result terminates recovery immediately;
 report the exact failed endpoint and scope.
+
+The generic transport retry rule applies to reads and eligible Actions
+mutations only. An ambiguous create-comment result follows the one-shot
+comment-mutation rule and is never POSTed again for the same repository, PR,
+and head.

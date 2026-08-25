@@ -1781,7 +1781,9 @@ def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository
             "source-shallow-state-conflict",
             "source Git directories expose conflicting shallow state",
         )
-    object_stores = _discover_object_stores(objects, deadline)
+    object_stores = (
+        _validate_direct_primary_object_store(objects, common_dir, deadline),
+    )
     for store in object_stores:
         _check_object_store_deadline(deadline)
         pack_directory = store / "pack"
@@ -1835,62 +1837,231 @@ def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository
     )
 
 
-def _discover_object_stores(
-    primary: pathlib.Path,
-    deadline: float,
-) -> tuple[pathlib.Path, ...]:
-    stores: list[pathlib.Path] = []
-    pending = [primary]
-    while pending:
-        _check_object_store_deadline(deadline)
-        candidate = _absolute_existing_directory(
-            pending.pop(), "source object authority"
-        )
-        if candidate in stores:
-            continue
-        if len(stores) >= 32:
-            raise ReviewWorkspaceError(
-                "source-alternates-limit",
-                "source object authority exceeds the 32-store safety limit",
-            )
-        stores.append(candidate)
-        http_alternates = candidate / "info/http-alternates"
-        if http_alternates.exists() or http_alternates.is_symlink():
-            raise ReviewWorkspaceError(
-                "source-http-alternate",
-                "HTTP object alternates are not an offline object authority",
-            )
-        alternates = candidate / "info/alternates"
-        try:
-            alternates.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise ReviewWorkspaceError(
-                "source-alternates-unavailable",
-                "source object alternates cannot be inspected",
-            ) from error
-        alternates_payload = _read_bounded_regular_file(
-            alternates,
-            limit=MARKER_LIMIT_BYTES,
-            deadline=deadline,
-            reason="source-alternates-invalid",
-            label="source object alternates",
-            unavailable_reason="source-alternates-unavailable",
-            revalidation_unavailable_reason=(
-                "source-alternates-revalidation-unavailable"
+def _direct_primary_object_store_guidance() -> str:
+    return (
+        "use an ordinary or linked worktree with canonical <common>/objects, "
+        "a filesystem reflink/COW copy, or a clone made independent with "
+        "--dissociate"
+    )
+
+
+def _direct_primary_object_store_details() -> dict[str, object]:
+    """Return closed parent-facing remediation for a rejected source layout."""
+
+    return {
+        "source_authority_policy": "direct-primary-only",
+        "remediation": {
+            "action": "use-independent-primary-object-store",
+            "accepted_source_layouts": [
+                "ordinary-clone",
+                "linked-worktree",
+                "filesystem-reflink-or-cow-copy",
+            ],
+            "alternate_backed_clone": (
+                "recreate the source as an independent clone with --dissociate"
             ),
-            drift_reason="source-alternates-drift",
+        },
+    }
+
+
+def _validate_source_object_info_directory(
+    objects: pathlib.Path,
+    deadline: float,
+) -> tuple[pathlib.Path, tuple[int, int, int] | None]:
+    """Bind the lexical object-info directory without following a link."""
+
+    _check_object_store_deadline(deadline)
+    info = objects / "info"
+    try:
+        metadata = info.lstat()
+    except FileNotFoundError:
+        return info, None
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-object-info-unavailable",
+            "source Git object-info storage cannot be inspected; "
+            + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        ) from error
+    try:
+        resolved = info.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewWorkspaceError(
+            "source-object-info-invalid",
+            "source Git object-info storage must be a canonical real directory; "
+            + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != info
+    ):
+        raise ReviewWorkspaceError(
+            "source-object-info-invalid",
+            "source Git object-info storage must be a canonical real directory; "
+            + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
         )
-        for raw_line in alternates_payload.splitlines():
+    return info, (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+
+
+def _validate_source_alternate_absence(
+    objects: pathlib.Path,
+    deadline: float,
+) -> None:
+    """Reject every lexical local or HTTP alternates control entry."""
+
+    info, initial_identity = _validate_source_object_info_directory(objects, deadline)
+
+    def reject_entries() -> None:
+        for candidate, label in (
+            (info / "alternates", "local alternates"),
+            (info / "http-alternates", "HTTP alternates"),
+        ):
             _check_object_store_deadline(deadline)
-            if not raw_line:
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
                 continue
-            alternate = pathlib.Path(os.fsdecode(raw_line))
-            if not alternate.is_absolute():
-                alternate = candidate / alternate
-            pending.append(alternate)
-    return tuple(stores)
+            except OSError as error:
+                raise ReviewWorkspaceError(
+                    "source-alternates-unavailable",
+                    f"source Git {label} state cannot be inspected; "
+                    + _direct_primary_object_store_guidance(),
+                    details=_direct_primary_object_store_details(),
+                ) from error
+            raise ReviewWorkspaceError(
+                "source-alternates-forbidden",
+                f"source Git {label} entry must be absent, regardless of its "
+                "contents or file type; " + _direct_primary_object_store_guidance(),
+                details=_direct_primary_object_store_details(),
+            )
+
+    for _ in range(2):
+        reject_entries()
+        _check_object_store_deadline(deadline)
+        _, observed_identity = _validate_source_object_info_directory(
+            objects,
+            deadline,
+        )
+        if observed_identity != initial_identity:
+            raise ReviewWorkspaceError(
+                "source-object-info-drift",
+                "source Git object-info storage changed during alternates "
+                "validation; " + _direct_primary_object_store_guidance(),
+                details=_direct_primary_object_store_details(),
+            )
+
+
+def _validate_direct_primary_object_store(
+    advertised: pathlib.Path,
+    common_dir: pathlib.Path,
+    deadline: float,
+) -> pathlib.Path:
+    """Require the only source authority to be real ``<common>/objects``."""
+
+    _check_object_store_deadline(deadline)
+    expected = common_dir / "objects"
+    try:
+        metadata = expected.lstat()
+        resolved = expected.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewWorkspaceError(
+            "source-primary-object-store-unavailable",
+            "source primary Git object storage cannot be resolved safely; "
+            + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != expected
+        or advertised != expected
+    ):
+        raise ReviewWorkspaceError(
+            "source-primary-object-store-invalid",
+            "source primary Git object storage must be canonical real "
+            "<common>/objects; " + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        )
+    _validate_source_alternate_absence(expected, deadline)
+    return expected
+
+
+def _revalidate_source_repository(
+    source: _SourceRepository,
+    deadline: float,
+) -> None:
+    """Point-revalidate direct source authority and alternates absence."""
+
+    def revalidate_authorities() -> None:
+        for authority in source.authorities:
+            descriptor = _open_revalidated_source_authority(authority)
+            os.close(descriptor)
+
+    revalidate_authorities()
+    try:
+        layout_payload = _run_git(
+            source.root,
+            (
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--git-path",
+                "objects",
+            ),
+            reason="source-repository-layout-revalidation-unavailable",
+            absolute_deadline=deadline,
+        )
+    except ReviewWorkspaceError as error:
+        error.details.update(_direct_primary_object_store_details())
+        raise
+    layout_lines = layout_payload.splitlines()
+    if len(layout_lines) != 3 or any(not line for line in layout_lines):
+        raise ReviewWorkspaceError(
+            "source-repository-layout-revalidation-invalid",
+            "source Git layout revalidation returned a malformed direct-primary "
+            "authority set; " + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        )
+    observed_git_dir, observed_common_dir, observed_objects = (
+        _decode_git_path(line, label)
+        for line, label in zip(
+            layout_lines,
+            (
+                "source Git directory",
+                "source common Git directory",
+                "source object directory",
+            ),
+            strict=True,
+        )
+    )
+    if (
+        observed_git_dir != source.git_dir
+        or observed_common_dir != source.common_dir
+        or observed_objects != source.common_dir / "objects"
+    ):
+        raise ReviewWorkspaceError(
+            "source-repository-layout-drift",
+            "source Git admin, common, or direct primary object authority changed "
+            "after discovery; " + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        )
+    expected = _validate_direct_primary_object_store(
+        observed_objects,
+        source.common_dir,
+        deadline,
+    )
+    if source.object_stores != (expected,):
+        raise ReviewWorkspaceError(
+            "source-primary-object-store-drift",
+            "source Git object authority changed after discovery; "
+            + _direct_primary_object_store_guidance(),
+            details=_direct_primary_object_store_details(),
+        )
+    revalidate_authorities()
 
 
 def _validate_requested_oid(value: str, label: str, object_format: str) -> str:
@@ -5058,6 +5229,7 @@ def _build_exact_object_store_under_signal_mask(
     deadline: float,
 ) -> str:
     _check_object_store_deadline(deadline)
+    _revalidate_source_repository(source, deadline)
     pack_directory = root / ".git/objects/pack"
     pack_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     token = secrets.token_hex(16)
@@ -5250,6 +5422,7 @@ def _build_exact_object_store_under_signal_mask(
                         )[:4096],
                     },
                 )
+            _revalidate_source_repository(source, deadline)
             pack_stream.flush()
             os.fsync(pack_stream.fileno())
             pack_metadata = os.fstat(pack_stream.fileno())
@@ -10559,6 +10732,7 @@ def prepare_workspace(
 ) -> PreparedWorkspace:
     object_store_deadline = time.monotonic() + WORKSPACE_PREPARATION_DEADLINE_SECONDS
     source_repo = _discover_source(source, object_store_deadline)
+    _revalidate_source_repository(source_repo, object_store_deadline)
     (
         base,
         head,
@@ -10580,6 +10754,7 @@ def prepare_workspace(
         ),
         deadline=object_store_deadline,
     )
+    _revalidate_source_repository(source_repo, object_store_deadline)
     range_object_count = len(range_objects)
     parent_support_object_count = len(support_objects)
     parent, root = _destination_path(worktree)
@@ -10611,6 +10786,7 @@ def prepare_workspace(
             parent_descriptor,
             source_repo.authorities,
         )
+        _revalidate_source_repository(source_repo, object_store_deadline)
         os.mkdir(root.name, mode=0o700, dir_fd=parent_descriptor)
         created = True
         created_metadata = os.stat(

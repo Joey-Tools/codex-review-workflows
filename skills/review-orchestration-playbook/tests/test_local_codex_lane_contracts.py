@@ -351,10 +351,9 @@ def _self_required_route_shape_conforms(metadata: dict[str, object]) -> bool:
         or not _is_object_id(required_set["head_sha"])
         or len(required_set["base_sha"]) != len(required_set["head_sha"])
         or type(required_set["path_count"]) is not int
-        or required_set["path_count"] <= 0
+        or required_set["path_count"] < 0
         or not _is_sha256(required_set["paths_sha256"])
         or type(inventory) is not list
-        or not inventory
     ):
         return False
 
@@ -1052,8 +1051,6 @@ def _self_policy_admission_conforms(
         return False
     if required_subject_paths != ordered_required_subject_paths:
         return False
-    if not required_subject_paths:
-        return False
     frozen_base_sha = evidence["frozen_base_sha"]
     frozen_head_sha = evidence["frozen_head_sha"]
     if type(frozen_base_sha) is not str or type(frozen_head_sha) is not str:
@@ -1483,6 +1480,57 @@ class LocalCodexLaneContractTest(unittest.TestCase):
                 True,
                 "claude",
                 self_policy_claude_metadata,
+            )
+        )
+        empty_self_required_set = _self_policy_required_subject_set_for(
+            "1" * 40,
+            "2" * 40,
+            [],
+        )
+        empty_self_policy_codex_metadata = copy.deepcopy(self_policy_codex_metadata)
+        empty_self_policy_codex_metadata["candidate_markdown_required_subject_set"] = (
+            empty_self_required_set
+        )
+        empty_self_policy_codex_metadata["candidate_markdown_subject_inventory"] = []
+        empty_self_policy_codex_metadata["candidate_markdown_admission"] = []
+        self.assertTrue(
+            _prelaunch_candidate_routes_conform(
+                True,
+                "codex",
+                empty_self_policy_codex_metadata,
+            )
+        )
+        empty_self_policy_claude_metadata = copy.deepcopy(
+            empty_self_policy_codex_metadata
+        )
+        for field in SELF_ADMISSION_FIELDS:
+            empty_self_policy_claude_metadata[field] = "not-applicable"
+        self.assertTrue(
+            _prelaunch_candidate_routes_conform(
+                True,
+                "claude",
+                empty_self_policy_claude_metadata,
+            )
+        )
+        nonempty_required_empty_projection = copy.deepcopy(self_policy_codex_metadata)
+        nonempty_required_empty_projection["candidate_markdown_subject_inventory"] = []
+        nonempty_required_empty_projection["candidate_markdown_admission"] = []
+        self.assertFalse(
+            _prelaunch_candidate_routes_conform(
+                True,
+                "codex",
+                nonempty_required_empty_projection,
+            )
+        )
+        empty_required_nonempty_projection = copy.deepcopy(self_policy_codex_metadata)
+        empty_required_nonempty_projection[
+            "candidate_markdown_required_subject_set"
+        ] = empty_self_required_set
+        self.assertFalse(
+            _prelaunch_candidate_routes_conform(
+                True,
+                "codex",
+                empty_required_nonempty_projection,
             )
         )
         malformed_self_profile = copy.deepcopy(self_policy_codex_metadata)
@@ -2678,7 +2726,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             [],
             {},
         )
-        self.assertFalse(
+        self.assertTrue(
             _self_policy_admission_conforms(
                 [],
                 [],
@@ -2690,6 +2738,28 @@ class LocalCodexLaneContractTest(unittest.TestCase):
                 {},
                 {},
                 empty_required_set_evidence,
+                applicable_both_paths=[],
+            )
+        )
+        wrong_empty_digest_evidence = copy.deepcopy(empty_required_set_evidence)
+        for field in (
+            "parent_required_subject_set",
+            "prompt_required_subject_set",
+            "report_required_subject_set",
+        ):
+            wrong_empty_digest_evidence[field]["paths_sha256"] = "0" * 64
+        self.assertFalse(
+            _self_policy_admission_conforms(
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                {},
+                {},
+                wrong_empty_digest_evidence,
                 applicable_both_paths=[],
             )
         )
@@ -3779,21 +3849,23 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "machine-decidable transient pending or infrastructure reason",
             "Repetition of that exact tuple is idempotent without a repository predeclaration",
             "current authorization for the external mutation",
-            "the same exact `@codex review` POST may be repeated after backoff",
-            "as an idempotent delivery retry",
-            "never run concurrent POSTs",
-            "stop POSTing as soon as delivery or another definite outcome is proved",
+            "at most one possibly delivered exact `@codex review` issue-comment POST",
+            "An ambiguous POST outcome consumes the comment-mutation budget",
+            "never repeat the comment POST in that epoch",
+            "Only the separately authorized exact repository-Action tuple is idempotently repeatable",
             "neither alone changes code, creates a head, or invalidates stable local reviews",
             "If resolving a finding changes code",
         ):
             self.assertIn(required.lower(), normalized_contracts.lower())
 
         self.assertIn(
-            "the same exact `@codex review` post may be repeated after backoff",
+            "ambiguous response consumes the comment-mutation budget",
             normalized_prompts.lower(),
         )
-        self.assertIn("as an idempotent delivery retry", normalized_prompts.lower())
-        self.assertIn("never as an additional lane", normalized_prompts.lower())
+        self.assertIn(
+            "never repeat the comment post in that epoch", normalized_prompts.lower()
+        )
+        self.assertIn("never authorizes another post", normalized_prompts.lower())
         self.assertIn("needs no repository predeclaration", normalized_prompts.lower())
         self.assertIn("changed scope", normalized_prompts.lower())
         self.assertIn("ordinary confirmation", normalized_prompts.lower())
@@ -3803,8 +3875,8 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "missing/stale/inconclusive/infrastructure",
             "single-flight idempotent repeat",
             "single-flight, idempotent producer recovery",
-            "never repeat the POST",
-            "never authorizes another POST",
+            "same exact `@codex review` POST may be repeated",
+            "idempotent delivery retry",
             "repository-predeclared",
         ):
             self.assertNotIn(retired, contracts + "\n" + prompts)

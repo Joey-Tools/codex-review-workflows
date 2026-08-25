@@ -33,13 +33,35 @@ Use absolute paths and a parent-validated absolute Python interpreter. Do not ex
 
 ## Source Preconditions
 
-The source may be a normal checkout or a linked worktree. It may be dirty, shallow, partial/promisor, or backed by alternates. Preparation never copies its live worktree, index, untracked files, config, hooks, remotes, or submodule checkout. Source storage dependencies are discovery inputs only: every required object must be imported into independent destination storage.
+The source may be a normal checkout or a linked worktree. It may be dirty,
+shallow, or partial/promisor. Under the `direct-primary-only` source policy,
+its only Git object authority must be the
+canonical real `<common-directory>/objects` directory. Any lexical
+`objects/info/alternates` or `objects/info/http-alternates` entry is blocked
+regardless of whether it is empty or nonempty, absolute or relative, a regular
+file, a directory, a symlink, or a dangling symlink. Do not parse such an entry
+or recursively adopt its target as another authority.
 
-Before creating the absent destination, preparation descriptor-binds and
-revalidates the resolved source worktree, Git directory, common directory, and
-every local object-store authority. The destination parent must not be that
-directory or any descendant of it, including through a symlink or filesystem
-path alias.
+An ordinary clone with its own object directory is accepted. So is a linked
+worktree, or an independent filesystem reflink/COW copy whose Git control paths
+still resolve to its own direct primary store. A shared/alternate-backed clone
+must first be made independent, for example with `git clone --dissociate` or an
+equivalent parent-owned object hydration. Shallow and promisor metadata do not
+by themselves violate this source-storage rule. Preparation never copies the
+live worktree, index, untracked files, config, hooks, remotes, or submodule
+checkout.
+
+At discovery and every later source-consumption handoff, preparation
+descriptor-binds and revalidates the resolved source worktree, Git directory,
+common directory, and the one direct primary object directory. It rechecks the
+canonical `<common>/objects` relationship and lexical absence of both alternate
+control entries before and after range freezing, before destination creation,
+and immediately before and after accepting the source `pack-objects` result.
+The destination parent must not be any bound source directory or any descendant
+of it, including through a symlink or filesystem path alias. These point checks
+detect persistent identity or control-entry drift; they do not claim to defeat
+an arbitrary same-UID ABA replacement that appears and disappears entirely
+between checks.
 
 With lazy fetching and credential prompts disabled, require:
 

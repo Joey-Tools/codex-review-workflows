@@ -1750,6 +1750,70 @@ raise SystemExit(returncode)
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "workspace terminal failures require POSIX signal masks",
+    )
+    def test_prepare_workspace_cli_reports_direct_primary_remediation(self) -> None:
+        base, head = self.workspace_range()
+        source = self.root / "alternate-backed-cli-source"
+        subprocess.run(
+            (
+                "git",
+                "clone",
+                "--quiet",
+                "--shared",
+                "--no-checkout",
+                str(self.repo),
+                str(source),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        destination = self.root / "alternate-backed-cli-workspace"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "prepare-workspace",
+                    "--source",
+                    str(source.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        failure = json.loads(stderr.getvalue())
+        self.assertEqual(failure["status"], "blocked-safety")
+        self.assertEqual(failure["reason"], "source-alternates-forbidden")
+        self.assertEqual(failure["source_authority_policy"], "direct-primary-only")
+        self.assertEqual(
+            failure["remediation"],
+            {
+                "action": "use-independent-primary-object-store",
+                "accepted_source_layouts": [
+                    "ordinary-clone",
+                    "linked-worktree",
+                    "filesystem-reflink-or-cow-copy",
+                ],
+                "alternate_backed_clone": (
+                    "recreate the source as an independent clone with --dissociate"
+                ),
+            },
+        )
+        self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
         "workspace receipt handoff requires POSIX signal masks",
     )
     def test_prepare_workspace_cli_publication_failures_roll_back_workspace(
@@ -13179,7 +13243,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(observed["arguments"], expected_arguments)
         self.assertEqual(profile["guard_constructed_arguments"], expected_arguments)
         self.assertEqual(profile["effective_arguments"], expected_arguments)
-        self.assertEqual(profile["profile"], "named-direct-claude-argv-v1")
+        self.assertEqual(profile["profile"], "named-direct-claude-argv-v2")
         self.assertEqual(
             profile["conformance"], "guard-constructed-exact-token-sequence"
         )
@@ -13197,11 +13261,25 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(profile["account_home"], str(home))
         self.assertEqual(profile["source_worktree"], str(self.source_control))
         self.assertEqual(
-            profile["source_worktree_binding"], "parent-supplied-deny-root"
+            profile["source_worktree_binding"],
+            "parent-supplied-direct-primary-only-deny-root",
         )
         self.assertEqual(
             profile["source_read_deny_roots"],
             [str(self.source_control), str(self.source_control / ".git")],
+        )
+        self.assertEqual(profile["source_authority_policy"], "direct-primary-only")
+        self.assertEqual(
+            profile["source_primary_object_store"],
+            str(self.source_control / ".git/objects"),
+        )
+        self.assertEqual(
+            profile["source_primary_object_store_identity"]["uid"],
+            os.getuid(),
+        )
+        self.assertEqual(
+            profile["source_authority_revalidation"],
+            ["pre-spawn", "pre-terminal-acceptance"],
         )
         self.assertEqual(
             profile["preflight_result"], str(self.preflight_result_path(executable))
@@ -13515,6 +13593,256 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         common = pathlib.Path(git(linked, "rev-parse", "--git-common-dir")).resolve()
         self.assertEqual(source, linked.resolve())
         self.assertEqual(roots, (linked.resolve(), admin, common))
+        binding = named_lane_runtime._bind_claude_source_read_boundary(linked.resolve())
+        self.assertEqual(binding.objects, common / "objects")
+        self.assertEqual(binding.objects_identity.owner, os.getuid())
+
+    def test_claude_source_rejects_every_lexical_alternate_entry(self) -> None:
+        info = self.source_control / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        regular_target = self.root / "claude-alternate-target"
+        regular_target.write_text("target\n", encoding="utf-8")
+        cases = (
+            ("empty-regular", lambda path: path.write_bytes(b"")),
+            (
+                "absolute-regular",
+                lambda path: path.write_text(
+                    str(self.source_control / ".git/objects") + "\n",
+                    encoding="utf-8",
+                ),
+            ),
+            (
+                "relative-regular",
+                lambda path: path.write_text("../../objects\n", encoding="utf-8"),
+            ),
+            ("symlink", lambda path: path.symlink_to(regular_target)),
+            (
+                "dangling-symlink",
+                lambda path: path.symlink_to(self.root / "missing-claude-alternate"),
+            ),
+            ("directory", lambda path: path.mkdir(mode=0o700)),
+        )
+        for control_name in ("alternates", "http-alternates"):
+            for variant, create in cases:
+                candidate = info / control_name
+                try:
+                    create(candidate)
+                    with (
+                        self.subTest(control=control_name, variant=variant),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            "entry must be absent",
+                        ),
+                    ):
+                        named_lane_runtime._resolve_claude_source_read_deny_roots(
+                            self.source_control
+                        )
+                finally:
+                    if candidate.is_symlink() or candidate.is_file():
+                        candidate.unlink()
+                    elif candidate.is_dir():
+                        candidate.rmdir()
+
+    def test_claude_source_object_info_indirection_is_rejected(self) -> None:
+        info = self.source_control / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        displaced = self.source_control / ".git/objects/info.direct"
+        external = self.root / "claude-external-object-info"
+        external.mkdir(mode=0o700)
+        info.rename(displaced)
+        cases = (
+            ("regular", lambda: info.write_bytes(b"")),
+            ("symlink", lambda: info.symlink_to(external, target_is_directory=True)),
+            (
+                "dangling-symlink",
+                lambda: info.symlink_to(
+                    self.root / "missing-claude-object-info",
+                    target_is_directory=True,
+                ),
+            ),
+        )
+        try:
+            for variant, create in cases:
+                try:
+                    create()
+                    with (
+                        self.subTest(variant=variant),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            "object-info storage must be a canonical real",
+                        ),
+                    ):
+                        named_lane_runtime._resolve_claude_source_read_deny_roots(
+                            self.source_control
+                        )
+                finally:
+                    if info.is_symlink() or info.is_file():
+                        info.unlink()
+        finally:
+            displaced.rename(info)
+
+    def test_claude_source_primary_objects_symlink_is_rejected(self) -> None:
+        objects = self.source_control / ".git/objects"
+        displaced = self.source_control / ".git/objects.direct"
+        external = self.root / "claude-external-objects"
+        external.mkdir(mode=0o700)
+        objects.rename(displaced)
+        objects.symlink_to(external, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "primary Git object directory must be a canonical real directory",
+            ):
+                named_lane_runtime._resolve_claude_source_read_deny_roots(
+                    self.source_control
+                )
+        finally:
+            objects.unlink()
+            displaced.rename(objects)
+
+    def test_claude_source_shallow_promisor_metadata_remains_eligible(self) -> None:
+        git(self.source_control, "config", "extensions.partialClone", "origin")
+        git(self.source_control, "config", "remote.origin.promisor", "true")
+        (self.source_control / ".git/shallow").write_text(
+            "0" * 40 + "\n",
+            encoding="ascii",
+        )
+        pack = self.source_control / ".git/objects/pack"
+        pack.mkdir(mode=0o700, exist_ok=True)
+        (pack / "fixture.promisor").write_text("fixture\n", encoding="utf-8")
+
+        source, roots = named_lane_runtime._resolve_claude_source_read_deny_roots(
+            self.source_control
+        )
+
+        self.assertEqual(source, self.source_control)
+        self.assertEqual(
+            roots,
+            (self.source_control, self.source_control / ".git"),
+        )
+
+    def test_claude_source_revalidation_blocks_alternate_before_spawn(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        child_marker = self.root / "alternate-pre-spawn-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n",
+            version="2.1.225",
+        )
+        alternate = self.source_control / ".git/objects/info/alternates"
+        real_snapshot = named_lane_runtime._create_claude_launch_snapshot
+
+        def snapshot_then_inject(*args: object, **kwargs: object) -> object:
+            snapshot = real_snapshot(*args, **kwargs)
+            alternate.parent.mkdir(mode=0o700, exist_ok=True)
+            alternate.write_bytes(b"")
+            return snapshot
+
+        stdout = self.root / "alternate-pre-spawn.out"
+        stderr = self.root / "alternate-pre-spawn.err"
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_create_claude_launch_snapshot",
+                    side_effect=snapshot_then_inject,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "entry must be absent",
+                ),
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            self.assertFalse(child_marker.exists())
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+            self.assertEqual(tuple(self.root.glob(".named-lane-launch-*")), ())
+        finally:
+            alternate.unlink(missing_ok=True)
+
+    def test_claude_source_revalidation_blocks_alternate_at_terminal(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        alternate = self.source_control / ".git/objects/info/http-alternates"
+        executable = self.make_executable(
+            "import pathlib\n"
+            f"path = pathlib.Path({str(alternate)!r})\n"
+            "path.parent.mkdir(mode=0o700, exist_ok=True)\n"
+            "path.write_bytes(b'')\n"
+            "print('captured but not accepted')\n",
+            version="2.1.225",
+        )
+        stdout = self.root / "alternate-terminal.out"
+        stderr = self.root / "alternate-terminal.err"
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "entry must be absent",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+        finally:
+            alternate.unlink(missing_ok=True)
+
+    def test_claude_source_revalidation_blocks_primary_replacement_at_terminal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        objects = self.source_control / ".git/objects"
+        displaced = self.source_control / ".git/objects.bound-original"
+        mode = stat.S_IMODE(objects.lstat().st_mode)
+        executable = self.make_executable(
+            "import os, pathlib\n"
+            f"objects = pathlib.Path({str(objects)!r})\n"
+            f"displaced = pathlib.Path({str(displaced)!r})\n"
+            "objects.rename(displaced)\n"
+            f"objects.mkdir(mode={mode})\n"
+            "print('captured but not accepted')\n",
+            version="2.1.225",
+        )
+        stdout = self.root / "objects-terminal.out"
+        stderr = self.root / "objects-terminal.err"
+        replaced = False
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "authority changed after initial binding",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=16 * 1024,
+                )
+            replaced = displaced.is_dir()
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+        finally:
+            if displaced.is_dir():
+                objects.rmdir()
+                displaced.rename(objects)
+            self.assertTrue(replaced)
 
     def test_claude_source_deny_root_rejects_non_git_alias_and_overlap(self) -> None:
         plain = self.root / "plain-source"

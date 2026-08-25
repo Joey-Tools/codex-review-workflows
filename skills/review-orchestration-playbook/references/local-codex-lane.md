@@ -60,6 +60,26 @@ parent separately requires exact parent/prompt/report equality. A projection
 or path that cannot round-trip losslessly through UTF-8, including a lone
 surrogate, is inconclusive rather than raised, rewritten, or omitted.
 
+For self-policy migration, an independently derived empty required subject set
+is a valid closed state. Accept it only when the
+`candidate-markdown-required-subject-set-v1` record has exact integer
+`path_count: 0`, exact
+`paths_sha256: 4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`
+for canonical empty-array bytes `[]`, and its frozen endpoints and complete
+parent/prompt/report projections remain type-preservingly equal. The
+subject-inventory parent, prompt, and report projections must each be exact
+array `[]`. For either local Codex adapter, the admission parent, prompt, and
+report projections must also each be exact array `[]`; this is complete empty
+admission, not `not-applicable`. The Claude lane remains different: all of its
+candidate-Markdown admission profile, array, and match fields remain scalar
+`not-applicable`, including when the subject inventory is empty. Empty means
+only that there are no candidate-head Markdown byte records. It does not narrow
+review of the complete frozen `base_sha..head_sha` DAG or any changed hunk,
+including deleted Markdown. If the independently derived required set is
+nonempty, an empty projection remains inconclusive. A subset, superset, stale
+endpoint or digest, invalid type, or parent/prompt/report projection drift is
+always inconclusive.
+
 After successful workspace validation, invoke the independently trusted
 bundle's `named_lane_guard codex-git-prefix` command for that exact worktree and
 frozen `base_sha..head_sha` plus the fixed Git executable. The command itself
@@ -123,8 +143,10 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   validated against the exact candidate-head blobs rather than treated as
   required-set fields. The exact required set includes every changed tracked Markdown path present at the candidate
   head plus any additional candidate-head Markdown the parent requires as
-  review subject or scoped convention; empty, subset, and superset projections
-  are invalid. Its admission path/digest/mode set must be exact. Candidate Markdown
+  review subject or scoped convention. An exact empty inventory is valid only
+  under the common zero-cardinality contract above; an empty projection of a
+  nonempty required set, a subset, or a superset is invalid. Its admission
+  path/digest/mode set must be exact. Candidate Markdown
   is `review-subject` by default. Only an
   exact parent-enumerated, digest-bound,
   applicable candidate instruction file selected by the parent—

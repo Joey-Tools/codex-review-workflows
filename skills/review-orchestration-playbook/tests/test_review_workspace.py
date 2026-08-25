@@ -601,44 +601,45 @@ class ReviewWorkspaceTest(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "workspace-source-overlap")
             self.assertFalse(destination.exists())
 
-    def test_destination_inside_alternate_object_authority_is_rejected(self) -> None:
-        alternate = self.root / "alternate-overlap-source"
+    def test_source_primary_objects_symlink_is_rejected(self) -> None:
+        source = self.root / "symlinked-objects-source"
         subprocess.run(
             (
                 "git",
                 "clone",
                 "--quiet",
-                "--shared",
                 "--no-checkout",
                 str(self.repo),
-                str(alternate),
+                str(source),
             ),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        borrowed_objects = pathlib.Path(
-            git(
-                self.repo,
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "objects",
+        objects = source / ".git/objects"
+        displaced = source / ".git/objects.direct"
+        external = self.root / "external-objects"
+        external.mkdir(mode=0o700)
+        objects.rename(displaced)
+        objects.symlink_to(external, target_is_directory=True)
+        destination = self.root / "symlinked-objects-workspace"
+        try:
+            with self.assertRaises(ReviewWorkspaceError) as caught:
+                prepare_workspace(
+                    source,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "source-primary-object-store-invalid",
             )
-        )
-        parent = borrowed_objects / "review-object-parent"
-        parent.mkdir(mode=0o700)
-        destination = parent / "lane"
-
-        with self.assertRaises(ReviewWorkspaceError) as caught:
-            prepare_workspace(
-                alternate,
-                destination,
-                self.commits[1],
-                self.commits[2],
-            )
-        self.assertEqual(caught.exception.reason, "workspace-source-overlap")
-        self.assertFalse(destination.exists())
+            self.assertIn("--dissociate", str(caught.exception))
+            self.assertFalse(destination.exists())
+        finally:
+            objects.unlink()
+            displaced.rename(objects)
 
     def test_source_overlap_ancestry_fstat_failure_closes_new_parent_fd(self) -> None:
         source = workspace_runtime._discover_source(self.repo, float("inf"))
@@ -896,7 +897,7 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             self.cleanup(prepared)
 
-    def test_local_alternate_source_is_materialized_without_destination_dependency(
+    def test_local_alternate_source_is_rejected_before_destination_creation(
         self,
     ) -> None:
         alternate = self.root / "alternate-source"
@@ -916,14 +917,234 @@ class ReviewWorkspaceTest(unittest.TestCase):
         )
         self.assertTrue((alternate / ".git/objects/info/alternates").is_file())
         destination = self.root / "alternate-workspace"
-        prepared = prepare_workspace(
-            alternate, destination, self.commits[1], self.commits[2]
+        with self.assertRaises(ReviewWorkspaceError) as caught:
+            prepare_workspace(alternate, destination, self.commits[1], self.commits[2])
+        self.assertEqual(caught.exception.reason, "source-alternates-forbidden")
+        self.assertIn("--dissociate", str(caught.exception))
+        self.assertEqual(
+            caught.exception.payload()["source_authority_policy"],
+            "direct-primary-only",
+        )
+        self.assertEqual(
+            caught.exception.payload()["remediation"],
+            {
+                "action": "use-independent-primary-object-store",
+                "accepted_source_layouts": [
+                    "ordinary-clone",
+                    "linked-worktree",
+                    "filesystem-reflink-or-cow-copy",
+                ],
+                "alternate_backed_clone": (
+                    "recreate the source as an independent clone with --dissociate"
+                ),
+            },
+        )
+        self.assertFalse(destination.exists())
+
+    def test_every_lexical_source_alternate_entry_is_rejected(self) -> None:
+        info = self.repo / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        regular_target = self.root / "alternate-target"
+        regular_target.write_text("target\n", encoding="utf-8")
+        cases = (
+            ("empty-regular", lambda path: path.write_bytes(b"")),
+            (
+                "absolute-regular",
+                lambda path: path.write_text(
+                    str(self.repo / ".git/objects") + "\n",
+                    encoding="utf-8",
+                ),
+            ),
+            (
+                "relative-regular",
+                lambda path: path.write_text("../../objects\n", encoding="utf-8"),
+            ),
+            ("symlink", lambda path: path.symlink_to(regular_target)),
+            (
+                "dangling-symlink",
+                lambda path: path.symlink_to(self.root / "missing-alternate"),
+            ),
+            ("directory", lambda path: path.mkdir(mode=0o700)),
+        )
+        for control_name in ("alternates", "http-alternates"):
+            for variant, create in cases:
+                candidate = info / control_name
+                destination = self.root / f"{control_name}-{variant}-workspace"
+                try:
+                    create(candidate)
+                    with (
+                        self.subTest(control=control_name, variant=variant),
+                        self.assertRaises(ReviewWorkspaceError) as caught,
+                    ):
+                        prepare_workspace(
+                            self.repo,
+                            destination,
+                            self.commits[1],
+                            self.commits[2],
+                        )
+                    self.assertEqual(
+                        caught.exception.reason,
+                        "source-alternates-forbidden",
+                    )
+                    self.assertFalse(destination.exists())
+                finally:
+                    if candidate.is_symlink() or candidate.is_file():
+                        candidate.unlink()
+                    elif candidate.is_dir():
+                        candidate.rmdir()
+
+    def test_source_object_info_indirection_cannot_hide_alternates(self) -> None:
+        info = self.repo / ".git/objects/info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        displaced = self.repo / ".git/objects/info.direct"
+        external = self.root / "external-object-info"
+        external.mkdir(mode=0o700)
+        info.rename(displaced)
+        cases = (
+            ("regular", lambda: info.write_bytes(b"")),
+            ("symlink", lambda: info.symlink_to(external, target_is_directory=True)),
+            (
+                "dangling-symlink",
+                lambda: info.symlink_to(
+                    self.root / "missing-object-info",
+                    target_is_directory=True,
+                ),
+            ),
         )
         try:
-            self.assert_independent_git_layout(prepared.root)
-            validate_workspace(prepared.root, self.commits[1], self.commits[2])
+            for variant, create in cases:
+                destination = self.root / f"object-info-{variant}-workspace"
+                try:
+                    create()
+                    with (
+                        self.subTest(variant=variant),
+                        self.assertRaises(ReviewWorkspaceError) as caught,
+                    ):
+                        prepare_workspace(
+                            self.repo,
+                            destination,
+                            self.commits[1],
+                            self.commits[2],
+                        )
+                    self.assertEqual(
+                        caught.exception.reason,
+                        "source-object-info-invalid",
+                    )
+                    self.assertFalse(destination.exists())
+                finally:
+                    if info.is_symlink() or info.is_file():
+                        info.unlink()
         finally:
-            self.cleanup(prepared)
+            displaced.rename(info)
+
+    def test_source_alternate_injected_after_range_freeze_is_rejected(self) -> None:
+        destination = self.root / "post-freeze-alternate-workspace"
+        alternate = self.repo / ".git/objects/info/alternates"
+        real_freeze = workspace_runtime._freeze_range
+
+        def freeze_then_inject(*args: object, **kwargs: object) -> object:
+            result = real_freeze(*args, **kwargs)
+            alternate.parent.mkdir(mode=0o700, exist_ok=True)
+            alternate.write_text(
+                str(self.repo / ".git/objects") + "\n",
+                encoding="utf-8",
+            )
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_freeze_range",
+                    side_effect=freeze_then_inject,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(caught.exception.reason, "source-alternates-forbidden")
+            self.assertFalse(destination.exists())
+        finally:
+            alternate.unlink(missing_ok=True)
+
+    def test_primary_object_directory_replaced_after_range_freeze_is_rejected(
+        self,
+    ) -> None:
+        destination = self.root / "post-freeze-objects-workspace"
+        objects = self.repo / ".git/objects"
+        displaced = self.repo / ".git/objects.bound-original"
+        mode = stat.S_IMODE(objects.lstat().st_mode)
+        real_freeze = workspace_runtime._freeze_range
+        replaced = False
+
+        def freeze_then_replace(*args: object, **kwargs: object) -> object:
+            nonlocal replaced
+            result = real_freeze(*args, **kwargs)
+            objects.rename(displaced)
+            objects.mkdir(mode=mode)
+            replaced = True
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_freeze_range",
+                    side_effect=freeze_then_replace,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "source-authority-identity-mismatch",
+            )
+            self.assertFalse(destination.exists())
+        finally:
+            if replaced:
+                objects.rmdir()
+                displaced.rename(objects)
+
+    def test_source_alternate_injected_by_pack_process_blocks_acceptance(self) -> None:
+        destination = self.root / "post-pack-alternate-workspace"
+        alternate = self.repo / ".git/objects/info/http-alternates"
+        real_run_process = workspace_runtime.run_process
+
+        def run_then_inject(argv: object, **kwargs: object) -> object:
+            result = real_run_process(argv, **kwargs)
+            if "pack-objects" in tuple(argv):
+                alternate.parent.mkdir(mode=0o700, exist_ok=True)
+                alternate.write_bytes(b"")
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "run_process",
+                    side_effect=run_then_inject,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(caught.exception.reason, "source-alternates-forbidden")
+            self.assertFalse(destination.exists())
+        finally:
+            alternate.unlink(missing_ok=True)
 
     def test_shallow_source_is_accepted_when_the_range_is_complete(self) -> None:
         shallow = self.root / "shallow-source"
@@ -9162,6 +9383,10 @@ class ReviewWorkspaceTest(unittest.TestCase):
 
                 with (
                     mock.patch.object(
+                        workspace_runtime,
+                        "_revalidate_source_repository",
+                    ),
+                    mock.patch.object(
                         workspace_runtime.os,
                         "fdopen",
                         side_effect=fail_selected_fdopen,
@@ -9259,6 +9484,10 @@ class ReviewWorkspaceTest(unittest.TestCase):
 
         try:
             with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_revalidate_source_repository",
+                ),
                 mock.patch.object(
                     workspace_runtime._PartialRecoveryControl,
                     "create",
@@ -9374,6 +9603,10 @@ class ReviewWorkspaceTest(unittest.TestCase):
         )
         with (
             mock.patch.object(
+                workspace_runtime,
+                "_revalidate_source_repository",
+            ),
+            mock.patch.object(
                 workspace_runtime.os,
                 "fdopen",
                 side_effect=faulting_fdopen,
@@ -9445,6 +9678,10 @@ class ReviewWorkspaceTest(unittest.TestCase):
             raise PermissionError("fixture control finalization failure")
 
         with (
+            mock.patch.object(
+                workspace_runtime,
+                "_revalidate_source_repository",
+            ),
             mock.patch.object(
                 workspace_runtime.os,
                 "fdopen",

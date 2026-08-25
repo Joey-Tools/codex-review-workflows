@@ -96,37 +96,90 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, combined)
 
-    def test_ambiguous_delivery_retry_is_consistent_across_github_contracts(
+    def test_comment_creation_is_one_shot_across_github_contracts(
         self,
     ) -> None:
-        documents = {
+        authoritative_documents = {
             "probes": self.probes,
             "authority": self.authority,
+        }
+        routing_documents = {
             "lane-contracts": self.contracts,
             "prompt-templates": self.prompts,
         }
-        required = (
-            "named lane's authorized ambiguous-delivery recovery",
-            "the same exact `@codex review` post may be repeated after backoff",
-            "as an idempotent delivery retry",
-            "single recovery owner",
-            "reread",
-            "never run concurrent posts",
-            "stop posting as soon as delivery or another definite outcome is proved",
+        authoritative_required = (
+            "comment-mutation epoch",
+            "at most one possibly delivered create-comment post",
+            "complete visible exact-request set",
+            "consumes the epoch's comment-mutation budget",
+            "never repeat the comment post",
+            "request_policy.status: unknown",
+            "request-delivery-unproven",
             "audit warning",
             "same logical review lane",
+            "never authorizes another comment write",
         )
 
+        for name, document in authoritative_documents.items():
+            normalized = _normalize(document)
+            with self.subTest(document=name):
+                for anchor in authoritative_required:
+                    self.assertIn(anchor, normalized)
+
+        routing_required = (
+            "possibly delivered",
+            "repository/pr/head epoch",
+            "complete visible request set",
+            "consumes the comment-mutation budget",
+            "request_policy.status: unknown",
+            "request-delivery-unproven",
+            "never repeat the comment post in that epoch",
+            "audit warning",
+            "same logical",
+            "never authorizes another",
+        )
+        for name, document in routing_documents.items():
+            normalized = _normalize(document)
+            with self.subTest(document=name):
+                for anchor in routing_required:
+                    self.assertIn(anchor, normalized)
+
+        documents = authoritative_documents | routing_documents
         for name, document in documents.items():
             normalized = _normalize(document)
             with self.subTest(document=name):
-                for anchor in required:
-                    self.assertIn(anchor, normalized)
-                self.assertNotIn("never repeat the post", normalized)
-                self.assertNotIn("never authorizes another post", normalized)
+                self.assertNotIn(
+                    "the same exact `@codex review` post may be repeated", normalized
+                )
+                self.assertNotIn("idempotent delivery retry", normalized)
+                self.assertNotIn("ambiguous-delivery recovery", normalized)
 
         combined = _normalize("\n".join(documents.values()))
-        self.assertNotIn("the github write is not intrinsically idempotent", combined)
+        self.assertIn("only a new feature head creates a new", combined)
+        self.assertIn("only an independently authorized exact actions tuple", combined)
+        self.assertIn("never applies to github comment creation", combined)
+        self.assertNotIn("before every repetition", combined)
+
+    def test_retry_schedule_cannot_repeat_comment_creation(self) -> None:
+        request = self.probes.split("## Request The Review", 1)[1].split(
+            "## Discover Related Checks Dynamically", 1
+        )[0]
+        recovery = self.probes.split("## Reconcile Only Recoverable States", 1)[
+            1
+        ].split("## Active Thread And Automation", 1)[0]
+        failures = self.probes.split("## Probe Failures", 1)[1]
+        normalized = _normalize(request + "\n" + recovery + "\n" + failures)
+
+        for anchor in (
+            "completely enumerate every page",
+            "comment creation is not an idempotent operation",
+            "it consumes the epoch's comment-mutation budget",
+            "this exact-tuple idempotence applies only to the actions mutations",
+            "it never repeats a create-comment post",
+            "generic transport retry rule applies to reads and eligible actions mutations only",
+        ):
+            self.assertIn(anchor, normalized)
+        self.assertNotIn("idempotent delivery retry", normalized)
 
     def test_unbounded_backoff_is_limited_to_typed_retryable_reasons(self) -> None:
         retry = self.probes.split("## Retry Schedule And Cost Control", 1)[1].split(

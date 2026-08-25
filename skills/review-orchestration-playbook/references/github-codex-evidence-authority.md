@@ -597,17 +597,30 @@ must repeat the epoch's request and provider-reaction identity/actor/times and
 join to the report evidence. An epoch cannot self-prove that final whole-PR
 snapshot.
 
-If the POST outcome was ambiguous, first reread the unchanged current head and
-its complete visible exact-request set. If delivery still cannot be proved,
-the same exact `@codex review` POST may be repeated after backoff as an
-idempotent delivery retry under the named lane's authorized ambiguous-delivery
-recovery. Before every repetition, the single recovery owner performs that
-reread again; never run concurrent POSTs, and stop POSTing as soon as delivery
-or another definite outcome is proved. Any visible duplicate remains part of
-the same logical review lane, is reported as an audit warning, and never counts
-as an additional lane. Prefer the latest visible request for fallback, and
-never let duplicate request count erase trustworthy terminal provider
-evidence.
+The exact repository, PR, and feature head define one comment-mutation epoch.
+That epoch permits at most one possibly delivered create-comment POST, and the
+parent must completely enumerate the visible exact-request set before making
+it. Once the call could have reached GitHub, it consumes the epoch's
+comment-mutation budget even when its result is ambiguous. Never repeat the
+comment POST in that epoch.
+
+After an ambiguous outcome, reread the unchanged current head and its complete
+visible exact-request set. If closed before/after observations unambiguously
+prove which request the one-shot call created, bind that stable request. If
+delivery cannot be proved, use `request_policy.status: unknown`; read-only
+observation may remain pending while another read is meaningful, but reaction
+fallback cannot use an unproved request identity. Without an independently
+accepted terminal basis, exhausted observation becomes `inconclusive` with
+`last_reason: request-delivery-unproven`. Only an independently authorized
+exact Actions tuple may use idempotent reconcile and backoff; that authority
+never extends to comment creation.
+
+Any visible duplicate remains part of the same logical review lane and is
+reported as an audit warning. An observed duplicate never authorizes another
+comment write, never restores the comment-mutation budget, and never counts as
+an additional lane. Prefer the latest provably selected visible request for
+fallback, and never let duplicate request count erase trustworthy terminal
+provider evidence.
 
 ## Service And Pending Evidence
 
@@ -869,10 +882,14 @@ when no stable diagnostic artifact is selected. The no-PR `not-applicable`
 variant always uses null evidence together with its required null PR/head fields.
 
 Use `warning` for observed early or duplicate requests. Warnings do not change
-the provider verdict and never authorize another concurrent request. Use
-`unknown` when request enumeration or POST outcome cannot yet be proved. Every
-finding entry records its stable ID/URL, commit, carrier, and thread resolution
-state without copying large bodies into the summary.
+the provider verdict and never authorize another comment write. Use `unknown`
+when request enumeration or the one-shot POST's delivery cannot be proved.
+While another read remains meaningful, that delivery uncertainty may be
+reported as `pending` with `last_reason: request-delivery-unproven`; when
+read-only observation is exhausted and no independently accepted terminal
+basis exists, report `inconclusive` with the same reason. Every finding entry
+records its stable ID/URL, commit, carrier, and thread resolution state without
+copying large bodies into the summary.
 
 ## Non-Goals
 
@@ -884,5 +901,6 @@ This contract does not:
 - infer clean from silence, request count, `eyes`, or a generic successful
   check;
 - treat human resolution as provider-lane resolution;
+- treat non-idempotent comment creation as an idempotent Actions tuple;
 - define repository workflow files, status-check names, or rulesets; or
 - turn retries or duplicate requests into additional reviewers.
