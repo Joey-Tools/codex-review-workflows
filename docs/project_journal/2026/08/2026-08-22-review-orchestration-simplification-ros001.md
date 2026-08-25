@@ -1630,6 +1630,71 @@ superseded_by:
   journal-only evidence update receives its own journal and contract checks
   before signing.
 
+### Formal review remediation after `3e29262`
+
+- Signed head `3e2926293aa6a2f3c09898cb45c7023f67d50736` received a new,
+  non-resumed GPT-5.6 Sol Ultra Codex CLI review under the independently trusted
+  pre-migration release. It did not pass. The reviewer found one P1 access-
+  policy omission and one P2 portability defect: the temporary Codex
+  authentication-home and neutral-root contract treated owner/mode/no-follow
+  evidence as complete on Darwin even though an extended ACL can grant another
+  principal access while `0600`/`0700` remains unchanged; the active Git object
+  verifier also constructed repository-mandated SHA-1 without
+  `usedforsecurity=False`, so a FIPS-enabled Python could reject every ordinary
+  SHA-1 repository.
+- The run reached a complete terminal findings result with successful trusted
+  post-run workspace validation. Materialization and both validation receipts
+  agreed on 20 inclusive commits, 19 parent edges, parent-graph SHA-256
+  `b366428be4209f2a9a46dfa5b73f11242362100d4312f9a61396524790c2e56b`,
+  and the unchanged local-config digest. The source authentication object
+  remained stable, the process-specific auth home passed its post-run
+  inventory check, and both that home and the materialized workspace were
+  removed. The CLI cask advanced from 0.149.0 to 0.149.1 while the review was
+  running, so its vanished old binary path could not supply a post-run binary
+  rehash; this is an additional reason not to reuse the attempt even apart from
+  its findings.
+- The Darwin contract now distinguishes the protected property from benign ACL
+  metadata. Source and temporary `auth.json`, each process-specific auth home,
+  every neutral launch root, and task-created private control directories must
+  have no extended ACL. Every complete absolute custody chain is opened from
+  the filesystem root through descriptor-relative no-follow operations;
+  pre-existing ancestors reject every allow/grant entry but may retain
+  deny-only ACLs, which grant no access and commonly appear on macOS home
+  directories. ACL inspection failure, unknown entries, protected-object ACLs,
+  ancestor grants, or a transition outside the admitted policy is
+  `blocked-safety`. The checks repeat before and after copying, immediately
+  before launch, after exit, and before cleanup. Receipts bind the access-policy
+  class with object identity and content/inventory evidence; directory
+  timestamps, size, and link count are not treated as mutation, and a file
+  timestamp merely triggers full content/access-policy revalidation. Two
+  boundary observations explicitly do not claim detection of a complete
+  between-observation ACL ABA.
+- This ACL detail stays in `local-codex-lane.md`, with one cross-lane receipt
+  summary in `review-lane-contracts.md`. It is not added to the reviewer role or
+  model-visible prompt, which retain only the opaque parent-private receipt
+  identity. No new canonical runtime helper or old supplied-diff entrypoint is
+  introduced: expanding the candidate self-policy control surface would not
+  help the candidate approve itself. The replacement formal review instead
+  uses a parent-owned, candidate-external, digest-bound task guard that enforces
+  the new auth-home and neutral-root boundary.
+- The active object-integrity stream now marks only Git SHA-1 construction as
+  non-security use; SHA-256 retains its prior constructor semantics. A FIPS
+  simulation rejects default/security SHA-1 while the complete real
+  `validate_workspace` path succeeds and proves every SHA-1 constructor
+  received `usedforsecurity=False`. The ACL policy and FIPS focused matrix
+  passed 15 tests, the complete `test_review_workspace.py` module passed all
+  194 tests in 344.014 seconds, and both independent remediation audits returned
+  `No findings.`
+- The corrected final bytes then ran the complete 3,191-test discovery suite
+  with `ResourceWarning` promoted to an error. In the restricted outer sandbox,
+  3,190 tests passed, six were conditionally skipped, and the sole failure was
+  the known nested `sandbox-exec: sandbox_apply: Operation not permitted`
+  denial in the Claude keychain-broker test after 1,771.015 seconds. The exact
+  denied test passed on the host in 2.058 seconds, and the authoritative
+  host-side whole-suite rerun passed all 3,191 tests with the same six skips in
+  1,265.683 seconds. Signed-head admission and another fresh whole-range Ultra
+  review remain mandatory before this remediation can be called clean.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

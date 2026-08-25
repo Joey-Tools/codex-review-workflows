@@ -7031,6 +7031,45 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             self.cleanup(prepared)
 
+    def test_sha1_object_integrity_verification_is_fips_compatible(self) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "fips-sha1-object-integrity-workspace",
+            self.commits[1],
+            self.commits[2],
+        )
+        real_hash_new = hashlib.new
+        sha1_security_flags: list[object] = []
+        missing = object()
+
+        def reject_security_sha1(
+            name: str,
+            data: bytes = b"",
+            **kwargs: object,
+        ) -> object:
+            if name == "sha1":
+                used_for_security = kwargs.get("usedforsecurity", missing)
+                sha1_security_flags.append(used_for_security)
+                if used_for_security is not False:
+                    raise ValueError("SHA-1 is disabled for security use under FIPS")
+            return real_hash_new(name, data, **kwargs)
+
+        try:
+            with mock.patch.object(
+                workspace_runtime.hashlib,
+                "new",
+                side_effect=reject_security_sha1,
+            ):
+                validate_workspace(
+                    prepared.root,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertTrue(sha1_security_flags)
+            self.assertEqual(set(sha1_security_flags), {False})
+        finally:
+            self.cleanup(prepared)
+
     def test_parent_support_validation_deadline_fails_closed(self) -> None:
         prepared = prepare_workspace(
             self.repo,

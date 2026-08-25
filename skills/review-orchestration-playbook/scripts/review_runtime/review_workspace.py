@@ -7118,7 +7118,11 @@ def _verify_range_object_contents_under_signal_mask(
                     observed=logical_bytes,
                     limit=RANGE_OBJECT_LOGICAL_BYTES_LIMIT,
                 )
-            current_hasher = hashlib.new(object_format)
+            current_hasher = (
+                hashlib.new(object_format, usedforsecurity=False)
+                if object_format == "sha1"
+                else hashlib.new(object_format)
+            )
             current_hasher.update(fields[1] + b" " + str(size).encode("ascii") + b"\0")
             remaining_content = size
             if remaining_content == 0:

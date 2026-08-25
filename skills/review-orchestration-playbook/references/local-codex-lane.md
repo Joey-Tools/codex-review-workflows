@@ -178,7 +178,15 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   candidate and source checkout, use `--skip-git-repo-check`, and target the
   validated workspace only through the trusted prompt and exact sanitized Git
   prefix. Bind the neutral directory's canonical identity and empty inventory
-  before and after launch. Never use the legacy
+  before and after launch. On Darwin, apply the descriptor-bound extended-ACL
+  custody contract below to the neutral root and its complete absolute custody
+  chain: the neutral root must carry no extended ACL, while a pre-existing
+  ancestor may carry deny-only entries but no allow/grant entry. Repeat the
+  identity, access-policy, and empty-inventory validation immediately before
+  launch and after process exit. This prevents a non-owner ACL grant from
+  authorizing transient project config or guidance injection even when mode
+  bits remain `0700`; the two observations do not prove that an add/remove ABA
+  occurred nowhere between them. Never use the legacy
   `-C <absolute-validated-workspace>` shape for a canonical CLI lane.
 - Outside self-policy migration, only the exact parent-enumerated records may
   be obeyed or used as guidance. Every changed hunk—including an unenumerated
@@ -282,12 +290,37 @@ control plane must:
 A failed no-follow, ownership, mode, identity, digest, copy, or source-stability
 check is `blocked-safety` for that CLI adapter.
 
+On Darwin, extended ACLs are part of the protected access policy even when
+ordinary mode bits remain `0600` or `0700`. Inspect them only from already
+opened descriptors with `acl_get_fd_np(ACL_TYPE_EXTENDED)` and a complete,
+fail-closed entry enumeration. Require the source and temporary `auth.json`,
+each process-specific auth home, every neutral launch root, and every
+task-created private control directory to carry no extended ACL. Traverse each
+complete absolute custody chain from the filesystem root with
+descriptor-relative, no-follow directory opens; reject every extended-ACL
+allow/grant entry on a pre-existing ancestor, but permit and bind
+deny-only ancestor ACLs
+because they grant no access and commonly protect macOS home directories.
+Unknown entry types, unavailable or malformed ACL inspection, a protected
+leaf/control-directory ACL, an ancestor grant, or ACL-policy drift is
+`blocked-safety`. Repeat the applicable chain and object checks before copying,
+after copying, immediately before each process launch, after process exit, and
+before cleanup. On Linux, this contract relies only on effective POSIX ACL
+permissions reflected through the exact file/directory modes above; it does not
+claim generic NFSv4-ACL exclusion.
+
 The protected properties are source object identity and content stability,
 credential confidentiality, exclusion of non-owner path replacement, and the
 destination's access policy. Source-directory group/other traverse or read bits
 are not mutation evidence and are allowed; a group/other write bit is not. File
 mode `0600` protects credential bytes, while trusted ownership plus non-writable
-real path components protects the selected object from non-owner replacement.
+real path components and the admitted ACL state protect the selected object
+from non-owner replacement. A directory receipt therefore binds device, inode,
+type, owner, mode, and admitted ACL state; directory size, link count, and
+timestamps are not mutation evidence. A file receipt additionally binds link
+count, byte length, and digest. A file timestamp change triggers content and
+access-policy revalidation but is not by itself content mutation. ACL state is
+revalidated as access policy rather than inferred from a `stat` delta.
 Identity and access metadata alone do not prove content stability, so the
 receipt binds both identity and digest. The copy must not be a symlink, hard
 link, mount alias, or other shared writable object. The control plane may stream

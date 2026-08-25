@@ -3542,6 +3542,25 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "group/other traverse or read bits are not mutation evidence and are allowed",
             "descriptor-to-descriptor byte copy",
             "source path-object identity, access policy, byte length, and SHA-256 digest",
+            "On Darwin, extended ACLs are part of the protected access policy",
+            "acl_get_fd_np(ACL_TYPE_EXTENDED)",
+            "source and temporary `auth.json`",
+            "each process-specific auth home",
+            "every neutral launch root",
+            "task-created private control directory",
+            "complete absolute custody chain",
+            "descriptor-relative, no-follow directory opens",
+            "extended-ACL allow/grant entry",
+            "deny-only ancestor ACLs",
+            "before copying",
+            "after copying",
+            "immediately before each process launch",
+            "after process exit",
+            "before cleanup",
+            "unavailable or malformed ACL inspection",
+            "ACL-policy drift",
+            "directory size, link count, and timestamps are not mutation evidence",
+            "file timestamp change triggers content and access-policy revalidation",
             "never copy a refreshed value back to the source",
             "blocked-authentication",
             "blocked-safety",
@@ -3593,6 +3612,25 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         self.assertIn(
             "incomplete credential cleanup prevents a clean CLI result", normalized
         )
+        self.assertIn(
+            "the two observations do not prove that an add/remove ABA occurred nowhere between them",
+            normalized,
+        )
+        self.assertIn(
+            "protected objects have no extended ACL",
+            _normalized(contracts),
+        )
+        self.assertIn(
+            "pre-existing ancestors have no allow/grant entry",
+            _normalized(contracts),
+        )
+        self.assertIn(
+            "deny-only ancestor ACLs remain admissible",
+            _normalized(contracts),
+        )
+        self.assertIn("unavailable inspection or drift", _normalized(contracts))
+        self.assertNotIn("acl_get_fd_np", prompts)
+        self.assertNotIn("deny-only ancestor", prompts)
         self.assertNotIn("owner-only real parent directories", local)
         self.assertNotIn("exposes them to the reviewer", local)
         self.assertNotIn("authenticated preflight status", local)

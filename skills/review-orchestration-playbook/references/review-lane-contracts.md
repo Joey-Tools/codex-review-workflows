@@ -307,7 +307,12 @@ For the Codex CLI adapter, self-policy isolation additionally requires:
   filesystem deny-read separation from the Codex runtime that must authenticate
   with that file;
 - pre/post neutral-root, auth-home, and version-bound instruction-surface
-  receipts; and
+  receipts. On Darwin, the neutral-root and auth-home receipts also bind
+  descriptor-derived extended-ACL evidence for every protected leaf/control
+  directory and the complete custody chain: protected objects have no extended
+  ACL, pre-existing ancestors have no allow/grant entry, deny-only ancestor
+  ACLs remain admissible, and unavailable inspection or drift is
+  `blocked-safety`;
 - every candidate Markdown file read to appear in the complete trusted-parent
   subject inventory and in the exact same path/digest/mode position under
   `candidate-markdown-admission-v2` with its coupled purpose/role.
