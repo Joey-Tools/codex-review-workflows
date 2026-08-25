@@ -464,6 +464,15 @@ A terminal clean artifact passes only when all of these hold:
 - scope, lifecycle, raw pages, and selected evidence remain stable on the
   final reread.
 
+The version-1 finding snapshot and actionable projection bind exactly one raw
+finding carrier. If the complete observation contains more than one applicable
+carrier with an active finding component, selection fails closed; the consumer
+must not choose only the newest carrier and hide an older unresolved finding. A
+later clean does not clear an unresolved inline child. Typed thread resolution
+or a strictly later trustworthy clean that supersedes only a top-level
+component may reduce the active set, after which the remaining unique carrier
+can be projected normally.
+
 A current-head `inline-parent-v1` artifact whose provider-target inline
 children are all resolved is a closed non-positive terminal classification,
 not a clean artifact. Report it as `pending` with the distinct
@@ -867,6 +876,8 @@ terminal selection, and validates the selected raw carrier before comparing
 its exact derived evidence and unresolved list type-preservingly with the report.
 Equality among report fields, or even a coupled edit to the carrier, embedded
 projection, report evidence, and every finding entry, supplies no authority.
+Because version 1 has a single-carrier evidence projection, more than one active
+finding carrier fails closed rather than permitting a newest-only report.
 Non-ancestor, stale, fabricated, incomplete-projection, incomplete-observation,
 or malformed-join carriers remain audit-only and cannot produce
 `status: findings`.

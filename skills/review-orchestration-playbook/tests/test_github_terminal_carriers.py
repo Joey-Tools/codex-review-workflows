@@ -1985,6 +1985,8 @@ class _ReportValidator:
             if has_unresolved_inline or not superseded_top_level:
                 active_findings.append(row)
         if active_findings:
+            if len(active_findings) != 1:
+                return None
             newest_finding_time = max(row["semantic_time"] for row in active_findings)
             if any(
                 row["classification"]["classification"] in invalid_classes
@@ -3048,6 +3050,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "findings take precedence over clean and resolved-inline-only",
             finding_snapshot_rule["terminal_selection"],
         )
+        self.assertIn(
+            "more than one active finding carrier fails closed",
+            finding_snapshot_rule["terminal_selection"],
+        )
+        self.assertIn(
+            "single-carrier projection cannot close",
+            finding_snapshot_rule["finding_projection"],
+        )
         self.assertIn("parent-enriched", finding_snapshot_rule["raw_carrier"])
         self.assertIn(
             "before finding_carrier_snapshot construction",
@@ -3331,6 +3341,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "separate closed parent-owned\n`complete_pr_snapshot`",
             "They are not digests of the report summary",
             "selected pass-basis projection",
+            "version-1 finding snapshot and actionable projection bind exactly one",
+            "more than one active\nfinding carrier fails closed",
             "feature-head check runs/statuses",
             "selected-subject check runs/statuses",
             "same page set type-for-type",
@@ -5610,6 +5622,116 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 inline_persists,
                 page_receipt=inline_persists_page_receipt,
             ).validate(inline_report)
+        )
+
+        newer_inline = copy.deepcopy(inline_raw)
+        newer_inline["id"] = 406
+        newer_inline["submitted_at"] = "2026-08-23T09:06:00Z"
+        newer_inline["children"][0].update(
+            {
+                "id": 506,
+                "url": (
+                    "https://github.com/octo/review-fixture/pull/7#discussion_r506"
+                ),
+                "pull_request_review_id": 406,
+                "body": "[P2] Preserve the newer independent finding",
+            }
+        )
+        newer_inline["children"][0]["thread_join"].update(
+            {
+                "parent_review_id": 406,
+                "child_comment_id": 506,
+                "url": (
+                    "https://github.com/octo/review-fixture/pull/7#discussion_r506"
+                ),
+            }
+        )
+        newer_report = copy.deepcopy(inline_report)
+        newer_report["evidence"].update(
+            {
+                "id": 406,
+                "url": (
+                    "https://github.com/octo/review-fixture/pull/7"
+                    "#pullrequestreview-406"
+                ),
+                "server_time": newer_inline["submitted_at"],
+            }
+        )
+        newer_report["unresolved_provider_findings"][0].update(
+            {
+                "id": 506,
+                "url": newer_inline["children"][0]["url"],
+                "evidence_id": 406,
+            }
+        )
+        for carrier in (inline_raw, newer_inline):
+            classification = self.classifier.classify(carrier)
+            self.assertEqual(classification["classification"], "findings")
+            self.assertEqual(classification["unresolved_findings"], 1)
+        newer_snapshot = copy.deepcopy(self.inline_finding_carrier_snapshot)
+        newer_snapshot["evidence"] = copy.deepcopy(newer_report["evidence"])
+        newer_snapshot["unresolved_provider_findings"] = copy.deepcopy(
+            newer_report["unresolved_provider_findings"]
+        )
+        multiple_active_page_receipt = bind_records(
+            newer_snapshot,
+            [],
+            [inline_raw, newer_inline],
+            newer_inline,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                newer_snapshot,
+                page_receipt=multiple_active_page_receipt,
+            ).validate(newer_report)
+        )
+
+        clean_after_both = copy.deepcopy(later_clean)
+        clean_after_both["id"] = 607
+        clean_after_both["submitted_at"] = "2026-08-23T09:07:00Z"
+        multiple_active_with_clean = copy.deepcopy(newer_snapshot)
+        multiple_active_with_clean_page_receipt = bind_records(
+            multiple_active_with_clean,
+            [],
+            [inline_raw, newer_inline, clean_after_both],
+            newer_inline,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                multiple_active_with_clean,
+                page_receipt=multiple_active_with_clean_page_receipt,
+            ).validate(newer_report)
+        )
+
+        resolved_older = copy.deepcopy(inline_raw)
+        resolved_older["children"][0]["thread_join"]["isResolved"] = True
+        newer_only_snapshot = copy.deepcopy(newer_snapshot)
+        newer_only_page_receipt = bind_records(
+            newer_only_snapshot,
+            [],
+            [resolved_older, newer_inline],
+            newer_inline,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                newer_only_snapshot,
+                page_receipt=newer_only_page_receipt,
+            ).validate(newer_report)
+        )
+
+        superseded_top_level = copy.deepcopy(top_raw)
+        newer_only_with_superseded = copy.deepcopy(newer_only_snapshot)
+        newer_only_with_superseded_page_receipt = bind_records(
+            newer_only_with_superseded,
+            [],
+            [superseded_top_level, newer_inline, clean_after_both],
+            newer_inline,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                newer_only_with_superseded,
+                page_receipt=newer_only_with_superseded_page_receipt,
+            ).validate(newer_report)
         )
 
         top_with_inline = copy.deepcopy(self.grammar["bases"]["top_level_with_inline"])

@@ -1907,6 +1907,25 @@ superseded_by:
   passed. Ruff lint/format and `git diff --check` also passed. No runtime helper
   or retired supplied-diff entrypoint changed.
 
+### Fail-closed multi-carrier finding projection after `929cfc8`
+
+- The second fresh-context whole-range reviewer found that the version-1
+  finding-report test consumer accumulated every active provider finding but
+  then selected only the newest carrier. Because the closed version-1 evidence
+  projection binds one raw carrier, that behavior could omit an older
+  unresolved carrier from the reported actionable findings.
+- Version 1 now fails closed whenever more than one finding carrier remains
+  active. A later clean does not clear an unresolved inline child; resolving
+  the older inline thread permits the unique newer carrier, and a strictly
+  later trustworthy clean may still supersede only an older top-level finding.
+  The JSON authority and prose authority state the same single-carrier limit.
+- Four regressions cover two active inline carriers, a later clean that cannot
+  hide either inline finding, explicit resolution of the older inline carrier,
+  and top-level supersession that leaves one independent active carrier. All
+  `28` terminal-carrier contract tests passed, JSON parsing, Ruff lint/format,
+  and `git diff --check` passed, and the original reviewer found no findings in
+  its targeted recheck of the complete three-file repair.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh
