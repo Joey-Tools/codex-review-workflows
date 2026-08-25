@@ -63,6 +63,27 @@ detect persistent identity or control-entry drift; they do not claim to defeat
 an arbitrary same-UID ABA replacement that appears and disappears entirely
 between checks.
 
+Immediately before publishing success, preparation performs one final source
+repository revalidation and then constructs the handoff only from the
+authorities captured before materialization; it never rediscovers a replacement
+to populate the receipt. The shared workspace marker and validation receipt stay
+`review-workspace-v1`. A successful preparation additionally declares
+`receipt_schema_version: review-workspace-prepare-v2` and carries the closed
+`review-source-authority-binding-v1` object plus its independent canonical-JSON
+SHA-256. That binding covers exact paths and directory identities for the source,
+admin, common, direct primary objects, and optional object-info directory; the
+exact `.git` marker identity/kind and gitfile content digest; a linked-worktree
+`admin/gitdir` back-pointer; and the presence or absence of `admin/commondir`.
+When `commondir` exists, its regular-file identity, size, content digest, and
+resolved common path are exact-bound. When absent, admin and common must be the
+same authority. Ordinary `marker == admin == common` remains valid.
+
+Binding paths use the closed `utf8-only-canonical-absolute-v1` contract.
+Filesystem byte paths that Python represents with surrogate escapes fail with
+structured `source-authority-path-encoding-unsupported` evidence; an unhandled
+Unicode encoding exception is not an admissible result. This is an explicit
+portability limitation, not path rewriting or lossy replacement.
+
 With lazy fetching and credential prompts disabled, require:
 
 - both full object IDs resolve locally as commits;

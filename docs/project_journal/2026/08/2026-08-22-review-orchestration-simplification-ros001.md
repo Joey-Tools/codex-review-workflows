@@ -1753,6 +1753,73 @@ superseded_by:
   plus a Ruby-standard-library YAML frontmatter fallback validated the skill
   instead.
 
+### Cross-phase source-authority finding after `7cc9f270`
+
+- A later fresh review found that the direct-primary repair still had a
+  cross-phase authority gap. `prepare-workspace` did not publish the source
+  authority it had used, while `run-claude` derived a new binding only from the
+  current lexical path. A persistent rename/replacement could therefore move
+  the original source outside requested `denyRead` and let both Claude point
+  checks accept the replacement; for a linked worktree the replacement could
+  retain the same admin, common, and object directories.
+- The remediation uses a direct parent handoff rather than a standalone mutable
+  file. The unchanged shared marker/validator schema remains
+  `review-workspace-v1`; prepare success separately declares
+  `review-workspace-prepare-v2` and publishes a closed
+  `review-source-authority-binding-v1` object plus canonical-JSON SHA-256.
+  Immediately before constructing it, preparation revalidates the source; the
+  binding is then projected only from the originally captured worktree,
+  `.git` marker, linked `gitdir` back-pointer, admin, `commondir`, common,
+  direct objects, object-info, and alternate-absence authorities.
+- The `admin/commondir` state is explicit. Absence requires `admin == common`;
+  presence binds the exact regular-file identity, size, content digest, and
+  resolved common path. Ordinary `marker == admin == common` remains valid.
+  Binding paths use `utf8-only-canonical-absolute-v1`; non-UTF-8 filesystem
+  bytes represented through surrogate escapes return structured
+  `source-authority-path-encoding-unsupported` evidence instead of being
+  rewritten or raising an unhandled encoder exception.
+- `run-claude` now requires the exact canonical JSON and digest as guard-parent
+  argv, verifies and detaches them before source probing or executable snapshot
+  creation, compares each independently resolved live authority projection at
+  initial binding, pre-spawn, and pre-terminal acceptance, and fully echoes the
+  exact parent values in `named-direct-claude-argv-v3`. The binding arguments
+  are not forwarded to Claude. Local process inspection may see their
+  non-secret control metadata (paths, identities, sizes, and control digests),
+  but they carry no cleanup token, credentials, prompt, or repository content.
+- This closes persistent replacement and cross-phase lineage mismatches under
+  the observed same-UID host TCB. It does not claim resistance to an
+  instantaneous or wholly between-check ABA rename/restore.
+- The final adversarial matrix passed five preparation/workspace cases and ten
+  Claude handoff cases, including missing CLI inputs, tampered digest, strict
+  JSON/schema variants, structured non-UTF-8 rejection, persistent ordinary
+  and linked replacements, same-content `commondir` replacement, exact v3
+  echo, pre-spawn alternate injection, and pre-terminal object replacement.
+  A fresh schema audit then found one test-only provenance blind spot: shared
+  helpers silently synthesized a current-source binding for unrelated tests.
+  The helpers now accept only the exact object/digest pair from a real cached
+  preparation receipt, created before test mocks. A raw helper-bypassing CLI
+  matrix covers digest mismatch, duplicate JSON keys, non-canonical JSON, and a
+  non-UTF-8 path and proves rejection before any worktree, preflight, source,
+  prompt, or snapshot probe. Its focused closure run passed five tests in
+  12.134 seconds, and the schema re-audit returned no findings. The separate
+  persistent ordinary/linked replacement audit also returned no findings after
+  eight directed tests passed.
+- Final full evidence: `test_review_workspace.py` passed 202 tests in 283.200
+  seconds; `test_named_lane.py` passed 326 tests in 639.969 seconds; and
+  `test_contracts.py` passed 32 tests in 3.796 seconds. Ruff lint and format,
+  project-journal validation, and the focused matrices were clean. The system
+  quick skill validator remained unavailable because its interpreter lacked
+  PyYAML; the repository contract module supplies the skill/frontmatter
+  fallback evidence.
+- The final warning-strict whole-skill discovery reached 3,215 tests in
+  1,769.189 seconds with six conditional skips. Its only failure was the known
+  host restriction that prevents the nested `sandbox-exec` broker test from
+  applying its child sandbox (`sandbox_apply: Operation not permitted`); the
+  other 3,214 tests passed. That exact broker test then passed alone outside
+  the host sandbox in 2.473 seconds with `ResourceWarning` still promoted to an
+  error. This paired result is the final whole-suite evidence for the dirty
+  candidate before its signed commit.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

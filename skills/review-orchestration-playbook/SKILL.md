@@ -73,6 +73,7 @@ contract below; the ordinary projection is not applicable, while every
 `candidate_markdown_*` field is not applicable to an ordinary review.
 
 Prepare and validate each workspace through the active trusted helper contract in [review-workspace.md](references/review-workspace.md). Always clean it up after a terminal lane result unless the user explicitly asks to retain it for diagnosis.
+For the Claude lane, retain the exact `review-workspace-prepare-v2` source-authority object and digest from its preparation receipt and pass both mandatory values unchanged to `run-claude`; require the v3 launch profile to echo them exactly. Never regenerate that cross-phase handoff from the later lexical source path.
 
 ### Local Codex
 

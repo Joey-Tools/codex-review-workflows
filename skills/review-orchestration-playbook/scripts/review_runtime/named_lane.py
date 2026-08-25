@@ -50,16 +50,25 @@ from .review_workspace import (
     PreparedWorkspace,
     RangeIncomplete,
     ReviewWorkspaceError,
+    SourceAuthorityBindingError,
     WORKSPACE_SCHEMA_VERSION,
     _attach_workspace_teardown_failures,
     _attempt_workspace_descriptor_closes,
     _finish_forwarded_signal_mask,
     _partial_workspace_recovery_payload,
     _select_workspace_teardown_failure,
+    build_source_authority_binding,
+    canonical_source_authority_binding_bytes,
     cleanup_workspace,
+    parse_canonical_source_authority_binding_bytes,
     prepare_workspace,
     recover_partial_workspace,
     retain_workspace_for_owner_exit_recovery,
+    source_authority_common_marker_record,
+    source_authority_control_record,
+    source_authority_directory_record,
+    source_authority_marker_record,
+    validate_source_authority_binding,
     validate_workspace,
 )
 
@@ -67,6 +76,7 @@ DEFAULT_TIMEOUT_SECONDS = 1_800.0
 DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
 CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES = 16 * 1024
+CLAUDE_SOURCE_AUTHORITY_BINDING_LIMIT_BYTES = 32 * 1024
 CLAUDE_BINARY_LIMIT_BYTES = 1024 * 1024 * 1024
 CLAUDE_SESSION_ENV_IDENTITY_BINDING = "first-no-follow-open-after-exclusive-mkdir"
 CLAUDE_SESSION_ENV_CREATION_ORIGIN_GUARANTEE = (
@@ -81,7 +91,7 @@ CLAUDE_SESSION_ENV_CLEANUP_GUARANTEE = (
     "cooperative-claude-control-directory-flock-same-uid-host-tcb"
 )
 CLAUDE_SESSION_ENV_CLEANUP_OBSERVATION = "selected-name-absent-after-rmdir"
-CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v2"
+CLAUDE_DIRECT_ARGV_PROFILE = "named-direct-claude-argv-v3"
 CLAUDE_DIRECT_ARGV_CONFORMANCE = "guard-constructed-exact-token-sequence"
 CLAUDE_DIRECT_SETTINGS_SCHEMA = "named-direct-claude-settings-v1"
 CLAUDE_DIRECT_ENVIRONMENT_PROFILE = "named-direct-claude-environment-v1"
@@ -1729,12 +1739,24 @@ class _ClaudeExecutableBinding:
 
 
 @dataclass(frozen=True)
+class _ClaudeSourceControlFileBinding:
+    path: pathlib.Path
+    identity: _DirectoryIdentity
+    file_type: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class _ClaudeSourceReadBoundaryBinding:
     source_worktree: pathlib.Path
     source_identity: _DirectoryIdentity
     marker: _MaterializerSourceMarkerBinding
+    marker_content: _ClaudeSourceControlFileBinding | None
+    back_pointer: _ClaudeSourceControlFileBinding | None
     admin: pathlib.Path
     admin_identity: _DirectoryIdentity
+    commondir: _ClaudeSourceControlFileBinding | None
     common: pathlib.Path
     common_identity: _DirectoryIdentity
     objects: pathlib.Path
@@ -1752,6 +1774,8 @@ class _ClaudeDirectArgvProfile:
     source_worktree: pathlib.Path
     source_read_deny_roots: tuple[pathlib.Path, ...]
     source_read_boundary: _ClaudeSourceReadBoundaryBinding
+    source_authority_binding: Mapping[str, object]
+    source_authority_binding_sha256: str
     preflight_result: pathlib.Path
     output_bindings: Mapping[str, object]
     environment_binding: Mapping[str, object]
@@ -8351,6 +8375,127 @@ def _claude_direct_primary_source_guidance() -> str:
     )
 
 
+def _claude_source_control_file_binding(
+    path: pathlib.Path,
+    *,
+    label: str,
+) -> tuple[_ClaudeSourceControlFileBinding, bytearray]:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            f"Claude source {label} cannot be inspected"
+        ) from error
+    payload = _read_materializer_control_file(path, label=label)
+    try:
+        after = path.lstat()
+    except OSError as error:
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError(
+            f"Claude source {label} cannot be revalidated"
+        ) from error
+
+    def signature(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_size,
+        )
+
+    if signature(before) != signature(after):
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError(
+            f"Claude source {label} changed during exact-content binding"
+        )
+    return (
+        _ClaudeSourceControlFileBinding(
+            path=path,
+            identity=_directory_identity(after),
+            file_type=stat.S_IFMT(after.st_mode),
+            size=after.st_size,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+        payload,
+    )
+
+
+def _claude_linked_marker_content_bindings(
+    marker: _MaterializerSourceMarkerBinding,
+    source: pathlib.Path,
+    admin: pathlib.Path,
+) -> tuple[_ClaudeSourceControlFileBinding, _ClaudeSourceControlFileBinding]:
+    marker_binding, marker_payload = _claude_source_control_file_binding(
+        marker.path,
+        label="Git admin marker",
+    )
+    try:
+        stripped = bytes(marker_payload).rstrip(b"\r\n")
+        prefix = b"gitdir: "
+        if not stripped.startswith(prefix) or not stripped[len(prefix) :]:
+            raise NamedLaneGuardError("Claude source Git admin marker is malformed")
+        if (
+            _materializer_control_path(
+                stripped[len(prefix) :],
+                relative_to=source,
+                label="Git admin marker",
+            )
+            != admin
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git admin marker does not match its bound admin"
+            )
+    finally:
+        marker_payload[:] = b"\x00" * len(marker_payload)
+    back_pointer, back_pointer_payload = _claude_source_control_file_binding(
+        admin / "gitdir",
+        label="Git admin back-pointer",
+    )
+    try:
+        if (
+            _materializer_control_path(
+                back_pointer_payload,
+                relative_to=admin,
+                label="Git admin back-pointer",
+            )
+            != marker.path
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git admin back-pointer does not match its marker"
+            )
+    finally:
+        back_pointer_payload[:] = b"\x00" * len(back_pointer_payload)
+    return marker_binding, back_pointer
+
+
+def _claude_common_directory_binding(
+    admin: pathlib.Path,
+) -> tuple[_ClaudeSourceControlFileBinding | None, pathlib.Path]:
+    marker_path = admin / "commondir"
+    try:
+        marker_path.lstat()
+    except FileNotFoundError:
+        return None, admin
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude source Git common-directory marker cannot be inspected"
+        ) from error
+    binding, payload = _claude_source_control_file_binding(
+        marker_path,
+        label="Git common-directory marker",
+    )
+    try:
+        common = _materializer_control_path(
+            payload,
+            relative_to=admin,
+            label="Git common-directory marker",
+        )
+    finally:
+        payload[:] = b"\x00" * len(payload)
+    return binding, common
+
+
 def _claude_source_object_info_identity(
     objects: pathlib.Path,
 ) -> _DirectoryIdentity | None:
@@ -8420,31 +8565,7 @@ def _bind_claude_source_read_boundary(
     _verify_materializer_source_marker(marker, source)
     admin = marker.expected_admin
     _verify_materializer_source_back_pointer(marker, admin)
-    commondir = admin / "commondir"
-
-    def resolve_common_directory() -> pathlib.Path:
-        try:
-            commondir.lstat()
-        except FileNotFoundError:
-            return admin
-        except OSError as error:
-            raise NamedLaneGuardError(
-                "Claude source Git common directory cannot be inspected"
-            ) from error
-        payload = _read_materializer_control_file(
-            commondir,
-            label="Git common-directory marker",
-        )
-        try:
-            return _materializer_control_path(
-                payload,
-                relative_to=admin,
-                label="Git common-directory marker",
-            )
-        finally:
-            payload[:] = b"\x00" * len(payload)
-
-    common = resolve_common_directory()
+    commondir, common = _claude_common_directory_binding(admin)
     objects = common / "objects"
     path_metadata: dict[pathlib.Path, os.stat_result] = {}
     for path, label in (
@@ -8461,16 +8582,44 @@ def _bind_claude_source_read_boundary(
         if metadata.st_uid != _current_user_id():
             raise NamedLaneGuardError(f"{label} must be current-user-owned")
         path_metadata[path] = metadata
+    marker_content: _ClaudeSourceControlFileBinding | None = None
+    back_pointer: _ClaudeSourceControlFileBinding | None = None
+    if marker.is_gitfile:
+        marker_content, back_pointer = _claude_linked_marker_content_bindings(
+            marker,
+            source,
+            admin,
+        )
+        if (
+            marker_content.path != marker.path
+            or marker_content.identity.device != marker.device
+            or marker_content.identity.inode != marker.inode
+            or marker_content.identity.owner != marker.owner
+            or marker_content.file_type != marker.file_type
+        ):
+            raise NamedLaneGuardError(
+                "Claude source Git marker identity changed during exact-content binding"
+            )
     object_info_identity = _claude_source_object_info_identity(objects)
     _reject_claude_source_alternate_entries(objects)
 
     _verify_materializer_source_marker(marker, source)
     _verify_materializer_source_back_pointer(marker, admin)
-    if resolve_common_directory() != common:
+    final_commondir, final_common = _claude_common_directory_binding(admin)
+    if final_commondir != commondir or final_common != common:
         raise NamedLaneGuardError(
-            "Claude source Git common-directory authority changed during "
+            "Claude source Git common-directory marker or authority changed during "
             "direct-primary source validation"
         )
+    if marker.is_gitfile:
+        final_marker_content, final_back_pointer = (
+            _claude_linked_marker_content_bindings(marker, source, admin)
+        )
+        if final_marker_content != marker_content or final_back_pointer != back_pointer:
+            raise NamedLaneGuardError(
+                "Claude source Git marker or back-pointer content changed during "
+                "direct-primary source validation"
+            )
     for path, label in (
         (source, "Claude source worktree"),
         (admin, "Claude source Git admin directory"),
@@ -8500,8 +8649,11 @@ def _bind_claude_source_read_boundary(
         source_worktree=source,
         source_identity=_directory_identity(path_metadata[source]),
         marker=marker,
+        marker_content=marker_content,
+        back_pointer=back_pointer,
         admin=admin,
         admin_identity=_directory_identity(path_metadata[admin]),
+        commondir=commondir,
         common=common,
         common_identity=_directory_identity(path_metadata[common]),
         objects=objects,
@@ -8518,11 +8670,131 @@ def _resolve_claude_source_read_deny_roots(
     return binding.source_worktree, binding.deny_roots
 
 
+def _claude_source_identity_tuple(
+    identity: _DirectoryIdentity,
+) -> tuple[int, int, int]:
+    return (identity.device, identity.inode, identity.owner)
+
+
+def _claude_source_authority_binding_payload(
+    binding: _ClaudeSourceReadBoundaryBinding,
+) -> dict[str, object]:
+    marker_content = binding.marker_content
+    back_pointer = binding.back_pointer
+    return build_source_authority_binding(
+        source_worktree=source_authority_directory_record(
+            binding.source_worktree,
+            _claude_source_identity_tuple(binding.source_identity),
+        ),
+        git_marker=source_authority_marker_record(
+            binding.marker.path,
+            binding.marker.expected_admin,
+            (
+                binding.marker.device,
+                binding.marker.inode,
+                binding.marker.owner,
+            ),
+            file_type=binding.marker.file_type,
+            kind="gitfile" if binding.marker.is_gitfile else "directory",
+            size=None if marker_content is None else marker_content.size,
+            sha256=None if marker_content is None else marker_content.sha256,
+        ),
+        linked_worktree_back_pointer=(
+            None
+            if back_pointer is None
+            else source_authority_control_record(
+                back_pointer.path,
+                _claude_source_identity_tuple(back_pointer.identity),
+                file_type=back_pointer.file_type,
+                size=back_pointer.size,
+                sha256=back_pointer.sha256,
+            )
+        ),
+        git_common_directory_marker=(
+            None
+            if binding.commondir is None
+            else source_authority_common_marker_record(
+                source_authority_control_record(
+                    binding.commondir.path,
+                    _claude_source_identity_tuple(binding.commondir.identity),
+                    file_type=binding.commondir.file_type,
+                    size=binding.commondir.size,
+                    sha256=binding.commondir.sha256,
+                ),
+                binding.common,
+            )
+        ),
+        git_admin=source_authority_directory_record(
+            binding.admin,
+            _claude_source_identity_tuple(binding.admin_identity),
+        ),
+        git_common=source_authority_directory_record(
+            binding.common,
+            _claude_source_identity_tuple(binding.common_identity),
+        ),
+        primary_object_store=source_authority_directory_record(
+            binding.objects,
+            _claude_source_identity_tuple(binding.objects_identity),
+        ),
+        object_info_path=binding.objects / "info",
+        object_info_identity=(
+            None
+            if binding.object_info_identity is None
+            else _claude_source_identity_tuple(binding.object_info_identity)
+        ),
+    )
+
+
+def _validate_parent_source_authority_binding(
+    value: object,
+    expected_sha256: object,
+) -> tuple[dict[str, object], str]:
+    try:
+        return validate_source_authority_binding(value, expected_sha256)
+    except SourceAuthorityBindingError as error:
+        raise NamedLaneGuardError(str(error)) from error
+
+
+def _parse_parent_source_authority_binding_json(
+    value: str,
+    expected_sha256: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise NamedLaneGuardError(
+            "parent source-authority binding JSON is not valid UTF-8"
+        ) from error
+    if len(encoded) > CLAUDE_SOURCE_AUTHORITY_BINDING_LIMIT_BYTES:
+        raise NamedLaneGuardError(
+            "parent source-authority binding JSON exceeds its size bound"
+        )
+    try:
+        return parse_canonical_source_authority_binding_bytes(
+            encoded,
+            expected_sha256,
+        )
+    except SourceAuthorityBindingError as error:
+        raise NamedLaneGuardError(str(error)) from error
+
+
 def _revalidate_claude_source_read_boundary(
     expected: _ClaudeSourceReadBoundaryBinding,
+    parent_binding: Mapping[str, object],
+    parent_binding_sha256: str,
 ) -> None:
     observed = _bind_claude_source_read_boundary(expected.source_worktree)
-    if observed != expected:
+    observed_payload = _claude_source_authority_binding_payload(observed)
+    if (
+        observed != expected
+        or observed_payload != parent_binding
+        or not secrets.compare_digest(
+            hashlib.sha256(
+                canonical_source_authority_binding_bytes(observed_payload)
+            ).hexdigest(),
+            parent_binding_sha256,
+        )
+    ):
         raise NamedLaneGuardError(
             "Claude source direct-primary authority changed after initial "
             "binding; " + _claude_direct_primary_source_guidance()
@@ -8709,6 +8981,8 @@ def _build_claude_direct_argv_profile(
     *,
     worktree: pathlib.Path,
     source_worktree: pathlib.Path,
+    source_authority_binding: Mapping[str, object],
+    source_authority_binding_sha256: str,
     preflight_result: pathlib.Path,
     stdout: _OutputTarget,
     stderr: _OutputTarget,
@@ -8720,6 +8994,22 @@ def _build_claude_direct_argv_profile(
             "Claude model must match the canonical named-direct model profile"
         )
     source_read_boundary = _bind_claude_source_read_boundary(source_worktree)
+    observed_source_authority = _claude_source_authority_binding_payload(
+        source_read_boundary
+    )
+    if (
+        observed_source_authority != source_authority_binding
+        or not secrets.compare_digest(
+            hashlib.sha256(
+                canonical_source_authority_binding_bytes(observed_source_authority)
+            ).hexdigest(),
+            source_authority_binding_sha256,
+        )
+    ):
+        raise NamedLaneGuardError(
+            "Claude source authority does not match the parent-owned "
+            "prepare-workspace binding"
+        )
     source = source_read_boundary.source_worktree
     source_read_deny_roots = source_read_boundary.deny_roots
     if (
@@ -8854,6 +9144,8 @@ def _build_claude_direct_argv_profile(
         source_worktree=source,
         source_read_deny_roots=source_read_deny_roots,
         source_read_boundary=source_read_boundary,
+        source_authority_binding=source_authority_binding,
+        source_authority_binding_sha256=source_authority_binding_sha256,
         preflight_result=preflight_result,
         output_bindings={
             "stdout": _claude_output_profile_binding(stdout),
@@ -8872,7 +9164,11 @@ def _claude_direct_argv_profile_receipt(
     *,
     effective_arguments: Sequence[str],
 ) -> dict[str, object]:
-    _revalidate_claude_source_read_boundary(profile.source_read_boundary)
+    _revalidate_claude_source_read_boundary(
+        profile.source_read_boundary,
+        profile.source_authority_binding,
+        profile.source_authority_binding_sha256,
+    )
     if _claude_git_null_read_exception_binding() != profile.git_null_read_exception:
         raise NamedLaneGuardError(
             "Claude Git null read exception changed before receipt generation"
@@ -8891,11 +9187,17 @@ def _claude_direct_argv_profile_receipt(
         "review_git_metadata": str(profile.git_metadata),
         "account_home": str(profile.account_home),
         "source_worktree": str(profile.source_worktree),
-        "source_worktree_binding": "parent-supplied-direct-primary-only-deny-root",
+        "source_worktree_binding": (
+            "prepare-workspace-receipt-exact-digest-bound-authority-v1"
+        ),
         "source_read_deny_roots": [
             str(path) for path in profile.source_read_deny_roots
         ],
         "source_authority_policy": "direct-primary-only",
+        "source_authority_binding": json.loads(
+            canonical_source_authority_binding_bytes(profile.source_authority_binding)
+        ),
+        "source_authority_binding_sha256": (profile.source_authority_binding_sha256),
         "source_primary_object_store": str(profile.source_read_boundary.objects),
         "source_primary_object_store_identity": {
             "device": profile.source_read_boundary.objects_identity.device,
@@ -10208,6 +10510,8 @@ def run_claude(
     *,
     worktree: pathlib.Path,
     source_worktree: pathlib.Path,
+    source_authority_binding: Mapping[str, object],
+    source_authority_binding_sha256: str,
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     command: Sequence[str],
@@ -10220,6 +10524,13 @@ def run_claude(
     deadline_monotonic: float | None = None,
     _receipt_emitter: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
+    (
+        parent_source_authority_binding,
+        parent_source_authority_binding_sha256,
+    ) = _validate_parent_source_authority_binding(
+        source_authority_binding,
+        source_authority_binding_sha256,
+    )
     deadline = _bounded_deadline(timeout_seconds, deadline_monotonic)
     _remaining_deadline_seconds(deadline, "Claude named lane")
     stream_limit = _validate_byte_limit(
@@ -10266,6 +10577,10 @@ def run_claude(
             argv_profile = _build_claude_direct_argv_profile(
                 worktree=root,
                 source_worktree=source_worktree,
+                source_authority_binding=parent_source_authority_binding,
+                source_authority_binding_sha256=(
+                    parent_source_authority_binding_sha256
+                ),
                 preflight_result=preflight_result,
                 stdout=stdout,
                 stderr=stderr,
@@ -10344,7 +10659,9 @@ def run_claude(
                         require_lexical_parent=True,
                     )
                 _revalidate_claude_source_read_boundary(
-                    argv_profile.source_read_boundary
+                    argv_profile.source_read_boundary,
+                    argv_profile.source_authority_binding,
+                    argv_profile.source_authority_binding_sha256,
                 )
                 restore_signal_mask(snapshot_mask)
                 try:
@@ -10627,7 +10944,9 @@ def run_claude(
                         previous_handlers[forwarded] = signal.getsignal(forwarded)
                         signal.signal(forwarded, defer_publication_signal)
                     _revalidate_claude_source_read_boundary(
-                        argv_profile.source_read_boundary
+                        argv_profile.source_read_boundary,
+                        argv_profile.source_authority_binding,
+                        argv_profile.source_authority_binding_sha256,
                     )
                     _revalidate_output_parent(stdout)
                     _revalidate_output_parent(stderr)
@@ -10846,6 +11165,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     claude.add_argument("--worktree", required=True)
     claude.add_argument("--source-worktree", required=True)
+    claude.add_argument("--source-authority-binding-json", required=True)
+    claude.add_argument("--source-authority-binding-sha256", required=True)
     claude.add_argument("--preflight-result", required=True)
     claude.add_argument("--stdout-path", required=True)
     claude.add_argument("--stderr-path", required=True)
@@ -11667,6 +11988,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stream limit",
         )
         with _structured_forwarded_signals() as signal_state:
+            (
+                source_authority_binding,
+                source_authority_binding_sha256,
+            ) = _parse_parent_source_authority_binding_json(
+                args.source_authority_binding_json,
+                args.source_authority_binding_sha256,
+            )
             timeout = _validate_timeout_limit(args.timeout_seconds)
             deadline = time.monotonic() + timeout
             prompt = _read_control_prompt(
@@ -11681,6 +12009,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = run_claude(
                 worktree=pathlib.Path(args.worktree),
                 source_worktree=pathlib.Path(args.source_worktree),
+                source_authority_binding=source_authority_binding,
+                source_authority_binding_sha256=(source_authority_binding_sha256),
                 stdout_path=pathlib.Path(args.stdout_path),
                 stderr_path=pathlib.Path(args.stderr_path),
                 command=command,

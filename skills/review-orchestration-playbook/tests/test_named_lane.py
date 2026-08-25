@@ -57,7 +57,7 @@ from review_runtime.named_lane import (  # noqa: E402
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
     build_sanitized_git_argv_prefix,
-    main as named_lane_main,
+    main as _named_lane_main,
     materialize_worktree,
     run_claude as _run_claude,
     sanitized_git_argv_prefix_receipt,
@@ -88,7 +88,9 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def run_claude(**kwargs: object) -> dict[str, object]:
+def call_run_claude(**kwargs: object) -> dict[str, object]:
+    """Call the production API only with an explicit parent binding."""
+
     if "source_worktree" not in kwargs:
         worktree = pathlib.Path(kwargs["worktree"])
         kwargs["source_worktree"] = worktree.parent / "source-control"
@@ -98,7 +100,21 @@ def run_claude(**kwargs: object) -> dict[str, object]:
         kwargs["preflight_result"] = executable.with_name(
             f"{executable.name}.preflight.json"
         )
+    binding_fields = {
+        "source_authority_binding",
+        "source_authority_binding_sha256",
+    }
+    if not binding_fields.issubset(kwargs):
+        raise AssertionError(
+            "run_claude tests must supply both values from a prepared source receipt"
+        )
     return _run_claude(**kwargs)
+
+
+def call_named_lane_main(argv: object) -> int:
+    """Call the production CLI entrypoint without synthesizing guard input."""
+
+    return _named_lane_main(tuple(argv))
 
 
 def retired_public_commands(*commands: str) -> object:
@@ -113,7 +129,7 @@ def retired_public_commands(*commands: str) -> object:
                     contextlib.redirect_stderr(io.StringIO()),
                     self.assertRaises(SystemExit) as caught,
                 ):
-                    named_lane_main((command,))
+                    self.named_lane_main((command,))
                 self.assertEqual(caught.exception.code, 2)
 
         return assert_retired
@@ -132,6 +148,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         self._prefix_test_workspaces: list[
             review_workspace_runtime.PreparedWorkspace
         ] = []
+        self._prepared_source_authority_receipts: dict[
+            pathlib.Path, dict[str, object]
+        ] = {}
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.source_control = self.root / "source-control"
@@ -141,6 +160,13 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "config", "user.name", "Named Lane Test")
         git(self.repo, "config", "user.email", "named-lane@example.invalid")
         git(self.repo, "config", "commit.gpgsign", "false")
+        method_names = set(getattr(type(self), self._testMethodName).__code__.co_names)
+        if method_names.intersection(
+            {"run_claude", "named_lane_main", "isolated_guard_command"}
+        ):
+            # Prepare before the test installs time, signal, filesystem, or
+            # process mocks. The cached receipt is the explicit parent input.
+            self.prepared_source_authority_receipt(self.source_control)
 
     def tearDown(self) -> None:
         for prepared in reversed(self._prefix_test_workspaces):
@@ -176,6 +202,129 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self._prefix_test_workspaces.append(prepared)
         return prepared, base, head
+
+    def source_control_range(self) -> tuple[str, str]:
+        git(self.source_control, "config", "user.name", "Named Lane Source Test")
+        git(
+            self.source_control,
+            "config",
+            "user.email",
+            "named-lane-source@example.invalid",
+        )
+        git(self.source_control, "config", "commit.gpgsign", "false")
+        tracked = self.source_control / "tracked.txt"
+        tracked.write_text("source base\n", encoding="utf-8")
+        git(self.source_control, "add", "tracked.txt")
+        git(self.source_control, "commit", "-m", "source base")
+        base = git(self.source_control, "rev-parse", "HEAD")
+        tracked.write_text("source head\n", encoding="utf-8")
+        git(self.source_control, "commit", "-am", "source head")
+        return base, git(self.source_control, "rev-parse", "HEAD")
+
+    def prepare_source_authority_receipt(
+        self,
+        source: pathlib.Path,
+        *,
+        base: str,
+        head: str,
+        name: str,
+    ) -> dict[str, object]:
+        prepared = review_workspace_runtime.prepare_workspace(
+            source,
+            self.root / f"{name}-prepared-workspace",
+            base,
+            head,
+        )
+        self._prefix_test_workspaces.append(prepared)
+        return prepared.receipt()
+
+    def prepared_source_authority_receipt(
+        self,
+        source: pathlib.Path,
+    ) -> dict[str, object]:
+        """Prepare and cache exact parent input for unrelated Claude unit tests."""
+
+        source = source.resolve()
+        cached = self._prepared_source_authority_receipts.get(source)
+        if cached is not None:
+            return cached
+        try:
+            head = git(source, "rev-parse", "HEAD")
+        except subprocess.CalledProcessError:
+            git(source, "config", "user.name", "Named Lane Source Test")
+            git(
+                source,
+                "config",
+                "user.email",
+                "named-lane-source@example.invalid",
+            )
+            git(source, "config", "commit.gpgsign", "false")
+            git(source, "commit", "--allow-empty", "-m", "source authority fixture")
+            head = git(source, "rev-parse", "HEAD")
+        receipt = self.prepare_source_authority_receipt(
+            source,
+            base=head,
+            head=head,
+            name=f"source-authority-{len(self._prepared_source_authority_receipts)}",
+        )
+        self._prepared_source_authority_receipts[source] = receipt
+        return receipt
+
+    def run_claude(self, **kwargs: object) -> dict[str, object]:
+        """Call Claude with exact cached prepare-receipt authority by default."""
+
+        binding_fields = {
+            "source_authority_binding",
+            "source_authority_binding_sha256",
+        }
+        supplied = binding_fields.intersection(kwargs)
+        if supplied and supplied != binding_fields:
+            raise AssertionError(
+                "Claude parent binding fields must be supplied together"
+            )
+        if not supplied:
+            source = pathlib.Path(
+                kwargs.get(
+                    "source_worktree",
+                    pathlib.Path(kwargs["worktree"]).parent / "source-control",
+                )
+            )
+            receipt = self.prepared_source_authority_receipt(source)
+            kwargs["source_authority_binding"] = receipt["source_authority_binding"]
+            kwargs["source_authority_binding_sha256"] = receipt[
+                "source_authority_binding_sha256"
+            ]
+        return call_run_claude(**kwargs)
+
+    def named_lane_main(self, argv: object) -> int:
+        """Call the CLI with exact cached prepare-receipt authority input."""
+
+        arguments = list(argv)
+        if (
+            arguments
+            and arguments[0] == "run-claude"
+            and "--source-authority-binding-json" not in arguments
+        ):
+            if "--source-worktree" not in arguments:
+                raise AssertionError("run-claude test argv lacks --source-worktree")
+            source = pathlib.Path(arguments[arguments.index("--source-worktree") + 1])
+            receipt = self.prepared_source_authority_receipt(source)
+            canonical = (
+                review_workspace_runtime.canonical_source_authority_binding_bytes(
+                    receipt["source_authority_binding"]
+                )
+            )
+            self.assertEqual(
+                hashlib.sha256(canonical).hexdigest(),
+                receipt["source_authority_binding_sha256"],
+            )
+            arguments[1:1] = (
+                "--source-authority-binding-json",
+                canonical.decode("utf-8"),
+                "--source-authority-binding-sha256",
+                receipt["source_authority_binding_sha256"],
+            )
+        return call_named_lane_main(tuple(arguments))
 
     def run_codex_git_prefix_committed_cleanup_fault(
         self,
@@ -491,7 +640,7 @@ raise SystemExit(returncode)
         git_executable = named_lane_runtime.resolve_git()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = named_lane_main(
+            result = self.named_lane_main(
                 (
                     "codex-git-prefix",
                     "--worktree",
@@ -663,7 +812,7 @@ raise SystemExit(returncode)
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
-                returncode = named_lane_main(
+                returncode = self.named_lane_main(
                     (
                         "codex-git-prefix",
                         "--worktree",
@@ -859,7 +1008,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(arguments)
+            returncode = self.named_lane_main(arguments)
 
         self.assertEqual(returncode, 0)
         self.assertEqual(stderr.getvalue(), "")
@@ -1147,7 +1296,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(arguments)
+            returncode = self.named_lane_main(arguments)
 
         self.assertEqual(returncode, 128 + signal.SIGTERM)
         self.assertEqual(stdout.getvalue(), "")
@@ -1252,7 +1401,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(arguments)
+            returncode = self.named_lane_main(arguments)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(stdout.getvalue(), "")
@@ -1306,7 +1455,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(arguments)
+            returncode = self.named_lane_main(arguments)
 
         self.assertEqual(returncode, 128 + signal.SIGTERM)
         self.assertEqual(stdout.getvalue(), "")
@@ -1724,7 +1873,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -1776,7 +1925,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "prepare-workspace",
                     "--source",
@@ -1871,7 +2020,7 @@ raise SystemExit(returncode)
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         self.prepare_workspace_argv(destination, base, head)
                     )
 
@@ -1927,7 +2076,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -1976,7 +2125,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -2054,7 +2203,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -2111,7 +2260,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -2168,7 +2317,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stderr(stderr),
             self.assertRaises(TerminalExit) as caught,
         ):
-            named_lane_main(self.prepare_workspace_argv(destination, base, head))
+            self.named_lane_main(self.prepare_workspace_argv(destination, base, head))
 
         self.assertEqual(caught.exception.returncode, 0)
         self.assertEqual(stderr.getvalue(), "")
@@ -2252,7 +2401,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -2461,7 +2610,7 @@ raise SystemExit(returncode)
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 self.prepare_workspace_argv(destination, base, head)
             )
 
@@ -2571,7 +2720,7 @@ raise SystemExit(returncode)
                     contextlib.redirect_stderr(stderr),
                     self.assertRaises(TerminalExit) as caught,
                 ):
-                    named_lane_main(
+                    self.named_lane_main(
                         self.prepare_workspace_argv(destination, base, head)
                     )
 
@@ -2745,7 +2894,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stderr(stderr),
             self.assertRaises(TerminalExit) as caught,
         ):
-            named_lane_main(self.prepare_workspace_argv(destination, base, head))
+            self.named_lane_main(self.prepare_workspace_argv(destination, base, head))
 
         self.assertEqual(caught.exception.returncode, 2)
         self.assertEqual(install_calls, 2)
@@ -2915,7 +3064,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                         )
                     stack.enter_context(contextlib.redirect_stdout(stdout))
                     stack.enter_context(contextlib.redirect_stderr(stderr))
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
                 self.assertTrue(stdout.injected)
                 self.assertEqual(returncode, 0)
                 self.assertEqual(stderr.getvalue(), "")
@@ -3085,18 +3234,45 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         guard: pathlib.Path,
         *arguments: str,
         python_executable: pathlib.Path | None = None,
+        include_prepared_source_authority: bool = True,
     ) -> tuple[str, ...]:
         if python_executable is None:
             python_executable = pathlib.Path(sys.executable).resolve()
         self.assertTrue(python_executable.is_absolute())
         self.assertTrue(python_executable.is_file())
+        guarded_arguments = list(arguments)
+        if (
+            include_prepared_source_authority
+            and guarded_arguments
+            and guarded_arguments[0] == "run-claude"
+            and "--source-authority-binding-json" not in guarded_arguments
+            and "--source-worktree" in guarded_arguments
+        ):
+            source_index = guarded_arguments.index("--source-worktree") + 1
+            source = pathlib.Path(guarded_arguments[source_index])
+            receipt = self.prepared_source_authority_receipt(source)
+            canonical_binding = (
+                review_workspace_runtime.canonical_source_authority_binding_bytes(
+                    receipt["source_authority_binding"]
+                )
+            )
+            self.assertEqual(
+                hashlib.sha256(canonical_binding).hexdigest(),
+                receipt["source_authority_binding_sha256"],
+            )
+            guarded_arguments[1:1] = (
+                "--source-authority-binding-json",
+                canonical_binding.decode("utf-8"),
+                "--source-authority-binding-sha256",
+                receipt["source_authority_binding_sha256"],
+            )
         return (
             str(python_executable),
             "-I",
             "-B",
             "-S",
             str(guard),
-            *arguments,
+            *guarded_arguments,
         )
 
     def install_unchecked_pyc(
@@ -7800,7 +7976,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stderr(missing_base_stderr),
             self.assertRaises(SystemExit) as missing_base,
         ):
-            named_lane_main(
+            self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -7814,7 +7990,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -8251,7 +8427,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -8296,7 +8472,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -8336,7 +8512,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -8420,7 +8596,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -9458,7 +9634,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9541,7 +9717,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9604,7 +9780,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9656,7 +9832,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9712,7 +9888,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9789,7 +9965,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9857,7 +10033,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -9940,7 +10116,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "materialize-worktree",
                     "--source",
@@ -10480,7 +10656,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "validate-worktree",
                     "--worktree",
@@ -10685,7 +10861,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 git(self.repo, "config", *scope, "alias.foo", f"!{probe}")
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "validate-worktree",
                             "--worktree",
@@ -10922,7 +11098,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         stdout = self.root / "stdout.bin"
         stderr = self.root / "stderr.bin"
 
-        result = run_claude(
+        result = self.run_claude(
             worktree=self.repo.resolve(),
             stdout_path=stdout,
             stderr_path=stderr,
@@ -11041,7 +11217,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "does not match the accepted preflight executable",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -11070,7 +11246,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "changed after accepted preflight",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "replacement-before.out",
                 stderr_path=self.root / "replacement-before.err",
@@ -11125,7 +11301,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "run_bounded_capture",
             side_effect=replace_at_handoff,
         ):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -11162,7 +11338,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         extra_link = self.root / "benign-executable-hardlink"
         os.link(executable, extra_link)
         try:
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "benign-metadata.out",
                 stderr_path=self.root / "benign-metadata.err",
@@ -11192,7 +11368,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "changed during launch binding",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "forged-checksum.out",
                 stderr_path=self.root / "forged-checksum.err",
@@ -11220,7 +11396,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "changed during launch binding",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "same-inode-drift.out",
                 stderr_path=self.root / "same-inode-drift.err",
@@ -11250,7 +11426,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ):
                 with self.subTest(label=label):
                     with self.assertRaisesRegex(NamedLaneGuardError, expected):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"{label}-preflight.out",
                             stderr_path=self.root / f"{label}-preflight.err",
@@ -11269,7 +11445,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "private single-link regular file",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "permissive-preflight.out",
                     stderr_path=self.root / "permissive-preflight.err",
@@ -11308,7 +11484,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "launch snapshot cannot be inspected safely",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-fstat.out",
                 stderr_path=self.root / "snapshot-fstat.err",
@@ -11348,7 +11524,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "cleanup cannot bind the retained path",
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "persistent-snapshot-fstat.out",
                     stderr_path=self.root / "persistent-snapshot-fstat.err",
@@ -11389,7 +11565,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             self.assertRaisesRegex(ReviewTimeoutError, "rehash deadline"),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "rehash-deadline.out",
                 stderr_path=self.root / "rehash-deadline.err",
@@ -11429,7 +11605,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             self.assertRaises(ForwardedSignal),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-handoff.out",
                 stderr_path=self.root / "snapshot-handoff.err",
@@ -11471,7 +11647,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             self.assertRaises(ForwardedSignal) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "cleanup-signal.out",
                 stderr_path=self.root / "cleanup-signal.err",
@@ -11530,7 +11706,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-signal-failure.out",
                     stderr_path=self.root / "cleanup-signal-failure.err",
@@ -11597,7 +11773,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "signal mask could not be restored",
                 ),
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-mask.out",
                     stderr_path=self.root / "cleanup-mask.err",
@@ -11650,7 +11826,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "restore_signal_mask",
             side_effect=fail_first_cleanup_restore,
         ):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "cleanup-mask-retry.out",
                 stderr_path=self.root / "cleanup-mask-retry.err",
@@ -11701,7 +11877,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     ),
                     self.assertRaises(type(control_error)) as context,
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"cleanup-{label}.out",
                         stderr_path=self.root / f"cleanup-{label}.err",
@@ -11745,7 +11921,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-complete.out",
                     stderr_path=self.root / "cleanup-complete.err",
@@ -11806,7 +11982,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "cleanup-deadline.out",
                     stderr_path=self.root / "cleanup-deadline.err",
@@ -11869,7 +12045,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         )
         denied["NODE_EXTRA_CA_CERTS"] = str(node_extra_ca)
         with mock.patch.dict(os.environ, {**allowed, **denied}, clear=True):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=default_stdout,
                 stderr_path=default_stderr,
@@ -11878,7 +12054,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
             )
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -11966,7 +12142,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         stdout = self.root / "session-env.json"
         stderr = self.root / "session-env.err"
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -12065,7 +12241,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "namespace lease is already held",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "namespace-lease.out",
                 stderr_path=self.root / "namespace-lease.err",
@@ -12145,7 +12321,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     side_effect=replace_after_leaf_mkdir,
                 ),
             ):
-                result = run_claude(
+                result = self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "mkdir-origin.out",
                     stderr_path=self.root / "mkdir-origin.err",
@@ -12238,7 +12414,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-replacement.out",
                     stderr_path=self.root / "snapshot-replacement.err",
@@ -12314,7 +12490,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "leaf handoff mode changed",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "snapshot-mode.out",
                 stderr_path=self.root / "snapshot-mode.err",
@@ -12389,7 +12565,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-content.out",
                     stderr_path=self.root / "snapshot-content.err",
@@ -12472,7 +12648,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCustodyError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "snapshot-parent.out",
                     stderr_path=self.root / "snapshot-parent.err",
@@ -12582,7 +12758,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                             named_lane_runtime._ClaudeSessionEnvCleanupError
                         ) as context,
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"prelaunch-{label}.out",
                             stderr_path=self.root / f"prelaunch-{label}.err",
@@ -12672,7 +12848,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                             named_lane_runtime._ClaudeSessionEnvCleanupError
                         ) as context,
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"unquiescent-{label}.out",
                             stderr_path=self.root / f"unquiescent-{label}.err",
@@ -12743,7 +12919,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "capture-without-proof.out",
                     stderr_path=self.root / "capture-without-proof.err",
@@ -12832,7 +13008,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeControlCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-mask-acquire.out",
                     stderr_path=self.root / "unquiescent-mask-acquire.err",
@@ -12904,7 +13080,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeControlCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "quiescent-mask-acquire.out",
                     stderr_path=self.root / "quiescent-mask-acquire.err",
@@ -12998,7 +13174,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-mask-restore.out",
                     stderr_path=self.root / "unquiescent-mask-restore.err",
@@ -13082,7 +13258,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeSessionEnvCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "unquiescent-deferred-signal.out",
                     stderr_path=self.root / "unquiescent-deferred-signal.err",
@@ -13151,7 +13327,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     ),
                     self.assertRaises(type(process_error)) as context,
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"quiescent-{label}.out",
                         stderr_path=self.root / f"quiescent-{label}.err",
@@ -13171,6 +13347,17 @@ raise AssertionError("terminal publisher returned with an active mask owner")
     def test_claude_2_1_225_receives_the_exact_guard_owned_profile(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
+        source_base, source_head = self.source_control_range()
+        source_receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="exact-profile-source",
+        )
+        source_binding = source_receipt["source_authority_binding"]
+        source_binding_sha256 = source_receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(source_binding, dict)
+        self.assertIsInstance(source_binding_sha256, str)
         home = self.make_claude_home()
         executable = self.make_executable(
             "import json, os, sys\n"
@@ -13184,11 +13371,13 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             requested_environment = named_lane_runtime._claude_environment(
                 self.repo.resolve()
             )
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
                 command=(str(executable),),
+                source_authority_binding=source_binding,
+                source_authority_binding_sha256=source_binding_sha256,
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
@@ -13243,7 +13432,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(observed["arguments"], expected_arguments)
         self.assertEqual(profile["guard_constructed_arguments"], expected_arguments)
         self.assertEqual(profile["effective_arguments"], expected_arguments)
-        self.assertEqual(profile["profile"], "named-direct-claude-argv-v2")
+        self.assertEqual(profile["profile"], "named-direct-claude-argv-v3")
         self.assertEqual(
             profile["conformance"], "guard-constructed-exact-token-sequence"
         )
@@ -13262,8 +13451,15 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertEqual(profile["source_worktree"], str(self.source_control))
         self.assertEqual(
             profile["source_worktree_binding"],
-            "parent-supplied-direct-primary-only-deny-root",
+            "prepare-workspace-receipt-exact-digest-bound-authority-v1",
         )
+        self.assertEqual(profile["source_authority_binding"], source_binding)
+        self.assertEqual(
+            profile["source_authority_binding_sha256"],
+            source_binding_sha256,
+        )
+        self.assertNotIn("--source-authority-binding-json", observed["arguments"])
+        self.assertNotIn("--source-authority-binding-sha256", observed["arguments"])
         self.assertEqual(
             profile["source_read_deny_roots"],
             [str(self.source_control), str(self.source_control / ".git")],
@@ -13498,7 +13694,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     NamedLaneGuardError,
                     "model must match the canonical named-direct model profile",
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"invalid-model-{model}.stdout",
                         stderr_path=self.root / f"invalid-model-{model}.stderr",
@@ -13560,7 +13756,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     NamedLaneGuardError,
                     "capability contract does not match the closed argv profile",
                 ):
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=self.root / f"preflight-{label}.stdout",
                         stderr_path=self.root / f"preflight-{label}.stderr",
@@ -13570,6 +13766,435 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                         stream_limit_bytes=16 * 1024,
                     )
                 self.assertFalse(marker.exists())
+
+    def test_cli_run_claude_requires_the_parent_source_binding(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        child_marker = self.root / "missing-source-binding-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--source-worktree",
+                str(self.source_control),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
+                "--stdout-path",
+                str(self.root / "missing-binding.stdout"),
+                "--stderr-path",
+                str(self.root / "missing-binding.stderr"),
+                "--",
+                str(executable),
+                include_prepared_source_authority=False,
+            ),
+            check=False,
+            input=b"review",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"--source-authority-binding-json", completed.stderr)
+        self.assertIn(b"--source-authority-binding-sha256", completed.stderr)
+        self.assertFalse(child_marker.exists())
+        self.assertFalse((self.root / "missing-binding.stdout").exists())
+        self.assertFalse((self.root / "missing-binding.stderr").exists())
+
+    def test_parent_source_binding_parser_rejects_closed_schema_bypasses(
+        self,
+    ) -> None:
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="parser-matrix-source",
+        )
+        binding = receipt["source_authority_binding"]
+        digest = receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(binding, dict)
+        self.assertIsInstance(digest, str)
+        canonical = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            binding
+        ).decode("utf-8")
+
+        extra = json.loads(canonical)
+        extra["extra"] = True
+        extra_json = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            extra
+        ).decode("utf-8")
+        wrong_type = json.loads(canonical)
+        wrong_type["source_worktree"]["identity"]["device"] = True
+        wrong_type_json = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(
+                wrong_type
+            ).decode("utf-8")
+        )
+        non_utf8_path = json.loads(canonical)
+        non_utf8_path["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
+        non_utf8_json = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(
+                non_utf8_path
+            ).decode("utf-8")
+        )
+        noncanonical = json.dumps(binding, indent=2, sort_keys=True)
+        duplicate = canonical.replace(
+            "{",
+            '{"schema_version":"review-source-authority-binding-v1",',
+            1,
+        )
+        cases = (
+            ("digest", canonical, "0" * 64, "digest does not match"),
+            (
+                "extra",
+                extra_json,
+                hashlib.sha256(extra_json.encode("utf-8")).hexdigest(),
+                "closed schema",
+            ),
+            (
+                "type",
+                wrong_type_json,
+                hashlib.sha256(wrong_type_json.encode("utf-8")).hexdigest(),
+                "identity field device is invalid",
+            ),
+            (
+                "non-utf8-path",
+                non_utf8_json,
+                hashlib.sha256(non_utf8_json.encode("utf-8")).hexdigest(),
+                "path must be valid UTF-8",
+            ),
+            ("noncanonical", noncanonical, digest, "not canonical"),
+            ("duplicate", duplicate, digest, "duplicate key"),
+        )
+        for label, payload, expected_digest, message in cases:
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(NamedLaneGuardError, message),
+            ):
+                named_lane_runtime._parse_parent_source_authority_binding_json(
+                    payload,
+                    expected_digest,
+                )
+
+    def test_raw_cli_rejects_parent_binding_before_any_runtime_probe(self) -> None:
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="raw-parser-ordering-source",
+        )
+        binding = receipt["source_authority_binding"]
+        digest = receipt["source_authority_binding_sha256"]
+        self.assertIsInstance(binding, dict)
+        self.assertIsInstance(digest, str)
+        canonical = review_workspace_runtime.canonical_source_authority_binding_bytes(
+            binding
+        )
+        non_utf8 = json.loads(canonical)
+        non_utf8["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
+        non_utf8_bytes = (
+            review_workspace_runtime.canonical_source_authority_binding_bytes(non_utf8)
+        )
+        duplicate = canonical.decode("utf-8").replace(
+            "{",
+            '{"schema_version":"review-source-authority-binding-v1",',
+            1,
+        )
+        cases = (
+            ("digest-mismatch", canonical.decode("utf-8"), "0" * 64),
+            (
+                "duplicate-key",
+                duplicate,
+                hashlib.sha256(duplicate.encode("utf-8")).hexdigest(),
+            ),
+            ("noncanonical", json.dumps(binding, indent=2), digest),
+            (
+                "non-utf8-path",
+                non_utf8_bytes.decode("utf-8"),
+                hashlib.sha256(non_utf8_bytes).hexdigest(),
+            ),
+        )
+        for label, payload, expected_digest in cases:
+            with self.subTest(label=label):
+                stderr = io.StringIO()
+                probes = (
+                    "_resolve_worktree_root",
+                    "_load_claude_executable_binding",
+                    "_bind_claude_source_read_boundary",
+                    "_create_claude_launch_snapshot",
+                    "_read_control_prompt",
+                    "run_claude",
+                )
+                with contextlib.ExitStack() as stack:
+                    observed = [
+                        stack.enter_context(
+                            mock.patch.object(named_lane_runtime, probe)
+                        )
+                        for probe in probes
+                    ]
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    returncode = _named_lane_main(
+                        (
+                            "run-claude",
+                            "--source-authority-binding-json",
+                            payload,
+                            "--source-authority-binding-sha256",
+                            expected_digest,
+                            "--worktree",
+                            str(self.repo.resolve()),
+                            "--source-worktree",
+                            str(self.source_control),
+                            "--preflight-result",
+                            str(self.root / f"{label}.preflight.json"),
+                            "--stdout-path",
+                            str(self.root / f"{label}.stdout"),
+                            "--stderr-path",
+                            str(self.root / f"{label}.stderr"),
+                            "--",
+                            "/usr/bin/false",
+                        )
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue())["status"], "inconclusive"
+                )
+                for probe in observed:
+                    probe.assert_not_called()
+
+    def test_claude_tampered_parent_source_binding_fails_before_snapshot(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="tampered-source-binding",
+        )
+        tampered = json.loads(json.dumps(receipt["source_authority_binding"]))
+        tampered["source_worktree"]["identity"]["inode"] += 1
+        child_marker = self.root / "tampered-source-binding-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(NamedLaneGuardError, "digest does not match"),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.source_control,
+                source_authority_binding=tampered,
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "tampered-binding.stdout",
+                stderr_path=self.root / "tampered-binding.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_persistent_ordinary_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        receipt = self.prepare_source_authority_receipt(
+            self.source_control,
+            base=source_base,
+            head=source_head,
+            name="ordinary-replacement-source",
+        )
+        displaced = self.root / "ordinary-source-outside-deny-read"
+        self.source_control.rename(displaced)
+        self.source_control.mkdir(mode=0o700)
+        git(self.source_control, "init", "-b", "master")
+        child_marker = self.root / "ordinary-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=self.source_control,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "ordinary-replacement.stdout",
+                stderr_path=self.root / "ordinary-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertTrue((displaced / ".git").is_dir())
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_persistent_linked_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        linked = self.root / "linked-authority-source"
+        git(
+            self.source_control,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            source_head,
+        )
+        receipt = self.prepare_source_authority_receipt(
+            linked,
+            base=source_base,
+            head=source_head,
+            name="linked-replacement-source",
+        )
+        marker_payload = (linked / ".git").read_bytes()
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        common = pathlib.Path(
+            git(linked, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve()
+        admin_identity = admin.stat().st_ino
+        common_identity = common.stat().st_ino
+        objects_identity = (common / "objects").stat().st_ino
+        displaced = self.root / "linked-source-outside-deny-read"
+        linked.rename(displaced)
+        linked.mkdir(mode=0o700)
+        (linked / ".git").write_bytes(marker_payload)
+        child_marker = self.root / "linked-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=linked,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "linked-replacement.stdout",
+                stderr_path=self.root / "linked-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertEqual(admin.stat().st_ino, admin_identity)
+        self.assertEqual(common.stat().st_ino, common_identity)
+        self.assertEqual((common / "objects").stat().st_ino, objects_identity)
+        self.assertTrue((displaced / ".git").is_file())
+        self.assertFalse(child_marker.exists())
+
+    def test_claude_parent_binding_blocks_linked_commondir_replacement(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        source_base, source_head = self.source_control_range()
+        linked = self.root / "linked-commondir-source"
+        git(
+            self.source_control,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            source_head,
+        )
+        receipt = self.prepare_source_authority_receipt(
+            linked,
+            base=source_base,
+            head=source_head,
+            name="linked-commondir-replacement",
+        )
+        admin = pathlib.Path(git(linked, "rev-parse", "--absolute-git-dir")).resolve()
+        commondir = admin / "commondir"
+        original = commondir.lstat()
+        replacement = admin / "commondir.replacement"
+        replacement.write_bytes(commondir.read_bytes())
+        replacement.chmod(stat.S_IMODE(original.st_mode))
+        os.replace(replacement, commondir)
+        self.assertNotEqual(commondir.stat().st_ino, original.st_ino)
+        child_marker = self.root / "linked-commondir-replacement-child"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(child_marker)!r}).touch()\n"
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_create_claude_launch_snapshot",
+            ) as create_snapshot,
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "does not match the parent-owned prepare-workspace binding",
+            ),
+        ):
+            self.run_claude(
+                worktree=self.repo.resolve(),
+                source_worktree=linked,
+                source_authority_binding=receipt["source_authority_binding"],
+                source_authority_binding_sha256=receipt[
+                    "source_authority_binding_sha256"
+                ],
+                stdout_path=self.root / "linked-commondir-replacement.stdout",
+                stderr_path=self.root / "linked-commondir-replacement.stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        create_snapshot.assert_not_called()
+        self.assertFalse(child_marker.exists())
 
     def test_claude_source_deny_roots_include_linked_git_storage(self) -> None:
         git(self.source_control, "config", "user.name", "Named Lane Source Test")
@@ -13752,7 +14377,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "entry must be absent",
                 ),
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -13787,7 +14412,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "entry must be absent",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -13826,7 +14451,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "authority changed after initial binding",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -13868,7 +14493,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "source and review worktrees must be independent",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 source_worktree=self.repo.resolve(),
                 stdout_path=self.root / "overlap-source.stdout",
@@ -13977,7 +14602,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "changed before receipt generation",
             ),
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
                 stderr_path=stderr,
@@ -14020,7 +14645,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             version="2.1.226",
         )
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-parent.out",
                 stderr_path=self.root / "session-env-parent.err",
@@ -14055,7 +14680,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-nonempty.out",
                 stderr_path=self.root / "session-env-nonempty.err",
@@ -14093,7 +14718,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-replaced.out",
                 stderr_path=self.root / "session-env-replaced.err",
@@ -14131,7 +14756,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 named_lane_runtime._ClaudeSessionEnvCleanupError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-mode.out",
                 stderr_path=self.root / "session-env-mode.err",
@@ -14162,7 +14787,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             version="2.1.226",
         )
         with mock.patch("pwd.getpwuid", return_value=self.claude_account(home)):
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-tightening.out",
                 stderr_path=self.root / "session-env-tightening.err",
@@ -14197,7 +14822,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 named_lane_runtime._ClaudeSessionEnvCustodyError
             ) as context,
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "session-env-parent-drift.out",
                 stderr_path=self.root / "session-env-parent-drift.err",
@@ -14247,7 +14872,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     "arguments are owned by the named-lane guard",
                 ),
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / f"selector-{selector[0][2:]}.out",
                     stderr_path=self.root / f"selector-{selector[0][2:]}.err",
@@ -14278,7 +14903,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     clear=True,
                 ):
                     with self.assertRaisesRegex(NamedLaneGuardError, message):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / f"{label}.out",
                             stderr_path=self.root / f"{label}.err",
@@ -14343,7 +14968,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 stdout = self.root / f"stdout-{size}.bin"
                 stderr = self.root / f"stderr-{size}.bin"
                 if should_pass:
-                    result = run_claude(
+                    result = self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=stdout,
                         stderr_path=stderr,
@@ -14355,7 +14980,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     self.assertEqual(result["stdout_bytes"], 4)
                 else:
                     with self.assertRaises(ReviewOutputLimitError):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=stdout,
                             stderr_path=stderr,
@@ -14380,7 +15005,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         started = time.monotonic()
 
         with self.assertRaises(ReviewTimeoutError):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "timeout.out",
                 stderr_path=self.root / "timeout.err",
@@ -14428,7 +15053,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         )
         detached_pid: int | None = None
         try:
-            result = run_claude(
+            result = self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "detached.out",
                 stderr_path=self.root / "detached.err",
@@ -14461,7 +15086,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         executable = self.make_executable("pass\n")
 
         with self.assertRaisesRegex(NamedLaneGuardError, "outside the worktree"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.repo / "stdout",
                 stderr_path=self.root / "stderr",
@@ -14471,7 +15096,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 stream_limit_bytes=64,
             )
         with self.assertRaisesRegex(NamedLaneGuardError, "must be absolute"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=self.root / "stdout",
                 stderr_path=self.root / "stderr",
@@ -14489,7 +15114,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         dangling.symlink_to(self.root / "missing-target")
 
         with self.assertRaisesRegex(NamedLaneGuardError, "already exist"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=dangling,
                 stderr_path=self.root / "dangling.err",
@@ -14506,7 +15131,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         with self.assertRaisesRegex(
             NamedLaneGuardError, "real directory|traverse a symlink"
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=linked_parent / "stdout",
                 stderr_path=self.root / "linked.err",
@@ -14522,7 +15147,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         linked_ancestor = self.root / "linked-ancestor"
         linked_ancestor.symlink_to(real_ancestor, target_is_directory=True)
         with self.assertRaisesRegex(NamedLaneGuardError, "traverse a symlink"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=linked_ancestor / "nested" / "stdout",
                 stderr_path=self.root / "ancestor.err",
@@ -14544,7 +15169,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             NamedLaneGuardError,
             "current-user-owned with mode 0700",
         ):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=output_parent / "stdout",
                 stderr_path=output_parent / "stderr",
@@ -14570,7 +15195,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "changed after validation",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout",
                     stderr_path=output_parent / "stderr",
@@ -14607,7 +15232,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         )
 
         with self.assertRaisesRegex(NamedLaneGuardError, "changed after validation"):
-            run_claude(
+            self.run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=output_parent / "stdout.bin",
                 stderr_path=output_parent / "stderr.bin",
@@ -14669,7 +15294,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=output_parent / "stdout.bin",
                     stderr_path=output_parent / "stderr.bin",
@@ -14729,7 +15354,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             with self.assertRaisesRegex(
                 NamedLaneGuardError, "temporary cleanup failed"
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -14774,7 +15399,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "temporary file cannot be inspected safely",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -14818,7 +15443,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     NamedLaneGuardError,
                     "temporary cleanup remained incomplete",
                 ) as context:
-                    run_claude(
+                    self.run_claude(
                         worktree=self.repo.resolve(),
                         stdout_path=stdout,
                         stderr_path=stderr,
@@ -14858,7 +15483,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "requires main-thread signal masking",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -14910,7 +15535,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ) as restore,
         ):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -14950,7 +15575,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             side_effect=interrupt_second_write,
         ):
             with self.assertRaises(KeyboardInterrupt):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -15015,7 +15640,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
         ):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -15070,7 +15695,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "rollback remained incomplete",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -15122,7 +15747,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 NamedLaneGuardError,
                 "cleanup or rollback remained incomplete",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout,
                     stderr_path=stderr,
@@ -15250,7 +15875,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 128 + int(forwarded))
                 self.assertEqual(stdout.getvalue(), "")
@@ -15295,7 +15920,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ) as run,
             mock.patch.object(named_lane_runtime, "_emit") as emit,
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "run-claude",
                     "--worktree",
@@ -15384,7 +16009,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(
+                    returncode = self.named_lane_main(
                         (
                             "run-claude",
                             "--worktree",
@@ -15451,7 +16076,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
 
         with contextlib.redirect_stdout(receipt_stdout):
             with self.assertRaises(ForwardedSignal) as raised:
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
@@ -15525,7 +16150,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(
+            returncode = self.named_lane_main(
                 (
                     "run-claude",
                     "--worktree",
@@ -15589,7 +16214,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 ReviewTimeoutError,
                 "synthetic slow Git resolution",
             ):
-                run_claude(
+                self.run_claude(
                     worktree=self.repo.resolve(),
                     stdout_path=self.root / "git-deadline.stdout",
                     stderr_path=self.root / "git-deadline.stderr",
@@ -15663,7 +16288,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(stdout.getvalue(), "")
@@ -15703,7 +16328,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                         NamedLaneGuardError,
                         "must not exceed",
                     ):
-                        run_claude(
+                        self.run_claude(
                             worktree=self.repo.resolve(),
                             stdout_path=self.root / "direct-cap.stdout",
                             stderr_path=self.root / "direct-cap.stderr",
@@ -15785,7 +16410,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -15835,7 +16460,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -15890,7 +16515,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -15953,7 +16578,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     ),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(
@@ -16010,7 +16635,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         self.assertEqual(
@@ -16072,7 +16697,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         payload = json.loads(stderr.getvalue())
@@ -16127,7 +16752,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = named_lane_main(argv)
+            returncode = self.named_lane_main(argv)
 
         self.assertEqual(returncode, 2)
         payload = json.loads(stderr.getvalue())
@@ -16179,7 +16804,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                     mock.patch(target, side_effect=error),
                     contextlib.redirect_stderr(stderr),
                 ):
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(
@@ -16286,7 +16911,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                                 )
                             )
                         stack.enter_context(contextlib.redirect_stderr(stderr))
-                        returncode = named_lane_main(argv)
+                        returncode = self.named_lane_main(argv)
 
                     self.assertEqual(returncode, expected_returncode)
                     self.assertEqual(
@@ -16379,7 +17004,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                             )
                         )
                     stack.enter_context(contextlib.redirect_stderr(stderr))
-                    returncode = named_lane_main(argv)
+                    returncode = self.named_lane_main(argv)
 
                 self.assertEqual(returncode, 2)
                 self.assertEqual(

@@ -49,6 +49,12 @@ from .common import (
 
 
 WORKSPACE_SCHEMA_VERSION = "review-workspace-v1"
+PREPARED_WORKSPACE_RECEIPT_SCHEMA_VERSION = "review-workspace-prepare-v2"
+SOURCE_AUTHORITY_BINDING_SCHEMA_VERSION = "review-source-authority-binding-v1"
+SOURCE_AUTHORITY_BINDING_ENCODING = "canonical-json-utf8-v1"
+SOURCE_AUTHORITY_BINDING_DIGEST_ALGORITHM = "sha256-canonical-json-utf8-v1"
+SOURCE_AUTHORITY_BINDING_PATH_ENCODING = "utf8-only-canonical-absolute-v1"
+SOURCE_AUTHORITY_BINDING_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 WORKSPACE_MARKER = "review-workspace.json"
 RANGE_OBJECT_MANIFEST = "review-range-objects"
 PARENT_SUPPORT_OBJECT_MANIFEST = "review-parent-support-objects"
@@ -333,6 +339,8 @@ class PreparedWorkspace:
     objects_identity: tuple[int, int, int]
     marker_sha256: str
     cleanup_token_sha256: str
+    _source_authority_binding_bytes: bytes = field(repr=False, compare=False)
+    source_authority_binding_sha256: str
     _handoff_signal_mask: ForwardedSignalMaskOwner | None = field(
         default=None,
         repr=False,
@@ -340,8 +348,21 @@ class PreparedWorkspace:
     )
 
     def receipt(self) -> dict[str, object]:
+        try:
+            source_authority_binding, _ = (
+                parse_canonical_source_authority_binding_bytes(
+                    self._source_authority_binding_bytes,
+                    self.source_authority_binding_sha256,
+                )
+            )
+        except SourceAuthorityBindingError as error:
+            raise ReviewWorkspaceError(
+                "source-authority-binding-invalid",
+                "prepared source-authority binding is not canonical or digest-bound",
+            ) from error
         return {
             "schema_version": WORKSPACE_SCHEMA_VERSION,
+            "receipt_schema_version": PREPARED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
             "status": "ok",
             "command": "prepare-workspace",
             "worktree": str(self.root),
@@ -381,6 +402,8 @@ class PreparedWorkspace:
             },
             "marker_sha256": self.marker_sha256,
             "cleanup_token_sha256": self.cleanup_token_sha256,
+            "source_authority_binding": source_authority_binding,
+            "source_authority_binding_sha256": (self.source_authority_binding_sha256),
         }
 
 
@@ -486,11 +509,35 @@ class _SourceDirectoryAuthority:
 
 
 @dataclass(frozen=True)
+class _SourceControlFileAuthority:
+    path: pathlib.Path
+    identity: tuple[int, int, int]
+    file_type: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _SourceGitMarkerAuthority:
+    path: pathlib.Path
+    expected_admin: pathlib.Path
+    identity: tuple[int, int, int]
+    file_type: int
+    kind: str
+    size: int | None
+    sha256: str | None
+    back_pointer: _SourceControlFileAuthority | None
+
+
+@dataclass(frozen=True)
 class _SourceRepository:
     root: pathlib.Path
+    marker: _SourceGitMarkerAuthority
+    commondir: _SourceControlFileAuthority | None
     git_dir: pathlib.Path
     common_dir: pathlib.Path
     object_stores: tuple[pathlib.Path, ...]
+    object_info_identity: tuple[int, int, int] | None
     authorities: tuple[_SourceDirectoryAuthority, ...]
     object_format: str
     shallow_path: pathlib.Path | None
@@ -1675,6 +1722,723 @@ def _read_bounded_regular_file(
         os.close(descriptor)
 
 
+class SourceAuthorityBindingError(ValueError):
+    """A malformed or non-canonical parent-owned source authority binding."""
+
+
+class SourceAuthorityPathEncodingError(SourceAuthorityBindingError):
+    """A path cannot be represented by the closed UTF-8 binding contract."""
+
+
+def canonical_source_authority_binding_bytes(
+    binding: Mapping[str, object],
+) -> bytes:
+    """Encode one closed source-authority binding for cross-phase handoff."""
+
+    return json.dumps(
+        binding,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def source_authority_binding_digest(binding: Mapping[str, object]) -> str:
+    return hashlib.sha256(canonical_source_authority_binding_bytes(binding)).hexdigest()
+
+
+def _source_authority_path_text(path: pathlib.Path) -> str:
+    value = str(path)
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise SourceAuthorityPathEncodingError(
+            "source-authority binding paths must be valid UTF-8; "
+            "non-UTF-8 filesystem byte paths are unsupported"
+        ) from error
+    return value
+
+
+def source_authority_directory_record(
+    path: pathlib.Path,
+    identity: tuple[int, int, int],
+) -> dict[str, object]:
+    return {
+        "path": _source_authority_path_text(path),
+        "identity": {
+            "device": identity[0],
+            "inode": identity[1],
+            "uid": identity[2],
+        },
+    }
+
+
+def source_authority_control_record(
+    path: pathlib.Path,
+    identity: tuple[int, int, int],
+    *,
+    file_type: int,
+    size: int,
+    sha256: str,
+) -> dict[str, object]:
+    return {
+        "path": _source_authority_path_text(path),
+        "identity": {
+            "device": identity[0],
+            "inode": identity[1],
+            "uid": identity[2],
+            "file_type": file_type,
+        },
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def source_authority_common_marker_record(
+    control: Mapping[str, object],
+    resolved_common: pathlib.Path,
+) -> dict[str, object]:
+    return {
+        **control,
+        "resolved_common": _source_authority_path_text(resolved_common),
+    }
+
+
+def source_authority_marker_record(
+    path: pathlib.Path,
+    expected_admin: pathlib.Path,
+    identity: tuple[int, int, int],
+    *,
+    file_type: int,
+    kind: str,
+    size: int | None,
+    sha256: str | None,
+) -> dict[str, object]:
+    return {
+        "path": _source_authority_path_text(path),
+        "identity": {
+            "device": identity[0],
+            "inode": identity[1],
+            "uid": identity[2],
+            "file_type": file_type,
+        },
+        "kind": kind,
+        "expected_admin": _source_authority_path_text(expected_admin),
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def build_source_authority_binding(
+    *,
+    source_worktree: Mapping[str, object],
+    git_marker: Mapping[str, object],
+    linked_worktree_back_pointer: Mapping[str, object] | None,
+    git_common_directory_marker: Mapping[str, object] | None,
+    git_admin: Mapping[str, object],
+    git_common: Mapping[str, object],
+    primary_object_store: Mapping[str, object],
+    object_info_path: pathlib.Path,
+    object_info_identity: tuple[int, int, int] | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": SOURCE_AUTHORITY_BINDING_SCHEMA_VERSION,
+        "identity_encoding": SOURCE_AUTHORITY_BINDING_ENCODING,
+        "identity_algorithm": SOURCE_AUTHORITY_BINDING_DIGEST_ALGORITHM,
+        "path_encoding": SOURCE_AUTHORITY_BINDING_PATH_ENCODING,
+        "source_authority_policy": "direct-primary-only",
+        "source_worktree": dict(source_worktree),
+        "git_marker": dict(git_marker),
+        "linked_worktree_back_pointer": (
+            None
+            if linked_worktree_back_pointer is None
+            else dict(linked_worktree_back_pointer)
+        ),
+        "git_common_directory_marker": (
+            None
+            if git_common_directory_marker is None
+            else dict(git_common_directory_marker)
+        ),
+        "git_admin": dict(git_admin),
+        "git_common": dict(git_common),
+        "primary_object_store": dict(primary_object_store),
+        "object_info": {
+            "path": _source_authority_path_text(object_info_path),
+            "identity": (
+                None
+                if object_info_identity is None
+                else {
+                    "device": object_info_identity[0],
+                    "inode": object_info_identity[1],
+                    "uid": object_info_identity[2],
+                }
+            ),
+        },
+        "alternate_controls": {
+            "objects_info_alternates": "absent",
+            "objects_info_http_alternates": "absent",
+        },
+    }
+
+
+def _source_binding_closed_mapping(
+    value: object,
+    keys: set[str],
+    *,
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != keys:
+        raise SourceAuthorityBindingError(f"{label} does not match its closed schema")
+    return value
+
+
+def _source_binding_identity(
+    value: object,
+    *,
+    label: str,
+    include_file_type: bool = False,
+) -> None:
+    keys = {"device", "inode", "uid"}
+    if include_file_type:
+        keys.add("file_type")
+    identity = _source_binding_closed_mapping(value, keys, label=f"{label} identity")
+    for key, item in identity.items():
+        if type(item) is not int or item < 0:
+            raise SourceAuthorityBindingError(
+                f"{label} identity field {key} is invalid"
+            )
+
+
+def _source_binding_path(value: object, *, label: str) -> pathlib.Path:
+    if type(value) is not str or not value:
+        raise SourceAuthorityBindingError(f"{label} path must be a nonempty string")
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        raise SourceAuthorityBindingError(f"{label} path contains a control character")
+    try:
+        value.encode("utf-8", errors="strict")
+        if os.fsdecode(os.fsencode(value)) != value:
+            raise SourceAuthorityBindingError(
+                f"{label} path does not round-trip through filesystem bytes"
+            )
+    except UnicodeError as error:
+        raise SourceAuthorityPathEncodingError(
+            f"{label} path must be valid UTF-8"
+        ) from error
+    path = pathlib.Path(value)
+    if not path.is_absolute() or str(path) != value or ".." in path.parts:
+        raise SourceAuthorityBindingError(
+            f"{label} path must be canonical and absolute"
+        )
+    return path
+
+
+def _source_binding_directory(value: object, *, label: str) -> pathlib.Path:
+    record = _source_binding_closed_mapping(
+        value,
+        {"path", "identity"},
+        label=label,
+    )
+    path = _source_binding_path(record["path"], label=label)
+    _source_binding_identity(record["identity"], label=label)
+    return path
+
+
+def _source_binding_control(
+    value: object,
+    *,
+    label: str,
+    include_resolved_common: bool = False,
+) -> pathlib.Path:
+    keys = {"path", "identity", "size", "sha256"}
+    if include_resolved_common:
+        keys.add("resolved_common")
+    record = _source_binding_closed_mapping(
+        value,
+        keys,
+        label=label,
+    )
+    path = _source_binding_path(record["path"], label=label)
+    _source_binding_identity(
+        record["identity"],
+        label=label,
+        include_file_type=True,
+    )
+    identity = record["identity"]
+    assert type(identity) is dict
+    if identity["file_type"] != stat.S_IFREG:
+        raise SourceAuthorityBindingError(f"{label} must bind a regular file")
+    if type(record["size"]) is not int or record["size"] < 0:
+        raise SourceAuthorityBindingError(f"{label} size is invalid")
+    if (
+        type(record["sha256"]) is not str
+        or SOURCE_AUTHORITY_BINDING_SHA256.fullmatch(record["sha256"]) is None
+    ):
+        raise SourceAuthorityBindingError(f"{label} digest is invalid")
+    return path
+
+
+def validate_source_authority_binding(
+    value: object,
+    expected_sha256: object,
+) -> tuple[dict[str, object], str]:
+    """Validate and detach one parent-owned binding without filesystem probes."""
+
+    if type(value) is not dict:
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding does not match its closed schema"
+        )
+    if (
+        type(expected_sha256) is not str
+        or SOURCE_AUTHORITY_BINDING_SHA256.fullmatch(expected_sha256) is None
+    ):
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding digest is invalid"
+        )
+    try:
+        canonical = canonical_source_authority_binding_bytes(value)
+    except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding cannot be canonically encoded"
+        ) from error
+    observed_sha256 = hashlib.sha256(canonical).hexdigest()
+    if not secrets.compare_digest(observed_sha256, expected_sha256):
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding digest does not match"
+        )
+    detached = json.loads(canonical)
+    record = _source_binding_closed_mapping(
+        detached,
+        {
+            "schema_version",
+            "identity_encoding",
+            "identity_algorithm",
+            "path_encoding",
+            "source_authority_policy",
+            "source_worktree",
+            "git_marker",
+            "linked_worktree_back_pointer",
+            "git_common_directory_marker",
+            "git_admin",
+            "git_common",
+            "primary_object_store",
+            "object_info",
+            "alternate_controls",
+        },
+        label="parent source-authority binding",
+    )
+    if (
+        record["schema_version"] != SOURCE_AUTHORITY_BINDING_SCHEMA_VERSION
+        or record["identity_encoding"] != SOURCE_AUTHORITY_BINDING_ENCODING
+        or record["identity_algorithm"] != SOURCE_AUTHORITY_BINDING_DIGEST_ALGORITHM
+        or record["path_encoding"] != SOURCE_AUTHORITY_BINDING_PATH_ENCODING
+        or record["source_authority_policy"] != "direct-primary-only"
+    ):
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding contract identifier is invalid"
+        )
+    source = _source_binding_directory(
+        record["source_worktree"],
+        label="source worktree",
+    )
+    admin = _source_binding_directory(record["git_admin"], label="source Git admin")
+    common = _source_binding_directory(
+        record["git_common"],
+        label="source Git common",
+    )
+    common_marker = record["git_common_directory_marker"]
+    if common_marker is None:
+        if common != admin:
+            raise SourceAuthorityBindingError(
+                "parent source common-directory marker absence is inconsistent"
+            )
+    else:
+        if (
+            _source_binding_control(
+                common_marker,
+                label="source Git common-directory marker",
+                include_resolved_common=True,
+            )
+            != admin / "commondir"
+            or _source_binding_path(
+                common_marker["resolved_common"],
+                label="source Git common-directory marker resolved common",
+            )
+            != common
+        ):
+            raise SourceAuthorityBindingError(
+                "parent source common-directory marker relationship is invalid"
+            )
+    objects = _source_binding_directory(
+        record["primary_object_store"],
+        label="source primary object store",
+    )
+    if objects != common / "objects":
+        raise SourceAuthorityBindingError(
+            "parent source primary object store must be exact <common>/objects"
+        )
+    marker = _source_binding_closed_mapping(
+        record["git_marker"],
+        {"path", "kind", "expected_admin", "identity", "size", "sha256"},
+        label="parent source Git marker",
+    )
+    marker_path = _source_binding_path(marker["path"], label="source Git marker")
+    expected_admin = _source_binding_path(
+        marker["expected_admin"],
+        label="source Git marker expected admin",
+    )
+    _source_binding_identity(
+        marker["identity"],
+        label="source Git marker",
+        include_file_type=True,
+    )
+    marker_identity = marker["identity"]
+    assert type(marker_identity) is dict
+    if marker_path != source / ".git" or expected_admin != admin:
+        raise SourceAuthorityBindingError(
+            "parent source Git marker path relationship is invalid"
+        )
+    back_pointer = record["linked_worktree_back_pointer"]
+    if marker["kind"] == "directory":
+        if (
+            marker_identity["file_type"] != stat.S_IFDIR
+            or marker["size"] is not None
+            or marker["sha256"] is not None
+            or back_pointer is not None
+            or marker_path != admin
+        ):
+            raise SourceAuthorityBindingError(
+                "parent ordinary source Git marker binding is invalid"
+            )
+    elif marker["kind"] == "gitfile":
+        if (
+            marker_identity["file_type"] != stat.S_IFREG
+            or type(marker["size"]) is not int
+            or marker["size"] < 0
+            or type(marker["sha256"]) is not str
+            or SOURCE_AUTHORITY_BINDING_SHA256.fullmatch(marker["sha256"]) is None
+            or back_pointer is None
+        ):
+            raise SourceAuthorityBindingError(
+                "parent linked source Git marker binding is invalid"
+            )
+        if (
+            _source_binding_control(
+                back_pointer,
+                label="source Git admin back-pointer",
+            )
+            != admin / "gitdir"
+        ):
+            raise SourceAuthorityBindingError(
+                "parent source Git admin back-pointer path is invalid"
+            )
+    else:
+        raise SourceAuthorityBindingError("parent source Git marker kind is invalid")
+    object_info = _source_binding_closed_mapping(
+        record["object_info"],
+        {"path", "identity"},
+        label="parent source object-info binding",
+    )
+    if (
+        _source_binding_path(
+            object_info["path"],
+            label="source object-info",
+        )
+        != objects / "info"
+    ):
+        raise SourceAuthorityBindingError("parent source object-info path is invalid")
+    if object_info["identity"] is not None:
+        _source_binding_identity(
+            object_info["identity"],
+            label="source object-info",
+        )
+    if record["alternate_controls"] != {
+        "objects_info_alternates": "absent",
+        "objects_info_http_alternates": "absent",
+    }:
+        raise SourceAuthorityBindingError(
+            "parent source alternate-control binding is invalid"
+        )
+    return detached, observed_sha256
+
+
+def _strict_source_authority_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise SourceAuthorityBindingError(
+                "parent source-authority binding JSON contains a duplicate key"
+            )
+        value[key] = item
+    return value
+
+
+def _reject_source_authority_json_constant(value: str) -> object:
+    raise SourceAuthorityBindingError(
+        f"parent source-authority binding JSON contains invalid constant {value}"
+    )
+
+
+def parse_canonical_source_authority_binding_bytes(
+    encoded: bytes,
+    expected_sha256: object,
+) -> tuple[dict[str, object], str]:
+    try:
+        value = json.loads(
+            encoded.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_source_authority_json_object,
+            parse_constant=_reject_source_authority_json_constant,
+        )
+    except (RecursionError, UnicodeError, ValueError) as error:
+        if isinstance(error, SourceAuthorityBindingError):
+            raise
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding is not strict UTF-8 JSON"
+        ) from error
+    binding, digest = validate_source_authority_binding(value, expected_sha256)
+    if canonical_source_authority_binding_bytes(binding) != encoded:
+        raise SourceAuthorityBindingError(
+            "parent source-authority binding JSON is not canonical"
+        )
+    return binding, digest
+
+
+def _source_control_file_authority(
+    path: pathlib.Path,
+    *,
+    label: str,
+    deadline: float,
+) -> tuple[_SourceControlFileAuthority, bytes]:
+    payload = _read_bounded_regular_file(
+        path,
+        limit=MARKER_LIMIT_BYTES,
+        deadline=deadline,
+        reason="source-git-control-invalid",
+        label=label,
+        unavailable_reason="source-git-control-unavailable",
+        revalidation_unavailable_reason="source-git-control-revalidation-unavailable",
+        drift_reason="source-git-control-drift",
+    )
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-git-control-revalidation-unavailable",
+            f"{label} identity cannot be captured",
+            status="inconclusive",
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ReviewWorkspaceError(
+            "source-git-control-invalid",
+            f"{label} must remain a regular file",
+        )
+    return (
+        _SourceControlFileAuthority(
+            path=path,
+            identity=(metadata.st_dev, metadata.st_ino, metadata.st_uid),
+            file_type=stat.S_IFMT(metadata.st_mode),
+            size=metadata.st_size,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+        payload,
+    )
+
+
+def _source_control_path(
+    payload: bytes,
+    *,
+    relative_to: pathlib.Path,
+    label: str,
+) -> pathlib.Path:
+    stripped = payload.rstrip(b"\r\n")
+    if not stripped or b"\0" in stripped or b"\n" in stripped or b"\r" in stripped:
+        raise ReviewWorkspaceError(
+            "source-git-control-invalid",
+            f"{label} is malformed",
+        )
+    candidate = pathlib.Path(os.fsdecode(stripped))
+    if not candidate.is_absolute():
+        candidate = relative_to / candidate
+    try:
+        return candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewWorkspaceError(
+            "source-git-control-invalid",
+            f"{label} cannot be resolved safely",
+        ) from error
+
+
+def _bind_source_git_marker(
+    root: pathlib.Path,
+    git_dir: pathlib.Path,
+    deadline: float,
+) -> _SourceGitMarkerAuthority:
+    """Bind the exact worktree marker and linked-worktree back-pointer bytes."""
+
+    _check_object_store_deadline(deadline)
+    marker_path = root / ".git"
+    try:
+        metadata = marker_path.lstat()
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-git-marker-unavailable",
+            "source must name an exact Git worktree root",
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ReviewWorkspaceError(
+            "source-git-marker-invalid",
+            "source Git marker must not be a symlink",
+        )
+    identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+    if stat.S_ISDIR(metadata.st_mode):
+        try:
+            resolved = marker_path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ReviewWorkspaceError(
+                "source-git-marker-invalid",
+                "source Git directory marker cannot be resolved safely",
+            ) from error
+        if resolved != marker_path or resolved != git_dir:
+            raise ReviewWorkspaceError(
+                "source-git-marker-invalid",
+                "source Git directory marker does not match the discovered admin",
+            )
+        return _SourceGitMarkerAuthority(
+            path=marker_path,
+            expected_admin=git_dir,
+            identity=identity,
+            file_type=stat.S_IFMT(metadata.st_mode),
+            kind="directory",
+            size=None,
+            sha256=None,
+            back_pointer=None,
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ReviewWorkspaceError(
+            "source-git-marker-invalid",
+            "source Git marker must be a real directory or regular gitfile",
+        )
+    marker, marker_payload = _source_control_file_authority(
+        marker_path,
+        label="source Git admin marker",
+        deadline=deadline,
+    )
+    prefix = b"gitdir: "
+    stripped = marker_payload.rstrip(b"\r\n")
+    if not stripped.startswith(prefix) or not stripped[len(prefix) :]:
+        raise ReviewWorkspaceError(
+            "source-git-marker-invalid",
+            "source Git admin marker is malformed",
+        )
+    expected_admin = _source_control_path(
+        stripped[len(prefix) :],
+        relative_to=root,
+        label="source Git admin marker",
+    )
+    if expected_admin != git_dir:
+        raise ReviewWorkspaceError(
+            "source-git-marker-invalid",
+            "source Git admin marker does not match the discovered admin",
+        )
+    back_pointer, back_pointer_payload = _source_control_file_authority(
+        git_dir / "gitdir",
+        label="source Git admin back-pointer",
+        deadline=deadline,
+    )
+    if (
+        _source_control_path(
+            back_pointer_payload,
+            relative_to=git_dir,
+            label="source Git admin back-pointer",
+        )
+        != marker_path
+    ):
+        raise ReviewWorkspaceError(
+            "source-git-back-pointer-invalid",
+            "source Git admin back-pointer does not match the exact marker",
+        )
+    return _SourceGitMarkerAuthority(
+        path=marker_path,
+        expected_admin=git_dir,
+        identity=marker.identity,
+        file_type=marker.file_type,
+        kind="gitfile",
+        size=marker.size,
+        sha256=marker.sha256,
+        back_pointer=back_pointer,
+    )
+
+
+def _revalidate_source_git_marker(
+    expected: _SourceGitMarkerAuthority,
+    root: pathlib.Path,
+    git_dir: pathlib.Path,
+    deadline: float,
+) -> None:
+    observed = _bind_source_git_marker(root, git_dir, deadline)
+    if observed != expected:
+        raise ReviewWorkspaceError(
+            "source-git-marker-drift",
+            "source Git marker or linked-worktree back-pointer changed after discovery",
+        )
+
+
+def _bind_source_common_directory_marker(
+    git_dir: pathlib.Path,
+    common_dir: pathlib.Path,
+    deadline: float,
+) -> _SourceControlFileAuthority | None:
+    marker_path = git_dir / "commondir"
+    try:
+        marker_path.lstat()
+    except FileNotFoundError:
+        if common_dir != git_dir:
+            raise ReviewWorkspaceError(
+                "source-git-commondir-invalid",
+                "source Git commondir absence conflicts with its resolved common directory",
+            )
+        return None
+    except OSError as error:
+        raise ReviewWorkspaceError(
+            "source-git-commondir-unavailable",
+            "source Git commondir state cannot be inspected",
+            status="inconclusive",
+        ) from error
+    marker, payload = _source_control_file_authority(
+        marker_path,
+        label="source Git common-directory marker",
+        deadline=deadline,
+    )
+    if (
+        _source_control_path(
+            payload,
+            relative_to=git_dir,
+            label="source Git common-directory marker",
+        )
+        != common_dir
+    ):
+        raise ReviewWorkspaceError(
+            "source-git-commondir-invalid",
+            "source Git commondir content does not match the resolved common directory",
+        )
+    return marker
+
+
+def _revalidate_source_common_directory_marker(
+    expected: _SourceControlFileAuthority | None,
+    git_dir: pathlib.Path,
+    common_dir: pathlib.Path,
+    deadline: float,
+) -> None:
+    if _bind_source_common_directory_marker(git_dir, common_dir, deadline) != expected:
+        raise ReviewWorkspaceError(
+            "source-git-commondir-drift",
+            "source Git commondir presence, identity, or exact content changed",
+        )
+
+
 def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository:
     _check_object_store_deadline(deadline)
     root = _absolute_existing_directory(source, "source repository")
@@ -1781,9 +2545,16 @@ def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository
             "source-shallow-state-conflict",
             "source Git directories expose conflicting shallow state",
         )
-    object_stores = (
-        _validate_direct_primary_object_store(objects, common_dir, deadline),
+    marker = _bind_source_git_marker(root, git_dir, deadline)
+    commondir = _bind_source_common_directory_marker(
+        git_dir,
+        common_dir,
+        deadline,
     )
+    primary_object_store, object_info_identity = _validate_direct_primary_object_store(
+        objects, common_dir, deadline
+    )
+    object_stores = (primary_object_store,)
     for store in object_stores:
         _check_object_store_deadline(deadline)
         pack_directory = store / "pack"
@@ -1826,9 +2597,12 @@ def _discover_source(source: pathlib.Path, deadline: float) -> _SourceRepository
     )
     return _SourceRepository(
         root=root,
+        marker=marker,
+        commondir=commondir,
         git_dir=git_dir,
         common_dir=common_dir,
         object_stores=object_stores,
+        object_info_identity=object_info_identity,
         authorities=authorities,
         object_format=object_format,
         shallow_path=present[0][0] if present else None,
@@ -1909,7 +2683,7 @@ def _validate_source_object_info_directory(
 def _validate_source_alternate_absence(
     objects: pathlib.Path,
     deadline: float,
-) -> None:
+) -> tuple[int, int, int] | None:
     """Reject every lexical local or HTTP alternates control entry."""
 
     info, initial_identity = _validate_source_object_info_directory(objects, deadline)
@@ -1952,13 +2726,14 @@ def _validate_source_alternate_absence(
                 "validation; " + _direct_primary_object_store_guidance(),
                 details=_direct_primary_object_store_details(),
             )
+    return initial_identity
 
 
 def _validate_direct_primary_object_store(
     advertised: pathlib.Path,
     common_dir: pathlib.Path,
     deadline: float,
-) -> pathlib.Path:
+) -> tuple[pathlib.Path, tuple[int, int, int] | None]:
     """Require the only source authority to be real ``<common>/objects``."""
 
     _check_object_store_deadline(deadline)
@@ -1985,8 +2760,8 @@ def _validate_direct_primary_object_store(
             "<common>/objects; " + _direct_primary_object_store_guidance(),
             details=_direct_primary_object_store_details(),
         )
-    _validate_source_alternate_absence(expected, deadline)
-    return expected
+    object_info_identity = _validate_source_alternate_absence(expected, deadline)
+    return expected, object_info_identity
 
 
 def _revalidate_source_repository(
@@ -2001,6 +2776,18 @@ def _revalidate_source_repository(
             os.close(descriptor)
 
     revalidate_authorities()
+    _revalidate_source_git_marker(
+        source.marker,
+        source.root,
+        source.git_dir,
+        deadline,
+    )
+    _revalidate_source_common_directory_marker(
+        source.commondir,
+        source.git_dir,
+        source.common_dir,
+        deadline,
+    )
     try:
         layout_payload = _run_git(
             source.root,
@@ -2049,19 +2836,102 @@ def _revalidate_source_repository(
             "after discovery; " + _direct_primary_object_store_guidance(),
             details=_direct_primary_object_store_details(),
         )
-    expected = _validate_direct_primary_object_store(
+    expected, object_info_identity = _validate_direct_primary_object_store(
         observed_objects,
         source.common_dir,
         deadline,
     )
-    if source.object_stores != (expected,):
+    if (
+        source.object_stores != (expected,)
+        or object_info_identity != source.object_info_identity
+    ):
         raise ReviewWorkspaceError(
             "source-primary-object-store-drift",
             "source Git object authority changed after discovery; "
             + _direct_primary_object_store_guidance(),
             details=_direct_primary_object_store_details(),
         )
+    _revalidate_source_git_marker(
+        source.marker,
+        source.root,
+        source.git_dir,
+        deadline,
+    )
+    _revalidate_source_common_directory_marker(
+        source.commondir,
+        source.git_dir,
+        source.common_dir,
+        deadline,
+    )
     revalidate_authorities()
+
+
+def _source_directory_binding_payload(
+    source: _SourceRepository,
+    path: pathlib.Path,
+) -> dict[str, object]:
+    matches = tuple(
+        authority for authority in source.authorities if authority.path == path
+    )
+    if len(matches) != 1:
+        raise ReviewWorkspaceError(
+            "source-authority-binding-invalid",
+            "captured source directory authority is missing or ambiguous",
+        )
+    return source_authority_directory_record(path, matches[0].identity)
+
+
+def _source_control_file_binding_payload(
+    control: _SourceControlFileAuthority,
+) -> dict[str, object]:
+    return source_authority_control_record(
+        control.path,
+        control.identity,
+        file_type=control.file_type,
+        size=control.size,
+        sha256=control.sha256,
+    )
+
+
+def _source_authority_binding_payload(
+    source: _SourceRepository,
+) -> dict[str, object]:
+    """Project only originally captured source authorities into a closed record."""
+
+    marker = source.marker
+    return build_source_authority_binding(
+        source_worktree=_source_directory_binding_payload(source, source.root),
+        git_marker=source_authority_marker_record(
+            marker.path,
+            marker.expected_admin,
+            marker.identity,
+            file_type=marker.file_type,
+            kind=marker.kind,
+            size=marker.size,
+            sha256=marker.sha256,
+        ),
+        linked_worktree_back_pointer=(
+            None
+            if marker.back_pointer is None
+            else _source_control_file_binding_payload(marker.back_pointer)
+        ),
+        git_common_directory_marker=(
+            None
+            if source.commondir is None
+            else source_authority_common_marker_record(
+                _source_control_file_binding_payload(source.commondir),
+                source.common_dir,
+            )
+        ),
+        git_admin=_source_directory_binding_payload(source, source.git_dir),
+        git_common=_source_directory_binding_payload(source, source.common_dir),
+        primary_object_store=_source_directory_binding_payload(
+            source,
+            source.object_stores[0],
+        ),
+        object_info_path=source.object_stores[0] / "info",
+        object_info_identity=source.object_info_identity,
+    )
 
 
 def _validate_requested_oid(value: str, label: str, object_format: str) -> str:
@@ -11008,6 +11878,38 @@ def prepare_workspace(
                 head,
                 expected_cleanup_token=cleanup_token,
             )
+            _revalidate_source_repository(source_repo, object_store_deadline)
+            try:
+                source_authority_binding = _source_authority_binding_payload(
+                    source_repo
+                )
+                source_authority_binding_bytes = (
+                    canonical_source_authority_binding_bytes(source_authority_binding)
+                )
+                source_authority_binding_sha256 = hashlib.sha256(
+                    source_authority_binding_bytes
+                ).hexdigest()
+                parse_canonical_source_authority_binding_bytes(
+                    source_authority_binding_bytes,
+                    source_authority_binding_sha256,
+                )
+            except SourceAuthorityPathEncodingError as error:
+                raise ReviewWorkspaceError(
+                    "source-authority-path-encoding-unsupported",
+                    "source authority paths must be valid UTF-8 for the closed "
+                    "prepare-workspace receipt binding",
+                    details={
+                        "binding_path_encoding": (
+                            SOURCE_AUTHORITY_BINDING_PATH_ENCODING
+                        )
+                    },
+                ) from error
+            except SourceAuthorityBindingError as error:
+                raise ReviewWorkspaceError(
+                    "source-authority-binding-invalid",
+                    "source authorities cannot be published as the closed "
+                    "prepare-workspace receipt binding",
+                ) from error
             prepared = PreparedWorkspace(
                 root=root,
                 base_sha=base,
@@ -11030,6 +11932,8 @@ def prepare_workspace(
                 objects_identity=validated.objects_identity,
                 marker_sha256=validated.marker_sha256,
                 cleanup_token_sha256=validated.cleanup_token_sha256,
+                _source_authority_binding_bytes=source_authority_binding_bytes,
+                source_authority_binding_sha256=(source_authority_binding_sha256),
                 _handoff_signal_mask=handoff_mask if defer_signal_handoff else None,
             )
         except BaseException as primary_error:

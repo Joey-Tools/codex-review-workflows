@@ -617,6 +617,10 @@ Read [canonical-claude-lane.md](canonical-claude-lane.md).
   only prior trusted external guidance; candidate Markdown including
   `AGENTS.md` remains review subject only.
 - Use the trusted runtime preflight, direct launcher, and strict output validator.
+- Pass the exact `review-workspace-prepare-v2` receipt's closed source-authority
+  object and digest into `run-claude`. Missing, malformed, tampered, or
+  current-source-mismatched handoff evidence blocks before child spawn; the v3
+  launch profile must echo the exact parent values.
 - The named direct lane uses ordinary local login in trusted real `HOME`. It exposes no API-key or OAuth-token launch interface.
 - Only validator-accepted terminal output can be clean or findings.
 

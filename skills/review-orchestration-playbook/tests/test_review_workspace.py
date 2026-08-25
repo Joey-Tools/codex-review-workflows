@@ -18,6 +18,7 @@ import threading
 import unittest
 import zlib
 from collections.abc import Iterator
+from dataclasses import replace
 from unittest import mock
 
 
@@ -873,6 +874,100 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             self.cleanup(prepared)
 
+    def test_prepare_receipt_binds_ordinary_source_authority_and_digest(
+        self,
+    ) -> None:
+        destination = self.root / "ordinary-authority-workspace"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        try:
+            receipt = prepared.receipt()
+            binding = receipt["source_authority_binding"]
+            canonical = workspace_runtime.canonical_source_authority_binding_bytes(
+                binding
+            )
+            self.assertEqual(
+                receipt["receipt_schema_version"],
+                "review-workspace-prepare-v2",
+            )
+            self.assertEqual(
+                binding["schema_version"],
+                "review-source-authority-binding-v1",
+            )
+            self.assertEqual(
+                binding["path_encoding"],
+                "utf8-only-canonical-absolute-v1",
+            )
+            self.assertEqual(binding["source_worktree"]["path"], str(self.repo))
+            self.assertEqual(binding["git_marker"]["kind"], "directory")
+            self.assertEqual(
+                binding["git_marker"]["path"],
+                str(self.repo / ".git"),
+            )
+            self.assertIsNone(binding["linked_worktree_back_pointer"])
+            self.assertIsNone(binding["git_common_directory_marker"])
+            self.assertEqual(binding["git_admin"], binding["git_common"])
+            self.assertEqual(
+                binding["primary_object_store"]["path"],
+                str(self.repo / ".git/objects"),
+            )
+            self.assertEqual(
+                receipt["source_authority_binding_sha256"],
+                hashlib.sha256(canonical).hexdigest(),
+            )
+        finally:
+            self.cleanup(prepared)
+
+    def test_prepare_receipt_rejects_tampered_binding_bytes_or_digest(self) -> None:
+        destination = self.root / "tampered-authority-receipt-workspace"
+        prepared = prepare_workspace(
+            self.repo,
+            destination,
+            self.commits[1],
+            self.commits[2],
+        )
+        try:
+            cases = (
+                replace(
+                    prepared,
+                    source_authority_binding_sha256="0" * 64,
+                ),
+                replace(
+                    prepared,
+                    _source_authority_binding_bytes=(
+                        prepared._source_authority_binding_bytes + b" "
+                    ),
+                ),
+            )
+            for tampered in cases:
+                with (
+                    self.subTest(tampered=tampered),
+                    self.assertRaises(ReviewWorkspaceError) as caught,
+                ):
+                    tampered.receipt()
+                self.assertEqual(
+                    caught.exception.reason,
+                    "source-authority-binding-invalid",
+                )
+        finally:
+            self.cleanup(prepared)
+
+    @unittest.skipUnless(os.name == "posix", "filesystem byte paths require POSIX")
+    def test_source_authority_binding_rejects_non_utf8_path_bytes(self) -> None:
+        non_utf8 = pathlib.Path(os.fsdecode(b"/tmp/source-\xff"))
+        with self.assertRaisesRegex(
+            workspace_runtime.SourceAuthorityBindingError,
+            "must be valid UTF-8",
+        ):
+            workspace_runtime.source_authority_directory_record(
+                non_utf8,
+                (1, 2, os.getuid()),
+            )
+
     def test_linked_source_still_produces_a_standalone_repository(self) -> None:
         linked = self.root / "linked-source"
         git(self.repo, "worktree", "add", "--detach", str(linked), self.commits[2])
@@ -894,6 +989,22 @@ class ReviewWorkspaceTest(unittest.TestCase):
             )
             self.assertNotEqual(destination_common, source_common)
             self.assert_independent_git_layout(prepared.root)
+            binding = prepared.receipt()["source_authority_binding"]
+            admin = pathlib.Path(
+                git(linked, "rev-parse", "--absolute-git-dir")
+            ).resolve()
+            self.assertEqual(binding["git_marker"]["kind"], "gitfile")
+            self.assertEqual(
+                binding["linked_worktree_back_pointer"]["path"],
+                str(admin / "gitdir"),
+            )
+            common_marker = binding["git_common_directory_marker"]
+            self.assertEqual(common_marker["path"], str(admin / "commondir"))
+            self.assertEqual(common_marker["resolved_common"], str(source_common))
+            self.assertEqual(
+                common_marker["sha256"],
+                hashlib.sha256((admin / "commondir").read_bytes()).hexdigest(),
+            )
         finally:
             self.cleanup(prepared)
 
