@@ -1820,6 +1820,38 @@ superseded_by:
   error. This paired result is the final whole-suite evidence for the dirty
   candidate before its signed commit.
 
+### Frozen resource-ceiling finding after `565cf252`
+
+- The required fresh-context whole-range reviewer confirmed one resource-bound
+  regression. The replacement workspace runtime had silently raised the active
+  ceilings from the independently trusted 250,000 objects, 250,000 parent-edge
+  occurrences, and 2 GiB of logical object bytes to 1,000,000, 1,000,000, and
+  32 GiB. Neither the user decisions nor this journal supplied a basis for the
+  fourfold and sixteenfold increases.
+- The historical WME probe reached only 16,689 objects and 1,528,979,578
+  logical bytes. The trusted limits therefore still cover the measured large
+  repository while keeping malicious or accidental range expansion bounded.
+  The active runtime restores the 250,000 / 250,000 / 2 GiB contract; the
+  complete-DAG, merge-side-history, range-plus-parent-support, 768 MiB pack,
+  256 MiB index, and 15-minute preparation behavior remain unchanged.
+- Error messages now derive their displayed counts from the enforced constants,
+  the routed workspace reference publishes the same limits, and a direct
+  regression test freezes all four active range ceilings. Retained unreachable
+  raw-copy constants and retired supplied-diff helper paths are intentionally
+  unchanged and receive no new routing or documentation.
+- The direct four-test ceiling/budget matrix passed in 1.610 seconds. The full
+  warning-strict `test_review_workspace.py` module passed all 203 tests in
+  444.645 seconds, and `test_contracts.py` passed all 32 tests in 5.059
+  seconds. Ruff lint/format, `git diff --check`, and project-journal validation
+  also passed for the remediation.
+- The post-remediation warning-strict whole-skill discovery ran 3,216 tests in
+  1,781.643 seconds with six conditional skips. Its only failure was the known
+  host restriction that prevents the nested `sandbox-exec` broker test from
+  applying its child sandbox (`sandbox_apply: Operation not permitted`); all
+  other 3,215 tests passed. That exact broker test then passed alone outside
+  the host sandbox in 2.127 seconds with `ResourceWarning` still promoted to an
+  error.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

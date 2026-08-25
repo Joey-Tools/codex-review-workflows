@@ -265,6 +265,15 @@ class ReviewWorkspaceTest(unittest.TestCase):
             returncode = named_lane_main(argv)
         return returncode, stdout.getvalue(), stderr.getvalue()
 
+    def test_active_range_resource_ceilings_match_the_frozen_contract(self) -> None:
+        self.assertEqual(workspace_runtime.RANGE_COMMIT_COUNT_LIMIT, 250_000)
+        self.assertEqual(workspace_runtime.RANGE_OBJECT_COUNT_LIMIT, 250_000)
+        self.assertEqual(workspace_runtime.RANGE_PARENT_EDGE_COUNT_LIMIT, 250_000)
+        self.assertEqual(
+            workspace_runtime.RANGE_OBJECT_LOGICAL_BYTES_LIMIT,
+            2 * 1024 * 1024 * 1024,
+        )
+
     def test_public_cli_exposes_only_the_new_workspace_lifecycle(self) -> None:
         guard = SCRIPTS / "named_lane_guard"
         completed = subprocess.run(

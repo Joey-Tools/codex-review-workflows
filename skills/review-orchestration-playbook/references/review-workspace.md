@@ -213,10 +213,10 @@ One 15-minute monotonic deadline covers source discovery, range freezing,
 base-history enumeration, pack production, and indexing. Current ceilings are:
 
 - 250,000 review commits;
-- 1,000,000 raw parent-graph commits and 1,000,000 parent-edge occurrences;
-- 1,000,000 distinct objects across the disjoint range-plus-parent-support
+- 250,000 raw parent-graph commits and 250,000 parent-edge occurrences;
+- 250,000 distinct objects across the disjoint range-plus-parent-support
   import union;
-- 32 GiB of canonical uncompressed payload across that complete union;
+- 2 GiB of canonical uncompressed payload across that complete union;
 - a 768 MiB compressed pack and 256 MiB pack index for that complete union; and
 - a checkout preflight of 100,000 tracked entries, 2 GiB of blob-occurrence
   bytes, 64 MiB of raw path bytes, and 96 MiB of bounded tree output.

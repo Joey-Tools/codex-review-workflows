@@ -68,9 +68,9 @@ GIT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 MARKER_LIMIT_BYTES = 64 * 1024
 MISSING_OBJECT_SAMPLE_LIMIT = 32
 RANGE_COMMIT_COUNT_LIMIT = 250_000
-RANGE_OBJECT_COUNT_LIMIT = 1_000_000
-RANGE_PARENT_EDGE_COUNT_LIMIT = 1_000_000
-RANGE_OBJECT_LOGICAL_BYTES_LIMIT = 32 * 1024 * 1024 * 1024
+RANGE_OBJECT_COUNT_LIMIT = 250_000
+RANGE_PARENT_EDGE_COUNT_LIMIT = 250_000
+RANGE_OBJECT_LOGICAL_BYTES_LIMIT = 2 * 1024 * 1024 * 1024
 RANGE_PACK_BYTES_LIMIT = 768 * 1024 * 1024
 RANGE_PACK_INDEX_BYTES_LIMIT = 256 * 1024 * 1024
 CHECKOUT_ENTRY_COUNT_LIMIT = 100_000
@@ -3196,7 +3196,10 @@ def _read_raw_commit_graph(
                     if workspace
                     else "base-support-commit-limit"
                 ),
-                "raw parent graph exceeds the 1,000,000-commit support limit",
+                (
+                    "raw parent graph exceeds the "
+                    f"{RANGE_OBJECT_COUNT_LIMIT:,}-commit support limit"
+                ),
             )
         parent_edge_count += len(parent_oids)
         if parent_edge_count > RANGE_PARENT_EDGE_COUNT_LIMIT:
@@ -3206,7 +3209,10 @@ def _read_raw_commit_graph(
                     if workspace
                     else "range-parent-edge-limit"
                 ),
-                "raw parent graph exceeds the 1,000,000-parent-edge limit",
+                (
+                    "raw parent graph exceeds the "
+                    f"{RANGE_PARENT_EDGE_COUNT_LIMIT:,}-parent-edge limit"
+                ),
             )
     if deadline is not None:
         (deadline_checker or _check_object_store_deadline)(deadline)
@@ -3787,7 +3793,10 @@ def _freeze_range(
     if len(total_objects) > RANGE_OBJECT_COUNT_LIMIT:
         raise ReviewWorkspaceError(
             "range-object-limit",
-            "frozen range plus parent support exceeds the 1,000,000-object limit",
+            (
+                "frozen range plus parent support exceeds the "
+                f"{RANGE_OBJECT_COUNT_LIMIT:,}-object limit"
+            ),
             details={
                 "range_object_count": len(range_objects),
                 "parent_support_object_count": len(support_objects),
