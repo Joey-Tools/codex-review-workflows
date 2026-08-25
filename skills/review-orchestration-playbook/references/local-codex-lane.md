@@ -71,6 +71,18 @@ digests and `exact-token-sequence` conformance result—unchanged in either peer
 adapter. Never hand-build the prefix, sign an unverified directory, or use the
 candidate guard to bootstrap a self-policy migration.
 
+Write that single issuer output unchanged to an owner-controlled regular JSON
+file under an owner-private mode-`0700` directory. After all other launch
+inputs are frozen and immediately before starting either peer adapter, invoke
+the independently trusted wrapper's
+`validate-codex-git-prefix-receipt --receipt-file <that-exact-file>
+--expected-receipt-sha256 <independently-retained-issuer-receipt-sha256>
+--worktree ... --base ... --head ... --git-executable ...` route. Accept only
+when success stdout is exact-object equal to the one issuer receipt. Retain
+that validated stdout outside the model-visible workspace. Never rerun the
+issuer to simulate this consumer; doing so validates a newly issued object
+rather than the receipt delivered to the reviewer.
+
 | Adapter | Use when | Operational trade-off |
 | --- | --- | --- |
 | Fresh `reviewer` subagent | The host can launch the installed role with zero inherited turns and enforce a read-only workspace. | Direct orchestration, mailbox lifecycle, and role reuse; the effective role profile may be partly controlled by the host. |

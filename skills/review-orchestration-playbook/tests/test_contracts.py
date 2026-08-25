@@ -941,6 +941,13 @@ class RepositoryContractTest(unittest.TestCase):
             "sha256-canonical-json-utf8-v1-without-receipt-sha256",
             contracts,
         )
+        for document in (contracts, prompts, local):
+            self.assertIn("validate-codex-git-prefix-receipt", document)
+            self.assertIn("expected-receipt-sha256", document)
+        self.assertIn("--receipt-file <absolute-published-receipt-json>", contracts)
+        self.assertIn("do not call `codex-git-prefix` a second time", contracts.lower())
+        self.assertIn("64 KiB", contracts)
+        self.assertIn("exact same closed", contracts)
 
         subagent = local.split("### Subagent adapter", 1)[1].split(
             "### CLI adapter", 1
@@ -1012,6 +1019,7 @@ class RepositoryContractTest(unittest.TestCase):
             "validate-workspace",
             "cleanup-workspace",
             "codex-git-prefix",
+            "validate-codex-git-prefix-receipt",
             "run-claude",
         ):
             self.assertIn(command, completed.stdout)

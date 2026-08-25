@@ -22,6 +22,7 @@ import tempfile
 import time
 import unittest
 import venv
+from collections.abc import Callable
 from unittest import mock
 
 
@@ -62,6 +63,7 @@ from review_runtime.named_lane import (  # noqa: E402
     sanitized_git_argv_prefix_receipt,
     validate_sanitized_git_argv_prefix,
     validate_sanitized_git_argv_prefix_receipt,
+    validate_published_sanitized_git_argv_prefix_receipt,
     validate_worktree,
 )
 
@@ -243,6 +245,143 @@ raise SystemExit(returncode)
             stderr=subprocess.PIPE,
             text=True,
         )
+
+    def publish_prefix_receipt(
+        self,
+        *,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        name: str,
+    ) -> tuple[pathlib.Path, dict[str, object]]:
+        issued = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                "codex-git-prefix",
+                "--worktree",
+                str(prepared.root),
+                "--base",
+                base,
+                "--head",
+                head,
+                "--git-executable",
+                str(named_lane_runtime.resolve_git()),
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        self.assertEqual(issued.returncode, 0, issued.stderr.decode("utf-8", "replace"))
+        self.assertEqual(issued.stderr, b"")
+        receipt = json.loads(issued.stdout)
+        receipt_directory = self.root / f"{name}-control"
+        receipt_directory.mkdir(mode=0o700)
+        receipt_path = receipt_directory / "codex-git-prefix-receipt.json"
+        receipt_path.write_bytes(issued.stdout)
+        receipt_path.chmod(0o600)
+        return receipt_path, receipt
+
+    def run_published_prefix_receipt_validation(
+        self,
+        *,
+        receipt_path: pathlib.Path,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        expected_receipt_sha256: str,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected_receipt_sha256,
+        )
+        return subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPTS / "named_lane_guard"),
+                *arguments,
+            ),
+            cwd=self.root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+
+    def published_prefix_receipt_validation_argv(
+        self,
+        *,
+        receipt_path: pathlib.Path,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+        expected_receipt_sha256: str,
+    ) -> tuple[str, ...]:
+        return (
+            "validate-codex-git-prefix-receipt",
+            "--receipt-file",
+            str(receipt_path),
+            "--expected-receipt-sha256",
+            expected_receipt_sha256,
+            "--worktree",
+            str(prepared.root),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--git-executable",
+            str(named_lane_runtime.resolve_git()),
+        )
+
+    def descriptor_close_fault_injector(
+        self,
+        faults: tuple[BaseException | None, ...],
+        attempts: list[int],
+    ) -> Callable[
+        [tuple[tuple[str, int], ...]],
+        list[tuple[str, BaseException]],
+    ]:
+        real_attempt = review_workspace_runtime._attempt_workspace_descriptor_closes
+        real_close = os.close
+
+        def inject(
+            descriptors: tuple[tuple[str, int], ...],
+        ) -> list[tuple[str, BaseException]]:
+            fault_index = 0
+
+            def close_then_fault(descriptor: int) -> None:
+                nonlocal fault_index
+                attempts.append(descriptor)
+                real_close(descriptor)
+                if fault_index >= len(faults):
+                    raise AssertionError("unexpected descriptor close attempt")
+                fault = faults[fault_index]
+                fault_index += 1
+                if fault is not None:
+                    raise fault
+
+            with mock.patch.object(
+                review_workspace_runtime.os,
+                "close",
+                side_effect=close_then_fault,
+            ):
+                failures = real_attempt(descriptors)
+            self.assertEqual(fault_index, len(faults))
+            return failures
+
+        return inject
 
     def test_codex_git_prefix_v2_matches_exact_accepted_adapter_sequence(
         self,
@@ -598,6 +737,583 @@ raise SystemExit(returncode)
             base=base,
             head=head,
             git_executable=git_executable,
+        )
+
+    def test_guard_live_consumer_accepts_same_published_prefix_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="valid-prefix-receipt",
+        )
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(json.loads(completed.stdout), receipt)
+        self.assertEqual(completed.stdout.encode("utf-8"), receipt_path.read_bytes())
+
+    def test_guard_live_consumer_rejects_stale_published_prefix_receipt(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "stale-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="stale-prefix-receipt",
+        )
+        (prepared.root / "tracked.txt").write_text(
+            "changed after prefix publication\n",
+            encoding="utf-8",
+        )
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        failure = json.loads(completed.stderr)
+        self.assertEqual(failure["status"], "blocked-safety")
+        self.assertTrue(failure["reason"])
+
+    def test_guard_live_consumer_rejects_tampered_published_prefix_receipt(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "tampered-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="tampered-prefix-receipt",
+        )
+        expected_receipt_sha256 = str(receipt["receipt_sha256"])
+        receipt["git_version"] = "git version 99.0.0"
+        receipt_path.write_text(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        receipt_path.chmod(0o600)
+
+        completed = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected_receipt_sha256,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(
+            json.loads(completed.stderr),
+            {
+                "status": "blocked-safety",
+                "reason": "sanitized Git argv prefix Git version binding is invalid",
+            },
+        )
+
+    def test_guard_live_consumer_does_not_reinvoke_prefix_issuer(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "issuer-independence-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="issuer-independence-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "sanitized_git_argv_prefix_receipt",
+                side_effect=AssertionError("consumer must not invoke issuer"),
+            ) as issuer,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(arguments)
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue()), receipt)
+        issuer.assert_not_called()
+
+    def test_guard_live_consumer_rejects_wrong_scope_and_expected_identity(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "wrong-scope-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="wrong-scope-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+
+        wrong_identity = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256="0" * 64,
+        )
+        wrong_scope = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=base,
+            expected_receipt_sha256=expected,
+        )
+
+        for completed in (wrong_identity, wrong_scope):
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(json.loads(completed.stderr)["status"], "blocked-safety")
+        self.assertIn("retained expected identity", wrong_identity.stderr)
+        self.assertIn("receipt head is invalid", wrong_scope.stderr)
+
+    def test_guard_live_consumer_rejects_hardlink_and_inside_worktree(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "path-policy-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="path-policy-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        hardlink = receipt_path.with_name("receipt-hardlink.json")
+        os.link(receipt_path, hardlink)
+
+        linked = self.run_published_prefix_receipt_validation(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected,
+        )
+        inside = self.run_published_prefix_receipt_validation(
+            receipt_path=prepared.root / "tracked.txt",
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=expected,
+        )
+
+        self.assertEqual(linked.returncode, 2)
+        self.assertIn("single-link regular file", linked.stderr)
+        self.assertEqual(inside.returncode, 2)
+        self.assertIn("must stay outside the worktree", inside.stderr)
+
+    def test_guard_live_consumer_rejects_unsafe_receipt_path_types_and_modes(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "unsafe-path-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="unsafe-path-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        symlink_path = receipt_path.with_name("symlink.json")
+        symlink_path.symlink_to(receipt_path.name)
+        fifo_path = receipt_path.with_name("receipt.fifo")
+        os.mkfifo(fifo_path, mode=0o600)
+        unsafe_mode_path = receipt_path.with_name("unsafe-mode.json")
+        unsafe_mode_path.write_bytes(receipt_path.read_bytes())
+        unsafe_mode_path.chmod(0o666)
+        unsafe_parent = self.root / "unsafe-receipt-parent"
+        unsafe_parent.mkdir(mode=0o755)
+        unsafe_parent_path = unsafe_parent / "receipt.json"
+        unsafe_parent_path.write_bytes(receipt_path.read_bytes())
+        unsafe_parent_path.chmod(0o600)
+
+        for label, candidate in (
+            ("symlink", symlink_path),
+            ("fifo", fifo_path),
+            ("group-world-writable", unsafe_mode_path),
+            ("non-private-parent", unsafe_parent_path),
+        ):
+            with self.subTest(label=label):
+                completed = self.run_published_prefix_receipt_validation(
+                    receipt_path=candidate,
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    expected_receipt_sha256=expected,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    json.loads(completed.stderr)["status"],
+                    "blocked-safety",
+                )
+
+    def test_guard_live_consumer_rejects_malformed_or_oversized_receipt_bytes(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "malformed-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="malformed-prefix-receipt",
+        )
+        expected = str(receipt["receipt_sha256"])
+        malformed_payloads = {
+            "deep": b"[" * 300 + b"0" + b"]" * 300,
+            "huge-integer": b'{"value":' + b"9" * 5_000 + b"}",
+            "duplicate": b'{"value":1,"value":2}',
+            "second-document": b"{}\n{}\n",
+            "invalid-utf8": b'{"value":"\xff"}',
+            "oversized": b" " * (64 * 1024 + 1),
+        }
+        for label, payload in malformed_payloads.items():
+            with self.subTest(label=label):
+                receipt_path.write_bytes(payload)
+                receipt_path.chmod(0o600)
+                completed = self.run_published_prefix_receipt_validation(
+                    receipt_path=receipt_path,
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    expected_receipt_sha256=expected,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(
+                    json.loads(completed.stderr)["status"],
+                    "blocked-safety",
+                )
+
+    def test_live_consumer_retains_receipt_descriptor_across_validation(self) -> None:
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+        base, head = self.workspace_range()
+        for replacement_mode in ("in-place", "name-replacement"):
+            with self.subTest(replacement_mode=replacement_mode):
+                prepared = review_workspace_runtime.prepare_workspace(
+                    self.repo.resolve(),
+                    self.root / f"{replacement_mode}-custody-review-workspace",
+                    base,
+                    head,
+                )
+                self._prefix_test_workspaces.append(prepared)
+                receipt_path, receipt = self.publish_prefix_receipt(
+                    prepared=prepared,
+                    base=base,
+                    head=head,
+                    name=f"{replacement_mode}-custody-prefix-receipt",
+                )
+
+                def mutate_after_validation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    validated = real_validator(*args, **kwargs)
+                    if replacement_mode == "in-place":
+                        receipt_path.write_bytes(b"{}\n")
+                        receipt_path.chmod(0o600)
+                    else:
+                        replacement = receipt_path.with_name("replacement.json")
+                        replacement.write_bytes(b"{}\n")
+                        replacement.chmod(0o600)
+                        os.replace(replacement, receipt_path)
+                    return validated
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "validate_sanitized_git_argv_prefix_receipt",
+                        side_effect=mutate_after_validation,
+                    ),
+                    self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "receipt (?:content|identity or access policy) changed",
+                    ),
+                ):
+                    validate_published_sanitized_git_argv_prefix_receipt(
+                        receipt_file=receipt_path,
+                        expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                        worktree=prepared.root,
+                        base=base,
+                        head=head,
+                        git_executable=named_lane_runtime.resolve_git(),
+                    )
+
+    def test_live_consumer_accepts_benign_receipt_parent_entry_churn(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "parent-churn-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="parent-churn-prefix-receipt",
+        )
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+
+        def churn_sibling(*args: object, **kwargs: object) -> dict[str, object]:
+            validated = real_validator(*args, **kwargs)
+            sibling = receipt_path.with_name("benign-sibling")
+            sibling.write_text("churn\n", encoding="utf-8")
+            sibling.unlink()
+            return validated
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "validate_sanitized_git_argv_prefix_receipt",
+            side_effect=churn_sibling,
+        ):
+            validated = validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+        self.assertEqual(validated, receipt)
+
+    def test_guard_live_consumer_signal_is_structured_and_does_not_issue(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "signal-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="signal-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "validate_sanitized_git_argv_prefix_receipt",
+                side_effect=ForwardedSignal(signal.SIGTERM),
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "sanitized_git_argv_prefix_receipt",
+                side_effect=AssertionError("consumer must not invoke issuer"),
+            ) as issuer,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(arguments)
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        issuer.assert_not_called()
+
+    def test_live_consumer_close_failures_preserve_active_primary_and_cause(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "primary-close-failure-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="primary-close-failure-prefix-receipt",
+        )
+        primary_cause = ValueError("synthetic active primary cause")
+        primary = NamedLaneGuardError("synthetic active primary")
+        primary.__cause__ = primary_cause
+        primary.__suppress_context__ = True
+        receipt_close = OSError("receipt real-close-then-error")
+        parent_close = OSError("parent real-close-then-error")
+        close_attempts: list[int] = []
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "validate_sanitized_git_argv_prefix_receipt",
+                side_effect=primary,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (receipt_close, parent_close),
+                    close_attempts,
+                ),
+            ),
+            self.assertRaises(NamedLaneGuardError) as caught,
+        ):
+            validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, primary_cause)
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(len(set(close_attempts)), 2)
+        for descriptor in close_attempts:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+        diagnostics = "\n".join(getattr(primary, "__notes__", ()))
+        self.assertIn("receipt descriptor close failed", diagnostics)
+        self.assertIn("receipt real-close-then-error", diagnostics)
+        self.assertIn("parent descriptor close failed", diagnostics)
+        self.assertIn("parent real-close-then-error", diagnostics)
+
+    def test_guard_live_consumer_close_failures_select_first_without_stdout(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "standalone-close-failure-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="standalone-close-failure-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        close_attempts: list[int] = []
+        receipt_close = OSError("receipt real-close-then-error")
+        parent_close = OSError("parent real-close-then-error")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (receipt_close, parent_close),
+                    close_attempts,
+                ),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(arguments)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "blocked-safety",
+                "reason": "receipt real-close-then-error",
+            },
+        )
+        diagnostics = "\n".join(getattr(receipt_close, "__notes__", ()))
+        self.assertEqual(str(receipt_close), "receipt real-close-then-error")
+        self.assertIn("receipt descriptor close failed", diagnostics)
+        self.assertIn("parent descriptor close failed", diagnostics)
+        self.assertIn("parent real-close-then-error", diagnostics)
+
+    def test_guard_live_consumer_close_signal_attempts_parent_and_exits_143(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "close-signal-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="close-signal-prefix-receipt",
+        )
+        arguments = self.published_prefix_receipt_validation_argv(
+            receipt_path=receipt_path,
+            prepared=prepared,
+            base=base,
+            head=head,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        close_attempts: list[int] = []
+        close_signal = ForwardedSignal(signal.SIGTERM)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_attempt_workspace_descriptor_closes",
+                side_effect=self.descriptor_close_fault_injector(
+                    (close_signal, None),
+                    close_attempts,
+                ),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(arguments)
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
         )
 
     def test_codex_git_prefix_rejects_absent_or_wrong_range_workspace(self) -> None:

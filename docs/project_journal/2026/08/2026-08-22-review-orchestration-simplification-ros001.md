@@ -1459,6 +1459,64 @@ superseded_by:
   admission, and one fresh whole-range GPT-5.6 Sol Ultra review remain the next
   immutable gates; this entry intentionally does not predict their outcome.
 
+### Formal review remediation after `8ae797d`
+
+- Signed head `8ae797d80fae998637fb55d19a486c34a55a17af` received a
+  new, non-resumed GPT-5.6 Sol Ultra Codex CLI review over the same frozen base.
+  The reviewer found one P1 contract/implementation mismatch: policy required
+  the live sanitized-Git-prefix consumer to validate the exact issued receipt
+  immediately before launch, but `named_lane_guard` exposed only the issuer
+  route that created a different receipt. Direct Python imports used by tests
+  were not a conforming orchestration path, so that head remained
+  inconclusive and none of its positive review evidence is reusable.
+- The finding run itself remained auditable. Its 654 events contained 320
+  completed command events and 47 Git invocations across 46 events; all Git
+  invocations used the exact parent-bound sanitized prefix. Prelaunch and
+  post-run trusted validation were type-preserving equal at 17 commits, 16
+  parent edges, parent-graph digest
+  `4437ea070269afc3bd4614aa4713ad3c370911e12dcf78fdf631fedcc7cbb8b6`,
+  and the unchanged local-config digest. One sampling reconnect, one analytics
+  503, and one recorded sandbox denial were bounded diagnostics; the complete
+  stream reached its terminal P1. Auth-home verification passed, and the
+  temporary review home and materialized workspace were removed.
+- The correction adds the guard-bound
+  `validate-codex-git-prefix-receipt` consumer. Its caller must supply the
+  issued receipt file, an independently retained expected receipt digest, the
+  frozen worktree/base/head, and the selected Git executable. The consumer
+  never invokes the issuer. It retains owner-private parent and single-link
+  leaf descriptors across strict bounded parsing and live workspace/Git
+  validation, rejects a receipt inside the model-visible worktree, separates
+  parent object/access policy from benign child-entry metadata churn, and
+  revalidates the same descriptor bytes plus path identity before publication.
+  Success re-emits the exact original v2 receipt object rather than introducing
+  a second acknowledgement schema.
+- Focused verification passed 11 live-consumer tests, 16 existing prefix tests,
+  two contract tests, and an additional unsafe-path/access-policy test. The
+  matrix covers the real source-only guard route, issuer non-use, wrong frozen
+  scope or expected digest, stale/tampered receipts, bounded strict JSON,
+  hardlinks, in-worktree paths, unsafe parent/leaf policy, benign sibling
+  churn, in-place mutation, name replacement, and structured signals. An
+  initial independent focused audit reported `No findings`, after which the
+  parent found a reachable P2 in descriptor teardown: the first close failure
+  could replace an active validation primary and skip the parent descriptor.
+  Follow-up audit confirmed the defect. Both descriptors now use the existing
+  all-attempt teardown path; an active primary retains its object and cause
+  while every close failure remains diagnostic, and a standalone forwarded
+  signal retains its exact terminal meaning. Three new real-close fault tests
+  passed in 17.752 seconds, and the expanded live-consumer matrix passed 14
+  tests in 86.974 seconds. Ruff 0.13.2, formatting, source compilation, skill
+  validation, and `git diff --check` passed. The pre-P2 complete
+  `test_named_lane.py` run passed 308 tests in 254.194 seconds but is baseline
+  evidence only. The post-fix complete file passed 311 tests in 299.528 seconds
+  with `ResourceWarning` promoted to an error, and the final focused audit
+  reported `No findings.` The restricted-host whole suite reached 3,178 tests
+  with six conditional skips; its only failure was the known nested macOS
+  `sandbox-exec` denial, whose exact test passed outside the host sandbox in
+  1.926 seconds. The authoritative unrestricted whole suite then passed all
+  3,178 tests with the same six skips in 1,165.556 seconds and
+  `ResourceWarning` promoted to an error. A new signed head, exact-head
+  admission, and a new whole-range fresh review remain mandatory next gates.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh

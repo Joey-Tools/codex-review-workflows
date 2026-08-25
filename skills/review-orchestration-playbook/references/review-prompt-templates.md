@@ -149,6 +149,17 @@ parent/prompt equality for the entire composite object. A coupled mutation with
 recomputed inner and outer digests still fails these independent frozen-scope
 and duplicated-field equalities.
 
+Immediately before launch, the parent must also pass the exact already
+published receipt file—not a newly generated replacement—through the trusted
+`named_lane_guard validate-codex-git-prefix-receipt` route with the repeated
+absolute receipt-file path, independently retained expected issuer
+`receipt_sha256` passed as exact `--expected-receipt-sha256`, worktree, frozen
+endpoints, and fixed Git executable. The
+parent retains the consumer stdout outside the prompt and accepts it only when
+it is exact-object equal to the originally issued composite receipt and the
+prompt projection. The reviewer receives that validated composite receipt but
+never the parent-private receipt-file path.
+
 `canonical-json-utf8-v1` has one closed encoder: recursively sort every JSON
 object's string member names by their UTF-8 bytes, serialize with UTF-8,
 compact separators `,` and `:`, `ensure_ascii=false`, and `allow_nan=false`,

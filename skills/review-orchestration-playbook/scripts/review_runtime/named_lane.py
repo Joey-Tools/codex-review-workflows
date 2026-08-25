@@ -39,6 +39,7 @@ from .common import (
     resolve_git,
     restore_signal_mask,
     run_bounded_capture,
+    strict_json_loads,
 )
 from .claude_version_policy import (
     CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
@@ -50,8 +51,11 @@ from .review_workspace import (
     RangeIncomplete,
     ReviewWorkspaceError,
     WORKSPACE_SCHEMA_VERSION,
+    _attach_workspace_teardown_failures,
+    _attempt_workspace_descriptor_closes,
     _finish_forwarded_signal_mask,
     _partial_workspace_recovery_payload,
+    _select_workspace_teardown_failure,
     cleanup_workspace,
     prepare_workspace,
     recover_partial_workspace,
@@ -163,6 +167,7 @@ SANITIZED_GIT_ARGV_PREFIX_RECEIPT_SCHEMA_VERSION = (
 SANITIZED_GIT_ARGV_PREFIX_RECEIPT_IDENTITY_ALGORITHM = (
     "sha256-canonical-json-utf8-v1-without-receipt-sha256"
 )
+SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES = 64 * 1024
 _SANITIZED_GIT_VERSION_OUTPUT = re.compile(
     rb"git version ([0-9]+)\.([0-9]+)\.([0-9]+)"
     rb"(?: \(Apple Git-[0-9]+(?:\.[0-9]+)*\))?\n?\Z"
@@ -868,6 +873,351 @@ def _revalidate_prefix_receipt_publication_identities(
         raise NamedLaneGuardError(
             "Codex review workspace identity changed before prefix receipt publication"
         )
+
+
+def _prefix_receipt_parent_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _prefix_receipt_parent_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int]:
+    return metadata.st_uid, stat.S_IMODE(metadata.st_mode)
+
+
+def _prefix_receipt_object_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _prefix_receipt_access_policy(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+    )
+
+
+def _prefix_receipt_content_signals(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+
+
+def _read_prefix_receipt_descriptor(descriptor: int) -> bytes:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt cannot be rewound"
+        ) from error
+    payload = bytearray()
+    try:
+        while len(payload) <= SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    64 * 1024,
+                    SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES
+                    + 1
+                    - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt cannot be read"
+        ) from error
+    if not payload or len(payload) > SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt exceeded its byte limit"
+        )
+    return bytes(payload)
+
+
+def _require_prefix_receipt_parent_policy(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent must be an owner-private directory"
+        )
+
+
+def _require_prefix_receipt_file_policy(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
+        or metadata.st_size <= 0
+        or metadata.st_size > SANITIZED_GIT_ARGV_PREFIX_RECEIPT_FILE_LIMIT_BYTES
+    ):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt must be a bounded owner-controlled single-link regular file"
+        )
+
+
+def _revalidate_open_prefix_receipt(
+    *,
+    receipt_path: pathlib.Path,
+    parent_descriptor: int,
+    receipt_descriptor: int,
+    parent_identity: tuple[int, int, int],
+    parent_policy: tuple[int, int],
+    receipt_identity: tuple[int, int, int],
+    receipt_policy: tuple[int, int, int, int],
+    initial_signals: tuple[int, int, int],
+    expected_payload: bytes,
+) -> None:
+    try:
+        parent_descriptor_metadata = os.fstat(parent_descriptor)
+        parent_path_metadata = receipt_path.parent.lstat()
+        resolved_parent = receipt_path.parent.resolve(strict=True)
+        receipt_descriptor_metadata = os.fstat(receipt_descriptor)
+        receipt_path_metadata = os.stat(
+            receipt_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt custody cannot be revalidated"
+        ) from error
+    for metadata in (parent_descriptor_metadata, parent_path_metadata):
+        try:
+            _require_prefix_receipt_parent_policy(metadata)
+        except NamedLaneGuardError as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent identity or access policy changed"
+            ) from error
+        if (
+            _prefix_receipt_parent_object_identity(metadata) != parent_identity
+            or _prefix_receipt_parent_access_policy(metadata) != parent_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent identity or access policy changed"
+            )
+    if resolved_parent != receipt_path.parent:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent path changed"
+        )
+    for metadata in (receipt_descriptor_metadata, receipt_path_metadata):
+        try:
+            _require_prefix_receipt_file_policy(metadata)
+        except NamedLaneGuardError as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt identity or access policy changed"
+            ) from error
+        if (
+            _prefix_receipt_object_identity(metadata) != receipt_identity
+            or _prefix_receipt_access_policy(metadata) != receipt_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt identity or access policy changed"
+            )
+    final_signals = _prefix_receipt_content_signals(receipt_descriptor_metadata)
+    if (
+        final_signals != initial_signals
+        or _prefix_receipt_content_signals(receipt_path_metadata) != initial_signals
+    ):
+        # Metadata churn is only a re-read trigger. Exact bytes select whether
+        # the protected content-stability property actually changed.
+        if _read_prefix_receipt_descriptor(receipt_descriptor) != expected_payload:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt content changed during validation"
+            )
+    elif _read_prefix_receipt_descriptor(receipt_descriptor) != expected_payload:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt content changed during validation"
+        )
+
+
+def validate_published_sanitized_git_argv_prefix_receipt(
+    *,
+    receipt_file: pathlib.Path,
+    expected_receipt_sha256: str,
+    worktree: pathlib.Path,
+    base: str,
+    head: str,
+    git_executable: pathlib.Path,
+) -> dict[str, object]:
+    """Consume one published prefix receipt while retaining descriptor custody."""
+
+    _validate_prefix_path(receipt_file, "sanitized Git argv prefix receipt file")
+    _require_sha256(
+        expected_receipt_sha256,
+        "expected sanitized Git argv prefix receipt identity",
+    )
+    if is_relative_to(receipt_file, worktree):
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt file must stay outside the worktree"
+        )
+    if receipt_file.name in {"", ".", ".."}:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt file has no ordinary leaf name"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or directory_only is None or nonblocking is None:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt validation requires no-follow opens"
+        )
+    try:
+        parent_before = receipt_file.parent.lstat()
+        resolved_parent = receipt_file.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent cannot be inspected"
+        ) from error
+    _require_prefix_receipt_parent_policy(parent_before)
+    if resolved_parent != receipt_file.parent:
+        raise NamedLaneGuardError(
+            "sanitized Git argv prefix receipt parent path traverses a symlink"
+        )
+    parent_identity = _prefix_receipt_parent_object_identity(parent_before)
+    parent_policy = _prefix_receipt_parent_access_policy(parent_before)
+
+    parent_descriptor: int | None = None
+    receipt_descriptor: int | None = None
+    result: dict[str, object] | None = None
+    operation_error: BaseException | None = None
+    try:
+        parent_descriptor = os.open(
+            receipt_file.parent,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | directory_only | nofollow,
+        )
+        parent_opened = os.fstat(parent_descriptor)
+        _require_prefix_receipt_parent_policy(parent_opened)
+        if (
+            _prefix_receipt_parent_object_identity(parent_opened) != parent_identity
+            or _prefix_receipt_parent_access_policy(parent_opened) != parent_policy
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt parent changed before opening"
+            )
+        lexical = os.stat(
+            receipt_file.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _require_prefix_receipt_file_policy(lexical)
+        receipt_descriptor = os.open(
+            receipt_file.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblocking,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(receipt_descriptor)
+        _require_prefix_receipt_file_policy(opened)
+        receipt_identity = _prefix_receipt_object_identity(opened)
+        receipt_policy = _prefix_receipt_access_policy(opened)
+        initial_signals = _prefix_receipt_content_signals(opened)
+        if (
+            _prefix_receipt_object_identity(lexical) != receipt_identity
+            or _prefix_receipt_access_policy(lexical) != receipt_policy
+            or _prefix_receipt_content_signals(lexical) != initial_signals
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt changed before reading"
+            )
+        payload = _read_prefix_receipt_descriptor(receipt_descriptor)
+        if len(payload) != opened.st_size:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt changed while reading"
+            )
+        try:
+            receipt = strict_json_loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt is not strict UTF-8 JSON"
+            ) from error
+        if (
+            type(receipt) is not dict
+            or receipt.get("receipt_sha256") != expected_receipt_sha256
+        ):
+            raise NamedLaneGuardError(
+                "sanitized Git argv prefix receipt does not match the retained expected identity"
+            )
+        validated = validate_sanitized_git_argv_prefix_receipt(
+            receipt,
+            worktree=worktree,
+            base=base,
+            head=head,
+            git_executable=git_executable,
+        )
+        _revalidate_open_prefix_receipt(
+            receipt_path=receipt_file,
+            parent_descriptor=parent_descriptor,
+            receipt_descriptor=receipt_descriptor,
+            parent_identity=parent_identity,
+            parent_policy=parent_policy,
+            receipt_identity=receipt_identity,
+            receipt_policy=receipt_policy,
+            initial_signals=initial_signals,
+            expected_payload=payload,
+        )
+        _revalidate_prefix_receipt_publication_identities(
+            validated,
+            worktree=worktree,
+            git_executable=git_executable,
+        )
+        _revalidate_open_prefix_receipt(
+            receipt_path=receipt_file,
+            parent_descriptor=parent_descriptor,
+            receipt_descriptor=receipt_descriptor,
+            parent_identity=parent_identity,
+            parent_policy=parent_policy,
+            receipt_identity=receipt_identity,
+            receipt_policy=receipt_policy,
+            initial_signals=initial_signals,
+            expected_payload=payload,
+        )
+        result = validated
+    except BaseException as error:
+        if isinstance(error, OSError):
+            operation_error = NamedLaneGuardError(
+                "sanitized Git argv prefix receipt cannot be opened safely"
+            )
+            operation_error.__cause__ = error
+            operation_error.__suppress_context__ = True
+        else:
+            operation_error = error
+    receipt_to_close = receipt_descriptor if receipt_descriptor is not None else -1
+    parent_to_close = parent_descriptor if parent_descriptor is not None else -1
+    receipt_descriptor = None
+    parent_descriptor = None
+    close_failures = _attempt_workspace_descriptor_closes(
+        (
+            (
+                "sanitized Git argv prefix receipt descriptor close failed",
+                receipt_to_close,
+            ),
+            (
+                "sanitized Git argv prefix receipt parent descriptor close failed",
+                parent_to_close,
+            ),
+        )
+    )
+    selected_error = operation_error
+    if selected_error is not None:
+        _attach_workspace_teardown_failures(selected_error, close_failures)
+    else:
+        selected_error = _select_workspace_teardown_failure(close_failures)
+    if selected_error is not None:
+        raise selected_error
+    assert result is not None
+    return result
 
 
 def sanitized_git_argv_prefix_receipt(
@@ -10301,6 +10651,17 @@ def _build_parser() -> argparse.ArgumentParser:
     codex_prefix.add_argument("--head", required=True)
     codex_prefix.add_argument("--git-executable", required=True)
 
+    validate_codex_prefix = subparsers.add_parser(
+        "validate-codex-git-prefix-receipt",
+        help=("Live-validate one already-published local-Codex Git prefix receipt."),
+    )
+    validate_codex_prefix.add_argument("--receipt-file", required=True)
+    validate_codex_prefix.add_argument("--expected-receipt-sha256", required=True)
+    validate_codex_prefix.add_argument("--worktree", required=True)
+    validate_codex_prefix.add_argument("--base", required=True)
+    validate_codex_prefix.add_argument("--head", required=True)
+    validate_codex_prefix.add_argument("--git-executable", required=True)
+
     claude = subparsers.add_parser(
         "run-claude",
         help="Run an exact Claude executable under bounded process supervision.",
@@ -10853,6 +11214,17 @@ def _workspace_command_main(args: argparse.Namespace) -> int:
                 )
                 _emit_workspace_terminal_receipt(receipt, signal_state)
                 return 0
+            if args.command_name == "validate-codex-git-prefix-receipt":
+                validation = validate_published_sanitized_git_argv_prefix_receipt(
+                    receipt_file=pathlib.Path(args.receipt_file),
+                    expected_receipt_sha256=args.expected_receipt_sha256,
+                    worktree=pathlib.Path(args.worktree),
+                    base=args.base,
+                    head=args.head,
+                    git_executable=pathlib.Path(args.git_executable),
+                )
+                _emit_workspace_terminal_receipt(validation, signal_state)
+                return 0
             if args.command_name == "prepare-workspace":
                 prepared = prepare_workspace(
                     pathlib.Path(args.source),
@@ -11096,6 +11468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "codex-git-prefix",
         "prepare-workspace",
         "recover-partial-workspace",
+        "validate-codex-git-prefix-receipt",
         "validate-workspace",
     }
     safety_command = workspace_command

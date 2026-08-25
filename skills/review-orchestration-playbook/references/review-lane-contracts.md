@@ -388,6 +388,39 @@ array does not conform to the named profile. During self-policy migration, the
 candidate guard remains review subject and cannot generate its own approval
 record.
 
+Publish that one issuer output unchanged as strict UTF-8 JSON in a non-symlink
+regular file inside a current-user-owned mode-`0700` parent directory; the file
+must not be group- or world-writable. Immediately before launch, consume that
+same published file through the same independently trusted wrapper:
+
+```text
+<absolute-python> -I -B -S <trusted-bundle>/scripts/named_lane_guard \
+  validate-codex-git-prefix-receipt \
+  --receipt-file <absolute-published-receipt-json> \
+  --expected-receipt-sha256 <independently-retained-issuer-receipt-sha256> \
+  --worktree <absolute-clean-workspace> \
+  --base <frozen-base-sha> --head <frozen-head-sha> \
+  --git-executable <fixed-absolute-git-executable>
+```
+
+Do not call `codex-git-prefix` a second time as a substitute for consuming the
+published object: that would issue a new receipt. The consumer reads at most
+64 KiB with identity-bound no-follow opens, requires the receipt to stay
+outside the review workspace, and holds both the owner-private real parent and
+the owner-controlled single-link ordinary receipt file descriptors across the
+live check. It strictly parses the existing closed receipt, fail-fast matches
+its embedded identity against the independently retained expected
+`receipt_sha256`, reruns Git identity/version and exact-workspace composite
+validation against the independently supplied frozen scope, then rereads the
+same open file descriptor and proves that the path still names that object
+under the same access policy. Directory-entry churn and leaf `mtime`/`ctime`
+changes trigger revalidation and an exact-byte reread; they are not by
+themselves mutation evidence. Success stdout is the exact same closed
+`sanitized-git-argv-prefix-receipt-v2` object, not a new acknowledgement
+schema. Retain that stdout as parent-private prelaunch evidence and require
+exact object equality with the already selected issuer receipt; do not expose
+the private receipt path to the reviewer.
+
 `codex-git-prefix` is a composite issuer, not a string-template renderer. It
 first requires the supplied Git path to equal the guard's independently
 resolved fixed absolute Git path and runs bounded `git --version` under the
