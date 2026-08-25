@@ -3,7 +3,7 @@ id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
 status: active
 created: 2026-08-22
-updated: 2026-08-24
+updated: 2026-08-25
 branch: review-orchestration-simplification
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/108
 supersedes: [20260807-wme001, 20260805-wpe001]
@@ -1563,6 +1563,73 @@ superseded_by:
   passed. The authoritative whole suite, a new signed head, exact-head secret
   admission, and a new whole-range fresh review remain mandatory next gates.
 
+### Formal review remediation after `3d080de`
+
+- Signed head `3d080deb582d3d77509e1847652336a564de1589` received a new,
+  non-resumed GPT-5.6 Sol Ultra Codex CLI review under the independently trusted
+  pre-migration release. The reviewer found one P1 in GitHub negative-evidence
+  authority: a findings report could change both its evidence commit and finding
+  entry to the same arbitrary non-ancestor SHA because the old validator checked
+  only report-internal agreement. That head did not pass, and none of its
+  positive review evidence is reusable.
+- The finding run remained complete and auditable. Materialization and trusted
+  post-run validation agreed on 19 inclusive commits, 18 parent edges,
+  parent-graph SHA-256
+  `81ab28ac3adcbd6d9ed80e0eb35ed3e1b452b94b593c04fb114dbce8841195af`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 7,031-byte parent-owned prompt had SHA-256
+  `fa5acba5506f470ea01cf0bfd12b1297c61a44a52dc9bccd673dc753b27c8514`;
+  event-stream, terminal-artifact, and stderr SHA-256 values were respectively
+  `dc434422a936ce1aba4c9c43e11c806873bbe4f822f0a45e81a4f236f85fef0e`,
+  `a0cf50f7d6b77a7c9417ec0d8c5106139721437ba3a176233362a1172d434a2d`,
+  and `77b9f24fcd54fcba377dab347617fbf5b2a65b9d7252bb9080323a1a4dd95a62`.
+  The 1,068-event stream contained 525 completed command events and 58 Git
+  invocations across 52 events; every Git invocation used the exact
+  parent-bound sanitized prefix. The source authentication object remained
+  unchanged, and the process-specific auth home and review workspace were
+  removed after their final checks.
+- Blocking findings now require three independent, closed parent inputs. A
+  `finding_page_receipt` freezes complete current-scope provider acquisition,
+  its five pagination-completeness/count pairs, and a consumer-recomputed
+  canonical digest of every issue-comment and review record including inline
+  children and GraphQL thread joins. A separate `finding_range_receipt` freezes
+  repository, PR, unique merge base, exact head, and the complete sorted
+  `base..head` ancestor set. The `finding_carrier_snapshot` supplies the actual
+  closed observation from which the consumer replays classification,
+  applicability, semantic-time precedence, supersession, thread resolution,
+  evidence, and the exact unresolved-finding projection. Report, snapshot, and
+  embedded carrier fields cannot create or repair either independent receipt.
+- The range receipt uses the complete Git DAG. Merge commits and side history
+  are included; first-parent, `--ancestry-path`, and linear-history projections
+  are rejected. Changing either base or head invalidates all three inputs and
+  requires a fresh acquisition, range proof, replay, and final reread. This
+  preserves the Q44 branch-refresh design: **Require branches to be up to date
+  before merging** authorizes a signed base-to-feature merge, then the new head
+  reruns the full pre-merge gate; it never implies a rebase or linear history.
+- Independent adversarial passes closed four follow-on gaps before the local
+  gate: coupled deletion of a later clean result, coupled page-count or thread-
+  state mutation, cross-channel latest-bucket conflicts, and partial retention
+  of a superseded top-level finding beside an unresolved inline child. The
+  final same-channel rule follows the authority exactly: at the same semantic
+  time, findings outrank clean or resolved-inline-only within one channel;
+  equal-priority ambiguity and conflicting channel winners remain
+  inconclusive.
+- On the final uncommitted bytes, the carrier module passed all 28 tests and
+  the combined carrier, recovery, and distribution matrix passed all 67 tests;
+  the adjacent local-lane module passed all 14 tests. JSON parsing, Ruff, skill
+  validation, and whitespace checks passed. Two independent read-only
+  adversarial audits returned
+  `No findings.` One restricted outer-environment discovery ran 3,190 tests;
+  3,183 passed, six were conditionally skipped, and the sole failure was the
+  known nested `sandbox-exec: sandbox_apply: Operation not permitted` denial
+  in the Claude keychain-broker test. The authoritative host-side whole-suite
+  rerun then passed all 3,190 tests with the same six conditional skips in
+  1,287.393 seconds with `ResourceWarning` promoted to an error. This result
+  freezes the implementation, schema, reference, and test bytes; the following
+  journal-only evidence update receives its own journal and contract checks
+  before signing.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh
@@ -1587,7 +1654,9 @@ superseded_by:
 - Final post-`cd5ccd2` remediation
   `python3 -B -W error::ResourceWarning -m unittest discover` review-playbook
   suite (`3,164` tests, `6` conditional skips, `1,181.076` seconds) outside the
-  nested macOS sandbox restriction. The prior stable tree passed `3,142` tests
+  nested macOS sandbox restriction. The post-`3d080de` final candidate passed
+  `3,190` tests with the same six skips in `1,287.393` seconds. The prior stable
+  tree passed `3,142` tests
   with the same six skips in `1,147.173` seconds; the post-prefix,
   pre-late-remediation tree passed `3,135` tests with the same six skips in
   `1,098.645` seconds; the earlier signal-remediation tree passed `3,120` tests
@@ -1601,7 +1670,7 @@ superseded_by:
   tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`77` focused policy, distribution, carrier, report, and self-policy
+  matrix (`81` focused policy, distribution, carrier, report, and self-policy
   contracts).
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML

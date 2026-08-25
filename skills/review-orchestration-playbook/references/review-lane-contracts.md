@@ -624,6 +624,13 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   `latest head plus no unresolved provider finding passes` always means this
   applicability-filtered rule.
 - A complete exact-provider `+1` reaction basis is a fallback, not the preferred artifact.
+- An applicable provider finding must be proved by three independently frozen
+  parent-owned inputs: a `finding_page_receipt` for the complete current-scope
+  provider acquisition, a `finding_range_receipt` for the exact full-DAG
+  range, and a `finding_carrier_snapshot` selected from that complete
+  observation under the evidence authority's precedence and supersession
+  rules. These inputs are prior to report validation; the report cannot supply,
+  rewrite, or self-certify carrier identity, scope, ancestry, or thread state.
 - Only applicable unresolved provider findings block. On the same head, an
   exact typed GraphQL thread resolution or a later trustworthy provider
   correction accepted by the evidence authority clears the corresponding
@@ -696,6 +703,13 @@ Classify each finding before choosing a transition:
   head; discard old-head positive evidence; prepare fresh workspaces and rerun
   every required local lane independently; and obtain new current-head GitHub
   evidence when required.
+- Every new head, including a signed base-merge head, invalidates all three old
+  finding inputs. Reacquire complete current-scope pages and thread state,
+  reproject any retained raw finding carrier against the new range's complete
+  reachable DAG, and rerun authority precedence and supersession before
+  freezing the replacement receipts and snapshot. Include merge commits and
+  every in-range side-history commit; never use a first-parent, ancestry-path,
+  single-parent, or linear-history projection.
 - Never create an empty commit solely to convert a resolution-only same-head
   transition into a fresh review epoch.
 

@@ -96,10 +96,22 @@ The intended current policy is:
 - Prefer a trustworthy merge/status producer when its independently verified repository contract binds the exact feature head, current base/merge scope, check-subject SHA, App/workflow/run/check identity, and defines success itself as GitHub Codex provider clean. A `feature-head` contract reports only latest-feature-head coverage; a `github-synthetic-merge` contract may report current-merge-scope coverage only while every base/merge/subject binding remains stable. With zero applicable unresolved findings, this basis passes independently and does not require a separate terminal clean comment or review. A generic successful check or service-start marker never qualifies.
 - Otherwise, a trustworthy provider terminal clean comment or review on the latest head, together with no unresolved provider finding in the PR, passes the lane.
 - A complete provider `+1` reaction basis is a fallback when no stronger terminal artifact is available.
-- Only applicable unresolved provider findings block. On the same head, an exact
-  typed GraphQL thread resolution or a later trustworthy provider correction
-  accepted by the evidence authority can clear a finding without inventing a
-  code change. If addressing a finding actually changes code, the resulting
+- Only applicable unresolved provider findings block. They require an
+  independent parent-owned `finding_page_receipt`, `finding_range_receipt`, and
+  `finding_carrier_snapshot`; report, carrier, and embedded page or ancestry
+  fields cannot prove one another. The page receipt freezes complete
+  current-scope acquisition counts and the canonical issue/review record bytes,
+  including child/thread joins. The range receipt binds the exact full-DAG
+  range, including merge commits and side history. The snapshot supplies the
+  closed replay observation and selected carrier, not only digests; the
+  consumer recomputes them and replays precedence, resolution, and supersession.
+  A new head or merge base requires all three inputs and the full-DAG projection
+  to be rebuilt. Stale, non-ancestor, fabricated, or incomplete raw evidence
+  remains audit-only and cannot create `status: findings`. On the same head, an
+  exact typed GraphQL
+  thread resolution or a later trustworthy provider correction accepted by the
+  evidence authority can clear a finding without inventing a code change. If
+  addressing a finding actually changes code, the resulting
   new head invalidates every old-head positive/pass/clean result and every
   head-bound readiness gate, and requires fresh review. An ancestry-proven
   unresolved provider finding that remains applicable to the current head is

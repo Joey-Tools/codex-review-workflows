@@ -236,6 +236,15 @@ provider finding that remains applicable to the new head is negative evidence,
 not reusable positive evidence; it continues to block until typed resolution
 or an accepted later corrective artifact satisfies
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
+The old raw finding carrier may be evaluated again, but its old acquisition,
+ancestry, and thread inputs are not reusable. The parent must reacquire the
+complete current-scope provider observation and freeze a new
+`finding_page_receipt`, independently freeze a new `finding_range_receipt`
+over the complete `merge_base..new_head` reachable DAG, and apply the evidence
+authority's precedence and supersession rules before freezing the selected
+`finding_carrier_snapshot`. Merge commits and all in-range side history count;
+never replace the range projection with `--first-parent`, `--ancestry-path`, a
+single-parent walk, or a linear-history assumption.
 
 Strict freshness catches the ordinary case where the feature branch is behind,
 but it does not close the exact-base race after the final reread. A changed
@@ -345,7 +354,10 @@ following without reusing stale summaries:
 - local review artifacts and validations newly acquired for both the resulting
   range and the current exact repository, `baseRefName`, and `baseRefOid`
   binding;
-- the complete GitHub Codex decision inputs and unresolved provider findings;
+- newly frozen parent-owned `finding_page_receipt`, `finding_range_receipt`,
+  and `finding_carrier_snapshot` inputs for the complete current-scope provider
+  observation, full-DAG range, authority-selected carrier, and unresolved
+  provider findings;
 - required check rollup, related merge/status evidence, mergeability, and
   merge-queue state;
 - every review and conversation thread relevant to readiness; and

@@ -99,12 +99,22 @@ range: missing or unknown origin may block local readiness while the
 trustworthy head-only GitHub result remains reusable. Reconcile any
 base-sensitive merge/status check. Do not post another `@codex review` merely
 because the base changed, and never describe the reused provider artifact as a
-review of the new base.
+review of the new base. The raw provider artifact may remain in the audit
+inventory, but old `finding_page_receipt`, `finding_range_receipt`, and
+`finding_carrier_snapshot` inputs are not reusable across that scope change.
+Freeze all three again, rebuild the ancestor projection over the new
+`base_sha..head_sha` full commit DAG, and reclassify the raw carrier before it
+may block the refreshed scope. Do not reduce that projection to first-parent,
+ancestry-path, or otherwise linear history.
 
 By contrast, merging the current base branch into the feature branch creates a
 new head. Every old-head positive GitHub Codex result is stale; unresolved
 findings remain applicable under the rules below. The new head must obtain fresh
-provider evidence after its local tests and review lanes are rerun.
+provider evidence after its local tests and review lanes are rerun. Reevaluate
+any retained raw finding carrier against a newly frozen current-scope
+`finding_page_receipt`, `finding_range_receipt`, and
+`finding_carrier_snapshot`; none of the old parent inputs or their page,
+ancestor, or thread projections carries forward to the new head.
 
 ## Provider Identity
 
@@ -206,6 +216,159 @@ amend, or self-prove it. The consumer requires both basis selections to be
 type-preserving equal and to join exactly to the report and its orthogonal
 epoch or merge-contract carrier; changing those carriers together while
 leaving this frozen selection unchanged fails closed.
+
+Before any blocking `findings` result, persist three separate closed
+parent-owned inputs: a `finding_page_receipt` for acquisition completeness, a
+`finding_range_receipt` for the current local range, and a
+`finding_carrier_snapshot` containing the consumer replay observation and
+selected carrier. All three are created before report validation and are
+read-only to the consumer. Report fields and embedded page, carrier, or
+ancestry projections cannot create, amend, or self-prove any of them.
+
+The `finding_page_receipt` has exact fields `owner`, `status`, `profile`,
+`scope`, `page_inventory`, and `records_sha256`. Require
+`owner: parent-orchestrator`, `status: complete`, and exact profile
+`github-codex-finding-acquisition-v1`. Its closed
+`finding_acquisition_scope` has exact fields `repository`, `pull_request`,
+`base_sha`, `head_sha`, and `ancestor_shas_sha256`; each joins the independent
+`finding_range_receipt` type-preservingly.
+
+Its closed `finding_acquisition_page_inventory` contains only the five
+acquisition completion Booleans and their five typed non-negative counts for
+issue comments, reviews, associated inline comments, GraphQL review threads,
+and nested thread comments. Every completion flag is exact `true`, and every
+field joins the corresponding `complete_observation.page_inventory` field
+before candidate selection. The derived `terminal_candidate_count` remains
+outside this acquisition receipt.
+
+The parent freezes this receipt from the complete current-scope page
+acquisition before constructing the finding snapshot. The consumer recomputes
+`records_sha256` as the lowercase SHA-256 digest of RFC 8785 canonical JSON for
+the exact closed object `{issue_comments, reviews}` supplied by the observation,
+including every ordered parent-enriched record, embedded provider child, and
+GraphQL thread join. Deleting or changing a later correction, child, thread
+join, page count, or completion flag cannot be repaired by changing the
+snapshot observation, its digest, or report summaries while this independent
+receipt remains unchanged.
+
+The `finding_range_receipt` has exact fields `owner`, `status`, `repository`,
+`pull_request`, `base_sha`, `head_sha`, `history_mode`,
+`base_is_unique_merge_base`, `base_is_ancestor_of_head`, `ancestor_shas`,
+`ancestor_count`, and `ancestor_shas_sha256`. Require
+`owner: parent-orchestrator`, `status: complete`, `history_mode: full-dag`, and
+both Boolean properties to be exact `true`. The ancestor list contains full
+lowercase SHAs, sorted by ASCII bytes, duplicate-free, and excludes both base
+and head; recompute its typed count and its SHA-256 digest over each ASCII SHA
+followed by LF. Build it from the complete `base_sha..head_sha` commit DAG,
+including merge commits and side history. First-parent, ancestry-path, or any
+other linear projection is invalid.
+
+The receipt's repository, PR, and head join the report and observation exactly.
+The consumer projects the receipt into every candidate carrier's complete
+`scope` and `ancestor_shas_projection` and requires type-preserving equality.
+An `owner` string or projection embedded only in the carrier is not independent
+ancestry evidence. The selected artifact is applicable only when its commit is
+the exact receipt head or a member of the receipt's complete ancestor list.
+Changing the base while retaining the same head invalidates the old receipt and
+snapshot; coupled edits to a carrier commit, body, report, and embedded
+projection cannot repair that mismatch.
+
+The `finding_carrier_snapshot` has exact fields `owner`, `status`,
+`complete_observation`, `complete_observation_sha256`, `raw_carrier`,
+`raw_carrier_sha256`, `evidence`, and `unresolved_provider_findings`. Require
+`owner: parent-orchestrator` and `status: complete`. `complete_observation` is
+the supplied closed `finding_complete_observation` object with exact fields
+`scope`, `page_inventory`, `issue_comments`, `reviews`,
+`selected_carrier_sha256`, and `selection_status`; require the status to be
+exactly `selected-findings`. A digest without this canonical object is invalid.
+Its scope is the closed repository/PR/head scope. Its `page_inventory` is the
+closed `finding_page_inventory`: issue-comment, review,
+associated-inline-comment, GraphQL review-thread, and nested thread-comment
+completion flags are exact `true`; their counts are typed non-negative
+integers. Require `issue_comment_count` and `review_count` to equal the exact
+lengths of the supplied channel arrays, `inline_comment_count` to equal the sum
+of every supplied review's child count, and `terminal_candidate_count` to be a
+typed positive integer equal to the consumer-derived terminal-looking record
+count. Before trusting those values or record arrays, require their acquisition
+subset and page-record digest to join the independent `finding_page_receipt`
+exactly.
+
+The parent supplies the canonical observation object itself, not merely a
+summary or claimed digest. The consumer recomputes
+`complete_observation_sha256` as the lowercase SHA-256 digest of RFC 8785
+canonical JSON for that exact object only after the independent range and page
+receipts join its scope, acquisition inventory, and page-record bytes. Validate
+every terminal candidate as a closed parent-enriched issue-comment or review
+carrier. The supplied channel arrays contain every record frozen by the page
+receipt from the complete current-scope pages, including nonterminal records
+from which the consumer derives the terminal candidates.
+Require unique raw-carrier digests and unique `(kind, id)` identities across
+both arrays, exact receipt scope joins, and canonical semantic-time/within-channel
+ID order in each array. Raw provider fields remain unchanged; parent-enriched
+scope, pagination, commit-resolution, and thread-join companions must all
+satisfy the version-1 grammar. A full-SHA issue-comment
+finding has `commit_resolution: null`. In this negative-observation selector,
+an issue-comment clean candidate with a 40-character marker can supply
+supersession authority only when `commit_resolution` is null and the marker
+equals the independent range receipt's head. A 10-character marker additionally
+requires a grammar-valid closed resolution whose repository and marker join the
+receipt and whose initial and final resolved commits both equal the receipt
+head, which must start with that marker. A carrier's `commit_resolution` never
+supplies finding-selection authority by itself; any range join failure makes
+the complete selection fail closed rather than superseding a finding.
+
+Run the normative classifier over every supplied record, derive the complete
+terminal-candidate set and its count, and independently
+replay this authority's applicability, ordering, cross-channel precedence,
+resolution, and supersession rules. Only a strictly later trustworthy clean may
+supersede an older top-level finding. `resolved-inline-only` clears only that
+carrier's typed resolved inline findings, and no later clean supersedes an
+unresolved inline child. A globally latest malformed or inconclusive candidate,
+conflicting cross-channel classification or commit result in the globally
+latest decision bucket, conflicting latest channels during finding selection,
+or an ambiguous same-channel winner prevents a valid selection and cannot be
+converted to blocking evidence. Require the independently selected carrier
+digest to equal
+`complete_observation.selected_carrier_sha256`.
+
+When a selected `top-level-finding-v1` carrier also contains an exact-provider
+unresolved inline child, a strictly later trustworthy clean may supersede only
+the top-level component. The selected raw carrier and evidence remain that
+original carrier, but the unresolved projection must then be non-empty and
+inline-only; retaining its superseded top-level entry or dropping its unresolved
+inline child fails closed.
+
+`raw_carrier` is the exact selected candidate and must be type-preservingly
+equal to one unique observation member. Recompute `raw_carrier_sha256` from its
+RFC 8785 canonical JSON and require it to equal the independently selected
+digest.
+Derive provider identity, channel, grammar branch, evidence identity, commit,
+server time, and the exact unresolved top-level or inline-child projection from
+that carrier. Derive a parent issue-comment or review URL canonically from the
+receipt repository, PR, channel, and carrier ID; bind an inline child's raw
+discussion URL through its exact parent review and GraphQL thread join. A
+parent-owned `request_id` association may remain in the evidence projection
+when the raw carrier has no such field; it cannot replace any carrier,
+observation, or range binding. Finally require the snapshot's evidence and
+unresolved list to equal those derived projections and the report
+type-preservingly.
+
+A single complete observation may prove the presence of a selected applicable
+unresolved finding and block immediately; it need not satisfy the
+two-observation stability proof used to prove absence for `pass`. This
+asymmetry does not remove the final-reread gate: merge readiness must still
+reread the complete current scope and may retain the finding only if it remains
+the independently selected applicable unresolved result.
+
+A non-ancestor or stale carrier, a fabricated commit or identity, an incomplete
+page or range receipt, incomplete observation or pagination, or an orphaned,
+ambiguous, or malformed thread join remains in the raw audit inventory. Such
+evidence may make the lane inconclusive, but it cannot enter the authoritative
+unresolved-finding projection or generate blocking `status: findings`. A new
+head or merge base requires a new page receipt, range receipt, and snapshot even
+if the raw provider carrier is retained; rebuild the projection over the new
+`base_sha..head_sha` full DAG and rerun acquisition and complete-observation
+selection.
 
 ## Evidence Strength
 
@@ -330,9 +493,15 @@ ancestor is still an applicable inline finding. A top-level finding review must
 likewise parse and join every associated provider child; its top-level finding
 cannot hide an unresolved inline thread.
 
-A terminal finding blocks immediately only when exact identity, scope, and
-carrier are trustworthy and the finding is applicable and unresolved. Missing
-positive evidence cannot neutralize such a finding.
+A terminal finding blocks immediately only when the independent parent-owned
+`finding_page_receipt` proves acquisition completeness, the separate
+`finding_range_receipt` proves current full-DAG applicability, and the separate
+`finding_carrier_snapshot` supplies a digest-recomputable observation whose
+replay selects that exact unresolved carrier. The consumer then joins its
+derived evidence and finding projection type-preservingly to the report. Report
+fields, a digest without its object, embedded page state, and a carrier's own
+scope never prove those facts to one another. Missing positive evidence cannot
+neutralize a finding that passes this negative-evidence contract.
 
 ## Finding Precedence And Resolution
 
@@ -349,6 +518,11 @@ Classify provider findings independently of human conversation state.
   `#discussion_r<ID>` suffix to match that exact child ID. An orphan, duplicate
   join, child-ID mismatch, parent mismatch, or incomplete nested page is
   inconclusive or malformed according to the closed grammar.
+- The parent review is part of the inline finding's identity. Its accepted
+  carrier is `inline-parent-v1`, its channel is exactly `review`, and its raw
+  pull-request-review ID and URL must bind both the child and the report through
+  the independent finding snapshot. A child discussion URL or copied parent
+  ID alone cannot establish that association.
 - A top-level provider finding remains active until a later trustworthy
   provider clean correction on the same head, or a trustworthy clean artifact
   on a locally proved descendant head, supersedes it. A same-head correction
@@ -457,7 +631,7 @@ defined in [github-pr-probes.md](github-pr-probes.md).
 | Trusted contract-verified merge/status producer is clean for its exact feature-head or synthetic-merge scope and no provider finding is unresolved | `pass` |
 | Trusted terminal clean artifact and no provider finding is unresolved | `pass` |
 | Valid reaction fallback and no provider finding is unresolved | `pass` |
-| Any applicable unresolved provider finding | `findings` |
+| Parent-owned page and range receipts plus replayed complete finding snapshot prove an applicable unresolved provider finding and join exactly to the report | `findings` |
 | Stable current-head inline-only artifact has one or more provider children and all are GraphQL-resolved, but no later terminal clean exists | `pending` with `resolved-inline-awaiting-clean`; reconcile may retry the Action |
 | Work is running or failure is retryable | `pending` |
 | Pagination, identity, grammar, scope, ordering, or final stability cannot be proved | `inconclusive` |
@@ -669,10 +843,30 @@ copying the App identity, feature head, or check name.
 
 A findings report backed by an accepted terminal carrier uses
 `kind: terminal-artifact`, a non-null full `artifact_commit`,
-`head_binding: explicit-commit`, and its finding grammar branch. Pending and
-inconclusive PR-bound reports may use `evidence: null` when no stable diagnostic
-artifact is selected. The no-PR `not-applicable` variant always uses null
-evidence together with its required null PR/head fields.
+`head_binding: explicit-commit`, and its finding grammar branch. It is accepted
+only alongside the independently supplied closed parent-owned
+`finding_page_receipt`, `finding_range_receipt`, and
+`finding_carrier_snapshot` described above. The consumer validates the current
+range first, recomputes the acquisition page-record digest and joins its exact
+inventory next, then recomputes the observation and selected-carrier digests,
+joins every record to the independent current range, replays the complete
+terminal selection, and validates the selected raw carrier before comparing
+its exact derived evidence and unresolved list type-preservingly with the report.
+Equality among report fields, or even a coupled edit to the carrier, embedded
+projection, report evidence, and every finding entry, supplies no authority.
+Non-ancestor, stale, fabricated, incomplete-projection, incomplete-observation,
+or malformed-join carriers remain audit-only and cannot produce
+`status: findings`.
+
+The page receipt, range receipt, and snapshot are external parent inputs, not
+fields in `github_codex_lane`. A new head or merge base requires all three to be
+newly frozen and requires a newly computed complete `base_sha..head_sha`
+full-DAG ancestor projection; the consumer cannot rebind old inputs by changing
+their page state, carrier, or report scopes. The final readiness reread still
+confirms that the current scope and thread state have not cleared or invalidated
+the finding. Pending and inconclusive PR-bound reports may use `evidence: null`
+when no stable diagnostic artifact is selected. The no-PR `not-applicable`
+variant always uses null evidence together with its required null PR/head fields.
 
 Use `warning` for observed early or duplicate requests. Warnings do not change
 the provider verdict and never authorize another concurrent request. Use

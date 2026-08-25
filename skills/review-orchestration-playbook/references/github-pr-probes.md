@@ -11,6 +11,16 @@ Prefer typed `gh` output and exact REST or GraphQL fields. Keep large raw page
 sets in a task-scoped bounded artifact and surface only IDs, URLs, times,
 states, and decisive findings.
 
+This probe layer owns acquisition, not interpretation. Preserve every complete
+raw REST and GraphQL page used by a finding decision so the parent can freeze a
+current-scope `finding_page_receipt`. Independently provide the exact full-DAG
+range input for the parent's `finding_range_receipt`; only then may the parent
+freeze the `finding_carrier_snapshot` selected from the complete observation
+under the evidence authority's precedence and supersession rules. Freeze and
+pass all three inputs before report validation and again for the final reread.
+The evidence authority alone defines carrier validity, applicability, thread
+resolution, terminal selection, and report classification.
+
 ## Select The Exact PR
 
 An explicitly named PR wins. Otherwise accept only one authenticated open PR
@@ -64,6 +74,12 @@ opaque `endCursor` for the next request. A terminal page is one with typed
 Bind every GraphQL response back to raw `repository.nameWithOwner` and
 `pullRequest.number`. Normalize IDs only for comparison; preserve the raw
 records. Never synthesize `thread_resolved` on REST comments.
+
+Derive the parent-owned `finding_range_receipt` independently from the exact
+range's complete reachable DAG rather than treating ancestry embedded in a
+carrier or snapshot as sole authority. Preserve merge commits and every
+in-range side-history commit; do not acquire a `--first-parent`,
+`--ancestry-path`, single-parent, or linear-history projection as a substitute.
 
 Immediately before accepting a result, repeat the PR detail, all provider
 evidence pages used by the decision, finding-thread state, exact feature-head

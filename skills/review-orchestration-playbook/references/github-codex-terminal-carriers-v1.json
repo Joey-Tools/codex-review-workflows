@@ -544,6 +544,78 @@
         "threads_pages_complete",
         "initial_snapshot_sha256",
         "final_snapshot_sha256"
+      ],
+      "finding_carrier_snapshot": [
+        "owner",
+        "status",
+        "complete_observation",
+        "complete_observation_sha256",
+        "raw_carrier",
+        "raw_carrier_sha256",
+        "evidence",
+        "unresolved_provider_findings"
+      ],
+      "finding_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count",
+        "terminal_candidate_count"
+      ],
+      "finding_page_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "scope",
+        "page_inventory",
+        "records_sha256"
+      ],
+      "finding_acquisition_scope": [
+        "repository",
+        "pull_request",
+        "base_sha",
+        "head_sha",
+        "ancestor_shas_sha256"
+      ],
+      "finding_acquisition_page_inventory": [
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count"
+      ],
+      "finding_complete_observation": [
+        "scope",
+        "page_inventory",
+        "issue_comments",
+        "reviews",
+        "selected_carrier_sha256",
+        "selection_status"
+      ],
+      "finding_range_receipt": [
+        "owner",
+        "status",
+        "repository",
+        "pull_request",
+        "base_sha",
+        "head_sha",
+        "history_mode",
+        "base_is_unique_merge_base",
+        "base_is_ancestor_of_head",
+        "ancestor_shas",
+        "ancestor_count",
+        "ancestor_shas_sha256"
       ]
     },
     "parent_input_rules": {
@@ -580,6 +652,40 @@
         "finding_state": "provider_target_children is a positive integer and unresolved_provider_findings is integer zero",
         "page_state": "children_pages_complete and threads_pages_complete are exact true",
         "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the closed parent review, complete provider-target child pages, and exact joined GraphQL thread state sorted by child ID"
+      },
+      "finding_carrier_snapshot": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from the complete raw selected finding carrier before report validation; read-only to the consumer and never derived from report or report evidence fields",
+        "complete_observation": "a closed finding_complete_observation used as the consumer replay source, containing a closed selected_pr_scope equal to the report, a closed finding_page_inventory, canonically ordered issue_comments and reviews arrays type-preserving equal to the independently frozen finding_page_receipt projection, the independently derived selected carrier digest, and selection_status selected-findings; issue_comment_count and review_count exactly equal their array lengths, inline_comment_count exactly equals the sum of every review children length, terminal_candidate_count exactly equals the consumer-derived terminal-looking candidate count, all page completion flags are exact true, counts are typed non-negative integers, raw digests and kind/ID identities are unique, and every record has the same exact scope and complete current ancestry projection",
+        "observation_digest": "complete_observation_sha256 is recomputed as the lowercase SHA-256 digest of RFC 8785 canonical JSON for complete_observation before page, candidate, ordering, or selection fields are trusted; arbitrary or stale digests and any observation-byte mutation without a matching digest fail closed",
+        "terminal_selection": "the consumer derives terminal candidates from every issue_comments and reviews record, runs the existing version-1 classifier over each, and independently applies authority precedence to derive selected_carrier_sha256; each channel array is canonically ordered by semantic server time and within-channel ID only for inventory identity, never to decide cross-channel precedence; within each GitHub channel's globally latest semantic-time bucket, findings take precedence over clean and resolved-inline-only, while multiple remaining same-priority candidates in one channel fail closed; only a strictly later trustworthy clean supersedes an older top-level finding, resolved-inline-only clears only that carrier's typed resolved inline findings, and an unresolved applicable inline child is not superseded by a later clean even when its parent also has a top-level finding; a globally latest malformed or inconclusive candidate, contradictory classification or commit results across channel winners, or multiple channels competing at the selected finding time also fails closed",
+        "raw_carrier": "the exact parent-enriched closed issue-comment or review carrier admitted by this version-1 grammar, including its closed scope and parent-owned ancestor projection, exact provider actor and App identity when applicable, state and body, complete child pagination, and exact parent-derived GraphQL thread joins; an issue-comment full-SHA finding has null commit_resolution",
+        "raw_digest": "raw_carrier_sha256 is the lowercase SHA-256 digest of RFC 8785 canonical JSON for raw_carrier and is recomputed before any projection is trusted",
+        "classification": "the existing version-1 carrier classifier must classify raw_carrier as findings; stale, inconclusive, malformed, irrelevant, clean, resolved-inline-only, and nonterminal carriers cannot support a findings report",
+        "scope_binding": "raw_carrier.scope is only an exact join projection, never independent ancestry authority: repository, pull_request, base_sha, head_sha, ancestor_shas, and its embedded ancestor_shas_projection are type-preserving equal to the separate parent-owned finding_range_receipt; only membership in that independently frozen complete full-DAG receipt makes a non-head artifact commit applicable",
+        "evidence_binding": "evidence is a closed parent-derived projection whose kind, ID, exact scope URL, channel, grammar, branch, accepted status, artifact commit, semantic server time and field, and explicit-commit binding are deterministically derived from raw_carrier and classifier output; request_id is the parent-owned request association retained in that exact projection",
+        "finding_projection": "unresolved_provider_findings is the exact ordered closed projection derived from raw_carrier: one top-level carrier entry when the selected branch is top-level-finding-v1 and that top-level component has not been superseded by a strictly later trustworthy clean, followed by every exact-provider child whose complete unique thread join has typed isResolved false; a selected top-level carrier whose top-level component was superseded projects only its still-unresolved inline children, while inline-parent-v1 always contains only those unresolved child entries; IDs, URLs, artifact commit, evidence ID, thread state, and report head are derived from the raw record",
+        "report_binding": "the separate page/acquisition receipt and full-DAG range receipt are validated and exactly joined to complete_observation before authority selection and selected-carrier classification; selected_carrier_sha256 equals raw_carrier_sha256, raw_carrier is type-preserving equal to that unique candidate, and snapshot evidence and unresolved_provider_findings are each type-preserving equal to their deterministic raw-carrier derivation and to the report fields; changing report, snapshot summaries, observation bytes, and digests together cannot make an omitted, independently superseded, or range-invalid carrier selectable while either independent receipt remains unchanged"
+      },
+      "finding_range_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "trust_boundary": "frozen and persisted independently by the parent from the exact current selected-PR range before carrier observation or report validation; read-only to the consumer and never derived from raw_carrier, complete_observation, report, or evidence fields",
+        "scope": "repository and pull_request equal the selected report and complete-observation scope; base_sha is the locally proved unique PR merge base, head_sha is the exact current head, base_is_unique_merge_base and base_is_ancestor_of_head are exact true, and history_mode is exact full-dag",
+        "ancestor_set": "ancestor_shas is the complete lowercase full-SHA set from base_sha..head_sha excluding both endpoints, ordered by ascending ASCII SHA with no duplicates; ancestor_count is a typed non-negative integer equal to its length and ancestor_shas_sha256 is recomputed over each ordered ASCII SHA followed by LF",
+        "carrier_join": "every complete-observation candidate and selected raw_carrier has a type-preserving exact scope equal to the receipt projection, including base_sha, head_sha, ancestor_shas, and a closed parent-orchestrator complete ancestor_shas_projection with the receipt count and digest; only head_sha or membership in this independent receipt can make a finding applicable",
+        "invalidation": "a repository, PR, head, unique merge base, or full-DAG ancestor-set change requires a new receipt and observation; same-head base movement, a coupled raw ancestry rewrite, first-parent projection, or ancestry-path omission cannot repair an old receipt"
+      },
+      "finding_page_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-finding-acquisition-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from the complete current-scope issue-comment, review, associated inline-comment, GraphQL review-thread, and nested thread-comment page acquisition before finding_carrier_snapshot construction or report validation; read-only to the consumer and never derived from complete_observation, raw_carrier, report, or report evidence fields",
+        "scope_binding": "scope is a closed finding_acquisition_scope whose repository, pull_request, base_sha, head_sha, and ancestor_shas_sha256 are type-preserving equal to the independent finding_range_receipt",
+        "page_inventory": "page_inventory is a closed finding_acquisition_page_inventory containing only the five acquisition completion booleans and their five typed non-negative counts; every completion flag is exact true and every field is type-preserving equal to its complete_observation.page_inventory counterpart before candidate selection; derived terminal_candidate_count remains outside this acquisition receipt",
+        "page_records_digest": "records_sha256 is recomputed as the lowercase SHA-256 digest of RFC 8785 canonical JSON for the closed object whose only fields are issue_comments and reviews, preserving each complete ordered parent-enriched record and every embedded provider child and exact GraphQL thread join; it exactly equals the complete_observation page-record projection before those replay bytes are trusted",
+        "mutation_resistance": "deleting or altering a page record, child, or thread join, or changing any page count or completion flag, while coupling complete_observation_sha256 and snapshot summaries cannot satisfy an unchanged independent receipt"
       }
     },
     "selection_outcome_rules": {
@@ -642,7 +748,7 @@
         "thread_is_resolved": "null for top-level-finding-v1; exact false for inline-parent-v1",
         "evidence_id": "required-positive-integer-equals-selected-evidence-id",
         "report_head_sha": "required-full-sha-equals-report-head-sha",
-        "carrier_relation": "inline-parent-v1 evidence permits only inline-parent-v1 entries; top-level-finding-v1 evidence requires at least one top-level-finding-v1 entry and may also carry joined inline-parent-v1 entries",
+        "carrier_relation": "inline-parent-v1 evidence permits only inline-parent-v1 entries; top-level-finding-v1 evidence permits top-level-finding-v1 and joined inline-parent-v1 entries and normally includes its top-level entry, but after the complete observation proves a strictly later trustworthy clean superseded only that top-level component it requires a non-empty inline-parent-v1-only projection derived from the same selected carrier",
         "uniqueness": "IDs and URLs are each independently unique"
       }
     },
@@ -750,6 +856,7 @@
           "top-level-finding-v1",
           "inline-parent-v1"
         ],
+        "parent_finding_snapshot_input": "findings require three separate closed parent-owned inputs: finding_page_receipt independently freezes complete current-scope acquisition counts and page-record bytes, finding_range_receipt independently freezes the current unique-merge-base full-DAG range, and finding_carrier_snapshot supplies the consumer replay observation, canonical observation digest, authority-precedence selection across every later correction or supersession, exact selected parent-enriched raw carrier and canonical digest, and deterministic evidence/unresolved-finding projections; embedded page counts and ancestry projections are exact joins only, and report fields cannot supply or repair any input",
         "finding_artifact_commit": "required-full-sha",
         "finding_head_binding": "explicit-commit"
       }
@@ -991,14 +1098,14 @@
       "basis": null,
       "evidence": {
         "kind": "terminal-artifact",
-        "id": 302,
-        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-302",
+        "id": 402,
+        "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-402",
         "channel": "review",
         "grammar": "github-codex-terminal-carriers-v1",
         "grammar_branch": "inline-parent-v1",
         "grammar_status": "accepted",
         "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
-        "server_time": "2026-08-23T09:03:00Z",
+        "server_time": "2026-08-23T09:05:00Z",
         "server_time_field": "submitted_at",
         "head_binding": "explicit-commit",
         "request_id": 91
@@ -1009,12 +1116,12 @@
       },
       "unresolved_provider_findings": [
         {
-          "id": 402,
-          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r402",
+          "id": 503,
+          "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
           "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
           "grammar_branch": "inline-parent-v1",
           "thread_is_resolved": false,
-          "evidence_id": 302,
+          "evidence_id": 402,
           "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
         }
       ],
@@ -1760,6 +1867,27 @@
       "valid": true
     },
     {
+      "id": "finding-report-coupled-nonancestor-commit-mutation",
+      "base": "finding",
+      "patch": {
+        "evidence": {
+          "artifact_commit": "1111111111111111111111111111111111111111"
+        },
+        "unresolved_provider_findings": [
+          {
+            "id": 301,
+            "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-301",
+            "artifact_commit": "1111111111111111111111111111111111111111",
+            "grammar_branch": "top-level-finding-v1",
+            "thread_is_resolved": null,
+            "evidence_id": 301,
+            "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
+          }
+        ]
+      },
+      "valid": false
+    },
+    {
       "id": "inline-finding-report-positive",
       "base": "inline_finding",
       "patch": {},
@@ -1908,12 +2036,12 @@
       "patch": {
         "unresolved_provider_findings": [
           {
-            "id": 402,
-            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r402",
+            "id": 503,
+            "url": "https://github.com/octo/review-fixture/pull/7#discussion_r503",
             "artifact_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
             "grammar_branch": "inline-parent-v1",
             "thread_is_resolved": true,
-            "evidence_id": 302,
+            "evidence_id": 402,
             "report_head_sha": "0123456789abcdef0123456789abcdef01234567"
           }
         ]
@@ -2427,6 +2555,40 @@
         "semantic_time_field": "submitted_at",
         "semantic_time": "2026-08-23T09:02:00Z",
         "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "issue-top-level-ancestor-finding-positive",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12"
+      },
+      "expected": {
+        "classification": "findings",
+        "branch": "top-level-finding-v1",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 1
+      }
+    },
+    {
+      "id": "issue-finding-rejects-commit-resolution",
+      "base": "clean_issue",
+      "patch": {
+        "body": "### 💡 Codex Review\n- [P1] Reject ambiguous cache entries — https://github.com/octo/review-fixture/blob/abcdefabcdefabcdefabcdefabcdefabcdefabcd/src/cache.py#L10-L12",
+        "commit_resolution": {
+          "repository": "octo/review-fixture",
+          "commit_ref": "abcdefabcd",
+          "initial_resolved_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          "final_resolved_commit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        }
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
       }
     },
     {

@@ -56,6 +56,69 @@ def _time(value: object) -> datetime.datetime:
     return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
+def _canonical_json_sha256(value: object) -> str:
+    """Return the RFC 8785 digest for this grammar's integer-only JSON values."""
+
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _finding_page_records_sha256(
+    issue_comments: object,
+    reviews: object,
+) -> str:
+    return _canonical_json_sha256(
+        {
+            "issue_comments": issue_comments,
+            "reviews": reviews,
+        }
+    )
+
+
+def _make_finding_page_receipt(
+    observation: dict[str, object],
+    range_receipt: dict[str, object],
+) -> dict[str, object]:
+    inventory_fields = (
+        "issue_comments_pages_complete",
+        "issue_comment_count",
+        "reviews_pages_complete",
+        "review_count",
+        "inline_comments_pages_complete",
+        "inline_comment_count",
+        "review_threads_pages_complete",
+        "review_thread_count",
+        "review_thread_comments_pages_complete",
+        "review_thread_comment_count",
+    )
+    return {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-finding-acquisition-v1",
+        "scope": {
+            "repository": range_receipt["repository"],
+            "pull_request": range_receipt["pull_request"],
+            "base_sha": range_receipt["base_sha"],
+            "head_sha": range_receipt["head_sha"],
+            "ancestor_shas_sha256": range_receipt["ancestor_shas_sha256"],
+        },
+        "page_inventory": {
+            field: copy.deepcopy(observation["page_inventory"][field])
+            for field in inventory_fields
+        },
+        "records_sha256": _finding_page_records_sha256(
+            observation["issue_comments"],
+            observation["reviews"],
+        ),
+    }
+
+
 class _ReferenceClassifier:
     """Bounded test-only reading of the four version-1 carrier branches."""
 
@@ -227,6 +290,8 @@ class _ReferenceClassifier:
         if finding is None:
             return self._result("malformed", None, semantic)
         commit, finding_count = finding
+        if record["commit_resolution"] is not None:
+            return self._result("malformed", None, semantic)
         applicability = self._ancestor_applicability(record["scope"], commit)
         if applicability != "applicable":
             return self._result(applicability, "top-level-finding-v1", semantic)
@@ -540,7 +605,11 @@ class _ReportValidator:
         merge_status_parent_contract: dict[str, object],
         resolved_inline_parent_snapshot: dict[str, object] | None = None,
         complete_pr_parent_snapshot: dict[str, object] | None = None,
+        finding_carrier_parent_snapshot: dict[str, object] | None = None,
+        finding_range_parent_receipt: dict[str, object] | None = None,
+        finding_page_parent_receipt: dict[str, object] | None = None,
     ) -> None:
+        self.grammar = grammar
         self.grammar_name = grammar["schema"]
         self.schema = grammar["required_report_schema"]
         self.fields = self.schema["closed_fields"]
@@ -560,7 +629,13 @@ class _ReportValidator:
             resolved_inline_parent_snapshot
         )
         self.complete_pr_parent_snapshot = copy.deepcopy(complete_pr_parent_snapshot)
+        self.finding_carrier_parent_snapshot = copy.deepcopy(
+            finding_carrier_parent_snapshot
+        )
+        self.finding_range_parent_receipt = copy.deepcopy(finding_range_parent_receipt)
+        self.finding_page_parent_receipt = copy.deepcopy(finding_page_parent_receipt)
         self.provider_identity = copy.deepcopy(grammar["provider_identity"])
+        self.reference_classifier = _ReferenceClassifier(grammar)
 
     def _closed(self, value: object, profile: str) -> bool:
         return isinstance(value, dict) and set(value) == set(self.fields[profile])
@@ -1428,8 +1503,610 @@ class _ReportValidator:
             evidence_branch == "inline-parent-v1" and branches == {"inline-parent-v1"}
         ) or (
             evidence_branch == "top-level-finding-v1"
-            and "top-level-finding-v1" in branches
+            and bool(branches)
+            and branches <= {"top-level-finding-v1", "inline-parent-v1"}
         )
+
+    @staticmethod
+    def _raw_finding_commit(raw_carrier: dict[str, object], branch: str) -> str | None:
+        if raw_carrier["kind"] == "review":
+            commit = raw_carrier["commit_id"]
+            return commit if isinstance(commit, str) else None
+        if branch != "top-level-finding-v1":
+            return None
+        try:
+            body = _normalize_body(raw_carrier["body"])
+        except (TypeError, ValueError):
+            return None
+        commits: set[str] = set()
+        for line in body.partition("\n\n")[0].split("\n")[1:]:
+            matched = FINDING.fullmatch(line)
+            if matched is None:
+                return None
+            parsed = urllib.parse.urlsplit(matched.group(2))
+            path = parsed.path.removeprefix("/").split("/")
+            if len(path) < 4 or path[2] != "blob":
+                return None
+            commits.add(path[3])
+        return next(iter(commits)) if len(commits) == 1 else None
+
+    def _derived_finding_evidence(
+        self,
+        raw_carrier: dict[str, object],
+        classification: dict[str, object],
+        request_id: object,
+    ) -> dict[str, object] | None:
+        branch = classification["branch"]
+        if branch not in {"top-level-finding-v1", "inline-parent-v1"}:
+            return None
+        commit = self._raw_finding_commit(raw_carrier, branch)
+        if not self._full_sha(commit):
+            return None
+        scope = raw_carrier["scope"]
+        channel = (
+            "issue-comment" if raw_carrier["kind"] == "issue_comment" else "review"
+        )
+        fragment = "issuecomment" if channel == "issue-comment" else "pullrequestreview"
+        return {
+            "kind": "terminal-artifact",
+            "id": raw_carrier["id"],
+            "url": (
+                f"https://github.com/{scope['repository']}/pull/"
+                f"{scope['pull_request']}#{fragment}-{raw_carrier['id']}"
+            ),
+            "channel": channel,
+            "grammar": self.grammar_name,
+            "grammar_branch": branch,
+            "grammar_status": "accepted",
+            "artifact_commit": commit,
+            "server_time": classification["semantic_time"],
+            "server_time_field": classification["semantic_time_field"],
+            "head_binding": "explicit-commit",
+            "request_id": request_id,
+        }
+
+    def _derived_unresolved_findings(
+        self,
+        raw_carrier: dict[str, object],
+        evidence: dict[str, object],
+        *,
+        include_top_level: bool = True,
+    ) -> list[dict[str, object]]:
+        scope = raw_carrier["scope"]
+        result: list[dict[str, object]] = []
+        if evidence["grammar_branch"] == "top-level-finding-v1" and include_top_level:
+            result.append(
+                {
+                    "id": raw_carrier["id"],
+                    "url": evidence["url"],
+                    "artifact_commit": evidence["artifact_commit"],
+                    "grammar_branch": "top-level-finding-v1",
+                    "thread_is_resolved": None,
+                    "evidence_id": evidence["id"],
+                    "report_head_sha": scope["head_sha"],
+                }
+            )
+        for child in raw_carrier.get("children", []):
+            if (
+                child["user"]
+                == {
+                    "login": self.provider_identity["login"],
+                    "type": self.provider_identity["type"],
+                }
+                and child["thread_join"]["isResolved"] is False
+            ):
+                result.append(
+                    {
+                        "id": child["id"],
+                        "url": child["url"],
+                        "artifact_commit": evidence["artifact_commit"],
+                        "grammar_branch": "inline-parent-v1",
+                        "thread_is_resolved": False,
+                        "evidence_id": evidence["id"],
+                        "report_head_sha": scope["head_sha"],
+                    }
+                )
+        return result
+
+    def _finding_carrier_snapshot_matches(
+        self,
+        report: dict[str, object],
+        evidence: dict[str, object],
+    ) -> bool:
+        snapshot = self.finding_carrier_parent_snapshot
+        if not self._closed_parent_input(snapshot, "finding_carrier_snapshot"):
+            return False
+        rules = self.schema["parent_input_rules"]["finding_carrier_snapshot"]
+        observation = snapshot["complete_observation"]
+        complete_observation_sha256 = snapshot["complete_observation_sha256"]
+        raw_carrier = snapshot["raw_carrier"]
+        parent_evidence = snapshot["evidence"]
+        parent_findings = snapshot["unresolved_provider_findings"]
+        digest = snapshot["raw_carrier_sha256"]
+        if (
+            snapshot["owner"] != rules["owner"]
+            or snapshot["status"] != rules["status"]
+            or not self._closed_parent_input(
+                observation, "finding_complete_observation"
+            )
+            or not isinstance(complete_observation_sha256, str)
+            or SHA256.fullmatch(complete_observation_sha256) is None
+            or complete_observation_sha256 != _canonical_json_sha256(observation)
+        ):
+            return False
+        expected_scope = self._finding_range_scope(report)
+        if expected_scope is None:
+            return False
+        selected_scope = {
+            "repository": expected_scope["repository"],
+            "pull_request": expected_scope["pull_request"],
+            "head_sha": expected_scope["head_sha"],
+        }
+        if not self._type_preserving_equal(observation["scope"], selected_scope):
+            return False
+        inventory = observation["page_inventory"]
+        issue_comments = observation["issue_comments"]
+        reviews = observation["reviews"]
+        page_flags = (
+            "issue_comments_pages_complete",
+            "reviews_pages_complete",
+            "inline_comments_pages_complete",
+            "review_threads_pages_complete",
+            "review_thread_comments_pages_complete",
+        )
+        page_counts = (
+            "issue_comment_count",
+            "review_count",
+            "inline_comment_count",
+            "review_thread_count",
+            "review_thread_comment_count",
+        )
+        if (
+            not self._closed_parent_input(inventory, "finding_page_inventory")
+            or any(inventory[field] is not True for field in page_flags)
+            or any(not self._nonnegative_int(inventory[field]) for field in page_counts)
+            or not isinstance(issue_comments, list)
+            or not isinstance(reviews, list)
+            or not self._positive_int(inventory["terminal_candidate_count"])
+            or observation["selection_status"] != "selected-findings"
+            or not isinstance(raw_carrier, dict)
+            or not isinstance(digest, str)
+            or SHA256.fullmatch(digest) is None
+            or digest != _canonical_json_sha256(raw_carrier)
+            or not self._closed(parent_evidence, "evidence")
+            or not isinstance(parent_findings, list)
+        ):
+            return False
+        if not self._finding_page_receipt_matches(observation, expected_scope):
+            return False
+        selected = self._select_finding_observation_candidate(
+            issue_comments,
+            reviews,
+            inventory,
+            expected_scope,
+        )
+        if selected is None:
+            return False
+        (
+            selected_carrier,
+            classification,
+            selected_digest,
+            top_level_component_superseded,
+        ) = selected
+        if (
+            observation["selected_carrier_sha256"] != selected_digest
+            or digest != selected_digest
+            or not self._type_preserving_equal(raw_carrier, selected_carrier)
+            or classification["classification"] != "findings"
+            or not isinstance(classification["unresolved_findings"], int)
+            or classification["unresolved_findings"] <= 0
+        ):
+            return False
+        derived_evidence = self._derived_finding_evidence(
+            raw_carrier,
+            classification,
+            parent_evidence["request_id"],
+        )
+        if derived_evidence is None:
+            return False
+        derived_findings = self._derived_unresolved_findings(
+            raw_carrier,
+            derived_evidence,
+            include_top_level=not top_level_component_superseded,
+        )
+        return (
+            bool(derived_findings)
+            and self._type_preserving_equal(parent_evidence, derived_evidence)
+            and self._type_preserving_equal(evidence, derived_evidence)
+            and self._type_preserving_equal(parent_findings, derived_findings)
+            and self._type_preserving_equal(
+                report["unresolved_provider_findings"], derived_findings
+            )
+        )
+
+    def _finding_range_scope(
+        self, report: dict[str, object]
+    ) -> dict[str, object] | None:
+        receipt = self.finding_range_parent_receipt
+        if not self._closed_parent_input(receipt, "finding_range_receipt"):
+            return None
+        rules = self.schema["parent_input_rules"]["finding_range_receipt"]
+        ancestors = receipt["ancestor_shas"]
+        if (
+            receipt["owner"] != rules["owner"]
+            or receipt["status"] != rules["status"]
+            or receipt["history_mode"] != "full-dag"
+            or receipt["base_is_unique_merge_base"] is not True
+            or receipt["base_is_ancestor_of_head"] is not True
+            or receipt["repository"] != report["repository"]
+            or receipt["pull_request"] != report["pull_request"]
+            or receipt["head_sha"] != report["head_sha"]
+            or not self._positive_int(receipt["pull_request"])
+            or not self._full_sha(receipt["base_sha"])
+            or not self._full_sha(receipt["head_sha"])
+            or receipt["base_sha"] == receipt["head_sha"]
+            or not isinstance(ancestors, list)
+            or not all(self._full_sha(sha) for sha in ancestors)
+            or ancestors != sorted(set(ancestors))
+            or receipt["base_sha"] in ancestors
+            or receipt["head_sha"] in ancestors
+            or not self._nonnegative_int(receipt["ancestor_count"])
+            or receipt["ancestor_count"] != len(ancestors)
+        ):
+            return None
+        digest_input = "".join(f"{sha}\n" for sha in ancestors).encode("ascii")
+        digest = hashlib.sha256(digest_input).hexdigest()
+        if receipt["ancestor_shas_sha256"] != digest:
+            return None
+        return {
+            "repository": receipt["repository"],
+            "pull_request": receipt["pull_request"],
+            "base_sha": receipt["base_sha"],
+            "head_sha": receipt["head_sha"],
+            "ancestor_shas": copy.deepcopy(ancestors),
+            "ancestor_shas_projection": {
+                "owner": self.grammar["ancestor_shas_projection"]["owner"],
+                "status": "complete",
+                "repository": receipt["repository"],
+                "pull_request": receipt["pull_request"],
+                "base_sha": receipt["base_sha"],
+                "head_sha": receipt["head_sha"],
+                "ancestor_count": receipt["ancestor_count"],
+                "ancestor_shas_sha256": digest,
+            },
+        }
+
+    def _finding_page_receipt_matches(
+        self,
+        observation: dict[str, object],
+        expected_scope: dict[str, object],
+    ) -> bool:
+        receipt = self.finding_page_parent_receipt
+        if not self._closed_parent_input(receipt, "finding_page_receipt"):
+            return False
+        rules = self.schema["parent_input_rules"]["finding_page_receipt"]
+        inventory = receipt["page_inventory"]
+        page_flags = (
+            "issue_comments_pages_complete",
+            "reviews_pages_complete",
+            "inline_comments_pages_complete",
+            "review_threads_pages_complete",
+            "review_thread_comments_pages_complete",
+        )
+        page_counts = (
+            "issue_comment_count",
+            "review_count",
+            "inline_comment_count",
+            "review_thread_count",
+            "review_thread_comment_count",
+        )
+        receipt_scope = {
+            "repository": expected_scope["repository"],
+            "pull_request": expected_scope["pull_request"],
+            "base_sha": expected_scope["base_sha"],
+            "head_sha": expected_scope["head_sha"],
+            "ancestor_shas_sha256": expected_scope["ancestor_shas_projection"][
+                "ancestor_shas_sha256"
+            ],
+        }
+        records_sha256 = receipt["records_sha256"]
+        return (
+            receipt["owner"] == rules["owner"]
+            and receipt["status"] == rules["status"]
+            and receipt["profile"] == "github-codex-finding-acquisition-v1"
+            and self._closed_parent_input(receipt["scope"], "finding_acquisition_scope")
+            and self._type_preserving_equal(receipt["scope"], receipt_scope)
+            and self._closed_parent_input(
+                inventory, "finding_acquisition_page_inventory"
+            )
+            and all(inventory[field] is True for field in page_flags)
+            and all(self._nonnegative_int(inventory[field]) for field in page_counts)
+            and all(
+                self._type_preserving_equal(
+                    inventory[field], observation["page_inventory"][field]
+                )
+                for field in (*page_flags, *page_counts)
+            )
+            and isinstance(records_sha256, str)
+            and SHA256.fullmatch(records_sha256) is not None
+            and records_sha256
+            == _finding_page_records_sha256(
+                observation["issue_comments"], observation["reviews"]
+            )
+        )
+
+    def _select_finding_observation_candidate(
+        self,
+        issue_comments: list[object],
+        reviews: list[object],
+        inventory: dict[str, object],
+        expected_scope: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object], str, bool] | None:
+        rows: list[dict[str, object]] = []
+        digests: set[str] = set()
+        identities: set[tuple[object, object]] = set()
+        child_count = 0
+        provider_target_child_count = 0
+        if inventory["issue_comment_count"] != len(issue_comments) or inventory[
+            "review_count"
+        ] != len(reviews):
+            return None
+        for records, kind, channel in (
+            (issue_comments, "issue_comment", "issue-comment"),
+            (reviews, "review", "review"),
+        ):
+            page_order: list[tuple[str, int]] = []
+            for candidate in records:
+                if (
+                    not isinstance(candidate, dict)
+                    or not self.reference_classifier._closed(candidate, kind)
+                    or candidate.get("kind") != kind
+                    or not self._type_preserving_equal(
+                        candidate.get("scope"), expected_scope
+                    )
+                    or not self._positive_int(candidate.get("id"))
+                ):
+                    return None
+                try:
+                    _, semantic_time = self.reference_classifier._semantic(candidate)
+                except (KeyError, TypeError, ValueError):
+                    return None
+                page_order.append((semantic_time, candidate["id"]))
+                digest = _canonical_json_sha256(candidate)
+                identity = (kind, candidate["id"])
+                if digest in digests or identity in identities:
+                    return None
+                digests.add(digest)
+                identities.add(identity)
+                if kind == "review":
+                    children = candidate.get("children")
+                    if not isinstance(children, list):
+                        return None
+                    child_count += len(children)
+                    provider_target_child_count += sum(
+                        1
+                        for child in children
+                        if isinstance(child, dict)
+                        and child.get("user")
+                        == {
+                            "login": self.provider_identity["login"],
+                            "type": self.provider_identity["type"],
+                        }
+                    )
+                classified = self.reference_classifier.classify(candidate)
+                if (
+                    classified["classification"] == "clean"
+                    and classified["branch"] == "clean-issue-v1"
+                    and not self._issue_resolution_matches_range(
+                        candidate, expected_scope
+                    )
+                ):
+                    return None
+                if classified["classification"] in {"irrelevant", "nonterminal"}:
+                    continue
+                if classified["semantic_time"] != semantic_time:
+                    return None
+                rows.append(
+                    {
+                        "carrier": candidate,
+                        "classification": classified,
+                        "digest": digest,
+                        "semantic_time": semantic_time,
+                        "channel": channel,
+                    }
+                )
+            if page_order != sorted(page_order):
+                return None
+        if (
+            inventory["inline_comment_count"] != child_count
+            or inventory["review_thread_count"] < provider_target_child_count
+            or inventory["review_thread_comment_count"] < provider_target_child_count
+            or inventory["terminal_candidate_count"] != len(rows)
+            or not rows
+        ):
+            return None
+        invalid_classes = {"malformed", "inconclusive"}
+        selectable_classes = {"clean", "findings", "resolved-inline-only"}
+        selection_rows = [
+            row
+            for row in rows
+            if row["classification"]["classification"]
+            in selectable_classes | invalid_classes
+        ]
+        if not selection_rows:
+            return None
+        latest_decision_time = max(row["semantic_time"] for row in selection_rows)
+        latest_decisions = [
+            row
+            for row in selection_rows
+            if row["semantic_time"] == latest_decision_time
+        ]
+        if any(
+            row["classification"]["classification"] in invalid_classes
+            for row in latest_decisions
+        ):
+            return None
+        latest_channel_winners = []
+        for channel in {row["channel"] for row in latest_decisions}:
+            channel_bucket = [
+                row for row in latest_decisions if row["channel"] == channel
+            ]
+            findings = [
+                row
+                for row in channel_bucket
+                if row["classification"]["classification"] == "findings"
+            ]
+            prioritized = findings or channel_bucket
+            if len(prioritized) != 1:
+                return None
+            latest_channel_winners.append(prioritized[0])
+        if (
+            len(
+                {
+                    self._terminal_outcome_key(row, expected_scope)
+                    for row in latest_channel_winners
+                }
+            )
+            > 1
+        ):
+            return None
+        clean_rows = [
+            row for row in rows if row["classification"]["classification"] == "clean"
+        ]
+        active_findings = []
+        for row in rows:
+            if row["classification"]["classification"] != "findings":
+                continue
+            has_unresolved_inline = self._has_unresolved_provider_child(row["carrier"])
+            is_top_level = row["classification"]["branch"] == "top-level-finding-v1"
+            superseded_top_level = is_top_level and any(
+                clean["semantic_time"] > row["semantic_time"] for clean in clean_rows
+            )
+            if has_unresolved_inline or not superseded_top_level:
+                active_findings.append(row)
+        if active_findings:
+            newest_finding_time = max(row["semantic_time"] for row in active_findings)
+            if any(
+                row["classification"]["classification"] in invalid_classes
+                and row["semantic_time"] >= newest_finding_time
+                for row in rows
+            ):
+                return None
+            winners = [
+                row
+                for row in active_findings
+                if row["semantic_time"] == newest_finding_time
+            ]
+            same_time_channels = {
+                row["channel"]
+                for row in rows
+                if row["semantic_time"] == newest_finding_time
+                and row["classification"]["classification"]
+                in {"clean", "findings", "resolved-inline-only"}
+            }
+            if len(same_time_channels) != 1:
+                return None
+            selected = self._unique_selected_row(winners)
+            if selected is None:
+                return None
+            carrier, classification, digest = selected
+            top_level_component_superseded = (
+                classification["branch"] == "top-level-finding-v1"
+                and self._has_unresolved_provider_child(carrier)
+                and any(
+                    clean["semantic_time"] > newest_finding_time for clean in clean_rows
+                )
+            )
+            return (
+                carrier,
+                classification,
+                digest,
+                top_level_component_superseded,
+            )
+        latest_time = max(row["semantic_time"] for row in selection_rows)
+        latest = [row for row in selection_rows if row["semantic_time"] == latest_time]
+        if any(
+            row["classification"]["classification"] in invalid_classes for row in latest
+        ):
+            return None
+        if len({row["channel"] for row in latest}) != 1:
+            return None
+        findings = [
+            row
+            for row in latest
+            if row["classification"]["classification"] == "findings"
+        ]
+        selected = self._unique_selected_row(findings or latest)
+        return None if selected is None else (*selected, False)
+
+    def _terminal_outcome_key(
+        self,
+        row: dict[str, object],
+        expected_scope: dict[str, object],
+    ) -> tuple[object, object]:
+        classification = row["classification"]
+        carrier = row["carrier"]
+        result = classification["classification"]
+        if result == "findings":
+            commit = self._raw_finding_commit(carrier, classification["branch"])
+        elif carrier["kind"] == "review":
+            commit = carrier["commit_id"]
+        else:
+            commit = expected_scope["head_sha"]
+        return result, commit
+
+    def _has_unresolved_provider_child(self, carrier: object) -> bool:
+        if not isinstance(carrier, dict) or carrier.get("kind") != "review":
+            return False
+        children = carrier.get("children")
+        return isinstance(children, list) and any(
+            isinstance(child, dict)
+            and child.get("user")
+            == {
+                "login": self.provider_identity["login"],
+                "type": self.provider_identity["type"],
+            }
+            and isinstance(child.get("thread_join"), dict)
+            and child["thread_join"].get("isResolved") is False
+            for child in children
+        )
+
+    @staticmethod
+    def _issue_resolution_matches_range(
+        candidate: dict[str, object], expected_scope: dict[str, object]
+    ) -> bool:
+        try:
+            body = _normalize_body(candidate["body"])
+        except (TypeError, ValueError):
+            return False
+        matches = [
+            MARKER.fullmatch(line)
+            for line in body.split("\n")
+            if line.startswith("**Reviewed commit:**")
+        ]
+        if len(matches) != 1 or matches[0] is None:
+            return False
+        commit_ref = matches[0].group(1)
+        resolution = candidate["commit_resolution"]
+        if len(commit_ref) == 40:
+            return resolution is None and commit_ref == expected_scope["head_sha"]
+        return (
+            isinstance(resolution, dict)
+            and resolution["repository"] == expected_scope["repository"]
+            and resolution["commit_ref"] == commit_ref
+            and resolution["initial_resolved_commit"] == expected_scope["head_sha"]
+            and resolution["final_resolved_commit"] == expected_scope["head_sha"]
+            and expected_scope["head_sha"].startswith(commit_ref)
+        )
+
+    @staticmethod
+    def _unique_selected_row(
+        rows: list[dict[str, object]],
+    ) -> tuple[dict[str, object], dict[str, object], str] | None:
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        return row["carrier"], row["classification"], row["digest"]
 
     def _selected_pr_scope(self, report: dict[str, object]) -> bool:
         rule = self.scope_rules["selected-pr"]
@@ -1587,6 +2264,7 @@ class _ReportValidator:
             and evidence["kind"] == null_rule["finding_evidence_kind"]
             and evidence["grammar_branch"] in null_rule["finding_branches"]
             and self._unresolved_findings(report, evidence)
+            and self._finding_carrier_snapshot_matches(report, evidence)
         )
 
 
@@ -1758,6 +2436,121 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "initial_snapshot_sha256": "4" * 64,
             "final_snapshot_sha256": "4" * 64,
         }
+        top_level_ancestor_raw = _merge_patch(
+            cls.grammar["bases"]["top_level_finding"],
+            {
+                "commit_id": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "body": (
+                    "### 💡 Codex Review\n"
+                    "- [P1] Reject ambiguous cache entries — "
+                    "https://github.com/octo/review-fixture/blob/"
+                    "abcdefabcdefabcdefabcdefabcdefabcdefabcd/"
+                    "src/cache.py#L10-L12"
+                ),
+            },
+        )
+        top_level_report = cls.grammar["report_bases"]["finding"]
+        top_level_raw_sha256 = _canonical_json_sha256(top_level_ancestor_raw)
+        carrier_scope = top_level_ancestor_raw["scope"]
+        cls.finding_range_parent_receipt = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "repository": carrier_scope["repository"],
+            "pull_request": carrier_scope["pull_request"],
+            "base_sha": carrier_scope["base_sha"],
+            "head_sha": carrier_scope["head_sha"],
+            "history_mode": "full-dag",
+            "base_is_unique_merge_base": True,
+            "base_is_ancestor_of_head": True,
+            "ancestor_shas": copy.deepcopy(carrier_scope["ancestor_shas"]),
+            "ancestor_count": carrier_scope["ancestor_shas_projection"][
+                "ancestor_count"
+            ],
+            "ancestor_shas_sha256": carrier_scope["ancestor_shas_projection"][
+                "ancestor_shas_sha256"
+            ],
+        }
+        top_level_inventory = {
+            "issue_comments_pages_complete": True,
+            "issue_comment_count": 0,
+            "reviews_pages_complete": True,
+            "review_count": 1,
+            "inline_comments_pages_complete": True,
+            "inline_comment_count": 0,
+            "review_threads_pages_complete": True,
+            "review_thread_count": 0,
+            "review_thread_comments_pages_complete": True,
+            "review_thread_comment_count": 0,
+            "terminal_candidate_count": 1,
+        }
+        top_level_observation = {
+            "scope": copy.deepcopy(cls.direct_positive_parent_scope),
+            "page_inventory": top_level_inventory,
+            "issue_comments": [],
+            "reviews": [top_level_ancestor_raw],
+            "selected_carrier_sha256": top_level_raw_sha256,
+            "selection_status": "selected-findings",
+        }
+        cls.finding_page_parent_receipt = _make_finding_page_receipt(
+            top_level_observation,
+            cls.finding_range_parent_receipt,
+        )
+        cls.top_level_finding_carrier_snapshot = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "complete_observation": top_level_observation,
+            "complete_observation_sha256": _canonical_json_sha256(
+                top_level_observation
+            ),
+            "raw_carrier": top_level_ancestor_raw,
+            "raw_carrier_sha256": top_level_raw_sha256,
+            "evidence": copy.deepcopy(top_level_report["evidence"]),
+            "unresolved_provider_findings": copy.deepcopy(
+                top_level_report["unresolved_provider_findings"]
+            ),
+        }
+        ancestor_inline_raw = copy.deepcopy(
+            cls.grammar["bases"]["approved_ancestor_inline"]
+        )
+        inline_report = cls.grammar["report_bases"]["inline_finding"]
+        inline_raw_sha256 = _canonical_json_sha256(ancestor_inline_raw)
+        inline_inventory = {
+            "issue_comments_pages_complete": True,
+            "issue_comment_count": 0,
+            "reviews_pages_complete": True,
+            "review_count": 1,
+            "inline_comments_pages_complete": True,
+            "inline_comment_count": 1,
+            "review_threads_pages_complete": True,
+            "review_thread_count": 1,
+            "review_thread_comments_pages_complete": True,
+            "review_thread_comment_count": 1,
+            "terminal_candidate_count": 1,
+        }
+        inline_observation = {
+            "scope": copy.deepcopy(cls.direct_positive_parent_scope),
+            "page_inventory": inline_inventory,
+            "issue_comments": [],
+            "reviews": [ancestor_inline_raw],
+            "selected_carrier_sha256": inline_raw_sha256,
+            "selection_status": "selected-findings",
+        }
+        cls.inline_finding_page_parent_receipt = _make_finding_page_receipt(
+            inline_observation,
+            cls.finding_range_parent_receipt,
+        )
+        cls.inline_finding_carrier_snapshot = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "complete_observation": inline_observation,
+            "complete_observation_sha256": _canonical_json_sha256(inline_observation),
+            "raw_carrier": ancestor_inline_raw,
+            "raw_carrier_sha256": inline_raw_sha256,
+            "evidence": copy.deepcopy(inline_report["evidence"]),
+            "unresolved_provider_findings": copy.deepcopy(
+                inline_report["unresolved_provider_findings"]
+            ),
+        }
         cls.merge_status_parent_scope = {
             "repository": "octo/review-fixture",
             "pull_request": 7,
@@ -1856,6 +2649,23 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
             cls.clean_complete_pr_parent_snapshot,
+            cls.top_level_finding_carrier_snapshot,
+            cls.finding_range_parent_receipt,
+            cls.finding_page_parent_receipt,
+        )
+        cls.inline_finding_report_validator = _ReportValidator(
+            cls.grammar,
+            cls.selected_parent_selection_outcome,
+            cls.direct_positive_parent_scope,
+            cls.terminal_clean_parent_identity,
+            cls.reaction_clean_parent_epoch,
+            cls.merge_status_parent_scope,
+            cls.merge_status_parent_contract,
+            cls.resolved_inline_parent_snapshot,
+            cls.clean_complete_pr_parent_snapshot,
+            cls.inline_finding_carrier_snapshot,
+            cls.finding_range_parent_receipt,
+            cls.inline_finding_page_parent_receipt,
         )
         cls.reaction_report_validator = _ReportValidator(
             cls.grammar,
@@ -1867,6 +2677,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
             cls.absent_complete_pr_parent_snapshot,
+            cls.top_level_finding_carrier_snapshot,
+            cls.finding_range_parent_receipt,
+            cls.finding_page_parent_receipt,
         )
         cls.merge_report_validator = _ReportValidator(
             cls.grammar,
@@ -1878,6 +2691,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
             cls.merge_complete_pr_parent_snapshot,
+            cls.top_level_finding_carrier_snapshot,
+            cls.finding_range_parent_receipt,
+            cls.finding_page_parent_receipt,
         )
         cls.no_pr_report_validator = _ReportValidator(
             cls.grammar,
@@ -1889,6 +2705,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_parent_contract,
             cls.resolved_inline_parent_snapshot,
             cls.clean_complete_pr_parent_snapshot,
+            cls.top_level_finding_carrier_snapshot,
+            cls.finding_range_parent_receipt,
+            cls.finding_page_parent_receipt,
         )
 
     def _validator_for_selection(
@@ -1904,6 +2723,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.merge_status_parent_contract,
             self.resolved_inline_parent_snapshot,
             self.clean_complete_pr_parent_snapshot,
+            self.top_level_finding_carrier_snapshot,
+            self.finding_range_parent_receipt,
+            self.finding_page_parent_receipt,
         )
 
     def _validator_with_complete_snapshot(
@@ -1936,6 +2758,44 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             ),
             self.resolved_inline_parent_snapshot,
             snapshot,
+            self.top_level_finding_carrier_snapshot,
+            self.finding_range_parent_receipt,
+            self.finding_page_parent_receipt,
+        )
+
+    def _validator_with_finding_snapshot(
+        self,
+        snapshot: dict[str, object] | None,
+        *,
+        selection_outcome: dict[str, object] | None = None,
+        range_receipt: dict[str, object] | None = None,
+        page_receipt: dict[str, object] | None = None,
+    ) -> _ReportValidator:
+        return _ReportValidator(
+            self.grammar,
+            (
+                selection_outcome
+                if selection_outcome is not None
+                else self.selected_parent_selection_outcome
+            ),
+            self.direct_positive_parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+            self.clean_complete_pr_parent_snapshot,
+            snapshot,
+            (
+                range_receipt
+                if range_receipt is not None
+                else self.finding_range_parent_receipt
+            ),
+            (
+                page_receipt
+                if page_receipt is not None
+                else self.finding_page_parent_receipt
+            ),
         )
 
     def _clean_snapshot_for_evidence(
@@ -2138,6 +2998,10 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "parent_complete_snapshot_input"
             ],
         )
+        self.assertIn(
+            "three separate closed parent-owned inputs",
+            report_schema["basis_rules"]["null"]["parent_finding_snapshot_input"],
+        )
         self.assertEqual(
             set(report_schema["parent_input_profiles"]),
             {
@@ -2154,11 +3018,40 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "merge_status_parent_contract",
                 "reaction_clean_epoch",
                 "resolved_inline_snapshot",
+                "finding_carrier_snapshot",
+                "finding_page_inventory",
+                "finding_page_receipt",
+                "finding_acquisition_scope",
+                "finding_acquisition_page_inventory",
+                "finding_complete_observation",
+                "finding_range_receipt",
             },
         )
         self.assertIn(
             "never derived from report, evidence, association, or merge-status fields",
             report_schema["parent_input_rules"]["complete_pr_snapshot"][
+                "trust_boundary"
+            ],
+        )
+        finding_snapshot_rule = report_schema["parent_input_rules"][
+            "finding_carrier_snapshot"
+        ]
+        self.assertIn(
+            "consumer replay source",
+            finding_snapshot_rule["complete_observation"],
+        )
+        self.assertIn(
+            "only a strictly later trustworthy clean",
+            finding_snapshot_rule["terminal_selection"],
+        )
+        self.assertIn(
+            "findings take precedence over clean and resolved-inline-only",
+            finding_snapshot_rule["terminal_selection"],
+        )
+        self.assertIn("parent-enriched", finding_snapshot_rule["raw_carrier"])
+        self.assertIn(
+            "before finding_carrier_snapshot construction",
+            report_schema["parent_input_rules"]["finding_page_receipt"][
                 "trust_boundary"
             ],
         )
@@ -2477,6 +3370,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "clean-issue-positive",
             "clean-review-positive",
             "top-level-finding-positive",
+            "issue-top-level-ancestor-finding-positive",
+            "issue-finding-rejects-commit-resolution",
             "top-level-ancestor-finding-positive",
             "top-level-multiple-findings",
             "inline-finding-unresolved",
@@ -2585,6 +3480,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "merge-status-invalid-contract-digest",
             "merge-status-coupled-contract-descriptor-mutation",
             "finding-report-positive",
+            "finding-report-coupled-nonancestor-commit-mutation",
             "inline-finding-report-positive",
             "finding-report-empty-unresolved-list",
             "pending-report-with-unresolved-finding",
@@ -2628,6 +3524,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     validator = self.reaction_report_validator
                 elif fixture["base"] == "merge_status":
                     validator = self.merge_report_validator
+                elif fixture["base"] == "inline_finding":
+                    validator = self.inline_finding_report_validator
                 self.assertEqual(validator.validate(report), fixture["valid"])
 
         terminal_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
@@ -2814,6 +3712,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         for field, replacement in {
             "owner": "consumer",
             "status": "incomplete",
+            "profile": "github-codex-finding-acquisition-v2",
         }.items():
             with self.subTest(field=field):
                 snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
@@ -3892,10 +4791,13 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
 
         for report in selected_reports:
             with self.subTest(status=report["status"], basis=report["basis"]):
-                validator = {
-                    "reaction-clean": self.reaction_report_validator,
-                    "merge-status": self.merge_report_validator,
-                }.get(report["basis"], self.report_validator)
+                if report == self.grammar["report_bases"]["inline_finding"]:
+                    validator = self.inline_finding_report_validator
+                else:
+                    validator = {
+                        "reaction-clean": self.reaction_report_validator,
+                        "merge-status": self.merge_report_validator,
+                    }.get(report["basis"], self.report_validator)
                 self.assertTrue(validator.validate(report))
                 self.assertFalse(self.no_pr_report_validator.validate(report))
 
@@ -4004,10 +4906,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             }
         )
         other_selected_validator = self._validator_for_selection(other_selected)
-        for report in (coupled_pending, coupled_inconclusive, coupled_finding):
+        for report in (coupled_pending, coupled_inconclusive):
             with self.subTest(status=report["status"]):
                 self.assertTrue(other_selected_validator.validate(report))
                 self.assertFalse(self.report_validator.validate(report))
+        self.assertFalse(other_selected_validator.validate(coupled_finding))
+        self.assertFalse(self.report_validator.validate(coupled_finding))
 
         coupled_no_pr = copy.deepcopy(
             self.grammar["report_bases"]["no_selected_supported_pr"]
@@ -4041,6 +4945,1120 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     null_scope = copy.deepcopy(report)
                     null_scope[field] = None
                     self.assertFalse(self.report_validator.validate(null_scope))
+
+    def test_finding_snapshot_binds_complete_selection_and_raw_carrier(self) -> None:
+        top_report = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        inline_report = copy.deepcopy(self.grammar["report_bases"]["inline_finding"])
+        self.assertTrue(self.report_validator.validate(top_report))
+        self.assertTrue(self.inline_finding_report_validator.validate(inline_report))
+        self.assertFalse(
+            self._validator_with_finding_snapshot(None).validate(top_report)
+        )
+
+        profile = self.grammar["required_report_schema"]["parent_input_profiles"]
+
+        def fixture_record(fixture_id: str) -> dict[str, object]:
+            fixture = next(
+                item for item in self.grammar["fixtures"] if item["id"] == fixture_id
+            )
+            return _merge_patch(
+                self.grammar["bases"][fixture["base"]], fixture["patch"]
+            )
+
+        def replace_raw(
+            snapshot: dict[str, object], raw_carrier: dict[str, object]
+        ) -> dict[str, object]:
+            digest = _canonical_json_sha256(raw_carrier)
+            snapshot["raw_carrier"] = raw_carrier
+            snapshot["raw_carrier_sha256"] = digest
+            observation = snapshot["complete_observation"]
+            observation["issue_comments"] = (
+                [raw_carrier] if raw_carrier["kind"] == "issue_comment" else []
+            )
+            observation["reviews"] = (
+                [raw_carrier] if raw_carrier["kind"] == "review" else []
+            )
+            observation["selected_carrier_sha256"] = digest
+            inventory = observation["page_inventory"]
+            inventory["issue_comment_count"] = len(observation["issue_comments"])
+            inventory["review_count"] = len(observation["reviews"])
+            inventory["inline_comment_count"] = sum(
+                len(review["children"]) for review in observation["reviews"]
+            )
+            inventory["review_thread_count"] = inventory["inline_comment_count"]
+            inventory["review_thread_comment_count"] = inventory["inline_comment_count"]
+            inventory["terminal_candidate_count"] = 1
+            snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                observation
+            )
+            return _make_finding_page_receipt(
+                observation,
+                self.finding_range_parent_receipt,
+            )
+
+        def bind_summary(
+            snapshot: dict[str, object], report: dict[str, object]
+        ) -> None:
+            snapshot["evidence"] = copy.deepcopy(report["evidence"])
+            snapshot["unresolved_provider_findings"] = copy.deepcopy(
+                report["unresolved_provider_findings"]
+            )
+
+        for field in profile["finding_carrier_snapshot"]:
+            with self.subTest(missing_snapshot_field=field):
+                snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+                snapshot.pop(field)
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(snapshot).validate(top_report)
+                )
+        opened = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        opened["opaque"] = True
+        self.assertFalse(
+            self._validator_with_finding_snapshot(opened).validate(top_report)
+        )
+
+        for field, replacement in {"owner": "consumer", "status": "incomplete"}.items():
+            with self.subTest(snapshot_control=field):
+                snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+                snapshot[field] = replacement
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(snapshot).validate(top_report)
+                )
+
+        for field in profile["finding_page_inventory"]:
+            with self.subTest(missing_inventory_field=field):
+                snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+                snapshot["complete_observation"]["page_inventory"].pop(field)
+                snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                    snapshot["complete_observation"]
+                )
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(snapshot).validate(top_report)
+                )
+        for field in (
+            "issue_comments_pages_complete",
+            "reviews_pages_complete",
+            "inline_comments_pages_complete",
+            "review_threads_pages_complete",
+            "review_thread_comments_pages_complete",
+        ):
+            snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+            snapshot["complete_observation"]["page_inventory"][field] = False
+            snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                snapshot["complete_observation"]
+            )
+            self.assertFalse(
+                self._validator_with_finding_snapshot(snapshot).validate(top_report)
+            )
+        for field in (
+            "issue_comment_count",
+            "review_count",
+            "inline_comment_count",
+            "review_thread_count",
+            "review_thread_comment_count",
+        ):
+            snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+            snapshot["complete_observation"]["page_inventory"][field] = -1
+            snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                snapshot["complete_observation"]
+            )
+            self.assertFalse(
+                self._validator_with_finding_snapshot(snapshot).validate(top_report)
+            )
+        no_candidate = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        no_candidate["complete_observation"]["page_inventory"][
+            "terminal_candidate_count"
+        ] = 0
+        no_candidate["complete_observation_sha256"] = _canonical_json_sha256(
+            no_candidate["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(no_candidate).validate(top_report)
+        )
+
+        bad_observation_digest = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bad_observation_digest["complete_observation_sha256"] = "A" * 64
+        self.assertFalse(
+            self._validator_with_finding_snapshot(bad_observation_digest).validate(
+                top_report
+            )
+        )
+        bad_raw_digest = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bad_raw_digest["raw_carrier_sha256"] = "9" * 64
+        self.assertFalse(
+            self._validator_with_finding_snapshot(bad_raw_digest).validate(top_report)
+        )
+        for field in profile["finding_complete_observation"]:
+            with self.subTest(missing_observation_field=field):
+                snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+                snapshot["complete_observation"].pop(field)
+                snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                    snapshot["complete_observation"]
+                )
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(snapshot).validate(top_report)
+                )
+        corrected_selection = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        corrected_selection["complete_observation"]["selection_status"] = "clean"
+        corrected_selection["complete_observation_sha256"] = _canonical_json_sha256(
+            corrected_selection["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(corrected_selection).validate(
+                top_report
+            )
+        )
+
+        coupled_report = copy.deepcopy(top_report)
+        coupled_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        nonancestor = "1111111111111111111111111111111111111111"
+        coupled_report["evidence"]["artifact_commit"] = nonancestor
+        coupled_report["unresolved_provider_findings"][0]["artifact_commit"] = (
+            nonancestor
+        )
+        bind_summary(coupled_snapshot, coupled_report)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(coupled_snapshot).validate(
+                coupled_report
+            )
+        )
+
+        nonancestor_raw = fixture_record("approved-nonancestor-inline-finding")
+        self.assertEqual(
+            self.classifier.classify(nonancestor_raw)["classification"], "stale"
+        )
+        nonancestor_report = copy.deepcopy(inline_report)
+        nonancestor_report["evidence"]["artifact_commit"] = nonancestor
+        nonancestor_report["unresolved_provider_findings"][0]["artifact_commit"] = (
+            nonancestor
+        )
+        nonancestor_snapshot = copy.deepcopy(self.inline_finding_carrier_snapshot)
+        nonancestor_page_receipt = replace_raw(nonancestor_snapshot, nonancestor_raw)
+        bind_summary(nonancestor_snapshot, nonancestor_report)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                nonancestor_snapshot,
+                page_receipt=nonancestor_page_receipt,
+            ).validate(nonancestor_report)
+        )
+
+        new_head = "2222222222222222222222222222222222222222"
+        old_head_report = copy.deepcopy(top_report)
+        old_head_report["head_sha"] = new_head
+        old_head_report["unresolved_provider_findings"][0]["report_head_sha"] = new_head
+        old_head_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        old_head_snapshot["complete_observation"]["scope"]["head_sha"] = new_head
+        old_head_snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+            old_head_snapshot["complete_observation"]
+        )
+        bind_summary(old_head_snapshot, old_head_report)
+        old_head_selection = copy.deepcopy(self.selected_parent_selection_outcome)
+        old_head_selection["head_sha"] = new_head
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                old_head_snapshot, selection_outcome=old_head_selection
+            ).validate(old_head_report)
+        )
+
+        identity_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        identity_raw = copy.deepcopy(identity_snapshot["raw_carrier"])
+        identity_raw["user"] = {"login": "lookalike[bot]", "type": "Bot"}
+        identity_page_receipt = replace_raw(identity_snapshot, identity_raw)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                identity_snapshot,
+                page_receipt=identity_page_receipt,
+            ).validate(top_report)
+        )
+
+        raw_report_mismatch = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        mismatched_raw = copy.deepcopy(raw_report_mismatch["raw_carrier"])
+        mismatched_raw["id"] = 304
+        mismatch_page_receipt = replace_raw(raw_report_mismatch, mismatched_raw)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                raw_report_mismatch,
+                page_receipt=mismatch_page_receipt,
+            ).validate(top_report)
+        )
+
+        channel_report = copy.deepcopy(top_report)
+        channel_report["evidence"].update(
+            {
+                "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-301",
+                "channel": "issue-comment",
+                "server_time_field": "created_at",
+            }
+        )
+        channel_report["unresolved_provider_findings"][0]["url"] = channel_report[
+            "evidence"
+        ]["url"]
+        channel_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bind_summary(channel_snapshot, channel_report)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(channel_snapshot).validate(
+                channel_report
+            )
+        )
+
+        branch_report = copy.deepcopy(top_report)
+        branch_report["evidence"]["grammar_branch"] = "inline-parent-v1"
+        branch_report["unresolved_provider_findings"][0].update(
+            {
+                "url": "https://github.com/octo/review-fixture/pull/7#discussion_r301",
+                "grammar_branch": "inline-parent-v1",
+                "thread_is_resolved": False,
+            }
+        )
+        branch_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bind_summary(branch_snapshot, branch_report)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(branch_snapshot).validate(
+                branch_report
+            )
+        )
+
+        for fixture_id, classification in (
+            ("inline-finding-resolved", "resolved-inline-only"),
+            ("inline-incomplete-join", "inconclusive"),
+            ("ancestor-inline-child-id-mismatch", "malformed"),
+        ):
+            with self.subTest(raw_carrier_state=fixture_id):
+                raw = fixture_record(fixture_id)
+                self.assertEqual(
+                    self.classifier.classify(raw)["classification"], classification
+                )
+                snapshot = copy.deepcopy(self.inline_finding_carrier_snapshot)
+                page_receipt = replace_raw(snapshot, raw)
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        snapshot,
+                        page_receipt=page_receipt,
+                    ).validate(inline_report)
+                )
+
+        issue_raw = fixture_record("issue-top-level-ancestor-finding-positive")
+        issue_report = copy.deepcopy(top_report)
+        issue_report["evidence"].update(
+            {
+                "id": 101,
+                "url": "https://github.com/octo/review-fixture/pull/7#issuecomment-101",
+                "channel": "issue-comment",
+                "server_time": "2026-08-23T09:00:00Z",
+                "server_time_field": "created_at",
+            }
+        )
+        issue_report["unresolved_provider_findings"][0].update(
+            {
+                "id": 101,
+                "url": issue_report["evidence"]["url"],
+                "evidence_id": 101,
+            }
+        )
+        issue_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        issue_page_receipt = replace_raw(issue_snapshot, issue_raw)
+        bind_summary(issue_snapshot, issue_report)
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                issue_snapshot,
+                page_receipt=issue_page_receipt,
+            ).validate(issue_report)
+        )
+
+    def test_finding_page_receipt_independently_binds_complete_pages(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        snapshot = self.top_level_finding_carrier_snapshot
+        self.assertTrue(self.report_validator.validate(report))
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                snapshot,
+                page_receipt={},
+            ).validate(report)
+        )
+
+        receipt_profile = self.grammar["required_report_schema"][
+            "parent_input_profiles"
+        ]["finding_page_receipt"]
+        for field in receipt_profile:
+            with self.subTest(missing_page_receipt_field=field):
+                receipt = copy.deepcopy(self.finding_page_parent_receipt)
+                receipt.pop(field)
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        snapshot,
+                        page_receipt=receipt,
+                    ).validate(report)
+                )
+
+        opened = copy.deepcopy(self.finding_page_parent_receipt)
+        opened["opaque"] = True
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                snapshot,
+                page_receipt=opened,
+            ).validate(report)
+        )
+
+        for profile_name, field_name in (
+            ("finding_acquisition_scope", "scope"),
+            ("finding_acquisition_page_inventory", "page_inventory"),
+        ):
+            nested_profile = self.grammar["required_report_schema"][
+                "parent_input_profiles"
+            ][profile_name]
+            for field in nested_profile:
+                with self.subTest(
+                    nested_receipt_profile=profile_name,
+                    missing_nested_field=field,
+                ):
+                    receipt = copy.deepcopy(self.finding_page_parent_receipt)
+                    receipt[field_name].pop(field)
+                    self.assertFalse(
+                        self._validator_with_finding_snapshot(
+                            snapshot,
+                            page_receipt=receipt,
+                        ).validate(report)
+                    )
+            opened_nested = copy.deepcopy(self.finding_page_parent_receipt)
+            opened_nested[field_name]["opaque"] = True
+            self.assertFalse(
+                self._validator_with_finding_snapshot(
+                    snapshot,
+                    page_receipt=opened_nested,
+                ).validate(report)
+            )
+
+        for field, replacement in {
+            "owner": "consumer",
+            "status": "incomplete",
+        }.items():
+            with self.subTest(page_receipt_control=field):
+                receipt = copy.deepcopy(self.finding_page_parent_receipt)
+                receipt[field] = replacement
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        snapshot,
+                        page_receipt=receipt,
+                    ).validate(report)
+                )
+
+        inventory_profile = self.grammar["required_report_schema"][
+            "parent_input_profiles"
+        ]["finding_acquisition_page_inventory"]
+        for field in inventory_profile:
+            with self.subTest(missing_receipt_inventory_field=field):
+                receipt = copy.deepcopy(self.finding_page_parent_receipt)
+                receipt["page_inventory"].pop(field)
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        snapshot,
+                        page_receipt=receipt,
+                    ).validate(report)
+                )
+
+        invalid_receipts = []
+        for field in (
+            "issue_comments_pages_complete",
+            "reviews_pages_complete",
+            "inline_comments_pages_complete",
+            "review_threads_pages_complete",
+            "review_thread_comments_pages_complete",
+        ):
+            receipt = copy.deepcopy(self.finding_page_parent_receipt)
+            receipt["page_inventory"][field] = False
+            invalid_receipts.append(receipt)
+        for field in (
+            "issue_comment_count",
+            "review_count",
+            "inline_comment_count",
+            "review_thread_count",
+            "review_thread_comment_count",
+        ):
+            receipt = copy.deepcopy(self.finding_page_parent_receipt)
+            receipt["page_inventory"][field] = True
+            invalid_receipts.append(receipt)
+        count_mismatch = copy.deepcopy(self.finding_page_parent_receipt)
+        count_mismatch["page_inventory"]["review_count"] = 2
+        invalid_receipts.append(count_mismatch)
+        pr_alias = copy.deepcopy(self.finding_page_parent_receipt)
+        pr_alias["scope"]["pull_request"] = True
+        invalid_receipts.append(pr_alias)
+        wrong_digest = copy.deepcopy(self.finding_page_parent_receipt)
+        wrong_digest["records_sha256"] = "9" * 64
+        invalid_receipts.append(wrong_digest)
+        for index, receipt in enumerate(invalid_receipts):
+            with self.subTest(invalid_page_receipt=index):
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        snapshot,
+                        page_receipt=receipt,
+                    ).validate(report)
+                )
+
+        mutated_snapshot = copy.deepcopy(snapshot)
+        mutated_raw = copy.deepcopy(mutated_snapshot["raw_carrier"])
+        mutated_raw["body"] = mutated_raw["body"].replace(
+            "Reject ambiguous cache entries",
+            "Reject conflicting cache entries",
+        )
+        mutated_digest = _canonical_json_sha256(mutated_raw)
+        mutated_snapshot["raw_carrier"] = mutated_raw
+        mutated_snapshot["raw_carrier_sha256"] = mutated_digest
+        mutated_observation = mutated_snapshot["complete_observation"]
+        mutated_observation["reviews"] = [mutated_raw]
+        mutated_observation["selected_carrier_sha256"] = mutated_digest
+        mutated_snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+            mutated_observation
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                mutated_snapshot,
+                page_receipt=self.finding_page_parent_receipt,
+            ).validate(report)
+        )
+
+    def test_complete_finding_observation_recomputes_pages_and_precedence(
+        self,
+    ) -> None:
+        top_report = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        inline_report = copy.deepcopy(self.grammar["report_bases"]["inline_finding"])
+
+        def bind_records(
+            snapshot: dict[str, object],
+            issue_comments: list[dict[str, object]],
+            reviews: list[dict[str, object]],
+            selected: dict[str, object],
+        ) -> dict[str, object]:
+            observation = snapshot["complete_observation"]
+            observation["issue_comments"] = issue_comments
+            observation["reviews"] = reviews
+            child_count = sum(len(review["children"]) for review in reviews)
+            inventory = observation["page_inventory"]
+            inventory["issue_comment_count"] = len(issue_comments)
+            inventory["review_count"] = len(reviews)
+            inventory["inline_comment_count"] = child_count
+            inventory["review_thread_count"] = child_count
+            inventory["review_thread_comment_count"] = child_count
+            inventory["terminal_candidate_count"] = len(issue_comments) + len(reviews)
+            selected_digest = _canonical_json_sha256(selected)
+            observation["selected_carrier_sha256"] = selected_digest
+            snapshot["raw_carrier"] = selected
+            snapshot["raw_carrier_sha256"] = selected_digest
+            snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                observation
+            )
+            return _make_finding_page_receipt(
+                observation,
+                self.finding_range_parent_receipt,
+            )
+
+        top_raw = copy.deepcopy(self.top_level_finding_carrier_snapshot["raw_carrier"])
+        later_clean = copy.deepcopy(self.grammar["bases"]["clean_review"])
+        later_clean["id"] = 601
+        later_clean["submitted_at"] = "2026-08-23T09:06:00Z"
+        superseded = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        superseded_page_receipt = bind_records(
+            superseded, [], [top_raw, later_clean], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                superseded,
+                page_receipt=superseded_page_receipt,
+            ).validate(top_report)
+        )
+
+        short_clean = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        short_clean["body"] = (
+            "Codex Review: Didn't find any major issues.\n\n"
+            "**Reviewed commit:** `0123456789`"
+        )
+        short_clean["created_at"] = "2026-08-23T09:06:00Z"
+        short_clean["updated_at"] = "2026-08-23T09:06:00Z"
+        short_clean["commit_resolution"] = {
+            "repository": "octo/review-fixture",
+            "commit_ref": "0123456789",
+            "initial_resolved_commit": top_report["head_sha"],
+            "final_resolved_commit": top_report["head_sha"],
+        }
+        short_superseded = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        short_page_receipt = bind_records(
+            short_superseded, [short_clean], [top_raw], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                short_superseded,
+                page_receipt=short_page_receipt,
+            ).validate(top_report)
+        )
+
+        later_malformed = copy.deepcopy(later_clean)
+        later_malformed["id"] = 602
+        later_malformed["submitted_at"] = "2026-08-23T09:07:00Z"
+        later_malformed["body"] = "No findings!"
+        malformed_latest = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        malformed_page_receipt = bind_records(
+            malformed_latest, [], [top_raw, later_malformed], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                malformed_latest,
+                page_receipt=malformed_page_receipt,
+            ).validate(top_report)
+        )
+
+        later_inconclusive = copy.deepcopy(self.grammar["bases"]["inline_finding"])
+        later_inconclusive["id"] = 603
+        later_inconclusive["submitted_at"] = "2026-08-23T09:08:00Z"
+        later_inconclusive["children"][0]["pull_request_review_id"] = 603
+        later_inconclusive["children"][0]["thread_join"]["parent_review_id"] = 603
+        later_inconclusive["threads_complete"] = False
+        inconclusive_latest = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        inconclusive_page_receipt = bind_records(
+            inconclusive_latest,
+            [],
+            [top_raw, later_inconclusive],
+            top_raw,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                inconclusive_latest,
+                page_receipt=inconclusive_page_receipt,
+            ).validate(top_report)
+        )
+
+        same_time_clean = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        same_time_clean["created_at"] = top_raw["submitted_at"]
+        same_time_clean["updated_at"] = top_raw["submitted_at"]
+        cross_channel = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        cross_channel_page_receipt = bind_records(
+            cross_channel, [same_time_clean], [top_raw], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                cross_channel,
+                page_receipt=cross_channel_page_receipt,
+            ).validate(top_report)
+        )
+
+        same_channel_clean = copy.deepcopy(later_clean)
+        same_channel_clean["submitted_at"] = top_raw["submitted_at"]
+        same_channel_finding_wins_clean = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot
+        )
+        finding_wins_clean_page_receipt = bind_records(
+            same_channel_finding_wins_clean,
+            [],
+            [top_raw, same_channel_clean],
+            top_raw,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                same_channel_finding_wins_clean,
+                page_receipt=finding_wins_clean_page_receipt,
+            ).validate(top_report)
+        )
+
+        same_channel_resolved = copy.deepcopy(self.grammar["bases"]["inline_finding"])
+        same_channel_resolved["id"] = 604
+        same_channel_resolved["submitted_at"] = top_raw["submitted_at"]
+        same_channel_resolved["children"][0]["pull_request_review_id"] = 604
+        same_channel_resolved["children"][0]["thread_join"]["parent_review_id"] = 604
+        same_channel_resolved["children"][0]["thread_join"]["isResolved"] = True
+        same_channel_finding_wins_resolved = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot
+        )
+        finding_wins_resolved_page_receipt = bind_records(
+            same_channel_finding_wins_resolved,
+            [],
+            [top_raw, same_channel_resolved],
+            top_raw,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                same_channel_finding_wins_resolved,
+                page_receipt=finding_wins_resolved_page_receipt,
+            ).validate(top_report)
+        )
+
+        competing_finding = copy.deepcopy(top_raw)
+        competing_finding["id"] = 605
+        competing_finding["body"] = competing_finding["body"].replace(
+            "Reject ambiguous cache entries",
+            "Reject conflicting cache entries",
+        )
+        ambiguous_same_priority = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        ambiguous_same_priority_page_receipt = bind_records(
+            ambiguous_same_priority,
+            [],
+            [top_raw, competing_finding],
+            top_raw,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                ambiguous_same_priority,
+                page_receipt=ambiguous_same_priority_page_receipt,
+            ).validate(top_report)
+        )
+
+        inline_raw = copy.deepcopy(self.inline_finding_carrier_snapshot["raw_carrier"])
+        inline_persists = copy.deepcopy(self.inline_finding_carrier_snapshot)
+        inline_persists_page_receipt = bind_records(
+            inline_persists, [], [inline_raw, later_clean], inline_raw
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                inline_persists,
+                page_receipt=inline_persists_page_receipt,
+            ).validate(inline_report)
+        )
+
+        top_with_inline = copy.deepcopy(self.grammar["bases"]["top_level_with_inline"])
+        mixed_report = copy.deepcopy(top_report)
+        mixed_report["evidence"].update(
+            {
+                "id": 302,
+                "url": "https://github.com/octo/review-fixture/pull/7#pullrequestreview-302",
+                "artifact_commit": top_with_inline["commit_id"],
+                "server_time": top_with_inline["submitted_at"],
+            }
+        )
+        mixed_report["unresolved_provider_findings"] = [
+            {
+                "id": 302,
+                "url": mixed_report["evidence"]["url"],
+                "artifact_commit": top_with_inline["commit_id"],
+                "grammar_branch": "top-level-finding-v1",
+                "thread_is_resolved": None,
+                "evidence_id": 302,
+                "report_head_sha": mixed_report["head_sha"],
+            },
+            {
+                "id": 502,
+                "url": "https://github.com/octo/review-fixture/pull/7#discussion_r502",
+                "artifact_commit": top_with_inline["commit_id"],
+                "grammar_branch": "inline-parent-v1",
+                "thread_is_resolved": False,
+                "evidence_id": 302,
+                "report_head_sha": mixed_report["head_sha"],
+            },
+        ]
+        mixed_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        mixed_snapshot["evidence"] = copy.deepcopy(mixed_report["evidence"])
+        mixed_snapshot["unresolved_provider_findings"] = copy.deepcopy(
+            mixed_report["unresolved_provider_findings"]
+        )
+        mixed_page_receipt = bind_records(
+            mixed_snapshot, [], [top_with_inline, later_clean], top_with_inline
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                mixed_snapshot,
+                page_receipt=mixed_page_receipt,
+            ).validate(mixed_report)
+        )
+
+        mixed_report["unresolved_provider_findings"] = [
+            copy.deepcopy(mixed_report["unresolved_provider_findings"][1])
+        ]
+        mixed_snapshot["unresolved_provider_findings"] = copy.deepcopy(
+            mixed_report["unresolved_provider_findings"]
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                mixed_snapshot,
+                page_receipt=mixed_page_receipt,
+            ).validate(mixed_report)
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(None).validate(mixed_report)
+        )
+
+        resolved_mixed = copy.deepcopy(top_with_inline)
+        resolved_mixed["children"][0]["thread_join"]["isResolved"] = True
+        resolved_mixed_snapshot = copy.deepcopy(mixed_snapshot)
+        resolved_mixed_page_receipt = bind_records(
+            resolved_mixed_snapshot,
+            [],
+            [resolved_mixed, later_clean],
+            resolved_mixed,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                resolved_mixed_snapshot,
+                page_receipt=resolved_mixed_page_receipt,
+            ).validate(mixed_report)
+        )
+
+        later_resolved_inline = copy.deepcopy(self.grammar["bases"]["inline_finding"])
+        later_resolved_inline["children"][0]["thread_join"]["isResolved"] = True
+        top_survives_other_resolution = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot
+        )
+        top_survives_page_receipt = bind_records(
+            top_survives_other_resolution,
+            [],
+            [top_raw, later_resolved_inline],
+            top_raw,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                top_survives_other_resolution,
+                page_receipt=top_survives_page_receipt,
+            ).validate(top_report)
+        )
+
+        same_time_issue_clean = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        same_time_issue_clean["created_at"] = "2026-08-23T09:06:00Z"
+        same_time_issue_clean["updated_at"] = "2026-08-23T09:06:00Z"
+        same_time_resolved_inline = copy.deepcopy(
+            self.grammar["bases"]["inline_finding"]
+        )
+        same_time_resolved_inline["id"] = 604
+        same_time_resolved_inline["submitted_at"] = "2026-08-23T09:06:00Z"
+        same_time_resolved_inline["children"][0]["pull_request_review_id"] = 604
+        same_time_resolved_inline["children"][0]["thread_join"]["parent_review_id"] = (
+            604
+        )
+        same_time_resolved_inline["children"][0]["thread_join"]["isResolved"] = True
+        conflicting_latest = copy.deepcopy(self.inline_finding_carrier_snapshot)
+        conflicting_page_receipt = bind_records(
+            conflicting_latest,
+            [same_time_issue_clean],
+            [inline_raw, same_time_resolved_inline],
+            inline_raw,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                conflicting_latest,
+                page_receipt=conflicting_page_receipt,
+            ).validate(inline_report)
+        )
+
+        missing_thread_inventory = copy.deepcopy(self.inline_finding_carrier_snapshot)
+        missing_thread_inventory["complete_observation"]["page_inventory"][
+            "review_thread_count"
+        ] = 0
+        missing_thread_inventory["complete_observation"]["page_inventory"][
+            "review_thread_comment_count"
+        ] = 0
+        missing_thread_inventory["complete_observation_sha256"] = (
+            _canonical_json_sha256(missing_thread_inventory["complete_observation"])
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                missing_thread_inventory,
+                page_receipt=self.inline_finding_page_parent_receipt,
+            ).validate(inline_report)
+        )
+
+        inflated_thread_inventory = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot
+        )
+        inflated_thread_inventory["complete_observation"]["page_inventory"][
+            "review_thread_count"
+        ] = 999
+        inflated_thread_inventory["complete_observation"]["page_inventory"][
+            "review_thread_comment_count"
+        ] = 999
+        inflated_thread_inventory["complete_observation_sha256"] = (
+            _canonical_json_sha256(inflated_thread_inventory["complete_observation"])
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                inflated_thread_inventory,
+                page_receipt=self.finding_page_parent_receipt,
+            ).validate(top_report)
+        )
+
+        bool_count = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bool_count["complete_observation"]["page_inventory"]["review_count"] = True
+        bool_count["complete_observation_sha256"] = _canonical_json_sha256(
+            bool_count["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(bool_count).validate(top_report)
+        )
+
+        omitted = copy.deepcopy(superseded)
+        omitted["complete_observation"]["reviews"] = [top_raw]
+        omitted["complete_observation"]["page_inventory"]["review_count"] = 1
+        omitted["complete_observation"]["page_inventory"][
+            "terminal_candidate_count"
+        ] = 1
+        omitted["complete_observation_sha256"] = _canonical_json_sha256(
+            omitted["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                omitted,
+                page_receipt=superseded_page_receipt,
+            ).validate(top_report)
+        )
+
+        duplicate = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        duplicate_page_receipt = bind_records(
+            duplicate, [], [top_raw, copy.deepcopy(top_raw)], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                duplicate,
+                page_receipt=duplicate_page_receipt,
+            ).validate(top_report)
+        )
+
+        out_of_order = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        out_of_order_page_receipt = bind_records(
+            out_of_order, [], [later_clean, top_raw], top_raw
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                out_of_order,
+                page_receipt=out_of_order_page_receipt,
+            ).validate(top_report)
+        )
+
+        selected_mismatch = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        selected_mismatch["complete_observation"]["selected_carrier_sha256"] = "9" * 64
+        selected_mismatch["complete_observation_sha256"] = _canonical_json_sha256(
+            selected_mismatch["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(selected_mismatch).validate(
+                top_report
+            )
+        )
+
+        arbitrary_digest = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        arbitrary_digest["complete_observation_sha256"] = "9" * 64
+        self.assertFalse(
+            self._validator_with_finding_snapshot(arbitrary_digest).validate(top_report)
+        )
+
+        bytes_changed = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        bytes_changed["complete_observation"]["page_inventory"]["review_count"] = 2
+        self.assertFalse(
+            self._validator_with_finding_snapshot(bytes_changed).validate(top_report)
+        )
+
+        count_mismatch = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        count_mismatch["complete_observation"]["page_inventory"][
+            "terminal_candidate_count"
+        ] = 2
+        count_mismatch["complete_observation_sha256"] = _canonical_json_sha256(
+            count_mismatch["complete_observation"]
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(count_mismatch).validate(top_report)
+        )
+
+    def test_finding_range_receipt_independently_binds_full_dag(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        self.assertTrue(self.report_validator.validate(report))
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                self.top_level_finding_carrier_snapshot,
+                range_receipt={},
+            ).validate(report)
+        )
+
+        receipt_profile = self.grammar["required_report_schema"][
+            "parent_input_profiles"
+        ]["finding_range_receipt"]
+        for field in receipt_profile:
+            with self.subTest(missing_range_field=field):
+                receipt = copy.deepcopy(self.finding_range_parent_receipt)
+                receipt.pop(field)
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        self.top_level_finding_carrier_snapshot,
+                        range_receipt=receipt,
+                    ).validate(report)
+                )
+
+        def digest_ancestors(ancestors: list[str]) -> str:
+            raw = "".join(f"{sha}\n" for sha in ancestors).encode("ascii")
+            return hashlib.sha256(raw).hexdigest()
+
+        def scope_from_receipt(receipt: dict[str, object]) -> dict[str, object]:
+            return {
+                "repository": receipt["repository"],
+                "pull_request": receipt["pull_request"],
+                "base_sha": receipt["base_sha"],
+                "head_sha": receipt["head_sha"],
+                "ancestor_shas": copy.deepcopy(receipt["ancestor_shas"]),
+                "ancestor_shas_projection": {
+                    "owner": "parent-orchestrator",
+                    "status": "complete",
+                    "repository": receipt["repository"],
+                    "pull_request": receipt["pull_request"],
+                    "base_sha": receipt["base_sha"],
+                    "head_sha": receipt["head_sha"],
+                    "ancestor_count": receipt["ancestor_count"],
+                    "ancestor_shas_sha256": receipt["ancestor_shas_sha256"],
+                },
+            }
+
+        def bind_selected_raw(
+            snapshot: dict[str, object],
+            raw: dict[str, object],
+            range_receipt: dict[str, object],
+        ) -> dict[str, object]:
+            digest = _canonical_json_sha256(raw)
+            snapshot["raw_carrier"] = raw
+            snapshot["raw_carrier_sha256"] = digest
+            observation = snapshot["complete_observation"]
+            observation["issue_comments"] = []
+            observation["reviews"] = [raw]
+            observation["selected_carrier_sha256"] = digest
+            observation["page_inventory"]["issue_comment_count"] = 0
+            observation["page_inventory"]["review_count"] = 1
+            observation["page_inventory"]["inline_comment_count"] = 0
+            observation["page_inventory"]["review_thread_count"] = 0
+            observation["page_inventory"]["review_thread_comment_count"] = 0
+            observation["page_inventory"]["terminal_candidate_count"] = 1
+            snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+                observation
+            )
+            return _make_finding_page_receipt(observation, range_receipt)
+
+        for history_mode in ("first-parent", "ancestry-path"):
+            with self.subTest(history_mode=history_mode):
+                receipt = copy.deepcopy(self.finding_range_parent_receipt)
+                receipt["history_mode"] = history_mode
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        self.top_level_finding_carrier_snapshot,
+                        range_receipt=receipt,
+                    ).validate(report)
+                )
+
+        receipt_aliases = {
+            "pull_request": True,
+            "ancestor_count": True,
+            "base_is_unique_merge_base": 1,
+            "base_is_ancestor_of_head": 1,
+        }
+        for field, alias in receipt_aliases.items():
+            with self.subTest(range_receipt_alias=field):
+                receipt = copy.deepcopy(self.finding_range_parent_receipt)
+                receipt[field] = alias
+                self.assertFalse(
+                    self._validator_with_finding_snapshot(
+                        self.top_level_finding_carrier_snapshot,
+                        range_receipt=receipt,
+                    ).validate(report)
+                )
+
+        nonancestor = "1111111111111111111111111111111111111111"
+        coupled_report = copy.deepcopy(report)
+        coupled_report["evidence"]["artifact_commit"] = nonancestor
+        coupled_report["unresolved_provider_findings"][0]["artifact_commit"] = (
+            nonancestor
+        )
+        coupled_raw = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot["raw_carrier"]
+        )
+        coupled_raw["commit_id"] = nonancestor
+        coupled_raw["body"] = (
+            "### 💡 Codex Review\n"
+            "- [P1] Reject ambiguous cache entries — "
+            "https://github.com/octo/review-fixture/blob/"
+            f"{nonancestor}/src/cache.py#L10-L12"
+        )
+        coupled_raw["scope"]["ancestor_shas"] = [nonancestor]
+        projection = coupled_raw["scope"]["ancestor_shas_projection"]
+        projection["ancestor_count"] = 1
+        projection["ancestor_shas_sha256"] = digest_ancestors([nonancestor])
+        coupled_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        coupled_snapshot["evidence"] = copy.deepcopy(coupled_report["evidence"])
+        coupled_snapshot["unresolved_provider_findings"] = copy.deepcopy(
+            coupled_report["unresolved_provider_findings"]
+        )
+        coupled_page_receipt = bind_selected_raw(
+            coupled_snapshot,
+            coupled_raw,
+            self.finding_range_parent_receipt,
+        )
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                coupled_snapshot,
+                page_receipt=coupled_page_receipt,
+            ).validate(coupled_report)
+        )
+
+        moved_base_receipt = copy.deepcopy(self.finding_range_parent_receipt)
+        moved_base_receipt["base_sha"] = "cccccccccccccccccccccccccccccccccccccccc"
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                self.top_level_finding_carrier_snapshot,
+                range_receipt=moved_base_receipt,
+            ).validate(report)
+        )
+
+        reprojected_raw = copy.deepcopy(
+            self.top_level_finding_carrier_snapshot["raw_carrier"]
+        )
+        reprojected_raw["scope"] = scope_from_receipt(moved_base_receipt)
+        reprojected_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        reprojected_page_receipt = bind_selected_raw(
+            reprojected_snapshot,
+            reprojected_raw,
+            moved_base_receipt,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                reprojected_snapshot,
+                range_receipt=moved_base_receipt,
+                page_receipt=reprojected_page_receipt,
+            ).validate(report)
+        )
+
+        side_history = "1111111111111111111111111111111111111111"
+        side_receipt = copy.deepcopy(self.finding_range_parent_receipt)
+        side_receipt["ancestor_shas"] = sorted(
+            [*side_receipt["ancestor_shas"], side_history]
+        )
+        side_receipt["ancestor_count"] = len(side_receipt["ancestor_shas"])
+        side_receipt["ancestor_shas_sha256"] = digest_ancestors(
+            side_receipt["ancestor_shas"]
+        )
+        side_raw = copy.deepcopy(self.top_level_finding_carrier_snapshot["raw_carrier"])
+        side_raw["commit_id"] = side_history
+        side_raw["body"] = (
+            "### 💡 Codex Review\n"
+            "- [P1] Preserve side history — "
+            "https://github.com/octo/review-fixture/blob/"
+            f"{side_history}/src/side.py#L4"
+        )
+        side_raw["scope"] = scope_from_receipt(side_receipt)
+        side_report = copy.deepcopy(report)
+        side_report["evidence"]["artifact_commit"] = side_history
+        side_report["unresolved_provider_findings"][0]["artifact_commit"] = side_history
+        side_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        side_snapshot["evidence"] = copy.deepcopy(side_report["evidence"])
+        side_snapshot["unresolved_provider_findings"] = copy.deepcopy(
+            side_report["unresolved_provider_findings"]
+        )
+        side_page_receipt = bind_selected_raw(
+            side_snapshot,
+            side_raw,
+            side_receipt,
+        )
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                side_snapshot,
+                range_receipt=side_receipt,
+                page_receipt=side_page_receipt,
+            ).validate(side_report)
+        )
+
+        omitted_side_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        self.assertFalse(
+            self._validator_with_finding_snapshot(
+                omitted_side_snapshot,
+                range_receipt=side_receipt,
+            ).validate(report)
+        )
 
     def test_normalization_is_scalar_and_does_not_apply_unicode_normalization(
         self,
